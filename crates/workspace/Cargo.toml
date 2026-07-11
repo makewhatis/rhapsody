@@ -22,6 +22,12 @@ sha2 = "0.10"
 # mirror mutex is held across the async git ops, so it is a tokio::sync::Mutex (matching the linear
 # adapter). Runtime features stay test-only (the library never spawns a runtime).
 tokio = { version = "1", default-features = false, features = ["process", "time", "sync", "rt"] }
+# libc: the W2 hook runner mirrors hooks.go's process-group SIGKILL on timeout
+# (`syscall.Kill(-pid, SIGKILL)`), so a backgrounded grandchild cannot survive the deadline and hold
+# the output pipe open. Go uses `syscall`; the Rust equivalent is a single `libc::kill(-pgid, …)` FFI
+# call. The W1 hooks doc anticipated this ("W2 … adds the syscall dependency"); libc is already in
+# the lock as a transitive dep (tokio), so this adds no new crate to the tree.
+libc = "0.2"
 
 [dev-dependencies]
 # tokio (test-only): a multi-thread runtime for `#[tokio::test]`, which drives the async workspace

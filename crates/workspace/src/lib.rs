@@ -7,11 +7,11 @@
 //!
 //! The Go package is one compilation unit, so `repo.go`'s methods hang off the same `Manager` as
 //! `manager.go`/`hooks.go`. To mirror `repo_test.go`/`repo_clone_test.go` (which build a `Manager`,
-//! run lifecycle hooks, and delegate empty-URL calls to the legacy path), W1 lays down the
-//! [`Manager`] + [`hooks::HookRunner`] scaffold those four test files exercise. The remaining
-//! lifecycle surface — `BeforeRun`/`AfterRun`, the public `CreateForIssue`/`Remove` wrappers, the
-//! labeler, GC, and the full process-group hook-timeout semantics (`hooks_test.go`) — lands in
-//! W2/W3, mirroring how the tracker crate shipped adapter skeletons its later tasks filled in.
+//! run lifecycle hooks, and delegate empty-URL calls to the legacy path), W1 laid down the
+//! [`Manager`] + [`hooks::HookRunner`] scaffold those four test files exercise. W2 completes the
+//! per-issue lifecycle on top: the public `create_for_issue`/`before_run`/`after_run`/`remove`
+//! surface P5 drives, the post-run [`labeler`], and the full process-group hook-timeout semantics
+//! (`hooks_test.go`). GC + the graphite guard land in W3.
 //!
 //! Go's `ctx context.Context` threading becomes implicit async cancellation (drop the future); the
 //! hook timeout stays explicit ([`hooks::HookRunner`]). Go's bare `error` returns wrapped around
@@ -19,6 +19,7 @@
 //! category string as its leading token so `errors.Is`-style category checks map to variant matches.
 
 mod hooks;
+mod labeler;
 mod manager;
 mod repo;
 mod safety;
@@ -38,8 +39,8 @@ pub use sanitize::{Workspace, sanitize_key};
 /// sentinel string (e.g. `git_failed`). Go's `errors.Is(err, ErrX)` becomes a `matches!` on the
 /// variant: the outermost wrap determines the category, exactly as Go reports the outer `%w`.
 ///
-/// `ErrGhFailed` (post-run labeler, AIE-301) is intentionally deferred to W2 with the labeler that
-/// constructs it; every category defined here is constructed by W1.
+/// `ErrGhFailed` (post-run labeler, AIE-301) lands in W2 with the [`labeler`](crate::labeler) that
+/// constructs it; every other category is constructed by W1.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// `workspace_create_failed` — mkdir/stat failure creating a legacy workspace directory.
@@ -89,6 +90,10 @@ pub enum Error {
     /// `workspace_stat_failed` — stat of the worktree path failed (a non-NotExist error).
     #[error("workspace_stat_failed: {0}")]
     WorkspaceStat(String),
+    /// `gh_failed` — a `gh` CLI invocation exited non-zero (or timed out) during the post-run
+    /// labeler (AIE-301). Constructed by [`crate::labeler`]; callers log and swallow it.
+    #[error("gh_failed: {0}")]
+    GhFailed(String),
 }
 
 /// Shared test scaffolding: the RAII [`testutil::TempDir`] (the port of Go's `t.TempDir()`), the
@@ -98,10 +103,13 @@ pub enum Error {
 /// exactly as the Go package shares these helpers across its `_test.go` files.
 #[cfg(test)]
 pub(crate) mod testutil {
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use crate::safety::join;
     use crate::{Config, HookScripts, Manager};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -210,5 +218,137 @@ pub(crate) mod testutil {
             return true;
         }
         p.starts_with(&format!("{root}/"))
+    }
+
+    // ---- labeler_test.go helpers (post-run PR labeler) ----
+
+    /// A fake `gh` on a private PATH (parity mirror of Go's `writeFakeGh`, parallel-safe). Holds the
+    /// temp dir alive, the log/prmap paths, and the [`Manager::gh_env_overlay`] a test installs so
+    /// the labeler's `gh` subprocess finds this fake and reads `$GH_LOG`/`$GH_PRMAP` — WITHOUT
+    /// mutating the process environment (Rust 2024 forbids the `unsafe set_var` Go's `t.Setenv`
+    /// relies on). Each test gets its own, so parallel labeler tests never collide.
+    pub(crate) struct FakeGh {
+        /// Kept alive so the fake `gh`, its log, and prmap survive for the test's lifetime.
+        pub _dir: TempDir,
+        pub log_path: String,
+        pub prmap_path: String,
+        pub overlay: Vec<(OsString, OsString)>,
+    }
+
+    /// The standard fake `gh` (mirror of Go's `writeFakeGh` script): logs one `ARGS: …` line per
+    /// call, fails `label create` with an "already exists"-style message, answers `pr list --head`
+    /// from the prmap control file, and exits 0 for `pr edit`.
+    const FAKE_GH_SCRIPT: &str = r#"#!/usr/bin/env bash
+echo "ARGS: $*" >> "$GH_LOG"
+if [ "$1" = "label" ] && [ "$2" = "create" ]; then
+  echo "label already exists" >&2
+  exit 1
+fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  head=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; fi
+    shift
+  done
+  grep -E "^${head}=" "$GH_PRMAP" 2>/dev/null | sed -E "s/^[^=]+=//"
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then
+  exit 0
+fi
+exit 0
+"#;
+
+    /// Installs the standard fake `gh` (mirror of `writeFakeGh`).
+    pub(crate) fn write_fake_gh() -> FakeGh {
+        write_gh_with_script(FAKE_GH_SCRIPT)
+    }
+
+    /// Installs a fake `gh` running `script`, returning a [`FakeGh`] whose `overlay` a test assigns
+    /// to `Manager::gh_env_overlay`. `PATH` is the fake's dir prepended to the ambient PATH (so the
+    /// labeler resolves this `gh` while `bash`/`grep`/`sed` still resolve normally), plus `GH_LOG`
+    /// and `GH_PRMAP`.
+    pub(crate) fn write_gh_with_script(script: &str) -> FakeGh {
+        let dir = TempDir::new();
+        let log_path = dir.child("gh.log");
+        let prmap_path = dir.child("prmap");
+        std::fs::write(&prmap_path, b"").unwrap();
+        let gh_path = dir.child("gh");
+        std::fs::write(&gh_path, script.as_bytes()).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut new_path = OsString::from(&dir.path);
+        new_path.push(":");
+        new_path.push(std::env::var_os("PATH").unwrap_or_default());
+        let overlay = vec![
+            (OsString::from("PATH"), new_path),
+            (OsString::from("GH_LOG"), OsString::from(log_path.clone())),
+            (
+                OsString::from("GH_PRMAP"),
+                OsString::from(prmap_path.clone()),
+            ),
+        ];
+        FakeGh {
+            _dir: dir,
+            log_path,
+            prmap_path,
+            overlay,
+        }
+    }
+
+    /// Reads the fake gh log, panicking if absent (mirror of Go's `readLog`; use only where the
+    /// labeler is expected to have invoked gh at least once).
+    pub(crate) fn read_log(path: &str) -> String {
+        std::fs::read_to_string(path).expect("read gh log")
+    }
+
+    /// Builds a real bare-mirror-backed worktree via `ensure_from_repo` and a two-level
+    /// Graphite-style stack inside it — the worktree's own `symphony/<key>` branch (stack base) ->
+    /// `branchA` -> `branchB`(HEAD) — plus a sibling branch off the trunk that is NOT an ancestor of
+    /// HEAD (to assert enumeration excludes sibling-run branches). Returns the worktree path and its
+    /// base branch name (mirror of Go's `buildStackWorktree`).
+    pub(crate) async fn build_stack_worktree(m: &Manager, origin: &str) -> (String, String) {
+        let ws = m
+            .ensure_from_repo(origin, "", "AIE-999")
+            .await
+            .expect("EnsureFromRepo");
+        let wt = ws.path;
+
+        let out = Command::new("git")
+            .args(["-C", &wt, "symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "resolve worktree branch");
+        let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Stack: commit on the base branch, then branchA, then branchB(HEAD).
+        git_run(&wt, &["commit", "--allow-empty", "-m", "A1"]);
+        git_run(&wt, &["branch", "branchA"]);
+        git_run(&wt, &["checkout", "branchA"]);
+        git_run(&wt, &["commit", "--allow-empty", "-m", "B1"]);
+        git_run(&wt, &["branch", "branchB"]);
+        git_run(&wt, &["checkout", "branchB"]);
+
+        // Sibling run's branch in the SHARED bare mirror: carries its own commit (not merged into
+        // origin/main) and is NOT an ancestor of HEAD, so `--merged HEAD` excludes it — the
+        // concurrent-run guarantee that matters for the shared mirror. Built in a throwaway worktree
+        // that is then removed (the branch persists in the mirror).
+        let sib_root = TempDir::new();
+        let sib = join(&[&sib_root.path, "sibling-wt"]);
+        git_run(
+            &wt,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "symphony/sibling-run",
+                &sib,
+                "origin/main",
+            ],
+        );
+        git_run(&sib, &["commit", "--allow-empty", "-m", "sibling work"]);
+        git_run(&wt, &["worktree", "remove", "--force", &sib]);
+
+        (wt, base)
     }
 }

@@ -128,7 +128,10 @@ impl Manager {
     /// Runs `git -c gc.auto=0 [-C dir] args...` with the hardened env, returning the combined
     /// stdout+stderr and, on a non-zero exit or spawn failure, an [`Error::GitFailed`]. The output
     /// is returned on success AND failure (mirroring Go's `m.git` returning `(out, err)`).
-    async fn git(&self, dir: &str, args: &[&str]) -> (String, Option<Error>) {
+    ///
+    /// `pub(crate)` so the post-run [`crate::labeler`] can enumerate stack branches through the same
+    /// helper Go's labeler does (`m.git`).
+    pub(crate) async fn git(&self, dir: &str, args: &[&str]) -> (String, Option<Error>) {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 4);
         full.push("-c");
         full.push("gc.auto=0");
@@ -257,7 +260,10 @@ impl Manager {
     /// the leading `origin/` is stripped); falls back to the remote-tracking `main` then `master`.
     /// Probes `refs/remotes/origin/*` (the live fetched refs), NOT `refs/heads/*` (frozen at clone
     /// time under the remote-tracking refspec).
-    async fn default_branch(&self, mirror_dir: &str) -> Result<String, Error> {
+    ///
+    /// `pub(crate)` so the post-run [`crate::labeler`] can resolve the trunk from a worktree (which
+    /// shares the mirror's remote-tracking refs), exactly as Go's labeler calls `m.defaultBranch`.
+    pub(crate) async fn default_branch(&self, mirror_dir: &str) -> Result<String, Error> {
         let (out, err) = self
             .git(
                 mirror_dir,
@@ -736,6 +742,7 @@ mod tests {
                 "worktree_outside_root: ",
             ),
             (Error::WorkspaceStat("x".into()), "workspace_stat_failed: "),
+            (Error::GhFailed("x".into()), "gh_failed: "),
         ];
         for (err, want_prefix) in cases {
             assert!(

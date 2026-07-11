@@ -1,9 +1,11 @@
-//! Per-issue workspace [`Manager`]: construction, the per-repo lock registry, path derivation, and
-//! the legacy (empty-URL) create/remove paths (`manager.go`, the subset W1's `repo_test.go` mirror
-//! exercises). `BeforeRun`/`AfterRun`, the public `CreateForIssue`/`Remove` wrappers, and the
-//! labeler land in W2.
+//! Per-issue workspace [`Manager`]: construction, the per-repo lock registry, path derivation, the
+//! legacy (empty-URL) create/remove paths, and the before_run/after_run lifecycle hooks
+//! (`manager.go`). W1 laid down construction + the legacy paths its `repo_test.go` mirror exercises;
+//! W2 makes the `create_for_issue`/`remove` surface public, adds `before_run`/`after_run`, and ports
+//! the `manager_test.go` cases. The post-run labeler lives in [`crate::labeler`].
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +50,15 @@ pub struct Manager {
     pub(crate) hooks: HookScripts,
     pub(crate) runner: HookRunner,
     pub(crate) repo_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Extra environment entries layered onto the post-run labeler's `gh` subprocesses (see
+    /// [`crate::labeler`]). Empty in production, so `gh` inherits the daemon's environment unchanged
+    /// — byte-for-byte Go's `cmd.Env = os.Environ()`. It exists solely as the labeler tests' seam
+    /// for injecting a fake `gh` (a temp dir prepended to `PATH`, plus `GH_LOG`/`GH_PRMAP`) WITHOUT
+    /// mutating the process environment, keeping those tests sound under Rust 2024's parallel-test
+    /// model (`std::env::set_var` is `unsafe` and the codebase forbids it — cf. the linear/config
+    /// crates' `$HOME`-based tests). Each test's Manager carries its own overlay, so parallel tests
+    /// never collide.
+    pub(crate) gh_env_overlay: Vec<(OsString, OsString)>,
 }
 
 impl Manager {
@@ -70,6 +81,7 @@ impl Manager {
             hooks: cfg.hooks,
             runner: HookRunner::new(timeout),
             repo_locks: Mutex::new(HashMap::new()),
+            gh_env_overlay: Vec::new(),
         })
     }
 
@@ -110,7 +122,13 @@ impl Manager {
     /// Legacy (mkdir-backed) create: ensures the per-issue workspace dir exists, runs after_create
     /// on fresh creation with SYMPHONY_* env (including `project_slug`), and returns the workspace
     /// (upstream §9.2, §9.3). repoURL is "" on this path, so SYMPHONY_REPO is empty.
-    pub(crate) async fn create_for_issue(
+    ///
+    /// This folds Go's public `CreateForIssue(identifier)` and private
+    /// `createForIssue(projectSlug, identifier)` into one method (Rust cannot overload): calling it
+    /// with `project_slug == ""` is exactly Go's exported `CreateForIssue`. It is `pub` so the
+    /// orchestrator (P5) drives the same slug-less legacy path Go exposes; [`crate::repo`]'s
+    /// empty-URL delegates thread the real slug.
+    pub async fn create_for_issue(
         &self,
         project_slug: &str,
         identifier: &str,
@@ -164,9 +182,53 @@ impl Manager {
         })
     }
 
+    /// Runs the before_run hook (upstream §9.4) in the workspace with the SYMPHONY_* env
+    /// (`repo_url`/`project_slug`/`identifier`; SYMPHONY_PROJECT always present). Its failure is
+    /// FATAL to the current attempt — the caller MUST abort on a non-`Ok` return.
+    pub async fn before_run(
+        &self,
+        ws: &Workspace,
+        repo_url: &str,
+        project_slug: &str,
+        identifier: &str,
+    ) -> Result<(), Error> {
+        self.runner
+            .run_env(
+                "before_run",
+                &self.hooks.before_run,
+                &ws.path,
+                Some(&self.hook_env(repo_url, project_slug, identifier)),
+            )
+            .await
+    }
+
+    /// Runs the after_run hook (upstream §9.4) in the workspace with the SYMPHONY_* env. It is
+    /// best-effort: it RETURNS any error for the caller to log, but the caller ignores it (parity
+    /// with Go, where AfterRun surfaces the error and the caller logs+ignores it).
+    pub async fn after_run(
+        &self,
+        ws: &Workspace,
+        repo_url: &str,
+        project_slug: &str,
+        identifier: &str,
+    ) -> Result<(), Error> {
+        self.runner
+            .run_env(
+                "after_run",
+                &self.hooks.after_run,
+                &ws.path,
+                Some(&self.hook_env(repo_url, project_slug, identifier)),
+            )
+            .await
+    }
+
     /// Legacy terminal cleanup: before_remove (best-effort) if the workspace exists, then delete the
     /// directory (upstream §9.4, §8.5). A missing workspace is a no-op. repoURL is "" here.
-    pub(crate) async fn remove(&self, project_slug: &str, identifier: &str) -> Result<(), Error> {
+    ///
+    /// Like [`Self::create_for_issue`], this folds Go's public `Remove(identifier)` and private
+    /// `remove(projectSlug, identifier)`: calling it with `project_slug == ""` is Go's exported
+    /// `Remove`. `pub` so P5 drives the slug-less legacy path; [`crate::repo`] threads the slug.
+    pub async fn remove(&self, project_slug: &str, identifier: &str) -> Result<(), Error> {
         let key = sanitize_key(identifier);
         let path = join(&[&self.root, &key]);
         ensure_within_root(&self.root, &path)?;
@@ -190,5 +252,303 @@ impl Manager {
         }
         remove_all(&path).map_err(|e| Error::WorkspaceRemove(format!("remove {path:?}: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{TempDir, repo_test_manager};
+    use std::os::unix::fs::PermissionsExt;
+
+    // The manager_test.go mirrors drive the legacy (empty-URL) lifecycle. Go's public
+    // `CreateForIssue(id)` / `Remove(id)` are this crate's `create_for_issue("", id)` /
+    // `remove("", id)` (the slug-less fold documented on those methods).
+
+    fn scripts(
+        after_create: &str,
+        before_run: &str,
+        after_run: &str,
+        before_remove: &str,
+    ) -> HookScripts {
+        HookScripts {
+            after_create: after_create.to_string(),
+            before_run: before_run.to_string(),
+            after_run: after_run.to_string(),
+            before_remove: before_remove.to_string(),
+        }
+    }
+
+    // Mirror of TestNewManagerRejectsRelativeRoot. (Matches on the Result rather than `unwrap_err`
+    // so `Manager` need not implement `Debug`, mirroring Go's `errors.Is` check on the returned err.)
+    #[test]
+    fn new_manager_rejects_relative_root() {
+        let res = Manager::new(Config {
+            root: "relative/path".to_string(),
+            hooks: HookScripts::default(),
+            hook_timeout: Duration::from_secs(5),
+        });
+        assert!(
+            matches!(res, Err(Error::PathOutsideRoot(_))),
+            "want PathOutsideRoot for relative root"
+        );
+    }
+
+    // Mirror of TestCreateForIssueCreatesThenReuses.
+    #[tokio::test]
+    async fn create_for_issue_creates_then_reuses() {
+        let (m, root) = repo_test_manager(HookScripts::default());
+        let ws = m.create_for_issue("", "MT-1").await.unwrap();
+        assert_eq!(ws.path, join(&[&root.path, "MT-1"]));
+        assert_eq!(ws.key, "MT-1");
+        assert!(ws.created_now, "first create should set created_now=true");
+        assert!(
+            std::fs::metadata(&ws.path).is_ok_and(|i| i.is_dir()),
+            "workspace dir not created"
+        );
+
+        let ws2 = m.create_for_issue("", "MT-1").await.unwrap();
+        assert!(
+            !ws2.created_now,
+            "second create should reuse: created_now=false"
+        );
+    }
+
+    // Mirror of TestCreateForIssueSanitizesIdentifier.
+    #[tokio::test]
+    async fn create_for_issue_sanitizes_identifier() {
+        let (m, root) = repo_test_manager(HookScripts::default());
+        let ws = m.create_for_issue("", "team/MT 9").await.unwrap();
+        assert_eq!(ws.path, join(&[&root.path, "team_MT_9"]));
+    }
+
+    // Mirror of TestCreateForIssueAfterCreateRunsOnlyOnNewCreation.
+    #[tokio::test]
+    async fn create_for_issue_after_create_runs_only_on_new_creation() {
+        let (m, _root) = repo_test_manager(scripts("echo x > created.txt", "", "", ""));
+        let ws = m.create_for_issue("", "MT-2").await.unwrap();
+        assert!(
+            std::fs::metadata(join(&[&ws.path, "created.txt"])).is_ok(),
+            "after_create did not run on new workspace"
+        );
+        // Remove the marker, recreate (reuse) — hook must NOT run again.
+        std::fs::remove_file(join(&[&ws.path, "created.txt"])).unwrap();
+        m.create_for_issue("", "MT-2").await.unwrap();
+        assert!(
+            matches!(std::fs::metadata(join(&[&ws.path, "created.txt"])), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "after_create must not run on reuse"
+        );
+    }
+
+    // Mirror of TestCreateForIssueAfterCreateFailureRemovesPartialDir.
+    #[tokio::test]
+    async fn create_for_issue_after_create_failure_removes_partial_dir() {
+        let (m, root) = repo_test_manager(scripts("exit 1", "", "", ""));
+        let err = m.create_for_issue("", "MT-3").await.unwrap_err();
+        assert!(
+            matches!(err, Error::HookFailed(_)),
+            "got {err}, want HookFailed"
+        );
+        assert!(
+            matches!(std::fs::metadata(join(&[&root.path, "MT-3"])), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "partial workspace dir should be removed after after_create failure"
+        );
+    }
+
+    // Mirror of TestCreateForIssueNonDirectoryCollision.
+    #[tokio::test]
+    async fn create_for_issue_non_directory_collision() {
+        let (m, root) = repo_test_manager(HookScripts::default());
+        // Pre-create a FILE where the workspace dir would go.
+        std::fs::write(join(&[&root.path, "MT-4"]), b"x").unwrap();
+        let err = m.create_for_issue("", "MT-4").await.unwrap_err();
+        assert!(
+            matches!(err, Error::WorkspaceNotDir(_)),
+            "got {err}, want WorkspaceNotDir"
+        );
+    }
+
+    // Mirror of TestCreateForIssueRejectsSymlinkOutsideRoot.
+    #[tokio::test]
+    async fn create_for_issue_rejects_symlink_outside_root() {
+        let (m, root) = repo_test_manager(HookScripts::default());
+        // Plant a symlink at <root>/<key> pointing outside root: lexical containment passes, but
+        // reusing it would put the agent cwd at the target — an escape.
+        let outside = TempDir::new();
+        let link = join(&[&root.path, "MT-SYM"]);
+        std::os::unix::fs::symlink(&outside.path, &link).unwrap();
+        let err = m.create_for_issue("", "MT-SYM").await.unwrap_err();
+        assert!(
+            matches!(err, Error::WorkspaceSymlink(_)),
+            "got {err}, want WorkspaceSymlink for symlink workspace path"
+        );
+        // The symlink must not have been followed/reused: the target dir stays empty.
+        assert_eq!(
+            std::fs::read_dir(&outside.path).unwrap().count(),
+            0,
+            "symlink target was written into"
+        );
+    }
+
+    // Mirror of TestBeforeRunReturnsHookErrorFatal.
+    #[tokio::test]
+    async fn before_run_returns_hook_error_fatal() {
+        let (m, _root) = repo_test_manager(scripts("", "exit 2", "", ""));
+        let ws = m.create_for_issue("", "MT-5").await.unwrap();
+        let err = m.before_run(&ws, "", "", "MT-5").await.unwrap_err();
+        assert!(
+            matches!(err, Error::HookFailed(_)),
+            "before_run failure must be returned, got {err}"
+        );
+    }
+
+    // Mirror of TestBeforeRunRunsInWorkspace.
+    #[tokio::test]
+    async fn before_run_runs_in_workspace() {
+        let (m, _root) = repo_test_manager(scripts("", "echo ran > before.txt", "", ""));
+        let ws = m.create_for_issue("", "MT-6").await.unwrap();
+        m.before_run(&ws, "", "", "MT-6").await.unwrap();
+        assert!(
+            std::fs::metadata(join(&[&ws.path, "before.txt"])).is_ok(),
+            "before_run did not run"
+        );
+    }
+
+    // Mirror of TestAfterRunRunsAndSurfacesError: AfterRun surfaces the error (caller logs+ignores).
+    #[tokio::test]
+    async fn after_run_runs_and_surfaces_error() {
+        let (m, _root) = repo_test_manager(scripts("", "", "exit 1", ""));
+        let ws = m.create_for_issue("", "MT-7").await.unwrap();
+        let err = m.after_run(&ws, "", "", "MT-7").await.unwrap_err();
+        assert!(
+            matches!(err, Error::HookFailed(_)),
+            "after_run should surface the error, got {err}"
+        );
+    }
+
+    // Mirror of TestBeforeRunSeesSymphonyEnv: before_run receives SYMPHONY_REPO/PROJECT/ISSUE.
+    #[tokio::test]
+    async fn before_run_sees_symphony_env() {
+        let (m, _root) = repo_test_manager(scripts(
+            "",
+            r#"printf 'repo=%s project=%s issue=%s' "$SYMPHONY_REPO" "$SYMPHONY_PROJECT" "$SYMPHONY_ISSUE" > before_env.txt"#,
+            "",
+            "",
+        ));
+        let ws = m.create_for_issue("", "MT-8").await.unwrap();
+        m.before_run(&ws, "git@github.com:o/r.git", "proj-z", "MT-8")
+            .await
+            .unwrap();
+        let got = std::fs::read_to_string(join(&[&ws.path, "before_env.txt"])).unwrap();
+        assert_eq!(got, "repo=git@github.com:o/r.git project=proj-z issue=MT-8");
+    }
+
+    // Mirror of TestRemoveRunsBeforeRemoveThenDeletes: before_remove writes a marker OUTSIDE the
+    // workspace (so we can see it ran even after the dir is deleted). Built manually because the
+    // marker path must be known before the Manager is constructed.
+    #[tokio::test]
+    async fn remove_runs_before_remove_then_deletes() {
+        let root = TempDir::new();
+        let marker = join(&[&root.path, "removed.flag"]);
+        let m = Manager::new(Config {
+            root: root.path.clone(),
+            hooks: scripts("", "", "", &format!("echo 1 > {marker}")),
+            hook_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let ws = m.create_for_issue("", "MT-8").await.unwrap();
+        m.remove("", "MT-8").await.unwrap();
+        assert!(
+            matches!(std::fs::metadata(&ws.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "workspace should be deleted"
+        );
+        assert!(
+            std::fs::metadata(&marker).is_ok(),
+            "before_remove should have run"
+        );
+    }
+
+    // Mirror of TestRemoveBeforeRemoveFailureStillDeletes.
+    #[tokio::test]
+    async fn remove_before_remove_failure_still_deletes() {
+        let (m, root) = repo_test_manager(scripts("", "", "", "exit 1"));
+        m.create_for_issue("", "MT-9").await.unwrap();
+        m.remove("", "MT-9")
+            .await
+            .expect("Remove should ignore before_remove failure");
+        assert!(
+            matches!(std::fs::metadata(join(&[&root.path, "MT-9"])), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "workspace should be deleted despite before_remove failure"
+        );
+    }
+
+    // Mirror of TestRemoveRejectsSymlinkAndSkipsBeforeRemove.
+    #[tokio::test]
+    async fn remove_rejects_symlink_and_skips_before_remove() {
+        let root = TempDir::new();
+        let marker = join(&[&root.path, "before_remove_ran.flag"]);
+        let m = Manager::new(Config {
+            root: root.path.clone(),
+            hooks: scripts("", "", "", &format!("echo 1 > {marker}")),
+            hook_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let outside = TempDir::new();
+        let link = join(&[&root.path, "MT-SYM-RM"]);
+        std::os::unix::fs::symlink(&outside.path, &link).unwrap();
+
+        let err = m.remove("", "MT-SYM-RM").await.unwrap_err();
+        assert!(
+            matches!(err, Error::WorkspaceSymlink(_)),
+            "got {err}, want WorkspaceSymlink for symlink workspace path"
+        );
+        // before_remove must NOT have run (no marker), and the symlink target stays untouched.
+        assert!(
+            matches!(std::fs::metadata(&marker), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "before_remove must not run when the workspace path is a symlink"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside.path).unwrap().count(),
+            0,
+            "symlink target was written into"
+        );
+    }
+
+    // Mirror of TestRemoveMissingWorkspaceIsNoError.
+    #[tokio::test]
+    async fn remove_missing_workspace_is_no_error() {
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        m.remove("", "never-existed")
+            .await
+            .expect("removing a missing workspace should be a no-op");
+    }
+
+    // Mirror of TestRemoveFailureWrapsErrWorkspaceRemove: drop write+exec on the workspace dir so
+    // RemoveAll cannot unlink the child entry and fails inside it.
+    #[tokio::test]
+    async fn remove_failure_wraps_err_workspace_remove() {
+        // SAFETY: geteuid() takes no arguments and has no preconditions; it is `unsafe` only as an
+        // FFI import. Skip when root, where permission bits cannot block RemoveAll.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (m, root) = repo_test_manager(HookScripts::default());
+        let ws = m.create_for_issue("", "MT-10").await.unwrap();
+        std::fs::write(join(&[&ws.path, "child"]), b"x").unwrap();
+        std::fs::set_permissions(&ws.path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Restore perms so TempDir cleanup can succeed regardless of the outcome.
+        struct Restore(String);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Restore(join(&[&root.path, "MT-10"]));
+
+        let err = m.remove("", "MT-10").await.unwrap_err();
+        assert!(
+            matches!(err, Error::WorkspaceRemove(_)),
+            "got {err}, want WorkspaceRemove"
+        );
     }
 }
