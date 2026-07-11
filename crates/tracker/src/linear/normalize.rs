@@ -242,8 +242,9 @@ impl Client {
 }
 
 /// Parses an ISO-8601 (RFC3339) timestamp; nil/empty/unparseable → `None` (normalize.go's
-/// `parseTime`). The result is normalized to UTC, mirroring Go's `t.UTC()`.
-fn parse_time(s: Option<&str>) -> Option<DateTime<Utc>> {
+/// `parseTime`). The result is normalized to UTC, mirroring Go's `t.UTC()`. Shared with the sibling
+/// `claim` module, which parses each comment's `createdAt` into a [`core::Comment`](rhapsody_core::Comment).
+pub(in crate::linear) fn parse_time(s: Option<&str>) -> Option<DateTime<Utc>> {
     let s = s?;
     if s.is_empty() {
         return None;

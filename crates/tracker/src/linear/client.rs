@@ -11,6 +11,7 @@ use crate::TrackerError;
 use regex::Regex;
 use rhapsody_core::Viewer;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 use tracing::{Instrument, Span};
@@ -69,6 +70,15 @@ pub struct Client {
     /// empty means unresolved. Same async-mutex rationale as [`viewer`](Self::viewer). Read/written
     /// by `resolve_milestone_id` in the sibling `candidates` module.
     pub(in crate::linear) milestone_id: tokio::sync::Mutex<String>,
+    /// Memoizes resolved workflow-state UUIDs by `"<teamID>\0<normalized name>"` (move.go's
+    /// `stateIDCache` guarded by `stateIDMu`), so a repeat move to the same (team, state) issues no
+    /// second `workflowStates` query. Unlike Go's single-flight viewer/milestone caches, the lock is
+    /// released across the resolution query (never held over `do_graphql`) — the faithful mirror of
+    /// move.go's lock/check/unlock → query → lock/insert/unlock. A not-found result is never cached,
+    /// so a later-created/renamed state resolves on a subsequent move. Written by `resolve_state_id`
+    /// in the sibling `move_state` module. Only the name-based resolution is cached; the type-based
+    /// one (`MoveIssueToType`) is not (cheap, rare).
+    pub(in crate::linear) state_id_cache: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 /// Builds a linear [`Client`] from its [`Config`], applying Go `New`'s defaults (30s timeout,
@@ -91,6 +101,7 @@ pub fn new(config: Config) -> Client {
         page_size: DEFAULT_PAGE_SIZE,
         viewer: tokio::sync::Mutex::new(None),
         milestone_id: tokio::sync::Mutex::new(String::new()),
+        state_id_cache: tokio::sync::Mutex::new(HashMap::new()),
     }
 }
 
@@ -109,15 +120,6 @@ impl Client {
     /// issues instead of assignee == viewer. Every other query stays assignee-keyed. INF-477.
     pub(in crate::linear) fn pool_mode(&self) -> bool {
         self.config.claim_mode == "pool"
-    }
-
-    /// Reports "not yet implemented" for the Tracker methods whose bodies land in P3 T5. Mirror
-    /// of the T1 skeleton's placeholder; each method's real body replaces this call.
-    pub(crate) fn not_implemented(&self) -> TrackerError {
-        TrackerError::Other(format!(
-            "linear adapter (endpoint {:?}) not yet implemented — ported by P3 Tasks T4–T5",
-            self.config.endpoint
-        ))
     }
 
     /// Executes one GraphQL operation and decodes `response.data` into `T` (client.go's

@@ -49,8 +49,19 @@ pub(super) struct IssuesConnection {
 pub(super) struct PageInfo {
     #[serde(rename = "hasNextPage")]
     pub has_next_page: bool,
-    #[serde(rename = "endCursor")]
+    /// The end cursor, or `""` when absent OR explicitly `null`. Linear (and the R3 `linear-stub`)
+    /// returns `endCursor: null` on a final/empty page; Go's `encoding/json` decodes a JSON null
+    /// into a `string` field as the zero value `""`, so [`null_to_empty`] reproduces that (a plain
+    /// `String` field would reject the null, diverging from the Go adapter — surfaced by T5's stub
+    /// gate). `has_next_page` gates its use, so a "" end cursor is only ever read on the last page.
+    #[serde(rename = "endCursor", deserialize_with = "null_to_empty")]
     pub end_cursor: String,
+}
+
+/// Deserializes a possibly-`null` GraphQL string into a `String` (null → `""`), the mirror of Go's
+/// `encoding/json` decoding a JSON null into a `string` field as the zero value.
+fn null_to_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// The `projectMilestones` connection shape returned by [`query::QUERY_PROJECT_MILESTONES`].

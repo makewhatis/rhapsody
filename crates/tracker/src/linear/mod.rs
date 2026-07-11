@@ -2,16 +2,19 @@
 //!
 //! P3 T3 ships the foundation ported from `{client,query,errors,tracing,normalize}.go`: the
 //! GraphQL transport ([`client`]), the byte-identical query builder ([`query`]), the typed error
-//! sentinels ([`errors`]), and issue normalization ([`normalize`]). The read (T4) and write (T5)
-//! paths fill in the per-operation [`Tracker`](crate::Tracker) methods, which until then report a
-//! not-yet-implemented [`TrackerError`].
+//! sentinels ([`errors`]), and issue normalization ([`normalize`]). T4 fills in the read path
+//! (candidates, by-states, by-ids, blocked-backlog + branch, projects) and T5 the write path
+//! (state moves in [`move_state`], the pool-mode claim assign/comment surface in [`claim`]) — every
+//! [`Tracker`](crate::Tracker) method now has a real body.
 
 mod backlog;
 mod by_ids;
 mod by_states;
 mod candidates;
+mod claim;
 mod client;
 mod errors;
+mod move_state;
 mod normalize;
 mod projects;
 pub mod query;
@@ -61,19 +64,19 @@ impl crate::Tracker for Client {
     }
     async fn move_issue_state(
         &self,
-        _issue_id: &str,
-        _team_id: &str,
-        _state_name: &str,
+        issue_id: &str,
+        team_id: &str,
+        state_name: &str,
     ) -> Result<(), TrackerError> {
-        Err(self.not_implemented())
+        move_state::move_issue_state(self, issue_id, team_id, state_name).await
     }
     async fn move_issue_to_type(
         &self,
-        _issue_id: &str,
-        _team_id: &str,
-        _state_type: &str,
+        issue_id: &str,
+        team_id: &str,
+        state_type: &str,
     ) -> Result<String, TrackerError> {
-        Err(self.not_implemented())
+        move_state::move_issue_to_type(self, issue_id, team_id, state_type).await
     }
     async fn resolve_viewer(&self) -> Result<Viewer, TrackerError> {
         client::resolve_viewer(self).await
@@ -81,20 +84,20 @@ impl crate::Tracker for Client {
     async fn list_projects(&self) -> Result<Vec<Project>, TrackerError> {
         projects::list_projects(self).await
     }
-    async fn assign_issue(&self, _issue_id: &str, _assignee_id: &str) -> Result<(), TrackerError> {
-        Err(self.not_implemented())
+    async fn assign_issue(&self, issue_id: &str, assignee_id: &str) -> Result<(), TrackerError> {
+        claim::assign_issue(self, issue_id, assignee_id).await
     }
-    async fn fetch_issue_assignee(&self, _issue_id: &str) -> Result<String, TrackerError> {
-        Err(self.not_implemented())
+    async fn fetch_issue_assignee(&self, issue_id: &str) -> Result<String, TrackerError> {
+        claim::fetch_issue_assignee(self, issue_id).await
     }
-    async fn create_comment(&self, _issue_id: &str, _body: &str) -> Result<String, TrackerError> {
-        Err(self.not_implemented())
+    async fn create_comment(&self, issue_id: &str, body: &str) -> Result<String, TrackerError> {
+        claim::create_comment(self, issue_id, body).await
     }
-    async fn list_comments(&self, _issue_id: &str) -> Result<Vec<Comment>, TrackerError> {
-        Err(self.not_implemented())
+    async fn list_comments(&self, issue_id: &str) -> Result<Vec<Comment>, TrackerError> {
+        claim::list_comments(self, issue_id).await
     }
-    async fn delete_comment(&self, _comment_id: &str) -> Result<(), TrackerError> {
-        Err(self.not_implemented())
+    async fn delete_comment(&self, comment_id: &str) -> Result<(), TrackerError> {
+        claim::delete_comment(self, comment_id).await
     }
 }
 
