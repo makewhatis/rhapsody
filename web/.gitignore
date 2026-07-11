@@ -1,0 +1,10 @@
+node_modules
+dist
+# Wails generates JS/TS bridge bindings into the frontend dir on `wails build`; the app
+# calls window.go.* directly via src/lib/bindings.ts, so the generated set is not committed.
+wailsjs
+*.local
+.vite
+*.tsbuildinfo
+vite.config.d.ts
+vitest.config.d.ts

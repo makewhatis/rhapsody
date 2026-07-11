@@ -1,0 +1,280 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   Symphony — dark-emerald design system foundation (INF-225)
+
+   Ported detail-for-detail from the Claude Design package
+   (`Symphony Settings.html :root` + global CSS). This is the canonical token
+   set for the whole-app re-skin: the package's raw tokens (`--bg-*`, `--em*`,
+   `--tx*`, status, lines, focus, radii, shadows, density) live on :root, and
+   the existing shadcn semantic tokens (`--background`, `--card`, `--primary`,
+   `--ring`, ...) are RE-POINTED at those package values so Tailwind utilities
+   (`bg-card`, `text-foreground`, `ring`, ...) resolve to the package colors.
+
+   Dark-only, emerald accent, no light mode. Tailwind v4 CSS-first — no
+   tailwind.config.js. Fonts are self-hosted (offline desktop app, no CDN).
+   ============================================================================ */
+
+/* ---- self-hosted Geist + Geist Mono (variable, weights 100–900) ---- */
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/Geist-Variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/GeistMono-Variable.woff2") format("woff2");
+}
+
+/* ---- Tailwind v4 theme mapping: semantic utilities -> CSS variables ---- */
+@theme inline {
+  --font-sans: "Geist", -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --font-mono: "Geist Mono", "SF Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  /* ---- surfaces (near-black slate, faint green tint) ---- */
+  --bg-window: #060807;
+  --bg-app: #0a0d0c;
+  --bg-titlebar: #0d100f;
+  --bg-card: #101513;
+  --bg-card-2: #0d1110;
+  --bg-input: #0c0f0e;
+  --bg-raised: #161b19;
+  --bg-hover: #151a18;
+  --bg-active: #1c2320;
+
+  /* ---- text ---- */
+  --tx: #e9ede9;
+  --tx-2: #98a39c;
+  --tx-3: #6a736d;
+  --tx-faint: #4b524d;
+
+  /* ---- emerald accent ---- */
+  --em: #10b981;
+  --em-bright: #34d399;
+  --em-dim: #0e8c63;
+  --em-glow: rgba(16, 185, 129, 0.16);
+  --em-soft: rgba(16, 185, 129, 0.1);
+  --on-em: #04140d;
+
+  /* ---- status ---- */
+  --sky: #38bdf8;
+  --violet: #a78bfa;
+  --amber: #f5b544;
+  --rose: #f4708a;
+  --red: #ef5350;
+  --amber-soft: rgba(245, 181, 68, 0.13);
+  --red-soft: rgba(239, 83, 80, 0.13);
+  --sky-soft: rgba(56, 189, 248, 0.13);
+
+  /* ---- lines / elevation ---- */
+  --line: rgba(255, 255, 255, 0.07);
+  --line-2: rgba(255, 255, 255, 0.04);
+  --line-strong: rgba(255, 255, 255, 0.12);
+  --focus: rgba(16, 185, 129, 0.55);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-pop: 0 18px 48px -12px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --shadow-sheet: -24px 0 60px -20px rgba(0, 0, 0, 0.7);
+
+  /* ---- shape ---- */
+  --r-window: 11px;
+  --r-card: 14px;
+  --r-ctrl: 9px;
+  --r-pill: 999px;
+
+  /* ---- density (comfortable defaults; [data-density="dense"] overrides) ---- */
+  --gut: 28px;
+  --row-h: 38px;
+
+  /* ---- shadcn semantic layer, re-pointed onto the package palette ---- */
+  --radius: 0.625rem;
+  --background: var(--bg-app);
+  --foreground: var(--tx);
+  --card: var(--bg-card);
+  --card-foreground: var(--tx);
+  --popover: var(--bg-raised);
+  --popover-foreground: var(--tx);
+  --primary: var(--em-bright);
+  --primary-foreground: var(--on-em);
+  --secondary: var(--bg-raised);
+  --secondary-foreground: var(--tx);
+  --muted: var(--bg-card-2);
+  --muted-foreground: var(--tx-2);
+  --accent: var(--bg-hover);
+  --accent-foreground: var(--tx);
+  --destructive: var(--red);
+  --destructive-foreground: #ffffff;
+  --border: var(--line);
+  --input: var(--line);
+  --ring: var(--focus);
+  --chart-1: var(--em-bright);
+  --chart-2: var(--sky);
+  --chart-3: var(--em);
+  --chart-4: var(--amber);
+  --chart-5: var(--violet);
+}
+
+[data-density="dense"] {
+  --gut: 20px;
+  --row-h: 34px;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html {
+    font-family: var(--font-sans);
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* Emerald focus ring on any native control that gains keyboard focus. The design-system
+     primitives (TextInput, Select, …) layer their own ring inline; this covers bare/native
+     controls so they keep a visible focus indicator (the package's 0 0 0 3px --focus ring)
+     instead of just losing the default outline. */
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus);
+  }
+}
+
+/* ---- mono treatment (Geist Mono + ss01 alt glyphs) ---- */
+.mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "ss01";
+}
+
+/* ---- custom 11px webkit scrollbars (match package) ---- */
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+  background-clip: padding-box;
+}
+
+::selection {
+  background: rgba(16, 185, 129, 0.28);
+}
+
+/* ---- keyframes (the 8 package animations) ---- */
+@keyframes pulseDot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--pulse-color, var(--em-glow));
+  }
+  60% {
+    box-shadow: 0 0 0 5px transparent;
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes shimmer {
+  0% {
+    background-position: -340px 0;
+  }
+  100% {
+    background-position: 340px 0;
+  }
+}
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes sheetIn {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes overlayIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes toastIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
