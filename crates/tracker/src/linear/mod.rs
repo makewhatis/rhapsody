@@ -6,10 +6,17 @@
 //! paths fill in the per-operation [`Tracker`](crate::Tracker) methods, which until then report a
 //! not-yet-implemented [`TrackerError`].
 
+mod backlog;
+mod by_ids;
+mod by_states;
+mod candidates;
 mod client;
 mod errors;
 mod normalize;
+mod projects;
 pub mod query;
+#[cfg(test)]
+mod testutil;
 
 pub use client::{Client, Config, new};
 pub use errors::{LinearError, LinearErrorKind};
@@ -28,26 +35,29 @@ use rhapsody_core::{Comment, Issue, Project, Viewer};
 #[macro_export]
 macro_rules! tracker_span {
     ($op:literal) => {
-        ::tracing::info_span!(concat!("symphony.tracker.", $op))
+        ::tracing::info_span!(
+            concat!("symphony.tracker.", $op),
+            error = ::tracing::field::Empty
+        )
     };
 }
 
 #[async_trait]
 impl crate::Tracker for Client {
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
-        Err(self.not_implemented())
+        candidates::fetch_candidate_issues(self).await
     }
-    async fn fetch_issues_by_states(&self, _states: &[String]) -> Result<Vec<Issue>, TrackerError> {
-        Err(self.not_implemented())
+    async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError> {
+        by_states::fetch_issues_by_states(self, states).await
     }
-    async fn fetch_issue_states_by_ids(&self, _ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
-        Err(self.not_implemented())
+    async fn fetch_issue_states_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
+        by_ids::fetch_issue_states_by_ids(self, ids).await
     }
     async fn fetch_blocked_backlog_issues(&self) -> Result<Vec<Issue>, TrackerError> {
-        Err(self.not_implemented())
+        backlog::fetch_blocked_backlog_issues(self).await
     }
-    async fn fetch_issue_branch_by_id(&self, _id: &str) -> Result<(String, i64), TrackerError> {
-        Err(self.not_implemented())
+    async fn fetch_issue_branch_by_id(&self, id: &str) -> Result<(String, i64), TrackerError> {
+        backlog::fetch_issue_branch_by_id(self, id).await
     }
     async fn move_issue_state(
         &self,
@@ -66,10 +76,10 @@ impl crate::Tracker for Client {
         Err(self.not_implemented())
     }
     async fn resolve_viewer(&self) -> Result<Viewer, TrackerError> {
-        Err(self.not_implemented())
+        client::resolve_viewer(self).await
     }
     async fn list_projects(&self) -> Result<Vec<Project>, TrackerError> {
-        Err(self.not_implemented())
+        projects::list_projects(self).await
     }
     async fn assign_issue(&self, _issue_id: &str, _assignee_id: &str) -> Result<(), TrackerError> {
         Err(self.not_implemented())

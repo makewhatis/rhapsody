@@ -13,14 +13,15 @@ use rhapsody_core::{BlockerRef, Issue, LinkedPRRef, normalize_state};
 use serde::Deserialize;
 use std::sync::LazyLock;
 
-// GitHub-PR url matchers (normalize.go's `prURLRe` / `prParseRe`). Compiled once; `None` only if
-// the constant pattern failed to compile (impossible), in which case PR detection degrades to
-// "no PR" rather than panicking — the same no-`MustCompile` decision as `core::compile_summon_re`.
-// (normalize.go's `prNumberRe` + `prNumberFromAttachments` are consumed only by
-// FetchIssueBranchByID, so they land with it in P3 T4.)
+// GitHub-PR url matchers (normalize.go's `prURLRe` / `prParseRe` / `prNumberRe`). Compiled once;
+// `None` only if the constant pattern failed to compile (impossible), in which case PR detection
+// degrades to "no PR" rather than panicking — the same no-`MustCompile` decision as
+// `core::compile_summon_re`. `PR_NUMBER_RE` + `pr_number_from_attachments` back the graphite
+// stacking hint (FetchIssueBranchByID, P3 T4).
 static PR_URL_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"/pull/[0-9]+").ok());
 static PR_PARSE_RE: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)").ok());
+static PR_NUMBER_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"/pull/([0-9]+)").ok());
 
 /// One `{ name }` GraphQL node (an issue/relation state, or a label).
 #[derive(Debug, Default, Deserialize)]
@@ -131,6 +132,15 @@ pub struct RawIssue {
     inverse_relations: RawNodes<RawRelation>,
     attachments: RawNodes<RawAttachment>,
     comments: RawNodes<RawComment>,
+}
+
+impl RawIssue {
+    /// The issue's Linear `gitBranchName`, or `None` when unset — the `n.BranchName` access in
+    /// FetchIssueBranchByID. Exposed for the sibling `backlog` module because `RawIssue`'s fields
+    /// are private to this module.
+    pub(in crate::linear) fn git_branch_name(&self) -> Option<&str> {
+        self.branch_name.as_deref()
+    }
 }
 
 impl Client {
@@ -274,6 +284,25 @@ fn pr_activity_at(updated_at: &str, merged_at: &str, created_at: &str) -> Option
     parse_time(Some(updated_at))
         .or_else(|| parse_time(Some(merged_at)))
         .or_else(|| parse_time(Some(created_at)))
+}
+
+/// Returns the PR number of the first linked GitHub PR attachment on `r`, or 0 when none parses
+/// (normalize.go's `prNumberFromAttachments`). Best-effort: the number is decorative graphite
+/// stacking context, never load-bearing (FetchIssueBranchByID). INF-318.
+pub(super) fn pr_number_from_attachments(r: &RawIssue) -> i64 {
+    for a in &r.attachments.nodes {
+        if !is_github_pr(&a.source_type, &a.metadata.url) {
+            continue;
+        }
+        if let Some(re) = PR_NUMBER_RE.as_ref()
+            && let Some(caps) = re.captures(&a.metadata.url)
+            && let Some(m) = caps.get(1)
+            && let Ok(n) = m.as_str().parse::<i64>()
+        {
+            return n;
+        }
+    }
+    0
 }
 
 #[cfg(test)]

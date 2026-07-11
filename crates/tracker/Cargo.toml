@@ -35,6 +35,13 @@ regex = "1"
 # OpenTelemetry directly; the idiomatic Rust mirror is the `tracing` facade (anticipated by the
 # P3 plan, T3). P3 T3.
 tracing = "0.1"
+# tokio (sync only): the linear adapter caches the resolved viewer + milestone id behind a mutex
+# held ACROSS the GraphQL await (single-flight resolution, mirroring Go holding `viewerMu` /
+# `milestoneMu` across the network call). `std::sync::Mutex` cannot: its guard is `!Send`, so it
+# cannot cross the `.await` in a `Send` async-trait future, and clippy denies await-holding-lock.
+# `tokio::sync::Mutex` is built for exactly this. tokio was anticipated as a tracker dependency by
+# the P3 plan (T1); only the `sync` feature is needed here (the runtime stays test-only). P3 T4.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 # tokio (test-only): a current-thread runtime for `#[tokio::test]`, which drives the async
