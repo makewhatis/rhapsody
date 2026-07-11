@@ -4,32 +4,36 @@ on:
   push:
     branches: [main]
 
+# Self-hosted runner (davds-macbook-pro-rhapsody): repo-scoped, like the tally/booch runners.
+# rustup lives in ~/.cargo/bin which is not in the runner's seeded PATH — each rust job adds it.
 jobs:
   lint:
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show   # installs the toolchain pinned by rust-toolchain.toml
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: .github/check-forbidden-tokens.sh   # TRA-221 brand-token guard
 
   test:
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show
       - run: cargo test --workspace
 
   web:
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+          # No `cache: npm` on the self-hosted runner: the machine's npm cache is already
+          # local + persistent, and the post-job step would upload ~1GB to GitHub per run.
       - run: npm ci
         working-directory: web
       - run: npm test
