@@ -5,5 +5,11 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[dev-dependencies]
+harness-fixtures = { path = "../harness-fixtures" }
+
 [lints]
 workspace = true
