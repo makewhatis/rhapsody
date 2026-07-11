@@ -14,18 +14,36 @@ rhapsody-core = { path = "../core" }
 async-trait = "0.1"
 # chrono: the fake stamps created claim comments with a clock defaulting to `Utc::now()` — the
 # Rust mirror of Go's `time.Now()` — and stores them as `core::Comment.created_at`. The `serde`
-# feature (de)serializes the file adapter's RFC3339 timestamps (schema `DateTime<FixedOffset>`).
+# feature (de)serializes the file adapter's RFC3339 timestamps (schema `DateTime<FixedOffset>`, T2);
+# the linear adapter's normalize also parses Linear's RFC3339 timestamps into `DateTime<Utc>` (T3).
 chrono = { version = "0.4", features = ["clock", "serde"] }
-# serde + serde_json: the file adapter is JSON-backed — it parses and atomically rewrites its
-# source file (the Rust equivalent of Go `internal/tracker/file`'s `encoding/json`). Same versions
-# as core/config; the P3 plan (T3) also lists `serde_json` for this crate.
+# reqwest: the Linear adapter's GraphQL transport (`doGraphQL`) — the Rust mirror of Go's
+# `net/http` client (client.go). default-tls (native-tls) is used rather than rustls: CI and dev
+# are macOS, where native-tls is Security.framework (no OpenSSL/cmake build step). Default
+# features are off — only the async client + TLS are needed (no blocking client, gzip, or json
+# body helper; the request body is built with serde_json to mirror Go's `json.Marshal`). P3 T3.
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+# serde + serde_json: the file adapter (T2) is JSON-backed — it parses and atomically rewrites its
+# source file; the linear adapter (T3) derives Deserialize on `rawIssue` and marshals the request
+# body + decodes the GraphQL envelope. Both mirror Go's `encoding/json`; same versions as core/config.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# regex: normalize.go's GitHub-PR url matchers (`prURLRe`, `prParseRe`) — mirrored as compiled
+# patterns; the summon matcher is reused from `rhapsody-core`. P3 T3.
+regex = "1"
+# tracing: the per-operation `symphony.tracker.<op>` spans (tracing.go). The Go adapter uses
+# OpenTelemetry directly; the idiomatic Rust mirror is the `tracing` facade (anticipated by the
+# P3 plan, T3). P3 T3.
+tracing = "0.1"
 
 [dev-dependencies]
 # tokio (test-only): a current-thread runtime for `#[tokio::test]`, which drives the async
-# Tracker methods the fake tests exercise.
-tokio = { version = "1", features = ["macros", "rt"] }
+# Tracker methods the fake tests exercise. `net` + `io-util` back the hand-rolled loopback HTTP
+# server the transport tests use in place of Go's `net/http/httptest` (P3 T3).
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util"] }
+# tracing-subscriber (test-only): a recording span layer for the tracing test — the Rust analogue
+# of Go's `go.opentelemetry.io/otel/sdk/trace/tracetest.SpanRecorder` (tracing_test.go). P3 T3.
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

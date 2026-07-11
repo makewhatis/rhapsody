@@ -25,15 +25,15 @@ use std::any::Any;
 /// `ErrLinearStateNotFound`); following `rhapsody-store`'s dependency-free style, Rhapsody makes
 /// the failure an explicit value type instead of pulling in a derive crate.
 ///
-/// T1 needs only the opaque [`TrackerError::Other`] carrier (used by the fake's error injection
-/// and the adapter skeletons); the linear adapter's structured sentinels are added alongside it
-/// by the later P3 tasks that introduce them — T2 adds the first, [`TrackerError::StateNotFound`],
-/// which the file tracker's `move_issue_to_type` returns; T3–T5 add the remaining linear sentinels.
+/// Beyond the opaque [`TrackerError::Other`] carrier: [`TrackerError::StateNotFound`] is the shared
+/// by-type-move sentinel both adapters return (T2, the parity mirror of Go's
+/// `ErrLinearStateNotFound`), and [`TrackerError::Linear`] carries the linear adapter's remaining
+/// transport/GraphQL sentinels (T3–T5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackerError {
     /// A tracker operation failed with the given message. This is the parity mirror of Go's
     /// opaque `errors.New`/`fmt.Errorf` values: the [`fake::Fake`] surfaces a test-injected
-    /// failure through it, and the T1 adapter skeletons report "not yet implemented" through it
+    /// failure through it, and the adapter skeletons report "not yet implemented" through it
     /// until their P3 task fills the body in.
     Other(String),
 
@@ -44,6 +44,15 @@ pub enum TrackerError {
     /// missing, the linear adapter (T5) when the team has no state of that type. Carries the
     /// context string; the sentinel token is composed by [`Display`](std::fmt::Display).
     StateNotFound(String),
+
+    /// A typed Linear adapter error — the parity mirror of the REMAINING `linear/errors.go`
+    /// sentinels (transport, GraphQL, pagination, move-rejected, milestone, viewer). Carries a
+    /// [`LinearErrorKind`](linear::LinearErrorKind) category (matched with `matches!`, the way Go
+    /// callers use `errors.Is`) plus the wrapped `fmt.Errorf` detail; its `Display` reproduces the
+    /// Go error text. `ErrLinearStateNotFound` is the one exception — it is the shared
+    /// [`StateNotFound`](TrackerError::StateNotFound) variant above, not a `LinearErrorKind`.
+    /// Constructed by the linear adapter's transport + read/write paths (P3 T3–T5).
+    Linear(linear::LinearError),
 }
 
 impl std::fmt::Display for TrackerError {
@@ -51,11 +60,18 @@ impl std::fmt::Display for TrackerError {
         match self {
             TrackerError::Other(msg) => write!(f, "{msg}"),
             TrackerError::StateNotFound(msg) => write!(f, "linear_state_not_found: {msg}"),
+            TrackerError::Linear(err) => write!(f, "{err}"),
         }
     }
 }
 
 impl std::error::Error for TrackerError {}
+
+impl From<linear::LinearError> for TrackerError {
+    fn from(err: linear::LinearError) -> Self {
+        TrackerError::Linear(err)
+    }
+}
 
 /// Tracker is the issue-tracker contract used by the orchestrator (upstream §11.1).
 /// Implementations must return normalized [`Issue`](rhapsody_core::Issue) values.
