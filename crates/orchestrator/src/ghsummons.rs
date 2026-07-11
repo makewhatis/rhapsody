@@ -1,12 +1,21 @@
 //! ghsummons — orchestrator-internal port of Go `internal/ghsummons`.
 //!
-//! Go's package has no dedicated Rust crate, so it lives here. O1 ports only [`parse_repo`] (used
-//! by the effective builder to derive `owner`/`repo` from a project's git remote for the
-//! GitHub-summons feature's routing labels). The GitHub PR-comment `SummonSource` polling itself is
-//! the enrichment ticket's concern (O6) and is not ported here.
+//! Go's package has no dedicated Rust crate, so it lives here. O1 ported [`parse_repo`] (used by the
+//! effective builder to derive `owner`/`repo` from a project's git remote for the GitHub-summons
+//! feature's routing labels). O6 adds the [`SummonSource`] abstraction + its [`SummonHit`] result —
+//! the summons-enrichment source the poll path queries per repo ([`crate::ghenrich`]).
+//!
+//! Deviation: the concrete `gh`-exec [`SummonSource`] (Go `ghsummons.GH` / `NewGH` — two `gh api`
+//! calls per repo per tick) is NOT ported here. It is pure runtime infrastructure with no
+//! P5-orchestrator test (every P5 caller, incl. O7's `poll_all_projects`, uses a fake source), so it
+//! is deferred to the daemon-wiring phase that first constructs `o.gh_source`. This module ports the
+//! trait ([`SummonSource`]) + result type ([`SummonHit`]) the enrichment logic consumes.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use regex::Regex;
 
 /// Matches an ssh or https GitHub remote URL, capturing `owner` (group 1) and `repo` (group 2).
@@ -27,6 +36,31 @@ pub fn parse_repo(repo_url: &str) -> Option<(String, String)> {
     let re = REPO_RE.as_ref()?;
     let caps = re.captures(repo_url)?;
     Some((caps[1].to_string(), caps[2].to_string()))
+}
+
+/// The newest summons on a PR: the comment time and its body. The body rides along so a mid-run
+/// summons can be delivered to the live run's operator mailbox with the actual instruction, not just
+/// a timestamp (INF-448). Mirrors Go `ghsummons.SummonHit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummonHit {
+    pub at: DateTime<Utc>,
+    pub body: String,
+}
+
+/// The fallible result of a [`SummonSource`] query. The error is opaque (boxed) because the only
+/// caller ([`crate::ghenrich::fetch_github_summons`]) distinguishes ok-vs-error only — it logs the
+/// error and treats a failed fetch as "nothing to apply this tick" — mirroring Go's plain `error`
+/// return.
+pub type SummonResult = Result<HashMap<i64, SummonHit>, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Returns, per PR number, the newest summons (time + body) whose comment contains the summon token
+/// at/after `since`, across BOTH issue-comments and PR review comments for the repo. Mirrors Go
+/// `ghsummons.SummonSource` (`SummonsSince`). Object-safe (held as `dyn SummonSource` by the poll
+/// path's enrichment source), so it is declared via `async_trait`. The map key is the PR number
+/// (Go's `int` → the port's `i64`, matching [`rhapsody_core::LinkedPRRef::number`]).
+#[async_trait]
+pub trait SummonSource: Send + Sync {
+    async fn summons_since(&self, owner: &str, repo: &str, since: DateTime<Utc>) -> SummonResult;
 }
 
 #[cfg(test)]

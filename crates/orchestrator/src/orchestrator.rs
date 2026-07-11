@@ -301,6 +301,15 @@ pub struct Orchestrator {
     /// Count of history events shed because [`Orchestrator::store_events_tx`] was full when the control
     /// task tried to enqueue them (the enqueue never blocks the loop). Mirrors Go `dropped`.
     pub(crate) dropped: AtomicI64,
+
+    /// Per-run operator-message mailboxes (INF-250), keyed by opaque issue id (one live run per
+    /// issue). Created at dispatch ([`dispatch_issue`](Orchestrator::dispatch_issue)) and dropped at
+    /// run end ([`persist_end_run`](Orchestrator::persist_end_run)). Go carries the channel as a
+    /// `runningEntry` field; a Rust [`mpsc`](tokio::sync::mpsc) split cannot be a `Clone` entry field,
+    /// so the mailbox lives here as a side map (see [`crate::message`]). The [`Mutex`] keeps the
+    /// `Orchestrator` `Sync` for the off-loop HTTP path (a bare `mpsc::Receiver` is `!Sync`); it is
+    /// only touched on the control task. O7's real spawn takes each mailbox's receiver.
+    pub(crate) mailboxes: Mutex<HashMap<String, crate::message::Mailbox>>,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -364,6 +373,7 @@ impl Orchestrator {
             store_events_rx: Mutex::new(Some(store_events_rx)),
             writer_handle: None,
             dropped: AtomicI64::new(0),
+            mailboxes: Mutex::new(HashMap::new()),
         }
     }
 

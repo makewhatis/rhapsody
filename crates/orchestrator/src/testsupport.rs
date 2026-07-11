@@ -372,7 +372,7 @@ fn record_ids(sink: &DispatchedIds) -> crate::orchestrator::SpawnFn {
 }
 
 /// A spawn seam that records each dispatched running entry into `sink`.
-fn record_entries(sink: &DispatchedEntries) -> crate::orchestrator::SpawnFn {
+pub(crate) fn record_entries(sink: &DispatchedEntries) -> crate::orchestrator::SpawnFn {
     let sink = Arc::clone(sink);
     Box::new(move |_iss, _attempt, re| sink.lock().expect("dispatched lock").push(re.clone()))
 }

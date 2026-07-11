@@ -29,6 +29,12 @@ tracing = "0.1"
 # pattern. Already in the workspace tree (rhapsody-core / rhapsody-tracker depend on it), so no new
 # crate enters Cargo.lock.
 regex = "1"
+# async-trait: O6's `ghsummons::SummonSource` is an OBJECT-SAFE async trait (the orchestrator holds
+# it as `dyn SummonSource` for the GitHub-summons enrichment source, exactly as it holds `dyn
+# Tracker`). Rust's native `async fn` in traits is not dyn-compatible, so the object-safe form needs
+# async-trait — the same crate + same reason the `rhapsody-tracker` `Tracker` trait uses. Already in
+# Cargo.lock (a rhapsody-tracker dependency), so no new crate enters the tree.
+async-trait = "0.1"
 # tokio: O2's pool-mode claim protocol (`claim.rs`) is async — it drives the async `Tracker` trait
 # and waits out the jittered settle window (`tokio::time::sleep`, Go's `sleepCtx`). O3's worker
 # threads the operator-message receiver (Go's `messages <-chan string`) to `Session::run_turn`, which

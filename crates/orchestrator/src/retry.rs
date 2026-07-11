@@ -86,6 +86,10 @@ pub(crate) struct DispatchRoute {
     pub group: String,
     pub repo: String,
     pub model: String,
+    /// The owning project's `workspace_mode`, so a graphite auto-promote's stashed stacking hint is
+    /// rendered at dispatch with THIS project's provisioning shape (Go `rp.workspaceMode`; INF-318 /
+    /// INF-418). Empty for the legacy single-project path (dispatch falls back to the top-level mode).
+    pub workspace_mode: String,
 }
 
 /// The effective config a fired retry schedules against, snapshotted into owned values so no borrow
@@ -150,6 +154,7 @@ impl RetryConfig {
                 group: rp.group.clone(),
                 repo: rp.repo.clone(),
                 model: rp.model.clone(),
+                workspace_mode: rp.workspace_mode.clone(),
             }),
             rp_group: Some(rp.group.clone()),
         }
@@ -230,10 +235,26 @@ impl Orchestrator {
         route: Option<DispatchRoute>,
         stack_context: String,
     ) {
-        // INF-318: consuming the pending-stack hint (Go `o.pendingStack`) + rendering it via
-        // `stackContextHint` is the graphite auto-promote pass's job (O6) — the only producer of
-        // `pending_stack`, which is empty here — so an O5 retry always dispatches with the passed
-        // `stack_context` ("").
+        // A graphite auto-promote stashed a predecessor stacking hint for this issue's first dispatch
+        // (it moved the ticket Backlog→Todo and left the slot-accounted dispatch to the select path).
+        // Consume it when the caller didn't pass one explicitly, rendering the workspace_mode-aware
+        // recipe HERE with the DISPATCH-time effective mode (this project's when routed, else the
+        // top-level/legacy default), so a workspace_mode flip between promote and dispatch can never
+        // produce a recipe for the wrong provisioning shape (INF-318 / INF-418). A retry never hits
+        // this (its issue's hint was consumed at first dispatch, so `pending_stack` is empty for it).
+        let mut stack_context = stack_context;
+        if stack_context.is_empty()
+            && let Some(h) = self.pending_stack.remove(&iss.id)
+        {
+            let ws_mode = match &route {
+                Some(r) => r.workspace_mode.clone(),
+                None => self
+                    .eff
+                    .as_ref()
+                    .map_or_else(String::new, |e| e.workspace_mode.clone()),
+            };
+            stack_context = crate::promote::stack_context_hint(&h.branch, h.pr_number, &ws_mode);
+        }
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
         re.started_at = (self.now)();
@@ -263,6 +284,14 @@ impl Orchestrator {
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
         self.persist_start_run(&mut re, attempt_norm);
+        // Per-run operator-message mailbox (INF-250): buffered so a brief delivery lag doesn't reject
+        // an operator's message; a full mailbox (`OPERATOR_MAILBOX_CAP`) rejects backlog_full. Go
+        // carries this channel on the running entry; the Rust `mpsc` split makes it a side map keyed by
+        // issue id (`message.rs`). O7's real spawn takes its receiver; `persist_end_run` drops it.
+        self.mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), crate::message::Mailbox::new());
         // Hand the entry to the worker-spawn seam (Go `o.spawn(...)`) BEFORE moving it into `o.running`
         // — the borrow of `self.spawn` must not alias `self.running`. Behavior-identical: nothing
         // between insert and spawn reads `o.running` in the Rust port (Go's `metrics.SetRunning` is

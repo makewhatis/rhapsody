@@ -305,7 +305,11 @@ impl Orchestrator {
     }
 
     /// The ticket's latest transcript path, or `""` if logging is off. Mirrors Go `transcriptPath`.
-    fn transcript_path(&self, identifier: &str) -> String {
+    ///
+    /// `pub(crate)` because it is the shared per-issue transcript-path helper: the snapshot builder
+    /// here and the per-run `/log` renderer ([`crate::issuelog`], O6) both resolve a ticket's
+    /// `latest.jsonl` through it, exactly as Go's single `transcriptPath` serves both files.
+    pub(crate) fn transcript_path(&self, identifier: &str) -> String {
         match self.eff.as_ref() {
             Some(eff) if !eff.log_dir.is_empty() => eff.transcripts_latest(identifier),
             _ => String::new(),

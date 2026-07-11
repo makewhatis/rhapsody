@@ -197,6 +197,14 @@ impl Orchestrator {
     /// the UI/GET don't show them as forever-pending (INF-250) — this is the single end-of-run point
     /// every termination path flows through. Mirrors Go `persistEndRun`.
     pub fn persist_end_run(&self, re: &RunningEntry, outcome: &str, err_str: &str) {
+        // The per-run operator mailbox (INF-250) dies with the run — drop it at this single end-of-run
+        // chokepoint every termination path flows through, BEFORE the store-gated early return below
+        // (the mailbox is independent of the store). Mirrors Go's `runningEntry.mailbox` being GC'd
+        // once the entry leaves `o.running`.
+        self.mailboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&re.issue.id);
         if re.run_id == 0 {
             return;
         }
@@ -254,6 +262,41 @@ impl Orchestrator {
         }
         if let Err(e) = self.store.expire_run_messages(re.run_id) {
             tracing::error!(issue_identifier = %re.issue.identifier, error = %e, "persist run messages expired failed");
+        }
+    }
+
+    /// Inserts a new operator-message row (status "sent") with the operator's ORIGINAL text, returning
+    /// the row id (0 when persistence is disabled / `run_id == 0`). Best-effort: a failure is logged
+    /// and the admission still succeeds (the message is already on the mailbox). Mirrors Go
+    /// `persistRunMessage` (INF-250).
+    pub(crate) fn persist_run_message(&self, re: &RunningEntry, body: &str) -> i64 {
+        if re.run_id == 0 {
+            return 0;
+        }
+        match self
+            .store
+            .insert_run_message(re.run_id, body, (self.now)().timestamp_millis())
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(issue_identifier = %re.issue.identifier, error = %e, "persist run message failed");
+                0
+            }
+        }
+    }
+
+    /// Marks the OLDEST still-"sent" message for a run delivered with the turn it was folded into (FIFO
+    /// matches the mailbox order). Best-effort / no-op on `run_id == 0`. Mirrors Go
+    /// `persistRunMessageDelivered` (INF-250).
+    pub(crate) fn persist_run_message_delivered(&self, re: &RunningEntry, turn: i64) {
+        if re.run_id == 0 {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .mark_oldest_run_message_delivered(re.run_id, turn)
+        {
+            tracing::error!(issue_identifier = %re.issue.identifier, error = %e, "persist run message delivered failed");
         }
     }
 

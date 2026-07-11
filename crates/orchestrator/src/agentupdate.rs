@@ -39,20 +39,24 @@ impl Orchestrator {
     /// Folds one agent event into the running entry's live state and the aggregate token totals
     /// (upstream §13.5). A no-op for an unknown issue (already terminated). Mirrors Go `onAgentUpdate`.
     pub fn on_agent_update(&mut self, e: AgentUpdate) {
+        // Operator-message delivery (INF-250) is synthesized by the runner when a message is actually
+        // written to the live turn's stdin. Mark the oldest still-"sent" row delivered with its turn
+        // (FIFO matches mailbox order) and return: this synthetic event must NOT be folded into the
+        // agent's liveness/token/history state below (it carries no usage and is not a real agent
+        // step). Handled up front via a SHARED borrow of the live entry so the delivery mark can reach
+        // the store; an unknown issue is a no-op either way (Go's `!ok` guard precedes this). Mirrors
+        // Go `onAgentUpdate` → `persistRunMessageDelivered`.
+        if e.ev.event_type == agent::EVENT_OPERATOR_MESSAGE {
+            if let Some(re) = self.running.get(&e.issue_id) {
+                self.persist_run_message_delivered(re, e.ev.turn);
+            }
+            return;
+        }
         let now = (self.now)();
         let re = match self.running.get_mut(&e.issue_id) {
             Some(re) => re,
             None => return,
         };
-        // Operator-message delivery (INF-250) is synthesized by the runner when a message is actually
-        // written to the live turn's stdin. This synthetic event must NOT be folded into the agent's
-        // liveness/token/history state below (it carries no usage and is not a real agent step). Go
-        // marks the oldest still-"sent" row delivered and returns; that store-side delivery
-        // bookkeeping lands with O4 persistence / O6 operator messages, so O3 keeps only the early
-        // return that excludes it from the state folding.
-        if e.ev.event_type == agent::EVENT_OPERATOR_MESSAGE {
-            return;
-        }
         re.last_event = e.ev.event_type.clone();
         re.last_event_at = now;
         if !e.ev.message.is_empty() {
