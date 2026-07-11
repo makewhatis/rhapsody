@@ -5,5 +5,56 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+# axum: the loopback JSON API + embedded-dashboard server (Go `internal/httpapi` uses net/http +
+# ServeMux; the Rust port targets axum, the P6 plan's named server framework). Version 0.8 matches
+# the workspace's existing axum user (`harness/stubs/linear-stub`), so no new major enters Cargo.lock.
+axum = "0.8"
+# tokio: the async runtime the server binds/serves on. `net` for the loopback `TcpListener` (Go
+# `net.Listen("tcp", addr)`), `time` for the `/state` handler's snapshot deadline (Go's
+# `context.WithTimeout(r.Context(), snapshotTimeout)`). Already in Cargo.lock (axum/tracker/etc.).
+tokio = { version = "1", features = ["net", "time"] }
+# serde (derive): the response-envelope DTOs (`ErrorEnvelope`/`ErrorBody`/`HealthzJson`), the Rust
+# mirror of Go `responses.go`'s tagged structs. Already in Cargo.lock (config/store/tracker).
+serde = { version = "1", features = ["derive"] }
+# serde_json: the on-the-wire JSON codec and the `serde_json::Value` the `/state` render returns.
+# Already in Cargo.lock (config/store/orchestrator).
+serde_json = "1"
+# async-trait: `StateProvider` is the async interface the handlers read (Go's `StateProvider`
+# interface). Native `async fn` in traits is not dyn-compatible, and the handlers hold the provider
+# as `Arc<dyn StateProvider>` (Go holds the interface value), so the object-safe form needs
+# async-trait — the same reasoning + version the `tracker`/`agent` crates already record. In Cargo.lock.
+async-trait = "0.1"
+# rust-embed: embeds the built React dashboard (`web-dist/`) into the binary, the Rust analog of Go's
+# `//go:embed all:web/dist` (`web.go`). The P6 plan names it explicitly ("Rust: `rust-embed` over
+# `crates/httpapi/web-dist/`"). NEW workspace dependency (plan-anticipated); `mime-guess` powers the
+# per-asset Content-Type the SPA file server sets (Go's `http.FileServer`).
+rust-embed = { version = "8", features = ["mime-guess"] }
+# rhapsody-orchestrator: the `Snapshot` the `/state` handler serves and the O4-owned
+# `snapshot_json::render` it REUSES (the plan's "byte-parity … config handler REUSES effective_json,
+# no reimplementation" rule, applied to the snapshot wire view). This is H1's root dependency (O4).
+rhapsody-orchestrator = { path = "../orchestrator" }
+# tracing: the structured-diagnostics facade the workspace uses in place of Go's `slog`; here it
+# carries the single `writeJSON` encode-failure log (Go `handlers.go`: "http: encode response
+# failed"). Already in Cargo.lock (orchestrator/tracker/workspace).
+tracing = "0.1"
+
+[dev-dependencies]
+# harness-fixtures (test-only): the H1 state golden — the served `GET /api/v1/state` body,
+# normalized, must byte-match the committed `api/state.json` fixture. Same golden pattern the config
+# crate's `tests/golden.rs` and the orchestrator's `snapshot_json` test use. Already in Cargo.lock.
+harness-fixtures = { path = "../harness-fixtures" }
+# reqwest (test-only): the HTTP client the handler tests drive the real loopback server with (GET /
+# POST / HEAD status + body assertions), mirroring Go's `net/http` client in `*_test.go`. Feature set
+# matches the `tracker` crate's existing use, so no new crate/feature enters Cargo.lock.
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+# chrono (test-only): builds the `DateTime<Utc>` fields of the test `Snapshot`s (the orchestrator's
+# clock type). Already in Cargo.lock (orchestrator/store/tracker).
+chrono = "0.4"
+# tokio (test-only extras): `macros` + `rt-multi-thread` power `#[tokio::test]` with a real
+# multi-threaded runtime, so a test's client request and the spawned server task make progress
+# concurrently (the same flavor `linear-stub`'s server tests use). Already in Cargo.lock.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true

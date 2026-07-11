@@ -1,0 +1,14 @@
+<!doctype html>
+<!-- Test-only stand-in for the vite dashboard bundle. NOT the build output (that lands in
+     web-dist/, uncommitted) — this fixture lets the SPA-handler tests assert the served page
+     deterministically without a Node build, and carries the same #root anchor web_test.go checks. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Symphony (test dist)</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

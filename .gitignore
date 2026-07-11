@@ -5,3 +5,8 @@ coverage/
 .DS_Store
 /harness/capture/target/
 /harness/capture/work/
+# Embedded dashboard build output: vite builds the React bundle into crates/httpapi/web-dist/
+# (see crates/httpapi/src/web.rs). Like Go's uncommitted web/dist, the bundle is NOT committed —
+# only the .gitkeep anchor is, so rust-embed's #[folder = "web-dist/"] compiles on a clean checkout.
+/crates/httpapi/web-dist/*
+!/crates/httpapi/web-dist/.gitkeep

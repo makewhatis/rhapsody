@@ -38,3 +38,7 @@ jobs:
         working-directory: web
       - run: npm test
         working-directory: web
+      # Build the dashboard bundle into crates/httpapi/web-dist/ (vite outDir), the rust-embed
+      # source for the embedded dashboard (P6-H1). Proves the build + outDir move stay green.
+      - run: npm run build
+        working-directory: web
