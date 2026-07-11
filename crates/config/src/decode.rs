@@ -836,6 +836,72 @@ mod tests {
         );
     }
 
+    // ---- pr_label_test.go / review_test.go / dependency_mode_test.go decode mirrors ----
+    // The Encode round-trip halves of these files land in C6; their EffectiveFor/Validate halves
+    // live in `projects.rs` / `validate.rs`. These are the pure-Decode cases (the C5 ticket names
+    // pr_label_test.go, review_test.go, and the validation half of dependency_mode_test.go).
+
+    // Mirrors Go `TestDecodePRLabelDefault`.
+    #[test]
+    fn decode_pr_label_default() {
+        let c = decode_yaml("", "body");
+        assert_eq!(c.pr_label, "symphony", "pr_label default (AIE-301)");
+    }
+
+    // Mirrors Go `TestDecodeReviewSummonDefaults`.
+    #[test]
+    fn decode_review_summon_defaults() {
+        let c = decode_yaml("", "");
+        assert!(
+            c.tracker.review_states.is_empty(),
+            "review_states default empty (feature off)"
+        );
+        assert_eq!(c.tracker.summon_token, "@symphony");
+        assert_eq!(c.tracker.review_promote_state, "In Progress");
+    }
+
+    // Mirrors Go `TestDecodeReviewSummonOverrides`.
+    #[test]
+    fn decode_review_summon_overrides() {
+        let c = decode_yaml(
+            "tracker:\n  review_states:\n    - In Review\n    - Needs QA\n  summon_token: \"@bot\"\n  review_promote_state: Doing\n",
+            "",
+        );
+        assert_eq!(
+            c.tracker.review_states,
+            vec!["In Review".to_string(), "Needs QA".to_string()]
+        );
+        assert_eq!(c.tracker.summon_token, "@bot");
+        assert_eq!(c.tracker.review_promote_state, "Doing");
+    }
+
+    // Mirrors Go `TestDecodeDependencyMode`: dependency_mode + dep_mode_prompt_file decode verbatim
+    // at the global (tracker) level and per-project; an absent value stays "" so the effective layer
+    // applies the default.
+    #[test]
+    fn decode_dependency_mode() {
+        let c = decode_yaml(
+            concat!(
+                "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states:\n    - Todo\n  terminal_states:\n    - Done\n",
+                "  dependency_mode: dag\n  dep_mode_prompt_file: .symphony/CUSTOM.md\n",
+                "repo: \"git@github.com:o/r.git\"\n",
+                "projects:\n",
+                "  - slugs:\n      - a-1\n    dependency_mode: graphite\n    dep_mode_prompt_file: .symphony/A.md\n",
+                "  - slugs:\n      - b-1\n",
+            ),
+            "body",
+        );
+        assert_eq!(c.tracker.dependency_mode, "dag");
+        assert_eq!(c.tracker.dep_mode_prompt_file, ".symphony/CUSTOM.md");
+        assert_eq!(c.projects[0].dependency_mode, "graphite");
+        assert_eq!(c.projects[0].dep_mode_prompt_file, ".symphony/A.md");
+        assert_eq!(c.projects[1].dependency_mode, "", "project[1] inherits");
+        assert_eq!(
+            c.projects[1].dep_mode_prompt_file, "",
+            "project[1] inherits"
+        );
+    }
+
     // ---- config_mcp_test.go mirrors (the Decode-related cases; the Encode round-trip is C6) ----
 
     /// Minimal front matter Decode needs for the MCP cases (tracker + repo), per Go `baseTrackerMCP`.

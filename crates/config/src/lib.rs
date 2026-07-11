@@ -12,13 +12,19 @@
 
 pub mod decode;
 pub mod model;
+pub mod projects;
 pub mod prompt;
 pub mod resolve;
+pub mod validate;
 pub mod workflow;
 
 pub use decode::{ConfigError, decode};
 pub use model::{
-    Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT, Hooks, Logging, Mcp, Otel,
-    Polling, Project, Server, Storage, Tracker, Workspace,
+    Agent, CLAIM_MODE_ASSIGNEE, CLAIM_MODE_POOL, Claude, ClaudeOverride, Codex, Config,
+    DEFAULT_DEP_MODE_PROMPT_FILE, DEFAULT_OTEL_ENDPOINT, DEPENDENCY_MODE_DAG,
+    DEPENDENCY_MODE_DISABLED, DEPENDENCY_MODE_GRAPHITE, Hooks, Logging, Mcp, Otel, Polling,
+    Project, Server, Storage, Tracker, WORKSPACE_MODE_CLONE, WORKSPACE_MODE_WORKTREE, Workspace,
 };
+pub use projects::{EffectiveConfig, ResolvedProject, effective_for, resolve_projects};
 pub use resolve::{Resolved, resolve};
+pub use validate::{ValidationError, validate};

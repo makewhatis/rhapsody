@@ -27,6 +27,44 @@ use serde_yaml_ng::Value;
 pub const DEFAULT_OTEL_ENDPOINT: &str = "https://otel-symphony.ops-oma-prod.makewhat.is";
 
 // ---------------------------------------------------------------------------
+// Override-knob vocabularies (Go `internal/config/config.go` const blocks)
+// ---------------------------------------------------------------------------
+//
+// The accepted `dependency_mode` / `claim_mode` / `workspace_mode` values, plus the mode-on prompt
+// default. Empty means inherit/default at the effective layer ([`crate::projects`]); these literals
+// are both the validation allow-list (Go `*ModeValid`) and the resolved default the effective layer
+// materializes. Ported verbatim from Go so the two crates agree on the exact tokens.
+
+/// `dependency_mode` DEFAULT: a `blockedBy` edge clears only when the blocker is terminal — the
+/// pre-feature daemon byte-for-byte (Go `DependencyModeDisabled`, INF-318).
+pub const DEPENDENCY_MODE_DISABLED: &str = "disabled";
+/// `dependency_mode` "graphite": unblock a dependent at a review state and dispatch it stacked on the
+/// predecessor branch; requires a non-empty `review_states` (Go `DependencyModeGraphite`, INF-318).
+pub const DEPENDENCY_MODE_GRAPHITE: &str = "graphite";
+/// `dependency_mode` "dag": unblock only when ALL blockers are terminal/merged and dispatch fresh
+/// from main (Go `DependencyModeDag`, INF-318).
+pub const DEPENDENCY_MODE_DAG: &str = "dag";
+
+/// The canonical repo-relative path of the mode-on run prompt rendered in graphite/dag mode; the
+/// effective default for `dep_mode_prompt_file` (Go `DefaultDepModePromptFile`, INF-318).
+pub const DEFAULT_DEP_MODE_PROMPT_FILE: &str = ".symphony/PROMPT.dep_mod.md";
+
+/// `claim_mode` DEFAULT: fetch only issues assigned to the API-key owner, no claim election — today's
+/// behavior exactly (Go `ClaimModeAssignee`, INF-477).
+pub const CLAIM_MODE_ASSIGNEE: &str = "assignee";
+/// `claim_mode` "pool": fetch UNASSIGNED issues and run the single-claimant claim protocol before
+/// dispatch, so many daemons can share one project (Go `ClaimModePool`, INF-477).
+pub const CLAIM_MODE_POOL: &str = "pool";
+
+/// `workspace_mode` DEFAULT: a shared per-repo bare mirror with one `git worktree` per issue — the
+/// pre-feature daemon byte-for-byte (Go `WorkspaceModeWorktree`, INF-418).
+pub const WORKSPACE_MODE_WORKTREE: &str = "worktree";
+/// `workspace_mode` "clone": provision each issue as an independent `git clone`, removing the
+/// cross-ticket checkout lock at the cost of a full clone per dispatch (Go `WorkspaceModeClone`,
+/// INF-418).
+pub const WORKSPACE_MODE_CLONE: &str = "clone";
+
+// ---------------------------------------------------------------------------
 // Typed runtime model (Go `Config` and friends)
 // ---------------------------------------------------------------------------
 
@@ -175,7 +213,9 @@ pub struct Mcp {
 
 /// The subset of Claude knobs a project may override (Go `ClaudeOverride`). Every field is
 /// `Option`/`Vec`: `None`/empty ⇒ inherit the top-level effective value (no default applied here).
-#[derive(Debug, Clone, PartialEq)]
+/// `Default` (all-`None`/empty) mirrors a Go zero-value `ClaudeOverride{}` for constructing partial
+/// overrides field-by-field.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClaudeOverride {
     pub command: Option<String>,
     pub model: Option<String>,
@@ -196,7 +236,9 @@ pub struct ClaudeOverride {
 
 /// One multi-project entry (Go `Project`). Override fields keep their `Option`/`Vec` optionality
 /// so `ResolveProjects` (Task 5) can distinguish inherit-from-top-level from an explicit value.
-#[derive(Debug, Clone, PartialEq)]
+/// `Default` (all-empty/`None`) mirrors a Go zero-value `Project{}`, so tests and callers can build
+/// one setting only the fields they need (`Project { slugs, ..Default::default() }`).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Project {
     pub name: String,
     pub repo: String,
