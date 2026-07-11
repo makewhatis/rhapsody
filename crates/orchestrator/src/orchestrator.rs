@@ -10,8 +10,11 @@
 //! the fields its behavior needs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use rhapsody_core::normalize_state;
+use rhapsody_store::{self as store, Store};
 
 use crate::effective::Effective;
 
@@ -194,6 +197,46 @@ pub struct Orchestrator {
     pub pending_stack: HashMap<String, StackHint>,
     /// Aggregate token + runtime accounting.
     pub totals: Totals,
+
+    /// Per-process daemon identity embedded in pool-mode claim markers (`daemon=<viewerID>/<uuid>`,
+    /// alongside the API-key viewer id). It is the audit/identity token in a claim comment; the
+    /// claim election ([`crate::claim`]) decides the winner by the immutable comment `createdAt` and
+    /// tie-breaks on comment id, so `daemon_id` is NOT load-bearing for election correctness. O1's
+    /// constructor deferred it (the claim election is its sole consumer); O2 introduces it. Mirrors
+    /// Go `daemonID`. INF-477.
+    pub daemon_id: String,
+
+    /// The durable history + recovery store (NEVER an absent handle: defaulted to [`store::Noop`] in
+    /// [`Orchestrator::new`] and replaced with a real store by [`Orchestrator::set_store`] / the Run
+    /// bootstrap), so every store call site is guard-free. O2 is its first consumer — the
+    /// summons-suppression read (`last_run_started_at`) queries `issue_history`; the write-side run
+    /// lifecycle lands in O4. Held behind [`Arc`] so the future off-loop HTTP read path (P6) can
+    /// share it. Mirrors Go `pstore` (Go additionally guards it with `storeMu` for those off-loop
+    /// reads, which arrive in P6; O2's access is control-task-confined, so it needs no lock).
+    pub store: Arc<dyn Store + Send + Sync>,
+}
+
+/// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
+/// [`RandomState::new`](std::collections::hash_map::RandomState) draws fresh keys from the standard
+/// library's OS-seeded thread-local RNG, so finishing a hasher over the empty input yields an
+/// independent value per call. Used for the daemon id and the claim settle jitter — neither is
+/// load-bearing for correctness (see [`new_daemon_id`] / `claim::jittered_settle`), so
+/// non-cryptographic entropy is sufficient.
+pub(crate) fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// Generates a per-process daemon identity for pool-mode claim markers. Mirrors Go
+/// `uuid.NewString()`: the value is opaque and NOT load-bearing for election correctness (the claim
+/// election orders by the immutable comment `createdAt` and tie-breaks on comment id), so it needs
+/// only per-process uniqueness. Rendered as a 128-bit hex id from two [`random_u64`] draws, so two
+/// `Orchestrator::new()` calls get distinct ids (the contention test relies on it) and two daemon
+/// processes get distinct ids (the per-process RNG seed is OS-random).
+fn new_daemon_id() -> String {
+    format!("{:016x}{:016x}", random_u64(), random_u64())
 }
 
 impl Orchestrator {
@@ -203,8 +246,10 @@ impl Orchestrator {
     ///
     /// Deviation from Go: Go's `New(workflowPath, logger *slog.Logger)` threads a `slog` logger; the
     /// Rust crate emits diagnostics via `tracing` (as the sibling crates do), so the logger
-    /// parameter is dropped. The pool-mode daemon identity (Go `daemonID = uuid.NewString()`) is not
-    /// set here — it is used only by the claim election (O2), which introduces it.
+    /// parameter is dropped. The pool-mode daemon identity (Go `daemonID = uuid.NewString()`) IS set
+    /// here now (O2, its introducing ticket); the durable store defaults to [`store::Noop`] until a
+    /// real store is injected (Go defaults `pstore` to `store.Noop()`), keeping every store call site
+    /// guard-free.
     pub fn new(workflow_path: impl Into<String>) -> Orchestrator {
         Orchestrator {
             workflow_path: workflow_path.into(),
@@ -216,6 +261,8 @@ impl Orchestrator {
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             totals: Totals::default(),
+            daemon_id: new_daemon_id(),
+            store: Arc::new(store::Noop),
         }
     }
 
@@ -223,6 +270,51 @@ impl Orchestrator {
     /// `WorkflowPath`.
     pub fn workflow_path(&self) -> &str {
         &self.workflow_path
+    }
+
+    /// Returns the durable history + recovery store (never absent; [`store::Noop`] when disabled).
+    /// Mirrors Go `Store`. O2's summons-suppression read (`last_run_started_at`) goes through it, as
+    /// will O4's run-lifecycle writes.
+    pub fn store(&self) -> &dyn Store {
+        self.store.as_ref()
+    }
+
+    /// Injects a store handle, bypassing the Run-time open path — intended for tests (an in-memory
+    /// store) and any caller that owns the store lifecycle. Mirrors Go `SetStore` (whose `nil → Noop`
+    /// guard is unrepresentable here, since an [`Arc`] is never null).
+    pub fn set_store(&mut self, st: Arc<dyn Store + Send + Sync>) {
+        self.store = st;
+    }
+
+    /// Returns the set of currently-running issue ids (Go `runningIDSet`). The selection pass seeds
+    /// its per-tick reservation set from this so one tick cannot re-dispatch an in-flight issue.
+    pub(crate) fn running_id_set(&self) -> HashSet<String> {
+        self.running.keys().cloned().collect()
+    }
+
+    /// Counts running issues per NORMALIZED state (Go `runningStateCounts`) — the base the selection
+    /// pass measures the per-state cap against.
+    pub(crate) fn running_state_counts(&self) -> HashMap<String, i64> {
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for re in self.running.values() {
+            *counts.entry(normalize_state(&re.issue.state)).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Returns the set of issue IDENTIFIERs a still-pending boot-recovered retry owns (entries in
+    /// [`Orchestrator::retry_attempts`] with `recovered == true`, keyed by identifier with an
+    /// unresolved opaque id). Mirrors Go `recoveredClaimIdentifiers`: the boot-race guard the
+    /// selection pass consults so a poll tick firing in the recovery window never dispatches an issue
+    /// out from under a recovered claim (the recovered on-retry would then delete the freshly-started
+    /// live run's persisted claim row; Phase 4 §3.7). Empty in the common case, so steady-state /
+    /// storage-off dispatch is unaffected.
+    pub(crate) fn recovered_claim_identifiers(&self) -> HashSet<String> {
+        self.retry_attempts
+            .values()
+            .filter(|re| re.recovered && !re.identifier.is_empty())
+            .map(|re| re.identifier.clone())
+            .collect()
     }
 }
 

@@ -1168,11 +1168,14 @@ dependencies = [
  "rhapsody-agent",
  "rhapsody-config",
  "rhapsody-core",
+ "rhapsody-store",
  "rhapsody-tracker",
  "rhapsody-workspace",
  "serde_yaml_ng",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

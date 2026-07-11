@@ -11,6 +11,11 @@ rhapsody-config = { path = "../config" }
 rhapsody-tracker = { path = "../tracker" }
 rhapsody-workspace = { path = "../workspace" }
 rhapsody-agent = { path = "../agent" }
+# rhapsody-store: the durable history + recovery store. O2 is its first orchestrator consumer —
+# `last_run_started_at` (dispatch.rs) reads `issue_history` for the summons-suppression watermark,
+# so the `Orchestrator` gains the store handle (Go `orchestrator.go`'s `pstore`, defaulted to Noop)
+# now; O4 layers the write-side run lifecycle on top. Consumed per the P5 plan's dep set.
+rhapsody-store = { path = "../store" }
 # chrono: the orchestrator's clock (`now`), retry due-times, and the effective stall-timeout
 # duration — the Rust mirror of Go's `time` package. Anticipated by the P5 plan's dep set.
 chrono = "0.4"
@@ -24,12 +29,27 @@ tracing = "0.1"
 # pattern. Already in the workspace tree (rhapsody-core / rhapsody-tracker depend on it), so no new
 # crate enters Cargo.lock.
 regex = "1"
+# tokio: O2's pool-mode claim protocol (`claim.rs`) is async — it drives the async `Tracker` trait
+# and waits out the jittered settle window (`tokio::time::sleep`, Go's `sleepCtx`). Only the `time`
+# driver is needed here; the control-loop runtime is O7's. Anticipated by the P5 plan's dep set;
+# already in Cargo.lock (agent/workspace/tracker depend on it).
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 # serde_yaml_ng: the effective tests parse WORKFLOW.md front matter into the config crate's
 # `YamlMap` (the same helper the config crate's own tests use), mirroring Go `effective_test.go`'s
 # `decodeCfg`. Already in Cargo.lock (a rhapsody-config dependency) — no new crate enters the tree.
 serde_yaml_ng = "0.10"
+# tracing-subscriber (test-only): a recording event Layer that captures the INF-249 blocked-skip
+# `tracing` diagnostics so the `select` log tests can assert them by SEMANTIC field (Go's
+# `dispatch`/`select_test` capture the equivalent `slog` output to a buffer). The Rust analogue is
+# the same recording-layer pattern the tracker crate's `tracing_test` already uses; already in
+# Cargo.lock, so no new crate enters the tree.
+tracing-subscriber = "0.3"
+# tokio (test-only extras): the `macros` + `rt` features power `#[tokio::test]` and the `tokio::join!`
+# the claim-contention test uses to race two daemons; the `time` feature is inherited from the
+# non-dev dependency above. Already in Cargo.lock.
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true
