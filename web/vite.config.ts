@@ -2,10 +2,28 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
+import fs from "node:fs";
+
+const embedDir = path.resolve(__dirname, "../crates/httpapi/web-dist");
+
+// Re-create the .gitkeep anchor that `emptyOutDir` wipes at the start of each build, so the
+// committed placeholder — which lets rust-embed's `#[folder = "web-dist/"]` compile on a clean /
+// Node-less checkout — survives a local `npm run build` (mirrors the Go Makefile's build-web anchor
+// re-touch). Without this, a developer who builds then `git add -A` would stage the anchor's
+// deletion and break the clean-checkout compile.
+function keepEmbedAnchor() {
+  return {
+    name: "keep-embed-anchor",
+    closeBundle() {
+      fs.mkdirSync(embedDir, { recursive: true });
+      fs.writeFileSync(path.join(embedDir, ".gitkeep"), "");
+    },
+  };
+}
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), keepEmbedAnchor()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -17,7 +35,7 @@ export default defineConfig({
     // Build into the httpapi crate's embed dir so rust-embed's `#[folder = "web-dist/"]`
     // (crates/httpapi/src/web.rs) finds it. The bundle is NOT committed — only web-dist/.gitkeep
     // is (see the repo .gitignore); CI's `web` job runs `npm run build` to populate it.
-    outDir: path.resolve(__dirname, "../crates/httpapi/web-dist"),
+    outDir: embedDir,
     emptyOutDir: true,
   },
   server: {

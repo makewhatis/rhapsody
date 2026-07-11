@@ -190,4 +190,22 @@ mod tests {
         let _ = tx.send(());
         handle.await.expect("server task join");
     }
+
+    // The plain `serve` (no shutdown signal, mirroring Go `Serve`) binds + routes correctly: a
+    // spawned server answers /healthz. It runs until dropped, so the test aborts the task to stop it.
+    #[tokio::test]
+    async fn server_serve_answers_requests() {
+        let server = Server::bind(Arc::new(FakeProvider::ok(empty_snapshot())), "127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = server.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move { server.serve().await });
+
+        let resp = reqwest::get(format!("http://{addr}/healthz"))
+            .await
+            .expect("GET /healthz");
+        assert_eq!(resp.status(), 200);
+
+        handle.abort();
+    }
 }
