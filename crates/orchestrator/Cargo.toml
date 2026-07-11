@@ -30,10 +30,11 @@ tracing = "0.1"
 # crate enters Cargo.lock.
 regex = "1"
 # tokio: O2's pool-mode claim protocol (`claim.rs`) is async — it drives the async `Tracker` trait
-# and waits out the jittered settle window (`tokio::time::sleep`, Go's `sleepCtx`). Only the `time`
-# driver is needed here; the control-loop runtime is O7's. Anticipated by the P5 plan's dep set;
-# already in Cargo.lock (agent/workspace/tracker depend on it).
-tokio = { version = "1", features = ["time"] }
+# and waits out the jittered settle window (`tokio::time::sleep`, Go's `sleepCtx`). O3's worker
+# threads the operator-message receiver (Go's `messages <-chan string`) to `Session::run_turn`, which
+# needs `sync` to name `tokio::sync::mpsc::Receiver`. The control-loop runtime is O7's. Anticipated by
+# the P5 plan's dep set; already in Cargo.lock (agent/workspace/tracker depend on it).
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
 # serde_yaml_ng: the effective tests parse WORKFLOW.md front matter into the config crate's

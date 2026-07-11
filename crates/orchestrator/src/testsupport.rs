@@ -430,3 +430,44 @@ pub(crate) fn capture_events<R, F: FnOnce() -> R>(f: F) -> (R, Vec<CapturedEvent
 pub(crate) fn count_messages(events: &[CapturedEvent], message: &str) -> usize {
     events.iter().filter(|e| e.message == message).count()
 }
+
+// --- temp directories (Go's t.TempDir() analogue) --------------------------------------------
+
+static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RAII temp directory mirroring Go's `t.TempDir()` (unique per pid+counter, auto-removed on drop).
+/// The O3 worker / obslog / workspace-GC tests provision real filesystem roots the way the Go tests
+/// do; the sibling crates roll the same tiny helper rather than take a `tempfile` dependency, so this
+/// matches the workspace crate's `testutil::TempDir`.
+pub(crate) struct TempDir {
+    pub path: String,
+}
+
+impl TempDir {
+    pub(crate) fn new() -> TempDir {
+        let n = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rhapsody-orchestrator-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir {
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Joins `name` under this directory, returning the path string.
+    pub(crate) fn child(&self, name: &str) -> String {
+        std::path::Path::new(&self.path)
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}

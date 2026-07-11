@@ -31,6 +31,7 @@
 //! `crates/orchestrator`. This O1 slice — the core state, the effective config view, and the
 //! telemetry attrs — compiles standalone and introduces none.
 
+pub mod agentupdate;
 pub mod claim;
 pub mod concurrency;
 pub mod dispatch;
@@ -41,14 +42,19 @@ pub mod obslog;
 pub mod orchestrator;
 pub mod select;
 pub mod telemetry_attrs;
+pub mod worker;
+pub mod workspace_gc;
 
 #[cfg(test)]
 mod testsupport;
 
+pub use agentupdate::AgentUpdate;
 pub use concurrency::{global_slots, state_limit};
 pub use dispatch::{eligible, sort_for_dispatch};
 pub use effective::{Effective, ResolvedProject, build_effective, build_effective_with_runner};
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
+pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
+pub use workspace_gc::WorkspaceGcPlan;
 
 /// Typed orchestrator error categories.
 ///
