@@ -11,17 +11,16 @@
 //! * [`billing`] — the env scrub + `apiKeySource` billing guard (Go `billing.go`).
 //! * [`mcpinject`] — per-workspace `.mcp.json` merge + the `SYMPHONY_*` "me" identity env
 //!   (Go `mcpinject.go` + `appendMeEnv`).
-//!
-//! The subprocess runner itself (Go `runner.go`) lands in the follow-up task A3; it consumes every
-//! item this module exposes. Those items are `pub` (not `pub(crate)`) so that sibling module — not
-//! yet present — can reference them without tripping `dead_code` under `-D warnings`; Go keeps them
-//! package-private, but Rust visibility is not observable behavior, and this avoids a
-//! `#[allow(dead_code)]`.
+//! * [`runner`] — the subprocess runner ([`Runner`]): spawn `claude` per turn in the worktree with
+//!   the exact argv, a Unix process group (pgid kill), a held-open stdin operator-message mailbox
+//!   with continuous drain (INF-250), the turn deadline, and terminal-result handling (Go
+//!   `runner.go`). It consumes every item the sibling modules above expose.
 
 pub mod args;
 pub mod billing;
 pub mod mcpinject;
 pub mod parse;
+pub mod runner;
 
 pub use args::{Config, build_args, split_command};
 pub use billing::{
@@ -30,3 +29,4 @@ pub use billing::{
 };
 pub use mcpinject::{MERGED_MCP_CONFIG_NAME, append_me_env, inject_symphony_mcp};
 pub use parse::{Classified, classify};
+pub use runner::Runner;

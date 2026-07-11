@@ -7,6 +7,14 @@ repository.workspace = true
 
 [dependencies]
 rhapsody-core = { path = "../core" }
+# rhapsody-workspace: the A3 runner enforces the pre-launch containment invariant (§9.5) via
+# `validate_launch`, exactly as Go `runner.go` imports `internal/workspace` and calls
+# `workspace.ValidateLaunch` before every exec. The P4 plan's "consume only rhapsody-core" note
+# describes the two lanes' GENERAL shape; the runner is the one place the agent lane crosses into
+# workspace — mirroring the reference, whose runner imports workspace for this same check. Reusing
+# the committed `validate_launch` (a security invariant) instead of duplicating it keeps the guard
+# single-sourced. No new external crate enters Cargo.lock (a workspace-internal path dep).
+rhapsody-workspace = { path = "../workspace" }
 # async-trait: the `Runner`/`Session` abstraction is async (Go's methods take `ctx context.Context`;
 # the P5 orchestrator is tokio-based and the claude runner spawns a subprocess), and both are used
 # as trait objects — `Runner::start_session` returns `Box<dyn Session>` and P5 holds `Box<dyn
@@ -30,15 +38,40 @@ thiserror = "1"
 # Cargo.lock.
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-# tokio (sync only): names the operator-mailbox channel type in `Session::run_turn` (Go's
-# `messages <-chan string`, INF-250). A1's fake ignores it; the A3 runner drains it. Only the `sync`
-# feature is needed here (the runtime stays test-only). Anticipated by the P4 plan (A1).
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# tokio: names the operator-mailbox channel type in `Session::run_turn` (Go's `messages <-chan
+# string`, INF-250) AND drives the A3 subprocess runner. A1 needed only `sync`; A3 adds `process`
+# (spawn `claude`/`bash` per turn, Go's `os/exec`), `io-util` (async read stdout/stderr, write the
+# stdin mailbox), `time` (the turn deadline — Go's `context.WithTimeout`), `macros` (`select!` folds
+# the stdout scan, stderr drain, mailbox, and deadline into one cancel-safe task), and `rt` (the
+# process reaper the `process` feature requires). The A1 Cargo.toml already anticipated this ("the
+# runtime stays test-only ... the A3 runner drains it").
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "process",
+    "io-util",
+    "time",
+    "macros",
+    "rt",
+] }
+# libc (Unix only): `kill(-pgid, SIGKILL)` to signal the child's whole process group on a stall/turn
+# deadline — the parity mirror of Go `syscall.Kill(-cmd.Process.Pid, SIGKILL)`. tokio's `Child::kill`
+# signals only the direct child, which would orphan the agent's own children (e.g. fake-claude's
+# background stdin drain) and leave the stdout pipe open. Already in Cargo.lock (a tokio dependency).
+libc = "0.2"
+# tracing: best-effort warn diagnostics when a transcript sink write fails (Go logs these via
+# `slog`; the workspace convention is `tracing`, as `rhapsody-tracker` records). Behavior is
+# unchanged whether the warn fires; it is observability only. Already in Cargo.lock.
+tracing = "0.1"
 
 [dev-dependencies]
-# tokio (test-only): a current-thread runtime for `#[tokio::test]`, which drives the async
-# `Session`/`Runner` methods the fake tests exercise.
-tokio = { version = "1", features = ["macros", "rt"] }
+# tokio (test-only): the current-thread runtime + timer + I/O the `#[tokio::test]` runner tests and
+# the fixture gate drive the async `Session`/`Runner` methods with.
+tokio = { version = "1", features = ["macros", "rt", "time", "io-util", "process"] }
+# harness-fixtures: the fixture gate loads the committed `runs/*.jsonl` goldens and applies the
+# shared `normalize` rules (Task R5) to assert the runner's event stream against them. (serde_json,
+# used to build the `/api/v1/runs/{id}/events`-shaped objects the gate compares, is already a
+# non-test dependency above and needs no dev re-declaration.)
+harness-fixtures = { path = "../harness-fixtures" }
 
 [lints]
 workspace = true
