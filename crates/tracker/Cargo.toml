@@ -13,8 +13,14 @@ rhapsody-core = { path = "../core" }
 # (anticipated by the P3 plan, T1).
 async-trait = "0.1"
 # chrono: the fake stamps created claim comments with a clock defaulting to `Utc::now()` — the
-# Rust mirror of Go's `time.Now()` — and stores them as `core::Comment.created_at`.
-chrono = { version = "0.4", features = ["clock"] }
+# Rust mirror of Go's `time.Now()` — and stores them as `core::Comment.created_at`. The `serde`
+# feature (de)serializes the file adapter's RFC3339 timestamps (schema `DateTime<FixedOffset>`).
+chrono = { version = "0.4", features = ["clock", "serde"] }
+# serde + serde_json: the file adapter is JSON-backed — it parses and atomically rewrites its
+# source file (the Rust equivalent of Go `internal/tracker/file`'s `encoding/json`). Same versions
+# as core/config; the P3 plan (T3) also lists `serde_json` for this crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 # tokio (test-only): a current-thread runtime for `#[tokio::test]`, which drives the async

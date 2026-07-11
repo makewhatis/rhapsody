@@ -27,7 +27,8 @@ use std::any::Any;
 ///
 /// T1 needs only the opaque [`TrackerError::Other`] carrier (used by the fake's error injection
 /// and the adapter skeletons); the linear adapter's structured sentinels are added alongside it
-/// by the later P3 tasks that introduce them.
+/// by the later P3 tasks that introduce them — T2 adds the first, [`TrackerError::StateNotFound`],
+/// which the file tracker's `move_issue_to_type` returns; T3–T5 add the remaining linear sentinels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackerError {
     /// A tracker operation failed with the given message. This is the parity mirror of Go's
@@ -35,12 +36,21 @@ pub enum TrackerError {
     /// failure through it, and the T1 adapter skeletons report "not yet implemented" through it
     /// until their P3 task fills the body in.
     Other(String),
+
+    /// No workflow state exists for the requested (team, name/type). The parity mirror of Go's
+    /// `linear.ErrLinearStateNotFound` sentinel (`internal/tracker/linear/errors.go`): its Display
+    /// is `linear_state_not_found`, wrapped with the caller's context after `: `. Both adapters
+    /// return it from the by-type move — the file tracker (T2) when a `state_types` mapping is
+    /// missing, the linear adapter (T5) when the team has no state of that type. Carries the
+    /// context string; the sentinel token is composed by [`Display`](std::fmt::Display).
+    StateNotFound(String),
 }
 
 impl std::fmt::Display for TrackerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TrackerError::Other(msg) => write!(f, "{msg}"),
+            TrackerError::StateNotFound(msg) => write!(f, "linear_state_not_found: {msg}"),
         }
     }
 }
