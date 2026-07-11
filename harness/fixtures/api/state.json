@@ -1,0 +1,25 @@
+{
+  "codex_totals": {
+    "input_tokens": 20,
+    "output_tokens": 20,
+    "seconds_running": "<NUM>",
+    "total_tokens": 40
+  },
+  "counts": {
+    "retrying": 1,
+    "running": 0
+  },
+  "generated_at": "<TIMESTAMP>",
+  "poll_interval_ms": 2000,
+  "rate_limits": [],
+  "retrying": [
+    {
+      "attempt": 1,
+      "due_at": "<TIMESTAMP>",
+      "error": "",
+      "issue_identifier": "RHA-1"
+    }
+  ],
+  "running": [],
+  "status": "ok"
+}

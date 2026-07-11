@@ -1,0 +1,237 @@
+{
+  "config": {
+    "agent": {
+      "backend": "claude",
+      "max_concurrent_agents": 2,
+      "max_concurrent_agents_by_state": {
+        "in progress": 2,
+        "todo": 1
+      },
+      "max_retry_backoff_ms": 120000,
+      "max_turns": 10
+    },
+    "claude": {
+      "billing_guard": true,
+      "command": "<HOME>/bin/fake-claude",
+      "effort": "xhigh",
+      "model": "claude-opus-4-8",
+      "permission_mode": "bypassPermissions",
+      "read_timeout_ms": 5000,
+      "stall_timeout_ms": 1200000,
+      "turn_timeout_ms": 3600000,
+      "ultracode": true
+    },
+    "hooks": {
+      "after_create": "true",
+      "after_run": "true",
+      "before_remove": "true",
+      "before_run": "true",
+      "timeout_ms": 60000
+    },
+    "mcp": {
+      "allow_resume": true,
+      "allow_send_message": true,
+      "allow_stop": true,
+      "enabled": true
+    },
+    "otel": {
+      "enabled": false
+    },
+    "polling": {
+      "interval_ms": 500
+    },
+    "server": {
+      "port": 0
+    },
+    "storage": {
+      "path": "<HOME>/symphony.db",
+      "retention_days": 30
+    },
+    "tracker": {
+      "active_states": [
+        "Todo",
+        "In Progress"
+      ],
+      "api_key": "stub-key",
+      "canceled_states": [
+        "Cancelled",
+        "Canceled",
+        "Duplicate"
+      ],
+      "claim_mode": "pool",
+      "claim_settle_delay": "1s",
+      "claim_ttl": "2m",
+      "endpoint": "http://127.0.0.1:<PORT>/graphql",
+      "github_summons": true,
+      "kind": "linear",
+      "labels": [
+        "ready",
+        "urgent"
+      ],
+      "milestone": "v2.0",
+      "project_slug": "558008ab185c",
+      "review_promote_state": "In Progress",
+      "review_states": [
+        "In Review"
+      ],
+      "summon_token": "@symphony",
+      "terminal_states": [
+        "Done",
+        "Canceled",
+        "Cancelled",
+        "Duplicate"
+      ]
+    },
+    "workspace": {
+      "root": "~/symphony_workspaces"
+    }
+  },
+  "generated_at": "<TIMESTAMP>",
+  "global": {
+    "active_states": [
+      "Todo",
+      "In Progress"
+    ],
+    "agent": {
+      "backend": "claude",
+      "max_concurrent_agents": 2,
+      "max_concurrent_agents_by_state": {
+        "in progress": 2,
+        "todo": 1
+      },
+      "max_retry_backoff_ms": 120000,
+      "max_turns": 10
+    },
+    "canceled_states": [
+      "Cancelled",
+      "Canceled",
+      "Duplicate"
+    ],
+    "claim_mode": "pool",
+    "claude": {
+      "billing_guard": true,
+      "command": "<HOME>/bin/fake-claude",
+      "effort": "xhigh",
+      "mcp_config": "",
+      "model": "claude-opus-4-8",
+      "permission_mode": "bypassPermissions",
+      "read_timeout_ms": 5000,
+      "stall_timeout_ms": 1200000,
+      "turn_timeout_ms": 3600000,
+      "ultracode": true
+    },
+    "dep_mode_prompt_file": "",
+    "dependency_mode": "",
+    "git_flow": "",
+    "github_summons": true,
+    "labels": [
+      "ready",
+      "urgent"
+    ],
+    "logging": {
+      "dir": "~/.symphony/logs"
+    },
+    "mcp": {
+      "allow_resume": true,
+      "allow_send_message": true,
+      "allow_stop": true,
+      "enabled": true
+    },
+    "milestone": "v2.0",
+    "otel": {
+      "enabled": false,
+      "endpoint": "https://otel-symphony.ops-oma-prod.makewhat.is",
+      "insecure": false,
+      "protocol": "http",
+      "service_name": "symphony"
+    },
+    "polling": {
+      "interval_ms": 500
+    },
+    "prompt": "You own {{ issue.identifier }} — {{ issue.title }}. Current state: {{ issue.state }}.",
+    "prompt_file": "",
+    "repo": "",
+    "review_promote_state": "In Progress",
+    "review_states": [
+      "In Review"
+    ],
+    "server": {
+      "port": 0
+    },
+    "storage": {
+      "path": "<HOME>/symphony.db",
+      "retention_days": 30
+    },
+    "summon_token": "@symphony",
+    "terminal_states": [
+      "Done",
+      "Canceled",
+      "Cancelled",
+      "Duplicate"
+    ],
+    "tracker": {
+      "api_key_set": true,
+      "endpoint": "http://127.0.0.1:<PORT>/graphql",
+      "kind": "linear"
+    },
+    "workspace": {
+      "root": "~/symphony_workspaces"
+    },
+    "workspace_mode": ""
+  },
+  "projects": [
+    {
+      "effective": {
+        "active_states": [
+          "Todo",
+          "In Progress"
+        ],
+        "canceled_states": [
+          "Cancelled",
+          "Canceled",
+          "Duplicate"
+        ],
+        "claim_mode": "pool",
+        "dep_mode_prompt_file": ".symphony/PROMPT.dep_mod.md",
+        "dependency_mode": "disabled",
+        "effort": "xhigh",
+        "enabled": true,
+        "git_flow": "",
+        "labels": [
+          "ready",
+          "urgent"
+        ],
+        "max_concurrent_agents": 0,
+        "milestone": "v2.0",
+        "model": "claude-opus-4-8",
+        "name": "558008ab185c",
+        "permission": "bypassPermissions",
+        "prompt": "You own {{ issue.identifier }} — {{ issue.title }}. Current state: {{ issue.state }}.",
+        "prompt_file": "",
+        "repo": "",
+        "review_promote_state": "In Progress",
+        "review_states": [
+          "In Review"
+        ],
+        "stall_timeout_ms": 1200000,
+        "terminal_states": [
+          "Done",
+          "Canceled",
+          "Cancelled",
+          "Duplicate"
+        ],
+        "turn_timeout_ms": 3600000,
+        "ultracode": true,
+        "workspace_mode": "worktree"
+      },
+      "enabled": true,
+      "name": "",
+      "overrides": {},
+      "slugs": [
+        "558008ab185c"
+      ],
+      "workspace_mode_recommended": false
+    }
+  ],
+  "prompt_body": "You own {{ issue.identifier }} — {{ issue.title }}. Current state: {{ issue.state }}."
+}

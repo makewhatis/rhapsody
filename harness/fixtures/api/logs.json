@@ -1,0 +1,318 @@
+{
+  "entries": [
+    {
+      "attrs": {
+        "addr": "127.0.0.1:<PORT>"
+      },
+      "level": "INFO",
+      "msg": "observability server listening",
+      "seq": 1,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "assignee": "symphony-stub",
+        "email": "",
+        "id": "usr_stub"
+      },
+      "level": "INFO",
+      "msg": "linear: candidate filter bound to key owner",
+      "seq": 2,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "retention_days": "30"
+      },
+      "level": "INFO",
+      "msg": "pruned old history",
+      "seq": 3,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "stall_timeout": "5m0s"
+      },
+      "level": "WARN",
+      "msg": "CPU-based liveness unavailable (no readable /proc); stall detection will not fire",
+      "seq": 4,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "path": "<HOME>/symphony.db"
+      },
+      "level": "INFO",
+      "msg": "durable history store open",
+      "seq": 5,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "0",
+        "issue_id": "iss_1",
+        "issue_identifier": "RHA-1",
+        "project_slug": "558008ab185c",
+        "run_id": "1"
+      },
+      "level": "INFO",
+      "msg": "dispatching issue",
+      "seq": 6,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "false",
+        "turn": "1"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 7,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "2"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 8,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "3"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 9,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "4"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 10,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "5"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 11,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "6"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 12,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "7"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 13,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "8"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 14,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "9"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 15,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "10"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 16,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "11"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 17,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "12"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 18,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "13"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 19,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "14"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 20,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "15"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 21,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "16"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 22,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "17"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 23,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "18"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 24,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "19"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 25,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "attempt": "-1",
+        "issue": "RHA-1",
+        "resume": "true",
+        "turn": "20"
+      },
+      "level": "INFO",
+      "msg": "agent turn start",
+      "seq": 26,
+      "time": "<TIMESTAMP>"
+    },
+    {
+      "attrs": {
+        "issue_id": "iss_1",
+        "issue_identifier": "RHA-1",
+        "last_state": "Todo",
+        "run_id": "1",
+        "session_id": "fake-claude-session-20",
+        "snapshot_state": "Todo"
+      },
+      "level": "INFO",
+      "msg": "worker completed",
+      "seq": 27,
+      "time": "<TIMESTAMP>"
+    }
+  ]
+}

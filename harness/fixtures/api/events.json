@@ -1,0 +1,724 @@
+{
+  "hits": [
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 80,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 79,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 78,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 77,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 76,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 75,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 74,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 73,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 72,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 71,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 70,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 69,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 68,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 67,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 66,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 65,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 64,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 63,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 62,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 61,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 60,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 59,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 58,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 57,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 56,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 55,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 54,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 53,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 52,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 51,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 50,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 49,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 48,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 47,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 46,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 45,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 44,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 43,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 42,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 41,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 40,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 39,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 38,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 37,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 36,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 35,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 34,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 33,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 32,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 31,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 30,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 29,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 28,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 27,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 26,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 25,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 24,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 23,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 22,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 21,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 20,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 19,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 18,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 17,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 16,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 15,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 14,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 13,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 12,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 11,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 10,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 9,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 8,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 7,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 6,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 5,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 4,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 3,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "text",
+      "run_id": 1,
+      "seq": 2,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "issue_identifier": "RHA-1",
+      "kind": "event",
+      "run_id": 1,
+      "seq": 1,
+      "text": "session started",
+      "tool": ""
+    }
+  ]
+}

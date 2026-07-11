@@ -1,0 +1,486 @@
+{
+  "entries": [
+    {
+      "kind": "event",
+      "seq": 1,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 2,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 3,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 4,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 5,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 6,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 7,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 8,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 9,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 10,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 11,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 12,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 13,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 14,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 15,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 16,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 17,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 18,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 19,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 20,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 21,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 22,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 23,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 24,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 25,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 26,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 27,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 28,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 29,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 30,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 31,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 32,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 33,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 34,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 35,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 36,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 37,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 38,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 39,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 40,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 41,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 42,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 43,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 44,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 45,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 46,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 47,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 48,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 49,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 50,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 51,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 52,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 53,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 54,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 55,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 56,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 57,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 58,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 59,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 60,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 61,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 62,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 63,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 64,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 65,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 66,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 67,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 68,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 69,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 70,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 71,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 72,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 73,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 74,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 75,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 76,
+      "text": "turn completed",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 77,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 78,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "text",
+      "seq": 79,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "kind": "event",
+      "seq": 80,
+      "text": "turn completed",
+      "tool": ""
+    }
+  ],
+  "generated_at": "<TIMESTAMP>",
+  "run_id": 1
+}

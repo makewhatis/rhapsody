@@ -1,0 +1,33 @@
+{
+  "events": [
+    {
+      "at": "<TIMESTAMP>",
+      "kind": "event",
+      "seq": 1,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "kind": "text",
+      "seq": 2,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "kind": "text",
+      "seq": 3,
+      "text": "fake-claude: finishing smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "kind": "event",
+      "seq": 4,
+      "text": "turn failed: error_during_execution",
+      "tool": ""
+    }
+  ],
+  "run_id": 1
+}

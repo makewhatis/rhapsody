@@ -1,0 +1,275 @@
+{
+  "attempt": 0,
+  "ended_at": "<TIMESTAMP>",
+  "error": "",
+  "generated_at": "<TIMESTAMP>",
+  "input_tokens": 20,
+  "issue_id": "iss_1",
+  "issue_identifier": "RHA-1",
+  "issue_state": "",
+  "last_codex_event": "",
+  "last_event_at": "",
+  "live": false,
+  "outcome": "continued",
+  "output_tokens": 20,
+  "project": "558008ab185c",
+  "recent_events": [
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: finishing smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "turn completed"
+    }
+  ],
+  "repo": "",
+  "run_id": 1,
+  "started_at": "<TIMESTAMP>",
+  "title": "Smoke issue",
+  "total_tokens": 40,
+  "turn_count": 20,
+  "usage_estimated": false
+}

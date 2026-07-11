@@ -1,0 +1,40 @@
+{
+  "attempt": 0,
+  "ended_at": "<TIMESTAMP>",
+  "error": "turn_timeout: turn exceeded 3s",
+  "generated_at": "<TIMESTAMP>",
+  "input_tokens": 0,
+  "issue_id": "iss_1",
+  "issue_identifier": "RHA-1",
+  "issue_state": "",
+  "last_codex_event": "",
+  "last_event_at": "",
+  "live": false,
+  "outcome": "failed",
+  "output_tokens": 0,
+  "project": "558008ab185c",
+  "recent_events": [
+    {
+      "at": "<TIMESTAMP>",
+      "event": "event",
+      "message": "session started"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: starting smoke run"
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "event": "text",
+      "message": "fake-claude: hanging (FAKE_CLAUDE_HANG=1)"
+    }
+  ],
+  "repo": "",
+  "run_id": 1,
+  "started_at": "<TIMESTAMP>",
+  "title": "Hang smoke issue",
+  "total_tokens": 0,
+  "turn_count": 1,
+  "usage_estimated": false
+}

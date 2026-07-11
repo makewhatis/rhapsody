@@ -1,0 +1,181 @@
+{
+  "config": {
+    "agent": {
+      "backend": "claude",
+      "max_concurrent_agents": 1
+    },
+    "claude": {
+      "command": "<HOME>/bin/fake-claude"
+    },
+    "git_flow": "graphite",
+    "mcp": {
+      "enabled": false
+    },
+    "otel": {
+      "enabled": false
+    },
+    "polling": {
+      "interval_ms": 500
+    },
+    "server": {
+      "port": 0
+    },
+    "storage": {
+      "path": "<HOME>/symphony.db"
+    },
+    "tracker": {
+      "active_states": [
+        "Todo",
+        "In Progress"
+      ],
+      "api_key": "stub-key",
+      "dep_mode_prompt_file": ".symphony/PROMPT.dep_mod.md",
+      "dependency_mode": "graphite",
+      "endpoint": "http://127.0.0.1:<PORT>/graphql",
+      "kind": "linear",
+      "project_slug": "558008ab185c",
+      "review_promote_state": "In Progress",
+      "review_states": [
+        "In Review"
+      ],
+      "terminal_states": [
+        "Done",
+        "Canceled"
+      ]
+    }
+  },
+  "generated_at": "<TIMESTAMP>",
+  "global": {
+    "active_states": [
+      "Todo",
+      "In Progress"
+    ],
+    "agent": {
+      "backend": "claude",
+      "max_concurrent_agents": 1,
+      "max_retry_backoff_ms": 300000,
+      "max_turns": 20
+    },
+    "canceled_states": [
+      "Cancelled",
+      "Canceled",
+      "Duplicate"
+    ],
+    "claim_mode": "",
+    "claude": {
+      "billing_guard": true,
+      "command": "<HOME>/bin/fake-claude",
+      "effort": "",
+      "mcp_config": "",
+      "model": "",
+      "permission_mode": "bypassPermissions",
+      "read_timeout_ms": 5000,
+      "stall_timeout_ms": 300000,
+      "turn_timeout_ms": 3600000,
+      "ultracode": false
+    },
+    "dep_mode_prompt_file": ".symphony/PROMPT.dep_mod.md",
+    "dependency_mode": "graphite",
+    "git_flow": "graphite",
+    "github_summons": false,
+    "labels": null,
+    "logging": {
+      "dir": "~/.symphony/logs"
+    },
+    "mcp": {
+      "allow_resume": false,
+      "allow_send_message": true,
+      "allow_stop": false,
+      "enabled": false
+    },
+    "milestone": "",
+    "otel": {
+      "enabled": false,
+      "endpoint": "https://otel-symphony.ops-oma-prod.makewhat.is",
+      "insecure": false,
+      "protocol": "http",
+      "service_name": "symphony"
+    },
+    "polling": {
+      "interval_ms": 500
+    },
+    "prompt": "Work {{ issue.identifier }} on a Graphite stack: {{ issue.title }}.",
+    "prompt_file": "",
+    "repo": "",
+    "review_promote_state": "In Progress",
+    "review_states": [
+      "In Review"
+    ],
+    "server": {
+      "port": 0
+    },
+    "storage": {
+      "path": "<HOME>/symphony.db",
+      "retention_days": null
+    },
+    "summon_token": "@symphony",
+    "terminal_states": [
+      "Done",
+      "Canceled"
+    ],
+    "tracker": {
+      "api_key_set": true,
+      "endpoint": "http://127.0.0.1:<PORT>/graphql",
+      "kind": "linear"
+    },
+    "workspace": {
+      "root": ""
+    },
+    "workspace_mode": ""
+  },
+  "projects": [
+    {
+      "effective": {
+        "active_states": [
+          "Todo",
+          "In Progress"
+        ],
+        "canceled_states": [
+          "Cancelled",
+          "Canceled",
+          "Duplicate"
+        ],
+        "claim_mode": "assignee",
+        "dep_mode_prompt_file": ".symphony/PROMPT.dep_mod.md",
+        "dependency_mode": "graphite",
+        "effort": "",
+        "enabled": true,
+        "git_flow": "graphite",
+        "labels": null,
+        "max_concurrent_agents": 0,
+        "milestone": "",
+        "model": "",
+        "name": "558008ab185c",
+        "permission": "bypassPermissions",
+        "prompt": "Work {{ issue.identifier }} on a Graphite stack: {{ issue.title }}.",
+        "prompt_file": "",
+        "repo": "",
+        "review_promote_state": "In Progress",
+        "review_states": [
+          "In Review"
+        ],
+        "stall_timeout_ms": 300000,
+        "terminal_states": [
+          "Done",
+          "Canceled"
+        ],
+        "turn_timeout_ms": 3600000,
+        "ultracode": false,
+        "workspace_mode": "worktree"
+      },
+      "enabled": true,
+      "name": "",
+      "overrides": {},
+      "slugs": [
+        "558008ab185c"
+      ],
+      "workspace_mode_recommended": true
+    }
+  ],
+  "prompt_body": "Work {{ issue.identifier }} on a Graphite stack: {{ issue.title }}."
+}

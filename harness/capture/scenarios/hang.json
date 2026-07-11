@@ -1,0 +1,7 @@
+{
+  "viewer": { "id": "usr_stub", "name": "symphony-stub" },
+  "project": { "id": "proj_stub", "name": "Rhapsody", "slugId": "558008ab185c" },
+  "issues": [
+    { "id": "iss_1", "identifier": "RHA-1", "title": "Hang smoke issue", "description": "Hang with no output to exercise the stall timeout.", "state": "Todo", "labels": [], "blockedBy": [] }
+  ]
+}

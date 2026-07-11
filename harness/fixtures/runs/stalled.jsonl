@@ -1,0 +1,26 @@
+{
+  "events": [
+    {
+      "at": "<TIMESTAMP>",
+      "kind": "event",
+      "seq": 1,
+      "text": "session started",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "kind": "text",
+      "seq": 2,
+      "text": "fake-claude: starting smoke run",
+      "tool": ""
+    },
+    {
+      "at": "<TIMESTAMP>",
+      "kind": "text",
+      "seq": 3,
+      "text": "fake-claude: hanging (FAKE_CLAUDE_HANG=1)",
+      "tool": ""
+    }
+  ],
+  "run_id": 1
+}

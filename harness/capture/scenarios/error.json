@@ -1,0 +1,7 @@
+{
+  "viewer": { "id": "usr_stub", "name": "symphony-stub" },
+  "project": { "id": "proj_stub", "name": "Rhapsody", "slugId": "558008ab185c" },
+  "issues": [
+    { "id": "iss_1", "identifier": "RHA-1", "title": "Error smoke issue", "description": "Exit with an error to exercise the failure/retry path.", "state": "Todo", "labels": [], "blockedBy": [] }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "next_offset": null,
+  "runs": [
+    {
+      "attempt": 0,
+      "branch": "",
+      "ended_at": "<TIMESTAMP>",
+      "error": "",
+      "id": 1,
+      "input_tokens": 20,
+      "issue_id": "iss_1",
+      "issue_identifier": "RHA-1",
+      "outcome": "continued",
+      "output_tokens": 20,
+      "project_slug": "558008ab185c",
+      "repo": "",
+      "session_uuid": "",
+      "started_at": "<TIMESTAMP>",
+      "team_id": "team_stub",
+      "title": "Smoke issue",
+      "total_tokens": 40,
+      "transcript_path": "<HOME>/.symphony/logs/RHA-1/<TIMESTAMP>-1.jsonl",
+      "turns": 20,
+      "usage_estimated": false
+    }
+  ]
+}

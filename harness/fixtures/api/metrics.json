@@ -1,0 +1,11 @@
+{
+  "days": [
+    {
+      "completed": 0,
+      "date": "<TIMESTAMP>",
+      "failed": 0,
+      "runs": 1,
+      "total_tokens": 40
+    }
+  ]
+}
