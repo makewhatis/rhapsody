@@ -15,8 +15,16 @@ serde = { version = "1", features = ["derive"] }
 # parser matches gopkg.in/yaml.v3 map/seq/scalar semantics used by WORKFLOW.md.
 # (Choice justified in the C2 PR body.)
 serde_yaml_ng = "0.10"
+# serde_json powers the `effective_json` view (C6): the plan's `render(..) -> serde_json::Value`
+# reproduces the Go `GET /api/v1/config` JSON shape (P6 reuses this module).
+serde_json = "1"
 thiserror = "1"
 chrono = "0.4"
+
+[dev-dependencies]
+# Golden parity assertions for the effective-config view (C6): load the committed fixtures and
+# apply the shared `normalize` rules (Task R5).
+harness-fixtures = { path = "../harness-fixtures" }
 
 [lints]
 workspace = true

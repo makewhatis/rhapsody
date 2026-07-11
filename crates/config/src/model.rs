@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use chrono::Duration;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 
 /// The internal fleet-observability hub the daemon exports telemetry to when
@@ -304,13 +304,17 @@ pub struct Config {
 // Raw front-matter model (Go `raw` and friends)
 // ---------------------------------------------------------------------------
 //
-// Deserialization mirror of the YAML front matter. Every field is `#[serde(default)]`
-// (container-level) so an absent key lands on its zero value, exactly like Go's yaml.v3
-// unmarshal into a struct. Default-sensitive fields are `Option<T>` (Go's `*int`/`*bool`)
-// so `decode` can tell unset from an explicit zero/false. Unknown keys are ignored (no
-// `deny_unknown_fields`), matching yaml.v3.
+// (De)serialization mirror of the YAML front matter — the SAME tree serves both directions,
+// exactly as Go reuses its `raw` struct for `Decode` (unmarshal) and `Encode` (marshal). On the
+// read path every field is `#[serde(default)]` (container-level) so an absent key lands on its
+// zero value, like yaml.v3 unmarshal into a struct. On the write path (Task C6 `encode`) the
+// derived `Serialize` emits EVERY field (no `skip_serializing_if`, mirroring the Go `raw` tags
+// which carry no `omitempty`); `encode::prune_empty` does all the trimming afterwards. Default-
+// sensitive fields are `Option<T>` (Go's `*int`/`*bool`) so `decode` can tell unset from an
+// explicit zero/false and `encode` can drop an unset knob (null) while keeping an explicit
+// zero/false. Unknown keys are ignored (no `deny_unknown_fields`), matching yaml.v3.
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct Raw {
     pub tracker: RawTracker,
@@ -333,7 +337,7 @@ pub(crate) struct Raw {
     pub projects: Vec<RawProject>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawTracker {
     pub kind: String,
@@ -357,20 +361,20 @@ pub(crate) struct RawTracker {
     pub claim_settle_delay: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawPolling {
     pub interval_ms: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawWorkspace {
     pub root: String,
 }
 
 /// Mirrors both Go `raw.Hooks` (top level) and `rawHooks` (per project) — identical schema.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawHooks {
     pub after_create: String,
@@ -380,7 +384,7 @@ pub(crate) struct RawHooks {
     pub timeout_ms: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawAgent {
     pub backend: String,
@@ -392,7 +396,7 @@ pub(crate) struct RawAgent {
     pub max_concurrent_agents_by_state: HashMap<String, Value>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawCodex {
     pub command: String,
@@ -404,7 +408,7 @@ pub(crate) struct RawCodex {
     pub stall_timeout_ms: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawClaude {
     pub command: String,
@@ -424,26 +428,26 @@ pub(crate) struct RawClaude {
     pub ultracode: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawServer {
     pub port: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawLogging {
     pub dir: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawStorage {
     pub path: String,
     pub retention_days: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawOtel {
     pub enabled: Option<bool>,
@@ -455,7 +459,7 @@ pub(crate) struct RawOtel {
     pub operator: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawMcp {
     pub enabled: Option<bool>,
@@ -464,7 +468,7 @@ pub(crate) struct RawMcp {
     pub allow_resume: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawProject {
     pub name: String,
@@ -489,7 +493,7 @@ pub(crate) struct RawProject {
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawClaudeOverride {
     pub command: Option<String>,

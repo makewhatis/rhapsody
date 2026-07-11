@@ -11,6 +11,8 @@
 //! validated) [`Config`].
 
 pub mod decode;
+pub mod effective_json;
+pub mod encode;
 pub mod model;
 pub mod projects;
 pub mod prompt;
@@ -19,6 +21,7 @@ pub mod validate;
 pub mod workflow;
 
 pub use decode::{ConfigError, decode};
+pub use encode::encode;
 pub use model::{
     Agent, CLAIM_MODE_ASSIGNEE, CLAIM_MODE_POOL, Claude, ClaudeOverride, Codex, Config,
     DEFAULT_DEP_MODE_PROMPT_FILE, DEFAULT_OTEL_ENDPOINT, DEPENDENCY_MODE_DAG,

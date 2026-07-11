@@ -730,9 +730,11 @@ name = "rhapsody-config"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "harness-fixtures",
  "liquid",
  "rhapsody-core",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror 1.0.69",
 ]
