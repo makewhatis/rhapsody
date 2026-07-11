@@ -1162,6 +1162,18 @@ version = "0.1.0"
 [[package]]
 name = "rhapsody-orchestrator"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "rhapsody-agent",
+ "rhapsody-config",
+ "rhapsody-core",
+ "rhapsody-tracker",
+ "rhapsody-workspace",
+ "serde_yaml_ng",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "rhapsody-store"

@@ -5,5 +5,31 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+rhapsody-core = { path = "../core" }
+rhapsody-config = { path = "../config" }
+rhapsody-tracker = { path = "../tracker" }
+rhapsody-workspace = { path = "../workspace" }
+rhapsody-agent = { path = "../agent" }
+# chrono: the orchestrator's clock (`now`), retry due-times, and the effective stall-timeout
+# duration — the Rust mirror of Go's `time` package. Anticipated by the P5 plan's dep set.
+chrono = "0.4"
+# thiserror: `OrchestratorError`'s typed variants (Display strings are the observable contract),
+# mirroring the Go package's sentinel errors. Anticipated by the P5 plan's dep set.
+thiserror = "2"
+# tracing: the effective builder's best-effort warn diagnostics (Go logs these via `slog`; the
+# workspace convention is `tracing`, as the sibling crates record). Anticipated by the P5 plan.
+tracing = "0.1"
+# regex: ghsummons `parse_repo` mirrors Go `ghsummons.ParseRepo`'s single compiled remote-URL
+# pattern. Already in the workspace tree (rhapsody-core / rhapsody-tracker depend on it), so no new
+# crate enters Cargo.lock.
+regex = "1"
+
+[dev-dependencies]
+# serde_yaml_ng: the effective tests parse WORKFLOW.md front matter into the config crate's
+# `YamlMap` (the same helper the config crate's own tests use), mirroring Go `effective_test.go`'s
+# `decodeCfg`. Already in Cargo.lock (a rhapsody-config dependency) — no new crate enters the tree.
+serde_yaml_ng = "0.10"
+
 [lints]
 workspace = true
