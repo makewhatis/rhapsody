@@ -10,7 +10,10 @@
 //! the fields its behavior needs.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use chrono::{DateTime, Utc};
 use rhapsody_core::normalize_state;
@@ -214,6 +217,34 @@ pub struct Orchestrator {
     /// share it. Mirrors Go `pstore` (Go additionally guards it with `storeMu` for those off-loop
     /// reads, which arrive in P6; O2's access is control-task-confined, so it needs no lock).
     pub store: Arc<dyn Store + Send + Sync>,
+
+    /// Account-level tracker plus resolved key backing the read-only Linear surfaces (the Settings
+    /// identity endpoint and the add-agent projects picker, INF-224), which the future P6 HTTP path
+    /// serves OFF the control loop. Unlike the loop-confined scheduling state, these are read
+    /// concurrently by HTTP tasks while the reload path ([`Orchestrator::set_reads_target`], O7)
+    /// swaps them, so they sit behind an [`RwLock`] (Go `readsMu` guarding
+    /// `readsTracker`/`readsAPIKey`). Empty until the first config load — the reads helpers surface
+    /// [`crate::reads::ReadsError::ConfigNotLoaded`] until then.
+    pub(crate) reads: RwLock<crate::reads::ReadsTarget>,
+
+    /// The async event-writer feed (Phase 4 §3.1): coarse per-event history rows are handed to the
+    /// batched writer thread through this bounded channel. A full buffer SHEDS the event (counted in
+    /// [`Orchestrator::dropped`]) rather than block the control task — the raw `.jsonl` transcript on
+    /// disk stays the lossless record. `None` once [`stop_event_writer`](Orchestrator::stop_event_writer)
+    /// drops the sender to close the channel. Mirrors Go `storeEvents` (a buffered `chan storeEventWrite`).
+    pub(crate) store_events_tx: Option<SyncSender<crate::persist::StoreEventWrite>>,
+    /// The receive end, held until [`start_event_writer`](Orchestrator::start_event_writer) hands it
+    /// to the writer thread. Wrapped in a `Mutex` solely so the `Orchestrator` stays `Sync` for the
+    /// off-loop HTTP path (a bare [`Receiver`] is `!Sync`); it is taken exactly once, on the control
+    /// task. Go keeps no separate handle — its writer goroutine ranges the channel directly.
+    pub(crate) store_events_rx: Mutex<Option<Receiver<crate::persist::StoreEventWrite>>>,
+    /// The event-writer thread handle, set by [`start_event_writer`](Orchestrator::start_event_writer)
+    /// and joined by [`stop_event_writer`](Orchestrator::stop_event_writer). Go coordinates the same
+    /// lifecycle with `writerWG` + `writerOnce`.
+    pub(crate) writer_handle: Option<JoinHandle<()>>,
+    /// Count of history events shed because [`Orchestrator::store_events_tx`] was full when the control
+    /// task tried to enqueue them (the enqueue never blocks the loop). Mirrors Go `dropped`.
+    pub(crate) dropped: AtomicI64,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -251,6 +282,11 @@ impl Orchestrator {
     /// real store is injected (Go defaults `pstore` to `store.Noop()`), keeping every store call site
     /// guard-free.
     pub fn new(workflow_path: impl Into<String>) -> Orchestrator {
+        // The event feed is created up front (Go makes `storeEvents` in `New`) so `enqueue_event`
+        // works before the writer starts — a full/unwatched buffer just sheds events; the writer
+        // thread is spawned later by `start_event_writer`.
+        let (store_events_tx, store_events_rx) =
+            std::sync::mpsc::sync_channel(crate::persist::EVENT_BUF_CAP);
         Orchestrator {
             workflow_path: workflow_path.into(),
             now: Box::new(Utc::now),
@@ -263,6 +299,11 @@ impl Orchestrator {
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
             store: Arc::new(store::Noop),
+            reads: RwLock::new(crate::reads::ReadsTarget::default()),
+            store_events_tx: Some(store_events_tx),
+            store_events_rx: Mutex::new(Some(store_events_rx)),
+            writer_handle: None,
+            dropped: AtomicI64::new(0),
         }
     }
 

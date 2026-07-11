@@ -19,6 +19,7 @@
 //!     field (O1) and the worker's `on_transcript` callback (O3) are already in place.
 
 use rhapsody_agent as agent;
+use rhapsody_store as store;
 
 use crate::orchestrator::{EventRecord, Orchestrator};
 
@@ -121,28 +122,39 @@ impl Orchestrator {
             }
         }
 
-        // Go captures a coarse history event (`enqueueEvent`) here and, on turn boundaries, writes
-        // per-turn progress (`persistProgress`) — both O4 store writes. O3 advances the monotonic
-        // per-run `event_seq` (so O4's history writer inherits a correct sequence) and keeps the
-        // `cur_*` turn-boundary reset, which is loop-confined state, not persistence.
+        // Phase 4: capture a coarse history event (async, non-blocking — this runs ON the control
+        // task, so `enqueue_event` never blocks) and, on turn boundaries, write per-turn progress
+        // synchronously. Both no-op when `re.run_id == 0` (store disabled). O3 advanced the monotonic
+        // per-run `event_seq` and left these two store writes for O4 (`persist.rs`); they land here.
         re.event_seq += 1;
-        if e.ev.event_type == agent::EVENT_TURN_COMPLETED
-            || e.ev.event_type == agent::EVENT_TURN_FAILED
-        {
+        let event_row = store::EventRow {
+            seq: re.event_seq,
+            at: crate::persist::rfc3339(re.last_event_at),
+            kind: crate::persist::map_kind(&e.ev),
+            tool: crate::persist::map_tool(&e.ev),
+            text: crate::persist::map_text(&e.ev),
+        };
+        let run_id = re.run_id;
+        let turn_boundary = e.ev.event_type == agent::EVENT_TURN_COMPLETED
+            || e.ev.event_type == agent::EVENT_TURN_FAILED;
+        if turn_boundary && e.ev.usage.is_some() {
             // Reset the live per-call estimate ONLY when this terminal event committed an
             // authoritative result usage (u.is_some() above). The committed total then supersedes the
             // in-flight estimate, so a continuation turn never displays a previous turn's stale cur_*.
             //
             // When the terminal event carried NO usage (the timeout turn_failed — runner.rs),
-            // PRESERVE cur_*: it is the only token signal for this turn, and O4's persistEndRun uses
-            // it as a floor so the run isn't recorded as 0 (INF-208). This cannot leak into a later
-            // turn on the same entry: runTurns returns on any non-result turn, so a no-usage terminal
-            // event always ends the run — there is no next turn here.
-            if e.ev.usage.is_some() {
-                re.cur_input_tokens = 0;
-                re.cur_output_tokens = 0;
-                re.cur_total_tokens = 0;
-            }
+            // PRESERVE cur_*: it is the only token signal for this turn, and O4's `persist_end_run`
+            // uses it as a floor so the run isn't recorded as 0 (INF-208). This cannot leak into a
+            // later turn on the same entry: runTurns returns on any non-result turn, so a no-usage
+            // terminal event always ends the run — there is no next turn here.
+            re.cur_input_tokens = 0;
+            re.cur_output_tokens = 0;
+            re.cur_total_tokens = 0;
+        }
+        // The `&mut re` borrow ends here; the `&self` store writes follow (a re-borrow for progress).
+        self.enqueue_event(run_id, event_row);
+        if turn_boundary && let Some(re) = self.running.get(&e.issue_id) {
+            self.persist_progress(re);
         }
     }
 }

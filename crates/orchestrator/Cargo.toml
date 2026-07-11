@@ -35,8 +35,18 @@ regex = "1"
 # needs `sync` to name `tokio::sync::mpsc::Receiver`. The control-loop runtime is O7's. Anticipated by
 # the P5 plan's dep set; already in Cargo.lock (agent/workspace/tracker depend on it).
 tokio = { version = "1", features = ["sync", "time"] }
+# serde_json powers the O4 `snapshot_json` view — the `/api/v1/state` wire render (`render(&Snapshot)
+# -> serde_json::Value`, mirroring Go httpapi `toStateJSON`). Following the config crate's
+# `effective_json` convention, the domain crate owns its wire view + parity gate and P6 reuses it
+# rather than reimplementing the serialization. `serde` is in the P5 plan's anticipated dep set;
+# `serde_json` (its JSON codec) is already in Cargo.lock via config/store — no new crate enters the tree.
+serde_json = "1"
 
 [dev-dependencies]
+# harness-fixtures (test-only): the O4 snapshot-shape cross-check renders a snapshot through
+# `snapshot_json`, normalizes it, and asserts byte-equality with the committed `api/state.json`
+# fixture — the same golden pattern the config crate's `tests/golden.rs` uses. Already in Cargo.lock.
+harness-fixtures = { path = "../harness-fixtures" }
 # serde_yaml_ng: the effective tests parse WORKFLOW.md front matter into the config crate's
 # `YamlMap` (the same helper the config crate's own tests use), mirroring Go `effective_test.go`'s
 # `decodeCfg`. Already in Cargo.lock (a rhapsody-config dependency) — no new crate enters the tree.
@@ -48,9 +58,11 @@ serde_yaml_ng = "0.10"
 # Cargo.lock, so no new crate enters the tree.
 tracing-subscriber = "0.3"
 # tokio (test-only extras): the `macros` + `rt` features power `#[tokio::test]` and the `tokio::join!`
-# the claim-contention test uses to race two daemons; the `time` feature is inherited from the
-# non-dev dependency above. Already in Cargo.lock.
-tokio = { version = "1", features = ["macros", "rt"] }
+# the claim-contention test uses to race two daemons; `rt-multi-thread` powers the O4 reads-target
+# race test (`reads.rs`), which mirrors Go's `-race` `TestReadsTargetRace` by driving the `RwLock`
+# guard from real parallel tasks (the same pattern the workspace crate's repo race tests use). The
+# `time` feature is inherited from the non-dev dependency above. Already in Cargo.lock.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true
