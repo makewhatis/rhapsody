@@ -10,6 +10,8 @@
 
 use crate::client::{Client, FacadeError};
 use chrono::{DateTime, Utc};
+use rhapsody_config::Config;
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
@@ -39,19 +41,44 @@ impl Options {
 }
 
 /// The `symphony mcp` facade server: a thin client of the daemon's loopback API. Built by
-/// [`Facade::new`]; served over stdio by [`Facade::run_stdio`]. Mirrors Go's `NewServer` — read
-/// tools are always registered (the config-gated write tools land in M2).
+/// [`Facade::new`]; served over stdio by [`Facade::run_stdio`]. Mirrors Go's `NewServer` — the
+/// always-on read tools plus the derived `symphony_run_status`, and the opt-in write tools when
+/// enabled in `cfg.mcp`.
 pub struct Facade {
-    client: Client,
-    opts: Options,
+    pub(crate) client: Client,
+    pub(crate) opts: Options,
+    /// The resolved tool set — always-on reads + the `cfg.mcp`-gated writes — built once in
+    /// [`Facade::new`] and consulted by the `#[tool_handler]` list/call/get plumbing.
+    tool_router: ToolRouter<Facade>,
 }
 
-#[tool_router]
+#[tool_router(router = read_router)]
 impl Facade {
-    /// Builds the facade over a resolved [`Client`] and "me" [`Options`] (server.go's `NewServer`,
-    /// read side).
-    pub fn new(client: Client, opts: Options) -> Self {
-        Self { client, opts }
+    /// Builds the `symphony mcp` server: always-on read tools plus the derived `symphony_run_status`,
+    /// and — when enabled in `cfg.mcp` — the opt-in write tools (`registerWriteTools`). The mirror of
+    /// Go's `NewServer(cfg, c, opts)`. A disabled write tool is not registered at all (invisible, per
+    /// the design's "the gate is the enabled-tool set").
+    pub fn new(cfg: &Config, client: Client, opts: Options) -> Self {
+        // Reads are always present; the writes (registered by [`crate::writes`]) are gated per
+        // `cfg.mcp` by REMOVING each disabled tool from the merged router — so a disabled tool is
+        // absent from `list_tools` and rejected on call (writes.go: "not registered at all"), rather
+        // than surfacing a runtime permission-denied.
+        let mut tool_router = Self::read_router();
+        tool_router.merge(Self::write_router());
+        if !cfg.mcp.allow_send_message {
+            tool_router.remove_route("symphony_send_message");
+        }
+        if !cfg.mcp.allow_stop {
+            tool_router.remove_route("symphony_stop");
+        }
+        if !cfg.mcp.allow_resume {
+            tool_router.remove_route("symphony_resume");
+        }
+        Self {
+            client,
+            opts,
+            tool_router,
+        }
     }
 
     #[tool(
@@ -222,7 +249,7 @@ impl Facade {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Facade {
     /// The initialize handshake: implementation name/version + the tools capability (server.go's
     /// `mcp.Implementation{Name: "symphony", Version}`).
@@ -233,8 +260,9 @@ impl ServerHandler for Facade {
 }
 
 /// Wraps a raw JSON body as a successful (unstructured text) tool result — the daemon's JSON is the
-/// payload (server.go's `textResult`).
-fn text_result(body: &[u8]) -> CallToolResult {
+/// payload (server.go's `textResult`). `pub(crate)` so the write tools ([`crate::writes`]) share it,
+/// mirroring Go's package-private `textResult`.
+pub(crate) fn text_result(body: &[u8]) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(
         String::from_utf8_lossy(body).into_owned(),
     )])
@@ -242,13 +270,14 @@ fn text_result(body: &[u8]) -> CallToolResult {
 
 /// Surfaces a tool failure as an `IsError` result (NOT a protocol error), so the agent can see it
 /// and self-correct — the FacadeError code (e.g. `daemon_unreachable`) leads the message
-/// (server.go's `errResult`).
-fn err_result(err: &FacadeError) -> CallToolResult {
+/// (server.go's `errResult`). `pub(crate)` so the write tools ([`crate::writes`]) share it.
+pub(crate) fn err_result(err: &FacadeError) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(err.to_string())])
 }
 
-/// `v` when non-empty, else `def` (server.go's `orDefault`).
-fn or_default(v: &str, def: &str) -> String {
+/// `v` when non-empty, else `def` (server.go's `orDefault`). `pub(crate)` so the write tools' run-id
+/// defaulting ([`crate::writes`]) shares it.
+pub(crate) fn or_default(v: &str, def: &str) -> String {
     if v.is_empty() {
         def.to_string()
     } else {
@@ -328,12 +357,13 @@ fn hex_upper(nibble: u8) -> char {
 // --- tool argument structs (server.go's `*Args`) ----------------------------------------------
 // Every field is optional (Go `,omitempty`): `#[serde(default)]` so an empty `{}` deserializes.
 
-/// `symphony_run` args.
+/// `symphony_run` args — also reused by the `symphony_stop` / `symphony_resume` write tools
+/// ([`crate::writes`]), exactly as Go's `runArgs` is shared across server.go and writes.go.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
-struct RunArgs {
+pub(crate) struct RunArgs {
     /// the run id (numeric). Defaults to SYMPHONY_RUN_ID (the worker's own run) when omitted.
     #[serde(default)]
-    run_id: String,
+    pub(crate) run_id: String,
 }
 
 /// `symphony_ticket` args.
@@ -398,7 +428,7 @@ mod tests {
     //! `TestRunStatusExplicitIssueBeatsEnvRunID` from status_test.go), driven through an in-memory
     //! MCP client over a tokio duplex — the analogue of Go's `mcp.NewInMemoryTransports()`.
     use super::*;
-    use crate::testutil::spawn_router;
+    use crate::testutil::{spawn_router, test_config};
     use crate::verdict::{KIND_ALIVE, KIND_NOT_DISPATCHED, Status};
     use axum::Router;
     use axum::routing::any;
@@ -434,7 +464,7 @@ mod tests {
     // The always-on read tools + the derived run_status are registered regardless of config.
     #[tokio::test]
     async fn read_tools_always_registered() {
-        let facade = Facade::new(Client::for_port(0), Options::default());
+        let facade = Facade::new(&test_config(), Client::for_port(0), Options::default());
         let client = connect(facade).await;
         let tools = client.list_all_tools().await.expect("list tools");
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -459,7 +489,7 @@ mod tests {
     // (IsError text), not a protocol error.
     #[tokio::test]
     async fn read_tool_daemon_unreachable() {
-        let facade = Facade::new(Client::for_port(0), Options::default());
+        let facade = Facade::new(&test_config(), Client::for_port(0), Options::default());
         let client = connect(facade).await;
         let res = client
             .call_tool(call("symphony_state"))
@@ -492,6 +522,7 @@ mod tests {
         let port = spawn_router(router).await;
 
         let facade = Facade::new(
+            &test_config(),
             Client::for_port(port as i64),
             Options {
                 default_run_id: "7".into(),
@@ -531,6 +562,7 @@ mod tests {
         let port = spawn_router(router).await;
 
         let facade = Facade::new(
+            &test_config(),
             Client::for_port(port as i64),
             Options {
                 default_issue: "INF-404".into(),
@@ -573,6 +605,7 @@ mod tests {
 
         // DefaultRunID is set (worker "me" env), but the caller explicitly asks about a different issue.
         let facade = Facade::new(
+            &test_config(),
             Client::for_port(port as i64),
             Options {
                 default_run_id: "7".into(),

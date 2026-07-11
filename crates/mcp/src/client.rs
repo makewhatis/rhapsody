@@ -210,6 +210,57 @@ impl Client {
             .await?;
         serde_json::from_slice(&raw).map_err(|e| FacadeError::new("decode_error", e.to_string()))
     }
+
+    /// POST `/api/v1/runs/{id}/message` with a `{"text": …}` body, returning the raw 2xx body
+    /// (writes.go's `postMessage`). The id is path-escaped for consistency with the other
+    /// run-scoped handlers; `text` is JSON-encoded (serde escapes it), so arbitrary message text
+    /// can't corrupt the request body.
+    pub(crate) async fn post_message(
+        &self,
+        run_id: &str,
+        text: &str,
+    ) -> Result<Vec<u8>, FacadeError> {
+        let payload = serde_json::to_vec(&MessageBody { text })
+            .map_err(|e| FacadeError::new("encode_error", e.to_string()))?;
+        self.do_request(
+            reqwest::Method::POST,
+            &format!(
+                "/api/v1/runs/{}/message",
+                crate::server::path_escape(run_id)
+            ),
+            Some(payload),
+        )
+        .await
+    }
+
+    /// POST `/api/v1/runs/{id}/{action}` (stop|resume) with no body, returning the raw 2xx body —
+    /// the HTTP half of writes.go's `runAction`. (Go folds the empty-id guard and result-shaping
+    /// into that one `*Client` method; here they live in [`crate::server::Facade::run_action`] so
+    /// the client stays rmcp-free, matching M1's layering.) The id is path-escaped; `action` is a
+    /// fixed literal the caller supplies.
+    pub(crate) async fn post_action(
+        &self,
+        action: &str,
+        run_id: &str,
+    ) -> Result<Vec<u8>, FacadeError> {
+        self.do_request(
+            reqwest::Method::POST,
+            &format!(
+                "/api/v1/runs/{}/{}",
+                crate::server::path_escape(run_id),
+                action
+            ),
+            None,
+        )
+        .await
+    }
+}
+
+/// The `symphony_send_message` request body (writes.go's inline `map[string]string{"text": …}`),
+/// a typed serializable so the text is always JSON-escaped.
+#[derive(Serialize)]
+struct MessageBody<'a> {
+    text: &'a str,
 }
 
 /// Extracts the configured loopback port (0 when unset) — client.go's `portFromConfig`.

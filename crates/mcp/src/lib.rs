@@ -4,12 +4,13 @@
 //! port (`runtime.json` discovery) — the daemon stays the single source of truth; daemon down ⇒ a
 //! clear `daemon_unreachable` error.
 //!
-//! This phase (P6-M1) ships the always-on read tools (`symphony_state` / `_runs` / `_run` /
-//! `_ticket` / `_logs` / `_events` + the derived `_run_status`); the config-gated write tools land
-//! in M2.
+//! The always-on read tools (`symphony_state` / `_runs` / `_run` / `_ticket` / `_logs` / `_events` +
+//! the derived `_run_status`) ship alongside the config-gated write tools (`symphony_send_message`,
+//! default on; `symphony_stop` / `symphony_resume`, opt-in) — the latter registered per the `mcp:`
+//! config block (P6-M2).
 //!
 //! - [`Client`] — the loopback HTTP client (client.go).
-//! - [`Facade`] / [`Options`] — the rmcp server + "me" defaults (server.go); served by
+//! - [`Facade`] / [`Options`] — the rmcp server + "me" defaults (server.go + writes.go); served by
 //!   [`Facade::run_stdio`].
 //! - [`resolve_daemon_port`] — runtime.json → `server.port` discovery (mcp.go's `daemonPort`).
 //! - [`Status`] — the `symphony_run_status` verdict (verdict.go).
@@ -19,6 +20,7 @@ mod discovery;
 mod server;
 mod status;
 mod verdict;
+mod writes;
 
 #[cfg(test)]
 mod testutil;

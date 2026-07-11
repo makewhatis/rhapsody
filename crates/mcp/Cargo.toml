@@ -50,6 +50,10 @@ axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
 # harness-fixtures: loads the committed golden api fixtures the integration stub serves.
 harness-fixtures = { path = "../harness-fixtures" }
+# rhapsody-config (already a normal dependency): the integration test — a consumer of the public
+# `Facade::new(&Config, …)` surface — builds a defaulted Config to pass in, exactly as F1's cmd layer
+# will. Listed here too so it is linkable from the separate `tests/` crate. Not a new external dep.
+rhapsody-config = { path = "../config" }
 
 [lints]
 workspace = true

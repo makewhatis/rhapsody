@@ -13,6 +13,17 @@ use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 
+/// A defaulted [`rhapsody_config::Config`] for the facade constructor — the read tools ignore the
+/// `mcp:` write toggles, so `decode`'s defaults suffice (the analogue of Go's `&config.Config{}`).
+fn test_config() -> rhapsody_config::Config {
+    use rhapsody_config::workflow::{Definition, YamlMap};
+    rhapsody_config::decode(&Definition {
+        config: YamlMap::new(),
+        prompt_template: String::new(),
+    })
+    .expect("decode default workflow")
+}
+
 /// A route serving `body` as JSON (cloned per request so the handler stays `Fn`).
 fn fixture_route(body: String) -> axum::routing::MethodRouter {
     any(move || {
@@ -90,7 +101,11 @@ async fn call_tool(
 #[tokio::test]
 async fn read_tools_proxy_fixture_bodies() {
     let port = spawn_stub().await;
-    let facade = Facade::new(Client::for_port(port as i64), Options::default());
+    let facade = Facade::new(
+        &test_config(),
+        Client::for_port(port as i64),
+        Options::default(),
+    );
     let client = connect(facade).await;
 
     for (tool, fixture) in [
@@ -132,7 +147,11 @@ async fn read_tools_proxy_fixture_bodies() {
 #[tokio::test]
 async fn runs_merges_history_and_running() {
     let port = spawn_stub().await;
-    let facade = Facade::new(Client::for_port(port as i64), Options::default());
+    let facade = Facade::new(
+        &test_config(),
+        Client::for_port(port as i64),
+        Options::default(),
+    );
     let client = connect(facade).await;
 
     let res = call_tool(&client, "symphony_runs", serde_json::json!({})).await;
@@ -163,6 +182,7 @@ async fn run_status_composes_completed_from_fixtures() {
     let port = spawn_stub().await;
     // The "me" default run id resolves to run 1, exactly as a dispatched worker's env would.
     let facade = Facade::new(
+        &test_config(),
         Client::for_port(port as i64),
         Options {
             default_run_id: "1".into(),
@@ -193,7 +213,7 @@ async fn run_status_composes_completed_from_fixtures() {
 /// Daemon unreachable (no port) ⇒ every read tool returns a `daemon_unreachable` IsError result.
 #[tokio::test]
 async fn daemon_unreachable_when_no_port() {
-    let facade = Facade::new(Client::for_port(0), Options::default());
+    let facade = Facade::new(&test_config(), Client::for_port(0), Options::default());
     let client = connect(facade).await;
 
     let res = call_tool(&client, "symphony_state", serde_json::json!({})).await;
