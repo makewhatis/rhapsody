@@ -5,5 +5,29 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+rhapsody-core = { path = "../core" }
+# thiserror: the workspace layer surfaces ~15 typed error categories (errors.go sentinels), each
+# wrapped with formatted context (`fmt.Errorf("%w: …")`). thiserror's `#[error("…")]` is the clean
+# mirror of Go's sentinel-plus-wrap pattern and was anticipated by the P4 plan (Task W1 deps).
+thiserror = "2"
+# sha2: RepoKey is the first 24 hex chars of SHA-256 over the repo URL (repo.go). symphonyd ships as
+# a drop-in sidecar for the Go daemon and shares the on-disk workspace layout
+# (<root>/<RepoKey>/<key>), so RepoKey MUST be byte-identical to Go's crypto/sha256 — a real SHA-256
+# is required, not a stand-in hash. sha2 is the standard Rust implementation (hex is hand-rolled to
+# avoid an extra dep).
+sha2 = "0.10"
+# tokio: git and hooks are subprocesses (repo.go / hooks.go shell out via os/exec). The P4 spec
+# mandates tokio::process so the orchestrator (P5) can `.await` workspace provisioning; the per-repo
+# mirror mutex is held across the async git ops, so it is a tokio::sync::Mutex (matching the linear
+# adapter). Runtime features stay test-only (the library never spawns a runtime).
+tokio = { version = "1", default-features = false, features = ["process", "time", "sync", "rt"] }
+
+[dev-dependencies]
+# tokio (test-only): a multi-thread runtime for `#[tokio::test]`, which drives the async workspace
+# API; the concurrency mirrors (TestEnsureFromRepo_Concurrent*, TestRepoLock_Concurrent*) spawn many
+# tasks that must run in parallel to exercise the per-repo mutex.
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true
