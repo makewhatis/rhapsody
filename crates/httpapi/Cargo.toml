@@ -38,6 +38,26 @@ rhapsody-orchestrator = { path = "../orchestrator" }
 # carries the single `writeJSON` encode-failure log (Go `handlers.go`: "http: encode response
 # failed"). Already in Cargo.lock (orchestrator/tracker/workspace).
 tracing = "0.1"
+# rhapsody-store (H2): the read-side history types (`RunSummary`/`EventRow`/`EventHit`/`DayRollup`/
+# `RunFilter`/`EventQuery`) the history endpoints serve and the `Store` trait the H2 `HistoryStore`
+# narrows (Go's `httpapi` imports `internal/store` for exactly this). Workspace crate, already in
+# Cargo.lock — no external crate enters.
+rhapsody-store = { path = "../store" }
+# rhapsody-core (H2): the `Project`/`Viewer` the Linear read handlers serialize (Go's `core.Project`
+# / the viewer inside `orchestrator.Identity`). Workspace crate, already in Cargo.lock.
+rhapsody-core = { path = "../core" }
+# rhapsody-agent (H2): the humanized `LogEntry` the run-transcript endpoint shapes (Go `agent.LogEntry`).
+# Workspace crate, already in Cargo.lock.
+rhapsody-agent = { path = "../agent" }
+# chrono (H2): formats the run-detail/transcript `generated_at` (`time.Now()`) and the live run-detail
+# instants (`rfc3339OrEmpty`) — the same `DateTime<Utc>` clock the orchestrator snapshot uses. Already
+# in Cargo.lock (orchestrator/store/tracker).
+chrono = "0.4"
+# tokio-stream (H2): adapts the `/api/v1/logs/stream` SSE frames (an mpsc of byte frames) into the
+# `Stream` `axum::body::Body::from_stream` consumes — the analog of Go's manual `fmt.Fprintf`+`Flush`
+# loop. `wrappers::ReceiverStream` only (default features). NEW workspace dependency; tokio-family,
+# tracks the existing `tokio` version, minimal surface.
+tokio-stream = "0.1"
 
 [dev-dependencies]
 # harness-fixtures (test-only): the H1 state golden — the served `GET /api/v1/state` body,

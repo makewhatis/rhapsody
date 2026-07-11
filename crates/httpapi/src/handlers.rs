@@ -18,7 +18,8 @@ use crate::server::StateProvider;
 /// Bounds how long a `/state` request waits on the orchestrator control task. Mirrors Go
 /// `snapshotTimeout` (2s): the HTTP layer owns the deadline (Go wraps the request ctx), so even a
 /// wedged provider yields a prompt 503 rather than hanging the desktop supervisor's readiness poll.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+/// `pub(crate)` so the run-detail handler (H2), which also consults the snapshot, shares the deadline.
+pub(crate) const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `GET /healthz` — a cheap, state-free liveness/readiness probe for the desktop supervisor. Never
 /// touches orchestrator state, so it answers even before the first poll. Mirrors Go `handleHealthz`.
@@ -61,8 +62,8 @@ pub(crate) async fn handle_state(
 /// method, `None` when allowed. The routes are registered method-agnostically (`any`) so a mismatch
 /// reaches the handler and yields an explicit 405 rather than the SPA fallback swallowing it into a
 /// 404. HEAD is allowed — the server elides the response body for HEAD, so no handler change is
-/// needed. Mirrors Go `requireGET`.
-fn require_get(method: &Method) -> Option<Response> {
+/// needed. Mirrors Go `requireGET`. `pub(crate)` so every read handler (H2) shares the one guard.
+pub(crate) fn require_get(method: &Method) -> Option<Response> {
     if *method == Method::GET || *method == Method::HEAD {
         return None;
     }
@@ -103,7 +104,7 @@ mod tests {
     }
 
     async fn spawn(provider: FakeProvider) -> String {
-        spawn_router(new_handler(Arc::new(provider))).await
+        spawn_router(new_handler(Arc::new(provider), None)).await
     }
 
     async fn get_json(url: &str) -> (reqwest::StatusCode, Value) {

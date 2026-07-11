@@ -134,7 +134,11 @@ mod tests {
     struct EmptyDist;
 
     async fn spawn_with_dist<E: RustEmbed + 'static>() -> String {
-        let router = build_router(Arc::new(FakeProvider::ok(empty_snapshot())), serve_web::<E>);
+        let router = build_router(
+            Arc::new(FakeProvider::ok(empty_snapshot())),
+            None,
+            serve_web::<E>,
+        );
         spawn_router(router).await
     }
 

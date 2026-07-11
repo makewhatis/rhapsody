@@ -1635,11 +1635,15 @@ dependencies = [
  "chrono",
  "harness-fixtures",
  "reqwest 0.12.28",
+ "rhapsody-agent",
+ "rhapsody-core",
  "rhapsody-orchestrator",
+ "rhapsody-store",
  "rust-embed",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
