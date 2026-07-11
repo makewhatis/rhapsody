@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# fake-claude — a zero-spend, zero-PR Claude Code stub for smoke-testing Symphony.
+#
+# It speaks the Claude Code stream-json JSONL protocol that the Symphony runner parses
+# (golang/symphony/internal/agent/claude/{runner,parse,billing,args}.go), so wiring it in
+# as a per-project `claude.command` override gives a full end-to-end daemon smoke
+# (poll → claim → dispatch → worktree → runner protocol → store → HTTP API → Runs UI →
+# state classification) with NO agent spend and NO PRs. The daemon never opens PRs —
+# the prompted agent does — and this stub runs no git, so nothing is pushed.
+#
+# Protocol contract (read the runner source, not this comment, if they ever diverge):
+#   * The runner invokes us with `-p --output-format stream-json --input-format stream-json
+#     --verbose ...`. We ignore all argv (the flags carry no information we need).
+#   * The runner writes the initial prompt as a {"type":"user",...} JSONL line on stdin and
+#     HOLDS STDIN OPEN as an operator-message mailbox until it sees the terminal result, then
+#     closes it (INF-250). We must drain stdin continuously so the runner's stdin-writer
+#     goroutine never blocks on a full pipe. We do NOT parse stdin — just discard it.
+#   * The first `system`/`init` line must carry apiKeySource:"none" so the default
+#     billing_guard passes (the agent is "using the logged-in subscription", never a metered
+#     API key) — no need to disable the guard for a smoke run.
+#   * Success = a terminal {"type":"result","is_error":false,...}; failure = is_error:true.
+#
+# Works from ANY working directory (the daemon invokes it inside per-issue worktrees): it
+# makes no relative-path assumptions and reads only env + stdin, writing only stdout.
+#
+# Env knobs:
+#   FAKE_CLAUDE_SLEEP_S   seconds to sleep before the terminal result (default 2), so the
+#                         run is visibly "running" in the Runs UI. Set 0 in tests.
+#   FAKE_CLAUDE_OUTCOME   success (default) | error. `error` emits is_error:true → exercises
+#                         the failure/retry paths (run outcome `failed`).
+#   FAKE_CLAUDE_HANG      when 1: emit init + one assistant line, then sleep forever →
+#                         exercises stall_timeout_ms / the Stop+kill flow deterministically
+#                         (run outcome `failed`, reason `stalled`). Never emits a result.
+#
+set -u
+
+readonly SESSION_ID="fake-claude-session"
+
+# Continuously drain stdin in the background so the runner's held-open-stdin writer never
+# blocks (INF-250). We discard the bytes; the stub does not act on operator messages. The
+# drain exits on its own when the runner closes stdin (EOF) after the terminal result, and
+# is killed by the process-group SIGKILL on the hang/timeout path.
+cat >/dev/null 2>&1 &
+readonly DRAIN_PID=$!
+
+# emit prints one JSONL protocol line.
+emit() { printf '%s\n' "$1"; }
+
+# system/init: apiKeySource "none" satisfies the default billing_guard.
+emit '{"type":"system","subtype":"init","session_id":"'"$SESSION_ID"'","apiKeySource":"none"}'
+emit '{"type":"assistant","session_id":"'"$SESSION_ID"'","message":{"content":[{"type":"text","text":"fake-claude: starting smoke run"}]}}'
+
+if [ "${FAKE_CLAUDE_HANG:-}" = "1" ]; then
+	emit '{"type":"assistant","session_id":"'"$SESSION_ID"'","message":{"content":[{"type":"text","text":"fake-claude: hanging (FAKE_CLAUDE_HANG=1)"}]}}'
+	# Sleep forever (no terminal result) so the runner hits its stall/turn timeout and kills
+	# the process group. Loop rather than `sleep infinity` for BSD/macOS portability.
+	while true; do sleep 3600; done
+fi
+
+# Make the run visibly "running" before finishing. Default ~2s; tests set 0.
+sleep "${FAKE_CLAUDE_SLEEP_S:-2}"
+
+emit '{"type":"assistant","session_id":"'"$SESSION_ID"'","message":{"content":[{"type":"text","text":"fake-claude: finishing smoke run"}]}}'
+
+if [ "${FAKE_CLAUDE_OUTCOME:-success}" = "error" ]; then
+	emit '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"'"$SESSION_ID"'","usage":{"input_tokens":1,"output_tokens":1}}'
+else
+	emit '{"type":"result","subtype":"success","is_error":false,"session_id":"'"$SESSION_ID"'","usage":{"input_tokens":1,"output_tokens":1}}'
+fi
+
+# Stop the stdin drain (best effort) and exit cleanly.
+kill "$DRAIN_PID" 2>/dev/null || true
+exit 0

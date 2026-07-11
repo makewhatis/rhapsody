@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# fake-claude wrapper: forces the error outcome (daemon config points claude.command here).
+FAKE_CLAUDE_OUTCOME=error exec "$(dirname "$0")/fake-claude" "$@"
