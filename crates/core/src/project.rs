@@ -18,7 +18,11 @@ pub struct Project {
 /// `Viewer` is the resolved owner of the configured tracker API key — the user whose assigned
 /// issues Symphony works. It backs the "connected as" identity surface (INF-224). `name` is the
 /// account's full name; `display_name` is the shorter handle Linear shows inline.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Default` is derived (beyond the base derive set) for the same reason [`crate::Issue`] carries
+/// it: the tracker fake holds a zero-value `Viewer` — the parity mirror of Go's zero-value
+/// `core.Viewer` struct — until a test programs one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Viewer {
     pub id: String,
     pub name: String,

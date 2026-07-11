@@ -5,5 +5,21 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+rhapsody-core = { path = "../core" }
+# async-trait: the Tracker interface is async (the orchestrator is tokio-based and the linear
+# adapter does HTTP), and the factory hands back a `Box<dyn Tracker>` — a trait object. Native
+# `async fn` in traits is not dyn-compatible, so the object-safe form requires async-trait
+# (anticipated by the P3 plan, T1).
+async-trait = "0.1"
+# chrono: the fake stamps created claim comments with a clock defaulting to `Utc::now()` — the
+# Rust mirror of Go's `time.Now()` — and stores them as `core::Comment.created_at`.
+chrono = { version = "0.4", features = ["clock"] }
+
+[dev-dependencies]
+# tokio (test-only): a current-thread runtime for `#[tokio::test]`, which drives the async
+# Tracker methods the fake tests exercise.
+tokio = { version = "1", features = ["macros", "rt"] }
+
 [lints]
 workspace = true
