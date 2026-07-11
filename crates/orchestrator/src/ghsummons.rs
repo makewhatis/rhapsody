@@ -101,8 +101,12 @@ impl GH {
 
 /// The default runner: `gh <args>`, returning stdout. A non-zero exit is an error (Go's
 /// `exec.Command(...).Output()` returns an `*ExitError`). Only used in production — every test
-/// injects its own runner. The exec is synchronous (Go's is too); the poll path bounds it with a
-/// timeout, and summons enrichment runs at most once per project per tick.
+/// injects its own runner. The exec is synchronous (Go's is too, run on a goroutine): it blocks the
+/// calling executor worker for the two `gh` calls. Enrichment runs at most once per project per tick
+/// and tokio's multi-worker runtime absorbs it, but because the call does not yield, `ghenrich`'s
+/// surrounding `tokio::time::timeout` cannot interrupt a hung `gh` mid-call — a fully non-blocking
+/// runner (`spawn_blocking` / `tokio::process`) is a daemon-wiring (F1) refinement when it first
+/// constructs `o.gh_source`.
 fn default_run(args: &[&str]) -> RunResult {
     let out = std::process::Command::new("gh").args(args).output()?;
     if !out.status.success() {

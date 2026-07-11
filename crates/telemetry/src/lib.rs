@@ -72,6 +72,11 @@ impl Telemetry {
 /// no-op `Telemetry` that still logs to stderr and into the in-memory ring; it NEVER returns an
 /// error that should stop the daemon. Mirrors Go `telemetry.Init`. `stderr` is any `MakeWriter`
 /// (the daemon passes `std::io::stderr`; tests pass a capture buffer).
+///
+/// When enabled with the gRPC transport (the default), this MUST be called from within a tokio
+/// runtime — the tonic exporter's channel construction needs an ambient runtime handle (the daemon
+/// boots telemetry from its async `main`, so this holds). The disabled and HTTP paths do not require
+/// a runtime.
 pub fn init<W>(cfg: &Config, stderr: W) -> Telemetry
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
