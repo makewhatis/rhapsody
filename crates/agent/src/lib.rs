@@ -18,6 +18,7 @@
 //! * Go's `int` maps to `i64` (matching `rhapsody-store`); Go pointer fields (`*Usage`, `*int`,
 //!   `time.Time` used as unset-able) become `Option<…>`.
 
+pub mod claude;
 pub mod fake;
 pub mod humanize;
 
