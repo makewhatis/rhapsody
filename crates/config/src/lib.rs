@@ -13,6 +13,7 @@
 pub mod decode;
 pub mod model;
 pub mod prompt;
+pub mod resolve;
 pub mod workflow;
 
 pub use decode::{ConfigError, decode};
@@ -20,3 +21,4 @@ pub use model::{
     Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT, Hooks, Logging, Mcp, Otel,
     Polling, Project, Server, Storage, Tracker, Workspace,
 };
+pub use resolve::{Resolved, resolve};

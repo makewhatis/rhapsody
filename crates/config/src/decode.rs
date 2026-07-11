@@ -31,6 +31,13 @@ pub enum ConfigError {
     /// schema, or a malformed duration knob. Mirrors Go's `fmt.Errorf("%w: …", ErrWorkflowParse)`.
     #[error("workflow_parse_error: {0}")]
     Parse(String),
+    /// The current working directory could not be determined while making a relative
+    /// `workspace.root` / `logging.dir` absolute (Go `Resolve` returns the bare `filepath.Abs` →
+    /// `os.Getwd` error here — the config package attaches no sentinel token, and no test exercises
+    /// it, since a missing cwd aborts config load). Surfaced as a value, not a panic, to keep the
+    /// crate `unwrap`-free. Constructed by [`crate::resolve::resolve`].
+    #[error("could not resolve working directory: {0}")]
+    WorkingDir(String),
 }
 
 /// Decodes `def` into a typed [`Config`] with defaults applied (Go `config.Decode`).
