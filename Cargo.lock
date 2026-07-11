@@ -732,6 +732,7 @@ dependencies = [
  "chrono",
  "liquid",
  "rhapsody-core",
+ "serde",
  "serde_yaml_ng",
  "thiserror 1.0.69",
 ]

@@ -8,6 +8,9 @@ repository.workspace = true
 [dependencies]
 rhapsody-core = { path = "../core" }
 liquid = "0.26"
+# serde derive powers the raw front-matter model in `model.rs` (C3), deserialized by
+# serde_yaml_ng — the same `serde = { derive }` the core crate uses.
+serde = { version = "1", features = ["derive"] }
 # serde_yaml_ng: maintained fork of the now-archived serde_yaml; its libyaml
 # parser matches gopkg.in/yaml.v3 map/seq/scalar semantics used by WORKFLOW.md.
 # (Choice justified in the C2 PR body.)
