@@ -5,5 +5,40 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+rhapsody-core = { path = "../core" }
+# async-trait: the `Runner`/`Session` abstraction is async (Go's methods take `ctx context.Context`;
+# the P5 orchestrator is tokio-based and the claude runner spawns a subprocess), and both are used
+# as trait objects — `Runner::start_session` returns `Box<dyn Session>` and P5 holds `Box<dyn
+# Runner>`, exactly as Go passes `agent.Session`/`agent.Runner` interface values. Native `async fn`
+# in traits is not dyn-compatible, so the object-safe form requires async-trait (the same reasoning
+# the P3 tracker crate records). Beyond the P4 plan's listed set for A1, but already a workspace
+# dependency (crates/tracker) — no new crate enters Cargo.lock.
+async-trait = "0.1"
+# chrono: `Event.timestamp` is Go's `time.Time` (`Option<DateTime<Utc>>` here — see lib.rs). The
+# `clock` feature is enabled for the A2 stream-json parser that will stamp events; the type alone is
+# what A1 uses.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# thiserror: `AgentError` mirrors `errors.go`'s typed sentinels (Display strings are the contract).
+# Anticipated by the P4 plan (A1); already a workspace dependency (crates/config).
+thiserror = "1"
+# serde + serde_json: the humanizer parses one raw claude stream-json line into `LogEntry` values —
+# the Rust mirror of Go `humanize.go`'s `encoding/json`. `raw_value` gives `RawValue`, the faithful
+# port of Go's `json.RawMessage` (tool inputs / tool_result content are re-parsed contextually).
+# Beyond the plan's listed set for A1, but a JSON humanizer cannot be ported without a JSON library,
+# and both are already workspace dependencies (crates/core, crates/tracker, …) — no new crate enters
+# Cargo.lock.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+# tokio (sync only): names the operator-mailbox channel type in `Session::run_turn` (Go's
+# `messages <-chan string`, INF-250). A1's fake ignores it; the A3 runner drains it. Only the `sync`
+# feature is needed here (the runtime stays test-only). Anticipated by the P4 plan (A1).
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+# tokio (test-only): a current-thread runtime for `#[tokio::test]`, which drives the async
+# `Session`/`Runner` methods the fake tests exercise.
+tokio = { version = "1", features = ["macros", "rt"] }
+
 [lints]
 workspace = true
