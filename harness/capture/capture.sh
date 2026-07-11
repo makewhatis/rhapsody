@@ -35,7 +35,7 @@ WORK="$HERE/work"
 BIN="$HERE/target/symphonyd-go"
 
 rm -rf "$WORK" "$FIX"
-mkdir -p "$WORK" "$HERE/target" "$FIX/config" "$FIX/api" "$FIX/runs"
+mkdir -p "$WORK" "$HERE/target" "$FIX/config" "$FIX/api" "$FIX/runs" "$FIX/db"
 
 echo "capture: building the reference daemon from $REF" >&2
 ( cd "$REF" && GOFLAGS=-mod=readonly go build -o "$BIN" ./cmd/symphony )
@@ -145,6 +145,34 @@ for attempt in 1 2 3 4 5; do
   echo "capture: success snapshot raced a continuation (attempt $attempt/5); retrying" >&2
 done
 [ "$success_ok" = "1" ] || { echo "capture: could not obtain a clean single-run success snapshot" >&2; exit 1; }
+
+# ------------------------------------------------------------------------------------------------
+# Go-written database fixture (Task S1): commit the success run's SQLite DB so rhapsody-store can
+# round-trip a real daemon-written file in CI without ever opening $REF. The daemon runs SQLite in
+# WAL mode (see $REF/internal/store/sqlite.go) and stop_stack kills it without a clean checkpoint,
+# so committed rows can still live in symphony.db-wal. `VACUUM INTO` reads that committed data
+# through a fresh connection and writes a complete, self-contained, rollback-mode snapshot with no
+# -wal/-shm sidecars — a plain `cp` of symphony.db alone can miss un-checkpointed rows and would
+# drag WAL sidecars into the fixtures tree. This runs after the success block, where $CAPTURE_HOME
+# still holds the clean single-run database and the daemon is already stopped.
+#
+# Determinism is asserted on the normalized rows JSON, NOT the .db binary: SQLite page layout and
+# embedded rowids vary between captures, so the committed .db is a documented double-capture
+# exception (see README.md). go-daemon-rows.json is a per-table `sqlite3 -json` dump (empty tables
+# -> []) piped through normalize.sh, and is built from the committed .db so it provably describes it.
+echo "capture: db/go-daemon.db + db/go-daemon-rows.json" >&2
+sqlite3 "$CAPTURE_HOME/symphony.db" "VACUUM INTO '$FIX/db/go-daemon.db'"
+{
+  printf '{'
+  sep=''
+  for t in $(sqlite3 "$FIX/db/go-daemon.db" \
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"); do
+    rows="$(sqlite3 -json "$FIX/db/go-daemon.db" "SELECT * FROM \"$t\" ORDER BY 1")"
+    printf '%s"%s":%s' "$sep" "$t" "${rows:-[]}"
+    sep=','
+  done
+  printf '}'
+} | jq -S . | "$HERE/normalize.sh" >"$FIX/db/go-daemon-rows.json"
 
 # ------------------------------------------------------------------------------------------------
 # error-run fixtures: fake-claude-error exits is_error:true -> run recorded `failed`. A failure

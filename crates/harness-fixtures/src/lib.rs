@@ -253,8 +253,12 @@ mod tests {
         );
     }
 
-    // CANARY: every committed fixture is already fully normalized, so re-normalizing is a no-op.
-    // Catches a raw timestamp / UUID / absolute path / live port hand-edited into a golden.
+    // CANARY: every committed TEXT fixture is already fully normalized, so re-normalizing is a
+    // no-op. Catches a raw timestamp / UUID / absolute path / live port hand-edited into a golden.
+    // The binary `db/*.db` fixtures are exempt: they are SQLite databases, not text, and are an
+    // intentional determinism exception — their parity/determinism signal is carried by the
+    // sibling `db/*-rows.json` dump (still walked and normalized here). See
+    // `harness/capture/README.md`, "Go-written database fixture".
     #[test]
     fn canary_fixtures_are_normalized() {
         let fixtures = all_fixtures();
@@ -263,6 +267,9 @@ mod tests {
             "expected the committed fixture tree, got {fixtures:?}"
         );
         for rel in fixtures {
+            if rel.ends_with(".db") {
+                continue;
+            }
             let raw = load(&rel);
             assert_eq!(
                 normalize(&raw),
