@@ -14,9 +14,9 @@
 //!     writer inherits a correct monotonic sequence.
 //!   * The token metric (`o.metrics.Tokens(...)`) export is P6; the bounded label set it would carry
 //!     lives in [`crate::telemetry_attrs`].
-//!   * Go's `onTranscriptOpened` (same file) is persistence-only — it sets `transcript_path` then
-//!     `persistProgress` onto the run row — so it lands with O4's persistence; the `transcript_path`
-//!     field (O1) and the worker's `on_transcript` callback (O3) are already in place.
+//!   * Go's `onTranscriptOpened` (same file) sets `transcript_path` then `persistProgress` onto the
+//!     run row; it is a control-loop entry point delivered by O7's loop (the `evTranscriptOpened` event
+//!     the worker's `on_transcript` callback posts), so it is ported here in O7.
 
 use rhapsody_agent as agent;
 use rhapsody_store as store;
@@ -36,6 +36,24 @@ pub struct AgentUpdate {
 }
 
 impl Orchestrator {
+    /// Records the concrete per-run transcript path on the running entry (control task) and
+    /// immediately persists it so the run row points at its OWN transcript even before the first
+    /// turn-boundary progress write. A no-op for an unknown issue (already terminated) or an empty
+    /// path. Mirrors Go `onTranscriptOpened` (a control-loop entry point delivered by O7's loop).
+    pub(crate) fn on_transcript_opened(&mut self, issue_id: &str, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        match self.running.get_mut(issue_id) {
+            Some(re) => re.transcript_path = path.to_string(),
+            None => return,
+        }
+        // Flush the concrete path onto runs.transcript_path right away (Go `persistProgress`).
+        if let Some(re) = self.running.get(issue_id) {
+            self.persist_progress(re);
+        }
+    }
+
     /// Folds one agent event into the running entry's live state and the aggregate token totals
     /// (upstream §13.5). A no-op for an unknown issue (already terminated). Mirrors Go `onAgentUpdate`.
     pub fn on_agent_update(&mut self, e: AgentUpdate) {

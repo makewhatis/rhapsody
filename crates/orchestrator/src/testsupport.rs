@@ -286,6 +286,7 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         issue,
         started_at: epoch,
         retry_attempt: 0,
+        cancel: crate::control_loop::CancelSignal::default(),
         project_slug: project_slug.to_string(),
         project_group: project_group.to_string(),
         project_repo: String::new(),
@@ -389,7 +390,7 @@ pub(crate) fn orch_for_retry(tr: Arc<Fake>, max_concurrent: i64) -> (Orchestrato
     let mut o = Orchestrator::new("WORKFLOW.md");
     o.eff = Some(eff);
     let dispatched: DispatchedIds = Arc::new(Mutex::new(Vec::new()));
-    o.spawn = record_ids(&dispatched);
+    o.spawn = Some(record_ids(&dispatched));
     (o, dispatched)
 }
 
@@ -407,7 +408,7 @@ pub(crate) fn orch_for_retry_multi(
     let mut o = Orchestrator::new("WORKFLOW.md");
     o.eff = Some(eff);
     let dispatched: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
-    o.spawn = record_entries(&dispatched);
+    o.spawn = Some(record_entries(&dispatched));
     (o, dispatched)
 }
 
@@ -450,7 +451,7 @@ pub(crate) fn orch_for_reconcile(tr: Arc<Fake>, stall: Duration) -> (Orchestrato
     eff.stall_timeout = stall;
     let mut o = Orchestrator::new("WORKFLOW.md");
     o.eff = Some(eff);
-    o.spawn = Box::new(|_iss, _attempt, _re| {}); // no real worker
+    o.spawn = Some(Box::new(|_iss, _attempt, _re| {})); // no real worker
     (o, dir)
 }
 
@@ -488,7 +489,7 @@ pub(crate) fn recovery_orch(
     o.now = Box::new(move || now);
     o.eff = Some(eff);
     let dispatched: DispatchedIds = Arc::new(Mutex::new(Vec::new()));
-    o.spawn = record_ids(&dispatched);
+    o.spawn = Some(record_ids(&dispatched));
     (o, dispatched)
 }
 

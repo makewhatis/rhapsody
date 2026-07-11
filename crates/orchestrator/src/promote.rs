@@ -314,7 +314,7 @@ mod tests {
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
         let dispatched: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
-        o.spawn = record_entries(&dispatched);
+        o.spawn = Some(record_entries(&dispatched));
         (o, dispatched)
     }
 

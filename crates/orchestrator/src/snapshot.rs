@@ -218,7 +218,7 @@ impl Orchestrator {
     /// config-disabled => paused; else >=1 in-flight agent => running (or review when those agents sit
     /// only on review-state tickets); else idle. `running` is reported regardless of status. Mirrors
     /// Go `projectStatuses`.
-    fn project_statuses(&self) -> Vec<ProjectStatus> {
+    pub(crate) fn project_statuses(&self) -> Vec<ProjectStatus> {
         let Some(eff) = self.eff.as_ref() else {
             return Vec::new();
         };
@@ -287,8 +287,9 @@ impl Orchestrator {
                 name: g.name.clone(),
                 status: status.to_string(),
                 running: g.running,
-                // Warnings (INF-277) are resolved off-loop by O6 (`warnings.go`); empty until then.
-                warnings: Vec::new(),
+                // Per-project advisories merged from the two off-loop resolvers (INF-277 slug + INF-279
+                // prompt-file), recorded by O7's `warnings` resolver. Empty until a resolver stores one.
+                warnings: self.project_warnings_for(group),
             });
         }
         out

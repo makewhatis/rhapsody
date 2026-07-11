@@ -35,6 +35,9 @@ pub mod agentupdate;
 pub mod backoff;
 pub mod claim;
 pub mod concurrency;
+// `loop` is a reserved word; the file mirrors Go `loop.go` while the module is `control_loop`.
+#[path = "loop.rs"]
+pub mod control_loop;
 pub mod dispatch;
 pub mod effective;
 pub mod ghenrich;
@@ -50,11 +53,14 @@ pub mod reads;
 pub mod reconcile;
 pub mod reconcile_run;
 pub mod recovery;
+pub mod reload;
 pub mod retry;
 pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;
+pub mod stop;
 pub mod telemetry_attrs;
+pub mod warnings;
 pub mod worker;
 pub mod workspace_gc;
 
@@ -64,6 +70,7 @@ mod testsupport;
 pub use agentupdate::AgentUpdate;
 pub use backoff::{CONTINUATION_DELAY_MS, failure_backoff_ms};
 pub use concurrency::{global_slots, state_limit};
+pub use control_loop::{CancelSignal, CancelWait, Event, WaitGroup};
 pub use dispatch::{eligible, sort_for_dispatch};
 pub use effective::{Effective, ResolvedProject, build_effective, build_effective_with_runner};
 pub use message::RunMessageResult;
@@ -72,6 +79,7 @@ pub use reads::{Identity, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
 pub use retry::{EvRetry, EvWorkerExit};
 pub use snapshot::{ProjectStatus, RateLimit, RetryRow, RunningRow, Snapshot, TokenCounts};
+pub use stop::{ControlHandle, ResumeResult, StopResult};
 pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
 pub use workspace_gc::WorkspaceGcPlan;
 

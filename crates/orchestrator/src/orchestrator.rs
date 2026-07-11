@@ -10,7 +10,7 @@
 //! the fields its behavior needs.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -18,8 +18,11 @@ use std::thread::JoinHandle;
 use chrono::{DateTime, Utc};
 use rhapsody_core::{Issue, normalize_state};
 use rhapsody_store::{self as store, Store};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::control_loop::{CancelSignal, CancelWait, DEFAULT_RETENTION_DAYS, Event, WaitGroup};
 use crate::effective::Effective;
+use crate::warnings::WarningsState;
 
 /// The worker-spawn seam signature (Go `spawn func(wctx, iss, attempt *int, re *runningEntry)`). The
 /// Go `context` is dropped — the Rust worker is a task whose abort handle O7 owns, so cancellation is
@@ -47,6 +50,13 @@ pub struct RunningEntry {
     pub issue: rhapsody_core::Issue,
     pub started_at: DateTime<Utc>,
     pub retry_attempt: i64,
+
+    /// The worker's cancellation trigger (Go `runningEntry.cancel context.CancelFunc`), armed by
+    /// [`dispatch_issue`](Orchestrator::dispatch_issue) before the spawn and fired by `terminate` /
+    /// `shutdown` to kill the run (the SIGKILL path in production). The [`empty`](RunningEntry::empty)
+    /// default is UNARMED (Go leaves `cancel` nil for test / legacy entries that never spawned a
+    /// cancelable worker); its trivial `PartialEq`/`Debug` keep [`RunningEntry`]'s derives.
+    pub(crate) cancel: CancelSignal,
 
     /// Owning project (Phase 2). Empty in the legacy single-project / test-injected path; stamped at
     /// dispatch from the resolved project. `project_repo` is carried for Phase 3 (worktrees).
@@ -128,6 +138,7 @@ impl RunningEntry {
             issue,
             started_at: zero_time(),
             retry_attempt: 0,
+            cancel: CancelSignal::default(),
             project_slug: String::new(),
             project_group: String::new(),
             project_repo: String::new(),
@@ -228,14 +239,15 @@ pub struct Orchestrator {
     /// represent. `Send + Sync` so the owning control task (O7) stays `Send`.
     pub now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 
-    /// The worker-spawn seam (Go `spawn func(...)`, defaulted in `New` to `o.spawnWorker`; injectable
-    /// for tests). [`dispatch_issue`](Orchestrator::dispatch_issue) hands the just-built running entry
-    /// to it to launch a worker. The DEFAULT is a placeholder: the real spawn — a worker task plus the
-    /// wiring of its per-turn events and exit back into the control loop — lands in O7 together with
-    /// the control-event channel and the task abort handle (the `worker.rs` module docs record the
-    /// same deferral for the worker body). O5's retry/recovery tests inject a recorder here, exactly as
-    /// the Go tests set `o.spawn`.
-    pub(crate) spawn: SpawnFn,
+    /// The worker-spawn TEST seam (Go's injectable `spawn func(...)`). `None` = production: dispatch
+    /// launches the real worker via [`spawn_worker`](Orchestrator::spawn_worker) (a tokio task driving
+    /// `run_agent_attempt`, forwarding its per-turn events + exit back onto the control channel). O5's
+    /// retry/recovery tests + O7's loop/stop tests inject a recorder here (`Some(..)`), exactly as the
+    /// Go tests set `o.spawn` — the seam can't be a closure over `&self` (the real spawn needs
+    /// `o.eff`/`o.events`/`o.wg`), so the production default is `None` rather than a self-capturing
+    /// closure. [`dispatch_issue`](Orchestrator::dispatch_issue) hands the just-built running entry to
+    /// the injected seam, or to the real spawn when none is set.
+    pub(crate) spawn: Option<SpawnFn>,
 
     /// The live config + built deps the loop schedules against; `None` until `Run`/reload builds it
     /// (O7). Mirrors Go `eff *effective` (nil until the first `reloadFromDisk`). Rebuilt and swapped
@@ -310,6 +322,55 @@ pub struct Orchestrator {
     /// `Orchestrator` `Sync` for the off-loop HTTP path (a bare `mpsc::Receiver` is `!Sync`); it is
     /// only touched on the control task. O7's real spawn takes each mailbox's receiver.
     pub(crate) mailboxes: Mutex<HashMap<String, crate::message::Mailbox>>,
+
+    // --- O7: the control loop + its runtime handles (Go `orchestrator.go`'s `events` / `tickTimer` /
+    //     `ctx` / `wg`, plus the reload-owned ghSource / retention / warning state). ---
+    /// The control-event feed. Workers, timers, the config watcher, and the off-loop
+    /// [`ControlHandle`](crate::stop::ControlHandle) SEND here; the single owning control task
+    /// ([`run_loaded`](Orchestrator::run_loaded)) receives + dispatches. Unbounded (Go: buffered 256)
+    /// so the worker's synchronous per-event forwarding closure can enqueue without blocking/awaiting
+    /// and no control event is ever shed. Mirrors Go `events chan event`.
+    pub(crate) events: UnboundedSender<Event>,
+    /// The receive end, taken by [`run_loaded`](Orchestrator::run_loaded) exactly once. Behind a
+    /// `Mutex` solely so the `Orchestrator` stays `Sync` (a bare receiver is `!Sync`); the loop takes
+    /// it on the control task. Go's loop ranges the channel directly with no separate handle.
+    pub(crate) events_rx: Mutex<Option<UnboundedReceiver<Event>>>,
+    /// The orchestrator lifetime cancellation (Go `ctx context.Context`), set at the start of the
+    /// control loop before the HTTP server accepts requests. `None` until the loop starts (some unit
+    /// tests round-trip without it); read off-loop by Stop/Resume reply waits + the warning resolver.
+    pub(crate) ctx: Option<CancelWait>,
+    /// The armed poll-tick timer task (Go `tickTimer *time.Timer`); aborted + replaced by
+    /// [`schedule_tick`](Orchestrator::schedule_tick), stopped on shutdown.
+    pub(crate) tick_timer: Option<tokio::task::JoinHandle<()>>,
+    /// The armed retry timer tasks keyed by issue id (Go `retryEntry.timer`, held here so
+    /// [`RetryEntry`] keeps its derives). `schedule_retry_for` arms one; `clear_retry` / shutdown abort
+    /// them. Go's `time.AfterFunc` fires `evRetry`; the Rust task sleeps then sends [`Event::Retry`].
+    pub(crate) retry_timers: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// The workers-and-resolvers barrier `shutdown` waits on (Go `sync.WaitGroup`). Each spawned worker
+    /// + off-loop warning resolver holds a [`WgGuard`](crate::control_loop::WgGuard) for its lifetime.
+    pub(crate) wg: WaitGroup,
+    /// The GitHub-summons source: `Some` iff the feature is enabled for the legacy config or a resolved
+    /// project, else `None` (the poll path stays byte-identical when off — every enrichment site gates
+    /// on `o.gh_source.is_some()`). Built once in `Run` and rebuilt on reload from the freshly-swapped
+    /// `eff` via [`new_github_summon_source`](Orchestrator::new_github_summon_source). Mirrors Go
+    /// `ghSource` (O6's `ghsummons::GH` polling source). Control-task-owned.
+    pub(crate) gh_source: Option<Box<dyn crate::ghsummons::SummonSource>>,
+    /// The effective `storage.retention_days` mirrored as an atomic so the daemon's prune scheduler
+    /// (P6) reads it without racing the control task's reload (default 30 until the first reload).
+    /// Mirrors Go `retentionDays`.
+    pub(crate) retention_days: Arc<AtomicI64>,
+    /// Flips true the first time [`reload_from_disk`](Orchestrator::reload_from_disk) stores the
+    /// effective retention_days, so the prune scheduler can skip the startup worktree GC while
+    /// `current_retention_days` still returns the `New` default. Mirrors Go `retentionLoaded`.
+    pub(crate) retention_loaded: Arc<AtomicBool>,
+    /// Per-project-group warning strings surfaced on the project status (INF-277 / INF-279), resolved
+    /// OFF the control task by the reload/worker-exit resolver. `Arc` so the off-loop resolver tasks
+    /// share it while the control task reads it in `project_statuses`. Mirrors Go's `warningsMu` +
+    /// `projectWarnings` / `projectFileWarnings` + the two generation counters.
+    pub(crate) warnings: Arc<WarningsState>,
+    /// Whether a store was injected via [`set_store`](Orchestrator::set_store) (Go `storeInjected`),
+    /// short-circuiting `Run`'s disk-open path so tests / callers own the store lifecycle.
+    pub(crate) store_injected: bool,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -352,13 +413,15 @@ impl Orchestrator {
         // thread is spawned later by `start_event_writer`.
         let (store_events_tx, store_events_rx) =
             std::sync::mpsc::sync_channel(crate::persist::EVENT_BUF_CAP);
+        // The control-event channel is created up front (Go makes `events` in `New`) so the off-loop
+        // Stop/Resume handle + timers can send before the loop takes the receiver.
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
         Orchestrator {
             workflow_path: workflow_path.into(),
             now: Box::new(Utc::now),
-            // Placeholder worker-spawn: the real spawn (a worker task + the wiring of its events /
-            // exit back into the control loop) is O7's, together with the control-event channel and
-            // the task abort handle. Until then this is a no-op; O5's handler tests inject a recorder.
-            spawn: Box::new(|_iss, _attempt, _re| {}),
+            // No test seam by default → dispatch launches the real `spawn_worker` (Go `New` sets
+            // `o.spawn = o.spawnWorker`). O5's handler tests + O7's loop tests inject a recorder.
+            spawn: None,
             eff: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
@@ -374,6 +437,17 @@ impl Orchestrator {
             writer_handle: None,
             dropped: AtomicI64::new(0),
             mailboxes: Mutex::new(HashMap::new()),
+            events,
+            events_rx: Mutex::new(Some(events_rx)),
+            ctx: None,
+            tick_timer: None,
+            retry_timers: HashMap::new(),
+            wg: WaitGroup::new(),
+            gh_source: None,
+            retention_days: Arc::new(AtomicI64::new(DEFAULT_RETENTION_DAYS)),
+            retention_loaded: Arc::new(AtomicBool::new(false)),
+            warnings: Arc::new(WarningsState::default()),
+            store_injected: false,
         }
     }
 
@@ -391,10 +465,28 @@ impl Orchestrator {
     }
 
     /// Injects a store handle, bypassing the Run-time open path — intended for tests (an in-memory
-    /// store) and any caller that owns the store lifecycle. Mirrors Go `SetStore` (whose `nil → Noop`
-    /// guard is unrepresentable here, since an [`Arc`] is never null).
+    /// store) and any caller that owns the store lifecycle. Marks the store as injected so `Run` skips
+    /// the disk-open path. Mirrors Go `SetStore` (whose `nil → Noop` guard is unrepresentable here,
+    /// since an [`Arc`] is never null).
     pub fn set_store(&mut self, st: Arc<dyn Store + Send + Sync>) {
         self.store = st;
+        self.store_injected = true;
+    }
+
+    /// The effective `storage.retention_days` (default 30 until the first reload). Read by the daemon's
+    /// prune scheduler (P6) each cycle without racing the control task's reload. Mirrors Go
+    /// `CurrentRetentionDays`.
+    pub fn current_retention_days(&self) -> i64 {
+        self.retention_days
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether [`reload_from_disk`](Orchestrator::reload_from_disk) has stored the effective
+    /// retention_days at least once. The prune scheduler reads it to skip the startup worktree GC while
+    /// `current_retention_days` would still return the `New` default. Mirrors Go `RetentionLoaded`.
+    pub fn retention_loaded(&self) -> bool {
+        self.retention_loaded
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the set of currently-running issue ids (Go `runningIDSet`). The selection pass seeds

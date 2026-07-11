@@ -34,6 +34,7 @@ use rhapsody_tracker::{Tracker, TrackerError};
 
 use crate::backoff::{CONTINUATION_DELAY_MS, failure_backoff_ms};
 use crate::concurrency::{global_slots, state_limit};
+use crate::control_loop::{CancelSignal, Event};
 use crate::dispatch::{EligibilityGate, eligible};
 use crate::effective::{Effective, ResolvedProject};
 use crate::orchestrator::{
@@ -280,6 +281,9 @@ impl Orchestrator {
             };
             re.project_repo = r.repo.clone();
         }
+        // Arm the worker's cancellation before the spawn observes it (Go `wctx, cancel :=
+        // context.WithCancel(o.ctx)` + `re.cancel = cancel`); `terminate` / `shutdown` fire it.
+        re.cancel = CancelSignal::new();
         let id = iss.id.clone();
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
@@ -292,18 +296,39 @@ impl Orchestrator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id.clone(), crate::message::Mailbox::new());
-        // Hand the entry to the worker-spawn seam (Go `o.spawn(...)`) BEFORE moving it into `o.running`
-        // — the borrow of `self.spawn` must not alias `self.running`. Behavior-identical: nothing
-        // between insert and spawn reads `o.running` in the Rust port (Go's `metrics.SetRunning` is
-        // dropped telemetry). The real spawn + event wiring is O7's.
-        (self.spawn)(&iss, attempt, &re);
+        let cancel = re.cancel.wait();
+        // Snapshot the routing + started_at the real spawn needs before `re` moves into `o.running`.
+        let project_slug = re.project_slug.clone();
+        let stack_context = re.stack_context.clone();
+        let started_at = re.started_at;
+        // Hand the entry to the injected TEST seam (Go `o.spawn(...)`) BEFORE moving it into
+        // `o.running` — the borrow of `self.spawn` must not alias `self.running`. In production
+        // (`self.spawn` is `None`) the real worker is launched AFTER the insert via `spawn_worker`,
+        // which reads `o.eff` / `o.events` / `o.wg` off `&self`.
+        if let Some(spawn) = &self.spawn {
+            spawn(&iss, attempt, &re);
+        }
+        let production = self.spawn.is_none();
         self.running.insert(id, re);
+        if production {
+            self.spawn_worker(
+                cancel,
+                iss,
+                attempt,
+                project_slug,
+                stack_context,
+                started_at,
+            );
+        }
     }
 
-    /// Removes any pending retry entry for an issue. Mirrors Go `clearRetry` (which also stops the
-    /// live timer; that timer is O7's — see [`Orchestrator::schedule_retry_for`]).
+    /// Removes any pending retry entry for an issue AND aborts its live timer (Go `clearRetry` stops
+    /// `retryEntry.timer`; the Rust timer task is held in [`retry_timers`](Orchestrator::retry_timers)).
     pub(crate) fn clear_retry(&mut self, id: &str) {
         self.retry_attempts.remove(id);
+        if let Some(timer) = self.retry_timers.remove(id) {
+            timer.abort();
+        }
     }
 
     /// (Re)schedules a retry for `t.id` after `delay_ms` (upstream §8.4) with explicit project routing,
@@ -338,9 +363,26 @@ impl Orchestrator {
                 recovered: false,
             },
         );
+        // Arm the live retry timer (Go `time.AfterFunc(delayMS, () => o.events <- evRetry{id})`),
+        // ONLY when the daemon is live — `o.ctx` is set exactly when a control loop is running to
+        // receive the fire. The off-loop unit tests drive `on_retry` / `on_worker_exit` directly with a
+        // nil `o.ctx` and no runtime to spawn onto; they assert on `retry_attempts`, not the timer.
+        if let Some(mut ctx) = self.ctx.clone() {
+            let events = self.events.clone();
+            let fire_id = t.id.to_string();
+            let delay = std::time::Duration::from_millis(delay_ms.max(0) as u64);
+            let timer = tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {
+                        let _ = events.send(Event::Retry(EvRetry { issue_id: fire_id }));
+                    }
+                    _ = ctx.cancelled() => {}
+                }
+            });
+            self.retry_timers.insert(t.id.to_string(), timer);
+        }
         // Persist the retry row (keyed by identifier) + claim=retry_queued so a restart re-arms this
-        // timer and keeps the claim (Phase 4 §3.8). The live timer (Go time.AfterFunc → evRetry) is
-        // armed by O7's control loop against `due_at_ms`.
+        // timer and keeps the claim (Phase 4 §3.8).
         self.persist_retry(t.identifier, attempt, due_at_ms, err_str, t.project_slug);
     }
 
@@ -365,8 +407,14 @@ impl Orchestrator {
             .unwrap_or(0) as f64
             / 1e9;
         self.totals.seconds_running += dur;
-        // Go re-resolves prompt-file warnings here (refreshPromptFileWarnings, INF-279); the warnings
-        // subsystem is O6 (best-effort, off the tested exit path), so O5 omits it.
+        // Re-resolve prompt-file warnings (Go `refreshPromptFileWarnings`, INF-279) so the missing-file
+        // flag surfaces after the first mirror sync. Off-loop + gated on a live daemon (a no-op when
+        // `o.ctx` is nil — the direct handler tests). `warnings.go` is O7's, so it is wired here.
+        if let Some(eff) = self.eff.as_ref() {
+            let inputs = crate::warnings::project_warn_inputs(eff);
+            let checker = self.prompt_file_checker_for(eff);
+            self.refresh_prompt_file_warnings(inputs, checker);
+        }
 
         if !e.failed {
             // The two freshest state samples: the worker's per-turn refresh (e.last_state) and

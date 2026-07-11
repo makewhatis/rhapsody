@@ -266,6 +266,9 @@ mod tests {
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
         o.set_store(Arc::clone(&st));
+        // Inject a no-op spawn so dispatch doesn't launch the real worker (which would drain this
+        // run's mailbox receiver) — these tests assert on the mailbox admission path, not the worker.
+        o.spawn = Some(Box::new(|_iss, _attempt, _re| {}));
         (o, st)
     }
 

@@ -310,11 +310,13 @@ impl Orchestrator {
         }
     }
 
-    /// Removes a running worker's entry, accumulating its runtime, and returns it (or `None` if not
-    /// running). The later worker-exit event becomes a no-op (entry already gone). Mirrors Go
-    /// `terminate` (minus the `outcome` metric label and `re.cancel()` — see the module docs).
+    /// Removes a running worker's entry, FIRES its cancellation (Go `re.cancel()` → SIGKILL the claude
+    /// process group), accumulating its runtime, and returns it (or `None` if not running). The later
+    /// worker-exit event becomes a no-op (entry already gone). Mirrors Go `terminate` (minus the
+    /// `outcome` metric label, which is dropped telemetry).
     pub(crate) fn terminate(&mut self, id: &str) -> Option<RunningEntry> {
         let re = self.running.remove(id)?;
+        re.cancel.cancel();
         let dur = ((self.now)() - re.started_at)
             .num_nanoseconds()
             .unwrap_or(0) as f64
@@ -707,7 +709,7 @@ mod tests {
         eff.projects = vec![pa, pb];
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
-        o.spawn = Box::new(|_, _, _| {});
+        o.spawn = Some(Box::new(|_, _, _| {}));
         o.running.insert(
             "a1".into(),
             running_entry(issue("a1", "A-1", "In Progress"), "a", "a"),
@@ -748,7 +750,7 @@ mod tests {
         eff.projects = vec![pa];
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
-        o.spawn = Box::new(|_, _, _| {});
+        o.spawn = Some(Box::new(|_, _, _| {}));
         let ws = mgr.create_for_issue("", "A-1").await.expect("create ws");
         o.running.insert(
             "a1".into(),
