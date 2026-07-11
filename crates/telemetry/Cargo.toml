@@ -1,0 +1,49 @@
+[package]
+name = "rhapsody-telemetry"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The OpenTelemetry Rust stack — the parity mirror of Go's `go.opentelemetry.io/otel` SDK +
+# OTLP exporters (traces/metrics/logs). `init` wires providers from the `otel:` config block.
+opentelemetry = { version = "0.32", features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "logs"] }
+# tls-ring + tls-webpki-roots give the gRPC (tonic) exporter a rustls provider + bundled cert roots
+# so a secure (`https://`) gRPC endpoint verifies TLS — Go's default (non-`WithInsecure`) transport.
+# Bundled roots (no system cert dep) keep the daemon portable across hosts.
+opentelemetry-otlp = { version = "0.32", features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots"] }
+# tracing bridge: the daemon records spans/logs via `tracing`; `tracing-opentelemetry` fans spans to
+# the OTLP trace provider (Go's `otelslog` + `otel.SetTracerProvider`).
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-opentelemetry = "0.33"
+# url: `endpoint_url_for_signal` fills the per-signal `/v1/*` OTLP path on a path-less endpoint
+# (Go `endpointURLForSignal`, the 404 fix). Already in the workspace lock.
+url = "2"
+# serde + chrono: `LogEntry` is the in-app Logs-tab record the P6 httpapi `/api/v1/logs` handler
+# serializes (Go `telemetry.LogEntry`, json-tagged); `time` is its timestamp. Already in the lock.
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+# libc: `host.name` resource attribute via `gethostname` — Go's `resource.WithHost()` (the SDK does
+# NOT auto-detect it). Already in the lock; matches the workspace's libc-over-new-crate idiom.
+libc = "0.2"
+# http: bridges the `otel.headers` config map into a gRPC `MetadataMap` (Go's OTLP `WithHeaders` on
+# the gRPC exporter). Ubiquitous, already in the lock (reqwest/tonic depend on it).
+http = "1"
+# opentelemetry-appender-tracing: fans `tracing` events into the OTLP LoggerProvider — the Rust
+# analogue of Go's `otelslog` handler in the log multi-handler (the daemon's log-export path).
+opentelemetry-appender-tracing = "0.32"
+# tokio (rt): the bounded-shutdown worker enters the daemon's tokio runtime so the gRPC exporter's
+# final flush has a reactor (Go bounds the same flush via a shutdown context). Already in the lock.
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
+# testing: the `InMemoryMetricExporter` the metrics tests collect through (Go's ManualReader
+# analogue). A dev-only feature so it never enters the production lib.
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+
+[lints]
+workspace = true

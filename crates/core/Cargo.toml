@@ -9,6 +9,14 @@ repository.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 regex = "1"
+# serde_json: `runtimeport` marshals/reads the `~/.symphony/runtime.json` `Info` record (Go
+# `encoding/json`). Already in the workspace lock (config/store/tracker/… depend on it) — no new
+# crate enters Cargo.lock.
+serde_json = "1"
+# libc: `runtimeport::process_alive` mirrors Go's `proc.Signal(syscall.Signal(0))` liveness probe
+# via a single `libc::kill(pid, 0)` FFI call (EPERM still means "alive, not ours"). Already in the
+# lock as a transitive dep (tokio/…), matching the `rhapsody-workspace`/`rhapsody-agent` idiom.
+libc = "0.2"
 
 [lints]
 workspace = true
