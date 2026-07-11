@@ -167,10 +167,10 @@ describe("Onboarding", () => {
       await screen.findByRole("option", { name: /Symphony App/ });
 
       fireEvent.click(screen.getByRole("button", { name: "Enter it manually" }));
-      fireEvent.change(await screen.findByLabelText("Project slug"), { target: { value: "symphony" } });
+      fireEvent.change(await screen.findByLabelText("Project slug"), { target: { value: "example-infra" } });
       fireEvent.click(screen.getByRole("button", { name: /Create config & start/ }));
 
-      await waitFor(() => expect(h.writeInitialConfig).toHaveBeenCalledWith("symphony"));
+      await waitFor(() => expect(h.writeInitialConfig).toHaveBeenCalledWith("example-infra"));
     });
 
     it("shows an inline error and never writes for un-normalizable input (URL with no project segment)", async () => {

@@ -12,14 +12,15 @@
 set -euo pipefail
 
 # --- reference tree (READ-ONLY) -----------------------------------------------------------------
-# Default to the frozen Downloads path (plan Global Constraints). macOS TCC blocks ~/Downloads for
-# daemon-spawned processes on some machines; when the primary REF is unreadable, fall back to the
-# spec-documented copy at ~/workspace/symphony-go-reference (design §2/§6). Override with REF=...
-REF="${REF:-/Users/david/Downloads/symphony-v0.4.0/golang/symphony}"
+# REF is REQUIRED: the operator provides the path to the frozen, read-only Symphony v0.4.0 tree —
+# none is committed here (run as `REF=/path/to/symphony make fixtures`). macOS TCC blocks
+# ~/Downloads for daemon-spawned processes on some machines; when the given REF is unreadable, fall
+# back to the spec-documented copy at ~/workspace/symphony-go-reference (design §2/§6).
+REF="${REF:?set REF to the read-only Symphony v0.4.0 reference tree}"
 if ! cat "$REF/go.mod" >/dev/null 2>&1; then
   fallback="$HOME/workspace/symphony-go-reference/golang/symphony"
   if cat "$fallback/go.mod" >/dev/null 2>&1; then
-    echo "capture: primary REF unreadable ($REF); using documented fallback $fallback" >&2
+    echo "capture: given REF unreadable ($REF); using documented fallback $fallback" >&2
     REF="$fallback"
   else
     echo "capture: reference tree unreadable at REF=$REF and fallback $fallback." >&2

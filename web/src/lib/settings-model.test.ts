@@ -51,7 +51,7 @@ function makeGlobal(over: Partial<GlobalConfigDTO> = {}): GlobalConfigDTO {
     mcp: { enabled: true, allow_send_message: true, allow_stop: false, allow_resume: false },
     server: { port: 8799 },
     logging: { dir: "~/.symphony/logs" },
-    repo: "git@github.com:makewhatis/symphony.git",
+    repo: "git@github.com:example/demo-repo.git",
     active_states: ["Todo", "In Progress"],
     terminal_states: ["Done", "Cancelled"],
     canceled_states: ["Cancelled"],
@@ -266,7 +266,7 @@ describe("toUiAgents", () => {
       overrides: { model: "claude-opus-4-8" },
       effective: {
         name: "Infra Bot",
-        repo: "git@github.com:makewhatis/symphony.git",
+        repo: "git@github.com:example/demo-repo.git",
         model: "claude-opus-4-8",
         effort: "high",
         permission: "bypassPermissions",
@@ -305,7 +305,7 @@ describe("toUiAgents", () => {
     expect(infra.id).toBe("infra-9c29");
     expect(infra.projectSlug).toBe("infra-9c29");
     expect(infra.color).toBe("#34d399");
-    expect(infra.repoShort).toBe("makewhatis/symphony");
+    expect(infra.repoShort).toBe("example/demo-repo");
     expect(infra.overrides.model).toBe("claude-opus-4-8");
     expect(effectiveModel(infra, toUiGlobal(g))).toBe("claude-opus-4-8");
     // enabled + running>0 => running with a live count

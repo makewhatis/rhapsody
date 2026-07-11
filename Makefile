@@ -6,6 +6,7 @@ test:
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	.github/check-forbidden-tokens.sh
 
 # Recapture golden fixtures from the reference Go daemon (operator machine only; see harness/capture/)
 fixtures:

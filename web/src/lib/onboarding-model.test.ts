@@ -37,8 +37,8 @@ describe("onboarding-model", () => {
     });
 
     it("accepts a bare non-hex slug (Linear slugIds are often plain words)", () => {
-      // e.g. the daemon's own fixtures: slugId "symphony" / "core-proj".
-      expect(normalizeProjectSlug("symphony")).toEqual({ ok: true, slug: "symphony" });
+      // e.g. the daemon's own fixtures: slugId "example-infra" / "core-proj".
+      expect(normalizeProjectSlug("example-infra")).toEqual({ ok: true, slug: "example-infra" });
       expect(normalizeProjectSlug("872639248532")).toEqual({ ok: true, slug: "872639248532" });
     });
 

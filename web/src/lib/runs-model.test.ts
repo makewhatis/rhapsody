@@ -244,8 +244,8 @@ describe("resolveAgent", () => {
       color: "var(--em-bright)",
     });
     // single-project mode (no slug): fall back to the repo short name
-    expect(resolveAgent("", "git@github.com:makewhatis/symphony.git", PROJECTS).name).toBe(
-      "makewhatis/symphony",
+    expect(resolveAgent("", "git@github.com:example/demo-repo.git", PROJECTS).name).toBe(
+      "example/demo-repo",
     );
   });
 });

@@ -35,14 +35,14 @@ export type NormalizeResult = { ok: true; slug: string } | { ok: false; error: s
 //
 // IMPORTANT: the slugId is the FULL trailing path segment of a Linear project URL, NOT a bare hex
 // id. Per GETTING_STARTED.md ("…/project/my-project-9c29e9ade060" → project_slug
-// "my-project-9c29e9ade060") and the daemon's own client fixtures (slugId "symphony",
+// "my-project-9c29e9ade060") and the daemon's own client fixtures (slugId "example-infra",
 // "core-proj"), a slugId is commonly "<name>-<id>" or even a plain word. (This intentionally
 // diverges from the INF-277 ticket's "extract the trailing [0-9a-f]{8,}" wording, which was based
 // on a mistaken premise — stripping to the hex tail would write a value that never equals the
 // configured slugId, so dispatch would never match. See the PR thread for the evidence.)
 //
 // Accepted shapes:
-//   • bare slug          "my-project-9c29e9ade060" / "symphony" / "872639248532" → as-is
+//   • bare slug          "my-project-9c29e9ade060" / "example-infra" / "872639248532" → as-is
 //   • full project URL   "https://linear.app/<org>/project/<slug>[/<view>][?…][#…]"     → <slug>
 // A URL with no /project/<slug> segment is un-normalizable and returns an error so the caller can
 // show it inline and refuse to write a config that would never dispatch. The result is lowercased
@@ -65,6 +65,6 @@ export function normalizeProjectSlug(input: string): NormalizeResult {
       error: `Couldn't find a Linear project slug in "${raw}" — paste the project URL or its slug.`,
     };
   }
-  // Otherwise it is already a bare slug (e.g. "my-project-9c29e9ade060" or "symphony").
+  // Otherwise it is already a bare slug (e.g. "my-project-9c29e9ade060" or "example-infra").
   return { ok: true, slug: raw.toLowerCase() };
 }

@@ -392,7 +392,7 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
       <SectionCard
         title="Observability"
         icon={Activity}
-        desc="Export run metrics + spans (timings, token counts, outcomes — never prompt or issue text) to Rhapsody's fleet-observability hub. On by default; turn it off to stop reporting."
+        desc="Export run metrics + spans (timings, token counts, outcomes — never prompt or issue text) to your fleet-observability collector. On by default; turn it off to stop reporting."
       >
         <Field
           label="Export telemetry"
@@ -410,7 +410,7 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
         <Field
           label="Telemetry endpoint"
           inline
-          hint="OTLP collector for run metrics + spans. Defaults to Rhapsody's tailnet-only hub."
+          hint="OTLP collector for run metrics + spans. Defaults to the configured OTLP collector."
         >
           <TextInput
             mono

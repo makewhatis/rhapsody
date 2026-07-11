@@ -43,7 +43,7 @@ function detail(over: Partial<RunDetailDTO> = {}): RunDetailDTO {
     issue_identifier: "INF-231",
     title: "Sign & notarize the dmg",
     project: "symphony-infra-tasks-9c29e9ade060",
-    repo: "git@github.com:makewhatis/symphony.git",
+    repo: "git@github.com:example/demo-repo.git",
     attempt: 0,
     outcome: "completed",
     live: false,
@@ -109,7 +109,7 @@ describe("RunDetail header + meta", () => {
     // raw config slug id) — they derive from the same project slug, so the name appears twice.
     expect(screen.getAllByText("Infrastructure")).toHaveLength(2);
     expect(screen.queryByText("symphony-infra-tasks-9c29e9ade060")).toBeNull(); // raw slug never shown when resolvable
-    expect(screen.getByText("makewhatis/symphony")).toBeTruthy(); // repo meta cell
+    expect(screen.getByText("example/demo-repo")).toBeTruthy(); // repo meta cell
   });
 
   it("omits the Attempt meta row for a clean attempt-0 run", async () => {

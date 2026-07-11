@@ -18,7 +18,7 @@ function makeGlobal(): GlobalConfigDTO {
     mcp: { enabled: true, allow_send_message: true, allow_stop: false, allow_resume: false },
     server: { port: 4317 },
     logging: { dir: "/logs" },
-    repo: "git@github.com:makewhatis/symphony.git",
+    repo: "git@github.com:example/demo-repo.git",
     active_states: ["Todo", "In Progress"],
     terminal_states: ["Done"],
     canceled_states: ["Cancelled"],
@@ -40,7 +40,7 @@ function makeGlobal(): GlobalConfigDTO {
 const infra: ProjectConfigDTO = {
   name: "Infra Bot",
   slugs: ["infra-9c29"],
-  repo: "git@github.com:makewhatis/symphony.git",
+  repo: "git@github.com:example/demo-repo.git",
   enabled: true,
   overrides: {},
 };

@@ -101,7 +101,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const TEST_PROJECTS_RESP: &str = r##"{"data":{"projects":{"nodes":[
-      {"id":"p1","name":"Infra Bot","slugId":"symphony","color":"#10b981","teams":{"nodes":[{"key":"INF","name":"Foundation Engineering"}]}},
+      {"id":"p1","name":"Infra Bot","slugId":"example-infra","color":"#10b981","teams":{"nodes":[{"key":"INF","name":"Foundation Engineering"}]}},
       {"id":"p2","name":"Core","slugId":"core-proj","color":"#6366f1","teams":{"nodes":[]}}
     ],"pageInfo":{"hasNextPage":false,"endCursor":"x"}}}}"##;
 
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].id, "p1");
         assert_eq!(got[0].name, "Infra Bot");
-        assert_eq!(got[0].slug, "symphony");
+        assert_eq!(got[0].slug, "example-infra");
         assert_eq!(got[0].color, "#10b981");
         assert_eq!(got[0].team, "Foundation Engineering");
         assert_eq!(got[1].team, "", "team empty when no teams");

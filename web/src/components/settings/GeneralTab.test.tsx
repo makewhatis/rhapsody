@@ -45,7 +45,7 @@ const account: LinearIdentity = {
   connected: true,
   name: "David Johansen",
   display_name: "David",
-  email: "david@makewhat.is",
+  email: "david@example.com",
   token: "lin_api_••••3f2a",
   workspace_url_key: "trackai",
 };
@@ -77,7 +77,7 @@ describe("GeneralTab", () => {
   it("renders the connected-as identity and a disabled, coming-soon Connect Linear button", () => {
     renderTab();
     expect(screen.getByText(/Connected as David Johansen/)).toBeTruthy();
-    expect(screen.getByText("david@makewhat.is")).toBeTruthy();
+    expect(screen.getByText("david@example.com")).toBeTruthy();
     const connect = screen.getByRole("button", { name: /Connect Linear/ }) as HTMLButtonElement;
     expect(connect.disabled).toBe(true);
   });

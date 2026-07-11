@@ -47,12 +47,12 @@ laundering; the loader's canary (R5) exists to catch it.
 
 ## Capture-fidelity notes (why the script does what it does)
 
-- **Reference path / macOS TCC.** `REF` defaults to the frozen
-  `~/Downloads/symphony-v0.4.0/golang/symphony`. macOS TCC blocks `~/Downloads`
-  for daemon-spawned processes on some machines; when the primary `REF` is unreadable the script
-  falls back to the spec-documented copy at `~/workspace/symphony-go-reference/golang/symphony`
-  (design §2/§6). Override with `REF=/path/to/symphony make fixtures`. The Go build output and
-  work dir live under `harness/capture/{target,work}` — **never** inside `$REF`.
+- **Reference path / macOS TCC.** `REF` is **required** — the operator-provided path to the frozen
+  Symphony v0.4.0 tree (`$REF`); no absolute path is committed. macOS TCC blocks `~/Downloads` for
+  daemon-spawned processes on some machines; when the given `REF` is unreadable the script falls
+  back to the spec-documented copy at `~/workspace/symphony-go-reference/golang/symphony` (design
+  §2/§6). Run as `REF=/path/to/symphony make fixtures`. The Go build output and work dir live under
+  `harness/capture/{target,work}` — **never** inside `$REF`.
 - **`schema.sql` = the 6 authored tables.** `run_messages` uses `AUTOINCREMENT`, so SQLite also
   materializes its internal `sqlite_sequence` bookkeeping table. That single engine-internal line
   is filtered out (`grep -v '^CREATE TABLE sqlite_sequence'`) so the golden holds exactly the six

@@ -5,8 +5,8 @@ per-issue workspaces, and runs Claude Code agents inside them. The daemon binary
 `symphonyd` (drop-in sidecar for the existing desktop shell).
 
 - Specs & plans: Linear project documents (Rhapsody project) — never committed to this repo.
-- Parity reference (read-only, NOT in this repo):
-  `/Users/david/Downloads/symphony-v0.4.0/golang/symphony` (Symphony v0.4.0)
+- Parity reference (read-only, NOT in this repo): `$REF` (operator-provided path to the frozen
+  Symphony v0.4.0 tree).
 - Golden fixtures: `harness/fixtures/` — captured via `make fixtures`, asserted by every crate.
 
 Build: `cargo build --workspace` · Test: `make test` · Lint: `make lint`
