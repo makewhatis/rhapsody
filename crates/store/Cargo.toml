@@ -7,9 +7,14 @@ repository.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+# chrono: RFC3339 "now" + day-arithmetic cutoffs, the Rust equivalent of Go's `time` package
+# (nowRFC3339 / AddDate) that the store's timestamp columns and retention window need.
+chrono = "0.4"
 
 [dev-dependencies]
 harness-fixtures = { path = "../harness-fixtures" }
+# serde_json (test-only): read the committed go-daemon-rows.json golden in the round-trip test.
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -1,14 +1,20 @@
 //! rhapsody-store — parity port of Go `internal/store` (Symphony v0.4.0).
 //!
-//! This phase (P2 · S2) lands the persistence foundation: the storage-path modes and the
-//! SQLite schema/open path. The full `Store` trait, CRUD, queries, retention, and the `Noop`
-//! implementation arrive in S3.
+//! This crate is the daemon's durable local history + restart-recovery layer. It persists every
+//! run/session/event behind the [`Store`] trait (the port of Go's `Store` interface) over 6
+//! tables — `runs`, `events`, `retry_queue`, `claims`, `totals`, `run_messages` — with two
+//! implementations: [`Sqlite`] (pure-in-process SQLite via `rusqlite`, WAL mode) and [`Noop`]
+//! (the guard-free disabled store used when `storage.path: off`).
 
 use std::path::PathBuf;
 
+mod noop;
 mod sqlite;
+mod types;
 
+pub use noop::Noop;
 pub use sqlite::Sqlite;
+pub use types::*;
 
 /// The resolved storage mode for the durable history + recovery store.
 ///
@@ -94,6 +100,72 @@ impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         StoreError::Sqlite(e)
     }
+}
+
+/// Store is Symphony's persistence + recovery port — the port of Go's `store.Store` interface.
+///
+/// Implementations must be safe for concurrent use: the write-through methods are called from the
+/// orchestrator actor and the event writer, while the read methods are called from the HTTP API.
+/// [`Sqlite`] serializes all access through a single owned connection; [`Noop`] is stateless.
+///
+/// Go returns bare `error`; here every fallible method yields [`StoreError`]. Go's `(row, found,
+/// err)` triple for a single lookup becomes `Result<Option<_>, _>`, and Go pointer fields map to
+/// [`Option`].
+pub trait Store {
+    // --- run lifecycle (write-through from the orchestrator actor) ---
+    fn start_run(&self, r: RunStart) -> Result<i64, StoreError>;
+    fn end_run(&self, run_id: i64, e: RunEnd) -> Result<(), StoreError>;
+    fn update_run_progress(&self, run_id: i64, p: RunProgress) -> Result<(), StoreError>;
+    fn append_events(&self, run_id: i64, ev: &[EventRow]) -> Result<(), StoreError>;
+
+    // --- restart-recovery ---
+    fn save_retry(&self, r: RetryRow) -> Result<(), StoreError>;
+    fn delete_retry(&self, issue_id: &str) -> Result<(), StoreError>;
+    fn save_claim(&self, issue_id: &str, state: &str, project_slug: &str)
+    -> Result<(), StoreError>;
+    fn delete_claim(&self, issue_id: &str) -> Result<(), StoreError>;
+    fn load_recovery(&self) -> Result<Recovery, StoreError>;
+    fn mark_running_interrupted(&self) -> Result<i64, StoreError>;
+    fn save_totals(&self, t: Totals) -> Result<(), StoreError>;
+    fn load_totals(&self) -> Result<Totals, StoreError>;
+
+    // --- history / queries (read-only, for the HTTP API) ---
+    fn list_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError>;
+    fn issue_history(
+        &self,
+        identifier: &str,
+        project: &str,
+        limit: i64,
+    ) -> Result<Vec<RunSummary>, StoreError>;
+    /// Returns a single run row by id. `Ok(None)` (not an error) when no such run exists, so the
+    /// caller can answer 404 without treating "missing" as an error.
+    fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError>;
+    fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError>;
+    fn search_events(&self, q: EventQuery) -> Result<Vec<EventHit>, StoreError>;
+    fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
+
+    // --- operator messages (INF-250) ---
+    /// Records a new operator message for a run with status "sent" and returns its row id. `body`
+    /// is the operator's ORIGINAL (unwrapped) text.
+    fn insert_run_message(
+        &self,
+        run_id: i64,
+        body: &str,
+        created_at_ms: i64,
+    ) -> Result<i64, StoreError>;
+    /// Stamps the OLDEST still-"sent" message for `run_id` as "delivered" with the given turn
+    /// number (FIFO matches mailbox delivery order). A no-op when no "sent" row exists.
+    fn mark_oldest_run_message_delivered(&self, run_id: i64, turn: i64) -> Result<(), StoreError>;
+    /// Marks every still-"sent" message for `run_id` as "expired" (called at run end so
+    /// undelivered messages don't linger as pending).
+    fn expire_run_messages(&self, run_id: i64) -> Result<(), StoreError>;
+    /// Returns all messages for a run ordered by id ASC.
+    fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError>;
+
+    /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
+    /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
+    fn prune(&self, retention_days: i64) -> Result<(), StoreError>;
+    fn close(&self) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]

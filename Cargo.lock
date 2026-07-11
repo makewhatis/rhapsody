@@ -762,8 +762,10 @@ version = "0.1.0"
 name = "rhapsody-store"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "harness-fixtures",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]
