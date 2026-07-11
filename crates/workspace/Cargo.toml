@@ -34,6 +34,11 @@ libc = "0.2"
 # API; the concurrency mirrors (TestEnsureFromRepo_Concurrent*, TestRepoLock_Concurrent*) spawn many
 # tasks that must run in parallel to exercise the per-repo mutex.
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
+# serde_json (test-only): the gtguard mirrors build a PreToolUse hook payload and parse
+# settings.local.json to validate its structure — exactly as gtguard_test.go uses encoding/json.
+# Already in the workspace lock (config/tracker/store/agent/harness-fixtures depend on it), so this
+# adds no new crate to the dependency tree; it is the same test-only pattern the store crate uses.
+serde_json = "1"
 
 [lints]
 workspace = true

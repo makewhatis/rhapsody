@@ -23,8 +23,9 @@ use crate::sanitize::{Workspace, sanitize_key};
 
 /// The single reserved root-level component that holds every bare mirror
 /// (`<root>/.mirrors/<RepoKey>.git`). A literal identifier of `.mirrors` sanitizes to `.mirrors`
-/// (`'.'` is permitted), so ensure/remove reject that collision defensively.
-const MIRRORS_DIR_NAME: &str = ".mirrors";
+/// (`'.'` is permitted), so ensure/remove reject that collision defensively. `pub(crate)` so the
+/// workspace GC ([`crate::gc`]) can skip it while scanning root and locate a worktree's mirror.
+pub(crate) const MIRRORS_DIR_NAME: &str = ".mirrors";
 
 /// Derives a stable, filesystem-safe single path component from a repo URL: the first 24 hex chars
 /// of SHA-256 over the trimmed URL. It never contains a path separator and is identical across runs
@@ -40,6 +41,28 @@ pub fn repo_key(repo_url: &str) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Reports whether `name` has the exact shape [`repo_key`] produces: 24 lowercase hex chars. The
+/// workspace GC uses it to classify a top-level dir as a repo-namespace PARENT even when no sibling
+/// bare mirror exists — the workspace_mode:clone case, where per-issue clones live at
+/// `<root>/<RepoKey>/<key>` with NO mirror. A legacy one-level worktree dir is `sanitize_key`-ed,
+/// which for a real tracker identifier (e.g. `"INF-418"`) is never pure 24-hex, so this never
+/// reclassifies a genuine legacy worktree as a parent (INF-418).
+pub(crate) fn looks_like_repo_key(name: &str) -> bool {
+    name.len() == 24 && name.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Reports whether `dir` is itself a git checkout — it contains a `.git` entry (a directory for a
+/// standalone clone, or a file for a worktree's gitdir link). The workspace GC uses it to
+/// distinguish a clone-namespace PARENT (no `.git` of its own; its children are the checkouts) from
+/// a leaf worktree/clone (has `.git`). This keeps a legacy hook-populated workspace whose
+/// `sanitize_key`-ed identifier coincidentally matches the 24-hex RepoKey shape (and so was
+/// `git clone`d into place, leaving a `.git`) classified as a single leaf — never as a namespace
+/// whose children get pruned individually (INF-418). Uses `symlink_metadata` (Go's `os.Lstat`), so a
+/// symlinked `.git` still counts.
+pub(crate) fn dir_is_git_checkout(dir: &str) -> bool {
+    std::fs::symlink_metadata(join(&[dir, ".git"])).is_ok()
 }
 
 /// Applies the hardened, non-interactive git environment on top of `base` (the port of Go's
@@ -68,8 +91,9 @@ fn git_env() -> Vec<(OsString, OsString)> {
 
 /// Removes well-known stale git lock files under `git_dir` (best-effort, idempotent): the top-level
 /// locks AND any `*.lock` under `<git_dir>/worktrees/*/` (per-worktree admin), so a worktree can be
-/// safely reused after a hard SIGKILL. Non-`.lock` files are never touched.
-fn clear_stale_locks(git_dir: &str) -> std::io::Result<()> {
+/// safely reused after a hard SIGKILL. Non-`.lock` files are never touched. `pub(crate)` so the
+/// workspace GC ([`crate::gc`]) can clear the mirror's stale locks before `git worktree remove`.
+pub(crate) fn clear_stale_locks(git_dir: &str) -> std::io::Result<()> {
     for name in ["index.lock", "HEAD.lock", "config.lock", "packed-refs.lock"] {
         match std::fs::remove_file(join(&[git_dir, name])) {
             Ok(()) => {}

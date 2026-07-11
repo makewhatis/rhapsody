@@ -123,6 +123,29 @@ pub(crate) fn dir(path: &str) -> String {
     clean(&path[0..i])
 }
 
+/// Returns the last element of `path` — the Unix port of Go's `filepath.Base`. Trailing separators
+/// are stripped first; an empty path yields `"."`, and an all-separator path yields `"/"`. Unlike
+/// [`dir`] it does NOT clean the result (matching `filepath.Base`, which only trims and slices). The
+/// workspace GC uses it to name a worktree's git admin dir (`<mirror>/worktrees/<Base(wt)>`).
+pub(crate) fn base(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    let b = path.as_bytes();
+    let mut end = b.len();
+    while end > 0 && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    let trimmed = &path[..end];
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    match trimmed.rfind('/') {
+        Some(i) => trimmed[i + 1..].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
 /// Enforces the pre-agent-launch invariants (upstream §9.5): the workspace path must stay inside
 /// the workspace root, and the agent's working directory must equal the workspace path.
 pub fn validate_launch(root: &str, workspace_path: &str, cwd: &str) -> Result<(), Error> {
@@ -222,5 +245,12 @@ mod tests {
         assert_eq!(dir("/tmp/x/.mirrors/abc.git"), "/tmp/x/.mirrors");
         assert_eq!(join(&["/a", "", "b", "c"]), "/a/b/c");
         assert_eq!(join(&["", ""]), "");
+        // base mirrors filepath.Base: leaf element, trailing slashes trimmed, edge cases.
+        assert_eq!(base("/a/b/c"), "c");
+        assert_eq!(base("/a/b/c/"), "c");
+        assert_eq!(base("/tmp/x/OLD-1"), "OLD-1");
+        assert_eq!(base(""), ".");
+        assert_eq!(base("/"), "/");
+        assert_eq!(base("leaf"), "leaf");
     }
 }

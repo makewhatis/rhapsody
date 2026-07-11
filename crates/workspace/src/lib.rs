@@ -18,6 +18,8 @@
 //! `errors.New` sentinels become the typed [`Error`] enum, whose `Display` reproduces the errors.go
 //! category string as its leading token so `errors.Is`-style category checks map to variant matches.
 
+mod gc;
+pub mod gtguard;
 mod hooks;
 mod labeler;
 mod manager;
@@ -25,6 +27,7 @@ mod repo;
 mod safety;
 mod sanitize;
 
+pub use gc::LiveCheck;
 pub use hooks::HookRunner;
 pub use manager::{Config, HookScripts, Manager};
 pub use repo::repo_key;
@@ -94,6 +97,12 @@ pub enum Error {
     /// labeler (AIE-301). Constructed by [`crate::labeler`]; callers log and swallow it.
     #[error("gh_failed: {0}")]
     GhFailed(String),
+    /// `gtguard` — an I/O failure installing the Graphite guardrail files. NOT an `errors.go`
+    /// sentinel: the `gtguard` sub-package uses a plain `fmt.Errorf("gtguard: …")` (no wrapped
+    /// sentinel), folded into the crate [`Error`] here so the workspace API surfaces one error type.
+    /// Constructed by [`crate::gtguard`] (W3).
+    #[error("gtguard: {0}")]
+    Gtguard(String),
 }
 
 /// Shared test scaffolding: the RAII [`testutil::TempDir`] (the port of Go's `t.TempDir()`), the
