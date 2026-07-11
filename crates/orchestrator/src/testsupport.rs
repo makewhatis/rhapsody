@@ -22,11 +22,13 @@ use rhapsody_store::{OUTCOME_COMPLETED, RunEnd, RunStart, Sqlite, Store, StorePa
 use rhapsody_tracker::Tracker;
 use rhapsody_workspace::{self as workspace, HookScripts, Manager};
 
+use rhapsody_tracker::fake::Fake;
+
 use crate::dispatch::EligibilityGate;
 use crate::effective::{DEFAULT_CLAIM_SETTLE_DELAY, DEFAULT_CLAIM_TTL, Effective, ResolvedProject};
-use crate::liveness;
+use crate::liveness::{self, Sampler};
 use crate::obslog::Store as TranscriptStore;
-use crate::orchestrator::{Orchestrator, RunningEntry};
+use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
 
 // --- issue / blocker / set builders (Go dispatch_test / select_test helpers) -----------------
 
@@ -352,6 +354,206 @@ pub(crate) fn seed_run(
             },
         )
         .expect("end_run");
+}
+
+// --- O5 retry / reconcile / recovery builders (Go orchForRetry / orchForReconcile / recoveryOrch /
+//     orchForRetryMulti helpers) ---------------------------------------------------------------------
+
+/// A spawn recorder capturing the dispatched issue ids (Go `orchForRetry`'s `dispatched []string`).
+pub(crate) type DispatchedIds = Arc<Mutex<Vec<String>>>;
+/// A spawn recorder capturing the dispatched running entries (Go `orchForRetryMulti`'s
+/// `dispatched []*runningEntry`).
+pub(crate) type DispatchedEntries = Arc<Mutex<Vec<RunningEntry>>>;
+
+/// A spawn seam that records each dispatched issue id into `sink`.
+fn record_ids(sink: &DispatchedIds) -> crate::orchestrator::SpawnFn {
+    let sink = Arc::clone(sink);
+    Box::new(move |iss, _attempt, _re| sink.lock().expect("dispatched lock").push(iss.id.clone()))
+}
+
+/// A spawn seam that records each dispatched running entry into `sink`.
+fn record_entries(sink: &DispatchedEntries) -> crate::orchestrator::SpawnFn {
+    let sink = Arc::clone(sink);
+    Box::new(move |_iss, _attempt, re| sink.lock().expect("dispatched lock").push(re.clone()))
+}
+
+/// Builds an orchestrator with a no-op spawn (recording dispatched ids) and a fake tracker, so state
+/// handlers can be tested synchronously. Mirrors Go `orchForRetry`.
+pub(crate) fn orch_for_retry(tr: Arc<Fake>, max_concurrent: i64) -> (Orchestrator, DispatchedIds) {
+    let mut eff = empty_effective(tr);
+    eff.active_states = set_of(&["todo", "in progress"]);
+    eff.terminal_states = set_of(&["done"]);
+    eff.max_concurrent = max_concurrent;
+    eff.max_retry_backoff_ms = 300_000;
+    eff.poll_interval = Duration::from_secs(3600);
+    let mut o = Orchestrator::new("WORKFLOW.md");
+    o.eff = Some(eff);
+    let dispatched: DispatchedIds = Arc::new(Mutex::new(Vec::new()));
+    o.spawn = record_ids(&dispatched);
+    (o, dispatched)
+}
+
+/// Builds a multi-project orchestrator with a spawn recording dispatched running entries and no
+/// top-level tracker of consequence (routing is per-project). Mirrors Go `orchForRetryMulti`.
+pub(crate) fn orch_for_retry_multi(
+    projects: Vec<ResolvedProject>,
+    global_max: i64,
+) -> (Orchestrator, DispatchedEntries) {
+    let mut eff = empty_effective(Arc::new(Fake::new()));
+    eff.max_concurrent = global_max;
+    eff.max_retry_backoff_ms = 300_000;
+    eff.poll_interval = Duration::from_secs(3600);
+    eff.projects = projects;
+    let mut o = Orchestrator::new("WORKFLOW.md");
+    o.eff = Some(eff);
+    let dispatched: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+    o.spawn = record_entries(&dispatched);
+    (o, dispatched)
+}
+
+/// A single-slug resolved project (group == slug) bound to `tr`, active `{todo, in progress}`,
+/// terminal `{done}`, cap 10. Mirrors Go `projWithTracker`.
+pub(crate) fn proj_with_tracker(slug: &str, tr: Arc<Fake>, prompt: &str) -> ResolvedProject {
+    let mut p = empty_resolved_project(slug, tr);
+    p.active_states = set_of(&["todo", "in progress"]);
+    p.terminal_states = set_of(&["done"]);
+    p.max_concurrent = 10;
+    p.prompt_tmpl = prompt.to_string();
+    p
+}
+
+/// Builds a workspace [`Manager`] rooted at `root` (real filesystem, so create/remove actually touch
+/// disk). Mirrors Go `workspace.NewManager` / `mkWS`.
+pub(crate) fn mk_workspace(root: &str) -> Arc<Manager> {
+    Arc::new(
+        Manager::new(workspace::Config {
+            root: root.to_string(),
+            hooks: HookScripts::default(),
+            hook_timeout: Duration::from_secs(1),
+        })
+        .expect("workspace manager"),
+    )
+}
+
+/// Builds an orchestrator with a real workspace manager (rooted in the returned [`TempDir`]) and a
+/// no-op spawn, for reconcile/liveness tests. Mirrors Go `orchForReconcile`. The [`TempDir`] is
+/// returned so the caller keeps it alive for the test's duration.
+pub(crate) fn orch_for_reconcile(tr: Arc<Fake>, stall: Duration) -> (Orchestrator, TempDir) {
+    let dir = TempDir::new();
+    let workspace = mk_workspace(&dir.path);
+    let mut eff = empty_effective(tr);
+    eff.workspace = workspace;
+    eff.active_states = set_of(&["todo", "in progress"]);
+    eff.terminal_states = set_of(&["done"]);
+    eff.max_concurrent = 10;
+    eff.max_retry_backoff_ms = 300_000;
+    eff.stall_timeout = stall;
+    let mut o = Orchestrator::new("WORKFLOW.md");
+    o.eff = Some(eff);
+    o.spawn = Box::new(|_iss, _attempt, _re| {}); // no real worker
+    (o, dir)
+}
+
+/// Inserts a running entry (issue + started_at, every other field zero) and claims it. Mirrors Go
+/// `addRunning` (minus the worker-cancel handle, which is O7's).
+pub(crate) fn add_running(
+    o: &mut Orchestrator,
+    id: &str,
+    ident: &str,
+    state: &str,
+    started_at: DateTime<Utc>,
+) {
+    let mut re = running_entry(issue(id, ident, state), "", "");
+    re.started_at = started_at;
+    o.running.insert(id.to_string(), re);
+    o.claimed.insert(id.to_string());
+}
+
+/// Builds an orchestrator on a caller-provided store with a recording no-op spawn and a fixed clock;
+/// eff has no resolved projects (legacy path). Mirrors Go `recoveryOrch`.
+pub(crate) fn recovery_orch(
+    st: Arc<dyn Store + Send + Sync>,
+    tr: Arc<Fake>,
+    now: DateTime<Utc>,
+) -> (Orchestrator, DispatchedIds) {
+    let mut eff = empty_effective(tr);
+    eff.active_states = set_of(&["todo", "in progress"]);
+    eff.terminal_states = set_of(&["done"]);
+    eff.max_concurrent = 10;
+    eff.max_retry_backoff_ms = 300_000;
+    eff.poll_interval = Duration::from_secs(3600);
+    eff.stall_timeout = Duration::from_secs(60);
+    let mut o = Orchestrator::new("WORKFLOW.md");
+    o.set_store(st);
+    o.now = Box::new(move || now);
+    o.eff = Some(eff);
+    let dispatched: DispatchedIds = Arc::new(Mutex::new(Vec::new()));
+    o.spawn = record_ids(&dispatched);
+    (o, dispatched)
+}
+
+/// A UTC datetime, the Rust analogue of Go's `time.Date(y, mo, d, h, mi, s, 0, time.UTC)`.
+pub(crate) fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+    use chrono::TimeZone;
+    Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
+        .single()
+        .expect("valid utc datetime")
+}
+
+/// A pending retry entry with the given key fields, every other field at its zero value (Go's
+/// `&retryEntry{issueID: …, identifier: …, attempt: …}` partial literals). Tests set `recovered` /
+/// `issue` / `project_slug` on the returned value as needed.
+pub(crate) fn retry_entry(issue_id: &str, identifier: &str, attempt: i64) -> RetryEntry {
+    RetryEntry {
+        issue_id: issue_id.to_string(),
+        identifier: identifier.to_string(),
+        attempt,
+        due_at: DateTime::from_timestamp(0, 0).expect("epoch"),
+        err: String::new(),
+        project_slug: String::new(),
+        project_repo: String::new(),
+        issue: Issue::default(),
+        due_at_ms: 0,
+        recovered: false,
+    }
+}
+
+/// A scripted CPU sampler returning per-pgid tick values (Go `fakeSampler`). `ok == false` models an
+/// unreadable `/proc` (→ `None`); a pgid with no scripted sequence returns `Some(0)`; a sequence is
+/// walked and then clamped to its last value.
+pub(crate) struct FakeSampler {
+    ok: bool,
+    seq: HashMap<i32, Vec<u64>>,
+    idx: Mutex<HashMap<i32, usize>>,
+}
+
+impl FakeSampler {
+    pub(crate) fn new(ok: bool, seq: HashMap<i32, Vec<u64>>) -> FakeSampler {
+        FakeSampler {
+            ok,
+            seq,
+            idx: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Sampler for FakeSampler {
+    fn group_cpu(&self, pgid: i32) -> Option<u64> {
+        if !self.ok {
+            return None;
+        }
+        let Some(s) = self.seq.get(&pgid) else {
+            return Some(0);
+        };
+        if s.is_empty() {
+            return Some(0);
+        }
+        let mut idx = self.idx.lock().expect("sampler idx lock");
+        let entry = idx.entry(pgid).or_insert(0);
+        let read = (*entry).min(s.len() - 1);
+        *entry += 1;
+        Some(s[read])
+    }
 }
 
 // --- tracing capture (Go's slog buffer analogue) ----------------------------------------------

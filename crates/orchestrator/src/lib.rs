@@ -32,6 +32,7 @@
 //! telemetry attrs — compiles standalone and introduces none.
 
 pub mod agentupdate;
+pub mod backoff;
 pub mod claim;
 pub mod concurrency;
 pub mod dispatch;
@@ -42,6 +43,10 @@ pub mod obslog;
 pub mod orchestrator;
 pub mod persist;
 pub mod reads;
+pub mod reconcile;
+pub mod reconcile_run;
+pub mod recovery;
+pub mod retry;
 pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;
@@ -53,11 +58,14 @@ pub mod workspace_gc;
 mod testsupport;
 
 pub use agentupdate::AgentUpdate;
+pub use backoff::{CONTINUATION_DELAY_MS, failure_backoff_ms};
 pub use concurrency::{global_slots, state_limit};
 pub use dispatch::{eligible, sort_for_dispatch};
 pub use effective::{Effective, ResolvedProject, build_effective, build_effective_with_runner};
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
 pub use reads::{Identity, ReadsError, ReadsTarget};
+pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
+pub use retry::{EvRetry, EvWorkerExit};
 pub use snapshot::{ProjectStatus, RateLimit, RetryRow, RunningRow, Snapshot, TokenCounts};
 pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
 pub use workspace_gc::WorkspaceGcPlan;

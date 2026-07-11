@@ -16,10 +16,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use chrono::{DateTime, Utc};
-use rhapsody_core::normalize_state;
+use rhapsody_core::{Issue, normalize_state};
 use rhapsody_store::{self as store, Store};
 
 use crate::effective::Effective;
+
+/// The worker-spawn seam signature (Go `spawn func(wctx, iss, attempt *int, re *runningEntry)`). The
+/// Go `context` is dropped — the Rust worker is a task whose abort handle O7 owns, so cancellation is
+/// a dropped future (mirroring `worker.rs`); [`Orchestrator::dispatch_issue`] passes the freshly-built
+/// running entry so the spawn can stamp the worker's project deps / run id. See [`Orchestrator::spawn`].
+pub(crate) type SpawnFn = Box<dyn Fn(&Issue, Option<i64>, &RunningEntry) + Send + Sync>;
 
 /// One observed agent event, for the per-issue `recent_events` ring surfaced in the API. Mirrors Go
 /// `EventRecord`.
@@ -111,6 +117,47 @@ pub struct RunningEntry {
     pub recent_events: Vec<EventRecord>,
 }
 
+impl RunningEntry {
+    /// A running entry for `issue` with every scheduling/telemetry field at its zero value (times at
+    /// the [`zero_time`] epoch, per the port's "never observed" convention). [`Orchestrator::dispatch_issue`]
+    /// builds one and then stamps the dispatch fields (`started_at`, `retry_attempt`, the owning-project
+    /// slug/group/repo, `model`, `stack_context`); `run_id` is stamped afterwards by `persist_start_run`.
+    /// The worker-machinery fields Go sets in `dispatchIssue` (`cancel`, `mailbox`) are O7's.
+    pub(crate) fn empty(issue: Issue) -> RunningEntry {
+        RunningEntry {
+            issue,
+            started_at: zero_time(),
+            retry_attempt: 0,
+            project_slug: String::new(),
+            project_group: String::new(),
+            project_repo: String::new(),
+            model: String::new(),
+            stack_context: String::new(),
+            last_delivered_summon_at: zero_time(),
+            thread_id: String::new(),
+            session_id: String::new(),
+            turn_count: 0,
+            last_event: String::new(),
+            last_message: String::new(),
+            last_event_at: zero_time(),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cur_input_tokens: 0,
+            cur_output_tokens: 0,
+            cur_total_tokens: 0,
+            run_id: 0,
+            event_seq: 0,
+            transcript_path: String::new(),
+            pgid: 0,
+            last_cpu_ticks: 0,
+            cpu_sampled: false,
+            last_cpu_active_at: zero_time(),
+            recent_events: Vec::new(),
+        }
+    }
+}
+
 /// Tracks a scheduled retry (upstream §4.1.7). Mirrors Go `retryEntry`.
 ///
 /// Go also carries the live `*time.Timer` here; the Rust retry timer arrives with the retry queue
@@ -180,6 +227,15 @@ pub struct Orchestrator {
     /// instant (`o.now = Box::new(move || fixed)`), which a non-capturing `fn` pointer could not
     /// represent. `Send + Sync` so the owning control task (O7) stays `Send`.
     pub now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+
+    /// The worker-spawn seam (Go `spawn func(...)`, defaulted in `New` to `o.spawnWorker`; injectable
+    /// for tests). [`dispatch_issue`](Orchestrator::dispatch_issue) hands the just-built running entry
+    /// to it to launch a worker. The DEFAULT is a placeholder: the real spawn — a worker task plus the
+    /// wiring of its per-turn events and exit back into the control loop — lands in O7 together with
+    /// the control-event channel and the task abort handle (the `worker.rs` module docs record the
+    /// same deferral for the worker body). O5's retry/recovery tests inject a recorder here, exactly as
+    /// the Go tests set `o.spawn`.
+    pub(crate) spawn: SpawnFn,
 
     /// The live config + built deps the loop schedules against; `None` until `Run`/reload builds it
     /// (O7). Mirrors Go `eff *effective` (nil until the first `reloadFromDisk`). Rebuilt and swapped
@@ -290,6 +346,10 @@ impl Orchestrator {
         Orchestrator {
             workflow_path: workflow_path.into(),
             now: Box::new(Utc::now),
+            // Placeholder worker-spawn: the real spawn (a worker task + the wiring of its events /
+            // exit back into the control loop) is O7's, together with the control-event channel and
+            // the task abort handle. Until then this is a no-op; O5's handler tests inject a recorder.
+            spawn: Box::new(|_iss, _attempt, _re| {}),
             eff: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
@@ -357,6 +417,33 @@ impl Orchestrator {
             .map(|re| re.identifier.clone())
             .collect()
     }
+}
+
+/// The zero / "never observed" [`DateTime`] sentinel — the Unix epoch. Go uses `time.Time{}`
+/// (`IsZero`); the Rust port initializes unset entry times to this epoch, so a field still equal to
+/// it means "not yet observed" (the reconcile stall detector reads it that way). Infallible via
+/// `from_timestamp_nanos(0)`.
+pub(crate) fn zero_time() -> DateTime<Utc> {
+    DateTime::from_timestamp_nanos(0)
+}
+
+/// Returns the attempt count, treating `None` (Go nil `*int`) as 0. Mirrors Go `normalizeAttempt`.
+/// (Go places this in `orchestrator.go`; O5 is its first consumer — [`crate::retry`] /
+/// [`Orchestrator::dispatch_issue`].)
+pub(crate) fn normalize_attempt(attempt: Option<i64>) -> i64 {
+    attempt.unwrap_or(0)
+}
+
+/// Returns the candidate matching `id` by opaque tracker ID. Mirrors Go `findByID`.
+pub(crate) fn find_by_id<'a>(issues: &'a [Issue], id: &str) -> Option<&'a Issue> {
+    issues.iter().find(|i| i.id == id)
+}
+
+/// Returns the candidate matching `identifier` by human identifier (e.g. "MT-12"). Boot-recovered
+/// retry entries key by identifier (the opaque tracker ID is unknown at restart), so `on_retry`
+/// resolves their candidate by identifier (Phase 4 §3.7). Mirrors Go `findByIdentifier`.
+pub(crate) fn find_by_identifier<'a>(issues: &'a [Issue], identifier: &str) -> Option<&'a Issue> {
+    issues.iter().find(|i| i.identifier == identifier)
 }
 
 #[cfg(test)]
