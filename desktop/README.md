@@ -1,11 +1,11 @@
 # Rhapsody.app (macOS desktop)
 
-A native macOS app (Tauri v2 — Rust + system WKWebView) that supervises the `symphonyd` daemon,
+A native macOS app (Tauri v2 — Rust + system WKWebView) that supervises the `rhapsodyd` daemon,
 shows its dashboard, and owns config + Linear credentials, so Rhapsody is a double-clickable tool
 instead of a pile of CLI prerequisites. Parity port of the Go/Wails shell (`$REF/desktop`).
 
 This is its **own cargo workspace** (see `Cargo.toml`), deliberately excluded from the repo-root
-workspace, so Tauri's heavy dependency tree stays out of the `symphonyd` daemon build — the same
+workspace, so Tauri's heavy dependency tree stays out of the `rhapsodyd` daemon build — the same
 isolation the Go module boundary provided. Root `cargo test --workspace` / `make lint` never
 compile it; the `desktop` CI job (`.github/workflows/ci.yml`) builds and tests it on its own.
 
@@ -14,11 +14,11 @@ compile it; the `desktop` CI job (`.github/workflows/ci.yml`) builds and tests i
 - **Window shell** (P7-D1, this scaffold): a status header + the daemon's loopback dashboard once
   healthy, with clear not-configured / starting / stopped / error states otherwise. The pure
   view-logic (`frontend/src/status.ts`) is ported 1:1 from the reference and unit-tested.
-- **Supervises `symphonyd`** as a bundled sidecar — launch on explicit `--port`, `/healthz`
+- **Supervises `rhapsodyd`** as a bundled sidecar — launch on explicit `--port`, `/healthz`
   readiness, crash-restart backoff, clean SIGTERM drain — plus the same-origin `/api` + `/healthz`
   reverse proxy. **D2 (landed)** ships these as the `supervisor` / `apiproxy` / `tooldirs` library
   modules + the `fakedaemon` test stub, proven against the stub and (gated) the real release
-  symphonyd; **D3** wires them into the window/tray.
+  rhapsodyd; **D3** wires them into the window/tray.
 - **Menu-bar tray** + app lifecycle (hide-on-close, quit drain) — **D3**.
 - **Settings**: Keychain credential, prefs, Linear project picker, onboarding, tool doctor — **D4**.
 - **Packaging**: unsigned `Rhapsody.app` + drag-to-Applications dmg; env-gated Developer ID
@@ -43,8 +43,8 @@ desktop/
 │   │   ├── supervisor/     # D2: launch/health/restart/drain + env + resolve (≈ internal/supervisor)
 │   │   ├── apiproxy.rs     # D2: same-origin /api + /healthz reverse proxy (≈ desktop/apiproxy.go)
 │   │   ├── tooldirs.rs     # D2: agent-launch PATH, override dirs first (≈ app.go + toolcheck/dirs.go)
-│   │   └── bin/fakedaemon.rs  # D2: symphonyd test stub (≈ internal/supervisor/testdata/fakedaemon)
-│   └── tests/              # D2: supervisor lifecycle + gated real-symphonyd smoke
+│   │   └── bin/fakedaemon.rs  # D2: rhapsodyd test stub (≈ internal/supervisor/testdata/fakedaemon)
+│   └── tests/              # D2: supervisor lifecycle + gated real-rhapsodyd smoke
 └── frontend/               # React + TS + Vite shell (≈ $REF/desktop/frontend)
     └── src/status.ts       # pure view-logic (status.test.ts asserts it)
 ```

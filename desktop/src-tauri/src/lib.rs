@@ -1,7 +1,7 @@
 //! rhapsody-desktop library — the P7-D2 sidecar layer the Tauri app (D3+) composes.
 //!
 //! Parity port of the Go/Wails shell's daemon plumbing:
-//!   - [`supervisor`] — launch `symphonyd` on an explicit `--port` + a known-good PATH, poll
+//!   - [`supervisor`] — launch `rhapsodyd` on an explicit `--port` + a known-good PATH, poll
 //!     `/healthz` for readiness, restart on crash with backoff, and drain on SIGTERM. Ports
 //!     `$REF/desktop/internal/supervisor` (`supervisor.go` + `env.go` + `resolve.go`).
 //!   - [`tooldirs`] — the daemon's agent-launch PATH dirs (per-tool override dirs first, then the

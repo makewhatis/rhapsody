@@ -1,12 +1,12 @@
-//! Locating the `symphonyd` sidecar binary. Parity port of
+//! Locating the `rhapsodyd` sidecar binary. Parity port of
 //! `$REF/desktop/internal/supervisor/resolve.go`.
 
 use std::path::{Path, PathBuf};
 
-/// The symphonyd executable name embedded as the app's sidecar.
-pub(crate) const BINARY_NAME: &str = "symphonyd";
+/// The rhapsodyd executable name embedded as the app's sidecar.
+pub(crate) const BINARY_NAME: &str = "rhapsodyd";
 
-/// Returned by [`resolve_binary`] when no `symphonyd` can be located. Mirrors the Go error string so
+/// Returned by [`resolve_binary`] when no `rhapsodyd` can be located. Mirrors the Go error string so
 /// the caller can surface a clear "daemon not found" instead of silently launching nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveError {
@@ -26,13 +26,13 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-/// Locates the symphonyd sidecar, in priority order:
+/// Locates the rhapsodyd sidecar, in priority order:
 ///
-///  1. `dev_override` — an explicit path (e.g. a freshly-built `./symphonyd` used by `tauri dev` or
+///  1. `dev_override` — an explicit path (e.g. a freshly-built `./rhapsodyd` used by `tauri dev` or
 ///     the `SYMPHONY_DAEMON` env override), when it exists.
-///  2. `<bundle_resources_dir>/symphonyd` — the sidecar `make app` copies into the app bundle's
+///  2. `<bundle_resources_dir>/rhapsodyd` — the sidecar `make app` copies into the app bundle's
 ///     `Contents/Resources`.
-///  3. `symphonyd` on PATH — a last-resort dev convenience.
+///  3. `rhapsodyd` on PATH — a last-resort dev convenience.
 ///
 /// Returns the resolved path, or a [`ResolveError`] if none is found.
 pub fn resolve_binary(
@@ -132,10 +132,10 @@ mod tests {
     #[test]
     fn resolve_binary_prefers_dev_override() {
         let dir = temp_dir();
-        let dev = dir.join("dev").join("symphonyd");
+        let dev = dir.join("dev").join("rhapsodyd");
         let res = dir.join("Resources");
         mk_exec(&dev);
-        mk_exec(&res.join("symphonyd"));
+        mk_exec(&res.join("rhapsodyd"));
 
         let got =
             resolve_binary(dev.to_str().unwrap(), res.to_str().unwrap()).expect("resolve_binary");
@@ -148,7 +148,7 @@ mod tests {
     fn resolve_binary_falls_back_to_bundle() {
         let dir = temp_dir();
         let res = dir.join("Resources");
-        let bundle_bin = res.join("symphonyd");
+        let bundle_bin = res.join("rhapsodyd");
         mk_exec(&bundle_bin);
 
         let got = resolve_binary("", res.to_str().unwrap()).expect("resolve_binary");
@@ -176,7 +176,7 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("PATH", v) },
             None => unsafe { std::env::remove_var("PATH") },
         }
-        assert!(got.is_err(), "expected an error when no symphonyd resolves");
+        assert!(got.is_err(), "expected an error when no rhapsodyd resolves");
         std::fs::remove_dir_all(&dir).ok();
     }
 

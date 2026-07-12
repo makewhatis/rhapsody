@@ -1,17 +1,17 @@
-//! Smoke test: supervise the REAL release-built `symphonyd` (the D2 acceptance's "smoke against the
-//! real release-built symphonyd"). Gated behind `RHAPSODY_SMOKE_SYMPHONYD=1` so the required
+//! Smoke test: supervise the REAL release-built `rhapsodyd` (the D2 acceptance's "smoke against the
+//! real release-built rhapsodyd"). Gated behind `RHAPSODY_SMOKE_RHAPSODYD=1` so the required
 //! `desktop` CI job (a plain `cargo test`) does not shell out to a second `cargo build` on the shared
 //! runner (which would contend with the root `test` job for the root workspace's target dir).
 //!
-//! It builds `symphonyd` in release mode from the repo-root workspace, resolves it exactly as the app
+//! It builds `rhapsodyd` in release mode from the repo-root workspace, resolves it exactly as the app
 //! would, and drives the supervisor against it:
-//!   - Once P6-F1 makes symphonyd a `/healthz`-serving daemon on `--port`, the smoke asserts the full
+//!   - Once P6-F1 makes rhapsodyd a `/healthz`-serving daemon on `--port`, the smoke asserts the full
 //!     start -> healthy -> stop lifecycle.
-//!   - Until then symphonyd is the P0 stub (prints its version and exits; no `--port`/`/healthz`), so
+//!   - Until then rhapsodyd is the P0 stub (prints its version and exits; no `--port`/`/healthz`), so
 //!     the smoke instead asserts the supervisor drives the REAL binary to a clean terminal `Stopped`
 //!     state (launch + resolve + restart-budget path exercised end to end, no hang/panic).
 //!
-//! Run: `RHAPSODY_SMOKE_SYMPHONYD=1 cargo test --test real_symphonyd_smoke -- --nocapture`.
+//! Run: `RHAPSODY_SMOKE_RHAPSODYD=1 cargo test --test real_rhapsodyd_smoke -- --nocapture`.
 
 use std::path::Path;
 use std::process::Command;
@@ -20,11 +20,11 @@ use std::time::Duration;
 use rhapsody_desktop::supervisor::{Options, State, Supervisor, resolve_binary};
 
 #[tokio::test]
-async fn smoke_supervises_real_release_symphonyd() {
-    if std::env::var_os("RHAPSODY_SMOKE_SYMPHONYD").is_none() {
+async fn smoke_supervises_real_release_rhapsodyd() {
+    if std::env::var_os("RHAPSODY_SMOKE_RHAPSODYD").is_none() {
         eprintln!(
-            "skip: set RHAPSODY_SMOKE_SYMPHONYD=1 to run the real-symphonyd smoke (builds the \
-             release symphonyd and supervises it)"
+            "skip: set RHAPSODY_SMOKE_RHAPSODYD=1 to run the real-rhapsodyd smoke (builds the \
+             release rhapsodyd and supervises it)"
         );
         return;
     }
@@ -36,27 +36,27 @@ async fn smoke_supervises_real_release_symphonyd() {
         .expect("resolve repo root");
     let manifest = root.join("Cargo.toml");
 
-    // Build the RELEASE symphonyd from the root workspace (a distinct target dir from desktop's).
+    // Build the RELEASE rhapsodyd from the root workspace (a distinct target dir from desktop's).
     let status = Command::new(env!("CARGO"))
-        .args(["build", "--release", "-p", "symphonyd", "--manifest-path"])
+        .args(["build", "--release", "-p", "rhapsodyd", "--manifest-path"])
         .arg(&manifest)
         .status()
         .expect("run cargo build");
     assert!(
         status.success(),
-        "cargo build --release -p symphonyd failed"
+        "cargo build --release -p rhapsodyd failed"
     );
 
-    let bin = root.join("target/release/symphonyd");
+    let bin = root.join("target/release/rhapsodyd");
     assert!(
         bin.exists(),
-        "release symphonyd missing at {}",
+        "release rhapsodyd missing at {}",
         bin.display()
     );
 
     // Resolving the real binary proves the resolve path works against the actual sidecar.
     let resolved =
-        resolve_binary(bin.to_str().expect("utf-8 path"), "").expect("resolve real symphonyd");
+        resolve_binary(bin.to_str().expect("utf-8 path"), "").expect("resolve real rhapsodyd");
 
     let sup = Supervisor::new(Options {
         binary_path: resolved,
@@ -72,19 +72,19 @@ async fn smoke_supervises_real_release_symphonyd() {
 
     match sup.start(tokio::time::sleep(Duration::from_secs(20))).await {
         Ok(()) => {
-            // Post-F1: symphonyd serves /healthz on --port.
+            // Post-F1: rhapsodyd serves /healthz on --port.
             assert_eq!(
                 sup.status().state,
                 State::Running,
                 "want Running once healthy"
             );
-            assert!(sup.healthy().await, "real symphonyd must answer /healthz");
+            assert!(sup.healthy().await, "real rhapsodyd must answer /healthz");
             sup.stop().await;
             assert_eq!(sup.status().state, State::Stopped, "clean stop");
-            eprintln!("smoke OK: real symphonyd went start -> healthy -> stop");
+            eprintln!("smoke OK: real rhapsodyd went start -> healthy -> stop");
         }
         Err(e) => {
-            // Pre-F1 stub: symphonyd exits immediately. The supervisor must reach a clean terminal
+            // Pre-F1 stub: rhapsodyd exits immediately. The supervisor must reach a clean terminal
             // Stopped state with the failure surfaced — the launch/resolve/restart machinery is
             // exercised against the REAL binary even though it can never become healthy yet.
             assert_eq!(
@@ -97,7 +97,7 @@ async fn smoke_supervises_real_release_symphonyd() {
                 "the launch failure must be surfaced via Status.last_err"
             );
             eprintln!(
-                "smoke OK (pre-F1): real symphonyd is still the P0 stub (no /healthz); supervisor \
+                "smoke OK (pre-F1): real rhapsodyd is still the P0 stub (no /healthz); supervisor \
                  reached terminal Stopped, last_err = {:?}; err = {e}",
                 sup.status().last_err
             );

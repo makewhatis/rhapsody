@@ -112,7 +112,7 @@ export default function App() {
         <div className="overlay" role="alert">
           <div className="overlay-card">
             <h2>Shutting down…</h2>
-            <p>Stopping symphonyd and any running agents.</p>
+            <p>Stopping rhapsodyd and any running agents.</p>
           </div>
         </div>
       )}
@@ -128,8 +128,8 @@ function Placeholder({ view, status }: { view: string; status: StatusDTO | null 
       detail:
         "Connect Linear and choose a project to create your WORKFLOW.md. Until then the daemon will not start.",
     },
-    starting: { title: "Starting symphonyd…", detail: "Waiting for the daemon to become healthy." },
-    stopped: { title: "Daemon stopped", detail: "Press Start to launch symphonyd." },
+    starting: { title: "Starting rhapsodyd…", detail: "Waiting for the daemon to become healthy." },
+    stopped: { title: "Daemon stopped", detail: "Press Start to launch rhapsodyd." },
     error: {
       title: "Daemon stopped after an error",
       detail: status?.last_err || "The daemon exited unexpectedly. Check the logs and try Start.",

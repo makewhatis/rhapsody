@@ -1,6 +1,6 @@
 [package]
 name = "rhapsody-desktop"
-description = "Rhapsody desktop app — supervises the symphonyd sidecar and shows its dashboard."
+description = "Rhapsody desktop app — supervises the rhapsodyd sidecar and shows its dashboard."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

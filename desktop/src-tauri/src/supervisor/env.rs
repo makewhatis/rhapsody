@@ -1,10 +1,10 @@
-//! Child-process environment for the `symphonyd` sidecar. Parity port of
+//! Child-process environment for the `rhapsodyd` sidecar. Parity port of
 //! `$REF/desktop/internal/supervisor/env.go`.
 
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Builds the environment for the `symphonyd` child process. It augments `base` (a slice of
+/// Builds the environment for the `rhapsodyd` child process. It augments `base` (a slice of
 /// `KEY=VALUE` entries, typically the process environment) so the daemon — which shells out to
 /// claude, gh, gt, and git — can find those tools even when launched from a GUI app with a minimal
 /// PATH (the launchd/Finder PATH gotcha, design §2):

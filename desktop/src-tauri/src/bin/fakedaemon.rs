@@ -1,4 +1,4 @@
-//! fakedaemon — a test stand-in for `symphonyd` used by the supervisor lifecycle tests. Parity port
+//! fakedaemon — a test stand-in for `rhapsodyd` used by the supervisor lifecycle tests. Parity port
 //! of `$REF/desktop/internal/supervisor/testdata/fakedaemon/main.go`.
 //!
 //! It mimics the parts the supervisor cares about — a `--port` flag, a `/healthz` route, graceful

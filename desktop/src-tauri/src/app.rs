@@ -88,7 +88,7 @@ struct Mutable {
 struct AppInner {
     /// The WORKFLOW.md the app supervises (`None` when `$HOME` is unset); its existence == configured.
     workflow_path: Option<PathBuf>,
-    /// The resolved `symphonyd` sidecar path (empty until resolved), passed to each supervisor.
+    /// The resolved `rhapsodyd` sidecar path (empty until resolved), passed to each supervisor.
     binary_path: PathBuf,
     mu: Mutex<Mutable>,
     /// Short-timeout client for the `/api/v1/state` agent-count probe (Go's `http.DefaultClient`).
@@ -187,7 +187,7 @@ impl App {
     }
 
     /// Builds the app from the environment — the OnStartup path resolution: the WORKFLOW.md
-    /// (`SYMPHONY_WORKFLOW` override, else `~/.symphony/WORKFLOW.md`) and the `symphonyd` sidecar
+    /// (`SYMPHONY_WORKFLOW` override, else `~/.symphony/WORKFLOW.md`) and the `rhapsodyd` sidecar
     /// (`SYMPHONY_DAEMON` dev override, else the app bundle's `Resources`, else PATH). A missing
     /// sidecar is logged and left empty (the daemon simply cannot start until it is found), mirroring
     /// Go `OnStartup`'s `resolveWorkflowPath` + `resolveDaemonBinary`.
@@ -535,7 +535,7 @@ fn resolve_workflow_path_from(
     }
 }
 
-/// Locates the `symphonyd` sidecar: a `SYMPHONY_DAEMON` dev override, else the app bundle's
+/// Locates the `rhapsodyd` sidecar: a `SYMPHONY_DAEMON` dev override, else the app bundle's
 /// `Resources`, else PATH. Returns an empty path (logged) when none is found — the daemon simply
 /// cannot start until it is present. Mirrors Go `resolveDaemonBinary`.
 fn resolve_daemon_binary() -> PathBuf {
@@ -548,7 +548,7 @@ fn resolve_daemon_binary() -> PathBuf {
     match resolve_binary(&over, &resources) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("rhapsody-desktop: could not locate symphonyd sidecar: {e}");
+            eprintln!("rhapsody-desktop: could not locate rhapsodyd sidecar: {e}");
             PathBuf::new()
         }
     }
@@ -665,7 +665,7 @@ mod tests {
         );
     }
 
-    // Per the README, the app must not launch symphonyd until a WORKFLOW.md exists. Mirrors Go
+    // Per the README, the app must not launch rhapsodyd until a WORKFLOW.md exists. Mirrors Go
     // `TestStartDaemonRefusesWhenNotConfigured`.
     #[test]
     fn start_daemon_refuses_when_not_configured() {

@@ -29,7 +29,7 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
-  // Embedded under the symphonyd binary at "/", so assets must be root-relative.
+  // Embedded under the rhapsodyd binary at "/", so assets must be root-relative.
   base: "/",
   build: {
     // Build into the httpapi crate's embed dir so rust-embed's `#[folder = "web-dist/"]`

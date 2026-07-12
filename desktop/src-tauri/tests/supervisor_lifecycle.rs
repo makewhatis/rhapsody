@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use rhapsody_desktop::supervisor::{Options, StartError, State, Supervisor};
 
-/// Path to the compiled fakedaemon stand-in for symphonyd (Cargo builds it for us).
+/// Path to the compiled fakedaemon stand-in for rhapsodyd (Cargo builds it for us).
 fn fake_daemon() -> &'static str {
     env!("CARGO_BIN_EXE_fakedaemon")
 }
@@ -321,7 +321,7 @@ async fn start_fails_fast_when_binary_missing() {
 #[tokio::test]
 async fn start_fails_fast_when_binary_not_executable() {
     use std::os::unix::fs::PermissionsExt;
-    let p = temp_path("symphonyd");
+    let p = temp_path("rhapsodyd");
     std::fs::write(&p, b"not an executable").expect("write");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).expect("chmod"); // no exec bit
     let sup = Supervisor::new(fast_options(p.to_str().unwrap(), &[]));

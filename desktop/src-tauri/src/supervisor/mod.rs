@@ -1,4 +1,4 @@
-//! Launches and supervises the `symphonyd` sidecar for the desktop app. Parity port of
+//! Launches and supervises the `rhapsodyd` sidecar for the desktop app. Parity port of
 //! `$REF/desktop/internal/supervisor/supervisor.go`: it resolves the daemon binary, launches it on a
 //! known-good PATH with an explicit `--port`, polls `/healthz` for readiness, restarts it on crash
 //! with backoff, and stops it cleanly (SIGTERM) on quit. It deliberately has no Tauri dependency, so
@@ -83,8 +83,9 @@ pub enum StartError {
     NotExecutable(String),
     /// A free loopback port could not be chosen.
     PortResolution(String),
-    /// The daemon never stayed healthy after exhausting the restart budget. Mirrors Go's
-    /// "symphonyd did not stay healthy after N restart(s)" giveup error.
+    /// The daemon never stayed healthy after exhausting the restart budget — the
+    /// "rhapsodyd did not stay healthy after N restart(s)" give-up error (mirrors Go's give-up,
+    /// with the sidecar's own — now `rhapsodyd` — binary name).
     NeverHealthy { restarts: i64, last_err: String },
     /// `stop`/shutdown was requested before the daemon ever became healthy. Mirrors Go `ErrStopped`.
     Stopped,
@@ -99,7 +100,7 @@ impl std::fmt::Display for StartError {
             StartError::PortResolution(msg) => write!(f, "resolve port: {msg}"),
             StartError::NeverHealthy { restarts, last_err } => write!(
                 f,
-                "symphonyd did not stay healthy after {restarts} restart(s): {last_err}"
+                "rhapsodyd did not stay healthy after {restarts} restart(s): {last_err}"
             ),
             StartError::Stopped => f.write_str("supervisor: stopped before becoming healthy"),
         }
@@ -110,7 +111,7 @@ impl std::error::Error for StartError {}
 
 /// Configures a [`Supervisor`]. Unset fields default in [`Supervisor::new`] (or via [`Default`]).
 pub struct Options {
-    /// Path to symphonyd (required).
+    /// Path to rhapsodyd (required).
     pub binary_path: PathBuf,
     /// Path to WORKFLOW.md, passed as the positional arg when present.
     pub workflow_path: Option<PathBuf>,
@@ -330,7 +331,7 @@ impl Supervisor {
             // with a clear error instead of spinning the restart loop on a launch error.
             if !is_executable_file(&self.inner.binary_path) {
                 let msg = format!(
-                    "symphonyd sidecar not available at {}: not an executable file",
+                    "rhapsodyd sidecar not available at {}: not an executable file",
                     self.inner.binary_path.display()
                 );
                 st.last_err = Some(msg.clone());

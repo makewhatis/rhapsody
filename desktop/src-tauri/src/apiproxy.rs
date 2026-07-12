@@ -1,8 +1,8 @@
 //! The same-origin reverse proxy that forwards the app's `/api/*` + `/healthz` requests to the
-//! supervised `symphonyd` sidecar. Parity port of `$REF/desktop/apiproxy.go`.
+//! supervised `rhapsodyd` sidecar. Parity port of `$REF/desktop/apiproxy.go`.
 //!
 //! The packaged app serves its UI from its own origin, so the UI's relative fetches — GET/POST
-//! `/api/*` and `/healthz` — must be forwarded to symphonyd's loopback server. That server binds a
+//! `/api/*` and `/healthz` — must be forwarded to rhapsodyd's loopback server. That server binds a
 //! dynamically-chosen free port which is reassigned across start/stop/restart, so the target is
 //! resolved from the supervisor PER REQUEST (via the `base_url` closure) rather than captured once.
 //! Non-API paths fall through to the static asset handler (`next`).
@@ -46,7 +46,7 @@ impl ProxyResponse {
     }
 }
 
-/// Reports whether a request path must be proxied to symphonyd instead of being served from the
+/// Reports whether a request path must be proxied to rhapsodyd instead of being served from the
 /// embedded UI bundle. Mirrors Go `isDaemonAPIPath`.
 pub fn is_daemon_api_path(path: &str) -> bool {
     path == "/healthz" || path.starts_with("/api/")

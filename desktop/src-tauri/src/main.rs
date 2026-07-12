@@ -1,4 +1,4 @@
-//! Rhapsody desktop — the macOS app that supervises the `symphonyd` sidecar and shows its dashboard.
+//! Rhapsody desktop — the macOS app that supervises the `rhapsodyd` sidecar and shows its dashboard.
 //! Tauri v2 port of the Wails shell (`$REF/desktop/main.go` + `app.go`). P7-D3 wires the menu-bar
 //! tray + the app lifecycle: closing the window hides it (the tray + daemon keep running), while
 //! quitting shows a "Shutting down…" overlay and drains the daemon OFF the main thread. Settings /
