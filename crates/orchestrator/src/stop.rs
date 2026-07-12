@@ -99,9 +99,12 @@ pub struct ControlHandle {
 
 impl crate::orchestrator::Orchestrator {
     /// The off-loop [`ControlHandle`] for driving the daemon's HTTP API while the control task runs.
-    /// Snapshots the current control-event sender, lifetime ctx, top-level tracker, store, the shared
-    /// reads cell, and the workflow path. Obtain it before the loop task takes ownership of the
-    /// orchestrator (the daemon builds it after `Run`'s first reload; tests after setting `eff`).
+    /// Snapshots the control-event sender + lifetime ctx + top-level tracker + store, and clones the
+    /// SHARED reads cell + retention atomics (so a reload updates what the handle sees). Obtain it
+    /// before the loop task takes ownership of the orchestrator: the daemon builds it right after
+    /// [`set_ctx`](Orchestrator::set_ctx) + [`set_store`](Orchestrator::set_store) and BEFORE `Run`,
+    /// so the `eff`-derived snapshot (`tracker`) is `None` and the reads-cell fallbacks fill in on the
+    /// first reload; tests build it after setting `eff`.
     pub fn control(&self) -> ControlHandle {
         ControlHandle {
             events: self.events.clone(),
@@ -586,6 +589,28 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), cw.cancelled())
             .await
             .expect("worker ctx was not cancelled");
+    }
+
+    // F1 self-review regression: when the daemon installs the lifetime ctx (`set_ctx`) BEFORE
+    // snapshotting the handle (`control`), the handle carries the REAL ctx, so a cancelled lifetime
+    // breaks an off-loop reply-wait. With the pre-fix never-cancelling default ctx this would hang
+    // (the events receiver is still held by `o`, so the reply never arrives and only the ctx can
+    // break the wait) — the `timeout` guards that regression.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_handle_lifetime_ctx_bounds_offloop_wait() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let signal = CancelSignal::new();
+        o.set_ctx(signal.wait()); // the daemon's pre-Run ctx install
+        let handle = o.control();
+        signal.cancel(); // lifetime ends before the reply can arrive
+        let res = tokio::time::timeout(Duration::from_secs(2), handle.send_run_message(1, "hi"))
+            .await
+            .expect("a cancelled lifetime ctx must break the reply-wait, not hang");
+        assert!(
+            res.not_running,
+            "a cancelled lifetime ctx yields not_running"
+        );
+        drop(o); // keep `o` (and its event receiver) alive until after the call, then release
     }
 
     // Mirrors Go `TestStopRun_KillsRecordsCancelsAndSuppresses`.

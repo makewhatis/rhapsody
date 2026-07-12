@@ -475,6 +475,16 @@ impl Orchestrator {
         self.store_injected = true;
     }
 
+    /// Installs the orchestrator's lifetime cancellation BEFORE [`Run`](Orchestrator::run) sets it, so
+    /// a [`ControlHandle`](crate::ControlHandle) snapshotted via [`control`](Orchestrator::control)
+    /// beforehand carries the REAL ctx (not the never-cancelling default). The daemon calls this with
+    /// the same ctx it later passes to `Run`, so its off-loop stop/resume/message reply-waits are
+    /// bounded by the lifetime ctx (Go's `o.ctx.Done()`), not only the control-channel teardown. `Run`
+    /// re-sets the same ctx idempotently.
+    pub fn set_ctx(&mut self, ctx: crate::control_loop::CancelWait) {
+        self.ctx = Some(ctx);
+    }
+
     /// The effective `storage.retention_days` (default 30 until the first reload). Read by the daemon's
     /// prune scheduler (P6) each cycle without racing the control task's reload. Mirrors Go
     /// `CurrentRetentionDays`.

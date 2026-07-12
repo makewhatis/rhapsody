@@ -104,6 +104,10 @@ where
         flags.no_store,
     );
     o.set_store(store);
+    // Install the lifetime ctx BEFORE snapshotting the off-loop handle, so the handle's stop/resume/
+    // message reply-waits are bounded by the real ctx (not the never-cancelling default). `Run`
+    // re-sets the same ctx below.
+    o.set_ctx(ctx.clone());
 
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
@@ -278,8 +282,8 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             None => (flag, None),
         };
         match name {
-            "no-store" => f.no_store = inline.as_deref() != Some("false"),
-            "no-color" => f.no_color = inline.as_deref() != Some("false"),
+            "no-store" => f.no_store = parse_bool_flag(inline, "no-store")?,
+            "no-color" => f.no_color = parse_bool_flag(inline, "no-color")?,
             "port" => {
                 let v = take_value(inline, args, &mut i, "port")?;
                 f.port = v
@@ -292,6 +296,22 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         i += 1;
     }
     Ok(f)
+}
+
+/// Parses a boolean flag's value, mirroring Go's `strconv.ParseBool` (which `flag` uses for bool
+/// flags): a bare `--flag` (no inline value) is `true`; an inline `=1/t/T/TRUE/True/true` is `true`
+/// and `=0/f/F/FALSE/False/false` is `false`; anything else is an error (Go exits 2). This is why a
+/// bare `--no-store` differs from `--no-store=0`: the latter means "store ON", not off — the naive
+/// `!= "false"` reading silently inverted it.
+fn parse_bool_flag(inline: Option<String>, name: &str) -> Result<bool, String> {
+    match inline {
+        None => Ok(true),
+        Some(v) => match v.as_str() {
+            "1" | "t" | "T" | "TRUE" | "True" | "true" => Ok(true),
+            "0" | "f" | "F" | "FALSE" | "False" | "false" => Ok(false),
+            _ => Err(format!("invalid boolean value {v:?} for flag -{name}")),
+        },
+    }
 }
 
 /// Resolves a value-flag's argument: the inline `=value`, or the next arg. Advances `i` past a
@@ -610,6 +630,33 @@ mod tests {
         assert!(f.no_store);
         let f = parse_flags(&["-no-color".into(), "wf".into()]).expect("single-dash bool");
         assert!(f.no_color);
+
+        // Go `strconv.ParseBool` for bool flags: `=0`/`=false`/`=f`/`=FALSE` mean OFF (do NOT disable
+        // the store — the naive `!= "false"` reading silently inverted this); `=1`/`=true` mean ON;
+        // anything else errors (Go exits 2).
+        for off in [
+            "--no-store=0",
+            "--no-store=false",
+            "--no-store=f",
+            "--no-store=FALSE",
+        ] {
+            assert!(
+                !parse_flags(&[off.to_string()])
+                    .unwrap_or_else(|e| panic!("{off}: {e}"))
+                    .no_store,
+                "{off} must NOT disable the store"
+            );
+        }
+        for on in ["--no-store=1", "--no-store=true", "--no-store=T"] {
+            assert!(
+                parse_flags(&[on.to_string()]).expect(on).no_store,
+                "{on} must disable the store"
+            );
+        }
+        assert!(
+            parse_flags(&["--no-store=garbage".into()]).is_err(),
+            "a non-boolean --no-store value must error (Go exits 2)"
+        );
 
         // Error paths: unknown flag, and a value flag with no argument.
         assert!(
