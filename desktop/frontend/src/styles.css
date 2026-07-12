@@ -1,0 +1,114 @@
+/* Desktop shell styling. Ported from $REF/desktop/frontend/src/styles.css, reduced to the P7-D1
+   surface (header + placeholder + dashboard iframe + footer). The Wails-specific window-drag CSS
+   (`--wails-draggable`) is dropped: Tauri drives window dragging via the `data-tauri-drag-region`
+   attribute, added with the custom titlebar in a later chain task. The Tool-doctor / credential /
+   onboarding styles land with their components (D4). */
+:root {
+  color-scheme: dark;
+  --bg: #121214;
+  --panel: #1b1b1f;
+  --border: #2a2a30;
+  --fg: #e8e8ea;
+  --muted: #9a9aa2;
+  --accent: #6c8cff;
+  --ok: #46c08a;
+  --warn: #e0a341;
+  --err: #e0574a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root,
+.app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand .label {
+  color: var(--muted);
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.dot.dashboard {
+  background: var(--ok);
+}
+.dot.starting {
+  background: var(--warn);
+}
+.dot.stopped,
+.dot.not-configured {
+  background: var(--muted);
+}
+.dot.error {
+  background: var(--err);
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.dashboard {
+  flex: 1;
+  border: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.placeholder {
+  margin: auto;
+  max-width: 420px;
+  text-align: center;
+  padding: 32px;
+  color: var(--muted);
+}
+
+.placeholder h2 {
+  color: var(--fg);
+  margin-bottom: 8px;
+}
+
+.foot {
+  padding: 6px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}

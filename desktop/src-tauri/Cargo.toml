@@ -1,0 +1,20 @@
+[package]
+name = "rhapsody-desktop"
+description = "Rhapsody desktop app — supervises the symphonyd sidecar and shows its dashboard."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

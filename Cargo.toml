@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "harness/stubs/linear-stub"]
+# The Tauri desktop app is its OWN cargo workspace (see desktop/Cargo.toml) — kept out of this one
+# so its heavy dependency tree stays out of the `symphonyd` daemon build, mirroring the Go module
+# boundary ($REF/desktop). Excluded so root `cargo`/`make lint` never descend into it (P7-D1).
+exclude = ["desktop"]
 
 [workspace.package]
 edition = "2024"

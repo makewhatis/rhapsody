@@ -42,3 +42,34 @@ jobs:
       # source for the embedded dashboard (P6-H1). Proves the build + outDir move stay green.
       - run: npm run build
         working-directory: web
+
+  # The Tauri desktop app (P7) is its OWN cargo workspace, excluded from the root workspace, so it
+  # is linted/built/tested here rather than by the `lint`/`test` jobs. Unsigned build only — the
+  # signed/notarized .app + .dmg are human-gated (P7-D5 / desktop SIGNING). Job name `desktop` is a
+  # branch-protection context; keep it stable.
+  desktop:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: rustup show   # installs the toolchain pinned by the shared repo-root rust-toolchain.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # No `cache: npm` on the self-hosted runner (same rationale as the web job).
+      # Build the shell's frontend bundle FIRST: `cargo`/`tauri::generate_context!` embeds
+      # desktop/frontend/dist (tauri.conf.json `frontendDist`), which is git-ignored build output.
+      - run: npm ci
+        working-directory: desktop/frontend
+      - run: npm test          # vitest: the shell view-logic (status.ts) parity suite
+        working-directory: desktop/frontend
+      - run: npm run build     # -> desktop/frontend/dist (the rust embed source)
+        working-directory: desktop/frontend
+      - run: cargo fmt --all --check
+        working-directory: desktop
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: desktop
+      - run: cargo build       # the unsigned build (compiles the Tauri app)
+        working-directory: desktop
+      - run: cargo test
+        working-directory: desktop
