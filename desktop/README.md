@@ -14,8 +14,11 @@ compile it; the `desktop` CI job (`.github/workflows/ci.yml`) builds and tests i
 - **Window shell** (P7-D1, this scaffold): a status header + the daemon's loopback dashboard once
   healthy, with clear not-configured / starting / stopped / error states otherwise. The pure
   view-logic (`frontend/src/status.ts`) is ported 1:1 from the reference and unit-tested.
-- **Supervises `symphonyd`** as a bundled sidecar (launch on explicit `--port`, `/healthz`
-  readiness, crash-restart backoff, clean SIGTERM drain) + same-origin `/api` proxy — **D2**.
+- **Supervises `symphonyd`** as a bundled sidecar — launch on explicit `--port`, `/healthz`
+  readiness, crash-restart backoff, clean SIGTERM drain — plus the same-origin `/api` + `/healthz`
+  reverse proxy. **D2 (landed)** ships these as the `supervisor` / `apiproxy` / `tooldirs` library
+  modules + the `fakedaemon` test stub, proven against the stub and (gated) the real release
+  symphonyd; **D3** wires them into the window/tray.
 - **Menu-bar tray** + app lifecycle (hide-on-close, quit drain) — **D3**.
 - **Settings**: Keychain credential, prefs, Linear project picker, onboarding, tool doctor — **D4**.
 - **Packaging**: unsigned `Rhapsody.app` + drag-to-Applications dmg; env-gated Developer ID
@@ -32,10 +35,16 @@ desktop/
 │   ├── tauri.conf.json     # window (Rhapsody, 1100x760) + bundle config
 │   ├── capabilities/       # Tauri v2 ACL
 │   ├── icons/              # app icon (placeholder until D5)
-│   └── src/
-│       ├── main.rs         # commands (status/app_version) + Builder::run
-│       ├── status.rs       # StatusDto + Configured() detection (≈ app.go)
-│       └── version.rs      # build stamp (≈ internal/version)
+│   ├── src/
+│   │   ├── main.rs         # D1 bin: commands (status/app_version) + Builder::run
+│   │   ├── lib.rs          # D2 library root: pub supervisor / apiproxy / tooldirs (consumed by D3)
+│   │   ├── status.rs       # D1: StatusDto + Configured() detection (≈ app.go)
+│   │   ├── version.rs      # D1: build stamp (≈ internal/version)
+│   │   ├── supervisor/     # D2: launch/health/restart/drain + env + resolve (≈ internal/supervisor)
+│   │   ├── apiproxy.rs     # D2: same-origin /api + /healthz reverse proxy (≈ desktop/apiproxy.go)
+│   │   ├── tooldirs.rs     # D2: agent-launch PATH, override dirs first (≈ app.go + toolcheck/dirs.go)
+│   │   └── bin/fakedaemon.rs  # D2: symphonyd test stub (≈ internal/supervisor/testdata/fakedaemon)
+│   └── tests/              # D2: supervisor lifecycle + gated real-symphonyd smoke
 └── frontend/               # React + TS + Vite shell (≈ $REF/desktop/frontend)
     └── src/status.ts       # pure view-logic (status.test.ts asserts it)
 ```

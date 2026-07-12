@@ -12,9 +12,32 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
+# The D2 sidecar supervisor + same-origin api proxy (parity port of $REF/desktop/internal/supervisor
+# + $REF/desktop/apiproxy.go). Every crate below is ALREADY in this workspace's Cargo.lock, pulled in
+# transitively by `tauri` — declaring them directly adds no new downloads, only a direct edge.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "time", "sync", "net", "io-util", "signal"] }
+reqwest = { version = "0.13", default-features = false }
+http = "1"
+url = "2"
+libc = "0.2"
+# hyper (+ hyper-util / http-body-util / bytes) back the fakedaemon test stub's /healthz server and
+# the apiproxy unit-test backend — the Rust equivalents of Go's net/http + httptest.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [dev-dependencies]
 serde_json = "1"
+# supervisor lifecycle tests are integration tests (tests/): they launch the real compiled
+# `fakedaemon` bin (via CARGO_BIN_EXE_fakedaemon) and drive start/health/restart/drain, mirroring
+# $REF/desktop/internal/supervisor/supervisor_test.go. libc is used to assert the process-group setup.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+libc = "0.2"
+
+# Cargo autodiscovers the targets: `src/lib.rs` (the D2 supervisor/apiproxy/tooldirs library),
+# `src/main.rs` (the `rhapsody-desktop` Tauri app bin), and `src/bin/fakedaemon.rs` (the `fakedaemon`
+# test-stub bin, located by the supervisor integration tests via CARGO_BIN_EXE_fakedaemon).
 
 [lints]
 workspace = true
