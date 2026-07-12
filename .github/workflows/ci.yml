@@ -86,7 +86,21 @@ jobs:
         working-directory: desktop
       - run: cargo clippy --workspace --all-targets -- -D warnings
         working-directory: desktop
-      - run: cargo build       # the unsigned build (compiles the Tauri app)
-        working-directory: desktop
+      # Unit + supervisor-lifecycle + packaging-gate tests. Default features build the `fakedaemon`
+      # supervisor stub the integration tests need (the packaging build turns it off — see below).
       - run: cargo test
+        working-directory: desktop
+      # P7-D5 packaging build gate: the Tauri bundler produces the UNSIGNED Rhapsody.app + a
+      # drag-to-Applications Rhapsody.dmg. The CLI install is idempotent and persists on the
+      # self-hosted runner. `make dmg` (run from the repo root) builds the daemon's embedded dashboard
+      # + the shell frontend + the release rhapsodyd sidecar, bundles the app with the fakedaemon stub
+      # excluded (`--no-default-features`), copies the sidecar into Contents/Resources, packages the
+      # dmg (hdiutil fallback, no create-dmg needed), and runs the gated-but-unset sign/notarize as a
+      # clean no-op + verifies the icon flowed through. NO signing secrets — signed dmg is human-gated.
+      - run: command -v cargo-tauri >/dev/null 2>&1 || cargo install tauri-cli --version "^2" --locked
+      - run: make dmg
+      # P7-D5 parity e2e: the app's supervisor drives the packaged rhapsodyd through
+      # start -> healthy -> dashboard -> stop (against the R3 linear-stub + fake-claude harness). Gated
+      # by RHAPSODY_PARITY_E2E so only this explicit step runs it (it needs the bundle `make dmg` built).
+      - run: RHAPSODY_PARITY_E2E=1 cargo test -p rhapsody-desktop --test parity_e2e -- --nocapture
         working-directory: desktop

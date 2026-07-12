@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the signed Rhapsody.app (applied by scripts/sign.sh; see
+  SIGNING.md). Parity port of $REF/desktop/build/darwin/entitlements.plist. Rhapsody supervises a
+  separately-built `rhapsodyd` sidecar and shells out to `claude` / `gh` / `gt` / `git`, so under the
+  hardened runtime it must load/launch code that was not signed inline with the app bundle.
+
+  com.apple.security.cs.disable-library-validation
+    Allows the hardened-runtime app to load/exec code (notably the embedded `rhapsodyd`, a distinct
+    Mach-O signed separately) that is not signed with the app's exact identity / Team ID. Required
+    so the sidecar loads; also future-proofs an org-cert split where the sidecar and app could be
+    signed differently. This is the spec's required minimum entitlement.
+
+  Intentionally NOT enabled — add only if a real signed launch test proves they are needed, and
+  document the reason here when you do:
+    com.apple.security.cs.allow-jit                         — no JIT engine in this Rust/WKWebView app.
+    com.apple.security.cs.allow-unsigned-executable-memory  — rhapsodyd is AOT-compiled Rust; no W^X.
+    com.apple.security.cs.allow-dyld-environment-variables  — the supervisor sets child PATH, not DYLD_*.
+  Each widens the runtime's attack surface, so the minimal set above is preferred.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

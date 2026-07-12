@@ -21,8 +21,9 @@ compile it; the `desktop` CI job (`.github/workflows/ci.yml`) builds and tests i
   rhapsodyd; **D3** wires them into the window/tray.
 - **Menu-bar tray** + app lifecycle (hide-on-close, quit drain) — **D3**.
 - **Settings**: Keychain credential, prefs, Linear project picker, onboarding, tool doctor — **D4**.
-- **Packaging**: unsigned `Rhapsody.app` + drag-to-Applications dmg; env-gated Developer ID
-  signing — **D5**. The signed/notarized dmg + machine install stay David's manual steps.
+- **Packaging** (**D5, landed**): unsigned `Rhapsody.app` + drag-to-Applications dmg; env-gated
+  Developer ID signing (opt-in vars only, no secrets). See [Packaging](#packaging-unsigned-app--dmg)
+  + [`SIGNING.md`](./SIGNING.md). The signed/notarized dmg + machine install stay David's manual steps.
 
 ## Layout
 
@@ -68,8 +69,33 @@ Lint (the desktop workspace carries its own `cargo fmt` / `clippy -D warnings`, 
 cd desktop && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`cargo tauri dev` / `cargo tauri build` (the bundler) arrive with packaging (D5); until then the app
-is exercised via `cargo build`/`cargo test` and the frontend's vitest suite.
+`cargo tauri dev` runs the app with hot reload; `cargo tauri build` (the bundler) is driven by the
+packaging targets below.
+
+## Packaging (unsigned .app + dmg)
+
+Packaging uses the Tauri bundler via the repo-root Makefile (parity of the Go `make app`/`make dmg`).
+Prereq: the Tauri CLI — `cargo install tauri-cli --version "^2"`. From the **repo root**:
+
+```sh
+make app        # build the UNSIGNED Rhapsody.app (Tauri bundler) with rhapsodyd embedded as the sidecar
+make dmg        # build the app, then package a drag-to-Applications Rhapsody.dmg installer
+```
+
+`make app` builds the daemon's embedded dashboard (`web/` → `crates/httpapi/web-dist`), the shell
+frontend (`desktop/frontend/dist`), and the release `rhapsodyd`, bundles `Rhapsody.app` with the
+`fakedaemon` test stub excluded (`--no-default-features`), and copies the sidecar into
+`Contents/Resources/rhapsodyd` (where `supervisor/resolve.rs` looks). Output:
+`desktop/target/release/bundle/macos/Rhapsody.app`. `make dmg` additionally writes
+`desktop/build/bin/Rhapsody.dmg` (via `create-dmg`, or an `hdiutil` fallback needing no extra deps).
+
+> **Unsigned by default.** A plain build is not code-signed or notarized (Tauri ad-hoc self-signs).
+> Gatekeeper warns on first open (right-click → Open, or `xattr -dr com.apple.quarantine Rhapsody.app`).
+> A **gated** Developer-ID code-signing + notarization path (a clean no-op without creds — the
+> unsigned path never touches the keychain or the network) is wired into `make dmg` via
+> `desktop/scripts/{sign,notarize}.sh` and keys off `APPLE_SIGNING_IDENTITY` / `NOTARY_PROFILE`. The
+> signed+notarized dmg and the machine install stay **David's manual steps** — see
+> [`SIGNING.md`](./SIGNING.md). The gating contract is pinned by `src-tauri/tests/packaging_gate.rs`.
 
 ## Version stamping
 
@@ -84,4 +110,4 @@ RHAPSODY_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   cargo build
 ```
 
-The Makefile `app`/`dmg` targets that set these land with packaging (D5).
+The Makefile `app`/`dmg` targets set these from `VERSION` + git (see [Packaging](#packaging-unsigned-app--dmg)).

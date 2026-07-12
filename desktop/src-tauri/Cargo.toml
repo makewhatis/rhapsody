@@ -5,6 +5,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
+# The crate ships three bin targets (the `rhapsody-desktop` app, the `fakedaemon` supervisor test
+# stub, and — implicitly — cargo's per-file discovery). `cargo tauri build` bundles the package's
+# DEFAULT binary; without this it picks `fakedaemon` (alphabetically first), producing a broken
+# Rhapsody.app whose Contents/MacOS is the stub. Pin the app as the default so the bundler embeds it.
+default-run = "rhapsody-desktop"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -54,10 +59,31 @@ bytes = "1"
 # $REF/desktop/internal/supervisor/supervisor_test.go. libc is used to assert the process-group setup.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 libc = "0.2"
+# The P7-D5 parity e2e (tests/parity_e2e.rs) drives the app's apiproxy + a dashboard fetch against the
+# real supervised daemon. These are ALREADY regular dependencies (same versions/features) — repeating
+# them here only grants the separate integration-test crate extern access; no new crate is added.
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+http = "1"
+bytes = "1"
 
-# Cargo autodiscovers the targets: `src/lib.rs` (the D2 supervisor/apiproxy/tooldirs library),
-# `src/main.rs` (the `rhapsody-desktop` Tauri app bin), and `src/bin/fakedaemon.rs` (the `fakedaemon`
-# test-stub bin, located by the supervisor integration tests via CARGO_BIN_EXE_fakedaemon).
+[features]
+# `fakedaemon` gates the compile of the supervisor test-stub bin below. It is a DEFAULT feature, so a
+# plain `cargo build` / `cargo test` / `cargo clippy` builds it — the supervisor + e2e integration
+# tests need `CARGO_BIN_EXE_fakedaemon` at compile time (P7-D5). The packaging build turns it OFF via
+# `cargo tauri build --no-default-features` (Makefile `app` target) so the stub is NOT shipped inside
+# Rhapsody.app: the Tauri bundler copies EVERY built package bin into `Contents/MacOS/`, and a stray
+# unsigned Mach-O there would both be wrong hygiene and break the hardened-runtime `--deep --strict`
+# signing/notarization path (SIGNING.md).
+default = ["fakedaemon"]
+fakedaemon = []
+
+# `src/main.rs` (the `rhapsody-desktop` app bin) and `src/lib.rs` (the D2 supervisor/apiproxy/tooldirs
+# library) are autodiscovered. `fakedaemon` is declared explicitly so `required-features` can gate it
+# out of the shipped bundle while keeping it available to `cargo test`.
+[[bin]]
+name = "fakedaemon"
+path = "src/bin/fakedaemon.rs"
+required-features = ["fakedaemon"]
 
 [lints]
 workspace = true
