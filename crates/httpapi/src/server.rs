@@ -9,31 +9,40 @@ use axum::Router;
 use axum::extract::FromRef;
 use axum::handler::Handler;
 use axum::routing::any;
-use rhapsody_orchestrator::{Identity, ReadsError, Snapshot};
+use rhapsody_config::ValidationError;
+use rhapsody_config::workflow::Definition;
+use rhapsody_orchestrator::{
+    Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot, StopResult,
+};
 
-use crate::handlers::{handle_healthz, handle_state};
+use crate::handlers::{handle_healthz, handle_refresh, handle_state};
+use crate::handlers_config::handle_config;
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_issue_history, handle_metrics, handle_run_detail,
     handle_run_events, handle_run_transcript,
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
+use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
+use crate::handlers_runaction::{handle_run_resume, handle_run_stop};
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
 use crate::web::{WebDist, serve_web};
 
-/// The orchestrator surface the HTTP layer reads. Mirrors Go's `StateProvider` interface
-/// (`$REF/internal/httpapi/handlers.go`), narrowed to the H1 slice: only [`StateProvider::snapshot`],
-/// backing `GET /api/v1/state`. Later H-lane tickets extend this trait as their handlers land (Go
-/// grows the one interface across `handlers*.go`): H2 adds the read surfaces
-/// (`Store`/history/projects/linear), H3 the writes (`Refresh`/`StopRun`/`ResumeRun`/
-/// `SendRunMessage`/`ValidateConfig`).
+/// The orchestrator surface the HTTP layer reads + writes. Mirrors Go's `StateProvider` interface
+/// (`$REF/internal/httpapi/handlers.go`), grown across the H-lane exactly as Go grows its one
+/// interface across `handlers*.go`: H1's [`snapshot`](StateProvider::snapshot) (`GET /api/v1/state`),
+/// H2's read surfaces ([`history`](StateProvider::history)/[`run_transcript`](StateProvider::run_transcript)/
+/// [`list_linear_projects`](StateProvider::list_linear_projects)/[`connected_viewer`](StateProvider::connected_viewer)),
+/// and H3's writes ([`refresh`](StateProvider::refresh), [`stop_run`](StateProvider::stop_run)/
+/// [`resume_run`](StateProvider::resume_run), [`send_run_message`](StateProvider::send_run_message),
+/// and [`workflow_path`](StateProvider::workflow_path) + [`validate_config`](StateProvider::validate_config)
+/// for the config endpoint).
 ///
-/// The real implementor is the orchestrator, whose async `snapshot` (the control-task channel
-/// round-trip) lands with the control loop (O7) and is wired as the live provider by the final
-/// assembly (F1) — the analog of Go's `var _ StateProvider = (*orchestrator.Orchestrator)(nil)`
-/// compile-time check. H1 tests against a fake, exactly as Go's `server_test.go` uses `fakeProvider`.
+/// The real implementor is the orchestrator, wired as the live provider by the final assembly (F1) —
+/// the analog of Go's `var _ StateProvider = (*orchestrator.Orchestrator)(nil)` compile-time check.
+/// Every handler tests against a fake, exactly as Go's `server_test.go` uses `fakeProvider`.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
     /// The synchronous runtime view served at `/api/v1/state` (Go `Snapshot(ctx)`). An `Err` renders
@@ -68,7 +77,96 @@ pub trait StateProvider: Send + Sync {
     /// `StateProvider.ConnectedViewer`, whose `(Identity, error)` return becomes this `(Identity,
     /// Option<String>)` (the same best-effort split `orchestrator::connected_viewer` already uses).
     async fn connected_viewer(&self) -> (Identity, Option<String>);
+
+    /// Kill the agent for `run_id` and move its ticket to Backlog (`POST /api/v1/runs/{id}/stop`,
+    /// Go `StopRun`). A *business* outcome — the run isn't running (→ 409), or it was killed but the
+    /// Backlog move failed (a partial success: 200 with `move_error`) — travels in the returned
+    /// [`StopResult`]; only a failed control round-trip is an [`Err`] (→ 500 `stop_failed`). No
+    /// request deadline is threaded in: like the read surfaces, the Rust port drops Go's
+    /// `context.Context` (the real adapter supplies the control task's `CancelWait`).
+    async fn stop_run(&self, run_id: i64) -> Result<StopResult, RunActionError>;
+
+    /// Move a stopped run's ticket back to Todo so the daemon re-dispatches it
+    /// (`POST /api/v1/runs/{id}/resume`, Go `ResumeRun`). Business outcomes (not found → 404;
+    /// not-stopped / live-run / superseded / no-team → 409; partial move failure → 200 with
+    /// `move_error`) travel in the [`ResumeResult`]; only a failed control round-trip is an [`Err`]
+    /// (→ 500 `resume_failed`).
+    async fn resume_run(&self, run_id: i64) -> Result<ResumeResult, RunActionError>;
+
+    /// Queue an operator "btw" message for a live run's agent (`POST /api/v1/runs/{id}/message`,
+    /// Go `SendRunMessage`, INF-250). The `text` is already trimmed + length-checked by the handler.
+    /// Unlike stop/resume there is no error return: the Rust orchestrator collapses "the run's
+    /// control loop is gone" into `not_running` (→ 409), and a full mailbox into `full` (→ 409
+    /// `backlog_full`); a clean accept carries the inserted `id` + `identifier` (→ 202). Mirrors the
+    /// O6 `ControlHandle::send_run_message` surface this forwards to.
+    async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult;
+
+    /// Request a coalesced poll+reconcile tick (`POST /api/v1/refresh`, Go `Refresh`). Synchronous +
+    /// infallible like Go's non-blocking channel send: the returned [`RefreshResult`] reports whether
+    /// the tick was `queued` or `coalesced` into a pending one, so the handler always answers 202.
+    fn refresh(&self) -> RefreshResult;
+
+    /// The absolute path of the WORKFLOW.md this daemon loads + watches, so `/api/v1/config` can read
+    /// it (GET) and atomically rewrite it (POST); the fsnotify watcher then hot-reloads the change.
+    /// Mirrors Go `WorkflowPath`.
+    fn workflow_path(&self) -> &str;
+
+    /// Run the daemon's load-time validation on a candidate `def` WITHOUT applying it, so
+    /// `POST /api/v1/config` rejects exactly what a hot-reload would reject. `Ok(())` ⇒ the config
+    /// would load cleanly; an `Err` carries a classifiable [`ConfigValidateError`] (the typed path
+    /// maps it to a field code, the legacy path surfaces it as `invalid_config`). Mirrors Go
+    /// `ValidateConfig` (Decode → Resolve → ValidateDispatch → buildEffective).
+    fn validate_config(&self, def: &Definition) -> Result<(), ConfigValidateError>;
 }
+
+/// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
+/// [`ConfigValidateError::Validation`] variant carries the config crate's structured
+/// [`ValidationError`] so the typed config POST can map it to a stable field code + path (Go
+/// `classifyConfigError`); every other pipeline failure (decode / resolve / buildEffective) is an
+/// opaque [`ConfigValidateError::Other`] surfaced as `invalid_config`. `Display` is the message the
+/// handler echoes — byte-identical to the config crate's error string, which the P1 validate tests
+/// already pin.
+#[derive(Debug)]
+pub enum ConfigValidateError {
+    /// A `ValidateDispatch` rejection with a stable variant the config POST maps to a field code.
+    Validation(ValidationError),
+    /// Any other load-pipeline failure (decode / resolve / buildEffective) → `invalid_config`.
+    Other(String),
+}
+
+impl std::fmt::Display for ConfigValidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigValidateError::Validation(err) => err.fmt(f),
+            ConfigValidateError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ConfigValidateError {}
+
+/// Why a run action (stop/resume) could not be attempted at all — the control round-trip itself
+/// failed (the second return of Go's `StopRun`/`ResumeRun`). The handler renders it as a 500
+/// (`stop_failed` / `resume_failed`). A *business* outcome (not running, not found, a partial
+/// Backlog/Todo move failure) is NOT an error — it is carried in the `StopResult`/`ResumeResult`
+/// value and can still yield a 200/404/409. This split mirrors the Go handlers exactly.
+#[derive(Debug, Clone)]
+pub struct RunActionError(String);
+
+impl RunActionError {
+    /// Construct a run-action error with a human `message` (rendered as the 500 body's `message`).
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for RunActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RunActionError {}
 
 /// Why a snapshot could not be produced. The HTTP layer renders ANY snapshot failure as a 503
 /// `snapshot_unavailable` envelope — mirroring Go, whose handler maps both `ErrSnapshotUnavailable`
@@ -133,6 +231,12 @@ where
     Router::new()
         .route("/healthz", any(handle_healthz))
         .route("/api/v1/state", any(handle_state))
+        // Coalesced poll+reconcile trigger (H3): POST-only, 202. Registered method-agnostically so a
+        // GET yields a 405 envelope rather than the SPA fallback.
+        .route("/api/v1/refresh", any(handle_refresh))
+        // Read-write config (H3): GET returns the on-disk WORKFLOW.md view; POST validates + atomically
+        // rewrites it (the watcher then hot-reloads). Loopback-only by server construction.
+        .route("/api/v1/config", any(handle_config))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.
@@ -142,6 +246,15 @@ where
         .route("/api/v1/runs/{id}/events", any(handle_run_events))
         .route("/api/v1/runs/{id}/transcript", any(handle_run_transcript))
         .route("/api/v1/issues/{id}/history", any(handle_issue_history))
+        // Run actions (H3): kill a running agent (+ move its ticket to Backlog) and resume a stopped
+        // run (+ move it back to Todo). More-specific multi-segment POST patterns; axum's matchit
+        // dispatches them ahead of the catch-all runs/{id} detail route regardless of order.
+        .route("/api/v1/runs/{id}/stop", any(handle_run_stop))
+        .route("/api/v1/runs/{id}/resume", any(handle_run_resume))
+        // Operator messages (H3): POST queues a "btw" for a live run's agent; GET lists the run's
+        // messages with their delivery status. More-specific than runs/{id}, so they win the match.
+        .route("/api/v1/runs/{id}/message", any(handle_run_message))
+        .route("/api/v1/runs/{id}/messages", any(handle_run_messages))
         .route("/api/v1/runs/{id}", any(handle_run_detail))
         // Per-project live status + the read-only Linear surfaces for the Settings page (H2).
         .route("/api/v1/projects", any(handle_projects))
@@ -225,6 +338,25 @@ impl Server {
     /// The actual bound address (useful when the port was 0). Mirrors Go `Addr`.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Publish this server's ACTUAL bound loopback port to `~/.symphony/runtime.json` via T1's
+    /// [`rhapsody_core::runtimeport`] (REUSED, not reimplemented), so `symphony mcp` — an operator's
+    /// CLI and the workers the daemon injects — can reach a daemon launched on a dynamic/ephemeral
+    /// `--port` instead of the stale `server.port` in WORKFLOW.md. `local_addr` resolves the real port
+    /// even when the bind port was 0. Best-effort: the caller treats a write failure as non-fatal
+    /// (`symphony mcp` then falls back to the config port), exactly as Go does.
+    ///
+    /// This is the server-side capability the H3 lane owns; the *invocation* (call after bind, and
+    /// `runtimeport::remove()` on clean shutdown) lands with the final assembly's `run.rs`, mirroring
+    /// Go's `cmd/symphony/run.go` — which is also where Go places and tests `runtimeport.Write`, so
+    /// like Go there is no httpapi-level test here (T1's `runtimeport` unit tests cover the atomic
+    /// write; F1's boot e2e covers the daemon-to-`symphony mcp` round-trip). No httpapi test drives it
+    /// because `runtimeport::write` targets the single shared `~/.symphony/runtime.json`, which a
+    /// test must not clobber on the self-hosted CI runner (a live daemon may own it).
+    pub fn publish_runtime_port(&self) -> std::io::Result<()> {
+        let port = self.local_addr()?.port();
+        rhapsody_core::runtimeport::write(i32::from(port))
     }
 
     /// Serve requests until the serving task is dropped. Mirrors Go `Serve`.

@@ -83,7 +83,9 @@ pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, Stac
 pub use reads::{Identity, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
 pub use retry::{EvRetry, EvWorkerExit};
-pub use snapshot::{ProjectStatus, RateLimit, RetryRow, RunningRow, Snapshot, TokenCounts};
+pub use snapshot::{
+    ProjectStatus, RateLimit, RefreshResult, RetryRow, RunningRow, Snapshot, TokenCounts,
+};
 pub use stop::{ControlHandle, ResumeResult, StopResult};
 pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
 pub use workspace_gc::WorkspaceGcPlan;

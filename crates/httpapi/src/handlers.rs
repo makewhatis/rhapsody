@@ -58,6 +58,32 @@ pub(crate) async fn handle_state(
     }
 }
 
+/// `POST /api/v1/refresh` — request a coalesced poll+reconcile tick and return 202. The provider's
+/// synchronous [`StateProvider::refresh`] never fails (a full control buffer just sets `coalesced`),
+/// so this always answers 202 with `{queued, coalesced, requested_at, operations}`. Non-POST methods
+/// get a 405 envelope (registered method-agnostically so the SPA catch-all does not 404 it). Mirrors
+/// Go `handleRefresh`.
+pub(crate) async fn handle_refresh(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_post(&method, "use POST to trigger a refresh") {
+        return resp;
+    }
+    let res = provider.refresh();
+    write_json(
+        StatusCode::ACCEPTED,
+        &serde_json::json!({
+            "queued": res.queued,
+            "coalesced": res.coalesced,
+            // Go marshals `time.Time` as RFC3339; render it as the same string the config view uses
+            // (UTC, `Z` offset). Nondeterministic (`time.Now()`), so no fixture pins it.
+            "requested_at": res.requested_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "operations": res.operations,
+        }),
+    )
+}
+
 /// Enforce GET/HEAD on a read-only route: `Some(405 envelope)` (with `Allow: GET, HEAD`) on any other
 /// method, `None` when allowed. The routes are registered method-agnostically (`any`) so a mismatch
 /// reaches the handler and yields an explicit 405 rather than the SPA fallback swallowing it into a
@@ -75,13 +101,31 @@ pub(crate) fn require_get(method: &Method) -> Option<Response> {
     ))
 }
 
+/// Enforce POST on a write-only route: `Some(405 envelope)` (with `Allow: POST` and the handler's
+/// own `message`, e.g. "use POST to stop a run") on any other method, `None` when allowed. Like
+/// [`require_get`], the routes are registered method-agnostically (`any`) so a mismatch reaches the
+/// handler and yields an explicit 405 rather than the SPA fallback swallowing it into a 404. Mirrors
+/// the per-handler `if r.Method != http.MethodPost { … }` guard the Go write handlers open with.
+/// `pub(crate)` so every write handler (run actions, messages, refresh) shares the one guard.
+pub(crate) fn require_post(method: &Method, message: &'static str) -> Option<Response> {
+    if *method == Method::POST {
+        return None;
+    }
+    Some(write_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        message,
+        Some("POST"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use reqwest::header::CONTENT_TYPE;
-    use rhapsody_orchestrator::{Snapshot, Totals};
+    use rhapsody_orchestrator::{RefreshResult, Snapshot, Totals};
     use serde_json::Value;
 
     use crate::new_handler;
@@ -243,6 +287,40 @@ mod tests {
         assert_eq!(status, 503);
         assert!(!body["error"].is_null(), "expected error envelope");
         assert_eq!(body["error"]["code"], "snapshot_unavailable");
+    }
+
+    // ------- refresh endpoint (mirrors server_test.go) -------
+
+    // Mirrors Go `TestRefreshEndpoint`: POST returns 202 with the queued outcome.
+    #[tokio::test]
+    async fn refresh_endpoint() {
+        let provider = FakeProvider::ok(empty_snapshot()).with_refresh_result(RefreshResult {
+            queued: true,
+            coalesced: false,
+            requested_at: fixed_instant(),
+            operations: vec!["poll".to_string(), "reconcile".to_string()],
+        });
+        let base = spawn(provider).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/refresh"))
+            .send()
+            .await
+            .expect("POST /refresh");
+        assert_eq!(resp.status(), 202);
+        let text = resp.text().await.expect("body");
+        let body: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["operations"], serde_json::json!(["poll", "reconcile"]));
+    }
+
+    // Mirrors Go `TestRefreshWrongMethod`: a GET is 405.
+    #[tokio::test]
+    async fn refresh_wrong_method() {
+        let base = spawn(FakeProvider::ok(empty_snapshot())).await;
+        let resp = reqwest::get(format!("{base}/api/v1/refresh"))
+            .await
+            .expect("GET /refresh");
+        assert_eq!(resp.status(), 405);
     }
 
     // ------- state wire shape (mirrors state_test.go) -------

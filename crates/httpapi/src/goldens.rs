@@ -106,6 +106,48 @@ async fn get_json(url: &str) -> (reqwest::StatusCode, Value) {
     (status, body)
 }
 
+/// Synthetic capture `$HOME` / stub port the placeholders substitute in — the SAME values the config
+/// crate's render golden uses, so the served config normalizes to the committed `<HOME>`/`<PORT>`.
+const CONFIG_CAPTURE_HOME: &str = "/capture-home";
+const CONFIG_STUB_PORT: &str = "51234";
+
+/// Materialize a committed capture workflow (with the three placeholders substituted) as a real
+/// WORKFLOW.md under a scratch dir, returning its path — the served config handler loads it. Mirrors
+/// the config crate golden's `load_substituted`, but keeps the file on disk for the HTTP GET.
+fn materialize_capture_workflow(name: &str) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../harness/capture/workflows/{name}.md"));
+    let raw = std::fs::read_to_string(&src)
+        .unwrap_or_else(|e| panic!("read capture workflow {name}: {e}"));
+    let substituted = raw
+        .replace("__STUB_PORT__", CONFIG_STUB_PORT)
+        .replace(
+            "__CLAUDE_CMD__",
+            &format!("{CONFIG_CAPTURE_HOME}/bin/fake-claude"),
+        )
+        .replace(
+            "__STORE_PATH__",
+            &format!("{CONFIG_CAPTURE_HOME}/symphony.db"),
+        );
+    let path = scratch_dir().join("WORKFLOW.md");
+    std::fs::write(&path, substituted).expect("write workflow");
+    path
+}
+
+/// The H3 config gate: the served `GET /api/v1/config` body, normalized, is byte-identical to the
+/// committed `api/config.json` — the same `minimal.md` capture the config crate's render golden
+/// asserts, proven here end-to-end over the HTTP server (the analog of H1's state golden). The config
+/// handler REUSES `effective_json::render`, so this closes the loop that the served view matches too.
+#[tokio::test]
+async fn config_endpoint_matches_config_golden() {
+    let path = materialize_capture_workflow("minimal");
+    let provider = FakeProvider::ok(empty_snapshot()).with_workflow_path(path.to_string_lossy());
+    let base = spawn(provider).await;
+    let (status, body) = get_json(&format!("{base}/api/v1/config")).await;
+    assert_eq!(status, 200);
+    assert_golden(body, "api/config.json", CONFIG_CAPTURE_HOME);
+}
+
 fn event_row(seq: i64, kind: &str, text: &str) -> EventRow {
     EventRow {
         seq,

@@ -2,18 +2,23 @@
 //! server spawner, and `Snapshot` builders. The Rust analog of `server_test.go`'s `fakeProvider` +
 //! `testServer` + `sampleSnapshot` helpers, narrowed to the H1 surface.
 
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use rhapsody_agent::LogEntry;
+use rhapsody_config::workflow::Definition;
+use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
 use rhapsody_orchestrator::{
-    Identity, ReadsError, RetryRow, RunningRow, Snapshot, TokenCounts, Totals,
+    Identity, ReadsError, RefreshResult, ResumeResult, RetryRow, RunMessageResult, RunningRow,
+    Snapshot, StopResult, TokenCounts, Totals,
 };
 use rhapsody_store::Noop;
 
-use crate::{HistoryStore, SnapshotError, StateProvider};
+use crate::{ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider};
 
 /// A canned [`StateProvider`]: a fixed snapshot (or snapshot error) plus a read-only history store.
 /// Mirrors Go `fakeProvider` (`server_test.go`), grown across the H-lane exactly as Go grows its one
@@ -34,6 +39,25 @@ pub(crate) struct FakeProvider {
     projects_config_not_loaded: bool,
     /// The canned connected-as identity (Go's `fakeProvider.identity`).
     identity: Identity,
+    /// H3 run-action surfaces: canned results, an optional control-round-trip error (the 500 path),
+    /// and the recorded run id (interior-mutable so a test holding an `Arc<FakeProvider>` can assert
+    /// the handler parsed + forwarded the `{id}`, mirroring Go reading `p.stopRunID`).
+    stop_result: StopResult,
+    stop_err: Option<String>,
+    stop_run_id: AtomicI64,
+    resume_result: ResumeResult,
+    resume_err: Option<String>,
+    resume_run_id: AtomicI64,
+    /// H3 operator-message surface: canned result + recorded args (Go's `messageResult`/`messageRunID`
+    /// /`messageText`). `message_text` records the TRIMMED text the handler forwarded.
+    message_result: RunMessageResult,
+    message_run_id: AtomicI64,
+    message_text: Mutex<String>,
+    /// The canned `refresh` result (Go's `fakeProvider.refresh`).
+    refresh_result: RefreshResult,
+    /// The WORKFLOW.md path the config endpoints read/write (Go's `fakeProvider.workflowPath`); its
+    /// parent dir is the `resolve` base in [`validate_config`].
+    workflow_path: String,
 }
 
 impl FakeProvider {
@@ -47,6 +71,23 @@ impl FakeProvider {
             linear_projects: Vec::new(),
             projects_config_not_loaded: false,
             identity: Identity::default(),
+            stop_result: StopResult::default(),
+            stop_err: None,
+            stop_run_id: AtomicI64::new(0),
+            resume_result: ResumeResult::default(),
+            resume_err: None,
+            resume_run_id: AtomicI64::new(0),
+            message_result: RunMessageResult::default(),
+            message_run_id: AtomicI64::new(0),
+            message_text: Mutex::new(String::new()),
+            // RefreshResult has no `Default` (its `DateTime` field), so build a zero value explicitly.
+            refresh_result: RefreshResult {
+                queued: false,
+                coalesced: false,
+                requested_at: epoch(),
+                operations: Vec::new(),
+            },
+            workflow_path: String::new(),
         }
     }
 
@@ -89,6 +130,56 @@ impl FakeProvider {
         self.identity = identity;
         self
     }
+
+    /// Set the canned `stop_run` result (Go's `&fakeProvider{stopResult: …}`).
+    pub(crate) fn with_stop_result(mut self, result: StopResult) -> Self {
+        self.stop_result = result;
+        self
+    }
+
+    /// Set the canned `resume_run` result (Go's `&fakeProvider{resumeResult: …}`).
+    pub(crate) fn with_resume_result(mut self, result: ResumeResult) -> Self {
+        self.resume_result = result;
+        self
+    }
+
+    /// The run id the last `stop_run` was called with (Go's `p.stopRunID`).
+    pub(crate) fn stop_run_id(&self) -> i64 {
+        self.stop_run_id.load(Ordering::SeqCst)
+    }
+
+    /// The run id the last `resume_run` was called with (Go's `p.resumeRunID`).
+    pub(crate) fn resume_run_id(&self) -> i64 {
+        self.resume_run_id.load(Ordering::SeqCst)
+    }
+
+    /// Set the canned `send_run_message` result (Go's `&fakeProvider{messageResult: …}`).
+    pub(crate) fn with_message_result(mut self, result: RunMessageResult) -> Self {
+        self.message_result = result;
+        self
+    }
+
+    /// The run id the last `send_run_message` was called with (Go's `p.messageRunID`).
+    pub(crate) fn message_run_id(&self) -> i64 {
+        self.message_run_id.load(Ordering::SeqCst)
+    }
+
+    /// The (trimmed) text the last `send_run_message` was called with (Go's `p.messageText`).
+    pub(crate) fn message_text(&self) -> String {
+        self.message_text.lock().expect("message_text lock").clone()
+    }
+
+    /// Set the canned `refresh` result (Go's `&fakeProvider{refresh: …}`).
+    pub(crate) fn with_refresh_result(mut self, result: RefreshResult) -> Self {
+        self.refresh_result = result;
+        self
+    }
+
+    /// Set the WORKFLOW.md path the config endpoints read/write (Go's `&fakeProvider{workflowPath:…}`).
+    pub(crate) fn with_workflow_path(mut self, path: impl Into<String>) -> Self {
+        self.workflow_path = path.into();
+        self
+    }
 }
 
 #[async_trait]
@@ -119,6 +210,51 @@ impl StateProvider for FakeProvider {
         // The resolution-error (Option) is only logged by the handler; no mirrored test exercises it
         // (Go's linear_test.go leaves `identityErr` unset), so the fake never surfaces one.
         (self.identity.clone(), None)
+    }
+
+    async fn stop_run(&self, run_id: i64) -> Result<StopResult, RunActionError> {
+        self.stop_run_id.store(run_id, Ordering::SeqCst);
+        match &self.stop_err {
+            Some(message) => Err(RunActionError::new(message.clone())),
+            None => Ok(self.stop_result.clone()),
+        }
+    }
+
+    async fn resume_run(&self, run_id: i64) -> Result<ResumeResult, RunActionError> {
+        self.resume_run_id.store(run_id, Ordering::SeqCst);
+        match &self.resume_err {
+            Some(message) => Err(RunActionError::new(message.clone())),
+            None => Ok(self.resume_result.clone()),
+        }
+    }
+
+    async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult {
+        self.message_run_id.store(run_id, Ordering::SeqCst);
+        *self.message_text.lock().expect("message_text lock") = text.to_string();
+        self.message_result.clone()
+    }
+
+    fn refresh(&self) -> RefreshResult {
+        self.refresh_result.clone()
+    }
+
+    fn workflow_path(&self) -> &str {
+        &self.workflow_path
+    }
+
+    fn validate_config(&self, def: &Definition) -> Result<(), ConfigValidateError> {
+        // Mirror the Go fake's ValidateConfig: Decode → Resolve → ValidateDispatch (the real
+        // orchestrator additionally runs buildEffective; that extra gate is covered by the
+        // orchestrator crate's own validate_config test). `resolve` bases relative paths on the
+        // WORKFLOW.md's dir, exactly like Go's `filepath.Dir(f.workflowPath)`.
+        let cfg = decode(def).map_err(|e| ConfigValidateError::Other(e.to_string()))?;
+        let dir = Path::new(&self.workflow_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut cfg = resolve(cfg, &dir).map_err(|e| ConfigValidateError::Other(e.to_string()))?;
+        validate(&mut cfg).map_err(ConfigValidateError::Validation)?;
+        Ok(())
     }
 }
 

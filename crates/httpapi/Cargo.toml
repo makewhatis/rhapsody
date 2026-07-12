@@ -49,6 +49,18 @@ rhapsody-core = { path = "../core" }
 # rhapsody-agent (H2): the humanized `LogEntry` the run-transcript endpoint shapes (Go `agent.LogEntry`).
 # Workspace crate, already in Cargo.lock.
 rhapsody-agent = { path = "../agent" }
+# rhapsody-config (H3): the P1 modules the `POST /api/v1/config` round-trip REUSES rather than
+# reimplements (the plan's "reuses P1 modules" rule) — `workflow::{Definition,load,save}`,
+# `{decode,encode}`, `{resolve,validate,ValidationError}`, the typed `Config`/`Project` model the
+# typed-view patch writes onto, and `effective_json::render` (the shared GET/POST response view, so
+# the config handler reuses `effective_json` exactly as the plan mandates). Workspace crate, already
+# in Cargo.lock (orchestrator/mcp already depend on it) — no external crate enters.
+rhapsody-config = { path = "../config" }
+# serde_yaml_ng (H3): builds the `workflow::Definition.config` front-matter map (a `serde_yaml_ng::
+# Mapping`) from the legacy POST body's verbatim JSON `config` object — the JSON→YAML direction the
+# config crate's GET view does not expose. Already in Cargo.lock (the config/tracker crates use it);
+# same version, no new external crate.
+serde_yaml_ng = "0.10"
 # chrono (H2): formats the run-detail/transcript `generated_at` (`time.Now()`) and the live run-detail
 # instants (`rfc3339OrEmpty`) — the same `DateTime<Utc>` clock the orchestrator snapshot uses. Already
 # in Cargo.lock (orchestrator/store/tracker).

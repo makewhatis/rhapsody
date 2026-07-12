@@ -2,10 +2,10 @@
 //! `$REF/internal/httpapi/handlers.go` (`writeJSON`/`writeError`) and the envelope DTOs in
 //! `$REF/internal/httpapi/responses.go` (`errorEnvelope`/`errorBody`/`healthzJSON`).
 //!
-//! Only the H1 subset is ported here. The typed per-field validation breakdown
-//! (`writeErrorFields` + `fieldError`, used only by the config POST) lands with H3, and the `/state`
-//! wire DTOs are O4's `orchestrator::snapshot_json` (which the state handler reuses) — so this file
-//! carries just the healthz body + the error envelope the H1 handlers write.
+//! The `/state` wire DTOs are O4's `orchestrator::snapshot_json` (which the state handler reuses), so
+//! this file carries the healthz body, the error envelope, and — added with the H3 config POST — the
+//! typed per-field validation breakdown (`write_error_fields` + [`FieldError`], Go `writeErrorFields`/
+//! `fieldError`).
 
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -25,13 +25,24 @@ struct ErrorEnvelope {
     error: ErrorBody,
 }
 
-/// The error body: a machine `code` + human `message`. Mirrors Go `errorBody`. Go's `omitempty`
-/// per-field `fields` breakdown (typed config POST) is added with H3; omitting it here is
-/// byte-identical to Go's output when it is empty, which is every H1 error response.
+/// The error body: a machine `code` + human `message`, plus an optional per-field `fields` breakdown
+/// (the typed config POST). Mirrors Go `errorBody`. `fields` is `skip_serializing_if` empty, so it is
+/// absent from every non-config-POST error — byte-identical to Go's `omitempty` output.
 #[derive(Serialize)]
 struct ErrorBody {
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<FieldError>,
+}
+
+/// Attaches a validation message to a specific config field path so the Settings UI can surface it
+/// inline (Go `fieldError`). Only populated on the typed config POST validation path. Mirrors the Go
+/// struct's `path`/`message` json shape.
+#[derive(Serialize)]
+pub(crate) struct FieldError {
+    pub(crate) path: String,
+    pub(crate) message: String,
 }
 
 /// Serialize `value` as a JSON response with `status` and `Content-Type: application/json` — exactly
@@ -75,6 +86,7 @@ pub(crate) fn write_error(
             error: ErrorBody {
                 code,
                 message: message.into(),
+                fields: Vec::new(),
             },
         },
     );
@@ -83,4 +95,25 @@ pub(crate) fn write_error(
             .insert(header::ALLOW, HeaderValue::from_static(allow));
     }
     resp
+}
+
+/// Write an error envelope with a structured per-field `fields` breakdown (Go `writeErrorFields`),
+/// used only by the typed config POST so the Settings UI can attach a validation message to the
+/// offending input. With an empty `fields` this is byte-identical to [`write_error`].
+pub(crate) fn write_error_fields(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+    fields: Vec<FieldError>,
+) -> Response {
+    write_json(
+        status,
+        &ErrorEnvelope {
+            error: ErrorBody {
+                code,
+                message: message.into(),
+                fields,
+            },
+        },
+    )
 }

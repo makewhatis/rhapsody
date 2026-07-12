@@ -8,13 +8,12 @@
 //! as an `Arc<dyn HistoryStore>` without any adapter — the analog of Go's compile-time
 //! `var _ HistoryStore = (store.Store)(nil)` assertion.
 //!
-//! Narrowed to the H2 read slice, exactly as H1 narrowed [`crate::StateProvider`] to `snapshot`: Go's
-//! `HistoryStore` also carries `ListRunMessages` (INF-250), which is consumed only by the run-messages
-//! handler in the H3 write lane; it is added when that handler lands, so this trait stays free of a
-//! method no H2 handler calls.
+//! Narrowed to the H2 read slice plus H3's `list_run_messages` (Go's `HistoryStore.ListRunMessages`,
+//! INF-250) — consumed only by the run-messages handler in this write lane, so it lands with that
+//! handler rather than earlier.
 
 use rhapsody_store::{
-    DayRollup, EventHit, EventQuery, EventRow, RunFilter, RunSummary, StoreError,
+    DayRollup, EventHit, EventQuery, EventRow, RunFilter, RunMessage, RunSummary, StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -43,6 +42,9 @@ pub trait HistoryStore: Send + Sync {
     /// Per-day run/success/token rollups over the last N days (`GET /api/v1/metrics`). Mirrors Go
     /// `Metrics`.
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
+    /// A run's operator messages with their delivery status, oldest first
+    /// (`GET /api/v1/runs/{id}/messages`, INF-250). Mirrors Go `ListRunMessages`.
+    fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError>;
 }
 
 /// Every thread-safe [`rhapsody_store::Store`] is a [`HistoryStore`] — the Rust analog of Go's
@@ -74,5 +76,8 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     }
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError> {
         rhapsody_store::Store::metrics(self, since_days, project)
+    }
+    fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError> {
+        rhapsody_store::Store::list_run_messages(self, run_id)
     }
 }

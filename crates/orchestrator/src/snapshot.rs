@@ -7,10 +7,13 @@
 //! dashboard ticks up mid-turn (upstream §13.5).
 //!
 //! Deviations from Go, all serial-chain deferrals:
-//!   * `Snapshot`/`Refresh` (the channel round-trip that requests a snapshot from the control task)
-//!     plus `ErrSnapshotTimeout`/`ErrSnapshotUnavailable`/`RefreshResult` need the control-event
-//!     channel, which lands with the loop (O7); O4 ports the assembly [`Orchestrator::build_snapshot`]
-//!     the loop's handler calls, which every Go `buildSnapshot` test drives directly.
+//!   * The `Snapshot`/`Refresh` channel round-trips (requesting a snapshot / a poll+reconcile tick
+//!     from the control task) plus `ErrSnapshotTimeout`/`ErrSnapshotUnavailable` need the
+//!     control-event channel; O4 ports the assembly [`Orchestrator::build_snapshot`] the loop's
+//!     handler calls (every Go `buildSnapshot` test drives it directly). [`RefreshResult`] — the
+//!     shape P6's `/refresh` handler serves — is defined here for that handler (H3); the live
+//!     `Orchestrator::refresh` that produces it (Go sending `evTick`) lands with the final-assembly
+//!     provider adapter, the loop's tick event still being unported.
 //!   * `ProjectStatus::warnings` (INF-277) are resolved off-loop by O6 (`warnings.go`); the field is
 //!     carried for shape parity but stays empty until O6 wires `projectWarningsFor`.
 //!   * `Snapshot::rate_limits` has no orchestrator source yet (Go copies its always-nil `rateLimits`
@@ -127,6 +130,23 @@ pub struct Snapshot {
     /// Per-project live status rollup (INF-224). One entry per configured project, in declaration
     /// order; empty when no resolved projects (test-injected effectives).
     pub projects: Vec<ProjectStatus>,
+}
+
+/// The outcome of a `POST /api/v1/refresh` trigger (§13.7.2). Mirrors Go `orchestrator.RefreshResult`
+/// (`snapshot.go`) — the HTTP layer renders it as the 202 body. `queued` marks the coalesced
+/// poll+reconcile tick as requested; `coalesced` marks the request folded into an already-pending tick
+/// (the control buffer was full); `operations` names the tick's phases (`["poll", "reconcile"]`).
+///
+/// H3 ports the struct — the shape its `/refresh` handler serves. The live `Orchestrator::refresh`
+/// that produces it (Go's non-blocking `evTick` send) lands with the final-assembly provider adapter;
+/// the loop's tick event is not ported yet (see the module note). No `Default` derive: like the
+/// sibling snapshot rows, the `DateTime<Utc>` field has no `Default`, so callers build it explicitly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshResult {
+    pub queued: bool,
+    pub coalesced: bool,
+    pub requested_at: DateTime<Utc>,
+    pub operations: Vec<String>,
 }
 
 impl Orchestrator {
