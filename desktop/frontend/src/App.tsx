@@ -1,16 +1,28 @@
 import { useEffect, useState } from "react";
-import { appVersion, getStatus, type StatusDTO, type VersionDTO } from "./bindings";
+import {
+  appVersion,
+  getStatus,
+  onNavigate,
+  onShuttingDown,
+  restartDaemon,
+  startDaemon,
+  stopDaemon,
+  type StatusDTO,
+  type VersionDTO,
+} from "./bindings";
 import { statusLabel, viewForStatus } from "./status";
 import "./styles.css";
 
-// The desktop window shell. Ported from $REF/desktop/frontend/src/App.tsx, reduced to the P7-D1
+// The desktop window shell. Ported from $REF/desktop/frontend/src/App.tsx, reduced to the P7-D3
 // surface: the two-layer UI is the status header + the daemon dashboard once healthy, with clear
-// not-configured / starting / stopped / error placeholders otherwise. The daemon-control buttons
-// (Start/Stop/Restart) arrive with the app lifecycle (D3); the Linear/Tools/Onboarding panels with
-// settings (D4). Until the supervisor is wired (D2), getStatus reports state "stopped".
+// not-configured / starting / stopped / error placeholders otherwise, plus the daemon-control buttons
+// (Start/Stop/Restart) and the quit "Shutting down…" overlay. The Linear/Tools/Onboarding panels land
+// with settings (D4).
 export default function App() {
   const [status, setStatus] = useState<StatusDTO | null>(null);
   const [ver, setVer] = useState<VersionDTO | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [shuttingDown, setShuttingDown] = useState(false);
 
   // Poll the daemon status so the shell reflects start/health/stop transitions live (2s, per $REF).
   useEffect(() => {
@@ -36,7 +48,26 @@ export default function App() {
     void appVersion().then(setVer);
   }, []);
 
+  // A tray "Open"/"Settings" click refreshes the status so a tray-driven start/stop shows at once (the
+  // Settings view itself lands in D4). Mirrors $REF App.tsx's onNavigate.
+  useEffect(() => onNavigate(() => void getStatus().then(setStatus)), []);
+
+  // Quit shows a "Shutting down…" overlay while the daemon drains off the main thread ($REF app.go
+  // emits "app:shutting-down"); once shown it stays until the app exits.
+  useEffect(() => onShuttingDown(() => setShuttingDown(true)), []);
+
   const view = viewForStatus(status);
+
+  // Run a daemon action, then refresh the status so the buttons/label reflect the new state.
+  const action = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await fn();
+    } finally {
+      setBusy(false);
+      setStatus(await getStatus());
+    }
+  };
 
   return (
     <div className="app">
@@ -45,6 +76,23 @@ export default function App() {
           <span className={`dot ${view}`} />
           <strong>Rhapsody</strong>
           <span className="label">{statusLabel(status)}</span>
+        </div>
+        <div className="actions">
+          <button
+            disabled={busy || (view !== "stopped" && view !== "error")}
+            onClick={() => void action(startDaemon)}
+          >
+            Start
+          </button>
+          <button
+            disabled={busy || view === "stopped" || view === "not-configured"}
+            onClick={() => void action(stopDaemon)}
+          >
+            Stop
+          </button>
+          <button disabled={busy || view === "not-configured"} onClick={() => void action(restartDaemon)}>
+            Restart
+          </button>
         </div>
       </header>
 
@@ -59,6 +107,15 @@ export default function App() {
       <footer className="foot">
         {ver ? `Rhapsody ${ver.version} (${ver.commit})` : ""}
       </footer>
+
+      {shuttingDown && (
+        <div className="overlay" role="alert">
+          <div className="overlay-card">
+            <h2>Shutting down…</h2>
+            <p>Stopping symphonyd and any running agents.</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -112,3 +112,57 @@ body {
   font-size: 12px;
   text-align: right;
 }
+
+/* Daemon-control buttons (Start/Stop/Restart) in the header. */
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.actions button {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.actions button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* "Shutting down…" overlay shown on quit while the daemon drains off the main thread. */
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(18, 18, 20, 0.85);
+  z-index: 10;
+}
+
+.overlay-card {
+  text-align: center;
+  padding: 32px 40px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.overlay-card h2 {
+  margin: 0 0 8px;
+  color: var(--fg);
+}
+
+.overlay-card p {
+  margin: 0;
+  color: var(--muted);
+}

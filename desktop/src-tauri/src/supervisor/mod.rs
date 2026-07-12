@@ -429,6 +429,14 @@ impl Supervisor {
     pub async fn healthy(&self) -> bool {
         self.inner.healthy().await
     }
+
+    /// Reports whether two handles point at the SAME supervisor instance (`Arc` identity). The App
+    /// uses this to tell a swapped-in supervisor from the one a background Start is in flight for —
+    /// mirroring the Go pointer comparisons (`a.startingSup == sup`, `a.getSup() == orig`;
+    /// `$REF/desktop/app.go`).
+    pub fn ptr_eq(&self, other: &Supervisor) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl Inner {
@@ -739,6 +747,20 @@ mod tests {
     fn pick_free_port_returns_a_port() {
         let p = pick_free_port().expect("pick a free port");
         assert!(p > 0);
+    }
+
+    // ptr_eq reports Arc identity: two clones of one supervisor are equal, two separate `new`s are
+    // not — so the App can tell a swapped-in supervisor from the one a background Start is in flight
+    // for (mirrors the Go pointer comparisons `a.startingSup == sup` / `a.getSup() == orig`).
+    #[test]
+    fn ptr_eq_tracks_arc_identity() {
+        let a = Supervisor::new(Options::default());
+        let b = Supervisor::new(Options::default());
+        assert!(a.ptr_eq(&a.clone()), "a clone shares the same instance");
+        assert!(
+            !a.ptr_eq(&b),
+            "two separate supervisors are distinct instances"
+        );
     }
 
     // exit_error flags a clean exit-0 as unexpected and describes a non-zero exit.

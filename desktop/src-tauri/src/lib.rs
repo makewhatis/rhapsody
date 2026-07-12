@@ -16,5 +16,7 @@
 //! (`status`, `version`).
 
 pub mod apiproxy;
+pub mod app;
+pub mod menu;
 pub mod supervisor;
 pub mod tooldirs;

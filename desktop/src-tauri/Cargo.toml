@@ -10,13 +10,17 @@ repository.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` enables the menu-bar tray (TrayIconBuilder) the D3 shell owns — $REF/desktop/tray.go.
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 # The D2 sidecar supervisor + same-origin api proxy (parity port of $REF/desktop/internal/supervisor
 # + $REF/desktop/apiproxy.go). Every crate below is ALREADY in this workspace's Cargo.lock, pulled in
 # transitively by `tauri` — declaring them directly adds no new downloads, only a direct edge.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "time", "sync", "net", "io-util", "signal"] }
-reqwest = { version = "0.13", default-features = false }
+# `json` decodes the daemon's /api/v1/state for the tray's live agent count (App::agent_count,
+# mirroring $REF/desktop/app.go). serde_json is already in this workspace's Cargo.lock (dev-dep +
+# pulled transitively), so the feature adds no new download — only reqwest's typed `.json()` helper.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 http = "1"
 url = "2"
 libc = "0.2"
