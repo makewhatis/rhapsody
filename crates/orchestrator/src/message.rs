@@ -240,7 +240,9 @@ impl Orchestrator {
 mod tests {
     use std::sync::Arc;
 
+    use chrono::{DateTime, Duration, Utc};
     use rhapsody_agent::{self as agent, EVENT_OPERATOR_MESSAGE};
+    use rhapsody_core::Issue;
     use rhapsody_store::{
         RUN_MESSAGE_DELIVERED, RUN_MESSAGE_EXPIRED, RUN_MESSAGE_SENT, Sqlite, Store, StorePath,
     };
@@ -250,7 +252,7 @@ mod tests {
     use crate::agentupdate::AgentUpdate;
     use crate::orchestrator::Orchestrator;
     use crate::retry::EvWorkerExit;
-    use crate::testsupport::{empty_effective, issue, set_of};
+    use crate::testsupport::{empty_effective, issue, set_of, utc};
 
     /// An orchestrator on a fresh in-memory store with a minimal eff (so `dispatch_issue`'s
     /// `persist_start_run` stamps a real run id). Returns the store so a test can read back the
@@ -488,5 +490,233 @@ mod tests {
             OPERATOR_MAILBOX_CAP + 1,
             "overflow not persisted (1 initial + cap fills)"
         );
+    }
+
+    // --- midrun_summon_test.go: the poll-side mid-run summons router (INF-448, O8 e2e) -----------
+    //
+    // One live fake run (ID-1/MT-1) pinned to `base`; `deliver_mid_run_summons` routes a candidate's
+    // summons into that run's mailbox exactly once per newer watermark. Reuses `message_orch` (in-memory
+    // store + no-op spawn, so the mailbox receiver is never taken by a real worker) and drives the
+    // router directly, exactly as the poll tick would BEFORE select drops the running issue.
+
+    /// Dispatches one fake run for ID-1/MT-1 whose `started_at` is pinned to `base`, returning the
+    /// orchestrator plus `base`. The live entry is read back via `o.running` (Go returns the `*runningEntry`
+    /// pointer; a Rust borrow is re-taken per use). Mirrors Go `midrunHarness`.
+    fn midrun_harness() -> (Orchestrator, DateTime<Utc>) {
+        let (mut o, _st) = message_orch();
+        let base = utc(2026, 6, 3, 12, 0, 0);
+        o.now = Box::new(move || base);
+        o.dispatch_issue(
+            issue("ID-1", "MT-1", "In Progress"),
+            None,
+            None,
+            String::new(),
+        );
+        let started = o.running.get("ID-1").expect("running entry").started_at;
+        assert_eq!(started, base, "running entry not pinned to base");
+        (o, base)
+    }
+
+    // TestMidRunSummonDeliveredOnce: a candidate with an ACTIVE run and a summons newer than the run
+    // start is delivered to the run's mailbox exactly once (wrapped body + persisted "sent" row); a
+    // repeat poll carrying the SAME summons is NOT re-delivered; a NEWER summons is.
+    #[tokio::test]
+    async fn mid_run_summon_delivered_once() {
+        let (mut o, base) = midrun_harness();
+        let run_id = o.running.get("ID-1").expect("running").run_id;
+
+        let summon = base + Duration::hours(1); // posted after the run started
+        let cand = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            title: "do".into(),
+            state: "In Progress".into(),
+            latest_summon_at: Some(summon),
+            latest_summon_body: "@symphony fix the MTU".into(),
+            ..Default::default()
+        };
+
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        let got = o
+            .mailbox_try_recv("ID-1")
+            .expect("expected a mid-run summons delivery");
+        assert!(
+            got.contains("OPERATOR MESSAGE") && got.contains("fix the MTU"),
+            "mailbox payload = {got:?}, want wrapped summons body"
+        );
+
+        // Repeat poll, SAME summons → no re-delivery (dedup watermark holds).
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        assert!(
+            o.mailbox_try_recv("ID-1").is_none(),
+            "summons re-delivered on repeat poll"
+        );
+
+        let msgs = o
+            .store()
+            .list_run_messages(run_id)
+            .expect("list run messages");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "persisted rows should be exactly 1 (deduped)"
+        );
+        assert_eq!(
+            msgs[0].body, "@symphony fix the MTU",
+            "persisted body must be the ORIGINAL (unwrapped) summons body"
+        );
+
+        // A NEWER summons IS delivered again.
+        let mut cand2 = cand.clone();
+        cand2.latest_summon_at = Some(base + Duration::hours(2));
+        cand2.latest_summon_body = "@symphony also bump the timeout".into();
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand2));
+        let got = o
+            .mailbox_try_recv("ID-1")
+            .expect("a newer summons must be delivered");
+        assert!(
+            got.contains("bump the timeout"),
+            "payload = {got:?}, want the newer summons' body"
+        );
+    }
+
+    // TestMidRunSummonBeforeRunStartIgnored: a summons at or before the run start is not a mid-run
+    // event (the round already had it from its start), so it is not injected.
+    #[tokio::test]
+    async fn mid_run_summon_before_run_start_ignored() {
+        let (mut o, base) = midrun_harness();
+        for at in [base - Duration::hours(1), base] {
+            let cand = Issue {
+                id: "ID-1".into(),
+                identifier: "MT-1".into(),
+                state: "In Progress".into(),
+                latest_summon_at: Some(at),
+                latest_summon_body: "@symphony old".into(),
+                ..Default::default()
+            };
+            o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+            assert!(
+                o.mailbox_try_recv("ID-1").is_none(),
+                "summons at {at} (not after run start {base}) must NOT be delivered"
+            );
+        }
+    }
+
+    // TestMidRunSummonFallbackBody: a summons whose source could not surface a body still nudges the
+    // agent with the generic fallback message.
+    #[tokio::test]
+    async fn mid_run_summon_fallback_body() {
+        let (mut o, base) = midrun_harness();
+        let cand = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            latest_summon_at: Some(base + Duration::hours(1)), // no body
+            ..Default::default()
+        };
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        let got = o
+            .mailbox_try_recv("ID-1")
+            .expect("a body-less mid-run summons must still be delivered (fallback)");
+        assert!(
+            got.contains(MID_RUN_SUMMON_FALLBACK),
+            "payload = {got:?}, want the generic fallback"
+        );
+    }
+
+    // TestMidRunSummonNotRunningIgnored: candidates with no active run, or with no summons at all, are
+    // no-ops (no panic on the nil entry lookup).
+    #[tokio::test]
+    async fn mid_run_summon_not_running_ignored() {
+        let (mut o, _st) = message_orch();
+        let summon = utc(2026, 6, 3, 13, 0, 0);
+        o.deliver_mid_run_summons(&[
+            Issue {
+                id: "NOPE".into(),
+                identifier: "MT-9".into(),
+                state: "In Progress".into(),
+                latest_summon_at: Some(summon),
+                latest_summon_body: "@symphony hi".into(),
+                ..Default::default()
+            },
+            Issue {
+                id: "ALSO-NOPE".into(),
+                identifier: "MT-10".into(),
+                state: "Todo".into(),
+                ..Default::default()
+            }, // no summons
+        ]);
+        assert!(o.running.is_empty(), "no run should have been created");
+    }
+
+    // TestMidRunSummonMailboxFullRetries: a full mailbox rejects the delivery WITHOUT advancing the
+    // dedup watermark, so the same summons is retried (and admitted) on a later poll once the worker has
+    // drained the backlog.
+    #[tokio::test]
+    async fn mid_run_summon_mailbox_full_retries() {
+        let (mut o, base) = midrun_harness();
+        let zero = o
+            .running
+            .get("ID-1")
+            .expect("running")
+            .last_delivered_summon_at;
+        let re = o.running.get("ID-1").expect("running").clone();
+        for i in 0..OPERATOR_MAILBOX_CAP {
+            assert!(
+                o.deliver_to_mailbox(&re, "fill").1,
+                "fill {i} rejected before cap"
+            );
+        }
+        let cand = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            latest_summon_at: Some(base + Duration::hours(1)),
+            latest_summon_body: "@symphony fix the MTU".into(),
+            ..Default::default()
+        };
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        assert_eq!(
+            o.running
+                .get("ID-1")
+                .expect("running")
+                .last_delivered_summon_at,
+            zero,
+            "a rejected (mailbox-full) delivery must not advance the watermark"
+        );
+
+        // The worker drains one slot → the next poll delivers the same summons.
+        o.mailbox_try_recv("ID-1").expect("drain one slot");
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        assert_eq!(
+            o.running
+                .get("ID-1")
+                .expect("running")
+                .last_delivered_summon_at,
+            base + Duration::hours(1),
+            "watermark should equal the delivered summons' time"
+        );
+    }
+
+    // TestMidRunSummonTagged: the multi-project adapter routes from the tagged candidate list.
+    #[tokio::test]
+    async fn mid_run_summon_tagged() {
+        let (mut o, base) = midrun_harness();
+        let cand = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            latest_summon_at: Some(base + Duration::hours(1)),
+            latest_summon_body: "@symphony fix the MTU".into(),
+            ..Default::default()
+        };
+        o.deliver_mid_run_summons_tagged(&[TaggedIssue {
+            iss: cand,
+            proj: None,
+        }]);
+        let got = o
+            .mailbox_try_recv("ID-1")
+            .expect("tagged mid-run summons must be delivered");
+        assert!(got.contains("fix the MTU"), "payload = {got:?}");
     }
 }

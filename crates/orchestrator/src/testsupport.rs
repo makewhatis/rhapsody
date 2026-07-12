@@ -629,6 +629,22 @@ pub(crate) fn capture_events<R, F: FnOnce() -> R>(f: F) -> (R, Vec<CapturedEvent
     (result, captured)
 }
 
+/// The recording subscriber plus the shared buffer it fills, for capturing events across an ASYNC
+/// call: install it with [`tracing::subscriber::set_default`] (whose guard holds the default across
+/// `.await` on a current-thread runtime), drive the future, drop the guard, then read the buffer. The
+/// sync [`capture_events`] cannot wrap a future, so the async worker/loop tests use this instead —
+/// mirroring the `set_default` pattern the loop's span test already uses.
+pub(crate) fn recording_subscriber() -> (
+    Arc<Mutex<Vec<CapturedEvent>>>,
+    impl tracing::Subscriber + Send + Sync,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(RecordingLayer {
+        events: Arc::clone(&events),
+    });
+    (events, subscriber)
+}
+
 /// Convenience: how many captured events carry the given message.
 pub(crate) fn count_messages(events: &[CapturedEvent], message: &str) -> usize {
     events.iter().filter(|e| e.message == message).count()

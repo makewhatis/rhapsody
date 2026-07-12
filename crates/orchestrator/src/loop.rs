@@ -195,9 +195,10 @@ pub(crate) const DEFAULT_GH_LOOKBACK: Duration = Duration::from_secs(5 * 60);
 /// timers, the config watcher, and the off-loop [`ControlHandle`](crate::stop::ControlHandle) only
 /// SEND them. Reply-carrying variants use a `oneshot` back-channel (Go a buffered reply `chan`).
 ///
-/// The Go `evRunMessage` variant (operator mid-run messages, INF-250) is O6's (`message.rs`); it is
-/// intentionally absent here (STUB(O6)) and added when that ticket lands (rebase onto main if it merges
-/// first). Its handler `handleRunMessage` and the mailbox plumbing are likewise O6.
+/// The [`RunMessage`](Event::RunMessage) variant (operator mid-run messages, INF-250) carries an
+/// admission request for a live run onto the control channel: O6 (`message.rs`) owns its handler
+/// [`handle_run_message`](Orchestrator::handle_run_message) + the mailbox plumbing, and O7 routes it
+/// through this channel so admission stays loop-confined (Go's `evRunMessage` / `SendRunMessage`).
 pub enum Event {
     /// A poll-timer fire (Go `evTick`).
     Tick,
@@ -969,10 +970,36 @@ impl ControlHandle {
 }
 
 #[cfg(test)]
+impl Orchestrator {
+    /// Test seam: dispatch one control event exactly as the running loop's [`handle`](Orchestrator::handle)
+    /// would (Go's e2e tests call `o.handle(o.ctx, e)` directly). O8's file-tracker e2e drives
+    /// `on_tick` / `on_retry` itself and pumps the control channel through this, so the whole
+    /// poll → claim → dispatch → worker → store cycle runs deterministically on the one test task
+    /// without ever starting [`run_loaded`](Orchestrator::run_loaded).
+    pub(crate) async fn drive_event(&mut self, ev: Event) {
+        self.handle(ev).await;
+    }
+
+    /// Test seam: take the control-event receiver so the e2e pump can drain it (Go's e2e tests read
+    /// `o.events` directly). Taken once; `run_loaded` is never started in these tests, so nothing else
+    /// contends for it.
+    pub(crate) fn take_events_rx(&self) -> Option<UnboundedReceiver<Event>> {
+        self.events_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestrator::Orchestrator;
-    use crate::testsupport::{TempDir, empty_effective, issue, set_of};
+    use crate::testsupport::{
+        DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,
+        proj_with_tracker, record_entries, set_of,
+    };
+    use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -1203,5 +1230,175 @@ mod tests {
             1,
             "project B tracker fetch_issues_by_states should be called once"
         );
+    }
+
+    // --- loop_multi_test.go: onTick's multi-project poll → dedup → dispatch fan-out (O8 e2e) ------
+    //
+    // These drive the assembled `on_tick` control pass against N slug-bound fake trackers and a
+    // recording spawn that captures the dispatched running entries (Go `newMultiOrch`'s
+    // `*[]*runningEntry`), asserting the project stamping / disabled-skip / per-project-error /
+    // dedup / legacy-path semantics `dispatch_decisions` + `poll_all_projects` encode.
+
+    // Mirrors Go `TestOnTickPollsAllProjectsAndDispatches`: onTick polls EVERY resolved project's
+    // slug-bound tracker exactly once and dispatches each candidate stamped with its owning project.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_polls_all_projects_and_dispatches() {
+        let mut ta = Fake::new();
+        ta.candidates = vec![issue("a1", "A-1", "Todo")];
+        let mut tb = Fake::new();
+        tb.candidates = vec![issue("b1", "B-1", "Todo")];
+        let ta = Arc::new(ta);
+        let tb = Arc::new(tb);
+        let (mut o, spawned) = orch_for_retry_multi(
+            vec![
+                proj_with_tracker("a", Arc::clone(&ta), "promptA"),
+                proj_with_tracker("b", Arc::clone(&tb), "promptB"),
+            ],
+            10,
+        );
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        let entries = spawned.lock().expect("dispatched lock");
+        assert_eq!(entries.len(), 2, "both projects' issues should dispatch");
+        let a1 = entries.iter().find(|re| re.issue.id == "a1");
+        let b1 = entries.iter().find(|re| re.issue.id == "b1");
+        assert_eq!(
+            a1.map(|re| re.project_slug.as_str()),
+            Some("a"),
+            "a1 should be stamped with project a"
+        );
+        assert_eq!(
+            b1.map(|re| re.project_slug.as_str()),
+            Some("b"),
+            "b1 should be stamped with project b"
+        );
+        assert_eq!(ta.candidate_calls(), 1, "project a polled once");
+        assert_eq!(tb.candidate_calls(), 1, "project b polled once");
+    }
+
+    // Mirrors Go `TestOnTickSkipsDisabledProject`: a paused project (enabled:false) is never polled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_skips_disabled_project() {
+        let mut ta = Fake::new();
+        ta.candidates = vec![issue("a1", "A-1", "Todo")];
+        let mut tb = Fake::new();
+        tb.candidates = vec![issue("b1", "B-1", "Todo")];
+        let ta = Arc::new(ta);
+        let tb = Arc::new(tb);
+        let pa = proj_with_tracker("a", Arc::clone(&ta), "promptA");
+        let mut pb = proj_with_tracker("b", Arc::clone(&tb), "promptB");
+        pb.disabled = true; // project B is paused (enabled:false in config)
+        let (mut o, spawned) = orch_for_retry_multi(vec![pa, pb], 10);
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        let entries = spawned.lock().expect("dispatched lock");
+        assert_eq!(entries.len(), 1, "only enabled project A should dispatch");
+        assert_eq!(entries[0].issue.id, "a1");
+        assert_eq!(
+            tb.candidate_calls(),
+            0,
+            "disabled project B must NOT be polled"
+        );
+        assert_eq!(ta.candidate_calls(), 1, "enabled project A polled once");
+    }
+
+    // Mirrors Go `TestOnTickProjectFetchErrorSkipsOnlyThatProject`: a per-project fetch error logs
+    // and skips only that project; the sibling still dispatches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_project_fetch_error_skips_only_that_project() {
+        let mut ta = Fake::new();
+        ta.candidates_err = Some(TrackerError::Other("boom".to_string()));
+        let mut tb = Fake::new();
+        tb.candidates = vec![issue("b1", "B-1", "Todo")];
+        let (mut o, spawned) = orch_for_retry_multi(
+            vec![
+                proj_with_tracker("a", Arc::new(ta), "promptA"),
+                proj_with_tracker("b", Arc::new(tb), "promptB"),
+            ],
+            10,
+        );
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        let entries = spawned.lock().expect("dispatched lock");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only project B's issue should dispatch when A errors"
+        );
+        assert_eq!(entries[0].issue.id, "b1");
+    }
+
+    // Mirrors Go `TestOnTickDedupByIDFirstWins`: a duplicate issue id across projects dispatches once
+    // and the FIRST project wins the dedup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_dedup_by_id_first_wins() {
+        let shared = issue("x1", "X-1", "Todo");
+        let mut ta = Fake::new();
+        ta.candidates = vec![shared.clone()];
+        let mut tb = Fake::new();
+        tb.candidates = vec![shared];
+        let (mut o, spawned) = orch_for_retry_multi(
+            vec![
+                proj_with_tracker("a", Arc::new(ta), "promptA"),
+                proj_with_tracker("b", Arc::new(tb), "promptB"),
+            ],
+            10,
+        );
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        let entries = spawned.lock().expect("dispatched lock");
+        assert_eq!(
+            entries.len(),
+            1,
+            "a duplicate issue id should dispatch once"
+        );
+        assert_eq!(
+            entries[0].project_slug, "a",
+            "first project (a) should win the dedup"
+        );
+    }
+
+    // Mirrors Go `TestOnTickSingleProjectLegacyPathWhenProjectsNil`: projects == nil + eff.tracker set
+    // ⇒ the legacy single-tracker path dispatches with an empty project slug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_single_project_legacy_path_when_projects_nil() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![issue("1", "MT-1", "Todo")];
+        let tr = Arc::new(tr);
+        let tr_dyn: Arc<dyn Tracker> = tr.clone();
+        let mut eff = empty_effective(tr_dyn);
+        eff.active_states = set_of(&["todo"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        eff.max_retry_backoff_ms = 300_000;
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        let entries = sink.lock().expect("dispatched lock");
+        assert_eq!(
+            entries.len(),
+            1,
+            "legacy single-tracker path should dispatch the candidate"
+        );
+        assert_eq!(entries[0].issue.id, "1");
+        assert_eq!(
+            entries[0].project_slug, "",
+            "legacy path should leave projectSlug empty"
+        );
+        assert_eq!(tr.candidate_calls(), 1, "legacy tracker polled once");
     }
 }

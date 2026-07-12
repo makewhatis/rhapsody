@@ -449,7 +449,7 @@ mod tests {
     use rhapsody_workspace::{self as workspace, HookScripts, Manager};
 
     use super::*;
-    use crate::testsupport::{TempDir, issue};
+    use crate::testsupport::{TempDir, issue, recording_subscriber};
 
     fn test_workspace(hooks: HookScripts) -> (Arc<Manager>, TempDir) {
         let root = TempDir::new();
@@ -1033,6 +1033,141 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "empty refresh should keep active and continue"
+        );
+    }
+
+    // --- log_correlation_test.go: worker-path log correlation (O8 e2e) ---------------------------
+
+    /// A fake scripting one turn that emits a single `notification` agent event then succeeds — the
+    /// analogue of Go log_correlation_test.go's `agentfake` script.
+    fn notify_then_succeed() -> Arc<agentfake::Fake> {
+        fake_agent(vec![agentfake::TurnScript {
+            events: vec![Event {
+                event_type: EVENT_NOTIFICATION.to_string(),
+                message: "thinking".to_string(),
+                ..Default::default()
+            }],
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                ..Default::default()
+            },
+            err: None,
+        }])
+    }
+
+    // The assertable-now slice of Go log_correlation_test.go `TestWorkerLogsCarryTraceContext`: a
+    // worker-path agent event is logged with the STANDARDIZED `issue_identifier` key. (The Go test
+    // additionally asserts the record carries a valid OTel trace context — the otelslog bridge attaches
+    // trace_id/span_id from the run/turn span — which is telemetry P6; this port emits no OTel span
+    // around the agent-event log yet, per the worker module docs. That half is the ignored full mirror
+    // below, matching how the loop's `loop_spans_test` is split into an active slice + a P6 mirror.)
+    #[tokio::test]
+    async fn worker_logs_carry_issue_identifier() {
+        let ag = notify_then_succeed();
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]); // leaves the active set after turn 1
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag, tr, "do it", 20);
+
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let (_last, _declared, err) = run_agent_attempt(
+            &d,
+            issue("1", "MT-1", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        drop(guard);
+        assert!(err.is_none(), "expected a normal run, got {err:?}");
+
+        let captured = events.lock().expect("event buffer lock");
+        let agent_ev = captured
+            .iter()
+            .find(|e| e.fields.get("event").map(String::as_str) == Some(EVENT_NOTIFICATION))
+            .expect("expected an agent-event log for the emitted notification");
+        assert_eq!(
+            agent_ev.fields.get("issue_identifier").map(String::as_str),
+            Some("MT-1"),
+            "agent-event log must carry the standardized issue_identifier key: {agent_ev:?}"
+        );
+    }
+
+    // The full Go `TestWorkerLogsCarryTraceContext`: a worker-path agent event must be emitted UNDER
+    // the run/turn span so the otelslog bridge can attach a valid trace context. That span + the OTel
+    // export are telemetry P6 (O3 deferred them; the worker wraps no span around the agent-event log
+    // yet — see the worker module docs), so the tracing-level analogue "emitted under a span" fails
+    // today. Un-ignored when P6 wires the run/turn span + the OTel bridge.
+    #[tokio::test]
+    #[ignore = "telemetry P6: OTel trace-context on worker logs (run/turn span + otelslog bridge; O3 deferred it)"]
+    async fn worker_logs_carry_trace_context() {
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        // Records, per event carrying an `event` field, that field's value + whether the event was
+        // emitted under a span (the tracing-level analogue of "the record's ctx carries a valid
+        // trace_id"). Reuses no crate state so the ignored mirror stays self-contained.
+        struct SpanCtxLayer {
+            hits: Arc<Mutex<Vec<(String, bool)>>>,
+        }
+        impl<S> Layer<S> for SpanCtxLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                struct EvField(Option<String>);
+                impl tracing::field::Visit for EvField {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "event" {
+                            self.0 = Some(format!("{value:?}"));
+                        }
+                    }
+                }
+                let mut v = EvField(None);
+                event.record(&mut v);
+                if let Some(name) = v.0 {
+                    self.hits
+                        .lock()
+                        .expect("hits lock")
+                        .push((name, ctx.event_span(event).is_some()));
+                }
+            }
+        }
+
+        let ag = notify_then_succeed();
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag, tr, "do it", 20);
+
+        let hits = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanCtxLayer {
+                hits: Arc::clone(&hits),
+            }));
+        let _ = run_agent_attempt(
+            &d,
+            issue("1", "MT-1", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        drop(guard);
+
+        let hits = hits.lock().expect("hits lock");
+        let agent_ev = hits
+            .iter()
+            .find(|(name, _)| name == EVENT_NOTIFICATION)
+            .expect("expected an agent-event log for the emitted notification");
+        assert!(
+            agent_ev.1,
+            "agent-event log must be emitted under the run/turn span for OTel trace correlation"
         );
     }
 }

@@ -67,6 +67,11 @@ pub mod workspace_gc;
 #[cfg(test)]
 mod testsupport;
 
+// O8 e2e gate: the INF-303 no-Linear end-to-end suite (real file tracker + real runner + committed
+// fake-claude + in-memory store), driving the assembled control pass. Test-only.
+#[cfg(test)]
+mod filetracker_e2e;
+
 pub use agentupdate::AgentUpdate;
 pub use backoff::{CONTINUATION_DELAY_MS, failure_backoff_ms};
 pub use concurrency::{global_slots, state_limit};
