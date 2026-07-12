@@ -17,6 +17,13 @@
 
 pub mod apiproxy;
 pub mod app;
+pub(crate) mod atomicfile;
+pub mod credential;
+pub mod linearoauth;
+pub mod linearprojects;
 pub mod menu;
+pub mod onboarding;
+pub mod prefs;
 pub mod supervisor;
+pub mod toolcheck;
 pub mod tooldirs;

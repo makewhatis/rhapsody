@@ -9,7 +9,9 @@ mod version;
 
 use std::time::Duration;
 
-use rhapsody_desktop::app::{App, CloseDecision, StatusDto};
+use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
+use rhapsody_desktop::linearprojects::Project;
+use rhapsody_desktop::toolcheck::ToolResult;
 use tauri::{Emitter, Manager};
 use version::VersionDto;
 
@@ -47,6 +49,66 @@ async fn restart_daemon(app: tauri::State<'_, App>) -> Result<(), String> {
     app.restart_daemon().await.map_err(|e| e.to_string())
 }
 
+// ---- D4 settings commands (Tauri stand-ins for the Wails-bound App methods) -----------------------
+
+/// Probe the external CLIs (claude, gh, gt, git) for the Tool-doctor panel. Mirrors Go `App.ProbeTools`.
+#[tauri::command]
+async fn probe_tools(app: tauri::State<'_, App>) -> Result<Vec<ToolResult>, String> {
+    Ok(app.probe_tools().await)
+}
+
+/// Record an explicit path for a tool (empty path clears it). Mirrors Go `App.SetToolOverride`.
+#[tauri::command]
+async fn set_tool_override(
+    app: tauri::State<'_, App>,
+    name: String,
+    path: String,
+) -> Result<(), String> {
+    app.set_tool_override(&name, &path)
+}
+
+/// The Linear credential panel status. Mirrors Go `App.CredentialStatus`.
+#[tauri::command]
+async fn credential_status(app: tauri::State<'_, App>) -> Result<CredentialStatusDto, String> {
+    Ok(app.credential_status())
+}
+
+/// Store a pasted Linear token (Keychain, file fallback) and restart the daemon. Mirrors Go
+/// `App.SetLinearToken`.
+#[tauri::command]
+async fn set_linear_token(app: tauri::State<'_, App>, token: String) -> Result<(), String> {
+    app.set_linear_token(&token).await
+}
+
+/// Revoke the stored Linear token. Mirrors Go `App.ClearLinearToken`.
+#[tauri::command]
+async fn clear_linear_token(app: tauri::State<'_, App>) -> Result<(), String> {
+    app.clear_linear_token().await
+}
+
+/// The deferred "Connect Linear" OAuth action (a clear message until a client_id exists). Mirrors Go
+/// `App.StartLinearOAuth`.
+#[tauri::command]
+async fn start_linear_oauth(app: tauri::State<'_, App>) -> Result<(), String> {
+    app.start_linear_oauth()
+}
+
+/// List the workspace's Linear projects for the onboarding picker. Mirrors Go `App.ListLinearProjects`.
+#[tauri::command]
+async fn list_linear_projects(app: tauri::State<'_, App>) -> Result<Vec<Project>, String> {
+    app.list_linear_projects().await
+}
+
+/// Onboarding's final step: seed WORKFLOW.md for the chosen project and start the daemon. Mirrors Go
+/// `App.WriteInitialConfig`.
+#[tauri::command]
+async fn write_initial_config(
+    app: tauri::State<'_, App>,
+    project_slug: String,
+) -> Result<(), String> {
+    app.write_initial_config(&project_slug).await
+}
+
 fn main() {
     // Errors are values (no panic on the startup path): mirror Go `main`, which logs the run error
     // ($REF/desktop/main.go). A failed launch exits non-zero so a supervising shell notices.
@@ -63,7 +125,15 @@ fn run() -> tauri::Result<()> {
             app_version,
             start_daemon,
             stop_daemon,
-            restart_daemon
+            restart_daemon,
+            probe_tools,
+            set_tool_override,
+            credential_status,
+            set_linear_token,
+            clear_linear_token,
+            start_linear_oauth,
+            list_linear_projects,
+            write_initial_config
         ])
         .setup(|app| {
             let application = App::from_env();

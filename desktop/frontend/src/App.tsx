@@ -11,18 +11,26 @@ import {
   type VersionDTO,
 } from "./bindings";
 import { statusLabel, viewForStatus } from "./status";
+import { Credential } from "./Credential";
+import { Onboarding } from "./Onboarding";
+import { ToolDoctor } from "./ToolDoctor";
 import "./styles.css";
 
-// The desktop window shell. Ported from $REF/desktop/frontend/src/App.tsx, reduced to the P7-D3
-// surface: the two-layer UI is the status header + the daemon dashboard once healthy, with clear
-// not-configured / starting / stopped / error placeholders otherwise, plus the daemon-control buttons
-// (Start/Stop/Restart) and the quit "Shutting down…" overlay. The Linear/Tools/Onboarding panels land
-// with settings (D4).
+// The desktop window shell. Ported from $REF/desktop/frontend/src/App.tsx: the two-layer UI is the
+// status header + the daemon dashboard once healthy, the first-launch Onboarding wizard in the
+// not-configured state, and the Linear-credential + Tool-doctor settings panels reachable from the
+// header (P7-D4). Keeps the D3 quit "Shutting down…" overlay + the build-stamp footer.
 export default function App() {
   const [status, setStatus] = useState<StatusDTO | null>(null);
   const [ver, setVer] = useState<VersionDTO | null>(null);
   const [busy, setBusy] = useState(false);
   const [shuttingDown, setShuttingDown] = useState(false);
+  const [showTools, setShowTools] = useState(false);
+  const [showCred, setShowCred] = useState(false);
+  // onboardErr persists an onboarding "config written but daemon couldn't start" message: once the
+  // config is written the wizard unmounts (configured flips true), so the message is lifted here to
+  // survive into the stopped/error placeholder. Cleared once the daemon is up.
+  const [onboardErr, setOnboardErr] = useState("");
 
   // Poll the daemon status so the shell reflects start/health/stop transitions live (2s, per $REF).
   useEffect(() => {
@@ -48,8 +56,9 @@ export default function App() {
     void appVersion().then(setVer);
   }, []);
 
-  // A tray "Open"/"Settings" click refreshes the status so a tray-driven start/stop shows at once (the
-  // Settings view itself lands in D4). Mirrors $REF App.tsx's onNavigate.
+  // A tray "Open"/"Settings" click refreshes the status so a tray-driven start/stop shows at once.
+  // Mirrors $REF App.tsx's onNavigate (which likewise just refreshes; the settings panels open from
+  // the header buttons).
   useEffect(() => onNavigate(() => void getStatus().then(setStatus)), []);
 
   // Quit shows a "Shutting down…" overlay while the daemon drains off the main thread ($REF app.go
@@ -57,6 +66,11 @@ export default function App() {
   useEffect(() => onShuttingDown(() => setShuttingDown(true)), []);
 
   const view = viewForStatus(status);
+
+  // Once the daemon is healthy, a prior onboarding start-failure message is stale — drop it.
+  useEffect(() => {
+    if (view === "dashboard") setOnboardErr("");
+  }, [view]);
 
   // Run a daemon action, then refresh the status so the buttons/label reflect the new state.
   const action = async (fn: () => Promise<void>) => {
@@ -79,6 +93,22 @@ export default function App() {
         </div>
         <div className="actions">
           <button
+            onClick={() => {
+              setShowCred((v) => !v);
+              setShowTools(false);
+            }}
+          >
+            {showCred ? "Hide Linear" : "Linear"}
+          </button>
+          <button
+            onClick={() => {
+              setShowTools((v) => !v);
+              setShowCred(false);
+            }}
+          >
+            {showTools ? "Hide tools" : "Tools"}
+          </button>
+          <button
             disabled={busy || (view !== "stopped" && view !== "error")}
             onClick={() => void action(startDaemon)}
           >
@@ -97,16 +127,20 @@ export default function App() {
       </header>
 
       <main className="content">
-        {view === "dashboard" && status ? (
+        {showCred ? (
+          <Credential onClose={() => setShowCred(false)} />
+        ) : showTools ? (
+          <ToolDoctor onClose={() => setShowTools(false)} />
+        ) : view === "dashboard" && status ? (
           <iframe className="dashboard" src={status.url} title="Rhapsody dashboard" />
+        ) : view === "not-configured" ? (
+          <Onboarding onConfigured={() => void getStatus().then(setStatus)} onError={setOnboardErr} />
         ) : (
-          <Placeholder view={view} status={status} />
+          <Placeholder view={view} status={status} onboardErr={onboardErr} />
         )}
       </main>
 
-      <footer className="foot">
-        {ver ? `Rhapsody ${ver.version} (${ver.commit})` : ""}
-      </footer>
+      <footer className="foot">{ver ? `Rhapsody ${ver.version} (${ver.commit})` : ""}</footer>
 
       {shuttingDown && (
         <div className="overlay" role="alert">
@@ -120,7 +154,15 @@ export default function App() {
   );
 }
 
-function Placeholder({ view, status }: { view: string; status: StatusDTO | null }) {
+function Placeholder({
+  view,
+  status,
+  onboardErr,
+}: {
+  view: string;
+  status: StatusDTO | null;
+  onboardErr?: string;
+}) {
   const body: Record<string, { title: string; detail: string }> = {
     loading: { title: "Loading…", detail: "Connecting to the supervisor." },
     "not-configured": {
@@ -140,6 +182,13 @@ function Placeholder({ view, status }: { view: string; status: StatusDTO | null 
     <div className="placeholder">
       <h2>{b.title}</h2>
       <p>{b.detail}</p>
+      {/* Persisted onboarding start-failure: config was written but the daemon couldn't start, so the
+          wizard unmounted before its message could be read — surface it here too. */}
+      {onboardErr && (
+        <p role="alert" className="cred-msg">
+          {onboardErr}
+        </p>
+      )}
     </div>
   );
 }

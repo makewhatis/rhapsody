@@ -29,6 +29,25 @@ export interface VersionDTO {
   build_time: string;
 }
 
+// ToolResult mirrors the Rust toolcheck::ToolResult (Go toolcheck.Result): one external CLI's
+// preflight status for the Tool-doctor panel.
+export interface ToolResult {
+  name: string;
+  path: string;
+  found: boolean;
+  healthy: boolean;
+  version: string;
+  detail: string;
+}
+
+// CredentialStatus mirrors the Rust CredentialStatusDto (Go CredentialStatusDTO): whether a Linear
+// token is stored, in which backend, and whether the deferred OAuth path is available.
+export interface CredentialStatus {
+  has_token: boolean;
+  backend: string;
+  oauth_available: boolean;
+}
+
 // tauriAvailable reports whether the Tauri IPC bridge is present. It is absent when the bundle is
 // loaded in a plain browser (e.g. `vite dev` without the app, or a unit test), so callers degrade
 // gracefully instead of throwing. Mirrors the reference's `window.go?.main?.App` guard.
@@ -65,6 +84,55 @@ export async function stopDaemon(): Promise<void> {
 export async function restartDaemon(): Promise<void> {
   if (!tauriAvailable()) return;
   await invoke("restart_daemon");
+}
+
+// --- D4 settings bridges: map to the App's bound methods ($REF/desktop/app.go), no-ops (or empty /
+// null) when the Tauri bridge is absent so the panels degrade gracefully outside the app. ---
+
+// probeTools runs the Tool-doctor preflight; returns [] when the bridge is absent.
+export async function probeTools(): Promise<ToolResult[]> {
+  if (!tauriAvailable()) return [];
+  return invoke<ToolResult[]>("probe_tools");
+}
+
+// setToolOverride records an explicit path for a tool (empty clears it); the dir reaches the daemon's
+// agent PATH on the next restart. Rejects (surfaced inline) when the path is not executable.
+export async function setToolOverride(name: string, path: string): Promise<void> {
+  if (!tauriAvailable()) return;
+  await invoke("set_tool_override", { name, path });
+}
+
+// credentialStatus drives the Linear credential panel; null when the bridge is absent.
+export async function credentialStatus(): Promise<CredentialStatus | null> {
+  if (!tauriAvailable()) return null;
+  return invoke<CredentialStatus>("credential_status");
+}
+
+// setLinearToken stores a pasted token (Keychain, file fallback) and restarts the daemon. Rejects
+// with a partial-success message when the token is saved but the daemon couldn't restart.
+export async function setLinearToken(token: string): Promise<void> {
+  if (!tauriAvailable()) return;
+  await invoke("set_linear_token", { token });
+}
+
+// clearLinearToken revokes the stored token from both backends and restarts the daemon.
+export async function clearLinearToken(): Promise<void> {
+  if (!tauriAvailable()) return;
+  await invoke("clear_linear_token");
+}
+
+// startLinearOAuth triggers the deferred "Connect Linear" flow; in v1 it rejects with a clear message
+// (no client_id configured) which the UI surfaces.
+export async function startLinearOAuth(): Promise<void> {
+  if (!tauriAvailable()) return;
+  await invoke("start_linear_oauth");
+}
+
+// writeInitialConfig is the onboarding wizard's final step: seed WORKFLOW.md for the chosen Linear
+// project and start the daemon.
+export async function writeInitialConfig(projectSlug: string): Promise<void> {
+  if (!tauriAvailable()) return;
+  await invoke("write_initial_config", { projectSlug });
 }
 
 // onNavigate subscribes to the tray's navigate event ("dashboard" | "settings"); returns an

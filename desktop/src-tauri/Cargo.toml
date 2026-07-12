@@ -18,9 +18,26 @@ serde = { version = "1", features = ["derive"] }
 # transitively by `tauri` — declaring them directly adds no new downloads, only a direct edge.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "time", "sync", "net", "io-util", "signal"] }
 # `json` decodes the daemon's /api/v1/state for the tray's live agent count (App::agent_count,
-# mirroring $REF/desktop/app.go). serde_json is already in this workspace's Cargo.lock (dev-dep +
-# pulled transitively), so the feature adds no new download — only reqwest's typed `.json()` helper.
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# mirroring $REF/desktop/app.go). `native-tls` (D4) links macOS's Security framework — the same
+# trust store Go's net/http uses — so `linearprojects` can reach https://api.linear.app for the
+# onboarding project picker; the pre-D4 loopback-only usage (apiproxy + agent count) needed no TLS.
+# native-tls (not rustls) reuses the security-framework crate keyring already pulls and needs no C
+# crypto toolchain (cmake/aws-lc-rs) on the runner. serde_json is already in this workspace's lock.
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+# serde_json (D4): parses Linear's GraphQL responses in `linearprojects` (mirror of
+# $REF/desktop/internal/linearprojects, which uses encoding/json) and (de)serializes the tool-doctor
+# override prefs map (mirror of $REF/desktop/internal/prefs). Already in this workspace's Cargo.lock
+# (dev-dep + reqwest's `json`), so promoting it to a direct dep adds no new download.
+serde_json = "1"
+# keyring (D4): the macOS Keychain-backed Linear-token store (mirror of $REF/desktop/internal/
+# credential's zalando/go-keyring usage). `apple-native` uses the Security framework directly, so an
+# unsigned build still reads/writes the login keychain; the 0600 file fallback covers write friction.
+# Plan-anticipated ("Keychain via the security-framework/keyring crate").
+keyring = { version = "3", features = ["apple-native"] }
+# serde_yaml_ng (D4): renders the onboarding WORKFLOW.md front matter (mirror of
+# $REF/desktop/internal/onboarding, which uses gopkg.in/yaml.v3). This is the SAME maintained
+# serde_yaml fork the daemon's `rhapsody-config` uses, so the generated YAML parses back identically.
+serde_yaml_ng = "0.10"
 http = "1"
 url = "2"
 libc = "0.2"
@@ -32,7 +49,6 @@ http-body-util = "0.1"
 bytes = "1"
 
 [dev-dependencies]
-serde_json = "1"
 # supervisor lifecycle tests are integration tests (tests/): they launch the real compiled
 # `fakedaemon` bin (via CARGO_BIN_EXE_fakedaemon) and drive start/health/restart/drain, mirroring
 # $REF/desktop/internal/supervisor/supervisor_test.go. libc is used to assert the process-group setup.

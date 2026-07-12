@@ -8,8 +8,9 @@
 //!
 //! It deliberately has NO Tauri dependency, so the lifecycle is unit-testable headlessly (the bin's
 //! `tray` module + the `run` event loop supply the Tauri effects: emit the overlay event, prevent the
-//! exit, and re-issue it once the drain completes). The credential/tool-override inputs to
-//! `make_supervisor` are wired in P7-D4; here they default (empty key, no overrides).
+//! exit, and re-issue it once the drain completes). P7-D4 adds the settings surface — the Keychain
+//! credential store, tool-doctor overrides (prefs), the Linear project picker, onboarding config
+//! write-back, and the tool doctor — wiring the stored token + override dirs into `make_supervisor`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,9 +22,11 @@ use tokio::sync::watch;
 
 use crate::menu::{MenuModel, menu_from_status};
 use crate::supervisor::{
-    DaemonOutput, Options, State, Status, Supervisor, resolve_binary, resources_dir_for,
+    DaemonOutput, Options, State, Status, Supervisor, is_executable_file, resolve_binary,
+    resources_dir_for,
 };
 use crate::tooldirs::agent_tool_dirs;
+use crate::{credential, linearoauth, linearprojects, onboarding, prefs, toolcheck};
 
 /// A one-shot broadcast the single stop task "closes" when the drain completes. Created on the FIRST
 /// close; re-entrant closes and `on_shutdown` wait on the SAME signal instead of issuing a second
@@ -78,8 +81,11 @@ struct Mutable {
     sup: Option<Supervisor>,
     /// The supervisor a background Start is in flight for (so a rebuild never orphans a live launch).
     starting_sup: Option<Supervisor>,
-    /// Tool-doctor per-tool path overrides (name -> path); wired by P7-D4, empty here.
+    /// Tool-doctor per-tool path overrides (name -> path); loaded from prefs at [`App::on_startup`].
     overrides: HashMap<String, String>,
+    /// The active Linear-token store: `None` until [`App::on_startup`] resolves the backend (Go's
+    /// `a.cred == nil`), then the Keychain or (fallback) file store. Swapped by set/clear.
+    cred: Option<Arc<dyn credential::Store>>,
     /// `Some` once shutdown is underway — collapses Go's `shuttingDown` bool + `stopDone` channel
     /// (always set together) into one field. The single stop task closes it when the drain completes.
     stop_done: Option<Arc<StopSignal>>,
@@ -90,7 +96,17 @@ struct AppInner {
     workflow_path: Option<PathBuf>,
     /// The resolved `rhapsodyd` sidecar path (empty until resolved), passed to each supervisor.
     binary_path: PathBuf,
+    /// Where tool-doctor overrides persist (`~/.symphony/tools.json`); `None` when `$HOME` is unset.
+    prefs_path: Option<PathBuf>,
+    /// The 0600 credential file fallback (`~/.symphony/credentials`), used when the Keychain is unusable.
+    cred_path: PathBuf,
+    /// The Keychain store the credential methods build fresh (Go's repeated `credential.New()`), behind
+    /// an `Arc<dyn Store>` so tests inject an in-memory double instead of touching the login keychain.
+    keychain: Arc<dyn credential::Store>,
     mu: Mutex<Mutable>,
+    /// Serializes [`App::set_tool_override`]'s read-merge-swap-persist so two overlapping saves cannot
+    /// each start from the same stale snapshot and drop one another's override (Go's `a.saveMu`).
+    save_mu: Mutex<()>,
     /// Short-timeout client for the `/api/v1/state` agent-count probe (Go's `http.DefaultClient`).
     http: reqwest::Client,
 }
@@ -161,10 +177,41 @@ pub struct StatusDto {
     pub configured: bool,
 }
 
+/// Reports whether a Linear token is stored, which backend holds it, and whether the deferred OAuth
+/// path is available (spec §7). The serde field names match Go `CredentialStatusDTO`'s json tags so the
+/// webview's `CredentialStatus` sees the identical shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CredentialStatusDto {
+    pub has_token: bool,
+    pub backend: String,
+    pub oauth_available: bool,
+}
+
 impl App {
-    /// Builds the app from the resolved sidecar + workflow paths (the OnStartup inputs). The
-    /// supervisor is wired by [`App::on_startup`]; tests set it directly via [`App::set_sup`].
+    /// Builds the app from the resolved sidecar + workflow paths, with the production Keychain store and
+    /// no prefs/cred paths — kept as the 2-arg constructor the lifecycle tests use. The supervisor is
+    /// wired by [`App::on_startup`]; tests set it directly via [`App::set_sup`]. Credential-touching
+    /// methods are not exercised through this constructor in tests, so the real Keychain is never hit.
     pub fn new(workflow_path: Option<PathBuf>, binary_path: PathBuf) -> App {
+        App::new_with(
+            workflow_path,
+            binary_path,
+            None,
+            PathBuf::new(),
+            Arc::new(credential::new()),
+        )
+    }
+
+    /// The full constructor: also takes where tool-override prefs and the credential file fallback live,
+    /// plus the Keychain store (production `credential::new()`, or a test double). Used by
+    /// [`App::from_env`] with production wiring and by the credential tests with an in-memory keychain.
+    pub fn new_with(
+        workflow_path: Option<PathBuf>,
+        binary_path: PathBuf,
+        prefs_path: Option<PathBuf>,
+        cred_path: PathBuf,
+        keychain: Arc<dyn credential::Store>,
+    ) -> App {
         // A short-timeout client for the agent-count probe; builder failure is practically impossible
         // for this http-only client, so fall back to the default rather than panic (errors are values).
         let http = reqwest::Client::builder()
@@ -175,29 +222,55 @@ impl App {
             inner: Arc::new(AppInner {
                 workflow_path,
                 binary_path,
+                prefs_path,
+                cred_path,
+                keychain,
                 mu: Mutex::new(Mutable {
                     sup: None,
                     starting_sup: None,
                     overrides: HashMap::new(),
+                    cred: None,
                     stop_done: None,
                 }),
+                save_mu: Mutex::new(()),
                 http,
             }),
         }
     }
 
     /// Builds the app from the environment — the OnStartup path resolution: the WORKFLOW.md
-    /// (`SYMPHONY_WORKFLOW` override, else `~/.symphony/WORKFLOW.md`) and the `rhapsodyd` sidecar
-    /// (`SYMPHONY_DAEMON` dev override, else the app bundle's `Resources`, else PATH). A missing
-    /// sidecar is logged and left empty (the daemon simply cannot start until it is found), mirroring
-    /// Go `OnStartup`'s `resolveWorkflowPath` + `resolveDaemonBinary`.
+    /// (`SYMPHONY_WORKFLOW` override, else `~/.symphony/WORKFLOW.md`), the `rhapsodyd` sidecar
+    /// (`SYMPHONY_DAEMON` dev override, else the app bundle's `Resources`, else PATH), the tool-override
+    /// prefs (`~/.symphony/tools.json`), and the credential file fallback (`~/.symphony/credentials`).
+    /// A missing sidecar is logged and left empty (the daemon simply cannot start until it is found),
+    /// mirroring Go `OnStartup`'s resolvers.
     pub fn from_env() -> App {
-        App::new(resolve_workflow_path(), resolve_daemon_binary())
+        App::new_with(
+            resolve_workflow_path(),
+            resolve_daemon_binary(),
+            resolve_prefs_path(),
+            resolve_credential_path(),
+            Arc::new(credential::new()),
+        )
     }
 
-    /// Builds the supervisor and — when configured with a resolved sidecar — kicks off the daemon in
-    /// the background (so startup never blocks on the readiness wait). Mirrors Go `OnStartup`'s tail.
+    /// Loads persisted tool overrides + resolves the credential backend, then builds the supervisor and
+    /// — when configured with a resolved sidecar — kicks off the daemon in the background (so startup
+    /// never blocks on the readiness wait). Mirrors Go `OnStartup`.
     pub fn on_startup(&self) {
+        // Load persisted tool overrides (a missing file yields an empty map) so the daemon's first
+        // launch already has the user's override dirs on the agent PATH.
+        if let Some(prefs_path) = &self.inner.prefs_path {
+            match prefs::load_tool_overrides(prefs_path) {
+                Ok(overrides) => lock(&self.inner.mu).overrides = overrides,
+                Err(e) => eprintln!("rhapsody-desktop: could not load tool overrides: {e}"),
+            }
+        }
+        // Resolve the credential backend (Keychain, or the file fallback when the Keychain is empty but
+        // a previously-written fallback file exists) so the first supervisor launches with the token.
+        let cred = resolve_credential_store(self.inner.keychain.clone(), &self.inner.cred_path);
+        lock(&self.inner.mu).cred = Some(cred);
+
         self.set_sup(self.make_supervisor());
         if self.configured() && !self.inner.binary_path.as_os_str().is_empty() {
             self.ensure_started();
@@ -219,14 +292,17 @@ impl App {
         lock(&self.inner.mu).overrides.clone()
     }
 
-    /// Builds a supervisor from the current paths + tool overrides (credential is P7-D4). The agent
-    /// PATH is the override dirs first, then the known-good defaults. Mirrors `makeSupervisor`.
+    /// Builds a supervisor from the current paths, tool overrides, and stored Linear token. The agent
+    /// PATH is the override dirs first, then the known-good defaults; the token becomes the daemon's
+    /// `$LINEAR_API_KEY` so it resolves `api_key: $LINEAR_API_KEY` without the user exporting anything.
+    /// Mirrors `makeSupervisor`.
     pub fn make_supervisor(&self) -> Supervisor {
         let home = std::env::var("HOME").unwrap_or_default();
         Supervisor::new(Options {
             binary_path: self.inner.binary_path.clone(),
             workflow_path: self.inner.workflow_path.clone(),
             tool_dirs: Some(agent_tool_dirs(&home, &self.snapshot_overrides())),
+            linear_api_key: self.linear_token(),
             // The Wails shell wires os.Stderr so the sidecar's logs reach the app's stderr.
             daemon_output: DaemonOutput::Inherit,
             ..Options::default()
@@ -505,6 +581,321 @@ impl App {
             Err(_) => 0,
         }
     }
+
+    // ---- credential (Linear token) ----------------------------------------------------------------
+
+    /// The stored Linear token, or `$LINEAR_API_KEY` when none is stored (dev convenience). Fed to the
+    /// daemon's launch env so it resolves `api_key: $LINEAR_API_KEY`. Mirrors `linearToken`.
+    fn linear_token(&self) -> String {
+        self.linear_token_with_env(env_linear_api_key().as_deref().unwrap_or(""))
+    }
+
+    /// The env-injected core of [`linear_token`], taking the `$LINEAR_API_KEY` value so tests need not
+    /// mutate the process environment (Go's tests use `t.Setenv`, which Rust cannot do parallel-safely).
+    /// A read error is NOT "no token": it returns "" WITHOUT falling back to the env var, so a stored
+    /// credential that is momentarily unreadable is never masked by a stray dev key (it stays visible).
+    fn linear_token_with_env(&self, env_token: &str) -> String {
+        let cred = lock(&self.inner.mu).cred.clone();
+        if let Some(cred) = cred {
+            match cred.get() {
+                Ok(token) if !token.is_empty() => return token,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "rhapsody-desktop: reading the stored Linear token failed ({}); not falling back to $LINEAR_API_KEY: {e}",
+                        cred.backend()
+                    );
+                    return String::new();
+                }
+            }
+        }
+        env_token.to_string()
+    }
+
+    /// Drives the credential panel: whether a token is stored, in which backend, and whether OAuth is
+    /// available. Mirrors `CredentialStatus`.
+    pub fn credential_status(&self) -> CredentialStatusDto {
+        self.credential_status_with(
+            env_linear_api_key().as_deref().unwrap_or(""),
+            self.linear_oauth_available(),
+        )
+    }
+
+    /// The env-injected core of [`credential_status`] (see [`linear_token_with_env`] for why). On a read
+    /// error it reports the unreadable backend and does NOT promote `$LINEAR_API_KEY` — consistent with
+    /// [`linear_token_with_env`], so the panel never shows a token the daemon will not actually use.
+    fn credential_status_with(
+        &self,
+        env_token: &str,
+        oauth_available: bool,
+    ) -> CredentialStatusDto {
+        let cred = lock(&self.inner.mu).cred.clone();
+        let mut dto = CredentialStatusDto {
+            has_token: false,
+            backend: String::new(),
+            oauth_available,
+        };
+        if let Some(cred) = cred {
+            match cred.get() {
+                Ok(token) if !token.is_empty() => {
+                    dto.has_token = true;
+                    dto.backend = cred.backend().to_string();
+                    return dto;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "rhapsody-desktop: reading the stored Linear token failed ({}): {e}",
+                        cred.backend()
+                    );
+                    dto.backend = cred.backend().to_string();
+                    return dto;
+                }
+            }
+        }
+        // Only when there is no stored credential at all do we report the dev env var — labelled "env"
+        // so the UI does not offer a Keychain "Remove" that is a no-op against $LINEAR_API_KEY.
+        if !env_token.is_empty() {
+            dto.has_token = true;
+            dto.backend = "env".to_string();
+        }
+        dto
+    }
+
+    /// Stores a pasted Linear token in the Keychain (falling back to a 0600 file if the Keychain rejects
+    /// the write), clears the other backend, then rebuilds/restarts the daemon so it picks up the new
+    /// credential. Mirrors `SetLinearToken`.
+    pub async fn set_linear_token(&self, token: &str) -> Result<(), String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("token is empty".to_string());
+        }
+        let kc = self.inner.keychain.clone();
+        let file: Arc<dyn credential::Store> =
+            Arc::new(credential::new_file(&self.inner.cred_path));
+        let active: Arc<dyn credential::Store> = match kc.set(token) {
+            Ok(()) => kc.clone(),
+            Err(e) => {
+                eprintln!(
+                    "rhapsody-desktop: keychain write failed; falling back to a 0600 file store: {e}"
+                );
+                file.set(token)
+                    .map_err(|fe| format!("store token (keychain: {e}; file: {fe})"))?;
+                file.clone()
+            }
+        };
+        // Clear the OTHER backend so a token never lingers in two places (an old Keychain entry after a
+        // file fallback, or a stale file after a later successful Keychain write).
+        let other = if active.backend() == "keychain" {
+            file
+        } else {
+            kc
+        };
+        if let Err(e) = other.delete() {
+            eprintln!(
+                "rhapsody-desktop: could not clear the inactive credential backend ({}); a stale token may remain: {e}",
+                other.backend()
+            );
+        }
+        lock(&self.inner.mu).cred = Some(active);
+        self.apply_credential_change().await
+    }
+
+    /// Rebuilds the supervisor so its launch env reflects the current stored credential, restarting the
+    /// daemon if it was already running. Rebuilding even while stopped is essential: the token is
+    /// captured at `make_supervisor` time, so without this a token saved before the first Start (the
+    /// onboarding sequence) would never reach the daemon. Mirrors `applyCredentialChange`.
+    async fn apply_credential_change(&self) -> Result<(), String> {
+        let old = self.get_sup();
+        let was_active = old
+            .as_ref()
+            .is_some_and(|s| s.status().state != State::Stopped);
+        if let Some(old) = old
+            && tokio::time::timeout(Duration::from_secs(10), old.stop())
+                .await
+                .is_err()
+        {
+            // The previous rhapsodyd may still be alive; installing + starting a new supervisor would
+            // launch a SECOND instance on a different loopback port. Abort — the credential is already
+            // persisted, so the next explicit Start/Restart picks it up once the old process is gone.
+            eprintln!(
+                "rhapsody-desktop: not rebuilding the daemon: stopping the previous instance failed (a second instance would race the first)"
+            );
+            return Err("the credential change was applied, but the daemon could not be restarted to pick it up — click Restart (or quit and relaunch)".to_string());
+        }
+        self.set_sup(self.make_supervisor());
+        if was_active && !self.inner.binary_path.as_os_str().is_empty() {
+            self.ensure_started();
+        }
+        Ok(())
+    }
+
+    /// Revokes the stored token: deletes from BOTH backends (so a token can never be orphaned after a
+    /// prior file fallback), resets to the Keychain backend, then rebuilds/restarts the daemon so the
+    /// live process drops the now-revoked `$LINEAR_API_KEY`. Mirrors `ClearLinearToken`.
+    pub async fn clear_linear_token(&self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        let file: Arc<dyn credential::Store> =
+            Arc::new(credential::new_file(&self.inner.cred_path));
+        for store in [self.inner.keychain.clone(), file] {
+            if let Err(e) = store.delete()
+                && first_err.is_none()
+            {
+                first_err = Some(e.to_string());
+            }
+        }
+        // Reset to the default (Keychain) backend so a subsequent Set goes back through the Keychain.
+        lock(&self.inner.mu).cred = Some(self.inner.keychain.clone());
+        // A delete error is the more important signal, so only surface the restart-failure notice when
+        // the revoke itself succeeded.
+        if let Err(e) = self.apply_credential_change().await
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Reports whether the deferred "Connect Linear" OAuth flow can run (a client_id is configured).
+    /// Always false in v1. Mirrors `LinearOAuthAvailable`.
+    pub fn linear_oauth_available(&self) -> bool {
+        linearoauth::configured(&std::env::var("SYMPHONY_LINEAR_CLIENT_ID").unwrap_or_default())
+    }
+
+    /// The "Connect Linear" button's action. The flow is scaffolded but its token exchange is deferred,
+    /// so this returns a clear, non-fatal message instead of running it. Mirrors `StartLinearOAuth`.
+    pub fn start_linear_oauth(&self) -> Result<(), String> {
+        if !self.linear_oauth_available() {
+            return Err("connect Linear isn't available yet: no client_id is configured — paste a Linear API token instead".to_string());
+        }
+        Err("the Linear OAuth flow is scaffolded but not yet enabled in this build".to_string())
+    }
+
+    /// Lists the workspace's Linear projects for the onboarding picker, using the token the wizard just
+    /// saved. Queries Linear directly (the daemon + its config do not exist yet). Mirrors
+    /// `ListLinearProjects`.
+    pub async fn list_linear_projects(&self) -> Result<Vec<linearprojects::Project>, String> {
+        let token = self.linear_token();
+        if token.is_empty() {
+            return Err("no Linear token saved — go back and re-enter your API key".to_string());
+        }
+        linearprojects::list(&token)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    // ---- tool doctor ------------------------------------------------------------------------------
+
+    /// Runs the Tool-doctor preflight: detect/version/health for claude, gh, gt, git across the
+    /// known-good dirs plus any per-tool overrides, searched in the daemon's agent-launch PATH order (so
+    /// the doctor health-checks the same binary the daemon will resolve). Mirrors `ProbeTools`.
+    pub async fn probe_tools(&self) -> Vec<toolcheck::ToolResult> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let overrides = self.snapshot_overrides();
+        let search_dirs = agent_tool_dirs(&home, &overrides);
+        let prober = toolcheck::Prober {
+            search_dirs,
+            overrides,
+            timeout: Duration::ZERO,
+        };
+        prober.probe(&toolcheck::default_tools()).await
+    }
+
+    /// Records an explicit path for a tool and persists it; the new path's directory reaches the
+    /// daemon's agent-launch PATH on the next daemon restart. An empty path clears the override. Mirrors
+    /// `SetToolOverride`.
+    pub fn set_tool_override(&self, name: &str, path: &str) -> Result<(), String> {
+        if !path.is_empty() && !is_executable_file(Path::new(path)) {
+            return Err(format!("{path:?} is not an executable file"));
+        }
+        // Serialize the whole read-merge-swap-persist so two overlapping saves can't each start from the
+        // same stale snapshot and drop one another's override (a lost update).
+        let _save_guard = lock(&self.inner.save_mu);
+        // Swap the in-memory overrides FIRST (the source of truth for the daemon's agent PATH), then
+        // persist; on a failed write we revert so an unpersisted override is not left applied.
+        let (prev, next) = {
+            let mut m = lock(&self.inner.mu);
+            let prev = m.overrides.clone();
+            let mut next = prev.clone();
+            if path.is_empty() {
+                next.remove(name);
+            } else {
+                next.insert(name.to_string(), path.to_string());
+            }
+            m.overrides = next.clone();
+            (prev, next)
+        };
+        if let Some(prefs_path) = &self.inner.prefs_path
+            && let Err(e) = prefs::save_tool_overrides(prefs_path, &next)
+        {
+            lock(&self.inner.mu).overrides = prev;
+            return Err(e.to_string());
+        }
+        Ok(())
+    }
+
+    // ---- onboarding (config write-back) -----------------------------------------------------------
+
+    /// The onboarding wizard's final step: write a minimal valid WORKFLOW.md for the chosen Linear
+    /// project, then (re)build the supervisor and start the daemon. Refuses to overwrite an existing
+    /// config (race-free via an exclusive create) so it can never clobber Settings edits, and verifies
+    /// the sidecar BEFORE writing so a failure leaves `configured()` false. Mirrors `WriteInitialConfig`.
+    pub async fn write_initial_config(&self, project_slug: &str) -> Result<(), String> {
+        let workflow_path = match &self.inner.workflow_path {
+            Some(p) => p.clone(),
+            None => return Err("no workflow path resolved".to_string()),
+        };
+        if self.configured() {
+            return Err(
+                "already configured: edit the config in Settings instead of re-running onboarding"
+                    .to_string(),
+            );
+        }
+        // Verify the sidecar BEFORE writing anything: if rhapsodyd can't be located, fail without
+        // writing WORKFLOW.md so `configured()` stays false and the wizard stays mounted with this error.
+        if self.inner.binary_path.as_os_str().is_empty() {
+            return Err("the rhapsodyd sidecar could not be located; reinstall the app (it ships in Contents/Resources)".to_string());
+        }
+        let data = onboarding::render_initial_workflow(project_slug).map_err(|e| e.to_string())?;
+        if let Some(parent) = workflow_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        // Create EXCLUSIVELY (O_CREATE|O_EXCL): the configured() check above is advisory, so the
+        // exclusive open makes "refuse to overwrite an existing WORKFLOW.md" race-free.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&workflow_path)
+            .map_err(|e| format!("create {}: {e}", workflow_path.display()))?;
+        if let Err(e) = file.write_all(&data) {
+            // Remove the partial file so a later attempt is not blocked by the "already configured" guard.
+            drop(file);
+            let _ = std::fs::remove_file(&workflow_path);
+            return Err(e.to_string());
+        }
+        drop(file);
+        // Stop any prior supervisor before replacing it, so an already-running daemon is not orphaned.
+        if let Some(old) = self.get_sup()
+            && tokio::time::timeout(Duration::from_secs(10), old.stop())
+                .await
+                .is_err()
+        {
+            eprintln!(
+                "rhapsody-desktop: config written but not starting the daemon: stopping the previous instance failed (a second instance would race the first)"
+            );
+            return Err("config saved, but the previous daemon could not be stopped to start the new one — quit and relaunch (or Restart)".to_string());
+        }
+        // Now configured — (re)build the supervisor with the current credential and start it.
+        self.set_sup(self.make_supervisor());
+        self.ensure_started();
+        Ok(())
+    }
 }
 
 /// Resolves the WORKFLOW.md the app supervises: a `SYMPHONY_WORKFLOW` override (dev), else
@@ -562,12 +953,93 @@ fn path_is_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The `$LINEAR_API_KEY` dev-env value, or `None` when unset/empty (Go's `os.Getenv` returning "").
+fn env_linear_api_key() -> Option<String> {
+    std::env::var("LINEAR_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// Where the app stores local prefs (tool overrides): `~/.symphony/tools.json`, or `None` when `$HOME`
+/// is unset. Mirrors Go `resolvePrefsPath`.
+fn resolve_prefs_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| Path::new(&h).join(".symphony").join("tools.json"))
+}
+
+/// The 0600 credential file fallback: `~/.symphony/credentials`, or `$TMPDIR/symphony-credentials` when
+/// `$HOME` is unset (so there is always a usable path). Mirrors Go `resolveCredentialPath`.
+fn resolve_credential_path() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => Path::new(&h).join(".symphony").join("credentials"),
+        _ => std::env::temp_dir().join("symphony-credentials"),
+    }
+}
+
+/// Picks the credential backend at startup: the Keychain by default, but the 0600 file fallback at
+/// `cred_path` when the Keychain holds no token yet a previously-written fallback file does — so a token
+/// saved via the fallback on an unsigned machine survives a relaunch (design §5). A READ error (Keychain
+/// locked, or an unreadable fallback file) is NOT "no token": it keeps that backend rather than masking
+/// a possibly-current credential with a stale/absent one. Mirrors `resolveCredentialStore`.
+fn resolve_credential_store(
+    keychain: Arc<dyn credential::Store>,
+    cred_path: &Path,
+) -> Arc<dyn credential::Store> {
+    match keychain.get() {
+        Err(e) => {
+            eprintln!(
+                "rhapsody-desktop: reading Linear token from Keychain failed; keeping the Keychain store (not masking it with the file fallback): {e}"
+            );
+            keychain
+        }
+        Ok(t) if !t.is_empty() => keychain,
+        Ok(_) => {
+            // Keychain is definitively empty: a token saved to the file fallback (a Keychain write
+            // rejected on an unsigned machine) must survive the relaunch (design §5).
+            let file: Arc<dyn credential::Store> = Arc::new(credential::new_file(cred_path));
+            match file.get() {
+                Err(e) => {
+                    eprintln!(
+                        "rhapsody-desktop: reading the Linear token file fallback failed; keeping the file store (not falling back to $LINEAR_API_KEY): {e}"
+                    );
+                    file
+                }
+                Ok(ft) if !ft.is_empty() => file,
+                Ok(_) => keychain,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::Store;
+    use crate::credential::mock::{MockKeyring, keychain as mock_keychain};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_app() -> App {
         App::new(None, PathBuf::new())
+    }
+
+    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("rhapsody-d4-app-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        p
+    }
+
+    /// An App wired with an in-memory keychain (the Rust analog of `keyring.MockInit`) and a temp
+    /// credential file path, for the credential/onboarding tests. `binary_path` is empty so no daemon is
+    /// ever launched. Returns the App and a handle to the keychain store so tests can inspect it.
+    fn cred_app(backend: Arc<MockKeyring>, cred_path: PathBuf) -> (App, Arc<dyn Store>) {
+        let keychain: Arc<dyn Store> = Arc::new(mock_keychain(backend));
+        let app = App::new_with(None, PathBuf::new(), None, cred_path, keychain.clone());
+        (app, keychain)
     }
 
     #[cfg(test)]
@@ -575,6 +1047,11 @@ mod tests {
         /// Test hook: simulate a background Start in flight for `s` (Go tests set `a.startingSup`).
         fn set_starting_sup_for_test(&self, s: Option<Supervisor>) {
             lock(&self.inner.mu).starting_sup = s;
+        }
+
+        /// Test hook: set the active credential store directly (Go tests build `&App{cred: ...}`).
+        fn set_cred_for_test(&self, cred: Arc<dyn Store>) {
+            lock(&self.inner.mu).cred = Some(cred);
         }
     }
 
@@ -767,6 +1244,248 @@ mod tests {
             "App::configured is false when the workflow file is missing"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- D4: credential resolution ----------------------------------------------------------------
+
+    // Mirrors TestResolveCredentialStorePrefersFileFallback: with an empty Keychain and a token in the
+    // file fallback, resolve_credential_store selects the file store and the token is visible.
+    #[test]
+    fn resolve_credential_store_prefers_file_fallback() {
+        let dir = temp_dir();
+        let file_path = dir.join("credentials");
+
+        // Nothing stored anywhere -> default (Keychain) store, no token.
+        let kc: Arc<dyn Store> = Arc::new(mock_keychain(MockKeyring::empty()));
+        assert_eq!(
+            resolve_credential_store(kc, &file_path).backend(),
+            "keychain",
+            "want keychain when nothing is stored"
+        );
+
+        // A token saved to the file fallback (Keychain still empty) must be picked up next launch.
+        credential::new_file(&file_path)
+            .set("lin_api_fromfile")
+            .expect("seed file fallback");
+        let kc: Arc<dyn Store> = Arc::new(mock_keychain(MockKeyring::empty()));
+        let store = resolve_credential_store(kc, &file_path);
+        assert_eq!(
+            store.backend(),
+            "file",
+            "the fallback should win when the Keychain is empty"
+        );
+        assert_eq!(store.get().expect("get"), "lin_api_fromfile");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mirrors TestResolveCredentialStoreKeepsKeychainOnReadError: a Keychain READ error keeps the
+    // Keychain store and must NOT promote a possibly-stale file token.
+    #[test]
+    fn resolve_credential_store_keeps_keychain_on_read_error() {
+        let dir = temp_dir();
+        let file_path = dir.join("credentials");
+        credential::new_file(&file_path)
+            .set("lin_api_stale_file")
+            .expect("seed stale file token");
+        let kc: Arc<dyn Store> = Arc::new(mock_keychain(MockKeyring::erroring("keychain locked")));
+        assert_eq!(
+            resolve_credential_store(kc, &file_path).backend(),
+            "keychain",
+            "a Keychain read error must keep the Keychain backend, not select the stale file token"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mirrors TestResolveCredentialStoreKeepsFileOnReadError: an empty Keychain but an existing-yet-
+    // unreadable file fallback (a directory path) keeps the file store so the failure surfaces.
+    #[test]
+    fn resolve_credential_store_keeps_file_on_read_error() {
+        let unreadable = temp_dir(); // a directory makes File.get's read fail with a non-NotFound error
+        let kc: Arc<dyn Store> = Arc::new(mock_keychain(MockKeyring::empty()));
+        assert_eq!(
+            resolve_credential_store(kc, &unreadable).backend(),
+            "file",
+            "must keep the file store when the fallback exists but is unreadable (not mask it with env)"
+        );
+        std::fs::remove_dir_all(&unreadable).ok();
+    }
+
+    // Mirrors TestSetLinearTokenClearsOtherBackend: a token saved to the Keychain must clear a
+    // previously-saved file-fallback token so it can't resurface / outlive the new token.
+    #[tokio::test]
+    async fn set_linear_token_clears_other_backend() {
+        let dir = temp_dir();
+        let cred_path = dir.join("credentials");
+        // Seed a stale token in the file fallback.
+        credential::new_file(&cred_path)
+            .set("lin_api_stale_file")
+            .expect("seed stale file token");
+
+        let (app, keychain) = cred_app(MockKeyring::empty(), cred_path.clone());
+        app.set_linear_token("lin_api_new")
+            .await
+            .expect("set_linear_token");
+
+        // The active backend is the Keychain and holds the new token.
+        assert_eq!(keychain.get().expect("keychain get"), "lin_api_new");
+        // The file fallback must have been cleared (no stale token lingering).
+        assert_eq!(
+            credential::new_file(&cred_path).get().expect("file get"),
+            "",
+            "the file fallback must be cleared after a successful Keychain write"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mirrors TestLinearTokenNoEnvFallbackOnReadError: a Keychain READ error must NOT silently fall back
+    // to $LINEAR_API_KEY — linear_token returns "" so the missing credential is visible rather than wrong.
+    #[test]
+    fn linear_token_no_env_fallback_on_read_error() {
+        let (app, _kc) = cred_app(MockKeyring::empty(), PathBuf::new());
+        app.set_cred_for_test(Arc::new(mock_keychain(MockKeyring::erroring(
+            "keychain locked",
+        ))));
+        assert_eq!(
+            app.linear_token_with_env("lin_api_env_should_not_be_used"),
+            "",
+            "a read error must not be masked by the env var"
+        );
+    }
+
+    // Mirrors TestCredentialStatusReadErrorDoesNotPromoteEnv: CredentialStatus must agree with
+    // linear_token on a read error — it must NOT report a token sourced from $LINEAR_API_KEY.
+    #[test]
+    fn credential_status_read_error_does_not_promote_env() {
+        let (app, _kc) = cred_app(MockKeyring::empty(), PathBuf::new());
+        app.set_cred_for_test(Arc::new(mock_keychain(MockKeyring::erroring(
+            "keychain locked",
+        ))));
+        assert!(
+            !app.credential_status_with("lin_api_env", false).has_token,
+            "CredentialStatus.has_token must be false on a read error (env must not be promoted)"
+        );
+    }
+
+    // Additive (Go tests the env promotion implicitly): with no stored credential, CredentialStatus
+    // reports the dev env var labelled "env" so the UI hides the no-op Keychain "Remove".
+    #[test]
+    fn credential_status_reports_env_when_nothing_stored() {
+        let (app, _kc) = cred_app(MockKeyring::empty(), PathBuf::new());
+        app.set_cred_for_test(Arc::new(mock_keychain(MockKeyring::empty())));
+        let dto = app.credential_status_with("lin_api_env", false);
+        assert!(
+            dto.has_token,
+            "an env token should be reported when nothing is stored"
+        );
+        assert_eq!(
+            dto.backend, "env",
+            "the dev env var backend is labelled env"
+        );
+    }
+
+    // ---- D4: tool overrides -----------------------------------------------------------------------
+
+    // Additive: set_tool_override rejects a non-executable path, persists an executable one to prefs and
+    // the in-memory map, and clears an override when given an empty path.
+    #[test]
+    fn set_tool_override_validates_persists_and_clears() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let prefs_path = dir.join("tools.json");
+        let exe = dir.join("claude");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write stub");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let exe_str = exe.to_string_lossy().into_owned();
+
+        let app = App::new_with(
+            None,
+            PathBuf::new(),
+            Some(prefs_path.clone()),
+            PathBuf::new(),
+            Arc::new(mock_keychain(MockKeyring::empty())),
+        );
+
+        // A non-executable path is rejected and nothing is persisted.
+        assert!(
+            app.set_tool_override("claude", dir.join("nope").to_str().unwrap())
+                .is_err(),
+            "a non-executable override path must be rejected"
+        );
+
+        // An executable override persists to the in-memory map and to tools.json.
+        app.set_tool_override("claude", &exe_str)
+            .expect("set override");
+        assert_eq!(app.snapshot_overrides().get("claude"), Some(&exe_str));
+        let persisted = prefs::load_tool_overrides(&prefs_path).expect("load prefs");
+        assert_eq!(
+            persisted.get("claude"),
+            Some(&exe_str),
+            "override must be persisted to prefs"
+        );
+
+        // An empty path clears the override.
+        app.set_tool_override("claude", "").expect("clear override");
+        assert!(
+            !app.snapshot_overrides().contains_key("claude"),
+            "empty path clears the override"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- D4: onboarding config write-back ---------------------------------------------------------
+
+    // Mirrors TestWriteInitialConfigRefusesExistingFile: onboarding must never clobber an existing
+    // WORKFLOW.md (the user's config / Settings edits).
+    #[tokio::test]
+    async fn write_initial_config_refuses_existing_file() {
+        let dir = temp_dir();
+        let wf = dir.join("WORKFLOW.md");
+        std::fs::write(&wf, b"existing config").expect("seed existing config");
+
+        // A resolvable sidecar path so the refusal is the "already configured" guard, not the sidecar one.
+        let app = App::new_with(
+            Some(wf.clone()),
+            PathBuf::from("/usr/bin/true"),
+            None,
+            PathBuf::new(),
+            Arc::new(mock_keychain(MockKeyring::empty())),
+        );
+        assert!(
+            app.write_initial_config("proj").await.is_err(),
+            "write_initial_config should refuse to overwrite an existing WORKFLOW.md"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&wf).expect("read wf"),
+            "existing config",
+            "the existing config must not be clobbered"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Mirrors TestWriteInitialConfigErrorsWithoutSidecar: with no resolvable rhapsodyd, the wizard fails
+    // WITHOUT writing WORKFLOW.md — so configured() stays false and the wizard stays on screen.
+    #[tokio::test]
+    async fn write_initial_config_errors_without_sidecar() {
+        let dir = temp_dir();
+        let wf = dir.join("WORKFLOW.md");
+        let app = App::new_with(
+            Some(wf.clone()),
+            PathBuf::new(), // no sidecar
+            None,
+            PathBuf::new(),
+            Arc::new(mock_keychain(MockKeyring::empty())),
+        );
+        assert!(
+            app.write_initial_config("proj").await.is_err(),
+            "expected an error when the rhapsodyd sidecar is missing"
+        );
+        assert!(
+            !wf.exists(),
+            "WORKFLOW.md must NOT be written when the sidecar is missing (configured stays false)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
