@@ -312,6 +312,10 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         workspace_mode: eff.workspace_mode.clone(),
         stack_context: String::new(),
         pr_label: eff.pr_label.clone(),
+        // The review state a declared HANDOFF parks the ticket in (TRA-240). review_states is a
+        // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
+        // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
+        review_handoff_state: eff.review_states.iter().next().cloned(),
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -322,6 +326,7 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         deps.git_flow = rp.git_flow.clone();
         deps.workspace_mode = rp.workspace_mode.clone();
         deps.active_states = rp.active_states.clone();
+        deps.review_handoff_state = rp.review_states.iter().next().cloned(); // per-project park state (TRA-240)
         deps.repo_url = rp.repo.clone(); // Phase 3: per-issue repo URL for the worktree workspace
         deps.project_slug = rp.slug.clone(); // surfaced to hooks as SYMPHONY_PROJECT
     }
@@ -1129,11 +1134,13 @@ mod tests {
         o.ctx = Some(CancelWait::default());
         o.spawn = Some(Box::new(|_iss, _attempt, _re| {})); // no worker send — just observe the spans
 
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
         let names = Arc::new(Mutex::new(Vec::<String>::new()));
         let guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanNameLayer {
                 names: Arc::clone(&names),
             }));
+        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
         o.on_tick().await;
         if let Some(t) = o.tick_timer.take() {
             t.abort(); // on_tick re-armed the poll timer; stop it
@@ -1165,11 +1172,13 @@ mod tests {
         let (mut o, _s) = new_loop_orch(tr, Duration::from_secs(3600));
         o.ctx = Some(CancelWait::default());
         o.spawn = Some(Box::new(|_iss, _attempt, _re| {}));
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
         let names = Arc::new(Mutex::new(Vec::<String>::new()));
         let guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanNameLayer {
                 names: Arc::clone(&names),
             }));
+        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
         o.on_tick().await;
         if let Some(t) = o.tick_timer.take() {
             t.abort();

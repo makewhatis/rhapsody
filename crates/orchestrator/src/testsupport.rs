@@ -616,15 +616,28 @@ impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RecordingLaye
     }
 }
 
+/// Serializes every test that installs a `tracing` subscriber and asserts on captured events
+/// (TRA-243). `tracing` caches per-callsite Interest GLOBALLY, so two such tests running on parallel
+/// harness threads can poison each other's cache and intermittently drop events. Async tests hold
+/// this across their whole body (`lock().await`); the sync [`capture_events`] holds it via
+/// `blocking_lock()`. A tokio mutex (already in the tree) is used so the async holders don't trip
+/// clippy's `await_holding_lock`. Every holder calls [`tracing::callsite::rebuild_interest_cache`]
+/// under the lock so its callsites re-evaluate Interest against ITS subscriber, not a stale entry.
+pub(crate) static TRACING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Runs `f` with a recording subscriber installed as the thread-local default, returning both `f`'s
 /// result and every event it emitted, in order — the analogue of Go capturing `slog` output to a
 /// `bytes.Buffer` while keeping the call's return value.
 pub(crate) fn capture_events<R, F: FnOnce() -> R>(f: F) -> (R, Vec<CapturedEvent>) {
+    let _serial = TRACING_TEST_LOCK.blocking_lock(); // TRA-243: no concurrent subscriber test
     let events = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(RecordingLayer {
         events: Arc::clone(&events),
     });
-    let result = tracing::subscriber::with_default(subscriber, f);
+    let result = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
     let captured = events.lock().expect("event buffer lock").clone();
     (result, captured)
 }

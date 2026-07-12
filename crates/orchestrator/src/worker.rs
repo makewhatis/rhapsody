@@ -103,6 +103,13 @@ pub struct WorkerDeps {
     pub stack_context: String,
     /// The GitHub label name the post-run labeler adds to every PR in this run's stack (AIE-301).
     pub pr_label: String,
+    /// The review state a declared HANDOFF parks the ticket in (a review-state name; `None` ⇒ the
+    /// feature is off, giving Go-identical behavior). Dispatched agents cannot move Linear state
+    /// themselves — the runner injects the mcp_config with `--strict-mcp-config`, so only the
+    /// `symphony` server is present, not a Linear-write server — so on a HANDOFF the daemon parks
+    /// the ticket here on the agent's behalf and ends the turn loop. Post-parity divergence from Go
+    /// (TRA-240): Go relied on the agent/merge moving the ticket, which the review-gated flow can't.
+    pub review_handoff_state: Option<String>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -426,6 +433,35 @@ impl WorkerDeps {
             // Remember the freshest final result text; the HANDOFF: marker (if any) is on the last
             // completed turn, which is what the caller classifies against (INF-272).
             last_result = tr.result_text;
+            // Handoff auto-park (TRA-240 loop fix): when the agent declares a HANDOFF but the ticket
+            // is still active, the daemon moves it to the configured review state on the agent's
+            // behalf (dispatched agents have no Linear-write MCP) and ENDS the loop here — otherwise
+            // the ticket never leaves the active set and the loop spins fresh turns until max_turns.
+            // `None` review_handoff_state ⇒ this whole block is inert, i.e. Go-identical.
+            if let Some(state) = self.review_handoff_state.as_deref()
+                && has_handoff_marker(&last_result)
+                && self.active_states.contains(&normalize_state(&issue.state))
+                && !issue.team_id.is_empty()
+            {
+                match self
+                    .tracker
+                    .move_issue_state(&issue.id, &issue.team_id, state)
+                    .await
+                {
+                    Ok(()) => issue.state = state.to_string(),
+                    Err(e) => tracing::warn!(
+                        issue_identifier = %issue.identifier,
+                        error = %e,
+                        "handoff auto-park: could not move the ticket to the review state; \
+                         ending the run anyway (a re-dispatch will retry the park)"
+                    ),
+                }
+                // End the loop regardless of the move outcome: the agent declared it is done, so
+                // further turns are pointless. On a successful move the ticket is now non-active
+                // (caller classifies completed, no re-dispatch); on failure the run still ends
+                // cleanly instead of burning the whole turn budget.
+                return (issue.state.clone(), last_result, None);
+            }
             let ids = [issue.id.clone()];
             let refreshed = match self.tracker.fetch_issue_states_by_ids(&ids).await {
                 Ok(r) => r,
@@ -503,6 +539,7 @@ mod tests {
             workspace_mode: String::new(),
             stack_context: String::new(),
             pr_label: String::new(),
+            review_handoff_state: None,
         }
     }
 
@@ -905,6 +942,54 @@ mod tests {
         assert_eq!(last, "In Review");
     }
 
+    // TRA-240: with review_handoff_state set, a HANDOFF on a still-active ticket makes the daemon
+    // park it in the review state and END the loop on that turn — dispatched agents can't move
+    // Linear state, so without this the loop spins fresh turns until max_turns.
+    #[tokio::test]
+    async fn handoff_parks_ticket_and_ends_loop() {
+        let handoff = agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "all done\nHANDOFF: in-review".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Extra turns queued so a regression (no auto-park) would keep looping instead of stopping.
+        let ag = fake_agent(vec![handoff.clone(), handoff.clone(), handoff]);
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let r2 = Arc::clone(&refreshes);
+        let mut tr = trackerfake::Fake::new();
+        tr.states_by_ids_func = Some(Box::new(move |_ids: &[String]| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![issue("1", "MT-1", "In Progress")]) // never leaves active on its own
+        }));
+        let tr = Arc::new(tr);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, tr.clone() as Arc<dyn Tracker>, "do it", 20);
+        d.review_handoff_state = Some("in review".to_string());
+        // The dispatched issue must carry a team_id — Linear state resolution is team-scoped.
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..issue("1", "MT-1", "In Progress")
+        };
+        let (last, handed_off, err) =
+            run_agent_attempt(&d, iss, None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert!(handed_off, "handoff marker should be detected");
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            0,
+            "loop must end on the handoff turn, before any state refresh (no max_turns spin)"
+        );
+        let moves = tr.move_calls();
+        assert_eq!(moves.len(), 1, "exactly one park move");
+        assert_eq!(moves[0].issue_id, "1");
+        assert_eq!(moves[0].team_id, "team-1");
+        assert_eq!(moves[0].state_name, "in review");
+        assert_eq!(last, "in review", "returned state reflects the park");
+    }
+
     // Mirrors Go `TestWorkerReturnsLastKnownState` (still-active at max turns).
     #[tokio::test]
     async fn worker_returns_last_known_state_active_at_max() {
@@ -1169,8 +1254,10 @@ mod tests {
         let (ws, _root) = test_workspace(HookScripts::default());
         let d = make_deps(ws, ag, tr, "do it", 20);
 
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
         let (events, subscriber) = recording_subscriber();
         let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
         let (_last, _declared, err) = run_agent_attempt(
             &d,
             issue("1", "MT-1", "In Progress"),
@@ -1245,11 +1332,13 @@ mod tests {
         let (ws, _root) = test_workspace(HookScripts::default());
         let d = make_deps(ws, ag, tr, "do it", 20);
 
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
         let hits = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
         let guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanCtxLayer {
                 hits: Arc::clone(&hits),
             }));
+        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
         let _ = run_agent_attempt(
             &d,
             issue("1", "MT-1", "In Progress"),
