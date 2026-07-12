@@ -436,7 +436,13 @@ impl Inner {
         let port = lock(&self.state).port;
         let url = format!("http://127.0.0.1:{port}/healthz");
         match self.http.get(url).send().await {
-            Ok(resp) => resp.status() == reqwest::StatusCode::OK,
+            Ok(resp) => {
+                let ok = resp.status() == reqwest::StatusCode::OK;
+                // Drain the body so the pooled connection can be reused for the next poll (parity
+                // with Go's io.Copy(io.Discard, resp.Body)).
+                let _ = resp.bytes().await;
+                ok
+            }
             Err(_) => false,
         }
     }

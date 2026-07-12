@@ -120,8 +120,9 @@ async fn forward(req: ProxyRequest, client: &reqwest::Client, target: &url::Url)
 
     let mut builder = client.request(req.method.clone(), dst);
     for (name, value) in &req.headers {
-        // `Host` is set by the client from the target; forwarding the app-origin Host would misroute.
-        if name == header::HOST {
+        // Drop Host (the client sets it from the target; the app-origin Host would misroute) and the
+        // hop-by-hop / framing headers — reqwest re-derives Content-Length from the buffered body.
+        if name == header::HOST || is_hop_by_hop(name) {
             continue;
         }
         builder = builder.header(name.clone(), value.clone());
@@ -133,7 +134,15 @@ async fn forward(req: ProxyRequest, client: &reqwest::Client, target: &url::Url)
     match builder.send().await {
         Ok(resp) => {
             let status = resp.status();
-            let headers = resp.headers().clone();
+            // Copy the daemon's headers EXCEPT hop-by-hop / framing ones — the body is fully buffered
+            // below, so the serializer (D3) sets Content-Length itself. Mirrors the header set Go's
+            // `httputil.ReverseProxy` strips. `append` preserves multi-valued headers (e.g. Set-Cookie).
+            let mut headers = HeaderMap::new();
+            for (name, value) in resp.headers() {
+                if !is_hop_by_hop(name) {
+                    headers.append(name.clone(), value.clone());
+                }
+            }
             let body = resp.bytes().await.unwrap_or_default();
             ProxyResponse {
                 status,
@@ -144,6 +153,25 @@ async fn forward(req: ProxyRequest, client: &reqwest::Client, target: &url::Url)
         // Go's ReverseProxy.ErrorHandler -> 502 "daemon unavailable".
         Err(_) => ProxyResponse::text(StatusCode::BAD_GATEWAY, "daemon unavailable"),
     }
+}
+
+/// Reports whether `name` is a hop-by-hop / framing header that must not be forwarded across the
+/// proxy. The request/response body is re-buffered, so `Content-Length` / `Transfer-Encoding` are
+/// re-derived by the client and the serializer. Mirrors the set Go's `httputil.ReverseProxy` strips.
+fn is_hop_by_hop(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+    )
 }
 
 #[cfg(test)]
