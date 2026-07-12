@@ -4,19 +4,32 @@ name: release
 # merging that PR cuts a vX.Y.Z tag + GitHub Release + CHANGELOG entry. release-please-config.json and
 # .release-please-manifest.json define the flat single-package setup (path ".", `simple` release-type —
 # tag/release/CHANGELOG only, no source-file rewrites in a virtual Cargo workspace). The Makefile's
-# VERSION default consumes the resulting tag (leading `v` stripped) — see TRA-239. No signing here.
+# VERSION default consumes the resulting tag (leading `v` stripped) — see TRA-239. The `build` job
+# below (TRA-240) turns that tag into a signed + notarized Rhapsody.dmg and uploads it to the Release.
 on:
   push:
     branches: [main]
+  # Manual dry-run (RD2 acceptance): point `tag` at an existing draft/prerelease and this builds,
+  # signs, notarizes, spctl-verifies, and uploads the installer assets to that Release — no need to
+  # wait for a real release-PR merge. release-please stays a no-op on this event (it only cuts a
+  # release when a release-PR merge lands on main), so the build job keys off the `tag` input here.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag (draft/prerelease) to build, sign, notarize & upload to
+        required: true
+        type: string
 
 # release-please-action opens/updates the release PR (pull-requests) and creates the tag + GitHub
-# Release (contents). GITHUB_TOKEN with these scopes is all it needs — no PAT.
+# Release (contents). GITHUB_TOKEN with these scopes is all it needs — no PAT. The `build` job reuses
+# `contents: write` to upload assets to the Release via `gh release upload`.
 permissions:
   contents: write
   pull-requests: write
 
 # Serialize release-please so overlapping pushes to main can't race on the release PR; never cancel an
-# in-flight run — cancelling mid-tag/release is worse than waiting.
+# in-flight run — cancelling mid-tag/release is worse than waiting. Run-level, so it also serializes
+# the downstream build/upload against a second push racing to the same Release.
 concurrency:
   group: release-please
   cancel-in-progress: false
@@ -38,3 +51,107 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  # TRA-240 (P8-RD2): on a real release (release-please cut a tag this run) OR a manual workflow_dispatch
+  # dry-run against an existing draft/prerelease tag, build the desktop app, sign + notarize the dmg with
+  # the runner's Developer ID, verify Gatekeeper acceptance, and attach the installer assets to the
+  # GitHub Release. Self-hosted (davds-macbook-pro-rhapsody), matching ci.yml's `desktop` job.
+  build:
+    name: Signed dmg build & release upload
+    needs: release-please
+    # Real path: release-please created a release this run. Dry-run path: a human dispatched the
+    # workflow with a `tag` input. release-please always *runs* (never event-gated, so never skipped),
+    # which keeps `needs` satisfied and lets this be a plain condition — no always()/status gymnastics.
+    if: ${{ needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      # Check out the exact tagged commit: the release-please tag on the real path, the dispatch input
+      # on the dry-run path. Building from the tag (not branch HEAD) is what makes the uploaded binary
+      # match the published Release.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+
+      # Same toolchain ci.yml's `desktop` job uses for `make dmg`: rustup on PATH (it lives in
+      # ~/.cargo/bin, not the runner's seeded PATH), node for the two frontend bundles, and the Tauri
+      # CLI (idempotent install — the CLI persists on the self-hosted runner between runs).
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: rustup show   # installs the toolchain pinned by rust-toolchain.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: command -v cargo-tauri >/dev/null 2>&1 || cargo install tauri-cli --version "^2" --locked
+
+      # Build + sign + notarize + staple the dmg. Signing turns ON because APPLE_SIGNING_IDENTITY (the
+      # Developer ID, held as a repo VARIABLE — not a secret) and NOTARY_PROFILE are set: sign.sh signs
+      # the rhapsodyd sidecar then the app under the hardened runtime, notarize.sh submits to Apple +
+      # staples the ticket (desktop/SIGNING.md). The notary profile `rhapsody-notary` is a per-machine
+      # keychain profile that already exists on this self-hosted runner.
+      - name: Build, sign & notarize the dmg
+        env:
+          # Repo VARIABLE (not a secret): "Developer ID Application: David Johansen (6FLMY269LR)".
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          NOTARY_PROFILE: rhapsody-notary
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "::error::APPLE_SIGNING_IDENTITY repo variable is unset (expected the Developer ID Application identity)"
+            exit 1
+          fi
+          version="${TAG#v}"   # Makefile stamps VERSION verbatim; strip the tag's leading v (v0.4.0 -> 0.4.0)
+          echo "Building signed dmg for tag '$TAG' (VERSION=$version)"
+
+          # Try direct signing first. The self-hosted runner runs under a launchd session whose login
+          # keychain can be locked / its signing key not partitioned for non-interactive codesign, which
+          # surfaces as errSecInternalComponent. ONLY on that specific failure do we unlock the keychain
+          # and authorize codesign/apple-tool to use the key, then retry (least privilege: no keychain
+          # unlock unless the direct attempt actually needs it).
+          log="$(mktemp)"
+          if ! make dmg VERSION="$version" 2>&1 | tee "$log"; then
+            if grep -q errSecInternalComponent "$log"; then
+              echo "codesign hit errSecInternalComponent — unlocking the login keychain for this launchd session"
+              keychain="$HOME/Library/Keychains/login.keychain-db"
+              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+              # -k passes the keychain password so the partition-list change is non-interactive (no GUI
+              # prompt on the headless runner); -s matches signing keys.
+              security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+              make dmg VERSION="$version"
+            else
+              echo "::error::make dmg failed for a reason other than errSecInternalComponent (see log above)"
+              exit 1
+            fi
+          fi
+
+      # RD2 acceptance gate: the stapled ticket validates offline and Gatekeeper reports a notarized
+      # Developer ID. We assert on the "Notarized Developer ID" source line (the definitive signal the
+      # ticket asks for) rather than spctl's exit code, which varies by assessment type across macOS.
+      - name: Verify notarization (stapler + spctl)
+        run: |
+          set -euo pipefail
+          dmg="desktop/build/bin/Rhapsody.dmg"
+          echo "== xcrun stapler validate =="
+          xcrun stapler validate "$dmg"
+          echo "== spctl --assess --type install =="
+          spctl -a -t install -vvv "$dmg" 2>&1 | tee /tmp/spctl.out || true
+          grep -q "Notarized Developer ID" /tmp/spctl.out \
+            || { echo "::error::spctl did not report 'Notarized Developer ID' for $dmg"; exit 1; }
+
+      # Attach the installer + raw daemon + checksums to the Release. --clobber makes re-runs (e.g. a
+      # dry-run retried, or a keychain-unlock retry above) overwrite the assets instead of failing.
+      - name: Upload assets to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist
+          cp desktop/build/bin/Rhapsody.dmg dist/Rhapsody.dmg
+          cp target/release/rhapsodyd dist/rhapsodyd
+          ( cd dist && shasum -a 256 Rhapsody.dmg rhapsodyd > SHA256SUMS )
+          echo "== SHA256SUMS =="
+          cat dist/SHA256SUMS
+          gh release upload "$TAG" \
+            dist/Rhapsody.dmg dist/rhapsodyd dist/SHA256SUMS \
+            --clobber
