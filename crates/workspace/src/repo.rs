@@ -1362,7 +1362,13 @@ mod tests {
     async fn ensure_from_repo_hook_runs_unlocked() {
         let origin = init_local_origin();
         // Perl Time::HiRes (present on macOS + Linux) rather than $EPOCHREALTIME (bash >= 5 only).
-        let hook = r#"now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }; now > .hook_times; sleep 0.3; now >> .hook_times"#;
+        // The hook stamps a start time, sleeps, then stamps an end time; the two concurrent hooks'
+        // [start,end] intervals must OVERLAP to prove the mirror lock is NOT held across the hook.
+        // The sleep is the jitter tolerance: it must exceed the scheduling skew between the two
+        // spawned tasks' hook starts, or a concurrent-but-skewed pair reads as non-overlapping under
+        // load (a false failure on busy CI). 1s comfortably exceeds real task-startup skew while a
+        // SERIALIZED pair (start2 == end1) still clearly fails the overlap check. (TRA-243)
+        let hook = r#"now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }; now > .hook_times; sleep 1; now >> .hook_times"#;
         let (m, _root) = repo_test_manager(after(hook));
         let m = Arc::new(m);
 
