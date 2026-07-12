@@ -12,7 +12,8 @@ use axum::routing::any;
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::{
-    Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot, StopResult,
+    HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot,
+    StopResult,
 };
 
 use crate::handlers::{handle_healthz, handle_refresh, handle_state};
@@ -25,7 +26,7 @@ use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
-use crate::handlers_runaction::{handle_run_resume, handle_run_stop};
+use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
 use crate::web::{WebDist, serve_web};
@@ -92,6 +93,16 @@ pub trait StateProvider: Send + Sync {
     /// `move_error`) travel in the [`ResumeResult`]; only a failed control round-trip is an [`Err`]
     /// (→ 500 `resume_failed`).
     async fn resume_run(&self, run_id: i64) -> Result<ResumeResult, RunActionError>;
+
+    /// Move a live run's ticket to the configured review handoff state so it leaves the active set and
+    /// the run cleanly ends (`POST /api/v1/runs/{id}/handoff`, TRA-242 — the daemon-mediated review
+    /// handoff, NEW beyond Go v0.4.0). Business outcomes travel in the [`HandoffResult`]: no live run
+    /// (`not_running` → 409), review handoff not configured (`not_configured` → 409), or the tracker
+    /// rejected the move (`move_err` → 502 — a handoff FAILURE, not a partial success like stop/resume,
+    /// so the agent falls back to the Linear-MCP path). A clean move is 200 `{identifier, moved_to}`.
+    /// Only a failed control round-trip is an [`Err`] (→ 500 `handoff_failed`). Unlike stop it does NOT
+    /// kill the agent (it is the agent's own terminal action) — the ticket move alone winds the run down.
+    async fn handoff_run(&self, run_id: i64) -> Result<HandoffResult, RunActionError>;
 
     /// Queue an operator "btw" message for a live run's agent (`POST /api/v1/runs/{id}/message`,
     /// Go `SendRunMessage`, INF-250). The `text` is already trimmed + length-checked by the handler.
@@ -251,6 +262,9 @@ where
         // dispatches them ahead of the catch-all runs/{id} detail route regardless of order.
         .route("/api/v1/runs/{id}/stop", any(handle_run_stop))
         .route("/api/v1/runs/{id}/resume", any(handle_run_resume))
+        // Daemon-mediated review handoff (TRA-242): move a live run's ticket to the review state so it
+        // leaves the active set and the run cleanly ends. POST-only; more-specific than runs/{id}.
+        .route("/api/v1/runs/{id}/handoff", any(handle_run_handoff))
         // Operator messages (H3): POST queues a "btw" for a live run's agent; GET lists the run's
         // messages with their delivery status. More-specific than runs/{id}, so they win the match.
         .route("/api/v1/runs/{id}/message", any(handle_run_message))

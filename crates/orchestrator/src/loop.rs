@@ -46,6 +46,7 @@ use crate::dispatch::dependency_mode_enabled;
 use crate::effective::{Effective, ResolvedProject};
 use crate::ghenrich::{apply_github_summons, enrich_with_github_summons, fetch_github_summons};
 use crate::ghsummons::{self, GH, SummonHit};
+use crate::handoff::HandoffPlan;
 use crate::message::RunMessageResult;
 use crate::orchestrator::Orchestrator;
 use crate::reload::ReloadError;
@@ -257,6 +258,13 @@ pub enum Event {
         text: String,
         reply: oneshot::Sender<RunMessageResult>,
     },
+    /// Resolve a live run's issue/team + configured review state on the loop, replying with the handoff
+    /// plan (TRA-242; NEW beyond Go v0.4.0). Read-only — no kill, no suppression change; the off-loop
+    /// [`handoff_run`](ControlHandle::handoff_run) does the review-state move that winds the run down.
+    HandoffRun {
+        run_id: i64,
+        reply: oneshot::Sender<HandoffPlan>,
+    },
 }
 
 /// The default `storage.retention_days` until a reload stores the effective value (Go `New`).
@@ -465,6 +473,9 @@ impl Orchestrator {
                 reply,
             } => {
                 let _ = reply.send(self.handle_run_message(run_id, &text));
+            }
+            Event::HandoffRun { run_id, reply } => {
+                let _ = reply.send(self.handle_handoff_run(run_id));
             }
         }
     }

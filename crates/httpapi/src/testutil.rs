@@ -13,8 +13,8 @@ use rhapsody_config::workflow::Definition;
 use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
 use rhapsody_orchestrator::{
-    Identity, ReadsError, RefreshResult, ResumeResult, RetryRow, RunMessageResult, RunningRow,
-    Snapshot, StopResult, TokenCounts, Totals,
+    HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RetryRow, RunMessageResult,
+    RunningRow, Snapshot, StopResult, TokenCounts, Totals,
 };
 use rhapsody_store::Noop;
 
@@ -48,6 +48,11 @@ pub(crate) struct FakeProvider {
     resume_result: ResumeResult,
     resume_err: Option<String>,
     resume_run_id: AtomicI64,
+    /// H-lane handoff surface (TRA-242): canned result, an optional control-round-trip error (the 500
+    /// path), and the recorded run id (so a test can assert the handler parsed + forwarded the `{id}`).
+    handoff_result: HandoffResult,
+    handoff_err: Option<String>,
+    handoff_run_id: AtomicI64,
     /// H3 operator-message surface: canned result + recorded args (Go's `messageResult`/`messageRunID`
     /// /`messageText`). `message_text` records the TRIMMED text the handler forwarded.
     message_result: RunMessageResult,
@@ -77,6 +82,9 @@ impl FakeProvider {
             resume_result: ResumeResult::default(),
             resume_err: None,
             resume_run_id: AtomicI64::new(0),
+            handoff_result: HandoffResult::default(),
+            handoff_err: None,
+            handoff_run_id: AtomicI64::new(0),
             message_result: RunMessageResult::default(),
             message_run_id: AtomicI64::new(0),
             message_text: Mutex::new(String::new()),
@@ -153,6 +161,17 @@ impl FakeProvider {
         self.resume_run_id.load(Ordering::SeqCst)
     }
 
+    /// Set the canned `handoff_run` result (TRA-242).
+    pub(crate) fn with_handoff_result(mut self, result: HandoffResult) -> Self {
+        self.handoff_result = result;
+        self
+    }
+
+    /// The run id the last `handoff_run` was called with (TRA-242).
+    pub(crate) fn handoff_run_id(&self) -> i64 {
+        self.handoff_run_id.load(Ordering::SeqCst)
+    }
+
     /// Set the canned `send_run_message` result (Go's `&fakeProvider{messageResult: …}`).
     pub(crate) fn with_message_result(mut self, result: RunMessageResult) -> Self {
         self.message_result = result;
@@ -225,6 +244,14 @@ impl StateProvider for FakeProvider {
         match &self.resume_err {
             Some(message) => Err(RunActionError::new(message.clone())),
             None => Ok(self.resume_result.clone()),
+        }
+    }
+
+    async fn handoff_run(&self, run_id: i64) -> Result<HandoffResult, RunActionError> {
+        self.handoff_run_id.store(run_id, Ordering::SeqCst);
+        match &self.handoff_err {
+            Some(message) => Err(RunActionError::new(message.clone())),
+            None => Ok(self.handoff_result.clone()),
         }
     }
 

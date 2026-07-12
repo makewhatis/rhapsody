@@ -19,8 +19,8 @@ use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
 use rhapsody_orchestrator::{
-    CancelWait, ControlHandle, Identity, ReadsError, RefreshResult, ReloadError, ResumeResult,
-    RunMessageResult, Snapshot, StopResult,
+    CancelWait, ControlHandle, HandoffResult, Identity, ReadsError, RefreshResult, ReloadError,
+    ResumeResult, RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
     DayRollup, EventHit, EventQuery, EventRow, RunFilter, RunMessage, RunSummary, Store, StoreError,
@@ -125,6 +125,15 @@ impl StateProvider for DaemonState {
     async fn resume_run(&self, run_id: i64) -> Result<ResumeResult, RunActionError> {
         self.handle
             .resume_run(CancelWait::default(), run_id)
+            .await
+            .map_err(|e| RunActionError::new(e.to_string()))
+    }
+
+    async fn handoff_run(&self, run_id: i64) -> Result<HandoffResult, RunActionError> {
+        // Like stop/resume, no HTTP request-cancel is threaded (the handle's lifetime ctx bounds the
+        // reply wait); a failed control round-trip becomes the 500 `handoff_failed` error (TRA-242).
+        self.handle
+            .handoff_run(CancelWait::default(), run_id)
             .await
             .map_err(|e| RunActionError::new(e.to_string()))
     }

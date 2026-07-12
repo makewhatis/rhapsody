@@ -1041,6 +1041,54 @@ mod tests {
         }
     }
 
+    // TRA-242 e2e (fake run): after the daemon-mediated `symphony_handoff` moves the run's ticket to
+    // the configured review state, the worker's per-turn state refresh sees it leave the active set and
+    // winds the turn loop down on the FIRST turn — even with a generous `max_turns` budget (NO
+    // max_turns spin). The agent still declares HANDOFF, so the clean exit classifies `completed` (see
+    // `retry::classify_clean_exit`). The tracker returning "In Review" stands in for the persisted
+    // daemon move (the move itself is proven end-to-end in `orchestrator::handoff` + the file-tracker
+    // MoveIssueState suite; the tool/endpoint wiring in `rhapsody-mcp` / `rhapsody-httpapi`).
+    #[tokio::test]
+    async fn handoff_review_state_ends_turn_loop_first_turn_no_max_turns_spin() {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let r2 = Arc::clone(&refreshes);
+        let mut tr = trackerfake::Fake::new();
+        tr.states_by_ids_func = Some(Box::new(move |_ids: &[String]| {
+            r2.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![issue("1", "MT-1", "In Review")]) // the state symphony_handoff moved the ticket to
+        }));
+        let tr = Arc::new(tr);
+        // ONE declaring-handoff turn is enough: if the loop wrongly spun to a 2nd turn the fake agent
+        // would run out of scripted turns and the test would fail loudly.
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "wrapped up the work\nHANDOFF: in-review".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag.clone(), tr, "do it", 20); // generous budget — only the handoff ends it
+        let (last, declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected a clean exit, got {err:?}");
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            1,
+            "exactly one turn ran — the review-state handoff ended the loop on turn 1, no max_turns spin"
+        );
+        assert_eq!(ag.start_calls(), 1, "worker starts exactly one session");
+        assert_eq!(
+            last, "In Review",
+            "worker's last-known state is the review handoff state"
+        );
+        assert!(
+            declared,
+            "the agent declared HANDOFF, so the clean exit classifies completed"
+        );
+    }
+
     // Mirrors Go `TestWorkerStopsAtMaxTurns`: always active → only max_turns stops it.
     #[tokio::test]
     async fn worker_stops_at_max_turns() {

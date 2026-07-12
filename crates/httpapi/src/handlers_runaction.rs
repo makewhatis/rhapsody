@@ -169,12 +169,73 @@ pub(crate) async fn handle_run_resume(
     )
 }
 
+/// `POST /api/v1/runs/{id}/handoff` — the daemon-mediated review handoff (TRA-242, NEW beyond Go
+/// v0.4.0): move a live run's ticket to the configured review state so it leaves the active set and the
+/// run cleanly ends. Unlike stop/resume a failed move is NOT a partial success — the move IS the
+/// handoff — so `not_configured` / a `move_error` surfaces as an error status the `symphony_handoff`
+/// tool relays to the agent, which then uses the documented Linear-MCP fallback:
+///   * `not_running`     ⇒ 409 (a stale/foreign run id; the agent normally calls from its own run),
+///   * `not_configured`  ⇒ 409 (no `review_states` for the run's project — feature off),
+///   * `move_error`      ⇒ 502 (the tracker rejected the review-state move),
+///   * clean move        ⇒ 200 `{identifier, moved_to}`.
+///
+/// Only a failed control round-trip is a 500 `handoff_failed`.
+pub(crate) async fn handle_run_handoff(
+    method: Method,
+    Path(id): Path<String>,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_post(&method, "use POST to hand off a run") {
+        return resp;
+    }
+    let run_id = match parse_run_id(&id) {
+        Ok(run_id) => run_id,
+        Err(resp) => return *resp,
+    };
+    match provider.handoff_run(run_id).await {
+        Err(err) => write_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "handoff_failed",
+            err.to_string(),
+            None,
+        ),
+        Ok(res) if res.not_running => write_error(
+            StatusCode::CONFLICT,
+            "not_running",
+            "run is not currently running",
+            None,
+        ),
+        Ok(res) if res.not_configured => write_error(
+            StatusCode::CONFLICT,
+            "handoff_not_configured",
+            "no review_states configured for this run's project — move the ticket via Linear instead",
+            None,
+        ),
+        // A failed review-state move is the whole handoff failing (there was no kill to salvage, unlike
+        // stop): surface it as a 502 so the tool relays an error and the agent falls back to Linear MCP.
+        Ok(res) if !res.move_err.is_empty() => write_error(
+            StatusCode::BAD_GATEWAY,
+            "handoff_move_failed",
+            res.move_err,
+            None,
+        ),
+        Ok(res) => write_json(
+            StatusCode::OK,
+            &RunActionJson {
+                identifier: res.identifier,
+                moved_to: res.moved_to,
+                move_error: String::new(),
+            },
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use reqwest::StatusCode;
-    use rhapsody_orchestrator::{ResumeResult, StopResult};
+    use rhapsody_orchestrator::{HandoffResult, ResumeResult, StopResult};
     use serde_json::Value;
 
     use crate::new_handler;
@@ -409,5 +470,132 @@ mod tests {
             assert_eq!(resp.status(), 404, "run id {bad} must 404");
             assert_eq!(err_code(resp).await, "not_found");
         }
+    }
+
+    // --- TRA-242 handoff endpoint --------------------------------------------------------------
+
+    // A clean handoff moves the ticket to the review state and returns 200 {identifier, moved_to},
+    // with the parsed run id forwarded to the provider.
+    #[tokio::test]
+    async fn handoff_post_moves_and_returns_json() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_handoff_result(
+            HandoffResult {
+                identifier: "INF-9".into(),
+                moved_to: "In Review".into(),
+                ..Default::default()
+            },
+        ));
+        let base = spawn(provider.clone()).await;
+        let resp = do_action(
+            &format!("{base}/api/v1/runs/7/handoff"),
+            reqwest::Method::POST,
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["identifier"], "INF-9");
+        assert_eq!(body["moved_to"], "In Review");
+        assert!(
+            body.get("move_error").is_none(),
+            "move_error must be omitted on success: {body}"
+        );
+        assert_eq!(
+            provider.handoff_run_id(),
+            7,
+            "handoff_run called with the parsed run id"
+        );
+    }
+
+    // GET is 405 with Allow: POST (POST-only, like stop/resume).
+    #[tokio::test]
+    async fn handoff_get_is_405() {
+        let base = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
+        let resp = do_action(
+            &format!("{base}/api/v1/runs/7/handoff"),
+            reqwest::Method::GET,
+        )
+        .await;
+        assert_eq!(resp.status(), 405);
+        assert_eq!(
+            resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+            Some("POST")
+        );
+    }
+
+    // A not-running run ⇒ 409 not_running.
+    #[tokio::test]
+    async fn handoff_not_running_is_409() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_handoff_result(
+            HandoffResult {
+                not_running: true,
+                ..Default::default()
+            },
+        ));
+        let base = spawn(provider).await;
+        let resp = do_action(
+            &format!("{base}/api/v1/runs/7/handoff"),
+            reqwest::Method::POST,
+        )
+        .await;
+        assert_eq!(resp.status(), 409);
+        assert_eq!(err_code(resp).await, "not_running");
+    }
+
+    // No configured review_states ⇒ 409 handoff_not_configured (the agent falls back to Linear MCP).
+    #[tokio::test]
+    async fn handoff_not_configured_is_409() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_handoff_result(
+            HandoffResult {
+                not_configured: true,
+                identifier: "INF-9".into(),
+                ..Default::default()
+            },
+        ));
+        let base = spawn(provider).await;
+        let resp = do_action(
+            &format!("{base}/api/v1/runs/7/handoff"),
+            reqwest::Method::POST,
+        )
+        .await;
+        assert_eq!(resp.status(), 409);
+        assert_eq!(err_code(resp).await, "handoff_not_configured");
+    }
+
+    // A failed review-state move is NOT a partial success (unlike stop): it is a 502 handoff_move_failed
+    // so the tool relays an error and the agent falls back to the Linear-MCP path.
+    #[tokio::test]
+    async fn handoff_move_failed_is_502() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_handoff_result(
+            HandoffResult {
+                identifier: "INF-9".into(),
+                move_err: "no review state for team".into(),
+                ..Default::default()
+            },
+        ));
+        let base = spawn(provider).await;
+        let resp = do_action(
+            &format!("{base}/api/v1/runs/7/handoff"),
+            reqwest::Method::POST,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            502,
+            "a failed handoff move is an error, not a partial success"
+        );
+        assert_eq!(err_code(resp).await, "handoff_move_failed");
+    }
+
+    // A bad/zero run id is a 404 (the shared `parseRunID`, exercised on the handoff path too).
+    #[tokio::test]
+    async fn handoff_bad_id_is_404() {
+        let base = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
+        let resp = do_action(
+            &format!("{base}/api/v1/runs/0/handoff"),
+            reqwest::Method::POST,
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        assert_eq!(err_code(resp).await, "not_found");
     }
 }

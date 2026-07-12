@@ -74,6 +74,11 @@ impl Facade {
         if !cfg.mcp.allow_resume {
             tool_router.remove_route("symphony_resume");
         }
+        // symphony_handoff (TRA-242): ON by default, so removed only on an explicit opt-out — the
+        // mirror of the send-message gate, not the stop/resume opt-in gate.
+        if !cfg.mcp.allow_handoff {
+            tool_router.remove_route("symphony_handoff");
+        }
         Self {
             client,
             opts,

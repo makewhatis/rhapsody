@@ -213,13 +213,19 @@ pub struct Otel {
 }
 
 /// `symphony mcp` local-facade config (Go `MCP`, INF-473). Plain bools — the presence-pointer
-/// defaults (inject + send_message ON, stop/resume OFF) are materialized in Decode.
+/// defaults (inject + send_message + handoff ON, stop/resume OFF) are materialized in Decode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mcp {
     pub enabled: bool,
     pub allow_send_message: bool,
     pub allow_stop: bool,
     pub allow_resume: bool,
+    /// Registers the `symphony_handoff` write tool (default ON). Rhapsody-only knob, NEW beyond Go
+    /// v0.4.0 (TRA-242): the daemon-mediated review handoff that moves the run's ticket to the review
+    /// state and cleanly ends the run. It gates the tool's presence in `symphony mcp` (invisible when
+    /// off) but is deliberately NOT surfaced in the `GET /api/v1/config` view / config round-trip, so
+    /// the config goldens stay byte-identical to Go v0.4.0 (a documented divergence).
+    pub allow_handoff: bool,
 }
 
 /// The subset of Claude knobs a project may override (Go `ClaudeOverride`). Every field is
@@ -477,6 +483,9 @@ pub(crate) struct RawMcp {
     pub allow_send_message: Option<bool>,
     pub allow_stop: Option<bool>,
     pub allow_resume: Option<bool>,
+    /// `symphony_handoff` toggle (TRA-242, default ON). `Option<bool>` so `decode` tells an explicit
+    /// opt-out from unset; NEW beyond Go v0.4.0 (no yaml tag on the Go raw struct — Rhapsody-only).
+    pub allow_handoff: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

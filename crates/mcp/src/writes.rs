@@ -8,6 +8,10 @@
 //!
 //!   - `symphony_send_message`: ON by default (`cfg.mcp.allow_send_message`) — the INF-250 mailbox.
 //!   - `symphony_stop` / `symphony_resume`: OFF by default (`cfg.mcp.allow_stop` / `allow_resume`).
+//!   - `symphony_handoff`: ON by default (`cfg.mcp.allow_handoff`) — the TRA-242 daemon-mediated review
+//!     handoff (a NEW capability beyond Go v0.4.0; the Go facade has no analog). It proxies the daemon's
+//!     `POST /api/v1/runs/{id}/handoff`, so it reuses the shared `run_action` result-shaping exactly
+//!     like stop/resume.
 
 use crate::client::FacadeError;
 use crate::server::{Facade, RunArgs, err_result, or_default, text_result};
@@ -76,6 +80,18 @@ impl Facade {
         )
         .await
     }
+
+    #[tool(
+        name = "symphony_handoff",
+        description = "Hand a completed run off for review: the daemon moves THIS run's ticket to the configured review state (leaving the active set), which cleanly ends the run — one confident terminal action, no Linear-write access needed (TRA-242). Proxies POST /api/v1/runs/{id}/handoff. Defaults run_id to SYMPHONY_RUN_ID. An error result (e.g. handoff_not_configured when no review states are set, or handoff_move_failed) means fall back to moving the ticket via your Linear MCP."
+    )]
+    async fn symphony_handoff(&self, Parameters(args): Parameters<RunArgs>) -> CallToolResult {
+        self.run_action(
+            "handoff",
+            or_default(&args.run_id, &self.opts.default_run_id),
+        )
+        .await
+    }
 }
 
 impl Facade {
@@ -113,13 +129,14 @@ mod tests {
     use rmcp::service::RunningService;
     use std::sync::{Arc, Mutex};
 
-    /// Go's `cfgWith`: a config with the three MCP write toggles set explicitly (the rest carry
-    /// `decode`'s defaults — irrelevant to gating).
-    fn cfg_with(send_message: bool, stop: bool, resume: bool) -> Config {
+    /// Go's `cfgWith`: a config with the MCP write toggles set explicitly (the rest carry `decode`'s
+    /// defaults — irrelevant to gating). `handoff` is the TRA-242 `allow_handoff` gate.
+    fn cfg_with(send_message: bool, stop: bool, resume: bool, handoff: bool) -> Config {
         let mut c = test_config();
         c.mcp.allow_send_message = send_message;
         c.mcp.allow_stop = stop;
         c.mcp.allow_resume = resume;
+        c.mcp.allow_handoff = handoff;
         c
     }
 
@@ -165,14 +182,19 @@ mod tests {
     }
 
     // A disabled write tool is NOT registered (invisible), and an enabled one IS
-    // (TestWriteToolsGatedByConfig).
+    // (TestWriteToolsGatedByConfig + the TRA-242 handoff gate).
     #[tokio::test]
     async fn write_tools_gated_by_config() {
-        let write_tools = ["symphony_send_message", "symphony_stop", "symphony_resume"];
+        let write_tools = [
+            "symphony_send_message",
+            "symphony_stop",
+            "symphony_resume",
+            "symphony_handoff",
+        ];
 
         // All off: no write tools at all.
         let names = tool_names(Facade::new(
-            &cfg_with(false, false, false),
+            &cfg_with(false, false, false, false),
             Client::for_port(0),
             Options::default(),
         ))
@@ -184,9 +206,9 @@ mod tests {
             );
         }
 
-        // Defaults (send-message on, stop/resume off).
+        // Defaults (send-message + handoff on, stop/resume off).
         let names = tool_names(Facade::new(
-            &cfg_with(true, false, false),
+            &cfg_with(true, false, false, true),
             Client::for_port(0),
             Options::default(),
         ))
@@ -196,6 +218,10 @@ mod tests {
             "symphony_send_message must be present when allow_send_message: {names:?}"
         );
         assert!(
+            names.contains(&"symphony_handoff".to_string()),
+            "symphony_handoff must be present by default (allow_handoff on): {names:?}"
+        );
+        assert!(
             !names.contains(&"symphony_stop".to_string())
                 && !names.contains(&"symphony_resume".to_string()),
             "stop/resume must be absent by default: {names:?}"
@@ -203,7 +229,7 @@ mod tests {
 
         // All on.
         let names = tool_names(Facade::new(
-            &cfg_with(true, true, true),
+            &cfg_with(true, true, true, true),
             Client::for_port(0),
             Options::default(),
         ))
@@ -238,7 +264,7 @@ mod tests {
 
         // DefaultRunID stands in for the worker's SYMPHONY_RUN_ID; no explicit run_id is passed.
         let facade = Facade::new(
-            &cfg_with(true, false, false),
+            &cfg_with(true, false, false, false),
             Client::for_port(port as i64),
             Options {
                 default_run_id: "7".into(),
@@ -286,7 +312,7 @@ mod tests {
         let port = spawn_router(router).await;
 
         let facade = Facade::new(
-            &cfg_with(true, false, false),
+            &cfg_with(true, false, false, false),
             Client::for_port(port as i64),
             Options {
                 default_run_id: "7".into(),
@@ -333,7 +359,7 @@ mod tests {
         let port = spawn_router(router).await;
 
         let facade = Facade::new(
-            &cfg_with(false, true, false),
+            &cfg_with(false, true, false, false),
             Client::for_port(port as i64),
             Options::default(),
         );
@@ -357,6 +383,91 @@ mod tests {
         let (path, method) = captured.lock().unwrap().clone();
         assert_eq!(path, "/api/v1/runs/42/stop");
         assert_eq!(method, "POST");
+        let _ = client.cancel().await;
+    }
+
+    // symphony_handoff proxies POST /runs/{id}/handoff and defaults the run id from SYMPHONY_RUN_ID
+    // (TRA-242). Reuses the shared run_action, exactly like symphony_stop.
+    #[tokio::test]
+    async fn handoff_proxies() {
+        let captured: Arc<Mutex<(String, String)>> =
+            Arc::new(Mutex::new((String::new(), String::new())));
+        let sink = captured.clone();
+        let router = Router::new().fallback(any(
+            move |method: axum::http::Method, uri: axum::http::Uri| {
+                let sink = sink.clone();
+                async move {
+                    *sink.lock().unwrap() = (uri.path().to_string(), method.to_string());
+                    (
+                        [("Content-Type", "application/json")],
+                        r#"{"identifier":"INF-1","moved_to":"In Review"}"#,
+                    )
+                }
+            },
+        ));
+        let port = spawn_router(router).await;
+
+        // DefaultRunID stands in for the worker's SYMPHONY_RUN_ID; no explicit run_id is passed.
+        let facade = Facade::new(
+            &cfg_with(false, false, false, true),
+            Client::for_port(port as i64),
+            Options {
+                default_run_id: "7".into(),
+                ..Default::default()
+            },
+        );
+        let client = connect(facade).await;
+
+        let res = client
+            .call_tool(call("symphony_handoff"))
+            .await
+            .expect("call");
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "unexpected error: {}",
+            result_text(&res)
+        );
+
+        let (path, method) = captured.lock().unwrap().clone();
+        assert_eq!(path, "/api/v1/runs/7/handoff");
+        assert_eq!(method, "POST");
+        let _ = client.cancel().await;
+    }
+
+    // A handoff error (e.g. handoff_not_configured) surfaces as an IsError result carrying the daemon's
+    // envelope code, so the agent knows to fall back to the Linear-MCP path (TRA-242).
+    #[tokio::test]
+    async fn handoff_error_surfaces_error() {
+        let router = Router::new().fallback(any(|| async {
+            (
+                axum::http::StatusCode::CONFLICT,
+                [("Content-Type", "application/json")],
+                r#"{"error":{"code":"handoff_not_configured","message":"no review_states configured"}}"#,
+            )
+        }));
+        let port = spawn_router(router).await;
+
+        let facade = Facade::new(
+            &cfg_with(false, false, false, true),
+            Client::for_port(port as i64),
+            Options {
+                default_run_id: "7".into(),
+                ..Default::default()
+            },
+        );
+        let client = connect(facade).await;
+
+        let res = client
+            .call_tool(call("symphony_handoff"))
+            .await
+            .expect("call");
+        assert_eq!(res.is_error, Some(true), "want IsError result");
+        assert!(
+            result_text(&res).contains("handoff_not_configured"),
+            "want handoff_not_configured in text = {:?}",
+            result_text(&res)
+        );
         let _ = client.cancel().await;
     }
 }

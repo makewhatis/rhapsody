@@ -184,12 +184,14 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         operator: r.otel.operator,
     };
 
-    // mcp — default-ON injection + send_message (opt-outs); stop/resume opt-in (default OFF).
+    // mcp — default-ON injection + send_message + handoff (opt-outs); stop/resume opt-in (default OFF).
+    // allow_handoff (TRA-242) gates the daemon-mediated review handoff tool; NEW beyond Go v0.4.0.
     let mcp = Mcp {
         enabled: or_bool(r.mcp.enabled, true),
         allow_send_message: or_bool(r.mcp.allow_send_message, true),
         allow_stop: or_bool(r.mcp.allow_stop, false),
         allow_resume: or_bool(r.mcp.allow_resume, false),
+        allow_handoff: or_bool(r.mcp.allow_handoff, true),
     };
 
     // multi-project routing — overrides mapped verbatim (nil preserved) so ResolveProjects can
@@ -927,13 +929,18 @@ mod tests {
             !c.mcp.allow_resume,
             "mcp.allow_resume default should be false"
         );
+        // TRA-242: allow_handoff is a Rhapsody-only knob (NEW beyond Go v0.4.0), default ON.
+        assert!(
+            c.mcp.allow_handoff,
+            "mcp.allow_handoff default should be true"
+        );
     }
 
-    // Mirrors Go `TestMCPExplicitRespected`.
+    // Mirrors Go `TestMCPExplicitRespected` (+ the Rhapsody-only allow_handoff opt-out, TRA-242).
     #[test]
     fn mcp_explicit_respected() {
         let front = base_tracker_mcp()
-            + "mcp:\n  enabled: false\n  allow_send_message: false\n  allow_stop: true\n  allow_resume: true\n";
+            + "mcp:\n  enabled: false\n  allow_send_message: false\n  allow_stop: true\n  allow_resume: true\n  allow_handoff: false\n";
         let c = decode_yaml(&front, "body {{ issue.identifier }}");
         assert!(
             !c.mcp.enabled,
@@ -947,6 +954,10 @@ mod tests {
         assert!(
             c.mcp.allow_resume,
             "explicit allow_resume:true not respected"
+        );
+        assert!(
+            !c.mcp.allow_handoff,
+            "explicit allow_handoff:false was re-defaulted"
         );
     }
 
