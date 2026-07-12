@@ -1151,10 +1151,27 @@ mod tests {
             tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanNameLayer {
                 names: Arc::clone(&names),
             }));
-        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
+        // TRA-243: the control-loop span callsites (`symphony.poll` / `symphony.fetch_candidates`) are
+        // shared with other tests that drive `on_tick` WITHOUT installing a subscriber. In tracing-core
+        // a callsite's Interest is cached ONCE, computed from whichever thread first *registers* it
+        // (`callsite::register` → `rebuild_callsite_interest`; with no global default set, that uses the
+        // registering thread's default subscriber). If a parallel no-subscriber test registers the
+        // callsite first it caches `Interest::never`, and this recording subscriber is then never
+        // consulted → the capture comes back empty (the flake). `rebuild_interest_cache` only recomputes
+        // callsites that are ALREADY registered, so a lone pre-run rebuild can't rescue a not-yet-hit
+        // callsite. Fix: run one throwaway warm-up tick to force these callsites to register, THEN
+        // rebuild against THIS thread's subscriber (→ enabled), THEN capture a clean tick. The held lock
+        // keeps any other subscriber test from rebuilding concurrently, so the pin is stable.
         o.on_tick().await;
         if let Some(t) = o.tick_timer.take() {
-            t.abort(); // on_tick re-armed the poll timer; stop it
+            t.abort(); // warm-up re-armed the poll timer; stop it
+        }
+        tracing::callsite::rebuild_interest_cache();
+        names.lock().expect("span names lock").clear();
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort(); // captured tick re-armed the poll timer; stop it
         }
         drop(guard);
 
@@ -1189,7 +1206,15 @@ mod tests {
             tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanNameLayer {
                 names: Arc::clone(&names),
             }));
-        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
+        // TRA-243: warm up to force callsite registration, then rebuild against this thread's
+        // subscriber, then capture — see `control_loop_emits_poll_and_fetch_spans` for the full rationale.
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        tracing::callsite::rebuild_interest_cache();
+        names.lock().expect("span names lock").clear();
+
         o.on_tick().await;
         if let Some(t) = o.tick_timer.take() {
             t.abort();

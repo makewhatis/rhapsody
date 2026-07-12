@@ -1297,15 +1297,40 @@ mod tests {
     // below, matching how the loop's `loop_spans_test` is split into an active slice + a P6 mirror.)
     #[tokio::test]
     async fn worker_logs_carry_issue_identifier() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        // TRA-243: the agent-event log callsite is shared with other worker tests that run agents
+        // WITHOUT a subscriber; in tracing-core the first thread to *register* a callsite pins its
+        // cached Interest (see `control_loop_emits_poll_and_fetch_spans` for the mechanism). A parallel
+        // no-subscriber test can cache it `Interest::never`, so this recording subscriber never sees the
+        // event → empty capture (flaky). Warm up one throwaway attempt to force the callsite to
+        // register, rebuild the interest cache against THIS thread's subscriber (RecordingLayer →
+        // always), then capture a fresh attempt. Fresh deps each pass — the scripted agent fake is
+        // single-shot.
+        {
+            let ag = notify_then_succeed();
+            let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let warm = make_deps(ws, ag, tr, "do it", 20);
+            let _ = run_agent_attempt(
+                &warm,
+                issue("1", "MT-1", "In Progress"),
+                None,
+                None,
+                &noop_event(),
+                None,
+            )
+            .await;
+        }
+        tracing::callsite::rebuild_interest_cache();
+        events.lock().expect("event buffer lock").clear();
+
         let ag = notify_then_succeed();
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]); // leaves the active set after turn 1
         let (ws, _root) = test_workspace(HookScripts::default());
         let d = make_deps(ws, ag, tr, "do it", 20);
-
-        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
-        let (events, subscriber) = recording_subscriber();
-        let guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
         let (_last, _declared, err) = run_agent_attempt(
             &d,
             issue("1", "MT-1", "In Progress"),
@@ -1375,18 +1400,36 @@ mod tests {
             }
         }
 
-        let ag = notify_then_succeed();
-        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
-        let (ws, _root) = test_workspace(HookScripts::default());
-        let d = make_deps(ws, ag, tr, "do it", 20);
-
         let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
         let hits = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
         let guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(SpanCtxLayer {
                 hits: Arc::clone(&hits),
             }));
-        tracing::callsite::rebuild_interest_cache(); // re-evaluate Interest against this subscriber
+        // TRA-243: warm up to force callsite registration, rebuild against this thread's subscriber,
+        // then capture — see `worker_logs_carry_issue_identifier` for the full rationale.
+        {
+            let ag = notify_then_succeed();
+            let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let warm = make_deps(ws, ag, tr, "do it", 20);
+            let _ = run_agent_attempt(
+                &warm,
+                issue("1", "MT-1", "In Progress"),
+                None,
+                None,
+                &noop_event(),
+                None,
+            )
+            .await;
+        }
+        tracing::callsite::rebuild_interest_cache();
+        hits.lock().expect("hits lock").clear();
+
+        let ag = notify_then_succeed();
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag, tr, "do it", 20);
         let _ = run_agent_attempt(
             &d,
             issue("1", "MT-1", "In Progress"),
