@@ -1,0 +1,40 @@
+name: release
+
+# release-please keeps a rolling release PR open on main: every feat:/fix: merge updates it, and
+# merging that PR cuts a vX.Y.Z tag + GitHub Release + CHANGELOG entry. release-please-config.json and
+# .release-please-manifest.json define the flat single-package setup (path ".", `simple` release-type —
+# tag/release/CHANGELOG only, no source-file rewrites in a virtual Cargo workspace). The Makefile's
+# VERSION default consumes the resulting tag (leading `v` stripped) — see TRA-239. No signing here.
+on:
+  push:
+    branches: [main]
+
+# release-please-action opens/updates the release PR (pull-requests) and creates the tag + GitHub
+# Release (contents). GITHUB_TOKEN with these scopes is all it needs — no PAT.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Serialize release-please so overlapping pushes to main can't race on the release PR; never cancel an
+# in-flight run — cancelling mid-tag/release is worse than waiting.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release Please
+    # Self-hosted only, matching ci.yml — this repo runs no ubuntu-latest/GitHub-hosted runners.
+    # release-please-action is a node action, so it runs on the runner's bundled node (TRA-239).
+    runs-on: [self-hosted, macOS, ARM64]
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

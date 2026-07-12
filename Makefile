@@ -1,4 +1,4 @@
-.PHONY: test lint fixtures app dmg _sign _dmg _notarize verify-icon
+.PHONY: test lint fixtures app dmg _sign _dmg _notarize verify-icon print-version
 
 test:
 	cargo test --workspace
@@ -21,9 +21,12 @@ fixtures:
 BINARY       := rhapsodyd
 # Build stamp compiled into the desktop app footer (mirrors the Go Makefile `-ldflags` injection into
 # $REF/desktop/internal/version, here via the RHAPSODY_* env vars src-tauri/build.rs + version.rs read).
-# VERSION is the release version — bump on release: `make app VERSION=1.2.0`. Dev builds default to
-# "dev" and carry the short git SHA (+ "-dirty" for an uncommitted tracked tree).
-VERSION      ?= dev
+# VERSION is the release version. It defaults to the most recent release-please tag (vX.Y.Z) with the
+# leading `v` stripped (TRA-239) — so `make app`/`make dmg` on a released commit stamp that version —
+# and falls back to "dev" on a tree with no release tag yet. Override explicitly: `make app VERSION=1.2.0`.
+# Dev builds carry the short git SHA (+ "-dirty" for an uncommitted tracked tree) via COMMIT/DIRTY below.
+RELEASE_TAG  := $(shell git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null)
+VERSION      ?= $(patsubst v%,%,$(or $(RELEASE_TAG),dev))
 COMMIT       := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DIRTY        := $(shell test -n "$$(git status --porcelain --untracked-files=no 2>/dev/null)" && echo -dirty)
 BUILDTIME    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -85,3 +88,8 @@ _notarize:
 # verify-icon confirms the build consumed the source icon into $(APP)'s .icns. Runs against a built $(APP).
 verify-icon:
 	bash desktop/scripts/verify-icon.sh "$(APP)" "$(APPICON)"
+
+# print-version echoes the resolved VERSION (release tag with the leading `v` stripped, else "dev").
+# Consumed by harness/release/version_test.sh; also handy to confirm what `make app`/`dmg` will stamp.
+print-version:
+	@echo $(VERSION)
