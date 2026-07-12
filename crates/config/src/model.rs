@@ -190,7 +190,13 @@ pub struct Storage {
 
 /// OpenTelemetry export config (Go `Otel`). `enabled` is a plain bool — the presence-pointer
 /// default (ON when absent, INF-442) is materialized in Decode.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Default` yields the zero value (all fields empty/false) — NOT the config default (which Decode
+/// materializes). It exists so `rhapsodyd`'s `run.go`-parity best-effort telemetry resolution can
+/// build the synthetic `Otel{protocol:"http", service_name:"symphony", ..}` base when the workflow
+/// fails to load, and so its otel-resolution tests can set individual fields on a zero base — exactly
+/// as the Go tests build `config.Config{}` and assign `c.Otel.<field>`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Otel {
     pub enabled: bool,
     pub endpoint: String,

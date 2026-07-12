@@ -43,6 +43,23 @@ jobs:
       - run: npm run build
         working-directory: web
 
+  # F1 boot gate: the assembled `rhapsodyd` daemon completes a scripted issue end-to-end against the
+  # R3 harness (linear-stub + fake-claude), serves the embedded dashboard non-empty, its live
+  # /api/v1/config byte-matches the committed golden, and `rhapsodyd mcp` reaches it via runtime.json.
+  # boot.sh builds the web dist (rust-embed source) then the daemon, so it is self-contained (jobs
+  # don't share a filesystem). NOTE: add `boot-e2e` to the branch-protection required contexts to gate
+  # merges on it (needs admin, like the lint/test/web contexts — see the PR body).
+  boot-e2e:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: rustup show
+      - run: harness/e2e/boot.sh
+
   # The Tauri desktop app (P7) is its OWN cargo workspace, excluded from the root workspace, so it
   # is linted/built/tested here rather than by the `lint`/`test` jobs. Unsigned build only — the
   # signed/notarized .app + .dmg are human-gated (P7-D5 / desktop SIGNING). Job name `desktop` is a

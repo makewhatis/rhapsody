@@ -62,34 +62,56 @@ pub struct ResumePlan {
     pub err: Option<rhapsody_store::StoreError>,
 }
 
-/// The off-loop control surface for Stop / Resume — the Rust stand-in for calling `o.StopRun` /
-/// `o.ResumeRun` on the shared `*Orchestrator` pointer while the control task owns the state. Cloneable;
-/// carries only thread-safe handles: the control-event sender (to drive the on-loop kill / admission),
-/// the orchestrator lifetime cancellation (the reply-wait + finalize ctx), and the tracker + store the
-/// off-loop Linear move / run lookup need. Obtain via [`Orchestrator::control`] after the effective
-/// config is built.
+/// The off-loop control surface for the daemon's HTTP API — the Rust stand-in for calling
+/// `o.StopRun` / `o.Snapshot` / `o.ListLinearProjects` / … on the shared `*Orchestrator` pointer
+/// while the control task owns the state. Cloneable; carries only thread-safe handles: the
+/// control-event sender (to drive on-loop work — the kill/admission, snapshot, refresh, message), the
+/// orchestrator lifetime cancellation (the reply-wait + finalize ctx), the tracker + store the
+/// off-loop Linear move / run lookup / history reads need, the shared reads cell backing the
+/// read-only Linear surfaces, and the workflow path the config endpoint reads/validates. Obtain via
+/// [`Orchestrator::control`].
+///
+/// It began (O7) as the Stop/Resume surface; F1 (the assembly) grows it into the full off-loop
+/// HTTP surface — the pieces `cmd/symphony` needs after the orchestrator moves into the control-loop
+/// task, since the daemon can then no longer reach the loop-owned `&self` read methods directly.
 #[derive(Clone)]
 pub struct ControlHandle {
     pub(crate) events: tokio::sync::mpsc::UnboundedSender<crate::control_loop::Event>,
     pub(crate) ctx: crate::control_loop::CancelWait,
     /// The top-level effective tracker snapshotted at [`Orchestrator::control`] time (Go reads
-    /// `o.eff.tracker` off-loop; the Rust snapshot avoids aliasing the loop-owned `o.eff`). `None` only
-    /// when built before the first config load.
+    /// `o.eff.tracker` off-loop; the Rust snapshot avoids aliasing the loop-owned `o.eff`). `None`
+    /// when built before the first config load — [`ControlHandle::move_to`] then falls back to the
+    /// live [`Self::reads`] tracker (the SAME top-level tracker the reload path publishes), so the
+    /// daemon, which builds the handle before `Run`'s first reload, still moves tickets.
     pub(crate) tracker: Option<std::sync::Arc<dyn rhapsody_tracker::Tracker>>,
     pub(crate) store: std::sync::Arc<dyn rhapsody_store::Store + Send + Sync>,
+    /// The SAME [`Arc`]-shared reads cell as [`Orchestrator::reads`], so the daemon's live Linear
+    /// read surfaces + the stop/resume move-tracker fallback reflect every hot-reload (F1).
+    pub(crate) reads: std::sync::Arc<std::sync::RwLock<crate::reads::ReadsTarget>>,
+    /// The workflow path the config endpoint reads / rewrites / validates (Go `WorkflowPath`).
+    pub(crate) workflow_path: String,
+    /// The SAME `Arc`-shared retention atomics as [`Orchestrator`], so the daemon's off-loop prune
+    /// scheduler reads a hot-reloaded `retention_days` (and the retention-loaded gate) each cycle
+    /// without racing the control task's reload (Go `CurrentRetentionDays` / `RetentionLoaded`).
+    pub(crate) retention_days: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    pub(crate) retention_loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl crate::orchestrator::Orchestrator {
-    /// The off-loop [`ControlHandle`] for driving Stop / Resume while the control task runs. Snapshots
-    /// the current control-event sender, lifetime ctx, top-level tracker, and store. Obtain it before
-    /// the loop task takes ownership of the orchestrator (the daemon builds it after `Run`'s first
-    /// reload; tests after setting `eff`).
+    /// The off-loop [`ControlHandle`] for driving the daemon's HTTP API while the control task runs.
+    /// Snapshots the current control-event sender, lifetime ctx, top-level tracker, store, the shared
+    /// reads cell, and the workflow path. Obtain it before the loop task takes ownership of the
+    /// orchestrator (the daemon builds it after `Run`'s first reload; tests after setting `eff`).
     pub fn control(&self) -> ControlHandle {
         ControlHandle {
             events: self.events.clone(),
             ctx: self.ctx.clone().unwrap_or_default(),
             tracker: self.eff.as_ref().map(|e| std::sync::Arc::clone(&e.tracker)),
             store: std::sync::Arc::clone(&self.store),
+            reads: std::sync::Arc::clone(&self.reads),
+            workflow_path: self.workflow_path.clone(),
+            retention_days: std::sync::Arc::clone(&self.retention_days),
+            retention_loaded: std::sync::Arc::clone(&self.retention_loaded),
         }
     }
 }
@@ -352,15 +374,38 @@ impl ControlHandle {
         moved_to: &mut String,
         move_err: &mut String,
     ) {
-        match &self.tracker {
+        // Prefer the `control()`-time snapshot (set when tests build the handle after `eff`); fall
+        // back to the live shared reads tracker (the SAME top-level tracker the reload path publishes)
+        // so the daemon — which builds the handle before the first reload, leaving the snapshot `None`
+        // — still moves tickets. Clone out before any await; the guard is never held across it.
+        let tracker = self.tracker.clone().or_else(|| {
+            self.reads
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tracker
+                .clone()
+        });
+        match tracker {
             Some(tr) => match tr.move_issue_to_type(issue_id, team_id, state_type).await {
                 Ok(name) => *moved_to = name,
                 Err(e) => *move_err = e.to_string(),
             },
-            // No tracker snapshotted (control() before the first config load): treat as a move failure
-            // so suppression is retained (never re-dispatch stopped work).
+            // No tracker at all (before the first config load): treat as a move failure so suppression
+            // is retained (never re-dispatch stopped work).
             None => *move_err = "no effective tracker".to_string(),
         }
+    }
+
+    /// The durable history + recovery store (Go `StateProvider.Store()`, `Arc`-shared), backing the
+    /// daemon's read-only history endpoints. Never absent ([`rhapsody_store::Noop`] when disabled).
+    pub fn store(&self) -> std::sync::Arc<dyn rhapsody_store::Store + Send + Sync> {
+        std::sync::Arc::clone(&self.store)
+    }
+
+    /// The absolute path of the WORKFLOW.md this daemon loads + watches (Go `WorkflowPath`). The
+    /// config endpoint reads + rewrites it; validation runs against it.
+    pub fn workflow_path(&self) -> &str {
+        &self.workflow_path
     }
 
     /// Round-trips `evStopFinalize` (`stop`) / `evResumeFinalize` (resume) to clear (moved) or keep

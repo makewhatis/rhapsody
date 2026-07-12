@@ -40,7 +40,7 @@ async-trait = "0.1"
 # threads the operator-message receiver (Go's `messages <-chan string`) to `Session::run_turn`, which
 # needs `sync` to name `tokio::sync::mpsc::Receiver`. O7's control-loop task, worker spawns, tick /
 # retry timers, and off-loop warning resolvers use `rt` (`tokio::spawn` / `JoinHandle`); the runtime
-# itself is provided by the `symphonyd` binary. Anticipated by the P5 plan's dep set; already in
+# itself is provided by the `rhapsodyd` binary. Anticipated by the P5 plan's dep set; already in
 # Cargo.lock (agent/workspace/tracker depend on it).
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 # serde_json powers the O4 `snapshot_json` view — the `/api/v1/state` wire render (`render(&Snapshot)

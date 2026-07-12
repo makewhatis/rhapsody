@@ -25,6 +25,7 @@ use rhapsody_agent::{self as agent, humanize_stream_line};
 use rhapsody_store::{self as store};
 
 use crate::orchestrator::Orchestrator;
+use crate::stop::ControlHandle;
 
 /// Caps the `/log` response to the last N humanized entries (design §3). Mirrors Go `maxLogEntries`.
 const MAX_LOG_ENTRIES: usize = 1000;
@@ -61,6 +62,28 @@ impl Orchestrator {
             path = self.transcript_path(&run.issue_identifier);
         }
         (humanize_transcript_file(&path), true)
+    }
+}
+
+impl ControlHandle {
+    /// The daemon's off-loop `GET /api/v1/runs/{id}/transcript` surface — the [`ControlHandle`]
+    /// mirror of [`Orchestrator::run_transcript`], reading the run row + humanizing its recorded
+    /// transcript through the shared store OFF the control loop (so a multi-MB read never blocks
+    /// dispatch, unlike routing it through the loop). It serves the persisted per-run
+    /// `transcript_path`; unlike the loop-owned method it omits the RUNNING-run `latest.jsonl`
+    /// live-early fallback (which needs the loop-owned `eff.log_dir`), so a just-started live run whose
+    /// worker has not yet opened its transcript reads as `entries: []` until the path persists — an
+    /// accepted narrow gap for the P6 assembly. Mirrors Go `RunTranscript` (persisted-path branch).
+    pub fn run_transcript(&self, run_id: i64) -> (Vec<agent::LogEntry>, bool) {
+        let run = match self.store().get_run(run_id) {
+            Ok(Some(run)) => run,
+            Ok(None) => return (Vec::new(), false),
+            Err(e) => {
+                tracing::error!(run_id, error = %e, "run transcript lookup failed");
+                return (Vec::new(), false);
+            }
+        };
+        (humanize_transcript_file(&run.transcript_path), true)
     }
 }
 

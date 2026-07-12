@@ -15,12 +15,13 @@
 //!   * The methods take no `context.Context`: the Rust `Tracker` async methods carry no context
 //!     (cancellation is task-abort), so the ctx parameter is dropped.
 
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use rhapsody_core::{Project, Viewer};
 use rhapsody_tracker::{Tracker, TrackerError};
 
 use crate::orchestrator::Orchestrator;
+use crate::stop::ControlHandle;
 
 /// The error surface of the read-only Linear endpoints. [`ReadsError::ConfigNotLoaded`] is the
 /// sentinel returned before the daemon's first successful config load (no account tracker captured
@@ -69,23 +70,11 @@ impl Orchestrator {
         w.api_key = api_key.into();
     }
 
-    /// Snapshots the current tracker handle + key under the read lock (Go `readsTarget`). Clones the
-    /// handle out so the lock is released before the caller's async tracker round-trip — never held
-    /// across an `await`.
-    fn reads_target(&self) -> (Option<Arc<dyn Tracker>>, String) {
-        let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
-        (r.tracker.clone(), r.api_key.clone())
-    }
-
     /// Lists the workspace's Linear projects for the add-agent picker (INF-224), reusing the
     /// account-level tracker captured at load time. Returns [`ReadsError::ConfigNotLoaded`] before
     /// the first successful config load (the HTTP layer maps it to 503). Mirrors Go `ListLinearProjects`.
     pub async fn list_linear_projects(&self) -> Result<Vec<Project>, ReadsError> {
-        let (tracker, _) = self.reads_target();
-        match tracker {
-            None => Err(ReadsError::ConfigNotLoaded),
-            Some(tr) => Ok(tr.list_projects().await?),
-        }
+        list_linear_projects_from(&self.reads).await
     }
 
     /// Resolves the owner of the configured Linear key for the "connected as" identity endpoint
@@ -94,29 +83,70 @@ impl Orchestrator {
     /// logging). The token is masked here so the raw secret never crosses the package boundary.
     /// Mirrors Go `ConnectedViewer` (whose `(Identity, error)` return becomes `(Identity, Option<_>)`).
     pub async fn connected_viewer(&self) -> (Identity, Option<TrackerError>) {
-        let (tracker, key) = self.reads_target();
-        let tr = match tracker {
-            Some(tr) if !key.trim().is_empty() => tr,
-            _ => return (Identity::default(), None),
-        };
-        match tr.resolve_viewer().await {
-            Ok(viewer) => (
-                Identity {
-                    connected: true,
-                    viewer,
-                    masked_token: mask_token(&key),
-                },
-                None,
-            ),
-            Err(e) => (
-                Identity {
-                    connected: false,
-                    viewer: Viewer::default(),
-                    masked_token: mask_token(&key),
-                },
-                Some(e),
-            ),
-        }
+        connected_viewer_from(&self.reads).await
+    }
+}
+
+impl ControlHandle {
+    /// The daemon's off-loop `GET /api/v1/linear/projects` surface — the [`ControlHandle`] mirror of
+    /// [`Orchestrator::list_linear_projects`], reading the SAME shared reads cell so a hot-reload is
+    /// reflected. F1 (the assembly) wires this into the httpapi provider adapter.
+    pub async fn list_linear_projects(&self) -> Result<Vec<Project>, ReadsError> {
+        list_linear_projects_from(&self.reads).await
+    }
+
+    /// The daemon's off-loop `GET /api/v1/linear/identity` surface — the [`ControlHandle`] mirror of
+    /// [`Orchestrator::connected_viewer`], reading the SAME shared reads cell. F1 wires it into the
+    /// httpapi provider adapter.
+    pub async fn connected_viewer(&self) -> (Identity, Option<TrackerError>) {
+        connected_viewer_from(&self.reads).await
+    }
+}
+
+/// Snapshots the current tracker handle + key from a shared reads cell (Go `readsTarget`). Clones the
+/// handle out so the lock is released before the caller's async tracker round-trip — never held across
+/// an `await`. Shared by [`Orchestrator`] and the daemon's [`ControlHandle`], which point at the same
+/// [`Arc`]-shared cell.
+fn reads_snapshot(reads: &RwLock<ReadsTarget>) -> (Option<Arc<dyn Tracker>>, String) {
+    let r = reads.read().unwrap_or_else(PoisonError::into_inner);
+    (r.tracker.clone(), r.api_key.clone())
+}
+
+/// Shared engine behind [`Orchestrator::list_linear_projects`] + [`ControlHandle::list_linear_projects`].
+async fn list_linear_projects_from(
+    reads: &RwLock<ReadsTarget>,
+) -> Result<Vec<Project>, ReadsError> {
+    let (tracker, _) = reads_snapshot(reads);
+    match tracker {
+        None => Err(ReadsError::ConfigNotLoaded),
+        Some(tr) => Ok(tr.list_projects().await?),
+    }
+}
+
+/// Shared engine behind [`Orchestrator::connected_viewer`] + [`ControlHandle::connected_viewer`].
+async fn connected_viewer_from(reads: &RwLock<ReadsTarget>) -> (Identity, Option<TrackerError>) {
+    let (tracker, key) = reads_snapshot(reads);
+    let tr = match tracker {
+        Some(tr) if !key.trim().is_empty() => tr,
+        _ => return (Identity::default(), None),
+    };
+    match tr.resolve_viewer().await {
+        Ok(viewer) => (
+            Identity {
+                connected: true,
+                viewer,
+                masked_token: mask_token(&key),
+            },
+            None,
+        ),
+        Err(e) => (
+            Identity {
+                connected: false,
+                viewer: Viewer::default(),
+                masked_token: mask_token(&key),
+            },
+            Some(e),
+        ),
     }
 }
 
@@ -272,6 +302,48 @@ mod tests {
         let got = o.list_linear_projects().await.expect("list projects");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].slug, "alpha");
+    }
+
+    // F1 daemon-wiring guard: the off-loop `ControlHandle` (built BEFORE the orchestrator moves into
+    // the control-loop task, mirroring the daemon) shares the SAME `Arc`-backed reads cell, so a later
+    // reload-path `set_reads_target` is reflected in the handle's `list_linear_projects` /
+    // `connected_viewer` — the property the httpapi provider adapter relies on for live Linear reads.
+    #[tokio::test]
+    async fn control_handle_reads_reflect_live_reload() {
+        let o = reads_test_orch();
+        let handle = o.control(); // built pre-load, exactly as the daemon does
+
+        // Before any config load: the shared cell is empty, so both surfaces report not-loaded.
+        match handle.list_linear_projects().await {
+            Err(ReadsError::ConfigNotLoaded) => {}
+            other => panic!("pre-load want ConfigNotLoaded, got {other:?}"),
+        }
+        let (id0, _) = handle.connected_viewer().await;
+        assert!(!id0.connected, "pre-load handle must report not-connected");
+
+        // The reload path publishes into the SAME shared cell...
+        let mut tr = Fake::new();
+        tr.viewer = Viewer {
+            id: "v1".to_string(),
+            ..Default::default()
+        };
+        tr.projects = vec![Project {
+            id: "p1".to_string(),
+            name: "Alpha".to_string(),
+            slug: "alpha".to_string(),
+            team: "Foundation".to_string(),
+            color: "#10b981".to_string(),
+        }];
+        o.set_reads_target(Arc::new(tr), "lin_api_key_value_1234");
+
+        // ...and the handle (Arc-shared) now sees it live.
+        let got = handle.list_linear_projects().await.expect("list projects");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].slug, "alpha");
+        let (id1, err) = handle.connected_viewer().await;
+        assert!(err.is_none());
+        assert!(id1.connected, "handle must resolve the reloaded viewer");
+        assert!(id1.masked_token.contains("***…"), "token stays masked");
     }
 
     // Mirrors Go `TestReadsTargetRace`: concurrent set_reads_target (reload path) interleaved with

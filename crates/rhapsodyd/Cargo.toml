@@ -1,0 +1,66 @@
+[package]
+name = "rhapsodyd"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# tokio: the daemon's async runtime. `rt-multi-thread` + `macros` for `#[tokio::main]` / the loop +
+# server tasks; `signal` for the SIGINT/SIGTERM graceful-shutdown handler (Go's
+# `signal.NotifyContext(..., os.Interrupt, syscall.SIGTERM)`); `net`/`time`/`sync` for the httpapi
+# server bind, timers, and the control-channel handles. Already in Cargo.lock (every async crate).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "net",
+    "time",
+    "sync",
+] }
+# libc: the single-instance run-lock is an advisory `flock(LOCK_EX|LOCK_NB)` on a per-config lock
+# file — the Rust mirror of Go `run.go`'s `syscall.Flock` (`$REF/cmd/symphony/run.go`). One FFI call;
+# already in Cargo.lock (rhapsody-core's `runtimeport::process_alive` uses it).
+libc = "0.2"
+# tracing / tracing-subscriber: the daemon installs the composed telemetry subscriber
+# (`tel.subscriber()`) as the process-global default and emits its own boot diagnostics through
+# `tracing` (Go threads a `*slog.Logger`; the Rust workspace uses `tracing` throughout). Already in
+# Cargo.lock (telemetry/orchestrator/httpapi).
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# async-trait: the httpapi `StateProvider` is an `#[async_trait]` interface; the daemon's provider
+# adapter (`state.rs`) implements it. Same crate + reason the httpapi/tracker crates already record.
+# Already in Cargo.lock.
+async-trait = "0.1"
+# chrono: the provider adapter stamps `RefreshResult.requested_at` (Go `o.now()`); the same
+# `DateTime<Utc>` clock the orchestrator snapshot uses. Already in Cargo.lock.
+chrono = "0.4"
+# url: `resolve_otel_config`'s loopback/https endpoint classification parses OTLP endpoints the way
+# Go's `run.go` does (`url.Parse` + `net.SplitHostPort`), to decide the plaintext-transport default
+# for a loopback collector. Already in Cargo.lock (the telemetry/config/tracker crates use it).
+url = "2"
+
+# The ported crates the daemon assembles into a running process (Go `cmd/symphony` imports the same
+# set from `internal/*`): config load/decode/resolve, the durable store, the tracker (banner
+# key-owner resolve), the orchestrator control loop, the httpapi observability server, telemetry
+# (OTLP + the in-memory log ring), the mcp facade (`symphony mcp`), and the core runtimeport publish.
+rhapsody-core = { path = "../core" }
+rhapsody-config = { path = "../config" }
+rhapsody-store = { path = "../store" }
+rhapsody-tracker = { path = "../tracker" }
+# rhapsody-agent: the humanized `LogEntry` the httpapi `StateProvider::run_transcript` yields (Go
+# `agent.LogEntry`), threaded straight through the provider adapter. Already in Cargo.lock.
+rhapsody-agent = { path = "../agent" }
+rhapsody-orchestrator = { path = "../orchestrator" }
+rhapsody-httpapi = { path = "../httpapi" }
+rhapsody-telemetry = { path = "../telemetry" }
+rhapsody-mcp = { path = "../mcp" }
+
+[dev-dependencies]
+# tokio test extras: `#[tokio::test(flavor = "multi_thread")]` so a test's client request and the
+# spawned daemon/loop/server tasks make progress concurrently (the flavor the orchestrator + httpapi
+# integration tests already use). Already in Cargo.lock.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints]
+workspace = true

@@ -287,13 +287,15 @@ pub struct Orchestrator {
     pub store: Arc<dyn Store + Send + Sync>,
 
     /// Account-level tracker plus resolved key backing the read-only Linear surfaces (the Settings
-    /// identity endpoint and the add-agent projects picker, INF-224), which the future P6 HTTP path
-    /// serves OFF the control loop. Unlike the loop-confined scheduling state, these are read
-    /// concurrently by HTTP tasks while the reload path ([`Orchestrator::set_reads_target`], O7)
-    /// swaps them, so they sit behind an [`RwLock`] (Go `readsMu` guarding
-    /// `readsTracker`/`readsAPIKey`). Empty until the first config load — the reads helpers surface
-    /// [`crate::reads::ReadsError::ConfigNotLoaded`] until then.
-    pub(crate) reads: RwLock<crate::reads::ReadsTarget>,
+    /// identity endpoint and the add-agent projects picker, INF-224), which the P6 HTTP path serves
+    /// OFF the control loop. Unlike the loop-confined scheduling state, these are read concurrently by
+    /// HTTP tasks while the reload path ([`Orchestrator::set_reads_target`], O7) swaps them, so they
+    /// sit behind an [`RwLock`] (Go `readsMu` guarding `readsTracker`/`readsAPIKey`). Empty until the
+    /// first config load — the reads helpers surface [`crate::reads::ReadsError::ConfigNotLoaded`]
+    /// until then. Held behind [`Arc`] (F1) so the daemon's off-loop [`crate::ControlHandle`] shares
+    /// the SAME live target after the orchestrator moves into the control-loop task — the reload path
+    /// still updates the one shared cell, so the HTTP reads reflect hot-reloads.
+    pub(crate) reads: Arc<RwLock<crate::reads::ReadsTarget>>,
 
     /// The async event-writer feed (Phase 4 §3.1): coarse per-event history rows are handed to the
     /// batched writer thread through this bounded channel. A full buffer SHEDS the event (counted in
@@ -431,7 +433,7 @@ impl Orchestrator {
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
             store: Arc::new(store::Noop),
-            reads: RwLock::new(crate::reads::ReadsTarget::default()),
+            reads: Arc::new(RwLock::new(crate::reads::ReadsTarget::default())),
             store_events_tx: Some(store_events_tx),
             store_events_rx: Mutex::new(Some(store_events_rx)),
             writer_handle: None,

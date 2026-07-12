@@ -16,11 +16,16 @@
 //! observable behavior these helpers assert is complete and independently tested here.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use rhapsody_workspace::Manager;
 
 use crate::orchestrator::{Orchestrator, RunningEntry};
+use crate::stop::ControlHandle;
 
 /// The race-free snapshot the workspace GC operates on: the live workspace [`Manager`] and the set of
 /// worktree paths that must NOT be pruned because a worker is currently running on them. Built on the
@@ -74,6 +79,54 @@ impl Orchestrator {
         self.running
             .values()
             .any(|re| worktree_path_for(m, re) == path)
+    }
+}
+
+impl ControlHandle {
+    /// The effective `storage.retention_days` (default 30 until the first reload), read each prune
+    /// cycle from the shared atomic without racing the control task's reload. Mirrors Go
+    /// `CurrentRetentionDays`.
+    pub fn current_retention_days(&self) -> i64 {
+        self.retention_days.load(Ordering::Relaxed)
+    }
+
+    /// Whether the reload path has stored the effective retention_days at least once. The prune
+    /// scheduler reads it to skip the STARTUP worktree GC while `current_retention_days` would still
+    /// return the `New` default. Mirrors Go `RetentionLoaded`.
+    pub fn retention_loaded(&self) -> bool {
+        self.retention_loaded.load(Ordering::Relaxed)
+    }
+
+    /// Prunes per-issue worktrees idle beyond `retention_days`, OFF the control loop: snapshots the
+    /// GC plan (the live [`Manager`] + the running keep-set) via the control channel, then removes
+    /// each stale worktree that is neither in the keep-set nor reported in-use by the authoritative
+    /// liveness re-check (itself a control round-trip carrying the plan's manager, so liveness paths
+    /// track the scanned root even across a `workspace.root` reload). Returns the count removed; a
+    /// `retention_days <= 0`, a missing plan, or no built manager is a no-op. Backs the daemon's prune
+    /// scheduler. Mirrors Go `PruneStaleWorkspaces`.
+    pub async fn prune_stale_workspaces(&self, retention_days: i64) -> usize {
+        if retention_days <= 0 {
+            return 0;
+        }
+        let Some(plan) = self.workspace_gc_plan().await else {
+            return 0;
+        };
+        let Some(mgr) = plan.mgr else {
+            return 0;
+        };
+        let max_age = Duration::from_secs(retention_days as u64 * 24 * 3600);
+        // The liveness callback round-trips the loop (evWorkspaceInUse). Cloning the handle + manager
+        // per call keeps the closure `Fn`; a dropped loop reports not-in-use, but the prune scheduler
+        // cancels its ctx before shutdown, so a removal-under-doubt cannot occur in practice.
+        let handle = self.clone();
+        let live_mgr = Arc::clone(&mgr);
+        let live = move |path: String| -> Pin<Box<dyn Future<Output = bool> + Send>> {
+            let handle = handle.clone();
+            let mgr = Arc::clone(&live_mgr);
+            Box::pin(async move { handle.worktree_in_use(Some(mgr), path).await })
+        };
+        mgr.prune_stale_worktrees(max_age, &plan.keep, Some(&live))
+            .await
     }
 }
 

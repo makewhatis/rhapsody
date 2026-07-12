@@ -11,8 +11,8 @@ rhapsody-core = { path = "../core" }
 # wrapped with formatted context (`fmt.Errorf("%w: …")`). thiserror's `#[error("…")]` is the clean
 # mirror of Go's sentinel-plus-wrap pattern and was anticipated by the P4 plan (Task W1 deps).
 thiserror = "2"
-# sha2: RepoKey is the first 24 hex chars of SHA-256 over the repo URL (repo.go). symphonyd ships as
-# a drop-in sidecar for the Go daemon and shares the on-disk workspace layout
+# sha2: RepoKey is the first 24 hex chars of SHA-256 over the repo URL (repo.go). rhapsodyd matches
+# the Go daemon's on-disk workspace layout
 # (<root>/<RepoKey>/<key>), so RepoKey MUST be byte-identical to Go's crypto/sha256 — a real SHA-256
 # is required, not a stand-in hash. sha2 is the standard Rust implementation (hex is hand-rolled to
 # avoid an extra dep).

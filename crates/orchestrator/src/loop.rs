@@ -51,7 +51,7 @@ use crate::orchestrator::Orchestrator;
 use crate::reload::ReloadError;
 use crate::retry::{DispatchRoute, EvRetry, EvWorkerExit};
 use crate::select::TaggedIssue;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{RefreshResult, Snapshot};
 use crate::stop::{ControlHandle, ResumePlan, StopPlan};
 use crate::worker::{WorkerDeps, run_agent_attempt};
 use crate::workspace_gc::WorkspaceGcPlan;
@@ -359,7 +359,7 @@ impl Orchestrator {
         self.gh_source = self.new_github_summon_source();
         if !self.store_injected {
             // Go opens the durable disk store here (`openStore`) from storage config + the --db /
-            // --no-store overrides; that disk-open wiring lands with the `symphonyd` binary (P6). O7
+            // --no-store overrides; that disk-open wiring lands with the `rhapsodyd` binary (P6). O7
             // keeps the injected / Noop store, so this is intentionally a no-op path.
             tracing::debug!(
                 "no store injected; using the default store (disk store-open is P6/daemon)"
@@ -965,6 +965,24 @@ impl ControlHandle {
         tokio::select! {
             r = rx => r.unwrap_or(RunMessageResult { not_running: true, ..Default::default() }),
             _ = lifetime.cancelled() => RunMessageResult { not_running: true, ..Default::default() },
+        }
+    }
+
+    /// Requests a coalesced poll+reconcile tick (Go's non-blocking `evTick` send), backing the P6
+    /// `POST /api/v1/refresh` surface. The control channel is unbounded, so a tick is always enqueued
+    /// (`queued: true`) and never folded into a pending one — `coalesced` is unreachable here, the
+    /// deliberate deviation from Go's buffered-channel coalescing (a burst of refreshes just enqueues a
+    /// burst of ticks the loop drains). Synchronous + infallible, so the handler always answers 202.
+    /// Mirrors Go `Refresh` (`snapshot.go`), whose live `Orchestrator::refresh` the assembly (F1) owns.
+    pub fn refresh(&self) -> RefreshResult {
+        // Best-effort: a send failure means the loop is already gone (the daemon is shutting down), in
+        // which case the tick is moot; still report `queued` to match Go's unconditional result shape.
+        let _ = self.events.send(Event::Tick);
+        RefreshResult {
+            queued: true,
+            coalesced: false,
+            requested_at: Utc::now(),
+            operations: vec!["poll".to_string(), "reconcile".to_string()],
         }
     }
 }

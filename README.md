@@ -2,7 +2,8 @@
 
 Rust parity port of Symphony — the daemon that reads work from Linear, creates isolated
 per-issue workspaces, and runs Claude Code agents inside them. The daemon binary ships as
-`symphonyd` (drop-in sidecar for the existing desktop shell).
+`rhapsodyd` — a standalone Rust daemon whose runtime behavior is a faithful clone of the Go
+`symphony` daemon (only the binary name differs).
 
 - Specs & plans: Linear project documents (Rhapsody project) — never committed to this repo.
 - Parity reference (read-only, NOT in this repo): `$REF` (operator-provided path to the frozen

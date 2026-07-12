@@ -23,6 +23,7 @@ use rhapsody_config::{ConfigError, ValidationError, decode, resolve, validate};
 use crate::control_loop::{CancelWait, DEFAULT_RETENTION_DAYS, Event};
 use crate::effective::build_effective;
 use crate::orchestrator::Orchestrator;
+use crate::stop::ControlHandle;
 use crate::warnings::project_warn_inputs;
 
 /// The mtime-poll cadence for the workflow watcher (Go's fsnotify is instant; see the module docs).
@@ -55,6 +56,28 @@ fn workflow_dir(path: &str) -> String {
     match Path::new(path).parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_string_lossy().into_owned(),
         _ => ".".to_string(),
+    }
+}
+
+/// Runs the daemon's load pipeline (Decode → Resolve → ValidateDispatch → buildEffective) on a
+/// candidate `def` resolved against `workflow_path`'s directory, WITHOUT applying it — the shared
+/// engine behind [`Orchestrator::validate_config`] + [`ControlHandle::validate_config`]. Mirrors Go
+/// `ValidateConfig`.
+fn validate_config_at(workflow_path: &str, def: &Definition) -> Result<(), ReloadError> {
+    let cfg = decode(def)?;
+    let mut cfg = resolve(cfg, &workflow_dir(workflow_path))?;
+    validate(&mut cfg)?;
+    build_effective(&cfg)?;
+    Ok(())
+}
+
+impl ControlHandle {
+    /// The daemon's off-loop config-validation for `POST /api/v1/config` — the [`ControlHandle`]
+    /// mirror of [`Orchestrator::validate_config`]. Runs the SAME load pipeline against the handle's
+    /// workflow path WITHOUT applying it, so the endpoint rejects exactly what a hot-reload would.
+    /// Mirrors Go `ValidateConfig`.
+    pub fn validate_config(&self, def: &Definition) -> Result<(), ReloadError> {
+        validate_config_at(self.workflow_path(), def)
     }
 }
 
@@ -98,11 +121,7 @@ impl Orchestrator {
     /// reject anything the daemon would reject on reload. Does not mutate orchestrator state. Mirrors
     /// Go `ValidateConfig`.
     pub fn validate_config(&self, def: &Definition) -> Result<(), ReloadError> {
-        let cfg = decode(def)?;
-        let mut cfg = resolve(cfg, &workflow_dir(&self.workflow_path))?;
-        validate(&mut cfg)?;
-        build_effective(&cfg)?;
-        Ok(())
+        validate_config_at(&self.workflow_path, def)
     }
 
     /// Re-runs dispatch preflight validation on the current effective config (upstream §6.3). A test-

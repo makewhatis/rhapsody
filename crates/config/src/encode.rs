@@ -314,7 +314,10 @@ fn prune_empty(v: Value) -> Option<Value> {
 /// [`crate::decode`]'s `parse_go_duration`, so a `claim_ttl` / `claim_settle_delay` knob round-trips
 /// through Encode → Decode. Nanosecond-exact; builds the text from the right into a fixed buffer,
 /// mirroring Go's `[32]byte` + descending write index.
-fn go_duration_string(d: Duration) -> String {
+///
+/// Public so the `rhapsodyd` startup banner can render `polling.interval_ms` exactly as Go's
+/// `run.go` does — `(time.Duration(cfg.Polling.IntervalMS) * time.Millisecond).String()`.
+pub fn go_duration_string(d: Duration) -> String {
     const NS_PER_US: u64 = 1_000;
     const NS_PER_MS: u64 = 1_000_000;
     const NS_PER_S: u64 = 1_000_000_000;

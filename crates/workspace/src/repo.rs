@@ -880,8 +880,8 @@ mod tests {
         );
     }
 
-    // symphonyd is a drop-in sidecar for the Go daemon and shares the on-disk `<root>/<RepoKey>`
-    // layout, so RepoKey MUST be byte-identical to Go's `hex(crypto/sha256(trim(url)))[:24]`. Lock
+    // rhapsodyd matches the Go daemon's on-disk `<root>/<RepoKey>` layout (parity), so RepoKey MUST
+    // be byte-identical to Go's `hex(crypto/sha256(trim(url)))[:24]`. Lock
     // the exact digest against a known SHA-256 (of "hello", trimmed) so any drift is caught without
     // needing the Go binary at test time.
     #[test]
