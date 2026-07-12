@@ -33,7 +33,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 FIX="$ROOT/harness/fixtures"
 WORK="$HERE/work"
-BIN="$HERE/target/symphonyd-go"
+# Local build output of the frozen Go reference daemon (`$REF/cmd/symphony`, binary name `symphony`).
+BIN="$HERE/target/symphony-go"
 
 rm -rf "$WORK" "$FIX"
 mkdir -p "$WORK" "$HERE/target" "$FIX/config" "$FIX/api" "$FIX/runs" "$FIX/db"
