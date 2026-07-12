@@ -826,10 +826,10 @@ mod tests {
     #[test]
     fn repo_lock_same_url_same_pointer() {
         let (m, _root) = repo_test_manager(HookScripts::default());
-        let a = m.repo_lock("git@github.com:interval/tally.git");
-        let b = m.repo_lock("git@github.com:interval/tally.git");
+        let a = m.repo_lock("git@github.com:example/tally.git");
+        let b = m.repo_lock("git@github.com:example/tally.git");
         assert!(Arc::ptr_eq(&a, &b), "same URL must map to the same mutex");
-        let c = m.repo_lock("git@github.com:interval/other.git");
+        let c = m.repo_lock("git@github.com:example/other.git");
         assert!(
             !Arc::ptr_eq(&a, &c),
             "distinct URLs must get distinct mutexes"
@@ -845,7 +845,7 @@ mod tests {
         for _ in 0..50 {
             let m = m.clone();
             handles.push(std::thread::spawn(move || {
-                let _ = m.repo_lock("git@github.com:interval/tally.git");
+                let _ = m.repo_lock("git@github.com:example/tally.git");
             }));
         }
         for h in handles {
@@ -860,11 +860,11 @@ mod tests {
     // Mirror of TestRepoKey_StableAndSafe.
     #[test]
     fn repo_key_stable_and_safe() {
-        let url = "git@github.com:interval/tally.git";
+        let url = "git@github.com:example/tally.git";
         assert_eq!(repo_key(url), repo_key(url), "must be deterministic");
         assert_ne!(
             repo_key(url),
-            repo_key("git@github.com:interval/other.git"),
+            repo_key("git@github.com:example/other.git"),
             "must differ for different URLs"
         );
         assert_eq!(
@@ -894,7 +894,7 @@ mod tests {
     #[test]
     fn mirror_dir_under_mirrors_root() {
         let (m, root) = repo_test_manager(HookScripts::default());
-        let url = "git@github.com:interval/tally.git";
+        let url = "git@github.com:example/tally.git";
         let bare = format!("{}.git", repo_key(url));
         let want = join(&[&root.path, ".mirrors", &bare]);
         assert_eq!(m.mirror_dir(url), want);
@@ -1484,7 +1484,7 @@ mod tests {
     async fn repo_worktree_reserved_mirrors_key_rejected() {
         let (m, root) = repo_test_manager(HookScripts::default());
         assert_eq!(sanitize_key(".mirrors"), ".mirrors");
-        let url = "git@github.com:interval/tally.git";
+        let url = "git@github.com:example/tally.git";
         assert!(matches!(
             m.ensure_from_repo(url, "", ".mirrors").await,
             Err(Error::WorktreeOutsideRoot(_))
@@ -1523,7 +1523,7 @@ mod tests {
     #[test]
     fn path_for_repo_namespaced_and_legacy() {
         let (m, root) = repo_test_manager(HookScripts::default());
-        let repo = "git@github.com:interval/tally.git";
+        let repo = "git@github.com:example/tally.git";
         assert_eq!(
             m.path_for(repo, "MT-7"),
             join(&[&root.path, &repo_key(repo), "MT-7"])

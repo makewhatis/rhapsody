@@ -16,11 +16,9 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// prompt fallback.
 const REPO_PROMPT_FILE: &str = ".rhapsody/PROMPT.md";
 
-/// The internal fleet-observability hub the onboarding config seeds as `otel.endpoint` (INF-442).
-/// Mirrors `config.DefaultOtelEndpoint`. Kept VERBATIM for runtime parity — the generated WORKFLOW.md
-/// must match the Go desktop's byte-for-byte in its values; this is a runtime infra endpoint, not a
-/// packaging/brand token (the D5 brand guard scopes to the `.app` identifier + name).
-const DEFAULT_OTEL_ENDPOINT: &str = "https://otel-symphony.ops-oma-prod.makewhat.is";
+/// Default OTLP endpoint the onboarding config seeds (empty — Rhapsody ships with no fleet hub, a
+/// DIVERGENCE from the Go desktop which seeded a company-internal collector; see README).
+const DEFAULT_OTEL_ENDPOINT: &str = "";
 
 /// A concise, valid starting prompt kept as the inline FALLBACK used when the seeded repo `prompt_file`
 /// is absent from the checkout — a relative `prompt_file` soft-falls-back to this body rather than
@@ -116,11 +114,11 @@ pub fn render_initial_workflow(project_slug: &str) -> Result<Vec<u8>, Error> {
         storage: Storage {
             path: "~/.rhapsody/rhapsody.db",
         },
-        // Export telemetry to the internal fleet-observability hub by default (INF-299). The endpoint is
-        // tailnet-only; off-tailnet the exporter drops/retries silently and is never fatal. Users opt
-        // out via the General tab's Observability toggle (otel.enabled: false).
+        // Telemetry export OFF by default — Rhapsody ships with no fleet hub and never phones home.
+        // An operator opts in via the General tab's Observability toggle and supplies their own OTLP
+        // endpoint (DIVERGENCE from the Go desktop, which defaulted export ON to a company collector).
         otel: Otel {
-            enabled: true,
+            enabled: false,
             endpoint: DEFAULT_OTEL_ENDPOINT,
             protocol: "http",
             service_name: "symphony",
@@ -189,31 +187,20 @@ mod tests {
         assert!(!body.trim().is_empty(), "prompt body is empty");
     }
 
-    // Mirrors TestRenderInitialWorkflowSeedsOtelExportOn: fresh installs export to the internal hub by
-    // default with the canonical ops-oma-prod values (#1794).
+    // Fresh installs seed telemetry export OFF with an empty endpoint — Rhapsody never phones home;
+    // the operator opts in and supplies their own OTLP collector (DIVERGENCE from the Go desktop).
     #[test]
-    fn render_initial_workflow_seeds_otel_export_on() {
+    fn render_initial_workflow_seeds_otel_export_off() {
         let cfg = front_yaml(&render_initial_workflow("my-project").expect("render"));
         assert_eq!(
             cfg["otel"]["enabled"].as_bool(),
-            Some(true),
-            "export on by default"
-        );
-        assert_eq!(
-            cfg["otel"]["endpoint"].as_str(),
-            Some("https://otel-symphony.ops-oma-prod.makewhat.is")
-        );
-        assert_eq!(
-            cfg["otel"]["protocol"].as_str(),
-            Some("http"),
-            "the hub collector is OTLP/HTTP-only"
-        );
-        assert_eq!(cfg["otel"]["service_name"].as_str(), Some("symphony"));
-        assert_eq!(
-            cfg["otel"]["insecure"].as_bool(),
             Some(false),
-            "TLS to the hub"
+            "export off by default"
         );
+        assert_eq!(cfg["otel"]["endpoint"].as_str(), Some(""), "no default hub");
+        assert_eq!(cfg["otel"]["protocol"].as_str(), Some("http"));
+        assert_eq!(cfg["otel"]["service_name"].as_str(), Some("symphony"));
+        assert_eq!(cfg["otel"]["insecure"].as_bool(), Some(false));
     }
 
     // Mirrors TestRenderInitialWorkflowBodyDeclaresHandoff: the seeded prompt must instruct the agent to

@@ -47,6 +47,18 @@ The repo-relative prompt defaults **fall back to the legacy `.symphony/` names**
 keep resolving their prompt untouched (the daemon's prompt resolver retries the `.symphony/`
 counterpart before soft-falling-back to the inline prompt).
 
+### Telemetry default → off, no bundled hub
+
+| Default | Go v0.4.0 | Rhapsody |
+|---|---|---|
+| `otel.endpoint` when unset | a company-internal fleet collector | `""` (empty — no bundled hub) |
+| Desktop onboarding seed | `otel.enabled: true`, export ON to that hub | `otel.enabled: false`, empty endpoint |
+
+Rhapsody **never phones home**: the Go daemon defaulted telemetry export ON to a company-internal
+collector, and the desktop onboarding seeded a fresh install to export there. Rhapsody defaults
+export OFF with no endpoint; an operator opts in via the Observability toggle and supplies their own
+OTLP collector. Affects the same config goldens as the path divergence above.
+
 **Out of scope (unchanged live wire contracts):** the `SYMPHONY_RUN_ID` / `SYMPHONY_ISSUE` (and
 sibling) agent env vars, the `symphony_*` MCP tool names, the `symphony/<key>` git branch prefix,
 and the `@symphony` summon token — all cross-process contracts that a path rebrand must not break.

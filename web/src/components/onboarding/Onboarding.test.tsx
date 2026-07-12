@@ -21,7 +21,7 @@ import { Onboarding } from "@/components/onboarding/Onboarding";
 
 const PROJECTS: LinearProject[] = [
   { id: "1", name: "Symphony App", slug: "872639248532", team: "FND", color: "#10b981" },
-  { id: "2", name: "Docs", slug: "symphony-docs-aabbccdd", team: "DOCS", color: "#f5b544" },
+  { id: "2", name: "Docs", slug: "example-docs-aabbccdd", team: "DOCS", color: "#f5b544" },
 ];
 
 beforeEach(() => {

@@ -22,9 +22,11 @@ use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 
-/// The internal fleet-observability hub the daemon exports telemetry to when
-/// `otel.endpoint` is unset (Go `DefaultOtelEndpoint`, INF-442).
-pub const DEFAULT_OTEL_ENDPOINT: &str = "https://otel-symphony.ops-oma-prod.makewhat.is";
+/// Default OTLP endpoint when `otel.endpoint` is unset. Empty by design: Rhapsody ships with no
+/// fleet-observability hub (the Go daemon defaulted to a company-internal collector — a DIVERGENCE,
+/// see README). With `otel.enabled` false by default nothing exports; an operator opting in sets
+/// their own collector endpoint.
+pub const DEFAULT_OTEL_ENDPOINT: &str = "";
 
 // ---------------------------------------------------------------------------
 // Override-knob vocabularies (Go `internal/config/config.go` const blocks)

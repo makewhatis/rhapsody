@@ -160,10 +160,14 @@ done
 # swap is a no-op once applied, e.g. graphite.md already carries the .rhapsody value).
 #   ~/.symphony/logs            -> ~/.rhapsody/logs           (logging.dir default)
 #   .symphony/PROMPT.dep_mod.md -> .rhapsody/PROMPT.dep_mod.md (dep_mode_prompt_file default)
-echo "capture: applying TRA-238 ~/.rhapsody config-default divergence to the config goldens" >&2
+echo "capture: applying config-default divergences (~/.rhapsody paths + empty otel endpoint) to the config goldens" >&2
+# The otel-endpoint sed matches by the "https://otel..." value prefix so this script carries no brand
+# literal (the forbidden-token guard scans it too). Rhapsody's default otel.endpoint is "" (telemetry
+# off, no bundled hub — see the README DIVERGENCES section); the Go daemon resolved a company hub here.
 for f in "$FIX"/config/minimal.json "$FIX"/config/full.json "$FIX"/config/graphite.json "$FIX"/api/config.json; do
   sed -e 's#~/\.symphony/logs#~/.rhapsody/logs#g' \
       -e 's#\.symphony/PROMPT\.dep_mod\.md#.rhapsody/PROMPT.dep_mod.md#g' \
+      -e 's#"endpoint": "https://otel[^"]*"#"endpoint": ""#g' \
       "$f" >"$f.tmp" && mv "$f.tmp" "$f"
 done
 

@@ -178,7 +178,7 @@ mod tests {
         // NOT export — a config endpoint alone never force-enables.
         let c3 = Otel {
             enabled: false,
-            endpoint: "https://otel-symphony.ops-oma-prod.makewhat.is".to_string(),
+            endpoint: "https://collector.example:4317".to_string(),
             ..Default::default()
         };
         assert!(

@@ -229,8 +229,8 @@ mod tests {
     fn parse_repo_forms() {
         let cases = [
             (
-                "git@github.com:makewhatis/symphony-core.git",
-                Some(("makewhatis", "symphony-core")),
+                "git@github.com:example/example-core.git",
+                Some(("example", "example-core")),
             ),
             ("https://github.com/o/r.git", Some(("o", "r"))),
             ("https://github.com/o/r", Some(("o", "r"))),

@@ -169,11 +169,11 @@ fn box_err(e: std::io::Error) -> Error {
 
 // ---- Constructors --------------------------------------------------------------------------------
 
-/// Default service/account namespace for the Linear token in the Keychain (mirrors the Go constants).
-/// Kept VERBATIM for runtime parity: this is the daemon-facing credential namespace, not a packaging
-/// brand token — the D5 brand guard scopes to the `.app` productIdentifier + name. Matching it also
-/// means a token the Go desktop stored is found by this drop-in port unchanged.
-pub const DEFAULT_SERVICE: &str = "is.makewhat.symphony";
+/// Default service/account namespace for the Linear token in the Keychain. Rebranded to Rhapsody's
+/// bundle identifier (post-parity, per the ~/.rhapsody runtime move): the app is its own product with
+/// its own credential namespace, and the app-level cutover has the operator paste the token fresh, so
+/// there is no need to share the Go desktop's old keychain item.
+pub const DEFAULT_SERVICE: &str = "is.makewhat.rhapsody";
 pub const DEFAULT_ACCOUNT: &str = "linear-api-token";
 
 /// The Keychain-backed store (the primary v1 path). Mirrors Go `credential.New`.

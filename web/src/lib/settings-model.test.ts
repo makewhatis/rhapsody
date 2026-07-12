@@ -127,16 +127,16 @@ describe("toUiGlobal / applyUiGlobal", () => {
   it("maps otel.enabled to an explicit toggle, independent of endpoint-presence (INF-299)", () => {
     // The seeded default-on config (enabled + a hub endpoint) surfaces the toggle ON.
     const seeded = makeGlobal({
-      otel: { enabled: true, endpoint: "https://otel-symphony.ops-oma-prod.makewhat.is", protocol: "grpc", service_name: "symphony", insecure: false },
+      otel: { enabled: true, endpoint: "https://collector.example:4317", protocol: "grpc", service_name: "symphony", insecure: false },
     });
     const ui = toUiGlobal(seeded);
     expect(ui.telemetryEnabled).toBe(true);
-    expect(ui.telemetryEndpoint).toBe("https://otel-symphony.ops-oma-prod.makewhat.is");
+    expect(ui.telemetryEndpoint).toBe("https://collector.example:4317");
 
     // Toggling export OFF disables it while KEEPING the endpoint (so re-enabling needs no re-typing).
     const optedOut = applyUiGlobal(seeded, { ...ui, telemetryEnabled: false });
     expect(optedOut.otel.enabled).toBe(false);
-    expect(optedOut.otel.endpoint).toBe("https://otel-symphony.ops-oma-prod.makewhat.is");
+    expect(optedOut.otel.endpoint).toBe("https://collector.example:4317");
     // Transport fields ride through untouched.
     expect(optedOut.otel.protocol).toBe("grpc");
     expect(optedOut.otel.service_name).toBe("symphony");

@@ -222,7 +222,7 @@ describe("deriveStatTiles", () => {
 
 const PROJECTS: LinearProject[] = [
   { id: "p1", name: "Infrastructure", slug: "symphony-infra-tasks-9c29e9ade060", team: "INF", color: "#34d399" },
-  { id: "p2", name: "Core Platform", slug: "symphony-core-5f1a2b3c4d5e", team: "CORE", color: "#38bdf8" },
+  { id: "p2", name: "Core Platform", slug: "example-core-5f1a2b3c4d5e", team: "CORE", color: "#38bdf8" },
 ];
 
 describe("projectColorMap", () => {
@@ -274,7 +274,7 @@ describe("mergeJobs", () => {
     const history = [
       // same run as the live one (id 10) — should be dropped in favour of the live row
       summary({ id: 10, issue_identifier: "INF-1", outcome: "running" }),
-      summary({ id: 9, issue_identifier: "CORE-2", outcome: "completed", project_slug: "symphony-core-5f1a2b3c4d5e" }),
+      summary({ id: 9, issue_identifier: "CORE-2", outcome: "completed", project_slug: "example-core-5f1a2b3c4d5e" }),
     ];
     const rows = mergeJobs(s, history, PROJECTS, NOW);
     expect(rows).toHaveLength(2);
@@ -513,7 +513,7 @@ describe("searchJobs", () => {
     state(),
     [
       summary({ id: 1, issue_identifier: "INF-231", title: "Sign & notarize the dmg", project_slug: "symphony-infra-tasks-9c29e9ade060" }),
-      summary({ id: 2, issue_identifier: "CORE-118", title: "rate limit headers", project_slug: "symphony-core-5f1a2b3c4d5e" }),
+      summary({ id: 2, issue_identifier: "CORE-118", title: "rate limit headers", project_slug: "example-core-5f1a2b3c4d5e" }),
     ],
     PROJECTS,
     NOW,

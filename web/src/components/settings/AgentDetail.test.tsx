@@ -41,7 +41,7 @@ const global: UiGlobal = {
 };
 
 const linearProjects: LinearProject[] = [
-  { id: "1", name: "Docs", slug: "symphony-docs-22aa44bb66cc", team: "DOCS", color: "#f5b544" },
+  { id: "1", name: "Docs", slug: "example-docs-22aa44bb66cc", team: "DOCS", color: "#f5b544" },
 ];
 
 function agent(over: Partial<UiAgent> = {}): UiAgent {
@@ -49,10 +49,10 @@ function agent(over: Partial<UiAgent> = {}): UiAgent {
     id: "docs",
     name: "Docs Bot",
     color: "#f5b544",
-    projectSlug: "symphony-docs-22aa44bb66cc",
+    projectSlug: "example-docs-22aa44bb66cc",
     projectName: "Docs",
-    repo: "git@github.com:makewhatis/symphony-docs.git",
-    repoShort: "makewhatis/symphony-docs",
+    repo: "git@github.com:example/example-docs.git",
+    repoShort: "example/example-docs",
     milestone: "",
     labels: [],
     enabled: false,

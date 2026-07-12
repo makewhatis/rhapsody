@@ -415,7 +415,7 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
           <TextInput
             mono
             value={value.telemetryEndpoint}
-            placeholder="https://otel-symphony.ops-oma-prod.makewhat.is"
+            placeholder="https://collector.example:4317"
             onChange={(e) => set("telemetryEndpoint", e.target.value)}
           />
         </Field>

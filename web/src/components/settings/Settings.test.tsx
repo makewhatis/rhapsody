@@ -155,7 +155,7 @@ describe("Settings (round-trip controller)", () => {
     fireEvent.change(screen.getByPlaceholderText("Search your Linear projects…"), { target: { value: "Core" } });
     fireEvent.click(screen.getByText("Core Platform"));
     fireEvent.change(screen.getByPlaceholderText("git@github.com:org/repo.git"), {
-      target: { value: "git@github.com:makewhatis/core.git" },
+      target: { value: "git@github.com:example/core.git" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create agent/ }));
     await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1));

@@ -56,9 +56,9 @@ mod tests {
         let cases = [
             (
                 "path-less https gets default",
-                "https://otel-symphony.ops-oma-prod.makewhat.is",
+                "https://collector.example:4317",
                 DEFAULT_LOGS_PATH,
-                "https://otel-symphony.ops-oma-prod.makewhat.is/v1/logs",
+                "https://collector.example:4317/v1/logs",
             ),
             (
                 "root-only path gets default",

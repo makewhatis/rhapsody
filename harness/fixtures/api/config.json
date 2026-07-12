@@ -84,7 +84,7 @@
     "milestone": "",
     "otel": {
       "enabled": false,
-      "endpoint": "https://otel-symphony.ops-oma-prod.makewhat.is",
+      "endpoint": "",
       "insecure": false,
       "protocol": "http",
       "service_name": "symphony"

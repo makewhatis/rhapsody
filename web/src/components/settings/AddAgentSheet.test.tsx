@@ -8,7 +8,7 @@ import { AddAgentSheet } from "@/components/settings/AddAgentSheet";
 
 const projects: LinearProject[] = [
   { id: "1", name: "Infrastructure", slug: "symphony-infra-9c29", team: "INF", color: "#34d399" },
-  { id: "2", name: "Core Platform", slug: "symphony-core-5f1a", team: "CORE", color: "#38bdf8" },
+  { id: "2", name: "Core Platform", slug: "example-core-5f1a", team: "CORE", color: "#38bdf8" },
   { id: "3", name: "Harvest", slug: "acme-harvest-7b2c", team: "HARV", color: "#a78bfa" },
 ];
 
@@ -67,7 +67,7 @@ describe("AddAgentSheet", () => {
   });
 
   it("excludes already-configured projects from the picker (unique-slug rule)", () => {
-    renderSheet({ usedSlugs: ["symphony-core-5f1a"] });
+    renderSheet({ usedSlugs: ["example-core-5f1a"] });
     fireEvent.change(screen.getByPlaceholderText("Search your Linear projects…"), { target: { value: "" } });
     expect(screen.queryByText("Core Platform")).toBeNull(); // already used → not offered
     expect(screen.getByText("Infrastructure")).toBeTruthy();
