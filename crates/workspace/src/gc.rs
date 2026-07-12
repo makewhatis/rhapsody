@@ -2,7 +2,7 @@
 //! worktrees (and clone-mode checkouts) whose most-recent activity predates `now - max_age` and that
 //! are neither in the `keep` snapshot nor reported in-use by the authoritative `live` callback. It is
 //! the workspace counterpart to the store's retention prune: nothing else GCs worktrees, so a durable
-//! `~/.symphony` root would otherwise grow without bound.
+//! `~/.rhapsody` root would otherwise grow without bound.
 //!
 //! Deviations from Go, per the crate's established conventions: `ctx context.Context` becomes
 //! implicit async cancellation (drop the future — the per-worktree awaits are the cancellation

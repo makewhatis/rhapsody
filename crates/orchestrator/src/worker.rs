@@ -168,6 +168,22 @@ pub(crate) fn resolve_prompt_template(
             // read error (permission, a directory) is a real fault and hard-fails below; absolute/host
             // paths always hard-fail.
             if relative && e.kind() == std::io::ErrorKind::NotFound {
+                // TRA-238: the repo-relative prompt defaults moved to `.rhapsody/` (rebrand). A repo
+                // that still ships the pre-rebrand `.symphony/PROMPT.md` (+ `.symphony/PROMPT.dep_mod.md`)
+                // keeps resolving its prompt: when a `.rhapsody/…` prompt is absent from the checkout,
+                // retry the SAME filename under the legacy `.symphony/` directory before soft-falling-back
+                // to the inline prompt. A non-empty legacy file WINS; any other legacy outcome (absent,
+                // empty, or unreadable) leaves the original inline soft-fallback intact — the fallback can
+                // only upgrade a would-be inline run to the legacy repo prompt, never add a failure mode.
+                if let Some(rest) = prompt_file.strip_prefix(".rhapsody/") {
+                    let legacy = std::path::Path::new(ws_path).join(".symphony").join(rest);
+                    if let Ok(b) = std::fs::read(&legacy) {
+                        let text = String::from_utf8_lossy(&b);
+                        if !text.trim().is_empty() {
+                            return Ok((text.into_owned(), String::new()));
+                        }
+                    }
+                }
                 return Ok((
                     prompt_tmpl.to_string(),
                     format!(
@@ -711,6 +727,91 @@ mod tests {
             "err = {err}"
         );
         assert_eq!(ag.start_calls(), 0, "agent must not start");
+    }
+
+    // TRA-238: the repo-relative prompt defaults moved to `.rhapsody/`. A repo that still ships the
+    // pre-rebrand `.symphony/PROMPT.md` keeps resolving its prompt — the resolver retries the legacy
+    // `.symphony/` counterpart when the `.rhapsody/` path is absent from the checkout. This is the
+    // ticket's fallback acceptance (a `.symphony/PROMPT.md`-only repo still resolves).
+    #[test]
+    fn rhapsody_prompt_falls_back_to_legacy_symphony() {
+        let td = TempDir::new();
+        let ws = std::path::Path::new(&td.path);
+        std::fs::create_dir_all(ws.join(".symphony")).unwrap();
+        std::fs::write(
+            ws.join(".symphony/PROMPT.md"),
+            "legacy repo prompt {{ issue.identifier }}",
+        )
+        .unwrap();
+        // Only the legacy `.symphony/PROMPT.md` exists — no `.rhapsody/PROMPT.md`.
+        let (tmpl, warn) =
+            resolve_prompt_template("inline body", ".rhapsody/PROMPT.md", &td.path).unwrap();
+        assert_eq!(
+            tmpl, "legacy repo prompt {{ issue.identifier }}",
+            "the legacy .symphony/PROMPT.md must win over the inline prompt"
+        );
+        assert!(
+            warn.is_empty(),
+            "a resolved fallback is not a warning: {warn:?}"
+        );
+    }
+
+    // The dep-mode prompt (`.rhapsody/PROMPT.dep_mod.md`) flows through the SAME resolver, so it
+    // falls back to `.symphony/PROMPT.dep_mod.md` the same way.
+    #[test]
+    fn rhapsody_dep_mode_prompt_falls_back_to_legacy_symphony() {
+        let td = TempDir::new();
+        let ws = std::path::Path::new(&td.path);
+        std::fs::create_dir_all(ws.join(".symphony")).unwrap();
+        std::fs::write(
+            ws.join(".symphony/PROMPT.dep_mod.md"),
+            "legacy dep-mode prompt",
+        )
+        .unwrap();
+        let (tmpl, warn) =
+            resolve_prompt_template("inline", ".rhapsody/PROMPT.dep_mod.md", &td.path).unwrap();
+        assert_eq!(tmpl, "legacy dep-mode prompt");
+        assert!(warn.is_empty());
+    }
+
+    // When BOTH the new and legacy files exist, the new `.rhapsody/` path WINS (the fallback is only
+    // consulted when the new path is absent).
+    #[test]
+    fn rhapsody_prompt_prefers_new_path_over_legacy() {
+        let td = TempDir::new();
+        let ws = std::path::Path::new(&td.path);
+        std::fs::create_dir_all(ws.join(".rhapsody")).unwrap();
+        std::fs::create_dir_all(ws.join(".symphony")).unwrap();
+        std::fs::write(ws.join(".rhapsody/PROMPT.md"), "new rhapsody prompt").unwrap();
+        std::fs::write(ws.join(".symphony/PROMPT.md"), "legacy prompt").unwrap();
+        let (tmpl, warn) =
+            resolve_prompt_template("inline", ".rhapsody/PROMPT.md", &td.path).unwrap();
+        assert_eq!(
+            tmpl, "new rhapsody prompt",
+            "the new .rhapsody path wins; the legacy fallback is not consulted"
+        );
+        assert!(warn.is_empty());
+    }
+
+    // Neither the new nor the legacy path exists → the original inline soft-fallback, warn naming the
+    // configured (new) path. Proves the fallback adds no new failure mode.
+    #[test]
+    fn rhapsody_prompt_absent_and_no_legacy_soft_falls_back() {
+        let td = TempDir::new();
+        let (tmpl, warn) = resolve_prompt_template(
+            "inline body {{ issue.identifier }}",
+            ".rhapsody/PROMPT.md",
+            &td.path,
+        )
+        .unwrap();
+        assert_eq!(
+            tmpl, "inline body {{ issue.identifier }}",
+            "no repo prompt → inline"
+        );
+        assert!(
+            warn.contains(".rhapsody/PROMPT.md"),
+            "warn must name the configured (new) path: {warn:?}"
+        );
     }
 
     // Mirrors Go `TestWorkerWritesTranscript`: the transcript dir is created and the worker passes a

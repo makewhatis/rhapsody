@@ -42,7 +42,7 @@ export interface PromptSourceProps {
 }
 
 // PromptSource lets a scope (global or per-agent) choose its prompt source. The PRIMARY control is a
-// checkbox that adopts the repo's canonical `.symphony/PROMPT.md` (the repo-level prompt convention,
+// checkbox that adopts the repo's canonical `.rhapsody/PROMPT.md` (the repo-level prompt convention,
 // INF-279): checked stores that path and greys the inline editor; unchecked clears the path (back to
 // inline, or to an inherited file). An "Advanced: custom path" disclosure keeps the original
 // free-form path input + Browse for a non-canonical file. The inline body remains visible as the

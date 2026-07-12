@@ -55,10 +55,10 @@ sed -e "s|__STUB_PORT__|$STUB_PORT|g" \
 # --- boot the daemon (server.port: 0 → ephemeral; runtime.json + DB under $CAPTURE_HOME) ---
 HOME="$CAPTURE_HOME" FAKE_CLAUDE_SLEEP_S=0 "$RHAPSODYD" "$CAPTURE_HOME/WORKFLOW.md" >"$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
-for _ in $(seq 1 100); do [ -f "$CAPTURE_HOME/.symphony/runtime.json" ] && break; sleep 0.1; done
-[ -f "$CAPTURE_HOME/.symphony/runtime.json" ] || {
+for _ in $(seq 1 100); do [ -f "$CAPTURE_HOME/.rhapsody/runtime.json" ] && break; sleep 0.1; done
+[ -f "$CAPTURE_HOME/.rhapsody/runtime.json" ] || {
   echo "boot-e2e: daemon did not publish runtime.json" >&2; cat "$WORK/daemon.log" >&2; exit 1; }
-PORT="$(jq -r .port "$CAPTURE_HOME/.symphony/runtime.json")"
+PORT="$(jq -r .port "$CAPTURE_HOME/.rhapsody/runtime.json")"
 API="http://127.0.0.1:$PORT"
 
 # 1. the published runtime port is live + reachable (the target `rhapsodyd mcp` dials).
@@ -116,5 +116,20 @@ printf '%s' "$mcp_out" | grep -q '"isError":false' || {
   echo "boot-e2e: rhapsodyd mcp symphony_state did not return live daemon state" >&2
   printf '%s\n' "$mcp_out" >&2; cat "$WORK/mcp.err" >&2; exit 1; }
 echo "boot-e2e: rhapsodyd mcp reached the daemon via runtime.json discovery" >&2
+
+# 7. TRA-238: the daemon's runtime home is ~/.rhapsody — it must create it and must NOT create a
+# legacy ~/.symphony. By now the run has completed and `rhapsodyd mcp` has run, so every daemon path
+# (runtime.json, logs, the default workspace root) has been written under $CAPTURE_HOME. The history
+# DB is the harness-chosen $CAPTURE_HOME/symphony.db (the explicit __STORE_PATH__ the config golden
+# pins) — a BARE file, not a ~/.symphony/ directory write — so we assert on the .symphony DIRECTORY,
+# proving the daemon's own runtime home moved off ~/.symphony.
+[ -d "$CAPTURE_HOME/.rhapsody" ] || {
+  echo "boot-e2e: daemon did not create its ~/.rhapsody runtime home" >&2
+  find "$CAPTURE_HOME" >&2; exit 1; }
+if [ -e "$CAPTURE_HOME/.symphony" ]; then
+  echo "boot-e2e: daemon wrote a legacy ~/.symphony path (rebrand regression)" >&2
+  find "$CAPTURE_HOME/.symphony" >&2; exit 1
+fi
+echo "boot-e2e: daemon wrote only under ~/.rhapsody (no legacy ~/.symphony directory)" >&2
 
 echo "boot-e2e: PASS" >&2

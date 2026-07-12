@@ -300,9 +300,10 @@ mod tests {
         assert_eq!(d.poll_interval, "50ms");
         assert_eq!(d.projects.len(), 1);
         assert_eq!(d.projects[0].slug, "proj");
-        // Default storage path ends in symphony.db with retention 30.
+        // Default storage path ends in rhapsody.db with retention 30 (TRA-238: the default DB is
+        // ~/.rhapsody/rhapsody.db, diverging from Go v0.4.0's ~/.symphony/symphony.db).
         assert!(
-            d.storage_path.ends_with("symphony.db"),
+            d.storage_path.ends_with("rhapsody.db"),
             "storage={}",
             d.storage_path
         );

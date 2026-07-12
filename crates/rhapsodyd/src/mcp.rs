@@ -4,7 +4,7 @@
 //! It resolves the SAME WORKFLOW.md the daemon uses (positional arg / `SYMPHONY_WORKFLOW` / default)
 //! to learn the loopback base URL (`server.port`, or the live `runtime.json` port) and which write
 //! tools are enabled, then serves until the peer disconnects or `ctx` is cancelled. It never touches
-//! `~/.symphony` or the DB — all state comes from the daemon's loopback HTTP API (INF-473). stdout is
+//! `~/.rhapsody` or the DB — all state comes from the daemon's loopback HTTP API (INF-473). stdout is
 //! the MCP transport; errors go to stderr.
 
 use std::io::Write;

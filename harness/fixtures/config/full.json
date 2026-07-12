@@ -129,7 +129,7 @@
       "urgent"
     ],
     "logging": {
-      "dir": "~/.symphony/logs"
+      "dir": "~/.rhapsody/logs"
     },
     "mcp": {
       "allow_resume": true,
@@ -192,7 +192,7 @@
           "Duplicate"
         ],
         "claim_mode": "pool",
-        "dep_mode_prompt_file": ".symphony/PROMPT.dep_mod.md",
+        "dep_mode_prompt_file": ".rhapsody/PROMPT.dep_mod.md",
         "dependency_mode": "disabled",
         "effort": "xhigh",
         "enabled": true,

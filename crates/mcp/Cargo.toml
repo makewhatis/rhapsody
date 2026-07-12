@@ -35,7 +35,7 @@ schemars = "1.0"
 # `now - t`, format the human age. The Rust mirror of Go verdict.go's `time.Parse` / `time.Now`.
 chrono = { version = "0.4", features = ["clock"] }
 # libc: `kill(pid, 0)` — the process-liveness probe that mirrors runtimeport.ProcessAlive, so a
-# stale ~/.symphony/runtime.json from a crashed daemon doesn't pin discovery to a dead port. No
+# stale ~/.rhapsody/runtime.json from a crashed daemon doesn't pin discovery to a dead port. No
 # std equivalent exists; libc is already in the workspace lockfile (reqwest/tokio pull it).
 libc = "0.2"
 

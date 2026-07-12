@@ -46,8 +46,11 @@ pub const DEPENDENCY_MODE_GRAPHITE: &str = "graphite";
 pub const DEPENDENCY_MODE_DAG: &str = "dag";
 
 /// The canonical repo-relative path of the mode-on run prompt rendered in graphite/dag mode; the
-/// effective default for `dep_mode_prompt_file` (Go `DefaultDepModePromptFile`, INF-318).
-pub const DEFAULT_DEP_MODE_PROMPT_FILE: &str = ".symphony/PROMPT.dep_mod.md";
+/// effective default for `dep_mode_prompt_file` (Go `DefaultDepModePromptFile`, INF-318). Rebranded
+/// to `.rhapsody/` — the TRA-238 divergence from Go v0.4.0's `.symphony/PROMPT.dep_mod.md`. A repo
+/// that still ships the legacy `.symphony/PROMPT.dep_mod.md` keeps resolving it via the worker's
+/// `.rhapsody`→`.symphony` prompt fallback (see `resolve_prompt_template`).
+pub const DEFAULT_DEP_MODE_PROMPT_FILE: &str = ".rhapsody/PROMPT.dep_mod.md";
 
 /// `claim_mode` DEFAULT: fetch only issues assigned to the API-key owner, no claim election — today's
 /// behavior exactly (Go `ClaimModeAssignee`, INF-477).

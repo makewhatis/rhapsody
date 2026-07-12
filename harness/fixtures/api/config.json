@@ -73,7 +73,7 @@
     "github_summons": false,
     "labels": null,
     "logging": {
-      "dir": "~/.symphony/logs"
+      "dir": "~/.rhapsody/logs"
     },
     "mcp": {
       "allow_resume": false,
@@ -132,7 +132,7 @@
           "Duplicate"
         ],
         "claim_mode": "assignee",
-        "dep_mode_prompt_file": ".symphony/PROMPT.dep_mod.md",
+        "dep_mode_prompt_file": ".rhapsody/PROMPT.dep_mod.md",
         "dependency_mode": "disabled",
         "effort": "",
         "enabled": true,

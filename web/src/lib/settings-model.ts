@@ -17,9 +17,11 @@ import { repoShortName } from "@/lib/project";
 import { GLOBAL_DEFAULTS } from "@/lib/settings-data";
 
 // REPO_PROMPT_PATH is the canonical repo-relative prompt path the "use this repo's prompt" checkbox
-// writes into prompt_file (repo-level prompt feature, INF-279). Mirror of config.DefaultRepoPromptFile
-// in the daemon — reference this constant instead of the literal.
-export const REPO_PROMPT_PATH = ".symphony/PROMPT.md";
+// writes into prompt_file (repo-level prompt feature, INF-279). Mirror of the daemon's
+// DefaultRepoPromptFile, rebranded to .rhapsody/ (TRA-238: the daemon diverges from Go v0.4.0's
+// .symphony/PROMPT.md). A repo that still ships .symphony/PROMPT.md keeps working — the daemon's
+// prompt resolver falls back to the legacy path. Reference this constant instead of the literal.
+export const REPO_PROMPT_PATH = ".rhapsody/PROMPT.md";
 
 // UiOverrides is the sparse per-agent override map (presence = override, absence = inherit).
 export interface UiOverrides {
@@ -617,7 +619,7 @@ export function projectSelectOptions(
 // newProjectConfig builds a fresh agent entry for the Add-agent sheet: it watches the chosen
 // Linear project, points at the given repo, and inherits everything else (empty overrides,
 // null/empty per-agent knobs) from the global defaults. New agents DEFAULT to the repo's own prompt
-// (prompt_file: .symphony/PROMPT.md) — safe because a missing relative file soft-falls-back to the
+// (prompt_file: .rhapsody/PROMPT.md) — safe because a missing relative file soft-falls-back to the
 // inline prompt (INF-279).
 export function newProjectConfig(project: LinearProject, repo: string): ProjectConfigDTO {
   return {

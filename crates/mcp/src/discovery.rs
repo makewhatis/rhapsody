@@ -2,7 +2,9 @@
 //! the daemon. Parity port of `$REF/cmd/symphony/mcp.go`'s `daemonPort` + the READ side of
 //! `$REF/internal/runtimeport/runtimeport.go` (`Read` / `Path` / `ProcessAlive`).
 //!
-//! A running daemon publishes its live loopback port to `~/.symphony/runtime.json` — which reflects
+//! A running daemon publishes its live loopback port to `~/.rhapsody/runtime.json` (TRA-238: the
+//! Rhapsody runtime home, diverging from Go v0.4.0's `~/.symphony`; the Rust daemon writes and this
+//! reader reads the same `.rhapsody` path) — which reflects
 //! a dynamic/ephemeral `--port` (the desktop app's launch mode) — so that wins when present AND its
 //! writer is still alive; otherwise the config `server.port` (a fixed-port CLI daemon) is used. The
 //! WRITE side (publish/remove, atomic-rename semantics) is the infra lane's (T1); the facade only
@@ -28,9 +30,10 @@ struct RuntimeInfo {
     pid: i64,
 }
 
-/// `<home>/.symphony/runtime.json` (runtimeport.go's `Path`, parameterized on the home dir).
+/// `<home>/.rhapsody/runtime.json` (runtimeport.go's `Path`, parameterized on the home dir; the
+/// rebranded Rhapsody home, TRA-238 — kept in lockstep with `rhapsody_core::runtimeport`).
 fn runtime_path_in(home: &Path) -> PathBuf {
-    home.join(".symphony").join(FILE_NAME)
+    home.join(".rhapsody").join(FILE_NAME)
 }
 
 /// Reads the published runtime info under `home` (the read core of runtimeport.go's `Read`). `None`
@@ -99,9 +102,9 @@ mod tests {
     use super::*;
     use crate::testutil::{TempDir, test_config};
 
-    /// Writes `~/.symphony/runtime.json` under `home` with the given port + pid.
+    /// Writes `~/.rhapsody/runtime.json` under `home` with the given port + pid.
     fn write_runtime(home: &Path, port: i64, pid: i64) {
-        let dir = home.join(".symphony");
+        let dir = home.join(".rhapsody");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("runtime.json"),

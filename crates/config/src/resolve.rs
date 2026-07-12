@@ -57,10 +57,13 @@ pub fn resolve(mut config: Config, workflow_dir: &str) -> Result<Resolved, Confi
     config.tracker.api_key = resolve_var(&config.tracker.api_key);
 
     // workspace.root: $VAR + ~ + relative-to-workflow-dir + absolute. Default
-    // ~/.symphony/symphony_workspaces (a DURABLE location alongside the DB + logs, NOT $TMPDIR).
+    // ~/.rhapsody/workspaces (a DURABLE location alongside the DB + logs, NOT $TMPDIR). Rhapsody's
+    // runtime home is ~/.rhapsody — an INTENTIONAL divergence from Go v0.4.0's ~/.symphony
+    // (TRA-238; the port's first deliberate behavioral divergence — see the DIVERGENCES section in
+    // the root README). The logs/db defaults below diverge the same way.
     let mut root = resolve_var(&config.workspace.root);
     if root.is_empty() {
-        root = "~/.symphony/symphony_workspaces".to_string();
+        root = "~/.rhapsody/workspaces".to_string();
     }
     root = expand_tilde(&root);
     if !is_abs(&root) {
@@ -71,7 +74,7 @@ pub fn resolve(mut config: Config, workflow_dir: &str) -> Result<Resolved, Confi
     // logging.dir: $VAR + ~ + relative-to-workflow-dir + absolute (same normalization as root).
     let mut log_dir = resolve_var(&config.logging.dir);
     if log_dir.is_empty() {
-        log_dir = "~/.symphony/logs".to_string();
+        log_dir = "~/.rhapsody/logs".to_string();
     }
     log_dir = expand_tilde(&log_dir);
     if !is_abs(&log_dir) {
@@ -79,14 +82,15 @@ pub fn resolve(mut config: Config, workflow_dir: &str) -> Result<Resolved, Confi
     }
     config.logging.dir = clean(&abs(&log_dir)?);
 
-    // storage.path: $VAR + ~ + absolute. Default ~/.symphony/symphony.db. "off" (case-insensitive)
-    // and ":memory:" (exact) are sentinels honored verbatim — NOT path-resolved. Evaluate them
-    // against the resolved+trimmed value. Unlike root/logging, a relative storage path anchors to
-    // the CWD (filepath.Abs), NOT workflow_dir, and its Abs error is swallowed (path stays as-is).
+    // storage.path: $VAR + ~ + absolute. Default ~/.rhapsody/rhapsody.db (TRA-238 divergence; see the
+    // workspace-root note above). "off" (case-insensitive) and ":memory:" (exact) are sentinels
+    // honored verbatim — NOT path-resolved. Evaluate them against the resolved+trimmed value. Unlike
+    // root/logging, a relative storage path anchors to the CWD (filepath.Abs), NOT workflow_dir, and
+    // its Abs error is swallowed (path stays as-is).
     let mut sp = resolve_var(&config.storage.path);
     sp = sp.trim().to_string();
     if sp.is_empty() {
-        sp = "~/.symphony/symphony.db".to_string();
+        sp = "~/.rhapsody/rhapsody.db".to_string();
     }
     if sp.eq_ignore_ascii_case("off") || sp == ":memory:" {
         config.storage.path = sp; // pass sentinel through verbatim
@@ -363,13 +367,14 @@ mod tests {
         assert_eq!(r.workspace.root, "/home/user/project/ws");
     }
 
-    // Mirrors Go `TestResolveWorkspaceRootDefault`.
+    // Mirrors Go `TestResolveWorkspaceRootDefault`, but asserts Rhapsody's ~/.rhapsody/workspaces
+    // default — the TRA-238 divergence from Go v0.4.0's ~/.symphony/symphony_workspaces.
     #[test]
     fn workspace_root_default() {
         let mut c = decode_blank();
         c.workspace.root = String::new();
         let r = resolve(c, "/tmp/wf").expect("resolve");
-        let want = clean(&expand_tilde("~/.symphony/symphony_workspaces"));
+        let want = clean(&expand_tilde("~/.rhapsody/workspaces"));
         assert_eq!(r.workspace.root, want);
         assert!(Path::new(&r.workspace.root).is_absolute());
         assert!(!r.workspace.root.contains('~'), "root not normalized");
@@ -414,11 +419,12 @@ mod tests {
 
     // ---- storage_test.go mirrors (the Resolve/default half; the ValidateDispatch cases are C5) ----
 
-    // Mirrors Go `TestStorageDefaultPath`.
+    // Mirrors Go `TestStorageDefaultPath`, but asserts Rhapsody's ~/.rhapsody/rhapsody.db default —
+    // the TRA-238 divergence from Go v0.4.0's ~/.symphony/symphony.db.
     #[test]
     fn storage_default_path() {
         let cfg = decode_resolve_storage(None, "/wf");
-        let want = clean(&expand_tilde("~/.symphony/symphony.db"));
+        let want = clean(&expand_tilde("~/.rhapsody/rhapsody.db"));
         assert_eq!(cfg.storage.path, want, "default storage path");
         assert_eq!(cfg.storage.retention_days, Some(30), "retention default");
         // Neither off nor in-memory (Go: !Storage.Off() && !Storage.InMemory()).

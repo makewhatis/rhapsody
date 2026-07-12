@@ -8,8 +8,10 @@
 //! (after the listener binds) and removes it on clean shutdown; `symphony mcp` reads it and prefers
 //! it over the stale config port (INF-473).
 //!
-//! The file lives at a single well-known path (`~/.symphony/runtime.json`) so writer and reader
-//! agree with no configuration. This assumes ONE daemon per machine, which the daemon's
+//! The file lives at a single well-known path (`~/.rhapsody/runtime.json`) so writer and reader
+//! agree with no configuration. (TRA-238: Rhapsody's runtime home is `~/.rhapsody`, an intentional
+//! divergence from Go v0.4.0's `~/.symphony` — the Rust daemon and the Rust `rhapsodyd mcp` reader
+//! both use `.rhapsody`, so they still agree.) This assumes ONE daemon per machine, which the daemon's
 //! single-instance flock enforces per config; concurrent daemons for distinct configs share this one
 //! file (last writer wins), so a `symphony mcp` for a non-owning config falls back to its config
 //! `server.port` — an accepted limitation for that uncommon setup.
@@ -51,17 +53,17 @@ fn home_dir() -> io::Result<PathBuf> {
     }
 }
 
-/// `<home>/.symphony/runtime.json` — the same durable home the DB and logs default to.
+/// `<home>/.rhapsody/runtime.json` — the same durable home the DB and logs default to (TRA-238).
 fn runtime_path_in(home: &Path) -> PathBuf {
-    home.join(".symphony").join(FILE_NAME)
+    home.join(".rhapsody").join(FILE_NAME)
 }
 
-/// Returns `~/.symphony/runtime.json`. Mirrors Go `Path`.
+/// Returns `~/.rhapsody/runtime.json`. Mirrors Go `Path` (rebranded home, TRA-238).
 pub fn path() -> io::Result<PathBuf> {
     Ok(runtime_path_in(&home_dir()?))
 }
 
-/// Publishes the daemon's live loopback port, creating `~/.symphony` if needed and recording the
+/// Publishes the daemon's live loopback port, creating `~/.rhapsody` if needed and recording the
 /// current PID. Writes atomically (unique temp file + rename) so a concurrent reader never observes a
 /// torn file, and overwrites any existing record (a fresh daemon supersedes a stale one). Mirrors Go
 /// `Write`.
@@ -110,7 +112,7 @@ pub fn process_alive(pid: i32) -> bool {
 //
 // The public `write`/`read`/`remove` resolve `$HOME`; these take the home directory explicitly so
 // the tests drive them against a per-test temp home — never touching a live daemon's
-// ~/.symphony/runtime.json, and running race-free without mutating process-global env (the same
+// ~/.rhapsody/runtime.json, and running race-free without mutating process-global env (the same
 // directory-injection the sibling `obslog::Store::new(dir)` / `liveness::group_cpu(root, …)` ports
 // use in place of Go's `t.Setenv`).
 
@@ -119,7 +121,7 @@ pub fn process_alive(pid: i32) -> bool {
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn write_in(home: &Path, port: i32) -> io::Result<()> {
-    let dir = home.join(".symphony");
+    let dir = home.join(".rhapsody");
     // The tree defaults to owner-only (the DB and transcripts under it may hold secrets): dir 0700.
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -229,7 +231,7 @@ mod tests {
         }
 
         fn runtime_file(&self) -> PathBuf {
-            self.path.join(".symphony").join(FILE_NAME)
+            self.path.join(".rhapsody").join(FILE_NAME)
         }
     }
 
@@ -239,7 +241,7 @@ mod tests {
         }
     }
 
-    // Mirrors Go `TestWriteReadRemoveRoundTrip`: the file lands at ~/.symphony/runtime.json, reads
+    // Mirrors Go `TestWriteReadRemoveRoundTrip`: the file lands at ~/.rhapsody/runtime.json, reads
     // back the port + writing PID, and Read after Remove is NotFound.
     #[test]
     fn write_read_remove_round_trip() {
@@ -297,8 +299,8 @@ mod tests {
     #[test]
     fn remove_leaves_file_owned_by_another_process() {
         let home = TempHome::new();
-        let dir = home.path.join(".symphony");
-        std::fs::create_dir_all(&dir).expect("mkdir .symphony");
+        let dir = home.path.join(".rhapsody");
+        std::fs::create_dir_all(&dir).expect("mkdir .rhapsody");
         let other = std::process::id() as i32 + 1;
         std::fs::write(
             dir.join(FILE_NAME),

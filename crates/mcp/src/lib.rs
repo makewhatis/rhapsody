@@ -1,6 +1,6 @@
 //! rhapsody-mcp — parity port of Go `internal/mcpfacade` (the `symphony mcp` local MCP facade,
 //! INF-473). A thin, read-mostly server over the daemon's loopback `/api/v1` HTTP API, built on the
-//! official `rmcp` SDK. It reads NOTHING from `~/.symphony` or the DB except the daemon's published
+//! official `rmcp` SDK. It reads NOTHING from `~/.rhapsody` or the DB except the daemon's published
 //! port (`runtime.json` discovery) — the daemon stays the single source of truth; daemon down ⇒ a
 //! clear `daemon_unreachable` error.
 //!

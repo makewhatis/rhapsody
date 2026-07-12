@@ -405,7 +405,7 @@ mod tests {
 
     // A minimal valid workflow, HERMETIC: the tracker points at a dead loopback address (fetches fail
     // fast, non-fatal), and workspace.root + logging.dir + storage stay inside the temp dir so a test
-    // NEVER writes into the real `~/.symphony` (which on the self-hosted CI runner may hold a live
+    // NEVER writes into the real `~/.rhapsody` (which on the self-hosted CI runner may hold a live
     // daemon's DB / runtime.json). `storage_block` + `extra_block` are top-level YAML blocks. Literal
     // api_key (not `$VAR`) avoids a process-global env mutation racing parallel tests — see bootcfg.
     fn write_wf(dir: &TempDir, storage_block: &str, extra_block: &str) -> PathBuf {
@@ -478,7 +478,7 @@ mod tests {
 
     // Mirrors Go `TestRunValidationFailureExitsNonZero`: missing api_key → startup validation fails.
     // storage.path is forced off (hermetic): the store is opened before the loop's validation, so a
-    // default path would create a real ~/.symphony DB before the daemon rejects the config.
+    // default path would create a real ~/.rhapsody DB before the daemon rejects the config.
     #[tokio::test(flavor = "multi_thread")]
     async fn run_validation_failure_exits_nonzero() {
         let dir = TempDir::new();

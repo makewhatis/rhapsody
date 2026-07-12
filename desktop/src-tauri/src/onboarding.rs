@@ -9,9 +9,12 @@ use serde::Serialize;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Canonical repo-relative prompt path the onboarding config seeds into `prompt_file` (repo-level
-/// prompt feature, INF-279). Mirrors `config.DefaultRepoPromptFile`; kept in sync with the daemon's
-/// `rhapsody-config`, which the desktop cannot import (separate build).
-const REPO_PROMPT_FILE: &str = ".symphony/PROMPT.md";
+/// prompt feature, INF-279). Mirrors the daemon's `DefaultRepoPromptFile`, rebranded to `.rhapsody/`
+/// (TRA-238; the daemon diverges from Go v0.4.0's `.symphony/PROMPT.md`). Kept in sync with the
+/// daemon's `rhapsody-config`, which the desktop cannot import (separate build). A repo that still
+/// ships the legacy `.symphony/PROMPT.md` keeps resolving via the daemon's `.rhapsody`→`.symphony`
+/// prompt fallback.
+const REPO_PROMPT_FILE: &str = ".rhapsody/PROMPT.md";
 
 /// The internal fleet-observability hub the onboarding config seeds as `otel.endpoint` (INF-442).
 /// Mirrors `config.DefaultOtelEndpoint`. Kept VERBATIM for runtime parity — the generated WORKFLOW.md
@@ -107,10 +110,11 @@ pub fn render_initial_workflow(project_slug: &str) -> Result<Vec<u8>, Error> {
             model: "claude-opus-4-8",
             turn_timeout_ms: 21_600_000,
         },
-        // Persist run history under ~/.symphony so it survives reboots (also the resolved default;
-        // kept explicit so the generated WORKFLOW.md the user sees is self-documenting).
+        // Persist run history under ~/.rhapsody so it survives reboots (also the resolved default;
+        // kept explicit so the generated WORKFLOW.md the user sees is self-documenting). TRA-238:
+        // ~/.rhapsody/rhapsody.db diverges from Go v0.4.0's ~/.symphony/symphony.db.
         storage: Storage {
-            path: "~/.symphony/symphony.db",
+            path: "~/.rhapsody/rhapsody.db",
         },
         // Export telemetry to the internal fleet-observability hub by default (INF-299). The endpoint is
         // tailnet-only; off-tailnet the exporter drops/retries silently and is never fatal. Users opt
@@ -179,8 +183,8 @@ mod tests {
         );
         assert_eq!(
             cfg["storage"]["path"].as_str(),
-            Some("~/.symphony/symphony.db"),
-            "want persistent history under ~/.symphony"
+            Some("~/.rhapsody/rhapsody.db"),
+            "want persistent history under ~/.rhapsody"
         );
         assert!(!body.trim().is_empty(), "prompt body is empty");
     }
@@ -232,7 +236,7 @@ mod tests {
         let cfg = front_yaml(&data);
         assert_eq!(
             cfg["prompt_file"].as_str(),
-            Some(".symphony/PROMPT.md"),
+            Some(".rhapsody/PROMPT.md"),
             "want the repo-prompt default"
         );
         let (_, body) = split_front_body(&data);

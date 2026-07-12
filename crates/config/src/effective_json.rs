@@ -27,7 +27,8 @@
 //!
 //! Second, `global`/`projects` derive from `Decode(def)`, NOT `Resolve`: Go `buildConfigJSON` calls
 //! `config.Decode`, never `Resolve`. The fixtures confirm it — `global.workspace.root` is
-//! `"~/symphony_workspaces"` (unexpanded ~), `global.logging.dir` is `"~/.symphony/logs"`, and
+//! `"~/symphony_workspaces"` (full.md's explicit, unexpanded value), `global.logging.dir` is the
+//! `"~/.rhapsody/logs"` default (the TRA-238 divergence from Go's `~/.symphony/logs`), and
 //! `storage.retention_days` is `null` for the minimal/graphite configs, all pre-resolution values.
 //! Rendering from a `Resolved` would absolutize those paths and default retention to 30, breaking
 //! the golden. So [`render`] decodes the `Definition` internally (best-effort), matching the Go GET

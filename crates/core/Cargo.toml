@@ -9,7 +9,7 @@ repository.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 regex = "1"
-# serde_json: `runtimeport` marshals/reads the `~/.symphony/runtime.json` `Info` record (Go
+# serde_json: `runtimeport` marshals/reads the `~/.rhapsody/runtime.json` `Info` record (Go
 # `encoding/json`). Already in the workspace lock (config/store/tracker/… depend on it) — no new
 # crate enters Cargo.lock.
 serde_json = "1"

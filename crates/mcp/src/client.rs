@@ -2,7 +2,7 @@
 //! `$REF/internal/mcpfacade/client.go`.
 //!
 //! [`Client`] carries the resolved loopback base URL (`127.0.0.1:<port>`) and a `reqwest` client
-//! (15s timeout, the mirror of Go's `*http.Client`). It reads NOTHING from `~/.symphony` or the DB
+//! (15s timeout, the mirror of Go's `*http.Client`). It reads NOTHING from `~/.rhapsody` or the DB
 //! — the daemon stays the single source of truth (INF-473). Every failure maps to a
 //! [`FacadeError`]: the daemon's `errorEnvelope` code when the HTTP layer answered, or
 //! `daemon_unreachable` when the daemon could not be contacted at all.

@@ -14,7 +14,7 @@ tracker:
   review_states: [In Review]
   review_promote_state: In Progress
   dependency_mode: graphite
-  dep_mode_prompt_file: .symphony/PROMPT.dep_mod.md
+  dep_mode_prompt_file: .rhapsody/PROMPT.dep_mod.md
 git_flow: graphite
 polling:
   interval_ms: 500

@@ -326,7 +326,8 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         deps.project_slug = rp.slug.clone(); // surfaced to hooks as SYMPHONY_PROJECT
     }
     // Prompt selection by dependency_mode (INF-318): graphite/dag mode renders the mode-on prompt
-    // (`.symphony/PROMPT.dep_mod.md`); disabled mode leaves `prompt_file` untouched (byte-identical).
+    // (`.rhapsody/PROMPT.dep_mod.md` by default, TRA-238); disabled mode leaves `prompt_file`
+    // untouched (byte-identical).
     let (mode, dep_prompt) = match rp {
         Some(rp) => (
             rp.dependency_mode.as_str(),

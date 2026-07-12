@@ -239,7 +239,7 @@ impl App {
     }
 
     /// Builds the app from the environment — the OnStartup path resolution: the WORKFLOW.md
-    /// (`SYMPHONY_WORKFLOW` override, else `~/.symphony/WORKFLOW.md`), the `rhapsodyd` sidecar
+    /// (`SYMPHONY_WORKFLOW` override, else `~/.rhapsody/WORKFLOW.md`), the `rhapsodyd` sidecar
     /// (`SYMPHONY_DAEMON` dev override, else the app bundle's `Resources`, else PATH), the tool-override
     /// prefs (`~/.symphony/tools.json`), and the credential file fallback (`~/.symphony/credentials`).
     /// A missing sidecar is logged and left empty (the daemon simply cannot start until it is found),
@@ -899,7 +899,8 @@ impl App {
 }
 
 /// Resolves the WORKFLOW.md the app supervises: a `SYMPHONY_WORKFLOW` override (dev), else
-/// `~/.symphony/WORKFLOW.md`. `HOME` is read directly, matching `os.UserHomeDir` on macOS. Mirrors Go
+/// `~/.rhapsody/WORKFLOW.md` (TRA-238: Rhapsody's runtime home, diverging from Go v0.4.0's
+/// `~/.symphony`). `HOME` is read directly, matching `os.UserHomeDir` on macOS. Mirrors Go
 /// `resolveWorkflowPath`.
 fn resolve_workflow_path() -> Option<PathBuf> {
     resolve_workflow_path_from(
@@ -910,7 +911,7 @@ fn resolve_workflow_path() -> Option<PathBuf> {
 
 /// Pure resolver for [`resolve_workflow_path`], taking the env values so it is unit-testable without
 /// mutating the process environment. A non-empty override wins; otherwise a non-empty home yields
-/// `<home>/.symphony/WORKFLOW.md`; an empty/absent home (Go's `os.UserHomeDir` error) yields `None`.
+/// `<home>/.rhapsody/WORKFLOW.md`; an empty/absent home (Go's `os.UserHomeDir` error) yields `None`.
 fn resolve_workflow_path_from(
     workflow_override: Option<&str>,
     home: Option<&str>,
@@ -921,7 +922,7 @@ fn resolve_workflow_path_from(
         return Some(PathBuf::from(p));
     }
     match home {
-        Some(h) if !h.is_empty() => Some(Path::new(h).join(".symphony").join("WORKFLOW.md")),
+        Some(h) if !h.is_empty() => Some(Path::new(h).join(".rhapsody").join("WORKFLOW.md")),
         _ => None,
     }
 }
@@ -1204,7 +1205,7 @@ mod tests {
     fn resolve_ignores_an_empty_override_and_uses_home() {
         assert_eq!(
             resolve_workflow_path_from(Some(""), Some("/home/u")),
-            Some(PathBuf::from("/home/u/.symphony/WORKFLOW.md")),
+            Some(PathBuf::from("/home/u/.rhapsody/WORKFLOW.md")),
         );
     }
 
@@ -1212,7 +1213,7 @@ mod tests {
     fn resolve_defaults_to_home_when_no_override() {
         assert_eq!(
             resolve_workflow_path_from(None, Some("/home/u")),
-            Some(PathBuf::from("/home/u/.symphony/WORKFLOW.md")),
+            Some(PathBuf::from("/home/u/.rhapsody/WORKFLOW.md")),
         );
     }
 

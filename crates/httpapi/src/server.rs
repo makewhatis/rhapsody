@@ -340,7 +340,7 @@ impl Server {
         self.listener.local_addr()
     }
 
-    /// Publish this server's ACTUAL bound loopback port to `~/.symphony/runtime.json` via T1's
+    /// Publish this server's ACTUAL bound loopback port to `~/.rhapsody/runtime.json` via T1's
     /// [`rhapsody_core::runtimeport`] (REUSED, not reimplemented), so `symphony mcp` — an operator's
     /// CLI and the workers the daemon injects — can reach a daemon launched on a dynamic/ephemeral
     /// `--port` instead of the stale `server.port` in WORKFLOW.md. `local_addr` resolves the real port
@@ -352,7 +352,7 @@ impl Server {
     /// Go's `cmd/symphony/run.go` — which is also where Go places and tests `runtimeport.Write`, so
     /// like Go there is no httpapi-level test here (T1's `runtimeport` unit tests cover the atomic
     /// write; F1's boot e2e covers the daemon-to-`symphony mcp` round-trip). No httpapi test drives it
-    /// because `runtimeport::write` targets the single shared `~/.symphony/runtime.json`, which a
+    /// because `runtimeport::write` targets the single shared `~/.rhapsody/runtime.json`, which a
     /// test must not clobber on the self-hosted CI runner (a live daemon may own it).
     pub fn publish_runtime_port(&self) -> std::io::Result<()> {
         let port = self.local_addr()?.port();

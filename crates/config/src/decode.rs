@@ -159,8 +159,11 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         port: r.server.port,
     };
 
+    // logging.dir default: ~/.rhapsody/logs — the TRA-238 divergence from Go v0.4.0's ~/.symphony/logs
+    // (Rhapsody's runtime home; see resolve.rs + the root README DIVERGENCES section). Resolve carries
+    // the same default for hand-built configs.
     let logging = Logging {
-        dir: or_str(r.logging.dir, "~/.symphony/logs"),
+        dir: or_str(r.logging.dir, "~/.rhapsody/logs"),
     };
 
     // storage mapped verbatim; path/retention defaults are applied in Resolve (C4).
@@ -689,11 +692,12 @@ mod tests {
         assert!(!c.claude.ultracode);
     }
 
-    // Mirrors Go `TestDecodeLoggingDefault`.
+    // Mirrors Go `TestDecodeLoggingDefault`, but asserts Rhapsody's ~/.rhapsody/logs default — the
+    // TRA-238 divergence from Go v0.4.0's ~/.symphony/logs.
     #[test]
     fn decode_logging_default() {
         let c = decode_yaml("", "body");
-        assert_eq!(c.logging.dir, "~/.symphony/logs");
+        assert_eq!(c.logging.dir, "~/.rhapsody/logs");
     }
 
     // Mirrors Go `TestDecodeLoggingOverride`.

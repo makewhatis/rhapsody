@@ -149,6 +149,25 @@ done
 [ "$success_ok" = "1" ] || { echo "capture: could not obtain a clean single-run success snapshot" >&2; exit 1; }
 
 # ------------------------------------------------------------------------------------------------
+# TRA-238 divergence: rebrand the Go daemon's ~/.symphony/* config DEFAULTS to Rhapsody's own runtime
+# home in the captured CONFIG goldens. This is the port's FIRST intentional divergence from Go v0.4.0
+# (see the DIVERGENCES section in the root README). The Rust config crate resolves these same Rhapsody
+# strings as its effective defaults, so config/*.json + api/config.json still gate parity — they just
+# gate it against the divergence. ONLY the two default strings below, and ONLY in the config goldens,
+# are rewritten; EVERY other golden — including the Go-written transcript paths in api/history.json +
+# db/go-daemon-rows.json, and the explicit __STORE_PATH__ (<HOME>/symphony.db) — stays a byte-exact
+# record of Go's output. Re-running `make fixtures` re-derives this deterministically (idempotent: the
+# swap is a no-op once applied, e.g. graphite.md already carries the .rhapsody value).
+#   ~/.symphony/logs            -> ~/.rhapsody/logs           (logging.dir default)
+#   .symphony/PROMPT.dep_mod.md -> .rhapsody/PROMPT.dep_mod.md (dep_mode_prompt_file default)
+echo "capture: applying TRA-238 ~/.rhapsody config-default divergence to the config goldens" >&2
+for f in "$FIX"/config/minimal.json "$FIX"/config/full.json "$FIX"/config/graphite.json "$FIX"/api/config.json; do
+  sed -e 's#~/\.symphony/logs#~/.rhapsody/logs#g' \
+      -e 's#\.symphony/PROMPT\.dep_mod\.md#.rhapsody/PROMPT.dep_mod.md#g' \
+      "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+done
+
+# ------------------------------------------------------------------------------------------------
 # Go-written database fixture (Task S1): commit the success run's SQLite DB so rhapsody-store can
 # round-trip a real daemon-written file in CI without ever opening $REF. The daemon runs SQLite in
 # WAL mode (see $REF/internal/store/sqlite.go) and stop_stack kills it without a clean checkpoint,
