@@ -5,6 +5,7 @@ import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/re
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { GlobalConfigDTO, ProjectConfigDTO, TypedConfigResponse } from "@/lib/api";
 import { fetchTypedConfig } from "@/lib/api";
+import type { ToolResult } from "@/lib/bindings";
 
 function makeGlobal(): GlobalConfigDTO {
   return {
@@ -49,6 +50,7 @@ const h = vi.hoisted(() => ({
   saveTypedConfig: vi.fn(),
   setLinearToken: vi.fn(async () => {}),
   clearLinearToken: vi.fn(async () => {}),
+  probeTools: vi.fn(async (): Promise<ToolResult[]> => []),
 }));
 
 vi.mock("@/lib/api", async (orig) => {
@@ -76,6 +78,7 @@ vi.mock("@/lib/bindings", () => ({
   clearLinearToken: h.clearLinearToken,
   pickDirectory: vi.fn(async () => ""),
   appVersion: vi.fn(async () => null), // plain-browser: no build stamp (RailVersion falls back to "dev")
+  probeTools: h.probeTools, // the shell mounts the preflight/doctor probe for the rail warning dot (D6)
 }));
 
 import { Settings } from "@/components/settings/Settings";
@@ -112,6 +115,8 @@ afterEach(() => {
 beforeEach(() => {
   // Echo the posted config so the post-save re-sync (onSuccess setQueryData) has a valid payload.
   h.saveTypedConfig.mockImplementation(async (global, projects) => ({ config: {}, prompt_body: "", global, projects }));
+  // Default: a clean preflight (no CLIs / no warnings) so the rail dot stays dark unless a test opts in.
+  h.probeTools.mockResolvedValue([]);
 });
 
 describe("Settings (autosave controller)", () => {
@@ -193,5 +198,29 @@ describe("Settings (autosave controller)", () => {
     await screen.findByText("No agents yet"); // back to the (now empty) list as a pending edit
     await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1), { timeout: 2000 });
     expect(h.saveTypedConfig.mock.calls[0][1]).toHaveLength(0);
+  });
+});
+
+describe("Settings rail (Tools warning dot — D6)", () => {
+  it("lights the rail's Tools amber dot when the preflight/doctor reports a warning", async () => {
+    // gh missing from PATH → a doctor warning, even though we're viewing the General tab.
+    h.probeTools.mockResolvedValueOnce([
+      { name: "gh", path: "", found: false, healthy: false, version: "", detail: "Not found on PATH" },
+    ]);
+    renderSettings("general");
+    await screen.findByText("Linear connection");
+    expect(await screen.findByRole("img", { name: "Tools — warnings" })).toBeTruthy();
+  });
+
+  it("leaves the rail's Tools dot dark when every required CLI is healthy", async () => {
+    h.probeTools.mockResolvedValue([
+      { name: "claude", path: "/c", found: true, healthy: true, version: "1", detail: "ok" },
+      { name: "git", path: "/g", found: true, healthy: true, version: "2", detail: "ok" },
+    ]);
+    renderSettings("general");
+    await screen.findByText("Linear connection");
+    // give the probe a tick to resolve, then assert the warning dot never appears
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole("img", { name: /warnings/ })).toBeNull();
   });
 });

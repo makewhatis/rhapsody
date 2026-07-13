@@ -17,6 +17,7 @@ import {
   applyUiGlobal,
   autosaveView,
   clampProjectCaps,
+  doctorHasWarnings,
   duplicateSlugs,
   globalPromoteValid,
   newProjectConfig,
@@ -26,6 +27,7 @@ import {
   type UiAgent,
   type UiGlobal,
 } from "@/lib/settings-model";
+import { useToolDoctor } from "@/hooks/useToolDoctor";
 import { handleTablistKeyDown } from "@/components/shell/tabs";
 import {
   ComingSoonPanel,
@@ -107,7 +109,14 @@ function RailItem({ tabId, label, active, onClick, badge, warn }: RailItemProps)
       }}
     >
       <span style={{ flex: 1 }}>{label}</span>
-      {warn ? <StatusDot color="var(--amber)" size={6} aria-label="warnings" /> : null}
+      {warn ? (
+        // 6px amber dot lit only while the doctor has warnings (mock 2a–2c). role="img"+aria-label
+        // gives it an accessible name (StatusDot itself is decorative) so the warning is announced
+        // and testable from the rail without opening the Tools tab.
+        <span role="img" aria-label={`${label} — warnings`} style={{ display: "inline-flex" }}>
+          <StatusDot color="var(--amber)" size={6} />
+        </span>
+      ) : null}
       {badge != null ? (
         <span
           className="mono"
@@ -198,6 +207,12 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
   const statuses = useProjectStatuses();
   const save = useSaveTypedConfig();
   const qc = useQueryClient();
+  // The preflight/doctor probe, shared with the Tools tab via TanStack's cache (same query key). It
+  // mounts here so the probe runs as soon as Settings opens ("re-checked on launch"), lighting the
+  // rail's Tools amber dot even before the Tools tab is visited. The Tools tab's "Re-run preflight"
+  // updates the same cache, so the dot re-derives without any extra wiring.
+  const doctor = useToolDoctor();
+  const toolsWarn = doctorHasWarnings(doctor.data ?? []);
 
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [dirty, setDirty] = React.useState(false);
@@ -485,8 +500,9 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
                 active={tab === s.id}
                 onClick={() => onTab(s.id)}
                 badge={s.id === "projects" ? projectCount : undefined}
-                // The Tools warning dot is lit from the doctor's results in D6; no doctor source yet.
-                warn={s.id === "tools" ? false : undefined}
+                // The Tools warning dot lights whenever the preflight/doctor probe reports a warning
+                // (a required CLI missing from PATH or unhealthy) — derived from the shared doctor query.
+                warn={s.id === "tools" ? toolsWarn : undefined}
               />
             ))}
           </div>

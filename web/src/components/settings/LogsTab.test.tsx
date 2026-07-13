@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, fireEvent, within } from "@testing-library/react";
 import type { LogLine, LogStreamStatus } from "@/hooks/useLogStream";
-import { LogsTab, shouldStickToBottom } from "@/components/settings/LogsTab";
+import { LogsTab } from "@/components/settings/LogsTab";
 
 // Mock the SSE hook so the tab test is deterministic (the hook's EventSource handling is
 // covered separately). The mock is mutated per-test before render.
@@ -33,14 +33,14 @@ describe("LogsTab", () => {
     expect(screen.getByText("poll tick")).toBeTruthy();
     expect(screen.getByText("dispatch failed")).toBeTruthy();
     // attr key=value is rendered alongside the message
-    expect(screen.getByText("eligible=")).toBeTruthy();
+    expect(screen.getByText("eligible=3")).toBeTruthy();
   });
 
   it("shows the live status and the visible line count", () => {
     state.lines = [line({ seq: 1 })];
     state.status = "open";
     render(<LogsTab />);
-    expect(screen.getByText("Live")).toBeTruthy();
+    expect(screen.getByText("live")).toBeTruthy();
     expect(screen.getByText("1 line")).toBeTruthy();
   });
 
@@ -57,11 +57,44 @@ describe("LogsTab", () => {
     expect(screen.getByText("err-line")).toBeTruthy();
   });
 
+  it("tracks the live count as the filter narrows", () => {
+    state.lines = [
+      line({ seq: 1, level: "INFO", msg: "a" }),
+      line({ seq: 2, level: "WARN", msg: "b" }),
+      line({ seq: 3, level: "ERROR", msg: "c" }),
+    ];
+    render(<LogsTab />);
+    expect(screen.getByText("3 lines")).toBeTruthy();
+    fireEvent.click(screen.getByRole("tab", { name: "Warn+" }));
+    expect(screen.getByText("2 lines")).toBeTruthy();
+  });
+
+  it("tints WARN rows amber and labels them WRN", () => {
+    state.lines = [line({ seq: 1, level: "WARN", msg: "restarting daemon" })];
+    render(<LogsTab />);
+    expect(screen.getByText("WRN")).toBeTruthy();
+    // the row carries the amber warn-row tint token
+    const row = screen.getByText("restarting daemon").closest("div");
+    expect(row?.style.background).toContain("--tint-warn-row");
+  });
+
   it("invokes clear() from the Clear button", () => {
     state.lines = [line({ seq: 1 })];
     render(<LogsTab />);
     fireEvent.click(screen.getByRole("button", { name: /Clear/ }));
     expect(clear).toHaveBeenCalledOnce();
+  });
+
+  it("pauses and resumes follow mode from the footer control", () => {
+    state.lines = [line({ seq: 1, msg: "a" }), line({ seq: 2, msg: "b" })];
+    render(<LogsTab />);
+    // starts following → the footer offers "pause follow"
+    expect(screen.getByText("following — newest at bottom")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /pause follow/ }));
+    // paused → the footer swaps to "jump to latest"
+    expect(screen.getByText("paused — scrolled up")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /jump to latest/ }));
+    expect(screen.getByText("following — newest at bottom")).toBeTruthy();
   });
 
   it("surfaces an unavailable stream as an empty-state note", () => {
@@ -101,25 +134,5 @@ describe("LogsTab console", () => {
     render(<LogsTab />);
     const consoleEl = screen.getByTestId("log-console");
     expect(within(consoleEl).getByText("in-console")).toBeTruthy();
-  });
-});
-
-// shouldStickToBottom is the race-free auto-scroll decision: follow the tail only when the user was
-// at/near the bottom BEFORE the new line appended (measured against the previous content height).
-describe("shouldStickToBottom", () => {
-  it("sticks on the first render (no prior height yet)", () => {
-    expect(shouldStickToBottom(0, 100, 0)).toBe(true);
-  });
-
-  it("sticks when the viewport was at — or within the threshold of — the previous bottom", () => {
-    // prevHeight 300, viewport bottom = scrollTop(200)+clientHeight(100) = 300 → exactly at bottom
-    expect(shouldStickToBottom(200, 100, 300)).toBe(true);
-    // 290 vs 300 → within the 32px stick threshold
-    expect(shouldStickToBottom(190, 100, 300)).toBe(true);
-  });
-
-  it("does NOT stick when the user scrolled up beyond the threshold (so a new line can't yank them)", () => {
-    // viewport bottom 150, prevHeight 300 → 150 < 268 → reading earlier output
-    expect(shouldStickToBottom(50, 100, 300)).toBe(false);
   });
 });

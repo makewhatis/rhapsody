@@ -9,6 +9,9 @@ export interface FollowScroll {
   onScroll: React.UIEventHandler<HTMLElement>;
   /** Scroll to the bottom and resume following (the "jump to latest ↓" action). */
   jumpToLatest: () => void;
+  /** Release follow-mode WITHOUT scrolling (the logs "pause follow ⏸" button, D6): stop auto-pinning
+   *  to the tail while leaving the reader where they are. Resume via jumpToLatest or scrolling down. */
+  pause: () => void;
 }
 
 // useFollowScroll keeps a scroll container pinned to its bottom as new content streams in, and
@@ -48,5 +51,7 @@ export function useFollowScroll(
     setFollowing(true);
   }, [ref]);
 
-  return { following, onScroll, jumpToLatest };
+  const pause = React.useCallback(() => setFollowing(false), []);
+
+  return { following, onScroll, jumpToLatest, pause };
 }

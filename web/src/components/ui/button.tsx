@@ -9,8 +9,8 @@ import { cn } from "@/lib/utils";
 // uses, so nothing is forked.
 //
 // The CVA default stays variant="default"/size="default" (NOT the package's subtle/md
-// default) so the legacy dashboard's bare <Button> call sites (e.g. SettingsView "Save",
-// EventSearch submit) keep their primary look; new UI passes explicit variants.
+// default) so the legacy dashboard's bare <Button> call sites keep their primary look; new UI
+// passes explicit variants.
 //
 // NOTE on key order: `size` is declared before `variant` so that variant classes are
 // emitted last and win twMerge conflicts — this lets `link` collapse the height/padding

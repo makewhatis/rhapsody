@@ -13,6 +13,7 @@ import type {
   ProjectConfigDTO,
   ProjectStatus,
 } from "@/lib/api";
+import type { ToolResult } from "@/lib/bindings";
 import { repoShortName } from "@/lib/project";
 import { GLOBAL_DEFAULTS } from "@/lib/settings-data";
 
@@ -675,6 +676,83 @@ export function autosaveView(i: {
   if (i.error) return { kind: "error", message: i.error };
   if (i.saving || i.dirty) return { kind: "saving" };
   return { kind: "saved" };
+}
+
+// ============================================================================
+// Settings · Tools + Logs derivations (P10-D6, mocks 2c/2d)
+//
+// Pure UI-derivations for the Tools (preflight/doctor) and Logs tabs, kept here beside the other
+// settings derivations (agentSeats, autosaveView) so they are unit-testable in the node-environment
+// Vitest setup — the plan's D6 acceptance calls for tests of the level filter + the warning→rail-dot
+// derivation, and the tab components stay thin DOM shells over these.
+// ============================================================================
+
+// LogLevelFilter is the Logs tab's segmented level selector (mock 2d): "All" shows everything,
+// "Info+" hides DEBUG, "Warn+" keeps WARN and ERROR, "Error" keeps only ERROR.
+export type LogLevelFilter = "all" | "info" | "warn" | "error";
+
+export const LOG_LEVEL_FILTERS: { id: LogLevelFilter; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "info", label: "Info+" },
+  { id: "warn", label: "Warn+" },
+  { id: "error", label: "Error" },
+];
+
+// logLevelRank orders severities so a "Warn+" filter keeps WARN and ERROR, a "Info+" filter drops
+// DEBUG, and so on. An unknown/blank level ranks as INFO (the daemon's default slog level) rather
+// than being silently dropped by a stricter filter.
+export function logLevelRank(level: string): number {
+  switch (level.trim().toUpperCase()) {
+    case "DEBUG":
+      return 0;
+    case "WARN":
+      return 2;
+    case "ERROR":
+      return 3;
+    default:
+      return 1; // INFO (and any unrecognized level)
+  }
+}
+
+// LOG_FILTER_MIN_RANK is the lowest severity each filter admits ("all" admits everything via -1).
+const LOG_FILTER_MIN_RANK: Record<LogLevelFilter, number> = { all: -1, info: 1, warn: 2, error: 3 };
+
+// logLinePasses reports whether a log line at `level` clears the selected level filter (mock 2d).
+export function logLinePasses(level: string, filter: LogLevelFilter): boolean {
+  return logLevelRank(level) >= LOG_FILTER_MIN_RANK[filter];
+}
+
+// ToolRowState collapses a preflight ToolResult onto the two visual states mock 2c draws: a healthy
+// CLI ("ok", sage dot) or one that needs attention ("warn", amber dot + row tint). The mock treats a
+// binary missing from PATH as the amber WARNING state (not a separate red error), so both "not found"
+// and "found but unhealthy" (e.g. an out-of-date version) fold into "warn".
+export type ToolRowState = "ok" | "warn";
+
+export function toolRowState(t: Pick<ToolResult, "found" | "healthy">): ToolRowState {
+  return t.found && t.healthy ? "ok" : "warn";
+}
+
+// doctorHasWarnings drives the rail's Tools amber dot (mock 2a–2c: "'Tools' carries a 6px amber dot
+// only while the doctor has warnings"): true when ANY probed CLI is in the warning state. An empty
+// list — no probe result yet, or the desktop bridge absent in a plain browser — is NOT a warning: we
+// can't warn about tools we never checked, so the dot stays dark until a probe surfaces a real gap.
+export function doctorHasWarnings(tools: readonly ToolResult[]): boolean {
+  return tools.some((t) => toolRowState(t) === "warn");
+}
+
+// preflightAgeLabel renders how long ago the last preflight probe completed, for the Tools header
+// ("preflight ran Xm ago"). `updatedAt`/`now` are epoch-ms (TanStack Query's dataUpdatedAt + a
+// ticking clock). Sub-minute reads as "just now", then whole minutes, then whole hours. A zero/absent
+// timestamp (no successful probe yet) returns null so the caller can show a "running preflight…"
+// placeholder instead of a misleading "0m ago".
+export function preflightAgeLabel(updatedAt: number, now: number): string | null {
+  if (!updatedAt || updatedAt <= 0) return null;
+  const sec = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  if (sec < 60) return "just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  return `${hr}h ago`;
 }
 
 // newProjectConfig builds a fresh agent entry for the Add-agent sheet: it watches the chosen

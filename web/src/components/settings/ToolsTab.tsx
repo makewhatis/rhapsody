@@ -1,74 +1,57 @@
 import * as React from "react";
-import { useQuery } from "@tanstack/react-query";
 import {
-  AlertTriangle,
   Button,
-  Check,
-  Download,
-  Folder,
-  type IconComponent,
+  CheckCircle,
   Linear,
-  Refresh,
+  RotateCcw,
   SectionCard,
-  Shield,
   SkeletonCard,
+  StatusDot,
   Terminal,
   TextInput,
-  X,
 } from "@/components/ui";
-import { installTool, pickFile, probeTools, setToolOverride, type ToolResult } from "@/lib/bindings";
+import { pickFile, setToolOverride, type ToolResult } from "@/lib/bindings";
 import { useLinearIdentity } from "@/hooks/useConfig";
+import { useToolDoctor } from "@/hooks/useToolDoctor";
+import { useNow } from "@/hooks/useNow";
+import { preflightAgeLabel, toolRowState, type ToolRowState } from "@/lib/settings-model";
 
-type ToolStatus = "ok" | "warn" | "not-found";
+// The tail the "Not found on PATH" copy shares with the summon flow — the warning message on a
+// missing-binary row (mock 2c). A CLI Rhapsody shells out to that isn't on PATH breaks the PR checks
+// and the @rhapsody summon re-engage, so the row spells out the consequence rather than a bare error.
+const NOT_FOUND_MESSAGE = "Not found on PATH — PR checks and summons will fail";
 
-const LIGHT: Record<ToolStatus, { color: string; bg: string; ring: string; label: string; icon: IconComponent }> = {
-  ok: { color: "var(--em-bright)", bg: "var(--em-soft)", ring: "rgba(16,185,129,.3)", label: "Ready", icon: Check },
-  warn: { color: "var(--amber)", bg: "var(--amber-soft)", ring: "rgba(245,181,68,.3)", label: "Warning", icon: AlertTriangle },
-  "not-found": { color: "var(--red)", bg: "var(--red-soft)", ring: "rgba(239,83,80,.3)", label: "Not found", icon: X },
-};
-
-// Static sub-labels the design shows beside the command (the daemon's ToolResult has no sub).
+// Static sub-labels the design shows beside a binary name (the daemon's ToolResult has no `sub`).
 const SUB: Record<string, string> = { gt: "Graphite", git: "system" };
 
-const ROW_GRID = "26px minmax(150px,1fr) minmax(180px,1.3fr) auto";
+// A row's amber border, derived from the amber token so the warning "Set path…" affordance stays in
+// the D1 palette (no hardcoded rgba) — mirrors TextInput's color-mix invalid border.
+const AMBER_BORDER = "color-mix(in srgb, var(--amber) 35%, transparent)";
 
-function toolStatus(t: ToolResult): ToolStatus {
-  if (!t.found) return "not-found";
-  return t.healthy ? "ok" : "warn";
-}
-
-// Missing CLI → Install; present-but-unhealthy (e.g. an update available) → Update; healthy → none.
-function toolAction(t: ToolResult): "Install" | "Update" | null {
-  if (!t.found) return "Install";
-  if (!t.healthy) return "Update";
-  return null;
-}
-
+// ToolRow — one required-CLI preflight row (mock 2c): a status dot + binary name, a version/detail
+// line (or the amber "not found" warning), an editable path-override field, and an Override…/Set
+// path… action. Healthy rows read sage; a missing OR unhealthy binary reads amber (row tint + dot +
+// message). The path field is editable so an override can be typed/pasted even where the native file
+// picker isn't wired (the daemon-served browser has no PickFile binding), and re-syncs from a fresh
+// probe only while the user isn't editing it.
 function ToolRow({
   t,
   last,
   onPickPath,
   onSetPath,
-  onAction,
 }: {
   t: ToolResult;
   last: boolean;
   onPickPath: () => void;
   onSetPath: (path: string) => void;
-  onAction: () => void;
 }) {
-  const status = toolStatus(t);
-  const m = LIGHT[status];
-  const StatusIcon = m.icon;
-  const action = toolAction(t);
+  const state: ToolRowState = toolRowState(t);
+  const warn = state === "warn";
   const sub = SUB[t.name];
-  // The path field is editable so an override can be typed/pasted (persisted via the existing
-  // setToolOverride binding) even where the native file picker isn't wired; keep it in sync when a
-  // re-probe changes the detected/overridden path.
   const [path, setPath] = React.useState(t.path);
   const [focused, setFocused] = React.useState(false);
-  // Sync the field from probe results only when the user ISN'T editing it — otherwise a refetch
-  // (triggered by another row's override/install) would clobber an in-progress edit.
+  // Sync the field from a probe result only when the user ISN'T editing it — otherwise a refetch
+  // (triggered by another row's override) would clobber an in-progress edit.
   React.useEffect(() => {
     if (!focused) setPath(t.path);
   }, [t.path, focused]);
@@ -83,123 +66,98 @@ function ToolRow({
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: ROW_GRID,
-        gap: 18,
+        gridTemplateColumns: "minmax(150px,1.1fr) minmax(190px,1.6fr) auto",
+        gap: 16,
         alignItems: "center",
-        padding: "16px 22px",
-        borderBottom: last ? "none" : "1px solid var(--line-2)",
+        padding: "13px 16px",
+        background: warn ? "var(--tint-warn-row)" : "transparent",
+        borderBottom: last ? "none" : "1px solid var(--hair-section)",
       }}
     >
-      {/* status light */}
-      <div
-        style={{
-          width: 26,
-          height: 26,
-          borderRadius: "50%",
-          display: "grid",
-          placeItems: "center",
-          background: m.bg,
-          border: `1px solid ${m.ring}`,
-          color: m.color,
-        }}
-      >
-        <StatusIcon size={status === "warn" ? 13 : 14} style={status === "warn" ? undefined : { strokeWidth: 2.4 }} />
-      </div>
-      {/* name + cmd + version + detail */}
-      <div style={{ minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 9 }}>
-          <span className="mono" style={{ fontSize: 14, fontWeight: 600, color: "var(--tx)" }}>
-            {t.name}
-          </span>
-          {sub ? <span style={{ fontSize: 12, color: "var(--tx-3)" }}>{sub}</span> : null}
-        </div>
-        <div style={{ fontSize: 12, color: "var(--tx-3)", marginTop: 3, display: "flex", alignItems: "center", gap: 7 }}>
-          {t.version ? (
-            <span className="mono" style={{ color: "var(--tx-2)" }}>
-              v{t.version}
+      {/* status dot + name + version/message line */}
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 10, minWidth: 0 }}>
+        <span style={{ display: "inline-flex", marginTop: 4 }}>
+          <StatusDot color={warn ? "var(--amber)" : "var(--sage)"} size={7} />
+        </span>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+            <span className="mono" style={{ fontSize: 12, fontWeight: 600, color: "var(--ink)" }}>
+              {t.name}
             </span>
+            {sub ? <span style={{ fontSize: 11, color: "var(--faint)" }}>{sub}</span> : null}
+          </div>
+          {warn ? (
+            <div style={{ fontSize: 11.5, color: "var(--amber)", marginTop: 3 }}>
+              {t.found ? t.detail || "Needs attention" : NOT_FOUND_MESSAGE}
+            </div>
           ) : (
-            <span style={{ color: m.color }}>—</span>
+            <div
+              className="mono"
+              style={{ fontSize: 11.5, color: "var(--faint)", marginTop: 3, display: "flex", gap: 7 }}
+            >
+              {t.version ? <span style={{ color: "var(--text-muted)" }}>v{t.version}</span> : null}
+              {t.version && t.detail ? <span>·</span> : null}
+              {t.detail ? <span>{t.detail}</span> : null}
+            </div>
           )}
-          <span style={{ color: "var(--tx-faint)" }}>·</span>
-          <span style={{ color: status === "ok" ? "var(--tx-3)" : m.color }}>{t.detail}</span>
         </div>
       </div>
-      {/* path override */}
-      <div style={{ display: "flex", gap: 8 }}>
-        <TextInput
-          value={path}
-          mono
-          placeholder="Auto-detect from PATH"
-          aria-label={`${t.name} path override`}
-          onChange={(e) => setPath(e.target.value)}
-          onFocus={() => setFocused(true)}
-          onBlur={() => {
-            setFocused(false);
-            commitPath();
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-          }}
-          style={{ height: 36, fontSize: 12, flex: 1 }}
-        />
-        <Button
-          variant="subtle"
-          size="sm"
-          icon={Folder}
-          aria-label={`Choose path for ${t.name}`}
-          onClick={onPickPath}
-          style={{ paddingLeft: 11, paddingRight: 11 }}
-        />
-      </div>
-      {/* remediation */}
+      {/* editable path override */}
+      <TextInput
+        value={path}
+        mono
+        placeholder="Auto-detect from PATH"
+        aria-label={`${t.name} path override`}
+        onChange={(e) => setPath(e.target.value)}
+        onFocus={() => setFocused(true)}
+        onBlur={() => {
+          setFocused(false);
+          commitPath();
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+        style={{ height: 32, fontSize: 11.5 }}
+      />
+      {/* override action — a plain path override is the mock's universal remediation (2c) */}
       <div style={{ display: "flex", justifyContent: "flex-end" }}>
-        {action ? (
-          <Button variant={status === "not-found" ? "primary" : "subtle"} size="sm" icon={action === "Install" ? Download : Refresh} onClick={onAction}>
-            {action}
-          </Button>
-        ) : (
-          <span style={{ fontSize: 12, color: "var(--tx-faint)", display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <Check size={13} style={{ color: "var(--em-bright)" }} />
-            {m.label}
-          </span>
-        )}
+        <Button
+          variant={warn ? "subtle" : "ghost"}
+          size="sm"
+          aria-label={`${warn ? "Set" : "Override"} ${t.name} path`}
+          onClick={onPickPath}
+          style={warn ? { borderColor: AMBER_BORDER, color: "var(--amber)" } : undefined}
+        >
+          {warn ? "Set path…" : "Override…"}
+        </Button>
       </div>
     </div>
   );
 }
 
-// ToolsTab — the app-side preflight panel (Go bindings, NOT the daemon). A summary banner over a
-// read-only Linear mirror and the required-CLI rows (claude/gh/gt/git): each row shows a status
-// light, version + detail, a path-override field with a folder picker, and an Install/Update
-// action wired to the supervisor. Re-run preflight re-probes via the `toolcheck` binding. Ported
-// from the design `tools.jsx`.
+// ToolsTab — the app-side preflight/doctor panel (mock 2c). It runs the Go `probeTools` binding (NOT
+// the daemon) via the shared useToolDoctor query, so the Settings rail's amber warning dot and this
+// tab derive off the same result. It shows the last-probe age + a "Re-run preflight" action, a
+// read-only mirror of the Linear connection configured on General, and the required-CLI rows with the
+// amber warning state for a binary missing from PATH.
 export function ToolsTab() {
-  const tools = useQuery({ queryKey: ["tools"], queryFn: probeTools, refetchOnWindowFocus: false });
+  const doctor = useToolDoctor();
   const identity = useLinearIdentity();
-  const list = tools.data ?? [];
-  const okCount = list.filter((t) => toolStatus(t) === "ok").length;
-  const issues = list.length - okCount;
+  const now = useNow(30_000);
+  const list = doctor.data ?? [];
   const account = identity.data;
-  // No tool data (after loading) means the toolcheck binding isn't reachable — e.g. the
-  // daemon-served browser UI with no Wails bridge — or the probe failed. That is NOT "all systems
-  // ready"; surface it distinctly so an empty list never reads as a clean bill of health.
-  const unavailable = !tools.isLoading && (tools.isError || list.length === 0);
-  // When unavailable (probe error / no bridge) don't render the cached rows — they'd be stale and
-  // contradict the "preflight unavailable" banner; show the empty-state note instead.
-  const displayList = unavailable ? [] : list;
 
   const [actionError, setActionError] = React.useState<string | null>(null);
 
   const applyOverride = (name: string, path: string) => {
     setActionError(null);
     void setToolOverride(name, path)
-      .then(() => tools.refetch())
+      .then(() => doctor.refetch())
       .catch((e: unknown) => {
         // The Go binding rejects a path that isn't an executable. Surface it and re-probe so the
         // field snaps back to the actual detected path rather than implying the override stuck.
         setActionError(e instanceof Error ? e.message : `Couldn't set the ${name} path.`);
-        void tools.refetch();
+        void doctor.refetch();
       });
   };
   const pickPath = (name: string) => {
@@ -208,18 +166,18 @@ export function ToolsTab() {
       if (path) applyOverride(name, path);
     });
   };
-  const runAction = (name: string) => {
-    setActionError(null);
-    void installTool(name)
-      .then(() => tools.refetch())
-      .catch((e: unknown) => setActionError(e instanceof Error ? e.message : `Couldn't install ${name}.`));
-  };
   const reRun = () => {
     setActionError(null);
-    void tools.refetch();
+    void doctor.refetch();
   };
 
-  if (tools.isLoading && !tools.data) {
+  // "preflight ran Xm ago" (mock 2c). dataUpdatedAt is 0 until the first successful probe; ageLabel is
+  // null until then, so the header reads "running preflight…" during the initial launch probe.
+  const ageLabel = preflightAgeLabel(doctor.dataUpdatedAt, now);
+  const headerText =
+    doctor.isError && !doctor.data ? "preflight failed" : ageLabel ? `preflight ran ${ageLabel}` : "running preflight…";
+
+  if (doctor.isLoading && !doctor.data) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
         <SkeletonCard />
@@ -230,50 +188,12 @@ export function ToolsTab() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      {/* summary banner */}
-      <div
-        style={{
-          background: "var(--bg-card)",
-          border: "1px solid var(--line)",
-          borderRadius: "var(--r-card)",
-          padding: "18px 22px",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 16,
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <div
-            style={{
-              width: 38,
-              height: 38,
-              borderRadius: 11,
-              display: "grid",
-              placeItems: "center",
-              background: issues || unavailable ? "var(--amber-soft)" : "var(--em-soft)",
-              border: `1px solid ${issues || unavailable ? "rgba(245,181,68,.3)" : "rgba(16,185,129,.3)"}`,
-              color: issues || unavailable ? "var(--amber)" : "var(--em-bright)",
-            }}
-          >
-            <Shield size={19} />
-          </div>
-          <div>
-            <div style={{ fontSize: 14.5, fontWeight: 600 }}>
-              {unavailable
-                ? "Tool preflight unavailable"
-                : issues
-                  ? `${issues} issue${issues > 1 ? "s" : ""} need attention`
-                  : "All systems ready"}
-            </div>
-            <div style={{ fontSize: 12.5, color: "var(--tx-3)", marginTop: 2 }}>
-              {unavailable
-                ? "Required-CLI checks run inside the Symphony desktop app."
-                : `${okCount} of ${list.length} required CLIs detected · re-checked on launch`}
-            </div>
-          </div>
-        </div>
-        <Button variant="subtle" icon={Refresh} onClick={reRun}>
+      {/* preflight header: last-run age + Re-run */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 12 }}>
+        <span className="mono" style={{ fontSize: 10.5, color: "var(--faint)" }}>
+          {headerText}
+        </span>
+        <Button variant="subtle" size="sm" icon={RotateCcw} onClick={reRun}>
           Re-run preflight
         </Button>
       </div>
@@ -284,8 +204,8 @@ export function ToolsTab() {
           style={{
             fontSize: 12.5,
             color: "var(--red)",
-            background: "var(--red-soft)",
-            border: "1px solid rgba(239,83,80,.3)",
+            background: "var(--tint-red)",
+            border: "1px solid var(--border-danger)",
             borderRadius: "var(--r-ctrl)",
             padding: "10px 14px",
           }}
@@ -294,9 +214,9 @@ export function ToolsTab() {
         </div>
       ) : null}
 
-      {/* Linear connection mirror */}
+      {/* Linear connection mirror — read-only reflection of the General-tab account */}
       <SectionCard title="Linear connection" icon={Linear} desc="Mirrors the account configured on the General tab.">
-        <div style={{ display: "grid", gridTemplateColumns: ROW_GRID, gap: 18, alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <div
             style={{
               width: 26,
@@ -304,51 +224,65 @@ export function ToolsTab() {
               borderRadius: "50%",
               display: "grid",
               placeItems: "center",
-              background: account?.connected ? "var(--em-soft)" : "var(--bg-raised)",
-              border: account?.connected ? "1px solid rgba(16,185,129,.3)" : "1px solid var(--line)",
-              color: account?.connected ? "var(--em-bright)" : "var(--tx-3)",
+              background: account?.connected ? "var(--tint-sage)" : "rgba(255,255,255,.03)",
+              border: account?.connected ? "1px solid color-mix(in srgb, var(--sage) 30%, transparent)" : "1px solid var(--hair-card)",
+              color: account?.connected ? "var(--sage)" : "var(--faint)",
             }}
           >
-            {account?.connected ? <Check size={14} style={{ strokeWidth: 2.4 }} /> : <X size={14} />}
+            <CheckCircle size={14} />
           </div>
-          <div>
-            <div style={{ fontSize: 14, fontWeight: 600 }}>Linear API</div>
-            <div style={{ fontSize: 12, color: "var(--tx-3)", marginTop: 3 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Linear API</div>
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
               {account?.connected ? (
                 <>
-                  Connected as <span style={{ color: "var(--tx-2)" }}>{account.name}</span>
+                  Connected as <span style={{ color: "var(--text-2)" }}>{account.name}</span>
                 </>
               ) : (
                 "Not connected"
               )}
             </div>
           </div>
-          <div className="mono" style={{ fontSize: 12, color: "var(--tx-3)" }}>
-            {account?.token}
-          </div>
-          <span style={{ justifySelf: "end", fontSize: 12, color: "var(--tx-faint)", display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <Check size={13} style={{ color: account?.connected ? "var(--em-bright)" : "var(--tx-faint)" }} />
+          {account?.token ? (
+            <span className="mono" style={{ fontSize: 12, color: "var(--faint)" }}>
+              {account.token}
+            </span>
+          ) : null}
+          <span
+            style={{
+              justifySelf: "end",
+              fontSize: 11.5,
+              color: account?.connected ? "var(--sage)" : "var(--faint)",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+            }}
+          >
+            <CheckCircle size={13} />
             {account?.connected ? "Authenticated" : "Not authenticated"}
           </span>
         </div>
       </SectionCard>
 
       {/* Required CLIs */}
-      <SectionCard title="Required CLIs" icon={Terminal} desc="Symphony shells out to these tools. Override a path if a binary isn't on your PATH.">
-        <div style={{ background: "var(--bg-card-2)", border: "1px solid var(--line)", borderRadius: "var(--r-card)" }}>
-          {displayList.length === 0 ? (
-            <div style={{ padding: "28px 22px", textAlign: "center", color: "var(--tx-3)", fontSize: 13 }}>
-              No CLIs detected. Launch the Symphony desktop app to run the preflight checks.
+      <SectionCard
+        title="Required CLIs"
+        icon={Terminal}
+        desc="Rhapsody shells out to these tools. Override a path if a binary isn't on your PATH."
+      >
+        <div style={{ border: "1px solid var(--hair-card)", borderRadius: "var(--r-card)", overflow: "hidden" }}>
+          {list.length === 0 ? (
+            <div style={{ padding: "26px 16px", textAlign: "center", color: "var(--faint)", fontSize: 12.5 }}>
+              No required CLIs detected.
             </div>
           ) : (
-            displayList.map((t, i) => (
+            list.map((t, i) => (
               <ToolRow
                 key={t.name}
                 t={t}
-                last={i === displayList.length - 1}
+                last={i === list.length - 1}
                 onPickPath={() => pickPath(t.name)}
                 onSetPath={(p) => applyOverride(t.name, p)}
-                onAction={() => runAction(t.name)}
               />
             ))
           )}

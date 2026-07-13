@@ -5,6 +5,7 @@ import type {
   ProjectConfigDTO,
   ProjectStatus,
 } from "@/lib/api";
+import type { ToolResult } from "@/lib/bindings";
 import {
   agentSeats,
   applyUiAgent,
@@ -12,14 +13,19 @@ import {
   autosaveView,
   backoffToMs,
   clampProjectCaps,
+  doctorHasWarnings,
   duplicateSlugs,
   effectiveModel,
   globalPromoteValid,
+  logLinePasses,
+  logLevelRank,
   msToBackoff,
   newProjectConfig,
+  preflightAgeLabel,
   projectSelectOptions,
   REPO_PROMPT_PATH,
   reviewPromoteValid,
+  toolRowState,
   toUiAgents,
   toUiGlobal,
 } from "@/lib/settings-model";
@@ -856,5 +862,107 @@ describe("autosaveView (autosave state machine — retires the Save button)", ()
   it("returns to 'saving' once the block clears, then 'saved' after persist", () => {
     expect(autosaveView({ ...base, dirty: true, blocked: null })).toEqual({ kind: "saving" });
     expect(autosaveView(base)).toEqual({ kind: "saved" });
+  });
+});
+
+// tool builds a preflight ToolResult; override the fields a case cares about.
+function tool(over: Partial<ToolResult>): ToolResult {
+  return { name: "claude", path: "/bin/claude", found: true, healthy: true, version: "1.0", detail: "ok", ...over };
+}
+
+describe("logLevelRank (Logs level ordering — 2d)", () => {
+  it("orders DEBUG < INFO < WARN < ERROR", () => {
+    expect(logLevelRank("DEBUG")).toBeLessThan(logLevelRank("INFO"));
+    expect(logLevelRank("INFO")).toBeLessThan(logLevelRank("WARN"));
+    expect(logLevelRank("WARN")).toBeLessThan(logLevelRank("ERROR"));
+  });
+
+  it("is case-insensitive and tolerant of whitespace", () => {
+    expect(logLevelRank(" warn ")).toBe(logLevelRank("WARN"));
+    expect(logLevelRank("error")).toBe(logLevelRank("ERROR"));
+  });
+
+  it("ranks an unknown/blank level as INFO (never silently dropped by a stricter filter)", () => {
+    expect(logLevelRank("")).toBe(logLevelRank("INFO"));
+    expect(logLevelRank("TRACE")).toBe(logLevelRank("INFO"));
+  });
+});
+
+describe("logLinePasses (Logs segmented filter — 2d)", () => {
+  it("'all' admits every level, DEBUG included", () => {
+    for (const lvl of ["DEBUG", "INFO", "WARN", "ERROR"]) {
+      expect(logLinePasses(lvl, "all")).toBe(true);
+    }
+  });
+
+  it("'info' hides DEBUG but keeps INFO and above", () => {
+    expect(logLinePasses("DEBUG", "info")).toBe(false);
+    expect(logLinePasses("INFO", "info")).toBe(true);
+    expect(logLinePasses("WARN", "info")).toBe(true);
+    expect(logLinePasses("ERROR", "info")).toBe(true);
+  });
+
+  it("'warn' keeps only WARN and ERROR", () => {
+    expect(logLinePasses("INFO", "warn")).toBe(false);
+    expect(logLinePasses("WARN", "warn")).toBe(true);
+    expect(logLinePasses("ERROR", "warn")).toBe(true);
+  });
+
+  it("'error' keeps only ERROR", () => {
+    expect(logLinePasses("WARN", "error")).toBe(false);
+    expect(logLinePasses("ERROR", "error")).toBe(true);
+  });
+});
+
+describe("toolRowState + doctorHasWarnings (Tools warning→rail-dot derivation — 2c)", () => {
+  it("a found + healthy CLI is 'ok'", () => {
+    expect(toolRowState(tool({ found: true, healthy: true }))).toBe("ok");
+  });
+
+  it("a missing binary is 'warn' (folded into the amber warning state, not a red error)", () => {
+    expect(toolRowState(tool({ found: false, healthy: false }))).toBe("warn");
+  });
+
+  it("a present-but-unhealthy binary is 'warn'", () => {
+    expect(toolRowState(tool({ found: true, healthy: false }))).toBe("warn");
+  });
+
+  it("lights the rail dot when ANY tool warns (e.g. gh missing)", () => {
+    const tools = [
+      tool({ name: "claude", found: true, healthy: true }),
+      tool({ name: "gh", found: false, healthy: false }),
+    ];
+    expect(doctorHasWarnings(tools)).toBe(true);
+  });
+
+  it("leaves the rail dot dark when every tool is healthy", () => {
+    expect(doctorHasWarnings([tool({ name: "claude" }), tool({ name: "git" })])).toBe(false);
+  });
+
+  it("treats an empty probe (no result / no desktop bridge) as no warning, not a false alarm", () => {
+    expect(doctorHasWarnings([])).toBe(false);
+  });
+});
+
+describe("preflightAgeLabel (Tools header 'preflight ran Xm ago' — 2c)", () => {
+  const now = 1_000_000_000_000;
+
+  it("returns null when no probe has completed yet (0 / absent timestamp)", () => {
+    expect(preflightAgeLabel(0, now)).toBeNull();
+  });
+
+  it("reads a sub-minute age as 'just now'", () => {
+    expect(preflightAgeLabel(now - 5_000, now)).toBe("just now");
+    expect(preflightAgeLabel(now - 59_000, now)).toBe("just now");
+  });
+
+  it("renders whole minutes, then whole hours", () => {
+    expect(preflightAgeLabel(now - 2 * 60_000, now)).toBe("2m ago");
+    expect(preflightAgeLabel(now - 59 * 60_000, now)).toBe("59m ago");
+    expect(preflightAgeLabel(now - 3 * 3_600_000, now)).toBe("3h ago");
+  });
+
+  it("clamps a future timestamp (clock skew) to 'just now' rather than a negative age", () => {
+    expect(preflightAgeLabel(now + 10_000, now)).toBe("just now");
   });
 });
