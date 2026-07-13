@@ -2,8 +2,14 @@
 # Package a built Rhapsody.app into a drag-to-Applications .dmg installer.
 # Parity port of $REF/desktop/scripts/make-dmg.sh (Symphony.app -> Rhapsody.app).
 #
-# Prefers create-dmg (`brew install create-dmg`) for a polished installer window; falls back to
-# hdiutil so the target works on a no-dependency baseline (e.g. a fresh machine or headless build).
+# Prefers create-dmg (`brew install create-dmg`) for a polished installer window, but ALWAYS falls
+# back to a robust image+ditto path — because on macOS 15+ (Sequoia/Tahoe) `hdiutil create
+# -srcfolder <app>` fails with "hdiutil: create failed - Operation not permitted" (preceded by
+# "could not access /Volumes/<vol>/<app>"). Root cause: a code-signed app acquires the kernel-only
+# `com.apple.provenance` xattr the first time it is validated/run, and `hdiutil -srcfolder` (which
+# create-dmg also uses internally) cannot replicate that protected xattr onto its synthesized volume.
+# CI never hits this because it never launches the app; a developer who ran the app locally does.
+#
 # Invoked by the Makefile's `make dmg` / `make _dmg` targets.
 #
 # Usage: make-dmg.sh <App.app> <out.dmg> [volume-name]
@@ -26,52 +32,59 @@ rm -f "$DMGOUT"
 
 app_name="$(basename "$APP")"
 
-# Both create-dmg and `hdiutil create` stage a volume at /Volumes/$VOLNAME. If one is already mounted
-# there — a leftover attachment from an interrupted run, or the app opened from a distributed .dmg —
-# the create fails with "hdiutil: create failed - Operation not permitted". Detach any stale volume at
-# that mountpoint first (best-effort) so the build is self-healing. This machine also hosts the release
-# runner, where an open Rhapsody.dmg would otherwise break the signed-dmg build.
+# create-dmg stages a volume at /Volumes/$VOLNAME; a leftover attachment from an interrupted run — or
+# the app opened from a distributed .dmg — makes it fail. Detach any stale volume there first.
 detach_stale_volume() {
   local mp="/Volumes/$VOLNAME"
   [ -d "$mp" ] || return 0
   echo "make-dmg: a volume is already mounted at $mp; detaching it before packaging" >&2
   hdiutil detach -force "$mp" >/dev/null 2>&1 \
     || diskutil unmount force "$mp" >/dev/null 2>&1 \
-    || echo "make-dmg: WARNING could not detach $mp — packaging may fail; eject it manually" >&2
+    || echo "make-dmg: WARNING could not detach $mp — eject it manually if packaging fails" >&2
+}
+
+# Robust packaging that works regardless of the com.apple.provenance xattr: create an EMPTY read/write
+# image, mount it at a PRIVATE mountpoint (not /Volumes/$VOLNAME, which collides with an open
+# installer), copy the app in with `ditto` (faithful to the code signature — unlike `hdiutil
+# -srcfolder`, and unlike `cp` which can drop the signature seal), add the drag-to-install alias, then
+# compress to UDZO.
+package_ditto() {
+  echo "make-dmg: packaging via image+ditto -> $DMGOUT" >&2
+  local size mnt rw
+  size=$(( $(du -sm "$APP" | cut -f1) + 60 ))   # app size in MiB + headroom for the image
+  mnt="$(mktemp -d)"
+  rw="$(dirname "$DMGOUT")/.${VOLNAME}.rw.dmg"
+  rm -f "$rw"
+  # Always release the mount + scratch image, even if a step below fails under `set -e`.
+  trap 'hdiutil detach -force "$mnt" >/dev/null 2>&1 || true; rm -f "$rw"; rmdir "$mnt" >/dev/null 2>&1 || true' RETURN
+  hdiutil create -size "${size}m" -fs HFS+ -volname "$VOLNAME" -type UDIF -ov "$rw" >/dev/null
+  hdiutil attach "$rw" -nobrowse -owners off -mountpoint "$mnt" >/dev/null
+  ditto "$APP" "$mnt/$app_name"
+  ln -s /Applications "$mnt/Applications"
+  hdiutil detach -force "$mnt" >/dev/null
+  hdiutil convert "$rw" -format UDZO -o "$DMGOUT" >/dev/null
 }
 
 if command -v create-dmg >/dev/null 2>&1; then
-  echo "make-dmg: packaging with create-dmg -> $DMGOUT"
-  # create-dmg drives Finder via AppleScript and occasionally fails on the first run (a
-  # Finder/AppleScript race, or a leftover attached device); retry once before giving up.
-  attempt() {
-    create-dmg \
-      --volname "$VOLNAME" \
-      --window-size 540 380 \
-      --icon "$app_name" 150 190 \
-      --app-drop-link 390 190 \
-      --hide-extension "$app_name" \
-      "$DMGOUT" "$APP"
-  }
+  echo "make-dmg: trying create-dmg -> $DMGOUT"
   detach_stale_volume
-  if ! attempt; then
-    echo "make-dmg: create-dmg failed once; retrying (known Finder/AppleScript flake)..." >&2
-    rm -f "$DMGOUT"
-    detach_stale_volume
-    attempt
+  # create-dmg drives Finder via AppleScript for the polished window; it can flake on the first run
+  # and, on macOS 15+ signed+run apps, fails outright (the -srcfolder/provenance issue above). Either
+  # way, fall through to the always-works ditto path rather than aborting the build.
+  if create-dmg \
+       --volname "$VOLNAME" \
+       --window-size 540 380 \
+       --icon "$app_name" 150 190 \
+       --app-drop-link 390 190 \
+       --hide-extension "$app_name" \
+       "$DMGOUT" "$APP" 2>&1; then
+    echo "make-dmg: built $DMGOUT (create-dmg)"
+    exit 0
   fi
-else
-  echo "make-dmg: create-dmg not found; using hdiutil fallback -> $DMGOUT"
-  # Stage the app plus an /Applications symlink so the mounted volume offers drag-to-install,
-  # then compress it into a read-only UDZO image.
-  dmgroot="$(dirname "$DMGOUT")/dmgroot"
-  rm -rf "$dmgroot"
-  mkdir -p "$dmgroot"
-  cp -R "$APP" "$dmgroot/"
-  ln -s /Applications "$dmgroot/Applications"
+  echo "make-dmg: create-dmg did not succeed on this host; using the robust image+ditto fallback" >&2
+  rm -f "$DMGOUT"
   detach_stale_volume
-  hdiutil create -volname "$VOLNAME" -srcfolder "$dmgroot" -ov -format UDZO "$DMGOUT"
-  rm -rf "$dmgroot"
 fi
 
+package_ditto
 echo "make-dmg: built $DMGOUT"
