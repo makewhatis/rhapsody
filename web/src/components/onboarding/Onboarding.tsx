@@ -1,14 +1,28 @@
 import * as React from "react";
-import { Button, Check, ChevronDown, Linear, Search, StatusDot, TextInput } from "@/components/ui";
+import { Button, Check, Key, Play, Select, StatusDot, TextInput } from "@/components/ui";
 import type { LinearProject } from "@/lib/api";
 import {
   clearLinearToken,
   credentialStatus,
   listLinearProjects,
+  openExternal,
+  probeTools,
   setLinearToken,
   writeInitialConfig,
+  type ToolResult,
 } from "@/lib/bindings";
-import { normalizeProjectSlug, onboardingStep, tokenLooksValid } from "@/lib/onboarding-model";
+import {
+  buildSoundCheck,
+  DEFAULT_MODEL,
+  MODEL_OPTIONS,
+  normalizeProjectSlug,
+  onboardingStep,
+  stepCapsLabel,
+  stripModel,
+  tokenLooksValid,
+  TOTAL_STEPS,
+  type WizardStep,
+} from "@/lib/onboarding-model";
 
 export interface OnboardingProps {
   // Called only on a SUCCESSFUL write (config seeded and the daemon told to start); the shell
@@ -25,138 +39,103 @@ export interface OnboardingProps {
   onError?: (msg: string) => void;
 }
 
-// ProjectPicker — searchable Linear-project picker for the onboarding project step. Adapted from
-// settings/AddAgentSheet's ProjectPicker (name + slugId subtext + team), minus the usedSlugs filter
-// (onboarding configures the first project, so nothing is taken yet). onChange receives the bare
-// slugId — the value the daemon's dispatch query filters on.
-function ProjectPicker({
-  value,
-  onChange,
-  projects,
-}: {
-  value: string;
-  onChange: (slug: string) => void;
-  projects: LinearProject[];
-}) {
-  const [q, setQ] = React.useState("");
-  // Open by default: onboarding has no prior selection, so showing the project list immediately
-  // (rather than behind a focus) is the expected first-run affordance. Picking one closes it to the
-  // selected-project summary, which reopens on click.
-  const [open, setOpen] = React.useState(true);
-  const sel = projects.find((p) => p.slug === value);
-  const results = projects.filter((p) => `${p.name} ${p.slug} ${p.team}`.toLowerCase().includes(q.toLowerCase()));
+// The compact URL a user creates a Linear personal API key from (Settings → Security & access →
+// Personal API keys). Opened in the default browser (never the embedded webview).
+const CREATE_TOKEN_URL = "https://linear.app/settings/account/security";
 
+// The model choices reuse the canonical Settings list but display the compact "opus-4-8" form the
+// mock shows (the full "claude-…" value is still what is stored/compared).
+const WIZARD_MODEL_OPTIONS = MODEL_OPTIONS.map((o) => ({ ...o, label: stripModel(o.value), mono: true }));
+
+// ProgressIndicator — the shared footer progress marker (mock 2e): the active step is a 16×5 rust
+// bar, completed steps are brighter dots, upcoming steps are faint dots. Exposed as a progressbar
+// for the a11y tree (and step-nav tests).
+function ProgressIndicator({ step }: { step: WizardStep }) {
   return (
-    <div style={{ position: "relative" }}>
-      {sel && !open ? (
-        <button
-          type="button"
-          onClick={() => {
-            setOpen(true);
-            setQ("");
-          }}
-          style={{
-            width: "100%",
-            height: 44,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 10,
-            background: "var(--bg-input)",
-            border: "1px solid var(--line-strong)",
-            borderRadius: "var(--r-ctrl)",
-            padding: "0 12px",
-            cursor: "pointer",
-          }}
-        >
-          <span style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-            <StatusDot color={sel.color} size={9} />
-            <span style={{ fontSize: 13.5, fontWeight: 500, color: "var(--tx)" }}>{sel.name}</span>
-            <span className="mono" style={{ fontSize: 11.5, color: "var(--tx-3)" }}>
-              {sel.team}
-            </span>
-          </span>
-          <ChevronDown size={15} style={{ color: "var(--tx-3)" }} />
-        </button>
-      ) : (
-        <TextInput
-          autoFocus
-          prefixIcon={Search}
-          placeholder="Search your Linear projects…"
-          aria-label="Search your Linear projects"
-          value={q}
-          onChange={(e) => {
-            setQ(e.target.value);
-            setOpen(true);
-          }}
-          onFocus={() => setOpen(true)}
-          style={{ height: 44 }}
-        />
-      )}
-      {open ? (
-        <div
-          role="listbox"
-          style={{
-            marginTop: 8,
-            background: "var(--bg-card-2)",
-            border: "1px solid var(--line)",
-            borderRadius: "var(--r-ctrl)",
-            overflow: "hidden",
-            maxHeight: 240,
-            overflowY: "auto",
-          }}
-        >
-          {results.length === 0 ? (
-            <div style={{ padding: "20px", textAlign: "center", color: "var(--tx-3)", fontSize: 13 }}>
-              No projects match.
-            </div>
-          ) : (
-            results.map((p) => (
-              <button
-                key={p.slug}
-                type="button"
-                role="option"
-                aria-selected={p.slug === value}
-                onClick={() => {
-                  onChange(p.slug);
-                  setOpen(false);
-                }}
-                style={{
-                  width: "100%",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 11,
-                  padding: "11px 14px",
-                  background: p.slug === value ? "var(--em-soft)" : "transparent",
-                  border: "none",
-                  borderBottom: "1px solid var(--line-2)",
-                  cursor: "pointer",
-                  textAlign: "left",
-                }}
-              >
-                <StatusDot color={p.color} size={9} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13.5, fontWeight: 500, color: "var(--tx)" }}>{p.name}</div>
-                  <div
-                    className="mono"
-                    style={{ fontSize: 11.5, color: "var(--tx-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                  >
-                    {p.slug}
-                  </div>
-                </div>
-                <span className="mono" style={{ fontSize: 11, fontWeight: 600, color: "var(--tx-3)" }}>
-                  {p.team}
-                </span>
-              </button>
-            ))
-          )}
-        </div>
-      ) : null}
+    <div
+      role="progressbar"
+      aria-label="Onboarding progress"
+      aria-valuemin={1}
+      aria-valuemax={TOTAL_STEPS}
+      aria-valuenow={step}
+      style={{ display: "flex", alignItems: "center", gap: 6 }}
+    >
+      {Array.from({ length: TOTAL_STEPS }, (_, i) => {
+        const n = i + 1;
+        const active = n === step;
+        const done = n < step;
+        return (
+          <span
+            key={n}
+            aria-hidden
+            style={{
+              width: active ? 16 : 5,
+              height: 5,
+              borderRadius: active ? 3 : "50%",
+              background: active ? "var(--rust)" : done ? "rgba(255,255,255,.25)" : "rgba(255,255,255,.14)",
+              transition: "width .2s, background .2s",
+            }}
+          />
+        );
+      })}
     </div>
   );
 }
 
-// linkButton — a small inline text affordance ("Enter it manually" / "Back to token" / "Retry").
+// ProjectRadio — one selectable row of the step-2 Linear-project list (mock 2e): a rust radio, the
+// project name, and the team code (right, mono). The selected row carries a faint rust tint.
+function ProjectRadio({
+  project,
+  selected,
+  onSelect,
+}: {
+  project: LinearProject;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      aria-label={project.name}
+      onClick={onSelect}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 11,
+        width: "100%",
+        padding: "12px 14px",
+        border: "none",
+        borderBottom: "1px solid var(--hair-section)",
+        background: selected ? "color-mix(in srgb, var(--rust-text) 8%, transparent)" : "transparent",
+        cursor: "pointer",
+        textAlign: "left",
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          width: 16,
+          height: 16,
+          flexShrink: 0,
+          borderRadius: "50%",
+          border: `1.5px solid ${selected ? "var(--rust)" : "var(--hair-strong)"}`,
+          display: "grid",
+          placeItems: "center",
+        }}
+      >
+        {selected ? <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--rust)" }} /> : null}
+      </span>
+      <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 500, color: "var(--ink)" }}>{project.name}</span>
+      <span className="mono" style={{ fontSize: 11, fontWeight: 600, color: selected ? "var(--rust-text)" : "var(--faint)" }}>
+        {project.team}
+      </span>
+    </button>
+  );
+}
+
+// linkButton — a small inline text affordance ("Enter it manually" / "Back to project list").
 function linkButton(label: string, onClick: () => void): React.ReactElement {
   return (
     <button
@@ -166,7 +145,7 @@ function linkButton(label: string, onClick: () => void): React.ReactElement {
         background: "none",
         border: "none",
         padding: 0,
-        color: "var(--tx-3)",
+        color: "var(--faint)",
         fontSize: 12,
         cursor: "pointer",
         textDecoration: "underline",
@@ -177,21 +156,48 @@ function linkButton(label: string, onClick: () => void): React.ReactElement {
   );
 }
 
+function Alert({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      role="alert"
+      style={{
+        fontSize: 12.5,
+        color: "var(--red)",
+        background: "var(--tint-red)",
+        border: "1px solid var(--border-danger)",
+        borderRadius: "var(--r-ctrl)",
+        padding: "9px 12px",
+        lineHeight: 1.5,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 // Onboarding — the first-run wizard AppShell shows when the daemon has no WORKFLOW.md yet
 // (StatusDTO.configured === false). It breaks the chicken-and-egg of the Settings page — which
-// hydrates from the daemon's /api and is therefore unusable before a config exists — by writing
-// the initial config through the WriteInitialConfig Go binding, which needs no running daemon.
-// Two steps: paste a Linear token (→ Keychain), then PICK a project from the real Linear list (via
-// the ListLinearProjects binding, which calls Linear directly pre-daemon — INF-277) and seed the
-// config + start the daemon. A manual fallback normalizes a pasted slug/URL to the bare slugId.
-// Every binding degrades to a no-op in a plain browser / tests, where this never renders (getStatus
-// is null → "loading", not "not-configured").
+// hydrates from the daemon's /api and is therefore unusable before a config exists — by writing the
+// initial config through the WriteInitialConfig Go binding, which needs no running daemon.
+//
+// Three steps (mock 2e), keeping the original data flow: (1) Connect Linear — paste a token to the
+// Keychain; (2) Choose what to watch — PICK a project from the real Linear list (via the
+// ListLinearProjects binding, which calls Linear directly pre-daemon — INF-277), with a manual
+// slug/URL fallback and a starting model; (3) Sound check — a preflight checklist (the app-side
+// `probeTools` doctor + the Linear connection), then "Start playing" seeds the config + starts the
+// daemon. The 1↔2 transition is credential-driven (a stored token skips step 1); 2↔3 is local wizard
+// state. Every binding degrades to a no-op / [] in a plain browser / tests, where this never renders
+// (getStatus is null → "loading", not "not-configured").
 export function Onboarding({ onConfigured, onError }: OnboardingProps) {
   const [hasToken, setHasToken] = React.useState(false);
   const [token, setToken] = React.useState("");
   const [slug, setSlug] = React.useState("");
+  const [model, setModel] = React.useState<string>(DEFAULT_MODEL);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // advanced gates step 2 → step 3: both are "token present", so a local flag (not a daemon-visible
+  // state) distinguishes the project picker from the sound check.
+  const [advanced, setAdvanced] = React.useState(false);
 
   // Project step: real projects fetched via the binding, plus a manual fallback.
   const [projects, setProjects] = React.useState<LinearProject[] | null>(null);
@@ -200,6 +206,9 @@ export function Onboarding({ onConfigured, onError }: OnboardingProps) {
   const [manualOpen, setManualOpen] = React.useState(false);
   const [manualInput, setManualInput] = React.useState("");
   const [manualError, setManualError] = React.useState<string | null>(null);
+
+  // Sound-check step: the app-side tool probe (null until fetched on reaching step 3).
+  const [tools, setTools] = React.useState<ToolResult[] | null>(null);
 
   const refreshToken = React.useCallback(async () => {
     const s = await credentialStatus();
@@ -210,7 +219,8 @@ export function Onboarding({ onConfigured, onError }: OnboardingProps) {
     void refreshToken();
   }, [refreshToken]);
 
-  const step = onboardingStep(hasToken);
+  // Effective step: no token → 1 (Connect Linear); token present → 3 once advanced, else 2.
+  const step: WizardStep = onboardingStep(hasToken) === "token" ? 1 : advanced ? 3 : 2;
 
   // loadSeq guards against a stale in-flight fetch applying its result after the user navigated
   // away (Back to token) or kicked off a newer fetch (Retry). Each load captures the current seq;
@@ -237,13 +247,21 @@ export function Onboarding({ onConfigured, onError }: OnboardingProps) {
     }
   }, []);
 
-  // Fetch projects once we reach the project step (and after a retry/back-to-token reset clears
-  // them). Skipped while loading or showing an error so Retry stays the explicit re-fetch trigger.
+  // Fetch projects once a token is stored (steps 2 and 3 both need them), and after a retry/
+  // back-to-token reset clears them. Skipped while loading or showing an error so Retry stays the
+  // explicit re-fetch trigger.
   React.useEffect(() => {
-    if (step === "project" && projects === null && !projLoading && projError === null) {
+    if (hasToken && projects === null && !projLoading && projError === null) {
       void loadProjects();
     }
-  }, [step, projects, projLoading, projError, loadProjects]);
+  }, [hasToken, projects, projLoading, projError, loadProjects]);
+
+  // Fetch the tool-doctor probe when the sound-check step is reached (degrades to [] with no bridge).
+  React.useEffect(() => {
+    if (step === 3 && tools === null) {
+      void probeTools().then(setTools);
+    }
+  }, [step, tools]);
 
   const saveToken = async () => {
     if (!tokenLooksValid(token) || busy) return;
@@ -263,8 +281,8 @@ export function Onboarding({ onConfigured, onError }: OnboardingProps) {
     }
   };
 
-  // backToToken returns to the token step to fix a bad/revoked key: it clears the stored token and
-  // the loaded-project state so re-entering a key re-fetches fresh.
+  // backToToken returns to step 1 to fix a bad/revoked key: it clears the stored token and the
+  // loaded-project state so re-entering a key re-fetches fresh (this is the "← Back" from step 2).
   const backToToken = async () => {
     // Invalidate any in-flight project fetch so its late result can't repopulate cache after we
     // clear it (a new token must re-fetch fresh, not show the previous token's projects).
@@ -275,6 +293,7 @@ export function Onboarding({ onConfigured, onError }: OnboardingProps) {
       // Best-effort: even if the clear fails, drop our cached state and re-read status below.
     }
     setSlug("");
+    setAdvanced(false);
     setProjects(null);
     setProjError(null);
     setProjLoading(false);
@@ -312,181 +331,235 @@ export function Onboarding({ onConfigured, onError }: OnboardingProps) {
     }
   };
 
-  // submitManual normalizes the pasted value (bare slugId / URL slug / full URL) to the bare slugId
-  // before writing; un-normalizable input shows an inline error and never writes.
-  const submitManual = () => {
-    const res = normalizeProjectSlug(manualInput);
-    if (!res.ok) {
-      setManualError(res.error);
+  // advanceToSoundCheck moves step 2 → step 3. In manual mode it normalizes the pasted value (bare
+  // slugId / URL slug / full URL) to the bare slugId first; un-normalizable input shows an inline
+  // error and does not advance.
+  const advanceToSoundCheck = () => {
+    if (manualOpen) {
+      const res = normalizeProjectSlug(manualInput);
+      if (!res.ok) {
+        setManualError(res.error);
+        return;
+      }
+      setManualError(null);
+      setSlug(res.slug);
+    } else if (!slug) {
       return;
     }
-    setManualError(null);
-    void createConfigWith(res.slug);
+    setAdvanced(true);
   };
 
+  // The footer's primary "Continue" (steps 1–2 only; step 3's primary is the full-width "Start
+  // playing"). Its enabled/label state is per-step.
+  const primaryAction = step === 1 ? () => void saveToken() : advanceToSoundCheck;
+  const continueDisabled =
+    busy ||
+    (step === 1 && !tokenLooksValid(token)) ||
+    (step === 2 && (projLoading || projError !== null || (manualOpen ? manualInput.trim() === "" : slug === "")));
+
+  const heading = step === 1 ? "One token drives the whole ensemble." : step === 2 ? "Point an agent at a project." : "Everything's in tune.";
+
   return (
-    <div style={{ display: "flex", justifyContent: "center", paddingTop: 40 }}>
-      <div style={{ width: "100%", maxWidth: 460, display: "flex", flexDirection: "column", gap: 22 }}>
-        {/* header */}
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, textAlign: "center" }}>
-          <div
+    <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+      {/* header: caps step marker + heading (+ body on step 1) */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: ".14em", color: "var(--rust-text)" }}>
+          {stepCapsLabel(step)}
+        </span>
+        <h1 style={{ fontSize: 17, fontWeight: 600, letterSpacing: "-0.01em", color: "var(--ink)" }}>{heading}</h1>
+        {step === 1 ? (
+          <p style={{ fontSize: 12.5, color: "var(--text-muted)", lineHeight: 1.55, maxWidth: 460 }}>
+            Rhapsody reads tickets from Linear and dispatches a coding agent per ticket. Paste a personal API key — it
+            lives in the macOS keychain, never on disk.
+          </p>
+        ) : null}
+      </div>
+
+      {/* step body */}
+      {step === 1 ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <TextInput
+            mono
+            type="password"
+            prefixIcon={Key}
+            value={token}
+            placeholder="lin_api_…"
+            aria-label="Linear API token"
+            onChange={(e) => setToken(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void saveToken();
+            }}
+            // Blinking rust caret (mock 2e); compact 34px field.
+            style={{ height: 34, fontSize: 13, caretColor: "var(--rust-text)" }}
+          />
+          <button
+            type="button"
+            onClick={() => openExternal(CREATE_TOKEN_URL)}
             style={{
-              width: 46,
-              height: 46,
-              borderRadius: 13,
-              display: "grid",
-              placeItems: "center",
-              background: "var(--em-soft)",
-              border: "1px solid rgba(16,185,129,.3)",
-              color: "var(--em-bright)",
+              alignSelf: "flex-start",
+              background: "none",
+              border: "none",
+              padding: 0,
+              color: "var(--rust-text)",
+              fontSize: 12.5,
+              cursor: "pointer",
             }}
           >
-            <Linear size={22} />
-          </div>
-          <div>
-            <h1 style={{ fontSize: 20, fontWeight: 600, letterSpacing: "-0.02em" }}>Welcome to Symphony</h1>
-            <p style={{ fontSize: 13, color: "var(--tx-3)", marginTop: 6, lineHeight: 1.5 }}>
-              {step === "token"
-                ? "Connect your Linear account to get started."
-                : "Pick the Linear project Symphony should watch."}
-            </p>
-          </div>
+            Create a token in Linear <span style={{ color: "var(--rust-text)" }}>↗</span>
+          </button>
         </div>
-
-        {/* step card */}
-        <div
-          style={{
-            background: "var(--bg-card)",
-            border: "1px solid var(--line)",
-            borderRadius: "var(--r-card)",
-            padding: 22,
-            display: "flex",
-            flexDirection: "column",
-            gap: 14,
-          }}
-        >
-          {step === "token" ? (
+      ) : step === 2 ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {projLoading ? (
+            <p style={{ fontSize: 13, color: "var(--text-muted)", padding: "8px 0" }}>Loading your Linear projects…</p>
+          ) : projError ? (
             <>
-              <label style={{ fontSize: 12.5, fontWeight: 600, color: "var(--tx-2)" }}>Linear API token</label>
+              <Alert>Couldn't load your Linear projects: {projError}</Alert>
+              <Button variant="primary" disabled={busy} onClick={() => void loadProjects()}>
+                Retry
+              </Button>
+            </>
+          ) : manualOpen ? (
+            <>
+              <label style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text-muted)" }}>Project slug or URL</label>
               <TextInput
                 mono
-                type="password"
-                value={token}
-                placeholder="lin_api_…"
-                aria-label="Linear API token"
-                onChange={(e) => setToken(e.target.value)}
+                value={manualInput}
+                placeholder="rhapsody-app-872639248532 or a Linear project URL"
+                aria-label="Project slug"
+                onChange={(e) => {
+                  setManualInput(e.target.value);
+                  setManualError(null);
+                }}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void saveToken();
+                  if (e.key === "Enter") advanceToSoundCheck();
                 }}
               />
-              <p style={{ fontSize: 12, color: "var(--tx-3)", lineHeight: 1.5 }}>
-                Stored in your macOS Keychain — never written to the config file. Create one in Linear
-                → Settings → Security &amp; access → Personal API keys.
+              <p style={{ fontSize: 12, color: "var(--faint)", lineHeight: 1.5 }}>
+                Paste the project's URL or its slug (e.g. <code>my-project-9c29e9ade060</code>).
               </p>
-              <Button variant="primary" disabled={!tokenLooksValid(token) || busy} onClick={() => void saveToken()}>
-                {busy ? "Saving…" : "Save & continue"}
-              </Button>
+              {manualError ? <Alert>{manualError}</Alert> : null}
+              <div>{linkButton("Back to project list", () => setManualOpen(false))}</div>
             </>
           ) : (
             <>
-              <div style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "var(--em-bright)" }}>
-                <Check size={14} style={{ strokeWidth: 2.4 }} /> Linear connected
+              <div
+                role="radiogroup"
+                aria-label="Linear project"
+                style={{
+                  border: "1px solid var(--hair-card)",
+                  borderRadius: "var(--r-card)",
+                  overflow: "hidden",
+                  background: "var(--card)",
+                }}
+              >
+                {(projects ?? []).length === 0 ? (
+                  <p style={{ padding: "18px 14px", fontSize: 12.5, color: "var(--faint)" }}>
+                    No projects found for this token — enter the slug manually below.
+                  </p>
+                ) : (
+                  (projects ?? []).map((p) => (
+                    <ProjectRadio key={p.slug} project={p} selected={p.slug === slug} onSelect={() => setSlug(p.slug)} />
+                  ))
+                )}
               </div>
 
-              {projLoading ? (
-                <>
-                  <p style={{ fontSize: 13, color: "var(--tx-3)", padding: "8px 0" }}>Loading your Linear projects…</p>
-                  {/* An escape during a slow/hung load: a stale in-flight fetch is dropped (see loadSeq). */}
-                  <div>{linkButton("Back to token", () => void backToToken())}</div>
-                </>
-              ) : projError ? (
-                <>
-                  <div
-                    role="alert"
-                    style={{
-                      fontSize: 12.5,
-                      color: "var(--red)",
-                      background: "var(--red-soft)",
-                      border: "1px solid rgba(239,83,80,.3)",
-                      borderRadius: "var(--r-ctrl)",
-                      padding: "9px 12px",
-                    }}
-                  >
-                    Couldn't load your Linear projects: {projError}
-                  </div>
-                  <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
-                    <Button variant="primary" disabled={busy} onClick={() => void loadProjects()}>
-                      Retry
-                    </Button>
-                    {linkButton("Back to token", () => void backToToken())}
-                  </div>
-                </>
-              ) : manualOpen ? (
-                <>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: "var(--tx-2)" }}>Project slug or URL</label>
-                  <TextInput
-                    mono
-                    value={manualInput}
-                    placeholder="symphony-app-872639248532 or a Linear project URL"
-                    aria-label="Project slug"
-                    onChange={(e) => {
-                      setManualInput(e.target.value);
-                      setManualError(null);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") submitManual();
-                    }}
-                  />
-                  <p style={{ fontSize: 12, color: "var(--tx-3)", lineHeight: 1.5 }}>
-                    Paste the project's URL or its slug (e.g. <code>my-project-9c29e9ade060</code>).
-                  </p>
-                  {manualError ? (
-                    <div role="alert" style={{ fontSize: 12, color: "var(--red)" }}>
-                      {manualError}
-                    </div>
-                  ) : null}
-                  <Button variant="primary" disabled={busy} onClick={() => submitManual()}>
-                    {busy ? "Creating…" : "Create config & start"}
-                  </Button>
-                  <div>{linkButton("Back to project list", () => setManualOpen(false))}</div>
-                </>
-              ) : (
-                <>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: "var(--tx-2)" }}>Linear project</label>
-                  <ProjectPicker value={slug} onChange={setSlug} projects={projects ?? []} />
-                  {projects && projects.length === 0 ? (
-                    <p style={{ fontSize: 12, color: "var(--tx-3)", lineHeight: 1.5 }}>
-                      No projects found for this token — enter the slug manually below.
-                    </p>
-                  ) : null}
-                  <Button variant="primary" disabled={!slug || busy} onClick={() => void createConfigWith(slug)}>
-                    {busy ? "Creating…" : "Create config & start"}
-                  </Button>
-                  <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
-                    {linkButton("Enter it manually", () => setManualOpen(true))}
-                    {linkButton("Back to token", () => void backToToken())}
-                  </div>
-                </>
-              )}
+              {/* detected-repo + model row: the repo is auto-detected by the daemon from the chosen
+                  project's Linear settings (no pre-daemon binding), so this reassures + sets the
+                  starting model. */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <span style={{ display: "inline-flex", color: "var(--sage)" }}>
+                  <Check size={15} style={{ strokeWidth: 2.4 }} />
+                </span>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 12, color: "var(--text-muted)" }}>
+                  Repo detected from the project's Linear settings
+                </span>
+                <Select value={model} options={WIZARD_MODEL_OPTIONS} onChange={setModel} width={150} />
+              </div>
+
+              <div>{linkButton("Enter it manually", () => setManualOpen(true))}</div>
             </>
           )}
-
-          {error ? (
-            <div
-              role="alert"
-              style={{
-                fontSize: 12.5,
-                color: "var(--red)",
-                background: "var(--red-soft)",
-                border: "1px solid rgba(239,83,80,.3)",
-                borderRadius: "var(--r-ctrl)",
-                padding: "9px 12px",
-              }}
-            >
-              {error}
-            </div>
-          ) : null}
         </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {/* sound-check checklist */}
+          <div
+            style={{
+              border: "1px solid var(--hair-card)",
+              borderRadius: "var(--r-card)",
+              overflow: "hidden",
+              background: "var(--card)",
+            }}
+          >
+            {buildSoundCheck(tools ?? [], { linearConnected: hasToken }).map((item, i, arr) => (
+              <div
+                key={item.key}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                  padding: "11px 14px",
+                  borderBottom: i === arr.length - 1 ? "none" : "1px solid var(--hair-section)",
+                }}
+              >
+                {item.ok ? (
+                  <span style={{ display: "inline-flex", color: "var(--sage)" }}>
+                    <Check size={14} style={{ strokeWidth: 2.4 }} />
+                  </span>
+                ) : (
+                  <StatusDot color="var(--amber)" size={7} />
+                )}
+                <span className="mono" style={{ width: 110, flexShrink: 0, fontSize: 12.5, color: "var(--ink)" }}>
+                  {item.name}
+                </span>
+                <span
+                  className="mono"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    fontSize: 11,
+                    color: item.ok ? "var(--faint)" : "var(--amber)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {item.detail}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <Button variant="primary" icon={Play} disabled={busy} onClick={() => void createConfigWith(slug)} style={{ width: "100%" }}>
+            {busy ? "Starting…" : "Start playing"}
+          </Button>
+          <p style={{ fontSize: 11, color: "var(--faint)", textAlign: "center" }}>
+            You can stop or restart anytime from the toolbar.
+          </p>
+        </div>
+      )}
+
+      {error ? <Alert>{error}</Alert> : null}
+
+      {/* shared footer: Back (from step 2) · progress · Continue (steps 1–2) */}
+      <div style={{ display: "flex", alignItems: "center", gap: 16, paddingTop: 2 }}>
+        {step > 1 ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={step === 2 ? () => void backToToken() : () => setAdvanced(false)}
+          >
+            ← Back
+          </Button>
+        ) : null}
+        <ProgressIndicator step={step} />
+        <div style={{ flex: 1 }} />
+        {step < 3 ? (
+          <Button variant="primary" disabled={continueDisabled} onClick={primaryAction}>
+            {busy && step === 1 ? "Saving…" : "Continue"}
+          </Button>
+        ) : null}
       </div>
     </div>
   );

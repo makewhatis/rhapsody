@@ -113,6 +113,44 @@ export function Toolbar({
   );
 }
 
+// SetupToolbar — the first-run wizard's toolbar variant (mock 2e): a 42px bar with only the native
+// traffic-lights reserve, the "Rhapsody" wordmark, and a right-aligned "SETUP" caps marker. There is
+// no daemon yet, so it deliberately drops the conductor-status cluster, the transport segment, and
+// the Settings gear. Like the full Toolbar it is a `data-tauri-drag-region` (window stays draggable)
+// with the left 78px reserved for the overlay-titlebar lights.
+export function SetupToolbar() {
+  return (
+    <div
+      data-tauri-drag-region=""
+      style={{
+        height: 42,
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        gap: 9,
+        background: "var(--surface)",
+        borderBottom: "1px solid var(--hair-card)",
+        padding: "0 16px 0 78px",
+        userSelect: "none",
+      }}
+    >
+      <span style={{ fontSize: 13, fontWeight: 600, color: "var(--ink)", letterSpacing: ".01em" }}>Rhapsody</span>
+      <div style={{ flex: 1 }} />
+      <span
+        style={{
+          fontSize: 10,
+          fontWeight: 600,
+          letterSpacing: ".14em",
+          textTransform: "uppercase",
+          color: "var(--faint)",
+        }}
+      >
+        Setup
+      </span>
+    </div>
+  );
+}
+
 // A 1×18px hairline divider with 4px horizontal margins (design spec).
 function Divider() {
   return <span aria-hidden style={{ width: 1, height: 18, background: "var(--hair-control)", margin: "0 4px" }} />;

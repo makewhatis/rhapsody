@@ -250,12 +250,11 @@ describe("AppShell (integration)", () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       renderShell();
 
-      // Drive the wizard's create step to the failure via the manual fallback (a bare slugId
-      // normalizes to itself, so writeInitialConfig is reached — and rejects per the mock).
-      fireEvent.click(await screen.findByRole("button", { name: "Enter it manually" }));
-      const slug = await screen.findByLabelText("Project slug");
-      fireEvent.change(slug, { target: { value: "872639248532" } });
-      fireEvent.click(screen.getByRole("button", { name: /Create config & start/ }));
+      // Drive the wizard to its failing final step: pick the project (step 2), continue to the
+      // sound check (step 3), then "Start playing" reaches writeInitialConfig — which rejects.
+      fireEvent.click(await screen.findByRole("radio", { name: "Symphony App" }));
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Start playing" }));
 
       // The lifted banner shows the partial-write message (in addition to the wizard's inline alert).
       await waitFor(() =>
@@ -269,8 +268,9 @@ describe("AppShell (integration)", () => {
         await vi.advanceTimersByTimeAsync(2100);
       });
 
-      // The wizard is gone (dashboard mounted), but the lifted banner survives the unmount.
-      await waitFor(() => expect(screen.queryByLabelText("Project slug")).toBeNull());
+      // The wizard is gone (dashboard mounted — its step marker no longer renders), but the lifted
+      // banner survives the unmount.
+      await waitFor(() => expect(screen.queryByText(/STEP 3 OF 3/)).toBeNull());
       expect(screen.getByText(/config saved, but the daemon could not start/)).toBeTruthy();
 
       // The banner is dismissible.

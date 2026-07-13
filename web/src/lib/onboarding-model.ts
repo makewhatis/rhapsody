@@ -1,12 +1,111 @@
 // Pure onboarding validators + step logic, free of React and the Wails bridge so they unit-test
-// cleanly. Ported from the desktop reference (creds.ts / wizard.ts) into the shipped web app.
+// cleanly. Ported from the desktop reference (creds.ts / wizard.ts) into the shipped web app, then
+// grown into the P10 "Podium" first-run wizard (three steps + a sound-check derivation).
+
+import type { ToolResult } from "@/lib/bindings";
+import { GLOBAL_DEFAULTS, MODELS } from "@/lib/settings-data";
 
 export type OnboardStep = "token" | "project";
 
-// onboardingStep picks the wizard step from whether a Linear token is already stored: no token →
-// collect it first; token present → collect the project slug.
+// onboardingStep picks the credential-gated stage from whether a Linear token is already stored: no
+// token → collect it first (wizard step 1); token present → the daemon-observable state that gates
+// the project stage onward (steps 2–3, distinguished by local wizard state). The 1↔2 transition
+// stays credential-driven so a partial prior attempt (token already in the Keychain) resumes past
+// step 1, exactly as the original two-step flow did.
 export function onboardingStep(hasToken: boolean): OnboardStep {
   return hasToken ? "project" : "token";
+}
+
+// --- P10 first-run wizard (mock 2e): three steps with a shared progress footer ---
+
+export const TOTAL_STEPS = 3;
+
+// WizardStep is the 1-indexed step the wizard is showing. Step 1 (Connect Linear) is gated on the
+// stored token (see onboardingStep); steps 2 (Choose what to watch) and 3 (Sound check) are both
+// "token present" and are distinguished by local wizard state (whether the user advanced past the
+// project picker).
+export type WizardStep = 1 | 2 | 3;
+
+const STEP_TITLES: Record<WizardStep, string> = {
+  1: "CONNECT LINEAR",
+  2: "CHOOSE WHAT TO WATCH",
+  3: "SOUND CHECK",
+};
+
+// stepCapsLabel renders the caps step marker shown above each step's heading, e.g.
+// "STEP 1 OF 3 — CONNECT LINEAR" (mock 2e, 10px/600 .14em rust).
+export function stepCapsLabel(step: WizardStep): string {
+  return `STEP ${step} OF ${TOTAL_STEPS} — ${STEP_TITLES[step]}`;
+}
+
+// --- Model select (step 2) ---
+
+// The wizard's model choices reuse the canonical Settings list so onboarding and Settings never
+// drift, and default to the same model the daemon seeds into a fresh WORKFLOW.md
+// (onboarding.RenderInitialWorkflow → claude.model). NOTE: the WriteInitialConfig binding takes only
+// the project slug, so a NON-default pick is presentational here — the seeded config uses this
+// default, and the model is editable per-agent in Settings once the daemon is up.
+export const MODEL_OPTIONS = MODELS;
+export const DEFAULT_MODEL: string = GLOBAL_DEFAULTS.model;
+
+// stripModel drops the "claude-" prefix for the compact model display (e.g. "claude-opus-4-8" →
+// "opus-4-8"), matching the mock and the Settings agent-list cell.
+export function stripModel(model: string): string {
+  return model.replace(/^claude-/, "");
+}
+
+// --- Sound check (step 3) ---
+
+// SoundCheckItem is one row of the step-3 checklist: a name, a mono detail, and whether the check
+// passed (sage tick) or needs attention (amber). Pure data so the derivation is unit-testable.
+export interface SoundCheckItem {
+  key: string;
+  name: string;
+  detail: string;
+  ok: boolean;
+}
+
+// The external CLIs the sound check verifies (mock 2e). The daemon shells out to these; `gt`
+// (Graphite) is optional and not part of the first-run required set, so it is not listed here.
+export const SOUND_CHECK_CLIS = ["claude", "git", "gh"] as const;
+
+// The Rhapsody runtime home the daemon provisions per-issue workspaces under (README Divergences).
+// There is no pre-daemon binding that reports the resolved path, so the sound check shows the seeded
+// default the fresh config will use.
+export const WORKSPACE_ROOT_DEFAULT = "~/.rhapsody/workspaces";
+
+// buildSoundCheck derives the step-3 checklist from the app-side tool probe plus the Linear
+// connection: a "Linear API" row (authenticated once a token is stored and its project list loaded),
+// one row per required CLI (from the `probeTools` result — version · path when healthy, else the
+// missing/unhealthy state), and the workspace-home row. It never gates completion: onboarding writes
+// the config and starts the daemon regardless (the checklist is informational), so a not-yet-perfect
+// row (e.g. gh missing) reads amber but does not block "Start playing".
+export function buildSoundCheck(
+  tools: ToolResult[],
+  opts: { linearConnected: boolean; account?: string },
+): SoundCheckItem[] {
+  const byName = new Map(tools.map((t) => [t.name, t]));
+  const account = opts.account?.trim();
+  const linear: SoundCheckItem = {
+    key: "linear",
+    name: "Linear API",
+    detail: account || (opts.linearConnected ? "Authenticated" : "Not connected"),
+    ok: opts.linearConnected,
+  };
+  const clis = SOUND_CHECK_CLIS.map((name): SoundCheckItem => {
+    const t = byName.get(name);
+    if (!t) return { key: name, name, detail: "Not detected", ok: false };
+    if (!t.found) return { key: name, name, detail: "Not found on PATH", ok: false };
+    const detail = [t.version, t.path].map((s) => s?.trim()).filter(Boolean).join(" · ");
+    return { key: name, name, detail: detail || "installed", ok: t.healthy };
+  });
+  const workspace: SoundCheckItem = {
+    key: "workspace",
+    name: "workspace",
+    detail: WORKSPACE_ROOT_DEFAULT,
+    ok: true,
+  };
+  return [linear, ...clis, workspace];
 }
 
 // tokenLooksValid is a light client-side sanity check before we hit the Keychain: a Linear personal

@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Toolbar } from "@/components/Toolbar";
+import { SetupToolbar, Toolbar } from "@/components/Toolbar";
 import { type SettingsTabId, type TopTabId, TOP_PANEL_ID } from "./placeholders";
 import { Settings } from "@/components/settings/Settings";
 import { RunsView } from "@/components/runs/RunsView";
@@ -17,6 +17,9 @@ const CONTENT_PAD: React.CSSProperties = { maxWidth: 1180, margin: "0 auto", pad
 // A lighter padded wrapper for the (rare) lifted onboarding-error banner shown above the full-bleed
 // Jobs view, so it isn't flush against the window edge.
 const CONTENT_PAD_TOP: React.CSSProperties = { maxWidth: 1180, margin: "0 auto", padding: "20px 40px 0" };
+// The first-run wizard's narrow, centered column (mock 2e ~620px setup window, 30/34 content pad).
+// It hosts both the lifted onboarding-error banner and the wizard so they share one centered column.
+const WIZARD_WRAP: React.CSSProperties = { maxWidth: 560, margin: "0 auto", padding: "34px 34px 60px" };
 
 // AppShell — the macOS window shell that hosts the whole UI: the single 46px "Podium" toolbar
 // (wordmark, conductor status, Linear/Tools shortcuts, daemon transport, Settings gear) as the first
@@ -124,24 +127,30 @@ function ShellBody() {
 
   return (
     <>
-      <Toolbar
-        conductor={conductor}
-        running={daemonRunning}
-        connecting={conductor.phase === "connecting"}
-        busy={daemon.busy}
-        settingsActive={topTab === "settings"}
-        onStart={() => lifecycle("Daemon started", "The supervisor is running.", daemon.start)}
-        onStop={() => lifecycle("Daemon stopped", "The supervisor is stopped.", daemon.stop)}
-        onRestart={() => lifecycle("Daemon restarted", "Daemon reloaded configuration ✓", daemon.restart)}
-        // The gear toggles Settings ↔ Runs (Runs is the whole main area; there is no tab strip).
-        onToggleSettings={() => setTopTab((t) => (t === "settings" ? "runs" : "settings"))}
-        // Open Linear in the browser; jump straight to the Tools settings tab.
-        onOpenLinear={() => openExternal("https://linear.app")}
-        onOpenTools={() => {
-          setTopTab("settings");
-          setSettingsTab("tools");
-        }}
-      />
+      {notConfigured ? (
+        // First run: no daemon yet, so the toolbar drops the conductor status + transport + gear and
+        // shows only the wordmark and a "SETUP" marker (mock 2e).
+        <SetupToolbar />
+      ) : (
+        <Toolbar
+          conductor={conductor}
+          running={daemonRunning}
+          connecting={conductor.phase === "connecting"}
+          busy={daemon.busy}
+          settingsActive={topTab === "settings"}
+          onStart={() => lifecycle("Daemon started", "The supervisor is running.", daemon.start)}
+          onStop={() => lifecycle("Daemon stopped", "The supervisor is stopped.", daemon.stop)}
+          onRestart={() => lifecycle("Daemon restarted", "Daemon reloaded configuration ✓", daemon.restart)}
+          // The gear toggles Settings ↔ Runs (Runs is the whole main area; there is no tab strip).
+          onToggleSettings={() => setTopTab((t) => (t === "settings" ? "runs" : "settings"))}
+          // Open Linear in the browser; jump straight to the Tools settings tab.
+          onOpenLinear={() => openExternal("https://linear.app")}
+          onOpenTools={() => {
+            setTopTab("settings");
+            setSettingsTab("tools");
+          }}
+        />
+      )}
       {/* Always reserve the vertical scrollbar's width so the centered content (max-width 1180,
           margin auto) never shifts left by a scrollbar width when a tab/run is tall enough to
           overflow — the size-dependent jitter between tabs (and Runs → Run detail). overflowY:
@@ -151,10 +160,10 @@ function ShellBody() {
       <div style={{ flex: 1, overflowY: "scroll", overflowX: "hidden", scrollbarGutter: "stable" }}>
         {notConfigured ? (
           // First run: no config yet. Show the wizard instead of the daemon-dependent header/nav
-          // (centred, padded). onConfigured re-reads status so the shell swaps to the dashboard once
-          // the daemon starts. onError lifts a partial-write failure here so it outlives the
-          // poll-driven unmount.
-          <div style={CONTENT_PAD}>
+          // (a narrow, centred column). onConfigured re-reads status so the shell swaps to the
+          // dashboard once the daemon starts. onError lifts a partial-write failure here so it
+          // outlives the poll-driven unmount.
+          <div style={WIZARD_WRAP}>
             {onboardErr ? <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} /> : null}
             <Onboarding onConfigured={() => void daemon.refresh()} onError={setOnboardErr} />
           </div>
