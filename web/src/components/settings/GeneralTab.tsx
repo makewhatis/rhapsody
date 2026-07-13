@@ -153,7 +153,18 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
         <Field
           label="GitHub summons"
           inline
-          hint="Re-engage an In-Review ticket when an @symphony comment lands on its unmerged linked GitHub PR."
+          hint={
+            <>
+              Re-engage an In-Review ticket when an{" "}
+              {/* The summon mention stays `@symphony` — the daemon's summon token is unchanged by the
+                  Rhapsody rebrand (a cross-process wire contract; the mock's `@rhapsody` would match
+                  nothing). Styled mono-rust per the spec so the exact mention to type stands out. */}
+              <code className="mono" style={{ fontSize: 11, color: "var(--rust-text)" }}>
+                @symphony
+              </code>{" "}
+              comment lands on its unmerged GitHub PR.
+            </>
+          }
         >
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
             <Toggle
@@ -173,7 +184,7 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
         <Field
           label="Max concurrent agents"
           inline
-          hint="Total runs Symphony will execute in parallel across all projects."
+          hint="Total runs Rhapsody will execute in parallel across all projects."
         >
           <Stepper value={value.maxConcurrent} onChange={(v) => set("maxConcurrent", v)} min={1} max={12} />
         </Field>
@@ -320,10 +331,10 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
       </SectionCard>
 
       <SectionCard title="App" icon={Settings}>
-        <Field label="Dashboard port" inline hint="Local port the Symphony dashboard binds to.">
+        <Field label="Dashboard port" inline hint="Local port the Rhapsody dashboard binds to.">
           <Stepper value={value.dashboardPort} onChange={(v) => set("dashboardPort", v)} min={1024} max={65535} />
         </Field>
-        <Field label="Poll interval" inline hint="How often Symphony checks Linear for new tickets.">
+        <Field label="Poll interval" inline hint="How often Rhapsody checks Linear for new tickets.">
           <Stepper value={value.pollIntervalSec} onChange={(v) => set("pollIntervalSec", v)} min={1} max={120} suffix="sec" />
         </Field>
         <Field label="Logs path" inline>
@@ -349,7 +360,7 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
       <SectionCard
         title="Agent MCP"
         icon={Link}
-        desc="Expose Symphony's run/daemon state to agents over a local MCP facade (`symphony mcp`). Read tools are always on; these toggles gate injection into dispatched workers and the opt-in write tools."
+        desc="Expose Rhapsody's run/daemon state to agents over a local MCP facade (`symphony mcp`). Read tools are always on; these toggles gate injection into dispatched workers and the opt-in write tools."
       >
         <Field
           label="Inject into agents"

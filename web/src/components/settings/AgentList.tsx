@@ -10,10 +10,11 @@ import {
   StatusDot,
   Toggle,
 } from "@/components/ui";
-import { effectiveModel, type UiAgent, type UiGlobal } from "@/lib/settings-model";
+import { agentSeats, effectiveModel, type UiAgent, type UiGlobal } from "@/lib/settings-model";
 
-// The agent-list row/header share one grid template: agent · project · model · on · status · ›.
-const GRID = "minmax(160px,1.4fr) minmax(120px,1fr) 130px 64px 110px 30px";
+// The agent-list row/header share one grid template (mock 2b): repo · Linear project · model · on ·
+// status · ›. The row leads with the repo (mono) — the agent's identifying handle in the table.
+const GRID = "minmax(0,280px) minmax(0,1fr) 120px 64px 130px 24px";
 
 // stripModel drops the "claude-" prefix for the compact model cell (matches the design).
 const stripModel = (m: string) => m.replace("claude-", "");
@@ -56,26 +57,18 @@ function AgentRow({
         transition: "background .1s",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 11, minWidth: 0 }}>
-        <StatusDot color={agent.color} size={9} pulse={agent.status === "running"} />
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 13.5, fontWeight: 600, color: agent.enabled ? "var(--tx)" : "var(--tx-2)" }}>
-            {agent.name}
-          </div>
-          <div
-            className="mono"
-            style={{
-              fontSize: 12,
-              color: "var(--tx-3)",
-              marginTop: 1,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {agent.repoShort}
-          </div>
-        </div>
+      <div
+        className="mono"
+        style={{
+          fontSize: 12.5,
+          color: agent.enabled ? "var(--tx)" : "var(--tx-2)",
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {agent.repoShort}
       </div>
       <div
         style={{
@@ -219,14 +212,19 @@ export interface AgentListProps {
 // AgentList — the agents header (counts + Add-agent) over either the canonical table-row layout
 // or the card-grid alternate, ported from the design `projects.jsx`.
 export function AgentList({ agents, global, listStyle = "rows", onSelect, onToggle, openSheet }: AgentListProps) {
-  const enabled = agents.filter((a) => a.enabled).length;
+  // Seat accounting (mock 2b): "N configured · M enabled · P of Q seats playing" + the open-seats
+  // affordance count (Q − M, hidden at 0). Q is the global max-concurrent capacity.
+  const seats = agentSeats(agents, global.maxConcurrent);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
           <h2 style={{ fontSize: 16, fontWeight: 600, letterSpacing: "-0.02em" }}>Agents</h2>
           <span style={{ fontSize: 13, color: "var(--tx-3)" }}>
-            {agents.length} configured · {enabled} enabled
+            {seats.configured} configured · {seats.enabled} enabled ·{" "}
+            <span style={{ color: "var(--rust-text)" }}>
+              {seats.playing} of {seats.seats} seats playing
+            </span>
           </span>
         </div>
         <Button variant="primary" icon={Plus} onClick={openSheet}>
@@ -258,7 +256,7 @@ export function AgentList({ agents, global, listStyle = "rows", onSelect, onTogg
               color: "var(--tx-faint)",
             }}
           >
-            {["Agent", "Project", "Model", "On", "Status", ""].map((h, i) => (
+            {["Repo", "Linear project", "Model", "On", "Status", ""].map((h, i) => (
               <div key={i}>{h}</div>
             ))}
           </div>
@@ -269,7 +267,41 @@ export function AgentList({ agents, global, listStyle = "rows", onSelect, onTogg
           ))}
         </div>
       )}
+      {seats.open > 0 ? <OpenSeats open={seats.open} onAdd={openSheet} /> : null}
     </div>
+  );
+}
+
+// OpenSeats — the dashed "N seats open" affordance under the agents table (mock 2b). Rendered only
+// when there is unfilled capacity (open = maxConcurrent − enabled > 0). The whole row is the
+// add-an-agent action (a button, for keyboard reach); the action half reads in rust.
+function OpenSeats({ open, onAdd }: { open: number; onAdd: () => void }) {
+  const [hover, setHover] = React.useState(false);
+  return (
+    <button
+      type="button"
+      onClick={onAdd}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        width: "100%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 5,
+        padding: "18px 22px",
+        border: "1px dashed var(--hair-dashed)",
+        borderRadius: "var(--r-card)",
+        background: hover ? "rgba(255,255,255,.02)" : "transparent",
+        cursor: "pointer",
+        fontSize: 12,
+        color: "var(--tx-3)",
+        transition: "background .12s",
+      }}
+    >
+      {open} {open === 1 ? "seat" : "seats"} open —{" "}
+      <span style={{ color: "var(--rust-text)" }}>add an agent to fill them</span>
+    </button>
   );
 }
 

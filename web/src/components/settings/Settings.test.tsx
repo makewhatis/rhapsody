@@ -75,11 +75,16 @@ vi.mock("@/lib/bindings", () => ({
   setLinearToken: h.setLinearToken,
   clearLinearToken: h.clearLinearToken,
   pickDirectory: vi.fn(async () => ""),
+  appVersion: vi.fn(async () => null), // plain-browser: no build stamp (RailVersion falls back to "dev")
 }));
 
 import { Settings } from "@/components/settings/Settings";
 import { ToastProvider } from "@/components/shell/Toast";
 import type { SettingsTabId } from "@/components/shell/placeholders";
+
+// Comfortably past the Settings autosave debounce (600ms) — used to assert a BLOCKED draft never
+// POSTs even after the window elapses.
+const AUTOSAVE_WAIT_MS = 800;
 
 // Stateful harness so clicking a rail tab actually switches the active tab (the real shell owns
 // the tab state) while keeping the Settings instance — and its pending-token state — mounted.
@@ -109,48 +114,44 @@ beforeEach(() => {
   h.saveTypedConfig.mockImplementation(async (global, projects) => ({ config: {}, prompt_body: "", global, projects }));
 });
 
-describe("Settings (round-trip controller)", () => {
-  it("reads config on mount, marks dirty on edit, and POSTs on Save with the reload toast", async () => {
+describe("Settings (autosave controller)", () => {
+  it("reads config on mount, shows Saving… on edit, and autosaves after the debounce", async () => {
     renderSettings("general");
     await screen.findByText("Linear connection");
-    // pristine: Save disabled
-    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
-    // edit max-concurrent (first Stepper) 8 -> 9
+    // pristine: the settled indicator, no Save button anywhere
+    expect(screen.getByText("All changes saved")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    // edit max-concurrent (first Stepper) 8 -> 9: the indicator flips to Saving… immediately…
     fireEvent.click(screen.getAllByLabelText("Increment")[0]);
-    expect(screen.getByText("Unsaved changes")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1));
+    expect(screen.getByText("Saving…")).toBeTruthy();
+    expect(h.saveTypedConfig).not.toHaveBeenCalled(); // …but the POST is debounced
+    // …then the debounce fires exactly one POST and the indicator settles.
+    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1), { timeout: 2000 });
     expect(h.saveTypedConfig.mock.calls[0][0].agent.max_concurrent_agents).toBe(9);
-    expect(await screen.findByText("Settings saved")).toBeTruthy();
-    expect(await screen.findByText("Daemon reloaded configuration ✓")).toBeTruthy();
+    await screen.findByText("All changes saved");
   });
 
-  it("writes a pasted token to the keychain on Save and never into the config payload", async () => {
+  it("writes a pasted token to the keychain on autosave and never into the config payload", async () => {
     renderSettings("general");
     await screen.findByText("Linear connection");
     fireEvent.change(screen.getByPlaceholderText("Paste lin_api_…"), { target: { value: "lin_api_secret123" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(h.setLinearToken).toHaveBeenCalledWith("lin_api_secret123"));
+    await waitFor(() => expect(h.setLinearToken).toHaveBeenCalledWith("lin_api_secret123"), { timeout: 2000 });
     expect(h.saveTypedConfig).toHaveBeenCalledTimes(1);
     // the config payload carries no raw token anywhere
     expect(JSON.stringify(h.saveTypedConfig.mock.calls[0])).not.toContain("lin_api_secret123");
   });
 
-  it("toggles enable as a draft edit that the Save bar persists via config", async () => {
+  it("autosaves an enable/pause toggle as a draft edit", async () => {
     renderSettings("projects");
-    await screen.findByText("Infra Bot");
+    await screen.findByText(/configured/);
     fireEvent.click(screen.getByRole("switch", { name: "Enable Infra Bot" }));
-    // a casual toggle does NOT auto-persist — it marks the form dirty
-    expect(h.saveTypedConfig).not.toHaveBeenCalled();
-    expect(screen.getByText("Unsaved changes")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1), { timeout: 2000 });
     expect(h.saveTypedConfig.mock.calls[0][1][0].enabled).toBe(false);
   });
 
-  it("creates an agent from the sheet (POST + 'Agent created' toast)", async () => {
+  it("appends an agent from the sheet and autosaves it", async () => {
     renderSettings("projects");
-    await screen.findByText("Infra Bot");
+    await screen.findByText(/configured/);
     fireEvent.click(screen.getByRole("button", { name: /Add agent/ }));
     fireEvent.change(screen.getByPlaceholderText("Search your Linear projects…"), { target: { value: "Core" } });
     fireEvent.click(screen.getByText("Core Platform"));
@@ -158,14 +159,13 @@ describe("Settings (round-trip controller)", () => {
       target: { value: "git@github.com:example/core.git" },
     });
     fireEvent.click(screen.getByRole("button", { name: /Create agent/ }));
-    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1), { timeout: 2000 });
     const postedProjects = h.saveTypedConfig.mock.calls[0][1];
     expect(postedProjects).toHaveLength(2);
     expect(postedProjects[1].slugs).toEqual(["core-5f1a"]);
-    expect(await screen.findByText("Agent created")).toBeTruthy();
   });
 
-  it("blocks Save when an agent's review-promote state isn't one of its active states", async () => {
+  it("blocks autosave (and surfaces the error) when a review-promote state isn't one of its active states", async () => {
     const bad = makeGlobal();
     bad.review_states = ["In Review"]; // review enabled, so the promote check applies
     bad.review_promote_state = "Shipped"; // ∉ infra's active states (Todo, In Progress)
@@ -176,23 +176,22 @@ describe("Settings (round-trip controller)", () => {
       projects: [structuredClone(infra)],
     });
     renderSettings("projects");
-    await screen.findByText("Infra Bot");
-    // make an edit so dirty=true; Save must STILL be blocked by the validation error
+    await screen.findByText(/configured/);
+    // make an edit so dirty=true; the block message shows and autosave must NOT fire
     fireEvent.click(screen.getByRole("switch", { name: "Enable Infra Bot" }));
     expect(screen.getByText(/Review-promote state must be one of/)).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
+    // wait past the debounce window — a blocked draft is never POSTed
+    await new Promise((r) => setTimeout(r, AUTOSAVE_WAIT_MS));
     expect(h.saveTypedConfig).not.toHaveBeenCalled();
   });
 
-  it("removes an agent (back to list, then Save persists config without that project)", async () => {
+  it("removes an agent and autosaves the config without that project", async () => {
     renderSettings("projects");
-    await screen.findByText("Infra Bot");
-    fireEvent.click(screen.getByText("Infra Bot")); // open detail
+    await screen.findByText(/configured/);
+    fireEvent.click(screen.getByText("example/demo-repo")); // open detail via the repo cell
     fireEvent.click(await screen.findByRole("button", { name: "Remove agent" }));
-    // returns to the (now empty) list as a pending edit; Save persists the removal
-    await screen.findByText("No agents yet");
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1));
+    await screen.findByText("No agents yet"); // back to the (now empty) list as a pending edit
+    await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1), { timeout: 2000 });
     expect(h.saveTypedConfig.mock.calls[0][1]).toHaveLength(0);
   });
 });

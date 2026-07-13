@@ -6,8 +6,10 @@ import type {
   ProjectStatus,
 } from "@/lib/api";
 import {
+  agentSeats,
   applyUiAgent,
   applyUiGlobal,
+  autosaveView,
   backoffToMs,
   clampProjectCaps,
   duplicateSlugs,
@@ -796,5 +798,63 @@ describe("null list fields from the daemon (blank-screen regression)", () => {
     const p: ProjectConfigDTO = { name: "A", slugs: ["a"], enabled: true, overrides: {} };
     expect(() => toUiAgents([p], g, [], [])).not.toThrow();
     expect(toUiAgents([p], g, [], [])[0].reviewStates).toEqual([]);
+  });
+});
+
+describe("agentSeats (Projects seat math — 2b)", () => {
+  const a = (enabled: boolean, running = 0) => ({ enabled, running });
+
+  it("counts configured, enabled, and playing seats and computes open = maxConcurrent − enabled", () => {
+    // The mock case: 1 configured, 1 enabled, that agent playing 1 run, of a 4-seat cap.
+    const s = agentSeats([a(true, 1)], 4);
+    expect(s).toEqual({ configured: 1, enabled: 1, playing: 1, seats: 4, open: 3 });
+  });
+
+  it("sums running across agents for the playing (occupied-seat) count", () => {
+    const s = agentSeats([a(true, 2), a(true, 1), a(false, 0)], 8);
+    expect(s.configured).toBe(3);
+    expect(s.enabled).toBe(2); // the paused agent does not hold a seat
+    expect(s.playing).toBe(3); // 2 + 1 live runs
+    expect(s.open).toBe(6); // 8 − 2 enabled
+  });
+
+  it("clamps open to 0 (never negative) when enabled agents meet or exceed the cap", () => {
+    expect(agentSeats([a(true), a(true), a(true)], 2).open).toBe(0);
+    expect(agentSeats([a(true), a(true)], 2).open).toBe(0);
+  });
+
+  it("is empty-safe (no agents, zero cap)", () => {
+    expect(agentSeats([], 4)).toEqual({ configured: 0, enabled: 0, playing: 0, seats: 4, open: 4 });
+    expect(agentSeats([], 0)).toEqual({ configured: 0, enabled: 0, playing: 0, seats: 0, open: 0 });
+  });
+});
+
+describe("autosaveView (autosave state machine — retires the Save button)", () => {
+  const base = { dirty: false, saving: false, blocked: null, error: null };
+
+  it("is 'saved' when clean, idle, and error-free", () => {
+    expect(autosaveView(base)).toEqual({ kind: "saved" });
+  });
+
+  it("is 'saving' while a persist is in flight OR edits are pending (debounce window)", () => {
+    expect(autosaveView({ ...base, saving: true })).toEqual({ kind: "saving" });
+    expect(autosaveView({ ...base, dirty: true })).toEqual({ kind: "saving" });
+  });
+
+  it("surfaces a save failure as an error with its message", () => {
+    expect(autosaveView({ ...base, dirty: true, error: "http_503" })).toEqual({
+      kind: "error",
+      message: "http_503",
+    });
+  });
+
+  it("surfaces a validation block even over an in-flight save (most actionable state wins)", () => {
+    const v = autosaveView({ dirty: true, saving: true, blocked: "Fix the promote state.", error: null });
+    expect(v).toEqual({ kind: "error", message: "Fix the promote state." });
+  });
+
+  it("returns to 'saving' once the block clears, then 'saved' after persist", () => {
+    expect(autosaveView({ ...base, dirty: true, blocked: null })).toEqual({ kind: "saving" });
+    expect(autosaveView(base)).toEqual({ kind: "saved" });
   });
 });

@@ -1,17 +1,6 @@
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import {
-  ArrowLeft,
-  Boxes,
-  Button,
-  Check,
-  type IconComponent,
-  ScrollText,
-  SkeletonCard,
-  Sliders,
-  StatusDot,
-  Wrench,
-} from "@/components/ui";
+import { ArrowLeft, Check, SkeletonCard, StatusDot } from "@/components/ui";
 import {
   LINEAR_IDENTITY_QUERY_KEY,
   useLinearIdentity,
@@ -20,12 +9,13 @@ import {
   useSaveTypedConfig,
   useTypedConfigQuery,
 } from "@/hooks/useConfig";
-import { clearLinearToken, setLinearToken } from "@/lib/bindings";
+import { appVersion, clearLinearToken, setLinearToken, type VersionDTO } from "@/lib/bindings";
 import type { GlobalConfigDTO, LinearProject, ProjectConfigDTO } from "@/lib/api";
 import { ConfigSaveError } from "@/lib/api";
 import {
   applyUiAgent,
   applyUiGlobal,
+  autosaveView,
   clampProjectCaps,
   duplicateSlugs,
   globalPromoteValid,
@@ -43,18 +33,23 @@ import {
   settingsRailTabId,
   type SettingsTabId,
 } from "@/components/shell/placeholders";
-import { useToast } from "@/components/shell/Toast";
 import { GeneralTab } from "./GeneralTab";
 import { ProjectsTab } from "./ProjectsTab";
 import { AddAgentSheet } from "./AddAgentSheet";
 import { ToolsTab } from "./ToolsTab";
 import { LogsTab } from "./LogsTab";
 
-const SETTINGS_NAV: { id: SettingsTabId; label: string; icon: IconComponent }[] = [
-  { id: "general", label: "General", icon: Sliders },
-  { id: "projects", label: "Projects", icon: Boxes },
-  { id: "tools", label: "Tools", icon: Wrench },
-  { id: "logs", label: "Logs", icon: ScrollText },
+// Autosave debounce: coalesce rapid edits (stepper clicks, typing) into one POST after the user
+// pauses. The Save button is retired (mock 2a/2b) — edits persist on their own.
+const AUTOSAVE_DEBOUNCE_MS = 600;
+
+// The Settings rail is text-only (mock 2a–2d): no leading icons. "Projects" carries a live count
+// badge; "Tools" carries an amber warning-dot slot lit by the doctor (wired in D6).
+const SETTINGS_NAV: { id: SettingsTabId; label: string }[] = [
+  { id: "general", label: "General" },
+  { id: "projects", label: "Projects" },
+  { id: "tools", label: "Tools" },
+  { id: "logs", label: "Logs" },
 ];
 
 const TAB_META: Record<SettingsTabId, { title: string; desc: string }> = {
@@ -70,15 +65,19 @@ const TAB_META: Record<SettingsTabId, { title: string; desc: string }> = {
 interface RailItemProps {
   tabId: SettingsTabId;
   label: string;
-  icon: IconComponent;
   active: boolean;
   onClick: () => void;
+  /** A mono count badge (e.g. the configured-agent count on "Projects"). */
   badge?: React.ReactNode;
+  /** A 6px amber warning dot (e.g. "Tools" while the doctor has warnings — wired in D6). */
+  warn?: boolean;
 }
 
-// RailItem — the Settings left-rail nav item (active emerald bar + soft fill, mono count badge),
-// ported from the design `app.jsx`.
-function RailItem({ tabId, label, icon: Icon, active, onClick, badge }: RailItemProps) {
+// RailItem — a Settings left-rail nav item (mock 2a): text-only, 12.5px, active rust text on the
+// active-nav tint. "Projects" shows a mono count badge; "Tools" shows an amber warning dot when the
+// doctor has warnings.
+function RailItem({ tabId, label, active, onClick, badge, warn }: RailItemProps) {
+  const [hover, setHover] = React.useState(false);
   return (
     <button
       type="button"
@@ -88,50 +87,37 @@ function RailItem({ tabId, label, icon: Icon, active, onClick, badge }: RailItem
       aria-controls={SETTINGS_PANEL_ID}
       tabIndex={active ? 0 : -1}
       onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 11,
+        gap: 8,
         width: "100%",
-        height: 38,
-        padding: "0 12px",
-        borderRadius: 9,
+        padding: "7px 10px",
+        borderRadius: "var(--r-ctrl)",
         border: "none",
         cursor: "pointer",
-        fontSize: 13.5,
-        fontWeight: 500,
+        fontSize: 12.5,
+        fontWeight: active ? 500 : 400,
         textAlign: "left",
-        background: active ? "var(--em-soft)" : "transparent",
-        color: active ? "var(--em-bright)" : "var(--tx-2)",
-        transition: "all .13s",
-        position: "relative",
+        background: active ? "var(--tint-active-nav)" : hover ? "rgba(255,255,255,.04)" : "transparent",
+        color: active ? "var(--rust-text)" : "var(--text-muted)",
+        transition: "background .12s, color .12s",
       }}
     >
-      <span
-        aria-hidden
-        style={{
-          position: "absolute",
-          left: 0,
-          top: 9,
-          bottom: 9,
-          width: 2.5,
-          borderRadius: 2,
-          background: "var(--em-bright)",
-          opacity: active ? 1 : 0,
-        }}
-      />
-      <Icon size={16} style={{ opacity: active ? 1 : 0.85 }} />
       <span style={{ flex: 1 }}>{label}</span>
+      {warn ? <StatusDot color="var(--amber)" size={6} aria-label="warnings" /> : null}
       {badge != null ? (
         <span
           className="mono"
           style={{
-            fontSize: 11,
+            fontSize: 10,
             fontWeight: 600,
-            color: active ? "var(--em-bright)" : "var(--tx-faint)",
-            background: active ? "transparent" : "rgba(255,255,255,.05)",
-            padding: active ? 0 : "2px 7px",
-            borderRadius: 999,
+            color: active ? "var(--rust-text)" : "var(--faint)",
+            background: active ? "var(--tint-rust)" : "rgba(255,255,255,.06)",
+            padding: "1px 6px",
+            borderRadius: "var(--r-keycap)",
           }}
         >
           {badge}
@@ -141,89 +127,56 @@ function RailItem({ tabId, label, icon: Icon, active, onClick, badge }: RailItem
   );
 }
 
-// SaveBar — the dirty-state indicator + Save button in the panel header. Owned by INF-226 (the
-// foundation shipped only the toast + sheet host). Saving POSTs the typed config and the toast
-// confirms the daemon hot-reload.
-function SaveBar({
-  dirty,
-  saving,
-  error,
-  invalid,
-  onSave,
-}: {
-  dirty: boolean;
-  saving: boolean;
-  error: string | null;
-  /** A validation error blocks Save (e.g. a review-promote state outside an agent's active states). */
-  invalid?: boolean;
-  onSave: () => void;
-}) {
+// RailVersion — the rail's build stamp footer (mock 2a: "0.1.0-dev · 8d288f8"), pinned to the rail
+// bottom. Reads the compiled-in stamp via the desktop bridge; falls back to "dev" in a plain browser
+// (no bridge), so the footer slot is always present.
+function RailVersion() {
+  const [v, setV] = React.useState<VersionDTO | null>(null);
+  React.useEffect(() => {
+    void appVersion().then(setV);
+  }, []);
+  const label = !v || !v.version || v.version === "dev" ? "dev" : v.version;
+  const commit = v && v.commit && v.commit !== "none" ? ` · ${v.commit}` : "";
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
-      {error ? (
-        <span style={{ fontSize: 12, color: "var(--red)", maxWidth: 320, textAlign: "right" }}>{error}</span>
-      ) : (
-        <span
-          style={{
-            fontSize: 12,
-            color: dirty ? "var(--amber)" : "var(--tx-faint)",
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 6,
-          }}
-        >
-          {dirty ? (
-            <>
-              <StatusDot color="var(--amber)" size={6} />
-              Unsaved changes
-            </>
-          ) : (
-            "All changes saved"
-          )}
-        </span>
-      )}
-      <Button variant="primary" icon={dirty ? undefined : Check} onClick={onSave} disabled={!dirty || saving || invalid}>
-        {saving ? "Saving…" : "Save"}
-      </Button>
+    <div
+      className="mono"
+      style={{ marginTop: "auto", paddingTop: 16, fontSize: 10, color: "var(--ghost)" }}
+    >
+      {label}
+      {commit}
     </div>
   );
 }
 
-type Draft = { global: GlobalConfigDTO; projects: ProjectConfigDTO[] };
-
-// BackToRuns — the explicit "leave Settings" affordance. The titlebar gear toggles Settings ↔ Runs,
-// but that's not discoverable on its own, so Settings always shows an obvious back link at the top.
-function BackToRuns({ onBack }: { onBack: () => void }) {
-  const [hover, setHover] = React.useState(false);
+// AutosaveIndicator — the header's save state (mock 2a/2b), derived by autosaveView: "Saving…" while
+// edits are pending or in flight, "✓ All changes saved" (sage) once settled, or the block/failure
+// message in red. It replaces the retired Save button.
+function AutosaveIndicator({ dirty, saving, blocked, error }: {
+  dirty: boolean;
+  saving: boolean;
+  blocked: string | null;
+  error: string | null;
+}) {
+  const view = autosaveView({ dirty, saving, blocked, error });
+  if (view.kind === "error") {
+    return (
+      <span style={{ fontSize: 11.5, color: "var(--red)", maxWidth: 340, textAlign: "right" }}>
+        {view.message}
+      </span>
+    );
+  }
+  if (view.kind === "saving") {
+    return <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>Saving…</span>;
+  }
   return (
-    <button
-      type="button"
-      onClick={onBack}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 6,
-        alignSelf: "flex-start",
-        border: "1px solid transparent",
-        borderRadius: 7,
-        cursor: "pointer",
-        color: hover ? "var(--tx)" : "var(--tx-3)",
-        background: hover ? "var(--bg-hover)" : "transparent",
-        borderColor: hover ? "var(--line-strong)" : "transparent",
-        fontSize: 13,
-        fontWeight: 500,
-        padding: "5px 11px 5px 8px",
-        marginBottom: 16,
-        marginLeft: -8,
-        transition: "all .12s",
-      }}
-    >
-      <ArrowLeft size={15} /> Back to Runs
-    </button>
+    <span style={{ fontSize: 11.5, color: "var(--sage)", display: "inline-flex", alignItems: "center", gap: 5 }}>
+      <Check size={13} style={{ color: "var(--sage)" }} />
+      All changes saved
+    </span>
   );
 }
+
+type Draft = { global: GlobalConfigDTO; projects: ProjectConfigDTO[] };
 
 export interface SettingsProps {
   tab: SettingsTabId;
@@ -232,12 +185,12 @@ export interface SettingsProps {
   onBack: () => void;
 }
 
-// Settings — the Settings surface: a vertical rail of tabs and a titled panel with the dirty Save
-// bar, plus the Add-agent sheet host. It owns the working config draft (deep-cloned from the
-// daemon's typed view), the dirty flag, and the pending Linear token (kept out of config — written
-// to the keychain on save). Nearly everything is a draft edit persisted atomically by the Save bar
-// (General fields, the agent detail editor, the list enable/pause toggle, and remove). The lone
-// immediate-persist action is creating an agent from the Add-agent sheet — an explicit "add + save".
+// Settings — the Settings surface (mock 2a–2d): a 188px rail (← Jobs, nav, count badge, Tools
+// warning-dot slot, version footer) beside a titled content pane. It owns the working config draft
+// (deep-cloned from the daemon's typed view), the dirty flag, and the pending Linear token (kept out
+// of config — written to the keychain on save). Every edit — General fields, the agent detail
+// editor, the list enable/pause toggle, remove, and Add-agent — is a draft edit AUTOSAVED after a
+// short debounce (the Save button is retired); the header shows "Saving…" → "✓ All changes saved".
 export function Settings({ tab, onTab, onBack }: SettingsProps) {
   const cfg = useTypedConfigQuery();
   const identity = useLinearIdentity();
@@ -245,7 +198,6 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
   const statuses = useProjectStatuses();
   const save = useSaveTypedConfig();
   const qc = useQueryClient();
-  const { toast } = useToast();
 
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [dirty, setDirty] = React.useState(false);
@@ -256,9 +208,9 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
   // The originally-loaded global, so a persist-artifacts off→on toggle can restore the real path.
   const baseGlobal = React.useRef<GlobalConfigDTO | null>(null);
   // Monotonic counter bumped synchronously on every draft/token edit. A save captures it at start
-  // and only marks the form clean (+ toasts) if it's unchanged when the POST resolves — so an edit
-  // racing the in-flight save is never silently discarded (a render-updated ref would be subject to
-  // paint timing and could miss the race).
+  // and only marks the form clean if it's unchanged when the POST resolves — so an edit racing the
+  // in-flight save is never silently discarded (a render-updated ref would be subject to paint
+  // timing and could miss the race).
   const editSeq = React.useRef(0);
 
   // Re-sync the draft from the server whenever a fresh config arrives and there are no local edits
@@ -324,10 +276,10 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
   };
 
   // persist flushes any pending token, POSTs `snapshot`, and — only if no edit raced the in-flight
-  // save (the edit sequence captured at `seqAtStart` is unchanged) — marks the form clean + toasts.
-  // Staying dirty on a race keeps the resync effect (gated on !dirty) from clobbering the newer edit
-  // and keeps the indicator/toast honest.
-  const persist = (snapshot: Draft, title: string, seqAtStart: number): Promise<void> =>
+  // save (the edit sequence captured at `seqAtStart` is unchanged) — marks the form clean. Staying
+  // dirty on a race keeps the resync effect (gated on !dirty) from clobbering the newer edit and
+  // re-arms the autosave for the racing edit.
+  const persist = (snapshot: Draft, seqAtStart: number): Promise<void> =>
     (async () => {
       const flushed = await flushPendingToken();
       // Clamp per-agent caps to the (possibly just-lowered) global max before POST.
@@ -337,14 +289,11 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
       if (editSeq.current === seqAtStart) {
         setDirty(false);
         setToken("");
-        toast(title, "Daemon reloaded configuration ✓");
       }
     })();
 
   // The list enable/pause toggle and remove are plain draft edits: they mark the form dirty and the
-  // Save bar persists them with the rest of the config (one atomic POST). This keeps a single source
-  // of truth — a casual toggle never silently writes unrelated pending edits, and nothing clears the
-  // dirty flag without a Save.
+  // autosave persists them with the rest of the config (one atomic POST).
   const onToggleAgent = (index: number, enabled: boolean) => {
     editSeq.current++;
     setDraft((d) => (d ? { ...d, projects: d.projects.map((p, i) => (i === index ? { ...p, enabled } : p)) } : d));
@@ -359,29 +308,16 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
     setDirty(true);
   };
 
-  // Creating an agent is an explicit "add + save" action (per the Add-agent flow): it appends the
-  // agent to the draft and persists immediately, toasting "Agent created". On failure the new agent
-  // stays in the draft as a pending edit (surfaced via the error + Save bar) rather than being lost.
+  // Creating an agent appends it to the draft as a dirty edit and closes the sheet; the autosave
+  // persists it with the rest of the config. On a save failure the new agent stays in the draft as a
+  // pending edit (surfaced via the error indicator) rather than being lost.
   const onCreate = (project: LinearProject, repo: string) => {
-    // Same gate as the Save bar — never POST a config that fails validation (promote or unique slug).
-    if (!draft || save.isPending || flushing || saveBlocked) return;
-    const next: Draft = { global: draft.global, projects: [...draft.projects, newProjectConfig(project, repo)] };
-    editSeq.current++; // the create is itself an edit
-    setDraft(next);
+    if (!draft) return;
+    editSeq.current++;
+    setDraft({ global: draft.global, projects: [...draft.projects, newProjectConfig(project, repo)] });
     setDirty(true);
     setSheetOpen(false);
     setError(null);
-    void persist(next, "Agent created", editSeq.current).catch((e: unknown) => {
-      setError(e instanceof ConfigSaveError || e instanceof Error ? e.message : "Save failed");
-    });
-  };
-
-  const doSave = () => {
-    if (!draft || save.isPending || flushing || saveBlocked) return;
-    setError(null);
-    void persist(draft, "Settings saved", editSeq.current).catch((e: unknown) => {
-      setError(e instanceof ConfigSaveError || e instanceof Error ? e.message : "Save failed");
-    });
   };
 
   const onDisconnect = () => {
@@ -395,7 +331,7 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
   const agents =
     draft ? toUiAgents(draft.projects, draft.global, linearProjects.data ?? [], statuses.data ?? []) : [];
   const projectCount = draft?.projects.length ?? cfg.data?.projects?.length ?? 0;
-  // Block Save when the review-promote state would fail the daemon's validation — at the global
+  // Block autosave when the review-promote state would fail the daemon's validation — at the global
   // scope (global review on → promote ∈ global active states) and/or any agent's per-project scope.
   // The daemon would reject such a POST; the detail editor flags an offending agent inline.
   const promoteGlobalInvalid = draft ? !globalPromoteValid(draft.global) : false;
@@ -412,8 +348,29 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
         ? "Review-promote state must be one of each agent's active states."
         : null;
 
-  // Tools and Logs are read-only, daemon-direct panels: they don't read the config draft,
-  // so they render before the config load/skeleton guards (and hide the Save bar below).
+  const saving = save.isPending || flushing;
+
+  // Autosave: debounce edits, then persist — but never while blocked by validation (the daemon would
+  // reject the POST) or while a save/token-flush is already in flight. The effect re-runs on every
+  // edit (draft/token change), so the timer always fires with the latest snapshot.
+  React.useEffect(() => {
+    if (!draft || !dirty || saveBlocked || saving) return;
+    const seq = editSeq.current;
+    const snapshot = draft;
+    const timer = setTimeout(() => {
+      setError(null);
+      void persist(snapshot, seq).catch((e: unknown) => {
+        setError(e instanceof ConfigSaveError || e instanceof Error ? e.message : "Save failed");
+      });
+    }, AUTOSAVE_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+    // Deps intentionally cover the edit signals (draft/token/dirty) + the save gates
+    // (saveBlocked/saving); `persist` is a fresh per-render closure captured at fire time, so it is
+    // deliberately not a dependency (adding it would re-arm the timer every render).
+  }, [draft, token, dirty, saveBlocked, saving]);
+
+  // Tools and Logs are read-only, daemon-direct panels: they don't read the config draft, so they
+  // render before the config load/skeleton guards (and hide the autosave indicator below).
   const readOnlyTab = tab === "tools" || tab === "logs";
 
   let body: React.ReactNode;
@@ -459,69 +416,98 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
 
   return (
     <>
-      <BackToRuns onBack={onBack} />
-      <div style={{ display: "grid", gridTemplateColumns: "208px minmax(0,1fr)", gap: 36, alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "188px minmax(0,1fr)", alignItems: "start" }}>
         <div
-          role="tablist"
-          aria-label="Settings"
-          aria-orientation="vertical"
-          onKeyDown={(e) =>
-            handleTablistKeyDown(
-              e,
-              SETTINGS_NAV.map((s) => s.id),
-              tab,
-              onTab,
-              "vertical",
-            )
-          }
-          style={{ position: "sticky", top: 0, display: "flex", flexDirection: "column", gap: 3 }}
+          style={{
+            position: "sticky",
+            top: 0,
+            // Fill the viewport (approx: toolbar 46px + content top pad ~26px + breathing room) so
+            // the version footer pins to the rail bottom, mirroring the mock.
+            height: "calc(100vh - 118px)",
+            display: "flex",
+            flexDirection: "column",
+            paddingRight: 16,
+            borderRight: "1px solid var(--hair-section)",
+            overflowY: "auto",
+          }}
         >
+          <button
+            type="button"
+            onClick={onBack}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+              alignSelf: "flex-start",
+              border: "none",
+              background: "transparent",
+              cursor: "pointer",
+              color: "var(--text-muted)",
+              fontSize: 12,
+              padding: "2px 4px 2px 0",
+              marginBottom: 10,
+            }}
+          >
+            <ArrowLeft size={14} /> Jobs
+          </button>
           <div
             style={{
-              fontSize: 11,
+              fontSize: 10,
               fontWeight: 600,
-              letterSpacing: ".08em",
+              letterSpacing: ".12em",
               textTransform: "uppercase",
-              color: "var(--tx-faint)",
-              padding: "4px 12px 8px",
+              color: "var(--faint)",
+              padding: "0 10px 8px",
             }}
           >
             Settings
           </div>
-          {SETTINGS_NAV.map((s) => (
-            <RailItem
-              key={s.id}
-              tabId={s.id}
-              label={s.label}
-              icon={s.icon}
-              active={tab === s.id}
-              onClick={() => onTab(s.id)}
-              badge={s.id === "projects" ? projectCount : undefined}
-            />
-          ))}
+          <div
+            role="tablist"
+            aria-label="Settings"
+            aria-orientation="vertical"
+            onKeyDown={(e) =>
+              handleTablistKeyDown(
+                e,
+                SETTINGS_NAV.map((s) => s.id),
+                tab,
+                onTab,
+                "vertical",
+              )
+            }
+            style={{ display: "flex", flexDirection: "column", gap: 2 }}
+          >
+            {SETTINGS_NAV.map((s) => (
+              <RailItem
+                key={s.id}
+                tabId={s.id}
+                label={s.label}
+                active={tab === s.id}
+                onClick={() => onTab(s.id)}
+                badge={s.id === "projects" ? projectCount : undefined}
+                // The Tools warning dot is lit from the doctor's results in D6; no doctor source yet.
+                warn={s.id === "tools" ? false : undefined}
+              />
+            ))}
+          </div>
+          <RailVersion />
         </div>
         <div
           id={SETTINGS_PANEL_ID}
           role="tabpanel"
           aria-labelledby={settingsRailTabId(tab)}
           tabIndex={0}
-          style={{ display: "flex", flexDirection: "column", gap: 20, minWidth: 0, outline: "none" }}
+          style={{ display: "flex", flexDirection: "column", gap: 20, minWidth: 0, outline: "none", padding: "0 0 0 26px" }}
         >
           <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
             <div>
-              <h1 style={{ fontSize: 21, fontWeight: 600, letterSpacing: "-0.025em" }}>{meta.title}</h1>
-              <p style={{ fontSize: 13, color: "var(--tx-3)", marginTop: 5, maxWidth: 560, lineHeight: 1.5 }}>
+              <h1 style={{ fontSize: 17, fontWeight: 600, letterSpacing: "-0.02em" }}>{meta.title}</h1>
+              <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4, maxWidth: 560, lineHeight: 1.5 }}>
                 {meta.desc}
               </p>
             </div>
             {!readOnlyTab ? (
-              <SaveBar
-                dirty={dirty}
-                saving={save.isPending || flushing}
-                error={error ?? blockMessage}
-                invalid={saveBlocked}
-                onSave={doSave}
-              />
+              <AutosaveIndicator dirty={dirty} saving={saving} blocked={blockMessage} error={error} />
             ) : null}
           </div>
           {body}

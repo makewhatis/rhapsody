@@ -70,16 +70,26 @@ afterEach(cleanup);
 
 describe("AgentList (rows)", () => {
   const agents = [
-    agent({ id: "infra", name: "Infra Bot", overrides: { model: "claude-opus-4-8" }, enabled: true }),
-    agent({ id: "core", name: "Core Bot", projectSlug: "core-5f1a", projectName: "Core Platform", overrides: {}, enabled: false, status: "paused", running: 0 }),
+    agent({ id: "infra", name: "Infra Bot", repo: "git@github.com:makewhatis/rhapsody.git", repoShort: "makewhatis/rhapsody", overrides: { model: "claude-opus-4-8" }, enabled: true }),
+    agent({ id: "core", name: "Core Bot", repo: "git@github.com:makewhatis/core.git", repoShort: "makewhatis/core", projectSlug: "core-5f1a", projectName: "Core Platform", overrides: {}, enabled: false, status: "paused", running: 0 }),
   ];
 
-  it("renders the header counts and an Add-agent button that fires openSheet", () => {
+  it("renders the header counts + the rust seats-playing fragment and an Add-agent button that fires openSheet", () => {
     const openSheet = vi.fn();
+    // maxConcurrent 3; Infra enabled & playing 2 runs, Core paused: 2 configured · 1 enabled · 2 of 3 playing.
     render(<AgentList agents={agents} global={global} listStyle="rows" onSelect={() => {}} onToggle={() => {}} openSheet={openSheet} />);
-    expect(screen.getByText("2 configured · 1 enabled")).toBeTruthy();
+    expect(screen.getByText(/2 configured/)).toBeTruthy();
+    expect(screen.getByText(/1 enabled/)).toBeTruthy();
+    expect(screen.getByText("2 of 3 seats playing")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /Add agent/ }));
     expect(openSheet).toHaveBeenCalledOnce();
+  });
+
+  it("leads each row with the repo (mono) and the Linear project", () => {
+    render(<AgentList agents={agents} global={global} listStyle="rows" onSelect={() => {}} onToggle={() => {}} openSheet={() => {}} />);
+    expect(screen.getByText("makewhatis/rhapsody")).toBeTruthy();
+    expect(screen.getByText("makewhatis/core")).toBeTruthy();
+    expect(screen.getByText("Core Platform")).toBeTruthy();
   });
 
   it("shows the effective model with claude- stripped and an override dot only when overridden", () => {
@@ -87,8 +97,24 @@ describe("AgentList (rows)", () => {
     // Both resolve to opus-4-8 (Infra overrides it, Core inherits the same global default), with
     // the "claude-" prefix stripped.
     expect(screen.getAllByText("opus-4-8").length).toBe(2);
-    // …but only the overriding agent shows the emerald override dot.
+    // …but only the overriding agent shows the override dot.
     expect(screen.getAllByTitle("Overridden").length).toBe(1);
+  });
+
+  it("shows the dashed open-seats affordance (maxConcurrent − enabled) and fires openSheet", () => {
+    const openSheet = vi.fn();
+    render(<AgentList agents={agents} global={global} listStyle="rows" onSelect={() => {}} onToggle={() => {}} openSheet={openSheet} />);
+    // 3 seats − 1 enabled = 2 open.
+    const affordance = screen.getByRole("button", { name: /2 seats open/ });
+    fireEvent.click(affordance);
+    expect(openSheet).toHaveBeenCalledOnce();
+  });
+
+  it("hides the open-seats affordance when every seat is claimed (open = 0)", () => {
+    // 3 enabled agents against a 3-seat cap -> 0 open -> no affordance.
+    const full = [agent({ enabled: true }), agent({ enabled: true }), agent({ enabled: true })];
+    render(<AgentList agents={full} global={global} listStyle="rows" onSelect={() => {}} onToggle={() => {}} openSheet={() => {}} />);
+    expect(screen.queryByText(/seats open/)).toBeNull();
   });
 
   it("selects a row on click but the enable toggle stops propagation and persists instead", () => {
@@ -100,7 +126,7 @@ describe("AgentList (rows)", () => {
     expect(onToggle).toHaveBeenCalledWith(0, false);
     expect(onSelect).not.toHaveBeenCalled();
     // clicking the row body navigates (Core is index 1)
-    fireEvent.click(screen.getByText("Core Bot"));
+    fireEvent.click(screen.getByText("Core Platform"));
     expect(onSelect).toHaveBeenCalledWith(1);
   });
 
@@ -108,15 +134,15 @@ describe("AgentList (rows)", () => {
     // Mid-edit, toUiAgent can derive the same id from a shared slug. Keying by index keeps the two
     // rows distinct (React doesn't collide their keys) so selection/state attach to the right row.
     const dupes = [
-      agent({ id: "dup", name: "First Bot", enabled: true }),
-      agent({ id: "dup", name: "Second Bot", projectName: "Core Platform", enabled: false, status: "paused", running: 0 }),
+      agent({ id: "dup", repoShort: "org/first", enabled: true }),
+      agent({ id: "dup", repoShort: "org/second", projectName: "Core Platform", enabled: false, status: "paused", running: 0 }),
     ];
     const onSelect = vi.fn();
     render(<AgentList agents={dupes} global={global} listStyle="rows" onSelect={onSelect} onToggle={() => {}} openSheet={() => {}} />);
-    expect(screen.getByText("First Bot")).toBeTruthy();
-    expect(screen.getByText("Second Bot")).toBeTruthy();
+    expect(screen.getByText("org/first")).toBeTruthy();
+    expect(screen.getByText("org/second")).toBeTruthy();
     // The second (duplicate-keyed) row still selects its own index, not the first.
-    fireEvent.click(screen.getByText("Second Bot"));
+    fireEvent.click(screen.getByText("org/second"));
     expect(onSelect).toHaveBeenCalledWith(1);
   });
 

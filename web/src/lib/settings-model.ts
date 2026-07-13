@@ -616,6 +616,67 @@ export function projectSelectOptions(
   return { options, unmatched };
 }
 
+// AgentSeats is the Projects-tab seat accounting (mock 2b): the header counts + the "N seats open"
+// affordance. "Seats" is the global max-concurrent capacity; an ENABLED agent claims a seat, and a
+// live run OCCUPIES one. All four figures derive from the current agent list + the global cap.
+export interface AgentSeats {
+  /** Agents configured (rows in the Projects table). */
+  configured: number;
+  /** Agents with `enabled: true` — each holds a concurrency seat while it watches. */
+  enabled: number;
+  /** Seats currently occupied by a live run (the sum of per-agent running counts). */
+  playing: number;
+  /** Total concurrency capacity (the global max-concurrent-agents setting). */
+  seats: number;
+  /** Unfilled capacity = max(0, seats − enabled); drives the "N seats open" affordance (hidden at 0). */
+  open: number;
+}
+
+// agentSeats computes the Projects header fragments ("N configured · M enabled · P of Q seats
+// playing") and the open-seats affordance count. `open` is clamped at 0 so an over-subscribed cap
+// (more enabled agents than seats) never renders a negative "seats open". (mock 2b)
+export function agentSeats(
+  agents: readonly Pick<UiAgent, "enabled" | "running">[],
+  maxConcurrent: number,
+): AgentSeats {
+  const configured = agents.length;
+  const enabled = agents.filter((a) => a.enabled).length;
+  const playing = agents.reduce((n, a) => n + Math.max(0, a.running), 0);
+  const seats = Math.max(0, maxConcurrent);
+  const open = Math.max(0, seats - enabled);
+  return { configured, enabled, playing, seats, open };
+}
+
+// AutosaveView is the Settings header's save indicator, derived purely from the controller's flags
+// (the Save button is retired — mock 2a/2b). "saving" covers both an in-flight POST and the debounce
+// window before it (dirty edits pending); "error" carries a validation block or a persist failure.
+export type AutosaveKind = "saved" | "saving" | "error";
+export interface AutosaveView {
+  kind: AutosaveKind;
+  /** Present only for kind === "error" — the block/failure message to surface. */
+  message?: string;
+}
+
+// autosaveView maps the controller's (dirty, saving, blocked, error) flags onto the header
+// indicator. Precedence: a validation block wins even over an in-flight save (it is the most
+// actionable state and the daemon would reject the POST), then a persist failure, then the
+// pending/in-flight "Saving…" state, then the settled "✓ All changes saved".
+export function autosaveView(i: {
+  /** Unsaved edits are pending (the debounce window, or a queued save). */
+  dirty: boolean;
+  /** A persist request is in flight. */
+  saving: boolean;
+  /** A validation error that BLOCKS autosave (the daemon would reject the POST); null when valid. */
+  blocked: string | null;
+  /** The last persist attempt failed with this message; null when none. */
+  error: string | null;
+}): AutosaveView {
+  if (i.blocked) return { kind: "error", message: i.blocked };
+  if (i.error) return { kind: "error", message: i.error };
+  if (i.saving || i.dirty) return { kind: "saving" };
+  return { kind: "saved" };
+}
+
 // newProjectConfig builds a fresh agent entry for the Add-agent sheet: it watches the chosen
 // Linear project, points at the given repo, and inherits everything else (empty overrides,
 // null/empty per-agent knobs) from the global defaults. New agents DEFAULT to the repo's own prompt

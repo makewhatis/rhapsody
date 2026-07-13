@@ -210,13 +210,13 @@ describe("AppShell (integration)", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "Tools" })).toBeTruthy());
   });
 
-  it("returns to Runs via the Settings 'Back to Runs' link", async () => {
+  it("returns to Runs via the Settings rail '← Jobs' link", async () => {
     renderShell();
     await waitFor(() => expect(screen.getByText("Jobs")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(screen.getByRole("heading", { name: "General" })).toBeTruthy();
-    // the explicit, discoverable way out (vs. re-clicking the gear)
-    fireEvent.click(screen.getByRole("button", { name: "Back to Runs" }));
+    // the explicit, discoverable way out at the top of the rail (vs. re-clicking the gear)
+    fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
     expect(screen.getByText("Jobs")).toBeTruthy();
   });
 
