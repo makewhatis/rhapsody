@@ -30,18 +30,21 @@ export function RunsView() {
   const [openRunId, setOpenRunId] = React.useState<number | null>(null);
 
   if (openRunId != null) {
-    // Run detail keeps the centred, padded container (its Podium restyle is D4); only the Jobs list
-    // goes full-bleed.
+    // Run detail renders full-bleed too (mock 1d): the header, the edge-to-edge meta strip, and the
+    // transcript card are bands like the Jobs list — not the old centred container. (P10-D4)
     return (
-      <div style={{ maxWidth: 1180, margin: "0 auto", padding: "26px 40px 60px" }}>
-        <RunDetail
-          runId={openRunId}
-          projects={projects}
-          enabled
-          onBack={() => setOpenRunId(null)}
-          onSelectRun={setOpenRunId}
-        />
-      </div>
+      // Keyed by run id so switching attempts (from the run-history panel) mounts a fresh detail with
+      // clean follow/confirm state. The id is unchanged across a run's own live→finished transition,
+      // so that transition still renders in place with no re-key (matching useRunDetail's keying).
+      <RunDetail
+        key={openRunId}
+        runId={openRunId}
+        projects={projects}
+        maxTurns={maxTurns}
+        enabled
+        onBack={() => setOpenRunId(null)}
+        onSelectRun={setOpenRunId}
+      />
     );
   }
 
