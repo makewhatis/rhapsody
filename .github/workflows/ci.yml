@@ -74,14 +74,11 @@ jobs:
         with:
           node-version: 22
           # No `cache: npm` on the self-hosted runner (same rationale as the web job).
-      # Build the shell's frontend bundle FIRST: `cargo`/`tauri::generate_context!` embeds
-      # desktop/frontend/dist (tauri.conf.json `frontendDist`), which is git-ignored build output.
-      - run: npm ci
-        working-directory: desktop/frontend
-      - run: npm test          # vitest: the shell view-logic (status.ts) parity suite
-        working-directory: desktop/frontend
-      - run: npm run build     # -> desktop/frontend/dist (the rust embed source)
-        working-directory: desktop/frontend
+      # Since TRA-251 `web/` IS the Tauri window's frontend (tauri.conf.json `frontendDist` ->
+      # crates/httpapi/web-dist) — the interim desktop/frontend shell was retired. The cargo steps
+      # below compile against the committed `.gitkeep` anchor (an empty dist is fine —
+      # `tauri::generate_context!` embeds whatever is there); `make app` builds the real bundle. `web/`
+      # itself is built + tested by the `web` job.
       - run: cargo fmt --all --check
         working-directory: desktop
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -92,8 +89,8 @@ jobs:
         working-directory: desktop
       # P7-D5 packaging build gate: the Tauri bundler produces the UNSIGNED Rhapsody.app. The CLI
       # install is idempotent and persists on the self-hosted runner. `make app` (run from the repo
-      # root) builds the daemon's embedded dashboard + the shell frontend + the release rhapsodyd
-      # sidecar, bundles the app with the fakedaemon stub excluded (`--no-default-features`), and copies
+      # root) builds the web/ dashboard (both the daemon embed AND the Tauri frontend) + the release
+      # rhapsodyd sidecar, bundles the app with the fakedaemon stub excluded (`--no-default-features`), and copies
       # the sidecar into Contents/Resources — everything the parity e2e below needs.
       #
       # We deliberately build `make app`, NOT `make dmg`, on PRs: the DMG packaging (hdiutil) is

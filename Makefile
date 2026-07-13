@@ -39,18 +39,17 @@ APPICON      := desktop/src-tauri/icons/icon.png
 
 # app builds the UNSIGNED macOS Rhapsody.app (Tauri bundler) with a freshly-built rhapsodyd embedded
 # as the sidecar. Mirrors the Go `app` target (build-web + build-go + wails build + cp sidecar):
-#   1. the daemon's embedded React dashboard (web/ -> crates/httpapi/web-dist, rust-embed source),
-#   2. the Tauri shell's own frontend bundle (desktop/frontend/dist, tauri.conf.json frontendDist),
-#   3. the release rhapsodyd daemon (embeds #1),
-#   4. the Tauri app bundle — `--no-default-features` drops the `fakedaemon` test-stub bin so it is
+#   1. the React dashboard (web/ -> crates/httpapi/web-dist, rust-embed source) — since TRA-251 `web/`
+#      is BOTH the daemon's embedded dashboard AND the Tauri window's frontend (tauri.conf.json
+#      `frontendDist` points here); the retired desktop/frontend shell no longer builds a second bundle,
+#   2. the release rhapsodyd daemon (embeds #1),
+#   3. the Tauri app bundle — `--no-default-features` drops the `fakedaemon` test-stub bin so it is
 #      NOT shipped in Contents/MacOS (the bundler copies every built package bin),
-#   5. the sidecar copied to Contents/Resources/rhapsodyd (where supervisor/resolve.rs looks).
+#   4. the sidecar copied to Contents/Resources/rhapsodyd (where supervisor/resolve.rs looks).
 # Output: desktop/target/release/bundle/macos/Rhapsody.app.
 app:
 	cd web && npm ci && npm run build
 	touch crates/httpapi/web-dist/.gitkeep
-	cd desktop/frontend && npm ci && npm run build
-	touch desktop/frontend/dist/.gitkeep
 	cargo build --release -p $(BINARY)
 	cd desktop && RHAPSODY_VERSION="$(VERSION)" RHAPSODY_COMMIT="$(COMMIT)$(DIRTY)" RHAPSODY_BUILD_TIME="$(BUILDTIME)" \
 		cargo tauri build --bundles app -- --no-default-features

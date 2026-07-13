@@ -6,8 +6,6 @@ import { REPO_PROMPT_PATH } from "@/lib/settings-model";
 
 afterEach(() => {
   cleanup();
-  // PromptSource Browse availability is keyed off window.go; clear any test-installed bridge.
-  delete (window as unknown as { go?: unknown }).go;
 });
 
 describe("promptFileHint / isLocalPromptPath", () => {
@@ -116,17 +114,10 @@ describe("PromptSource", () => {
     expect(screen.getByText("prompts/global.md")).toBeTruthy();
   });
 
-  it("hides the Browse button when the native file picker binding is absent", () => {
+  // The Advanced custom-path input has no native "Browse" affordance: the Tauri shell exposes no
+  // file-picker command (TRA-251 migration off the Wails `window.go` bridge), so paths are typed.
+  it("renders no native Browse button on the custom-path input", () => {
     render(<PromptSource prompt="" onPromptChange={vi.fn()} promptFile="prompts/x.md" onPromptFileChange={vi.fn()} />);
     expect(screen.queryByRole("button", { name: "Browse for prompt file" })).toBeNull();
-  });
-
-  it("shows Browse and wires it to the file picker when the binding is present", () => {
-    const PickFile = vi.fn().mockResolvedValue("/picked/prompt.md");
-    (window as unknown as { go: unknown }).go = { main: { App: { PickFile } } };
-    render(<PromptSource prompt="" onPromptChange={vi.fn()} promptFile="prompts/x.md" onPromptFileChange={vi.fn()} />);
-    const browse = screen.getByRole("button", { name: "Browse for prompt file" });
-    fireEvent.click(browse);
-    expect(PickFile).toHaveBeenCalled();
   });
 });

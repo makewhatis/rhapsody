@@ -1,6 +1,5 @@
 import * as React from "react";
-import { Folder, TextArea, TextInput } from "@/components/ui";
-import { pickFile } from "@/lib/bindings";
+import { TextArea, TextInput } from "@/components/ui";
 import { REPO_PROMPT_PATH } from "@/lib/settings-model";
 
 // promptFileHint returns the live relative-vs-absolute description shown under the path input. An
@@ -98,11 +97,6 @@ export function PromptSource({
     }
   };
 
-  const browse = async () => {
-    const path = await pickFile("Choose prompt file");
-    if (path) onPromptFileChange(path);
-  };
-
   const local = isLocalPromptPath(promptFile);
 
   return (
@@ -178,22 +172,18 @@ export function PromptSource({
         </button>
         {advancedOpen ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <div style={{ display: "flex", gap: 8 }}>
-              <TextInput
-                mono
-                value={promptFile}
-                placeholder={inheritsFile ? inherited : "prompts/PROMPT.md  or  /Users/me/prompt.md"}
-                onChange={(e) => onPromptFileChange(e.target.value)}
-                onFocus={() => {
-                  pathFocused.current = true;
-                }}
-                onBlur={() => {
-                  pathFocused.current = false;
-                }}
-                style={{ flex: 1 }}
-              />
-              <Button onBrowse={browse} />
-            </div>
+            <TextInput
+              mono
+              value={promptFile}
+              placeholder={inheritsFile ? inherited : "prompts/PROMPT.md  or  /Users/me/prompt.md"}
+              onChange={(e) => onPromptFileChange(e.target.value)}
+              onFocus={() => {
+                pathFocused.current = true;
+              }}
+              onBlur={() => {
+                pathFocused.current = false;
+              }}
+            />
             <div style={{ fontSize: 12, color: "var(--tx-3)" }}>
               {promptFileHint(promptFile)}
               {ownPath !== "" ? (
@@ -207,37 +197,5 @@ export function PromptSource({
         ) : null}
       </div>
     </div>
-  );
-}
-
-// Button — the Browse affordance for the path input. Rendered only when the native file picker
-// binding is present (degrades gracefully to nothing when window.go is absent / a plain browser).
-function Button({ onBrowse }: { onBrowse: () => void }) {
-  const available = typeof window !== "undefined" && !!window.go?.main?.App?.PickFile;
-  if (!available) return null;
-  return (
-    <button
-      type="button"
-      onClick={() => void onBrowse()}
-      aria-label="Browse for prompt file"
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 6,
-        height: 40,
-        padding: "0 14px",
-        borderRadius: "var(--r-ctrl)",
-        border: "1px solid var(--line)",
-        background: "var(--bg-raised)",
-        color: "var(--tx-2)",
-        fontSize: 12.5,
-        fontWeight: 600,
-        cursor: "pointer",
-        whiteSpace: "nowrap",
-      }}
-    >
-      <Folder size={14} />
-      Browse
-    </button>
   );
 }

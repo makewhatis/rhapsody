@@ -73,7 +73,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
 
       # Same toolchain ci.yml's `desktop` job uses for `make dmg`: rustup on PATH (it lives in
-      # ~/.cargo/bin, not the runner's seeded PATH), node for the two frontend bundles, and the Tauri
+      # ~/.cargo/bin, not the runner's seeded PATH), node for the web/ frontend bundle, and the Tauri
       # CLI (idempotent install — the CLI persists on the self-hosted runner between runs).
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show   # installs the toolchain pinned by rust-toolchain.toml

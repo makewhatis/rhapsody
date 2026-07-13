@@ -1,13 +1,16 @@
-// Typed wrappers over the Wails-injected bridge (window.go.main.App.*) and runtime events.
-// Moved into the canonical `web/` app (INF-225) from the desktop shell: the Wails app now
-// hosts this whole React UI, so the app-side capabilities (daemon lifecycle, tool-doctor,
-// keychain credentials) are reached here through the bridge.
+// Typed wrappers over the Tauri command bridge (`invoke`) and the app's runtime events. This is the
+// canonical `web/` app served as the top-level Tauri frontend (TRA-251): the app-side capabilities
+// (daemon lifecycle, tool-doctor, keychain credentials, onboarding) are reached through Tauri
+// `invoke(...)`, and the daemon's HTTP API is reached same-origin via the shell's apiproxy.
 //
-// Calling through the injected globals (rather than importing the generated wailsjs/
-// bindings, which only exist after a `wails build`) keeps `tsc`, vitest, and a plain
-// browser (dev server / demo route) runnable standalone — every wrapper degrades to a safe
-// no-op / null when `window.go` is absent.
+// Migrated off the dead Wails bridge (`window.go.main.App`): the Go bound methods are now
+// `#[tauri::command]`s (desktop/src-tauri/src/main.rs) reached via `invoke`, and the Wails runtime
+// events become Tauri `listen(...)` subscriptions. Every wrapper degrades to a safe no-op / null /
+// empty value when the Tauri bridge is absent (a plain browser: the daemon's served dashboard, the
+// vite dev server, or a unit test), so `tsc`, vitest, and a browser stay runnable standalone.
 
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { LinearProject } from "@/lib/api";
 
 export interface StatusDTO {
@@ -21,14 +24,14 @@ export interface StatusDTO {
   configured: boolean;
 }
 
-// VersionDTO is the desktop app's build stamp (compiled in via -ldflags), shown in the footer.
+// VersionDTO is the desktop app's build stamp (compiled in via build.rs env vars), shown in the footer.
 export interface VersionDTO {
   version: string; // "dev" or a release version like "1.2.0"
   commit: string; // short git SHA (+ "-dirty"), or "none" unstamped
   build_time: string; // RFC3339 UTC, or "unknown"
 }
 
-// ToolResult mirrors the Go toolcheck.Result: one external CLI's preflight status.
+// ToolResult mirrors the Rust toolcheck::ToolResult (Go toolcheck.Result): one external CLI's preflight status.
 export interface ToolResult {
   name: string;
   path: string;
@@ -38,202 +41,144 @@ export interface ToolResult {
   detail: string;
 }
 
-// CredentialStatus mirrors the Go CredentialStatusDTO: whether a Linear token is stored, in
-// which backend, and whether the deferred OAuth path is available.
+// CredentialStatus mirrors the Rust CredentialStatusDto (Go CredentialStatusDTO): whether a Linear
+// token is stored, in which backend, and whether the deferred OAuth path is available.
 export interface CredentialStatus {
   has_token: boolean;
   backend: string;
   oauth_available: boolean;
 }
 
-interface AppBridge {
-  Status(): Promise<StatusDTO>;
-  AppVersion(): Promise<VersionDTO>;
-  StartDaemon(): Promise<void>;
-  StopDaemon(): Promise<void>;
-  RestartDaemon(): Promise<void>;
-  DashboardURL(): Promise<string>;
-  ProbeTools(): Promise<ToolResult[]>;
-  SetToolOverride(name: string, path: string): Promise<void>;
-  CredentialStatus(): Promise<CredentialStatus>;
-  SetLinearToken(token: string): Promise<void>;
-  ClearLinearToken(): Promise<void>;
-  StartLinearOAuth(): Promise<void>;
-  WriteInitialConfig(projectSlug: string): Promise<void>;
-  // Lists the workspace's Linear projects for the onboarding picker, using the just-saved token.
-  // Calls Linear directly (no running daemon yet, INF-277). Rejects on a Linear/token error so the
-  // wizard can show a retry + "back to token" affordance.
-  ListLinearProjects(): Promise<LinearProject[]>;
-  // Optional: native folder chooser for the workspace-root / logs-path directory fields. May be
-  // absent in the current Go build, in which case the picker degrades to a no-op (see pickDirectory).
-  PickDirectory?(title: string): Promise<string>;
-  // Optional: native file chooser for a tool's executable path override (Tools tab). A CLI override
-  // is a path to a binary FILE, not a directory — see pickFile.
-  PickFile?(title: string): Promise<string>;
-  // Optional: ask the supervisor to install/update a required CLI (Tools tab Install/Update
-  // action). Absent in builds without an installer, where the action degrades to a no-op + re-probe.
-  InstallTool?(name: string): Promise<void>;
+// tauriAvailable reports whether the Tauri IPC bridge is present. It is absent when the bundle is
+// loaded in a plain browser (the daemon's served dashboard, `vite dev` without the app, or a unit
+// test), so callers degrade gracefully instead of throwing. Mirrors the reference's
+// `window.go?.main?.App` guard, adapted to Tauri's injected globals.
+function tauriAvailable(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-interface WailsRuntime {
-  EventsOn(event: string, cb: (...data: unknown[]) => void): () => void;
-  // Window controls (Wails-injected). Optional so tsc / vitest / a plain browser tolerate their
-  // absence.
-  WindowToggleMaximise?(): void;
-  // Open a URL in the user's default browser (not the embedded webview).
-  BrowserOpenURL?(url: string): void;
-}
-
-declare global {
-  interface Window {
-    go?: { main?: { App?: AppBridge } };
-    runtime?: WailsRuntime;
-  }
-}
-
-function app(): AppBridge | undefined {
-  return window.go?.main?.App;
-}
-
-/** True when running inside the Wails host (the Go bridge is present). */
+/** True when running inside the Tauri host (the IPC bridge is present). */
 export function hasBridge(): boolean {
-  return !!app();
+  return tauriAvailable();
 }
 
 export async function getStatus(): Promise<StatusDTO | null> {
-  const a = app();
-  if (!a) return null;
-  return a.Status();
+  if (!tauriAvailable()) return null;
+  return invoke<StatusDTO>("status");
 }
 
 // appVersion returns the compiled-in build stamp for the footer, or null in a plain browser (no
 // bridge) — callers render nothing in that case.
 export async function appVersion(): Promise<VersionDTO | null> {
-  const a = app();
-  if (!a) return null;
-  return a.AppVersion();
+  if (!tauriAvailable()) return null;
+  return invoke<VersionDTO>("app_version");
 }
 
 export async function startDaemon(): Promise<void> {
-  await app()?.StartDaemon();
+  if (!tauriAvailable()) return;
+  await invoke("start_daemon");
 }
 
 export async function stopDaemon(): Promise<void> {
-  await app()?.StopDaemon();
+  if (!tauriAvailable()) return;
+  await invoke("stop_daemon");
 }
 
 export async function restartDaemon(): Promise<void> {
-  await app()?.RestartDaemon();
-}
-
-export async function dashboardURL(): Promise<string> {
-  return (await app()?.DashboardURL()) ?? "";
+  if (!tauriAvailable()) return;
+  await invoke("restart_daemon");
 }
 
 export async function probeTools(): Promise<ToolResult[]> {
-  return (await app()?.ProbeTools()) ?? [];
+  if (!tauriAvailable()) return [];
+  return invoke<ToolResult[]>("probe_tools");
 }
 
 export async function setToolOverride(name: string, path: string): Promise<void> {
-  await app()?.SetToolOverride(name, path);
+  if (!tauriAvailable()) return;
+  await invoke("set_tool_override", { name, path });
 }
 
 export async function credentialStatus(): Promise<CredentialStatus | null> {
-  const a = app();
-  if (!a) return null;
-  return a.CredentialStatus();
+  if (!tauriAvailable()) return null;
+  return invoke<CredentialStatus>("credential_status");
 }
 
 export async function setLinearToken(token: string): Promise<void> {
-  await app()?.SetLinearToken(token);
+  if (!tauriAvailable()) return;
+  await invoke("set_linear_token", { token });
 }
 
 export async function clearLinearToken(): Promise<void> {
-  await app()?.ClearLinearToken();
+  if (!tauriAvailable()) return;
+  await invoke("clear_linear_token");
 }
 
 // startLinearOAuth triggers the deferred "Connect Linear" flow; in v1 it rejects with a clear
 // message (no client_id configured) which the UI surfaces.
 export async function startLinearOAuth(): Promise<void> {
-  await app()?.StartLinearOAuth();
+  if (!tauriAvailable()) return;
+  await invoke("start_linear_oauth");
 }
 
 // writeInitialConfig is the onboarding wizard's final step: seed WORKFLOW.md for the chosen
 // Linear project and start the daemon.
 export async function writeInitialConfig(projectSlug: string): Promise<void> {
-  await app()?.WriteInitialConfig(projectSlug);
+  if (!tauriAvailable()) return;
+  await invoke("write_initial_config", { projectSlug });
 }
 
 // listLinearProjects lists the workspace's Linear projects for the onboarding picker, using the
 // token the wizard just saved. Returns [] when the bridge is absent (plain browser / tests); a
 // Linear/token failure REJECTS so the caller can surface an error with retry + "back to token".
 export async function listLinearProjects(): Promise<LinearProject[]> {
-  const a = app();
-  if (!a) return [];
-  return (await a.ListLinearProjects()) ?? [];
+  if (!tauriAvailable()) return [];
+  return (await invoke<LinearProject[]>("list_linear_projects")) ?? [];
 }
 
-// pickDirectory opens the native folder chooser (Go binding) for a path field, returning the
-// chosen absolute path. Returns "" when the user cancels, when the bridge is absent (plain
-// browser / tests), or when this build's Go side does not expose the picker — so callers apply
-// the result only when non-empty and the field is otherwise unchanged.
-export async function pickDirectory(title: string): Promise<string> {
-  const a = app();
-  if (!a?.PickDirectory) return "";
-  try {
-    return (await a.PickDirectory(title)) ?? "";
-  } catch {
-    return "";
-  }
+// pickDirectory opens a native folder chooser for a path field, returning the chosen absolute path.
+// The Tauri shell does not expose a native picker command (parity with the reference, where the
+// picker was an OPTIONAL Go binding absent in the current build), so this degrades to "" and the
+// field keeps its manually-typed value — callers apply the result only when non-empty.
+export async function pickDirectory(_title: string): Promise<string> {
+  return "";
 }
 
-// pickFile opens the native file chooser (Go binding) for a tool's executable-path override,
-// returning the chosen absolute file path. Returns "" on cancel / when the bridge is absent / when
-// this build's Go side does not expose the picker (callers apply the result only when non-empty).
-// A CLI path override must point at the binary itself, so this uses a FILE chooser, not a folder one.
-export async function pickFile(title: string): Promise<string> {
-  const a = app();
-  if (!a?.PickFile) return "";
-  try {
-    return (await a.PickFile(title)) ?? "";
-  } catch {
-    return "";
-  }
+// pickFile opens a native file chooser for a tool's executable-path override, returning the chosen
+// absolute file path. Degrades to "" for the same reason as pickDirectory (no native-picker command);
+// callers apply the result only when non-empty, so the manual-entry field stays usable.
+export async function pickFile(_title: string): Promise<string> {
+  return "";
 }
 
-// installTool asks the supervisor to install/update a required CLI (Tools tab action). Resolves
-// to a no-op when the bridge or installer is absent (the caller re-probes afterwards either way).
-export async function installTool(name: string): Promise<void> {
-  await app()?.InstallTool?.(name);
+// installTool asks the supervisor to install/update a required CLI (Tools tab action). The shell has
+// no installer command (parity with the reference, where it was OPTIONAL and absent in v1), so it is
+// a no-op; the caller re-probes afterwards either way.
+export async function installTool(_name: string): Promise<void> {
+  return;
 }
 
-// openExternal opens a URL in the user's default browser. Under the Wails host it uses the runtime
-// (the embedded webview must not navigate away); in a plain browser it falls back to window.open.
+// openExternal opens a URL in the user's default browser (the embedded webview must not navigate
+// away). Under the Tauri host it uses the `open_external` command (macOS `open`); in a plain browser
+// it falls back to window.open.
 export function openExternal(url: string): void {
-  if (window.runtime?.BrowserOpenURL) window.runtime.BrowserOpenURL(url);
+  if (tauriAvailable()) void invoke("open_external", { url });
   else window.open(url, "_blank", "noopener");
 }
 
-// toggleMaximiseWindow zooms / unzooms the window. Wired to a double-click on the titlebar so the
-// app matches the standard macOS "double-click the title bar to zoom" behaviour (the custom drag
-// region otherwise swallows it). A no-op when the Wails runtime is absent (plain browser / tests).
-export function toggleMaximiseWindow(): void {
-  window.runtime?.WindowToggleMaximise?.();
-}
-
-// onShuttingDown subscribes to the app:shutting-down event the Go side emits when the user quits,
-// so the shell can show a "Shutting down…" screen while the daemon stops off the main thread.
-// Returns an unsubscribe; a no-op when the Wails runtime is absent (plain browser / tests).
+// onShuttingDown subscribes to the app:shutting-down event the shell emits when the user quits, so
+// the app can show a "Shutting down…" screen while the daemon stops off the main thread. Returns an
+// unsubscribe; a no-op when the Tauri bridge is absent (plain browser / tests).
 export function onShuttingDown(cb: () => void): () => void {
-  const rt = window.runtime;
-  if (!rt) return () => {};
-  return rt.EventsOn("app:shutting-down", () => cb());
+  if (!tauriAvailable()) return () => {};
+  const pending = listen("app:shutting-down", () => cb());
+  return () => void pending.then((un) => un());
 }
 
 // onNavigate subscribes to the tray's navigate event ("dashboard" | "settings"); returns an
-// unsubscribe function. A no-op when the Wails runtime is not present (e.g. plain browser).
+// unsubscribe function. A no-op when the Tauri bridge is not present (e.g. plain browser).
 export function onNavigate(cb: (view: string) => void): () => void {
-  const rt = window.runtime;
-  if (!rt) return () => {};
-  return rt.EventsOn("tray:navigate", (...data: unknown[]) => cb(String(data[0] ?? "")));
+  if (!tauriAvailable()) return () => {};
+  const pending = listen<string>("tray:navigate", (e) => cb(e.payload));
+  return () => void pending.then((un) => un());
 }

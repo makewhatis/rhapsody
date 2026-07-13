@@ -12,6 +12,7 @@ use std::time::Duration;
 use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
 use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::toolcheck::ToolResult;
+use rhapsody_desktop::windowserver;
 use tauri::{Emitter, Manager};
 use version::VersionDto;
 
@@ -109,6 +110,14 @@ async fn write_initial_config(
     app.write_initial_config(&project_slug).await
 }
 
+/// Open an external `http(s)` URL in the user's default browser (Linear links, the create-token page,
+/// "Open ticket"). The embedded webview must not navigate away, so this shells out to macOS `open`.
+/// Replaces the Wails runtime's `BrowserOpenURL` (which had no App-method equivalent to port).
+#[tauri::command]
+async fn open_external(url: String) -> Result<(), String> {
+    windowserver::open_external(&url)
+}
+
 fn main() {
     // Errors are values (no panic on the startup path): mirror Go `main`, which logs the run error
     // ($REF/desktop/main.go). A failed launch exits non-zero so a supervising shell notices.
@@ -119,22 +128,26 @@ fn main() {
 }
 
 fn run() -> tauri::Result<()> {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            status,
-            app_version,
-            start_daemon,
-            stop_daemon,
-            restart_daemon,
-            probe_tools,
-            set_tool_override,
-            credential_status,
-            set_linear_token,
-            clear_linear_token,
-            start_linear_oauth,
-            list_linear_projects,
-            write_initial_config
-        ])
+    let builder = tauri::Builder::default().invoke_handler(tauri::generate_handler![
+        status,
+        app_version,
+        start_daemon,
+        stop_daemon,
+        restart_daemon,
+        probe_tools,
+        set_tool_override,
+        credential_status,
+        set_linear_token,
+        clear_linear_token,
+        start_linear_oauth,
+        list_linear_projects,
+        write_initial_config,
+        open_external
+    ]);
+    // Serve the top-level window from the embedded `web/` bundle and reverse-proxy its same-origin
+    // `/api/*` fetches to the supervised rhapsodyd (the real double-chrome fix, TRA-251). A default
+    // client (no request timeout) so a slow but finite API call is never cut short.
+    windowserver::register(builder, reqwest::Client::new())
         .setup(|app| {
             let application = App::from_env();
             app.manage(application.clone());

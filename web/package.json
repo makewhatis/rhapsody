@@ -6,7 +6,6 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "build:wails": "tsc -b && vite build --outDir ../desktop/frontend/dist --emptyOutDir",
     "preview": "vite preview",
     "test": "vitest run"
   },
@@ -16,6 +15,7 @@
     "@radix-ui/react-slot": "^1.2.4",
     "@tanstack/react-query": "^5.100.14",
     "@tanstack/react-table": "^8.21.3",
+    "@tauri-apps/api": "^2.11.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.17.0",

@@ -4,19 +4,22 @@
   "version": "0.1.0",
   "identifier": "is.makewhat.rhapsody",
   "build": {
-    "frontendDist": "../frontend/dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm --prefix ../frontend run dev",
+    "frontendDist": "../../crates/httpapi/web-dist",
+    "beforeDevCommand": "npm --prefix ../../web run build",
     "beforeBuildCommand": ""
   },
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Rhapsody",
+        "url": "rhapsody://localhost/",
         "width": 1100,
         "height": 760,
         "minWidth": 720,
-        "minHeight": 480
+        "minHeight": 480,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

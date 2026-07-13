@@ -535,6 +535,16 @@ impl App {
         dto
     }
 
+    /// The live daemon target for the window's same-origin API proxy, or `None` when the daemon is
+    /// not usable (no supervisor yet, not Running, or an unbound/zero port). This is the per-request
+    /// `base_url` resolver [`crate::windowserver`] hands to [`crate::apiproxy::handle`]; the usability
+    /// core (Running + a real port) lives in [`crate::apiproxy::usable_base_url`]. Mirrors Go
+    /// `App.daemonBaseURL` (`$REF/desktop/apiproxy.go`).
+    pub fn daemon_base_url(&self) -> Option<String> {
+        let sup = self.get_sup()?;
+        crate::apiproxy::usable_base_url(sup.status().state, &sup.url())
+    }
+
     /// The tray's rendered menu model for the current status + live agent count. Mirrors Go
     /// `applyTray`'s status → [`menu_from_status`] mapping.
     pub async fn tray_menu_model(&self) -> MenuModel {

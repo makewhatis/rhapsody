@@ -11,9 +11,12 @@ compile it; the `desktop` CI job (`.github/workflows/ci.yml`) builds and tests i
 
 ## What it does (P7 chain)
 
-- **Window shell** (P7-D1, this scaffold): a status header + the daemon's loopback dashboard once
-  healthy, with clear not-configured / starting / stopped / error states otherwise. The pure
-  view-logic (`frontend/src/status.ts`) is ported 1:1 from the reference and unit-tested.
+- **Window shell**: the top-level window IS the `web/` React dashboard, served from the embedded
+  bundle over a custom URI scheme (`rhapsody://localhost`) with the app's same-origin `/api/*` fetches
+  reverse-proxied to the supervised daemon (`src/windowserver.rs` wiring the `apiproxy` core) — the
+  analogue of Go's Wails `AssetServer` + middleware. A native overlay titlebar (traffic lights only)
+  sits over the dashboard's Podium toolbar: one bar, no double chrome (TRA-251). The interim
+  header-plus-iframe shell (`desktop/frontend/`) was retired in that migration.
 - **Supervises `rhapsodyd`** as a bundled sidecar — launch on explicit `--port`, `/healthz`
   readiness, crash-restart backoff, clean SIGTERM drain — plus the same-origin `/api` + `/healthz`
   reverse proxy. **D2 (landed)** ships these as the `supervisor` / `apiproxy` / `tooldirs` library
@@ -37,28 +40,28 @@ desktop/
 │   ├── capabilities/       # Tauri v2 ACL
 │   ├── icons/              # app icon (placeholder until D5)
 │   ├── src/
-│   │   ├── main.rs         # D1 bin: commands (status/app_version) + Builder::run
-│   │   ├── lib.rs          # D2 library root: pub supervisor / apiproxy / tooldirs (consumed by D3)
-│   │   ├── status.rs       # D1: StatusDto + Configured() detection (≈ app.go)
-│   │   ├── version.rs      # D1: build stamp (≈ internal/version)
-│   │   ├── supervisor/     # D2: launch/health/restart/drain + env + resolve (≈ internal/supervisor)
-│   │   ├── apiproxy.rs     # D2: same-origin /api + /healthz reverse proxy (≈ desktop/apiproxy.go)
-│   │   ├── tooldirs.rs     # D2: agent-launch PATH, override dirs first (≈ app.go + toolcheck/dirs.go)
-│   │   └── bin/fakedaemon.rs  # D2: rhapsodyd test stub (≈ internal/supervisor/testdata/fakedaemon)
-│   └── tests/              # D2: supervisor lifecycle + gated real-rhapsodyd smoke
-└── frontend/               # React + TS + Vite shell (≈ $REF/desktop/frontend)
-    └── src/status.ts       # pure view-logic (status.test.ts asserts it)
+│   │   ├── main.rs         # bin: #[tauri::command]s + windowserver::register + Builder::run
+│   │   ├── lib.rs          # library root: pub app / supervisor / apiproxy / windowserver / …
+│   │   ├── app.rs          # App lifecycle + StatusDto + daemon_base_url (≈ app.go)
+│   │   ├── windowserver.rs # serve web/ over rhapsody:// + reverse-proxy /api (≈ main.go AssetServer)
+│   │   ├── version.rs      # build stamp (≈ internal/version)
+│   │   ├── supervisor/     # launch/health/restart/drain + env + resolve (≈ internal/supervisor)
+│   │   ├── apiproxy.rs     # same-origin /api + /healthz reverse-proxy core (≈ desktop/apiproxy.go)
+│   │   ├── tooldirs.rs     # agent-launch PATH, override dirs first (≈ app.go + toolcheck/dirs.go)
+│   │   └── bin/fakedaemon.rs  # rhapsodyd test stub (≈ internal/supervisor/testdata/fakedaemon)
+│   └── tests/              # supervisor lifecycle + packaging gate + gated real-rhapsodyd/parity e2e
+└── (frontend) the top-level window renders web/ — no separate shell; frontendDist -> crates/httpapi/web-dist
 ```
 
 ## Build & test
 
 Prerequisites: the repo-pinned Rust toolchain (`rustup show` installs it), Node + npm, and the
-Xcode command-line tools. The **frontend bundle must be built before any `cargo` command**, because
-`tauri::generate_context!` embeds `frontend/dist` (git-ignored build output, kept only as a
-`.gitkeep` anchor — mirrors the Go shell's `frontend/dist`):
+Xcode command-line tools. `tauri::generate_context!` embeds `frontendDist` (`../../crates/httpapi/web-dist`,
+the `web/` vite build — git-ignored output kept only as a `.gitkeep` anchor), so the cargo steps
+compile against an empty dist on a clean checkout; build the real `web/` bundle before running the app:
 
 ```sh
-cd desktop/frontend && npm ci && npm test && npm run build   # -> frontend/dist
+cd web && npm ci && npm run build   # -> crates/httpapi/web-dist (the Tauri frontend AND the daemon embed)
 cd desktop && cargo build && cargo test                      # unsigned build + tests
 ```
 
@@ -82,9 +85,9 @@ make app        # build the UNSIGNED Rhapsody.app (Tauri bundler) with rhapsodyd
 make dmg        # build the app, then package a drag-to-Applications Rhapsody.dmg installer
 ```
 
-`make app` builds the daemon's embedded dashboard (`web/` → `crates/httpapi/web-dist`), the shell
-frontend (`desktop/frontend/dist`), and the release `rhapsodyd`, bundles `Rhapsody.app` with the
-`fakedaemon` test stub excluded (`--no-default-features`), and copies the sidecar into
+`make app` builds the `web/` dashboard (`crates/httpapi/web-dist` — the same bundle is both the daemon's
+embedded dashboard AND the Tauri window's `frontendDist`) and the release `rhapsodyd`, bundles
+`Rhapsody.app` with the `fakedaemon` test stub excluded (`--no-default-features`), and copies the sidecar into
 `Contents/Resources/rhapsodyd` (where `supervisor/resolve.rs` looks). Output:
 `desktop/target/release/bundle/macos/Rhapsody.app`. `make dmg` additionally writes
 `desktop/build/bin/Rhapsody.dmg` (via `create-dmg`, or an `hdiutil` fallback needing no extra deps).
