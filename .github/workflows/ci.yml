@@ -90,17 +90,22 @@ jobs:
       # supervisor stub the integration tests need (the packaging build turns it off — see below).
       - run: cargo test
         working-directory: desktop
-      # P7-D5 packaging build gate: the Tauri bundler produces the UNSIGNED Rhapsody.app + a
-      # drag-to-Applications Rhapsody.dmg. The CLI install is idempotent and persists on the
-      # self-hosted runner. `make dmg` (run from the repo root) builds the daemon's embedded dashboard
-      # + the shell frontend + the release rhapsodyd sidecar, bundles the app with the fakedaemon stub
-      # excluded (`--no-default-features`), copies the sidecar into Contents/Resources, packages the
-      # dmg (hdiutil fallback, no create-dmg needed), and runs the gated-but-unset sign/notarize as a
-      # clean no-op + verifies the icon flowed through. NO signing secrets — signed dmg is human-gated.
+      # P7-D5 packaging build gate: the Tauri bundler produces the UNSIGNED Rhapsody.app. The CLI
+      # install is idempotent and persists on the self-hosted runner. `make app` (run from the repo
+      # root) builds the daemon's embedded dashboard + the shell frontend + the release rhapsodyd
+      # sidecar, bundles the app with the fakedaemon stub excluded (`--no-default-features`), and copies
+      # the sidecar into Contents/Resources — everything the parity e2e below needs.
+      #
+      # We deliberately build `make app`, NOT `make dmg`, on PRs: the DMG packaging (hdiutil) is
+      # release-only (release.yml builds + signs + notarizes it) and, because the self-hosted runner is
+      # a dev Mac, `hdiutil` fails with "Operation not permitted" whenever a volume named `Rhapsody` is
+      # already mounted (e.g. the app running from a mounted DMG). The parity e2e consumes the `.app`
+      # bundle (Contents/MacOS -> Contents/Resources/rhapsodyd), never the `.dmg`, so `make app` is the
+      # correct, collision-free PR gate.
       - run: command -v cargo-tauri >/dev/null 2>&1 || cargo install tauri-cli --version "^2" --locked
-      - run: make dmg
+      - run: make app
       # P7-D5 parity e2e: the app's supervisor drives the packaged rhapsodyd through
       # start -> healthy -> dashboard -> stop (against the R3 linear-stub + fake-claude harness). Gated
-      # by RHAPSODY_PARITY_E2E so only this explicit step runs it (it needs the bundle `make dmg` built).
+      # by RHAPSODY_PARITY_E2E so only this explicit step runs it (it needs the bundle `make app` built).
       - run: RHAPSODY_PARITY_E2E=1 cargo test -p rhapsody-desktop --test parity_e2e -- --nocapture
         working-directory: desktop
