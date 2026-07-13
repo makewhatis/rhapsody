@@ -9,7 +9,9 @@
 //!   - `base_url` is [`crate::app::App::daemon_base_url`], resolved per request over the live supervisor.
 //!
 //! [`build_response`] is the framework-agnostic core (unit-tested against fakes); [`register`] adapts
-//! a wry custom-protocol request into it and streams nothing — see the SSE note on [`LOGS_STREAM_PATH`].
+//! a wry custom-protocol request into it. The responder is fully buffered, so it cannot forward an
+//! infinite `text/event-stream`; the Logs view's live tail is streamed over a Tauri IPC channel instead
+//! (see [`crate::logbridge`]).
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -22,16 +24,6 @@ use crate::app::App;
 /// window `url`). A registered scheme is a *local* app origin: Tauri injects the IPC bootstrap so
 /// `invoke(...)` works, exactly as it does for the built-in `tauri://` scheme.
 pub const SCHEME: &str = "rhapsody";
-
-/// The daemon SSE endpoint the Logs tab tails (`EventSource("/api/v1/logs/stream")`). Tauri
-/// custom-protocol responses are **fully buffered** — wry's `RequestAsyncResponder::respond` takes a
-/// complete body, so an infinite `text/event-stream` cannot be forwarded incrementally: reading it to
-/// completion would block the request forever (a hung connection + leaked upstream socket). We
-/// short-circuit it with `501` so `EventSource` fails fast and closes (no reconnect storm) instead of
-/// stalling. Every non-stream API call (config, state, runs, transcript, messages, credentials) proxies
-/// normally. Live log streaming inside the packaged app is a documented follow-up (forward the tail over
-/// a Tauri channel / IPC event, or a real loopback HTTP server that can stream).
-pub const LOGS_STREAM_PATH: &str = "/api/v1/logs/stream";
 
 /// Registers the window-serving custom-protocol handler on the Tauri builder. Each request is handled
 /// on the async runtime: non-API paths serve embedded assets; `/api/*` + `/healthz` reverse-proxy to
@@ -74,10 +66,6 @@ where
     B: Fn() -> Option<String>,
 {
     let req = to_proxy_request(request);
-    // Buffered custom-protocol → cannot stream SSE (see LOGS_STREAM_PATH). Fail the Logs tail fast.
-    if req.path == LOGS_STREAM_PATH {
-        return to_http_response(streaming_unsupported());
-    }
     let resp = apiproxy::handle(req, client, next, base_url).await;
     to_http_response(resp)
 }
@@ -101,14 +89,6 @@ pub fn serve_asset<R: Runtime>(app: &AppHandle<R>, req: ProxyRequest) -> ProxyRe
         }
         None => text_response(StatusCode::INTERNAL_SERVER_ERROR, "dashboard not built"),
     }
-}
-
-/// The `501` returned for the buffered-proxy-incompatible SSE endpoint (see [`LOGS_STREAM_PATH`]).
-fn streaming_unsupported() -> ProxyResponse {
-    text_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "log streaming is not available in the desktop app",
-    )
 }
 
 /// A plain-text [`ProxyResponse`] with the given status.
@@ -234,24 +214,6 @@ mod tests {
             Some("application/json")
         );
         assert_eq!(out.body(), b"{}");
-    }
-
-    // The SSE Logs endpoint is short-circuited with 501 (buffered custom-protocol can't stream) — it
-    // never reaches the proxy `next`/`base_url` (which would panic here if consulted).
-    #[tokio::test]
-    async fn logs_stream_is_short_circuited_501() {
-        let client = reqwest::Client::new();
-        let out = build_response(
-            &client,
-            req(
-                Method::GET,
-                &format!("http://rhapsody.localhost{LOGS_STREAM_PATH}"),
-            ),
-            |_| panic!("must not fall through to the asset handler"),
-            || panic!("must not resolve a daemon target for the stream endpoint"),
-        )
-        .await;
-        assert_eq!(out.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     // A non-API path falls through to `next` (the embedded-asset handler) and never resolves a daemon

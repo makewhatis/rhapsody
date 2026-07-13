@@ -69,12 +69,12 @@ function LogRow({ line }: { line: LogLine }) {
   );
 }
 
-// LogsTab — a live console for the daemon's own process log (the slog stream over SSE, mock 2d). A
-// segmented level filter (All/Info+/Warn+/Error) + Clear sit beside a status line (live · N lines);
-// the console follows the tail while pinned to the bottom (shared follow hook), pausing on an upward
-// scroll or the explicit "pause follow ⏸", and resuming via "jump to latest ↓". Read-only: unlike the
-// Tools tab it needs no desktop bridge — the relative SSE URL reaches the daemon in both the desktop
-// app (via the proxy) and a plain browser.
+// LogsTab — a live console for the daemon's own process log (the slog stream, mock 2d). A segmented
+// level filter (All/Info+/Warn+/Error) + Clear sit beside a status line (live · N lines); the console
+// follows the tail while pinned to the bottom (shared follow hook), pausing on an upward scroll or the
+// explicit "pause follow ⏸", and resuming via "jump to latest ↓". Read-only: the tail is sourced by
+// useLogStream, which tails SSE directly in a browser and over a Tauri IPC channel in the packaged app
+// (the buffered custom-protocol proxy can't forward an infinite SSE stream — TRA-252).
 export function LogsTab() {
   const { lines, status, clear } = useLogStream();
   const [filter, setFilter] = React.useState<LogLevelFilter>("all");

@@ -9,7 +9,7 @@
 // empty value when the Tauri bridge is absent (a plain browser: the daemon's served dashboard, the
 // vite dev server, or a unit test), so `tsc`, vitest, and a browser stay runnable standalone.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { LinearProject } from "@/lib/api";
 
@@ -181,4 +181,33 @@ export function onNavigate(cb: (view: string) => void): () => void {
   if (!tauriAvailable()) return () => {};
   const pending = listen<string>("tray:navigate", (e) => cb(e.payload));
   return () => void pending.then((un) => un());
+}
+
+// LogStreamMsg is one frame the desktop host forwards over the log-stream Channel (Rust
+// logbridge::LogMsg, `kind`-tagged): `open`/`reconnecting` mirror EventSource's onopen/onerror for the
+// status dot, while `epoch`/`line` carry the same two SSE frame kinds the browser path handles (the
+// daemon's `event: epoch` and `data:` log-line JSON), so the hook's de-dup logic is shared across both.
+export type LogStreamMsg =
+  | { kind: "open" }
+  | { kind: "reconnecting" }
+  | { kind: "epoch"; epoch: string }
+  | { kind: "line"; data: string };
+
+// subscribeLogStream starts the packaged app's live log tail: the host connects to the daemon's SSE log
+// stream and re-emits each frame over a Tauri IPC Channel (TRA-252) — the buffered custom-protocol proxy
+// can't forward an infinite `text/event-stream`, so the Logs view uses this instead of EventSource under
+// Tauri. Returns an unsubscribe that stops the host-side stream. A no-op returning a no-op when the
+// bridge is absent (plain browser / tests), so callers fall back to EventSource.
+export function subscribeLogStream(onMessage: (msg: LogStreamMsg) => void): () => void {
+  if (!tauriAvailable()) return () => {};
+  const channel = new Channel<LogStreamMsg>();
+  channel.onmessage = onMessage;
+  const started = invoke("start_log_stream", { channel });
+  // Chain the stop on start's completion so the host can't process it before the stream is registered
+  // (StrictMode mount→unmount→mount / IPC reordering), and target this exact stream by its channel id so
+  // a rapid re-subscribe never aborts the wrong one. `catch` so a failed start still runs the (no-op) stop.
+  return () =>
+    void started
+      .catch(() => undefined)
+      .then(() => invoke("stop_log_stream", { streamId: channel.id }));
 }

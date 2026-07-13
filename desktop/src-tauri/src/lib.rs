@@ -21,6 +21,7 @@ pub(crate) mod atomicfile;
 pub mod credential;
 pub mod linearoauth;
 pub mod linearprojects;
+pub mod logbridge;
 pub mod menu;
 pub mod onboarding;
 pub mod prefs;

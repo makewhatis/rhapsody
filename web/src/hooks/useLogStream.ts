@@ -1,4 +1,5 @@
 import * as React from "react";
+import { hasBridge, subscribeLogStream } from "@/lib/bindings";
 
 // LogLine mirrors the daemon's telemetry.LogEntry on the wire (GET /api/v1/logs[/stream]), plus a
 // client-assigned `uid`. `seq` resets to 0 each daemon process, so after a restart old and new lines
@@ -19,12 +20,16 @@ export type LogStreamStatus = "connecting" | "open" | "closed";
 // matches the daemon ring's order of magnitude; older lines scroll out of memory.
 const MAX_LINES = 2000;
 
-// useLogStream tails the daemon process log over Server-Sent Events (GET /api/v1/logs/stream).
-// It keeps a bounded buffer of recent lines, de-duplicated by `seq` so the backlog replayed on
-// (re)connect never double-prints, and reports the connection status. EventSource reconnects
-// natively, so a daemon restart re-populates the tail automatically. clear() blanks the visible
-// buffer without resetting the seq watermark, so a post-clear reconnect won't replay what was
-// just cleared.
+// useLogStream tails the daemon process log and keeps a bounded buffer of recent lines, de-duplicated
+// by `seq` so the backlog replayed on (re)connect never double-prints, reporting the connection status.
+//
+// Two transports, one ingestion path: in a plain browser / the daemon-origin dashboard it tails the SSE
+// stream directly (GET /api/v1/logs/stream) with EventSource, which reconnects natively. In the packaged
+// Tauri app the same-origin custom-protocol proxy can't forward an infinite stream, so the host bridges
+// the tail over a Tauri IPC channel (TRA-252) — subscribeLogStream — which delivers the identical epoch +
+// log-line frames. Both feed the same de-dup/epoch-reset logic, so a daemon restart re-populates the tail
+// automatically either way. clear() blanks the visible buffer without resetting the seq watermark, so a
+// post-clear reconnect won't replay what was just cleared.
 export function useLogStream(): { lines: LogLine[]; status: LogStreamStatus; clear: () => void } {
   const [lines, setLines] = React.useState<LogLine[]>([]);
   const [status, setStatus] = React.useState<LogStreamStatus>("connecting");
@@ -41,22 +46,18 @@ export function useLogStream(): { lines: LogLine[]; status: LogStreamStatus; cle
   const clear = React.useCallback(() => setLines([]), []);
 
   React.useEffect(() => {
-    if (typeof EventSource === "undefined") {
-      setStatus("closed");
-      return;
-    }
-    const es = new EventSource("/api/v1/logs/stream");
-    es.onopen = () => setStatus("open");
-    es.addEventListener("epoch", (ev: MessageEvent<string>) => {
-      if (lastEpoch.current !== null && ev.data !== lastEpoch.current) {
+    // Transport-agnostic ingestion — shared by the EventSource (browser) and Tauri-channel (desktop)
+    // paths so seq de-dup, epoch-reset, and uid stamping behave identically on both.
+    const applyEpoch = (epoch: string) => {
+      if (lastEpoch.current !== null && epoch !== lastEpoch.current) {
         lastSeq.current = 0; // daemon restarted (seq reset) → accept the new stream's entries
       }
-      lastEpoch.current = ev.data;
-    });
-    es.onmessage = (ev: MessageEvent<string>) => {
+      lastEpoch.current = epoch;
+    };
+    const applyLine = (raw: string) => {
       let line: LogLine;
       try {
-        line = JSON.parse(ev.data) as LogLine;
+        line = JSON.parse(raw) as LogLine;
       } catch {
         return;
       }
@@ -71,6 +72,38 @@ export function useLogStream(): { lines: LogLine[]; status: LogStreamStatus; cle
         return next;
       });
     };
+
+    // Packaged Tauri app: the custom-protocol proxy can't stream SSE, so the host forwards the daemon's
+    // log tail over an IPC channel (TRA-252). `open`/`reconnecting` drive the status dot; the epoch + line
+    // frames feed the shared ingestion. Returns the host-side unsubscribe as the effect cleanup.
+    if (hasBridge()) {
+      return subscribeLogStream((msg) => {
+        switch (msg.kind) {
+          case "open":
+            setStatus("open");
+            break;
+          case "reconnecting":
+            setStatus("connecting");
+            break;
+          case "epoch":
+            applyEpoch(msg.epoch);
+            break;
+          case "line":
+            applyLine(msg.data);
+            break;
+        }
+      });
+    }
+
+    // Browser / daemon-origin: tail the SSE stream directly (same origin, so streaming works).
+    if (typeof EventSource === "undefined") {
+      setStatus("closed");
+      return;
+    }
+    const es = new EventSource("/api/v1/logs/stream");
+    es.onopen = () => setStatus("open");
+    es.addEventListener("epoch", (ev: MessageEvent<string>) => applyEpoch(ev.data));
+    es.onmessage = (ev: MessageEvent<string>) => applyLine(ev.data);
     es.onerror = () => {
       // EventSource retries on its own; reflect the transient drop without tearing down.
       setStatus("connecting");

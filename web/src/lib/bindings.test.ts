@@ -14,10 +14,23 @@ import {
   writeInitialConfig,
   openExternal,
   onNavigate,
+  subscribeLogStream,
 } from "@/lib/bindings";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// A minimal stand-in for @tauri-apps/api/core's Channel: a unique numeric id + a settable onmessage,
+// enough to assert subscribeLogStream wires start/stop_log_stream to the right channel.
+vi.mock("@tauri-apps/api/core", () => {
+  let counter = 0;
+  class Channel {
+    id = ++counter;
+    onmessage: ((m: unknown) => void) | null = null;
+  }
+  return { invoke: vi.fn(), Channel };
+});
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
+
+// Flush the microtask queue so subscribeLogStream's promise-chained stop (start.then(stop)) settles.
+const flush = () => new Promise((r) => setTimeout(r, 0));
 
 const invokeMock = vi.mocked(invoke);
 const listenMock = vi.mocked(listen);
@@ -70,6 +83,14 @@ describe("bindings — browser-safe degradation (no Tauri host)", () => {
     expect(open).toHaveBeenCalledWith("https://linear.app", "_blank", "noopener");
     expect(invokeMock).not.toHaveBeenCalled();
   });
+
+  it("subscribeLogStream returns an unsubscribe no-op and never touches invoke without a host", async () => {
+    const unsub = subscribeLogStream(() => {});
+    expect(typeof unsub).toBe("function");
+    expect(() => unsub()).not.toThrow();
+    await flush();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("bindings — Tauri host present", () => {
@@ -115,5 +136,19 @@ describe("bindings — Tauri host present", () => {
     const handler = listenMock.mock.calls[0][1] as (e: { payload: string }) => void;
     handler({ payload: "settings" });
     expect(seen).toBe("settings");
+  });
+
+  it("subscribeLogStream starts the host tail and stops it by channel id on unsubscribe", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const unsub = subscribeLogStream(() => {});
+    // start_log_stream is invoked with the created channel...
+    expect(invokeMock).toHaveBeenCalledWith("start_log_stream", { channel: expect.anything() });
+    const channel = (invokeMock.mock.calls[0][1] as { channel: { id: number } }).channel;
+    // ...and its onmessage was wired to the caller's handler (a Channel instance).
+    expect(channel).toBeTruthy();
+
+    unsub();
+    await flush(); // the stop is chained on start's resolution
+    expect(invokeMock).toHaveBeenCalledWith("stop_log_stream", { streamId: channel.id });
   });
 });

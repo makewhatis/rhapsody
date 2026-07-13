@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
 use rhapsody_desktop::linearprojects::Project;
+use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
 use rhapsody_desktop::toolcheck::ToolResult;
 use rhapsody_desktop::windowserver;
 use tauri::{Emitter, Manager};
@@ -118,6 +119,34 @@ async fn open_external(url: String) -> Result<(), String> {
     windowserver::open_external(&url)
 }
 
+/// Start the Logs view's live tail: connect the host to the supervised daemon's SSE log stream and
+/// re-emit each frame over the given IPC `channel` (TRA-252). The packaged app can't tail the stream
+/// through the buffered custom-protocol proxy, so it subscribes to this channel instead of `EventSource`.
+/// Restarts cleanly if called again (the previous stream is aborted).
+#[tauri::command]
+async fn start_log_stream(
+    app: tauri::State<'_, App>,
+    bridge: tauri::State<'_, LogBridge>,
+    channel: tauri::ipc::Channel<LogMsg>,
+) -> Result<(), String> {
+    let app = app.inner().clone();
+    // Resolve the live daemon target fresh on every (re)connect — a restart rebinds a new loopback port.
+    bridge.start(channel, move || app.daemon_base_url());
+    Ok(())
+}
+
+/// Stop the Logs view's live tail (the view unmounted): abort the streaming task for the channel with
+/// `stream_id` and drop its upstream connection. Mirrors closing an `EventSource`. The id targets the
+/// exact stream so a rapid unmount/remount never aborts the wrong one.
+#[tauri::command]
+async fn stop_log_stream(
+    bridge: tauri::State<'_, LogBridge>,
+    stream_id: u32,
+) -> Result<(), String> {
+    bridge.stop(stream_id);
+    Ok(())
+}
+
 fn main() {
     // Errors are values (no panic on the startup path): mirror Go `main`, which logs the run error
     // ($REF/desktop/main.go). A failed launch exits non-zero so a supervising shell notices.
@@ -142,7 +171,9 @@ fn run() -> tauri::Result<()> {
         start_linear_oauth,
         list_linear_projects,
         write_initial_config,
-        open_external
+        open_external,
+        start_log_stream,
+        stop_log_stream
     ]);
     // Serve the top-level window from the embedded `web/` bundle and reverse-proxy its same-origin
     // `/api/*` fetches to the supervised rhapsodyd (the real double-chrome fix, TRA-251). A default
@@ -151,6 +182,9 @@ fn run() -> tauri::Result<()> {
         .setup(|app| {
             let application = App::from_env();
             app.manage(application.clone());
+            // Owns the Logs view's host-side log-stream bridge (TRA-252); the start/stop_log_stream
+            // commands drive it.
+            app.manage(LogBridge::default());
             // The menu-bar tray is built on the main thread (menu items live there). Mirrors
             // OnStartup's a.startTray().
             tray::start_tray(app.handle())?;
