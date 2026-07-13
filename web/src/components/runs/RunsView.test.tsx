@@ -9,6 +9,7 @@ const h = vi.hoisted(() => ({
   state: vi.fn(),
   history: vi.fn(),
   linearProjects: vi.fn(),
+  typedConfig: vi.fn(),
   runDetail: vi.fn(),
   transcript: vi.fn(),
   issueHistory: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchState: () => h.state(),
     fetchHistory: () => h.history(),
     fetchLinearProjects: () => h.linearProjects(),
+    fetchTypedConfig: () => h.typedConfig(),
     fetchRunDetail: (id: number) => h.runDetail(id),
     fetchRunTranscript: (id: number) => h.transcript(id),
     fetchIssueHistory: (id: string) => h.issueHistory(id),
@@ -69,6 +71,13 @@ beforeEach(() => {
   });
   h.history.mockResolvedValue({ runs: [summary()], next_offset: null });
   h.linearProjects.mockResolvedValue([]);
+  // The instrument strip's "of N seats" + the "/max" turn cell read the resolved daemon config.
+  h.typedConfig.mockResolvedValue({
+    config: {},
+    prompt_body: "",
+    global: { agent: { max_concurrent_agents: 4, max_turns: 20 } },
+    projects: [],
+  });
   h.runDetail.mockResolvedValue({
     run_id: 12,
     issue_id: "x",
@@ -115,14 +124,16 @@ function renderView() {
 }
 
 describe("RunsView", () => {
-  it("renders the stat tiles and the unified jobs list", async () => {
+  it("renders the instrument strip (with the config-driven seat capacity) and the jobs list", async () => {
     renderView();
     // the job row arrives once the history query resolves
     expect(await screen.findByText("CORE-112")).toBeTruthy();
     expect(screen.getByText("Jobs")).toBeTruthy();
-    // stat tiles (labels unique to the tile row, not the filter pills)
+    // instrument-strip cells (labels unique to the strip, not the filter chips)
     expect(screen.getByText("Tokens today")).toBeTruthy();
     expect(screen.getByText("Runtime today")).toBeTruthy();
+    // the seat annotation proves maxConcurrent is wired through from the typed config query
+    expect(await screen.findByText("of 4 seats")).toBeTruthy();
   });
 
   it("opens the run detail on row click and returns to the list on Back", async () => {

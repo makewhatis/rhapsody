@@ -11,6 +11,13 @@ import { conductorStatus, viewForStatus } from "@/lib/daemon-status";
 import { appVersion, hasBridge, onNavigate, onShuttingDown, openExternal, type VersionDTO } from "@/lib/bindings";
 import { StatusDot } from "@/components/ui";
 
+// The centred, padded content container used by Settings + the onboarding wizard. The Jobs view
+// (P10-D3) opts OUT of it to render its instrument strip + footer as full-bleed bands.
+const CONTENT_PAD: React.CSSProperties = { maxWidth: 1180, margin: "0 auto", padding: "26px 40px 60px" };
+// A lighter padded wrapper for the (rare) lifted onboarding-error banner shown above the full-bleed
+// Jobs view, so it isn't flush against the window edge.
+const CONTENT_PAD_TOP: React.CSSProperties = { maxWidth: 1180, margin: "0 auto", padding: "20px 40px 0" };
+
 // AppShell — the macOS window shell that hosts the whole UI: the single 46px "Podium" toolbar
 // (wordmark, conductor status, Linear/Tools shortcuts, daemon transport, Settings gear) as the first
 // row, the Runs dashboard as the main area (Settings toggles in over it via the gear), and toasts.
@@ -142,31 +149,43 @@ function ShellBody() {
           even where scrollbar-gutter is unsupported); scrollbarGutter: "stable" is the modern
           complement where the engine honors it. */}
       <div style={{ flex: 1, overflowY: "scroll", overflowX: "hidden", scrollbarGutter: "stable" }}>
-        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "26px 40px 60px" }}>
-          {onboardErr ? <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} /> : null}
-          {notConfigured ? (
-            // First run: no config yet. Show the wizard instead of the daemon-dependent header/nav;
-            // onConfigured re-reads status so the shell swaps to the dashboard once the daemon starts.
-            // onError lifts a partial-write failure here so it outlives the poll-driven unmount.
+        {notConfigured ? (
+          // First run: no config yet. Show the wizard instead of the daemon-dependent header/nav
+          // (centred, padded). onConfigured re-reads status so the shell swaps to the dashboard once
+          // the daemon starts. onError lifts a partial-write failure here so it outlives the
+          // poll-driven unmount.
+          <div style={CONTENT_PAD}>
+            {onboardErr ? <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} /> : null}
             <Onboarding onConfigured={() => void daemon.refresh()} onError={setOnboardErr} />
-          ) : (
-            // Runs is the whole main area; the titlebar gear toggles Settings in over it. The panel
-            // keeps role="tabpanel" + a label for the a11y tree even though the tab strip is gone.
-            <div
-              id={TOP_PANEL_ID}
-              role="tabpanel"
-              aria-label={topTab === "runs" ? "Runs" : "Settings"}
-              tabIndex={0}
-              style={{ outline: "none" }}
-            >
-              {topTab === "runs" ? (
-                <RunsView />
+          </div>
+        ) : (
+          // Runs is the whole main area; the titlebar gear toggles Settings in over it. The panel
+          // keeps role="tabpanel" + a label for the a11y tree even though the tab strip is gone. The
+          // Jobs view renders full-bleed (its instrument strip + footer are edge-to-edge bands, mock
+          // 1a); Settings stays in the centred, padded container.
+          <div
+            id={TOP_PANEL_ID}
+            role="tabpanel"
+            aria-label={topTab === "runs" ? "Runs" : "Settings"}
+            tabIndex={0}
+            style={topTab === "runs" ? { outline: "none" } : { outline: "none", ...CONTENT_PAD }}
+          >
+            {onboardErr ? (
+              topTab === "runs" ? (
+                <div style={CONTENT_PAD_TOP}>
+                  <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
+                </div>
               ) : (
-                <Settings tab={settingsTab} onTab={setSettingsTab} onBack={() => setTopTab("runs")} />
-              )}
-            </div>
-          )}
-        </div>
+                <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
+              )
+            ) : null}
+            {topTab === "runs" ? (
+              <RunsView />
+            ) : (
+              <Settings tab={settingsTab} onTab={setSettingsTab} onBack={() => setTopTab("runs")} />
+            )}
+          </div>
+        )}
       </div>
       <VersionFooter />
       {shuttingDown ? <ShutdownOverlay /> : null}

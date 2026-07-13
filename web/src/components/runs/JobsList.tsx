@@ -3,29 +3,54 @@ import { StatusChip } from "@/components/ui/status-chip";
 import { StatusDot } from "@/components/ui/status-dot";
 import { TextInput } from "@/components/ui/text-input";
 import { Search } from "@/components/ui/icons";
-import { JOB_FILTERS, matchFilter, searchJobs, type JobFilterId, type JobRow } from "@/lib/runs-model";
-import { Panel } from "./Panel";
+import {
+  filterCounts,
+  JOB_FILTERS,
+  matchFilter,
+  searchJobs,
+  type JobFilterId,
+  type JobRow,
+} from "@/lib/runs-model";
 
-// Grid template shared by the column header and every row, ported from `runs.jsx`.
-const COLS = "minmax(220px,2.1fr) 150px 116px minmax(120px,1fr) 86px 86px 100px";
+// Grid template shared by the column header and every data row (mock 1a):
+// Issue · Agent · Status · Project · Turn · Tokens · Duration.
+const COLS = "minmax(0,1fr) 104px 112px 92px 56px 84px 92px";
+const HEADERS = ["Issue", "Agent", "Status", "Project", "Turn", "Tokens", "Duration"];
 
 export interface JobsListProps {
   rows: JobRow[];
   /** Live poll cadence in ms, shown in the footer (from state.poll_interval_ms). */
   pollMs?: number;
+  /** Max turns per run (global config), rendering the "N/max" turn cell. Omitted → bare "N". */
+  maxTurns?: number;
   /** Whether the data is actively polling; when false (e.g. under the Wails host where the HTTP
-   * poll is disabled) the footer hides the "live" indicator instead of falsely implying it. */
+   * poll is disabled) the footer shows "live updates paused" instead of falsely implying live. */
   polling?: boolean;
   onSelect: (runId: number) => void;
 }
 
-// JobsList — the unified Live + History jobs list: segmented filter, search, columns, and the
-// live polling footer. Replaces the legacy SessionsTable + HistoryTable. Ported from the
-// `runs.jsx` RunsView jobs section.
-export function JobsList({ rows, pollMs, polling = true, onSelect }: JobsListProps) {
+// JobsList — the Podium jobs view (mock 1a): a control row (title + segmented filter with live
+// counts + ⌘K search), the dense 42px table with the 2px rust rule + tint on playing rows, and the
+// sage "live · every 2s" footer. Client-side filter + search over the merged Live+History rows.
+export function JobsList({ rows, pollMs, maxTurns, polling = true, onSelect }: JobsListProps) {
   const [filter, setFilter] = React.useState<JobFilterId>("all");
   const [q, setQ] = React.useState("");
+  const searchRef = React.useRef<HTMLInputElement>(null);
 
+  // ⌘K (⌃K on non-mac) focuses the search field from anywhere in the view.
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchRef.current?.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  const counts = filterCounts(rows);
+  const playing = counts.running;
   const visible = searchJobs(
     rows.filter((r) => matchFilter(r, filter)),
     q,
@@ -33,67 +58,84 @@ export function JobsList({ rows, pollMs, polling = true, onSelect }: JobsListPro
   const pollSecs = pollMs ? Math.round(pollMs / 1000) : null;
 
   return (
-    <Panel style={{ padding: 0 }}>
-      {/* header: title + segmented filter + search */}
+    <div style={{ minWidth: 0 }}>
+      {/* control row: title + segmented filter + search */}
       <div
         style={{
+          height: 46,
+          padding: "0 20px",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
           gap: 16,
-          padding: "16px 20px",
-          borderBottom: "1px solid var(--line-2)",
+          borderBottom: "1px solid var(--hair-section)",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span style={{ fontSize: 14.5, fontWeight: 600, letterSpacing: "-0.01em" }}>Jobs</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, minWidth: 0 }}>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>Jobs</span>
           <div
             style={{
-              display: "flex",
-              gap: 4,
-              background: "var(--bg-input)",
-              borderRadius: 9,
-              padding: 3,
-              border: "1px solid var(--line)",
+              display: "inline-flex",
+              gap: 2,
+              padding: 2,
+              borderRadius: "var(--r-ctrl)",
+              background: "rgba(255,255,255,.04)",
+              border: "1px solid var(--hair-section)",
             }}
           >
-            {JOB_FILTERS.map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => setFilter(f.id)}
-                style={{
-                  height: 28,
-                  padding: "0 11px",
-                  borderRadius: 7,
-                  border: "none",
-                  cursor: "pointer",
-                  fontSize: 12.5,
-                  fontWeight: 500,
-                  background: filter === f.id ? "var(--bg-active)" : "transparent",
-                  color: filter === f.id ? "var(--tx)" : "var(--tx-3)",
-                  transition: "all .12s",
-                }}
-              >
-                {f.id === "running" ? (
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                    <StatusDot color="var(--em-bright)" pulse={polling} size={6} />
-                    {f.label}
+            {JOB_FILTERS.map((f) => {
+              const active = filter === f.id;
+              // The Playing count is always rust; other counts follow the chip's active/inactive ink.
+              const countColor =
+                f.id === "running" ? "var(--rust-text)" : active ? "var(--ink)" : "var(--faint)";
+              return (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setFilter(f.id)}
+                  style={{
+                    padding: "3px 9px",
+                    borderRadius: "var(--r-chip)",
+                    border: "none",
+                    cursor: "pointer",
+                    fontSize: 11.5,
+                    fontWeight: 500,
+                    background: active ? "rgba(255,255,255,.09)" : "transparent",
+                    color: active ? "var(--ink)" : "var(--muted)",
+                    transition: "background .12s, color .12s",
+                  }}
+                >
+                  {f.label}{" "}
+                  <span className="mono" data-filter-count={f.id} style={{ fontSize: 10.5, color: countColor }}>
+                    {counts[f.id]}
                   </span>
-                ) : (
-                  f.label
-                )}
-              </button>
-            ))}
+                </button>
+              );
+            })}
           </div>
         </div>
-        <div style={{ width: 240 }}>
+        <div style={{ width: 230, flexShrink: 0 }}>
           <TextInput
+            ref={searchRef}
             placeholder="Search jobs…"
             value={q}
             prefixIcon={Search}
             onChange={(e) => setQ(e.target.value)}
-            style={{ height: 34 }}
+            suffix={
+              <span
+                className="mono"
+                style={{
+                  fontSize: 9.5,
+                  padding: "1px 4px",
+                  borderRadius: "var(--r-keycap)",
+                  border: "1px solid var(--hair-strong)",
+                  color: "var(--faint)",
+                }}
+              >
+                ⌘K
+              </span>
+            }
+            style={{ height: 29 }}
           />
         </div>
       </div>
@@ -103,17 +145,17 @@ export function JobsList({ rows, pollMs, polling = true, onSelect }: JobsListPro
         style={{
           display: "grid",
           gridTemplateColumns: COLS,
-          gap: 16,
-          padding: "11px 20px",
-          borderBottom: "1px solid var(--line-2)",
-          fontSize: 10.5,
+          gap: 14,
+          padding: "9px 20px",
+          borderBottom: "1px solid var(--hair-row)",
+          fontSize: 10,
           fontWeight: 600,
-          letterSpacing: ".07em",
+          letterSpacing: ".12em",
           textTransform: "uppercase",
-          color: "var(--tx-faint)",
+          color: "var(--faint)",
         }}
       >
-        {["Issue", "Agent", "Status", "Project", "Turn", "Tokens", "Duration"].map((h, i) => (
+        {HEADERS.map((h, i) => (
           <div key={h} style={{ textAlign: i >= 4 ? "right" : "left" }}>
             {h}
           </div>
@@ -123,54 +165,57 @@ export function JobsList({ rows, pollMs, polling = true, onSelect }: JobsListPro
       {/* rows */}
       <div>
         {visible.length === 0 ? (
-          <div style={{ padding: "48px 0", textAlign: "center", color: "var(--tx-3)", fontSize: 13 }}>
+          <div style={{ padding: "48px 0", textAlign: "center", color: "var(--faint)", fontSize: 13 }}>
             No jobs match these filters.
           </div>
         ) : (
-          visible.map((r) => <RunRow key={r.key} r={r} onSelect={onSelect} />)
+          visible.map((r) => <RunRow key={r.key} r={r} maxTurns={maxTurns} onSelect={onSelect} />)
         )}
       </div>
 
       {/* footer */}
       <div
         style={{
-          padding: "12px 20px",
-          borderTop: "1px solid var(--line-2)",
+          height: 34,
+          padding: "0 20px",
+          borderTop: "1px solid var(--hair-card)",
+          background: "var(--list-footer)",
           display: "flex",
           justifyContent: "space-between",
           alignItems: "center",
         }}
       >
-        <span style={{ fontSize: 12, color: "var(--tx-3)" }}>
-          {visible.length} of {rows.length} jobs
+        <span style={{ fontSize: 11, color: "var(--faint)" }}>
+          {rows.length} job{rows.length === 1 ? "" : "s"} — {playing} playing
         </span>
         {polling ? (
           <span
-            style={{
-              fontSize: 11.5,
-              color: "var(--tx-faint)",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-            }}
+            data-live-indicator
+            style={{ fontSize: 11, color: "var(--faint)", display: "inline-flex", alignItems: "center", gap: 6 }}
           >
-            <StatusDot color="var(--em-bright)" pulse size={6} />
-            {pollSecs ? `live · polling every ${pollSecs}s` : "live"}
+            <StatusDot color="var(--sage)" pulse size={5} />
+            <span className="mono">{pollSecs ? `live · every ${pollSecs}s` : "live"}</span>
           </span>
         ) : (
-          <span style={{ fontSize: 11.5, color: "var(--tx-faint)" }}>live updates paused</span>
+          <span data-live-indicator className="mono" style={{ fontSize: 11, color: "var(--faint)" }}>
+            live updates paused
+          </span>
         )}
       </div>
-    </Panel>
+    </div>
   );
 }
 
 interface RunRowProps {
   r: JobRow;
+  maxTurns?: number;
   onSelect: (runId: number) => void;
 }
 
-function RunRow({ r, onSelect }: RunRowProps) {
+// EM_DASH — empty/"—" cell value (faint), for a never-run held row's turn/tokens/duration.
+const EM_DASH = "—";
+
+function RunRow({ r, maxTurns, onSelect }: RunRowProps) {
   const [hover, setHover] = React.useState(false);
   const clickable = r.runId > 0;
   return (
@@ -182,73 +227,64 @@ function RunRow({ r, onSelect }: RunRowProps) {
       style={{
         display: "grid",
         gridTemplateColumns: COLS,
-        gap: 16,
-        padding: "13px 20px",
+        gap: 14,
+        height: 42,
         alignItems: "center",
-        borderBottom: "1px solid var(--line-2)",
+        // 2px rust rule + tint on a playing row; a transparent 2px rule on the rest keeps the text
+        // baseline aligned (18px pad + 2px border == the 20px gutter either way).
+        paddingLeft: 18,
+        paddingRight: 20,
+        borderLeftWidth: 2,
+        borderLeftStyle: "solid",
+        borderLeftColor: r.live ? "var(--rust)" : "transparent",
+        borderBottom: "1px solid var(--hair-row)",
+        backgroundColor: r.live
+          ? "var(--tint-playing-row)"
+          : hover && clickable
+            ? "rgba(255,255,255,.03)"
+            : "transparent",
         cursor: clickable ? "pointer" : "default",
-        background: hover && clickable ? "var(--bg-hover)" : "transparent",
-        transition: "background .1s",
-        position: "relative",
+        transition: "background-color .12s",
       }}
     >
-      {r.live ? (
-        <span
-          data-accent-bar="true"
-          style={{
-            position: "absolute",
-            left: 0,
-            top: 8,
-            bottom: 8,
-            width: 2,
-            borderRadius: 2,
-            background: "var(--em-bright)",
-          }}
-        />
-      ) : null}
-      <div style={{ minWidth: 0 }}>
-        <div
-          className="mono"
-          style={{ fontSize: 13, fontWeight: 600, color: "var(--tx)", letterSpacing: "-0.01em" }}
-        >
+      {/* Issue: key + title inline on one baseline row. */}
+      <div style={{ display: "flex", alignItems: "baseline", gap: 9, minWidth: 0 }}>
+        <span className="mono" style={{ fontSize: 12, fontWeight: 600, color: "var(--ink)", flexShrink: 0 }}>
           {r.issue}
-        </div>
-        <div
+        </span>
+        <span
           style={{
-            fontSize: 12.5,
-            color: "var(--tx-3)",
-            marginTop: 2,
+            fontSize: 12,
+            color: "var(--muted)",
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
+            minWidth: 0,
           }}
         >
           {r.title}
-        </div>
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-        <StatusDot color={r.agentColor} size={8} />
-        <span
-          style={{
-            fontSize: 12.5,
-            color: "var(--tx-2)",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {r.agent}
         </span>
       </div>
+      {/* Agent */}
+      <div
+        style={{
+          fontSize: 12,
+          color: "var(--muted)",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {r.agent}
+      </div>
+      {/* Status pill (+ failure reason / waiting-on sub-label) */}
       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 3, minWidth: 0 }}>
         <StatusChip status={r.status} />
-        {/* Failed jobs surface the reason inline (e.g. "turn timeout", "stalled") so a failure is
-            identifiable without opening the run. */}
         {r.subLabel ? (
           <span
             style={{
               fontSize: 11,
-              color: "var(--tx-3)",
+              color: "var(--faint)",
               maxWidth: "100%",
               overflow: "hidden",
               textOverflow: "ellipsis",
@@ -259,11 +295,11 @@ function RunRow({ r, onSelect }: RunRowProps) {
           </span>
         ) : null}
       </div>
+      {/* Project */}
       <div
-        className="mono"
         style={{
           fontSize: 12,
-          color: "var(--tx-3)",
+          color: "var(--muted)",
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
@@ -271,21 +307,34 @@ function RunRow({ r, onSelect }: RunRowProps) {
       >
         {r.projectShort}
       </div>
-      <div className="mono" style={{ fontSize: 12.5, color: "var(--tx-2)", textAlign: "right" }}>
-        {r.turn}
+      {/* Turn: "N" ink + "/max" faint (em-dash when the job never ran). */}
+      <div className="mono" style={{ fontSize: 11.5, textAlign: "right" }}>
+        {r.turn > 0 ? (
+          <>
+            <span style={{ color: "var(--ink)" }}>{r.turn}</span>
+            {maxTurns ? <span style={{ color: "var(--faint)" }}>/{maxTurns}</span> : null}
+          </>
+        ) : (
+          <span style={{ color: "var(--faint)" }}>{EM_DASH}</span>
+        )}
       </div>
-      <div className="mono" style={{ fontSize: 12.5, color: "var(--tx-2)", textAlign: "right" }}>
-        {r.tokens}
+      {/* Tokens */}
+      <div
+        className="mono"
+        style={{ fontSize: 11.5, color: r.tokens && r.tokens !== "0" ? "var(--muted)" : "var(--faint)", textAlign: "right" }}
+      >
+        {r.tokens && r.tokens !== "0" ? r.tokens : EM_DASH}
       </div>
+      {/* Duration (rust while live) */}
       <div
         className="mono"
         style={{
-          fontSize: 12.5,
-          color: r.durationAccent ? "var(--em-bright)" : "var(--tx-2)",
+          fontSize: 11.5,
+          color: r.duration ? (r.durationAccent ? "var(--rust-text)" : "var(--muted)") : "var(--faint)",
           textAlign: "right",
         }}
       >
-        {r.duration}
+        {r.duration || EM_DASH}
       </div>
     </div>
   );

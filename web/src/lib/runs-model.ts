@@ -67,10 +67,10 @@ function durationSeconds(startedISO: string, endedISO: string): number {
   return Math.max(0, Math.floor((end - start) / 1000));
 }
 
-// deriveStatTiles computes the four Runs stat tiles from the live state snapshot plus the
+// deriveStatTiles computes the four instrument-strip cells from the live state snapshot plus the
 // history rows, sourcing everything from the real API (never the mock):
-//   - Running   : live `state.running` + store-running rows absent from the snapshot, deduped,
-//                 plus an active-agents (distinct project) hint.
+//   - Playing   : live `state.running` + store-running rows absent from the snapshot, deduped,
+//                 annotated with the seat math ("of N seats", N = maxConcurrent).
 //   - Completed : runs whose stored outcome is `completed` (taxonomy v2 — replaces "In review").
 //   - Tokens    : today's in/out/total tokens, summed per-run over the runs that STARTED today
 //                 (live running rows + finished history rows, de-duplicated).
@@ -80,22 +80,19 @@ export function deriveStatTiles(
   state: StateResponse | undefined,
   history: RunSummary[],
   nowMs: number,
+  maxConcurrent: number,
 ): StatTile[] {
   const running = state?.running ?? [];
   const liveRunIds = new Set<number>();
   for (const r of running) if (r.run_id > 0) liveRunIds.add(r.run_id);
 
-  // The Running tile counts the live snapshot PLUS any history rows still running but momentarily
+  // The Playing cell counts the live snapshot PLUS any history rows still running but momentarily
   // absent from the snapshot (deduped by run id), so it stays consistent with the merged jobs list
   // and never under-reads after a snapshot blip.
   const storeRunning = history.filter(
     (h) => h.outcome === "running" && !(h.id > 0 && liveRunIds.has(h.id)),
   );
   const runningCount = running.length + storeRunning.length;
-  const agentsActive = new Set([
-    ...running.map((r) => r.project),
-    ...storeRunning.map((h) => h.project_slug),
-  ]).size;
   const completedCount = history.filter((r) => r.outcome === "completed").length;
 
   // "Today" aggregates sum per-run over the runs that STARTED today, de-duplicated (a live run that
@@ -133,17 +130,20 @@ export function deriveStatTiles(
   return [
     {
       key: "running",
-      label: "Running",
+      // "Playing" is a display-only label (the run enum stays "running" across the API/state); the
+      // annotation is the seat math — playing of the max-concurrent capacity ("of N seats"). The
+      // annotation is omitted while the capacity is still unknown (config loading). (P10-D3)
+      label: "Playing",
       value: String(runningCount),
-      sub: `${agentsActive} agent${agentsActive === 1 ? "" : "s"} active`,
-      accent: "var(--em-bright)",
+      sub: maxConcurrent > 0 ? `of ${maxConcurrent} seats` : "",
+      accent: "var(--rust-text)",
       pulse: true,
     },
     {
       key: "completed",
       label: "Completed",
       value: String(completedCount),
-      sub: "agent hand-off verified",
+      sub: "hand-off verified",
     },
     {
       key: "tokens",
@@ -166,6 +166,40 @@ export function deriveStatTiles(
   ];
 }
 
+// rhythmBars derives the token "rhythm" sparkline in the Tokens-today cell: one bar per run STARTED
+// today (live running rows + finished history rows, de-duplicated by run id exactly like the token
+// totals above), oldest→newest so the last/brightest bar is the most recent. Each bar is the run's
+// total tokens normalized to the busiest run of the window (0..1). Capped at the most recent
+// RHYTHM_MAX runs so the strip stays compact; empty when nothing ran today (no rhythm to draw).
+const RHYTHM_MAX = 14;
+
+export function rhythmBars(
+  state: StateResponse | undefined,
+  history: RunSummary[],
+  nowMs: number,
+): number[] {
+  const liveRunIds = new Set<number>();
+  for (const r of state?.running ?? []) if (r.run_id > 0) liveRunIds.add(r.run_id);
+
+  const runs: { at: number; tokens: number }[] = [];
+  for (const r of state?.running ?? []) {
+    if (!isSameLocalDay(r.started_at, nowMs)) continue;
+    runs.push({ at: parseMs(r.started_at), tokens: r.total_tokens });
+  }
+  for (const h of history) {
+    if (h.id > 0 && liveRunIds.has(h.id)) continue; // already counted as a live row
+    if (!isSameLocalDay(h.started_at, nowMs)) continue;
+    runs.push({ at: parseMs(h.started_at), tokens: h.total_tokens });
+  }
+  if (runs.length === 0) return [];
+
+  runs.sort((a, b) => a.at - b.at); // oldest → newest (last bar is the most recent)
+  const recent = runs.slice(-RHYTHM_MAX);
+  const max = Math.max(...recent.map((r) => r.tokens));
+  if (max <= 0) return []; // no token signal yet → no rhythm
+  return recent.map((r) => r.tokens / max);
+}
+
 // --- Unified jobs list (merged Live + History) ---
 
 export type JobFilterId = "all" | "running" | "completed" | "stopped" | "failed" | "waiting";
@@ -175,10 +209,12 @@ export type JobFilterId = "all" | "running" | "completed" | "stopped" | "failed"
 // waiting signals by `jobStatus`. A subset of StatusKey.
 export type JobStatusKey = "running" | "completed" | "stopped" | "failed" | "waiting";
 
-// The segmented filter for the jobs list (the four job states + the held "waiting" state).
+// The segmented filter for the jobs list (the four job states + the held "waiting" state). The
+// "running" filter carries the display-only label "Playing" (the run enum stays "running"); its
+// count renders in rust on the chip. (P10-D3 copy audit)
 export const JOB_FILTERS: { id: JobFilterId; label: string }[] = [
   { id: "all", label: "All" },
-  { id: "running", label: "Running" },
+  { id: "running", label: "Playing" },
   { id: "completed", label: "Completed" },
   { id: "stopped", label: "Stopped" },
   { id: "failed", label: "Failed" },
@@ -536,6 +572,15 @@ export function matchFilter(row: JobRow, filter: JobFilterId): boolean {
     default:
       return true;
   }
+}
+
+// filterCounts tallies how many rows fall under each segmented filter — the live counts rendered
+// on the filter chips. `all` is the total; the rest reuse matchFilter so the chip counts and the
+// filtered table can never disagree.
+export function filterCounts(rows: JobRow[]): Record<JobFilterId, number> {
+  const counts = {} as Record<JobFilterId, number>;
+  for (const f of JOB_FILTERS) counts[f.id] = rows.filter((r) => matchFilter(r, f.id)).length;
+  return counts;
 }
 
 // searchJobs filters rows by a case-insensitive substring over issue + title + agent, plus the

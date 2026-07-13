@@ -1,71 +1,143 @@
 import { StatusDot } from "@/components/ui/status-dot";
 import type { RunSummary, StateResponse } from "@/lib/api";
-import { deriveStatTiles } from "@/lib/runs-model";
-import { Panel } from "./Panel";
-
-export interface StatTileProps {
-  label: string;
-  value: string;
-  sub?: string;
-  /** Accent colour for the value + a leading dot (e.g. the live "Running" tile). */
-  accent?: string;
-  /** Pulse the accent dot (live count). */
-  pulse?: boolean;
-}
-
-// StatTile — one summary tile (label, big mono value, sub). Ported from `runs.jsx` StatTile.
-export function StatTile({ label, value, sub, accent, pulse }: StatTileProps) {
-  return (
-    <Panel style={{ padding: "16px 18px", display: "flex", flexDirection: "column", gap: 6 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-        {accent ? <StatusDot color={accent} pulse={pulse} size={7} /> : null}
-        <span
-          style={{
-            fontSize: 11,
-            fontWeight: 600,
-            letterSpacing: ".07em",
-            textTransform: "uppercase",
-            color: "var(--tx-3)",
-          }}
-        >
-          {label}
-        </span>
-      </div>
-      <div
-        className="mono"
-        style={{
-          fontSize: 27,
-          fontWeight: 600,
-          letterSpacing: "-0.02em",
-          color: accent ?? "var(--tx)",
-          lineHeight: 1,
-        }}
-      >
-        {value}
-      </div>
-      {sub ? <div style={{ fontSize: 11.5, color: "var(--tx-3)" }}>{sub}</div> : null}
-    </Panel>
-  );
-}
+import { deriveStatTiles, rhythmBars, type StatTile } from "@/lib/runs-model";
 
 export interface RunsStatTilesProps {
   state: StateResponse | undefined;
   history: RunSummary[];
   nowMs: number;
-  /** Whether the data is live (polling). When false (e.g. under the Wails host) the accent dot
-   * stops pulsing so the tiles don't imply live updates while the queries are idle. */
+  /** Max concurrent agents (the seat capacity) → the Playing cell's "of N seats" annotation. */
+  maxConcurrent: number;
+  /** Whether the data is live (polling). When false (e.g. under the Wails host) the Playing pulse
+   *  dot stops breathing so the strip doesn't imply live updates while the queries are idle. */
   live?: boolean;
 }
 
-// RunsStatTiles — the 4-up tile row (Running / In review / Tokens today / Runtime today),
-// derived from the live state snapshot + history rollup. Replaces the legacy TotalsCards.
-export function RunsStatTiles({ state, history, nowMs, live = true }: RunsStatTilesProps) {
-  const tiles = deriveStatTiles(state, history, nowMs);
+// RunsStatTiles — the "instrument strip": a full-width band of four hairline-separated cells
+// (Playing · Completed · Tokens today + rhythm sparkline · Runtime today), derived from the live
+// snapshot + today's history. Replaces the former 4-up card row. (P10-D3 / mock 1a)
+export function RunsStatTiles({ state, history, nowMs, maxConcurrent, live = true }: RunsStatTilesProps) {
+  const cells = deriveStatTiles(state, history, nowMs, maxConcurrent);
+  const bars = rhythmBars(state, history, nowMs);
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
-      {tiles.map((t) => (
-        <StatTile key={t.key} label={t.label} value={t.value} sub={t.sub} accent={t.accent} pulse={t.pulse && live} />
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr 1.2fr 1.2fr",
+        padding: "16px 0",
+        borderBottom: "1px solid var(--hair-section)",
+      }}
+    >
+      {cells.map((cell, i) => (
+        <StripCell
+          key={cell.key}
+          cell={cell}
+          first={i === 0}
+          live={live}
+          bars={cell.key === "tokens" ? bars : undefined}
+        />
       ))}
     </div>
+  );
+}
+
+// StripCell — one instrument cell: a caps label over a value row (big tabular numeral + a faint
+// annotation). The live "Playing" cell leads with a pulsing rust dot and colours its numeral rust;
+// the Tokens cell right-aligns the rhythm sparkline.
+function StripCell({
+  cell,
+  first,
+  live,
+  bars,
+}: {
+  cell: StatTile;
+  first: boolean;
+  live: boolean;
+  bars?: number[];
+}) {
+  return (
+    <div
+      style={{
+        padding: "0 20px",
+        borderLeft: first ? undefined : "1px solid var(--hair-section)",
+        minWidth: 0,
+      }}
+    >
+      <div
+        style={{
+          fontSize: 10,
+          fontWeight: 600,
+          letterSpacing: ".12em",
+          textTransform: "uppercase",
+          color: "var(--faint)",
+          marginBottom: 7,
+        }}
+      >
+        {cell.label}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+        {cell.accent ? <StatusDot color="var(--rust-text)" pulse={live} size={7} /> : null}
+        <span
+          className="mono"
+          style={{
+            fontSize: 22,
+            fontWeight: 600,
+            lineHeight: 1,
+            letterSpacing: "-0.02em",
+            color: cell.accent ?? "var(--ink)",
+            flexShrink: 0,
+          }}
+        >
+          {cell.value}
+        </span>
+        {cell.sub ? (
+          <span
+            style={{
+              fontSize: 11,
+              color: "var(--faint)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              minWidth: 0,
+            }}
+          >
+            {cell.sub}
+          </span>
+        ) : null}
+        {bars && bars.length > 0 ? <RhythmSparkline bars={bars} /> : null}
+      </div>
+    </div>
+  );
+}
+
+// RhythmSparkline — the token-rhythm bars in the Tokens-today cell: 2px-wide bars, 2px gap, rust
+// on an opacity ramp (.3 oldest → .85 newest) with the most-recent bar full rust-text. Purely
+// decorative (aria-hidden); the numbers already carry the meaning. (mock 1a)
+function RhythmSparkline({ bars }: { bars: number[] }) {
+  const H = 22;
+  const n = bars.length;
+  return (
+    <span
+      data-rhythm="true"
+      aria-hidden
+      style={{ display: "inline-flex", alignItems: "flex-end", gap: 2, height: H, marginLeft: "auto", flexShrink: 0 }}
+    >
+      {bars.map((b, i) => {
+        const last = i === n - 1;
+        const t = n <= 1 ? 1 : i / (n - 1);
+        return (
+          <span
+            key={i}
+            style={{
+              width: 2,
+              height: Math.max(2, Math.round(b * H)),
+              borderRadius: 1,
+              background: last ? "var(--rust-text)" : "var(--rust)",
+              opacity: last ? 1 : 0.3 + 0.55 * t,
+            }}
+          />
+        );
+      })}
+    </span>
   );
 }

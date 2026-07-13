@@ -3,6 +3,7 @@ import type { LinearProject, RunSummary, StateResponse } from "@/lib/api";
 import {
   deriveStatTiles,
   failureSubLabel,
+  filterCounts,
   isMcpTool,
   JOB_FILTERS,
   jobStatus,
@@ -12,6 +13,7 @@ import {
   projectColorMap,
   resolveAgent,
   resolveProject,
+  rhythmBars,
   searchJobs,
   transcriptEntryType,
 } from "@/lib/runs-model";
@@ -97,17 +99,17 @@ describe("outcomeToStatus", () => {
 });
 
 describe("deriveStatTiles", () => {
-  it("always returns the four tiles in order: running, completed, tokens, runtime", () => {
-    const tiles = deriveStatTiles(undefined, [], NOW);
-    expect(tiles.map((t) => t.key)).toEqual(["running", "completed", "tokens", "runtime"]);
+  it("always returns the four cells in order: running, completed, tokens, runtime", () => {
+    const cells = deriveStatTiles(undefined, [], NOW, 4);
+    expect(cells.map((t) => t.key)).toEqual(["running", "completed", "tokens", "runtime"]);
     // With no data the counters are zeroed, not crashing on undefined state.
-    expect(tiles[0].value).toBe("0");
-    expect(tiles[1].value).toBe("0");
-    expect(tiles[2].value).toBe("0");
-    expect(tiles[3].value).toBe("0s");
+    expect(cells[0].value).toBe("0");
+    expect(cells[1].value).toBe("0");
+    expect(cells[2].value).toBe("0");
+    expect(cells[3].value).toBe("0s");
   });
 
-  it("counts running sessions and active agents (distinct projects)", () => {
+  it("labels the live cell 'Playing' and annotates the seat capacity (Podium copy audit)", () => {
     const s = state({
       running: [
         runningSession({ project: "alpha" }),
@@ -115,19 +117,20 @@ describe("deriveStatTiles", () => {
         runningSession({ project: "alpha" }),
       ],
     });
-    const running = deriveStatTiles(s, [], NOW)[0];
-    expect(running.value).toBe("3");
-    expect(running.sub).toBe("2 agents active");
-    expect(running.accent).toBe("var(--em-bright)");
-    expect(running.pulse).toBe(true);
+    const playing = deriveStatTiles(s, [], NOW, 4)[0];
+    expect(playing.label).toBe("Playing");
+    expect(playing.value).toBe("3");
+    expect(playing.sub).toBe("of 4 seats"); // seat math: playing of maxConcurrent
+    expect(playing.accent).toBe("var(--rust-text)");
+    expect(playing.pulse).toBe(true);
   });
 
-  it("singularizes the active-agents hint for a single agent", () => {
+  it("omits the seat annotation when the seat capacity is unknown (config still loading)", () => {
     const s = state({ running: [runningSession({ project: "alpha" })] });
-    expect(deriveStatTiles(s, [], NOW)[0].sub).toBe("1 agent active");
+    expect(deriveStatTiles(s, [], NOW, 0)[0].sub).toBe("");
   });
 
-  it("counts store-running rows that are absent from the live snapshot in the Running tile", () => {
+  it("counts store-running rows that are absent from the live snapshot in the Playing cell", () => {
     const s = state({ running: [runningSession({ run_id: 1, project: "alpha" })] });
     const history = [
       // still running in the store but dropped from the snapshot — must still count
@@ -136,22 +139,22 @@ describe("deriveStatTiles", () => {
       summary({ id: 1, outcome: "running", project_slug: "alpha" }),
       summary({ id: 3, outcome: "completed" }),
     ];
-    const running = deriveStatTiles(s, history, NOW)[0];
-    expect(running.value).toBe("2"); // 1 live + 1 store-running (id 2); id 1 deduped
-    expect(running.sub).toBe("2 agents active"); // alpha + beta
+    const playing = deriveStatTiles(s, history, NOW, 4)[0];
+    expect(playing.value).toBe("2"); // 1 live + 1 store-running (id 2); id 1 deduped
+    expect(playing.sub).toBe("of 4 seats");
   });
 
-  it("counts completed runs in the Completed tile", () => {
+  it("counts completed runs in the Completed cell with the 'hand-off verified' annotation", () => {
     const history = [
       summary({ outcome: "completed" }),
       summary({ outcome: "completed" }),
       summary({ outcome: "stopped" }),
       summary({ outcome: "failed" }),
     ];
-    const completed = deriveStatTiles(state(), history, NOW)[1];
+    const completed = deriveStatTiles(state(), history, NOW, 4)[1];
     expect(completed.label).toBe("Completed");
     expect(completed.value).toBe("2");
-    expect(completed.sub).toBe("agent hand-off verified");
+    expect(completed.sub).toBe("hand-off verified"); // copy audit: drop the leading "agent"
     expect(completed.accent).toBeUndefined();
   });
 
@@ -171,7 +174,7 @@ describe("deriveStatTiles", () => {
       // yesterday's run is excluded from "today"
       summary({ id: 8, outcome: "completed", started_at: yesterdayAt(9), input_tokens: 5000, output_tokens: 5000, total_tokens: 5000 }),
     ];
-    const tokens = deriveStatTiles(s, history, NOW)[2];
+    const tokens = deriveStatTiles(s, history, NOW, 4)[2];
     expect(tokens.value).toBe("1.0M"); // 1_000_000 (live) + 3_000 = 1_003_000 -> 1.0M
     // Three-part reconciling sub: in · out · cached. Here cache = total − in − out =
     // 1_003_000 − 401_000 − 602_000 = 0, so this also covers the zero-cache form "0 cached". (INF-282)
@@ -193,7 +196,7 @@ describe("deriveStatTiles", () => {
         }),
       ],
     });
-    const tokens = deriveStatTiles(s, [], NOW)[2];
+    const tokens = deriveStatTiles(s, [], NOW, 4)[2];
     expect(tokens.value).toBe("38.2M");
     expect(tokens.sub).toBe("44.0k in · 205.5k out · 38.0M cached"); // 37_950_500 -> 38.0M
     // The raw figures reconcile exactly to the headline total.
@@ -214,9 +217,84 @@ describe("deriveStatTiles", () => {
       // yesterday -> excluded
       summary({ id: 8, outcome: "completed", started_at: yesterdayAt(8), ended_at: yesterdayAt(9) }),
     ];
-    const runtime = deriveStatTiles(s, history, NOW)[3];
+    const runtime = deriveStatTiles(s, history, NOW, 4)[3];
     expect(runtime.value).toBe("40m 0s"); // 600 (live elapsed) + 1800 (finished) = 2400s
     expect(runtime.sub).toBe("across 2 runs"); // live run 5 + finished run 7 (dup 5 + yesterday 8 excluded)
+  });
+});
+
+describe("filterCounts", () => {
+  it("counts rows for each segmented filter (all = total; the rest by job state)", () => {
+    const rows = mergeJobs(
+      state({ running: [runningSession({ run_id: 1, issue_identifier: "RUN-1" })] }),
+      [
+        summary({ id: 2, issue_identifier: "STOP", outcome: "stopped" }),
+        summary({ id: 3, issue_identifier: "DONE", outcome: "completed" }),
+        summary({ id: 4, issue_identifier: "DONE-2", outcome: "completed" }),
+        summary({ id: 5, issue_identifier: "FAIL", outcome: "failed" }),
+      ],
+      PROJECTS,
+      NOW,
+    );
+    const counts = filterCounts(rows);
+    expect(counts.all).toBe(5);
+    expect(counts.running).toBe(1); // the live "playing" job
+    expect(counts.completed).toBe(2);
+    expect(counts.stopped).toBe(1);
+    expect(counts.failed).toBe(1);
+    expect(counts.waiting).toBe(0);
+  });
+
+  it("counts held dependents under the waiting filter (INF-320)", () => {
+    const rows = mergeJobs(
+      state({ blocked: [{ issue_identifier: "DEP-1", title: "d", project: "", blocker_identifier: "INF-1", blocker_state: "In Review" }] }),
+      [summary({ id: 2, issue_identifier: "DONE", outcome: "completed" })],
+      PROJECTS,
+      NOW,
+    );
+    const counts = filterCounts(rows);
+    expect(counts.all).toBe(2);
+    expect(counts.waiting).toBe(1);
+    expect(counts.completed).toBe(1);
+    expect(counts.running).toBe(0);
+  });
+});
+
+describe("rhythmBars", () => {
+  it("returns per-run token heights for today's runs, oldest→newest, normalized to the max", () => {
+    const history = [
+      summary({ id: 1, started_at: todayAt(9), total_tokens: 1000 }),
+      summary({ id: 2, started_at: todayAt(11), total_tokens: 4000 }),
+      summary({ id: 3, started_at: todayAt(10), total_tokens: 2000 }),
+      // yesterday's run is excluded from today's rhythm
+      summary({ id: 4, started_at: yesterdayAt(9), total_tokens: 8000 }),
+    ];
+    // sorted oldest→newest: 1000, 2000, 4000; normalized by the max (4000)
+    expect(rhythmBars(state(), history, NOW)).toEqual([0.25, 0.5, 1]);
+  });
+
+  it("de-duplicates a live run against its history twin (the live row wins)", () => {
+    const s = state({
+      running: [runningSession({ run_id: 5, started_at: todayAt(11), total_tokens: 3000 })],
+    });
+    const history = [
+      summary({ id: 7, started_at: todayAt(9), outcome: "completed", total_tokens: 1500 }),
+      summary({ id: 5, started_at: todayAt(11), outcome: "running", total_tokens: 3000 }), // twin of the live row
+    ];
+    // two bars (id 5 counted once): 1500 then 3000 → [0.5, 1]
+    expect(rhythmBars(s, history, NOW)).toEqual([0.5, 1]);
+  });
+
+  it("returns [] when there are no runs today (nothing to visualize)", () => {
+    expect(rhythmBars(state(), [], NOW)).toEqual([]);
+    expect(rhythmBars(state(), [summary({ started_at: yesterdayAt(9), total_tokens: 100 })], NOW)).toEqual([]);
+  });
+
+  it("keeps only the most recent 14 runs so the sparkline stays compact", () => {
+    const history = Array.from({ length: 20 }, (_, i) =>
+      summary({ id: i + 1, started_at: todayAt(1, i), total_tokens: 1000 }),
+    );
+    expect(rhythmBars(state(), history, NOW)).toHaveLength(14);
   });
 });
 
