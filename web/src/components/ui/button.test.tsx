@@ -15,11 +15,11 @@ describe("Button", () => {
     expect(onClick).toHaveBeenCalledOnce();
   });
 
-  it("applies the emerald primary variant", () => {
+  it("applies the rust primary variant", () => {
     render(<Button variant="primary">Go</Button>);
     const btn = screen.getByRole("button", { name: "Go" });
-    expect(btn.className).toContain("bg-[var(--em-bright)]");
-    expect(btn.className).toContain("text-[var(--on-em)]");
+    expect(btn.className).toContain("bg-[var(--rust)]");
+    expect(btn.className).toContain("text-[var(--on-rust)]");
   });
 
   it("applies the danger variant", () => {
@@ -78,8 +78,14 @@ describe("Button", () => {
 
   it("applies the subtle and ghost variant surfaces", () => {
     const { rerender } = render(<Button variant="subtle">s</Button>);
-    expect(screen.getByRole("button").className).toContain("bg-[var(--bg-raised)]");
+    expect(screen.getByRole("button").className).toContain("text-[var(--btn-label)]");
+    expect(screen.getByRole("button").className).toContain("border-[var(--hair-control)]");
     rerender(<Button variant="ghost">g</Button>);
-    expect(screen.getByRole("button").className).toContain("border-[var(--line-strong)]");
+    expect(screen.getByRole("button").className).toContain("border-transparent");
+  });
+
+  it("uses the rust focus ring", () => {
+    render(<Button>focus</Button>);
+    expect(screen.getByRole("button").className).toContain("focus-visible:ring-[var(--focus-ring)]");
   });
 });

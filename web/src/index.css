@@ -1,40 +1,34 @@
 @import "tailwindcss";
 
 /* ============================================================================
-   Symphony — dark-emerald design system foundation (INF-225)
+   Rhapsody — "Podium" warm-dark design tokens (P10-D1, TRA-244)
 
-   Ported detail-for-detail from the Claude Design package
-   (`Symphony Settings.html :root` + global CSS). This is the canonical token
-   set for the whole-app re-skin: the package's raw tokens (`--bg-*`, `--em*`,
-   `--tx*`, status, lines, focus, radii, shadows, density) live on :root, and
-   the existing shadcn semantic tokens (`--background`, `--card`, `--primary`,
-   `--ring`, ...) are RE-POINTED at those package values so Tailwind utilities
-   (`bg-card`, `text-foreground`, `ring`, ...) resolve to the package colors.
+   The single source of truth for the dashboard reskin. The spec's Design Tokens
+   (colors, tints, hairlines, type scale, spacing, radii — see the P10 design
+   handoff) live here as CSS vars; the primitives and screens consume them so no
+   hex is hardcoded outside this layer.
 
-   Dark-only, emerald accent, no light mode. Tailwind v4 CSS-first — no
-   tailwind.config.js. Fonts are self-hosted (offline desktop app, no CDN).
+   Two consumer layers read these vars:
+     1. the Tailwind v4 `@theme` map (semantic utilities: bg-card, text-foreground,
+        bg-primary, ring, border, …) re-pointed at the Podium palette, and
+     2. the design-system primitives (Button, Pill, StatusChip, …) that reference
+        the tokens directly.
+
+   During the D1→D7 staged reskin the earlier `--em*` / `--tx*` / `--bg-*` package
+   names (INF-225) remain as LEGACY ALIASES pointed at the Podium palette, so the
+   not-yet-restructured screens (Jobs, Run detail, Settings, onboarding) keep
+   rendering coherently on the new warm-dark palette. Later screen tasks migrate
+   their call sites onto the canonical Podium names and the aliases retire.
+
+   Dark-only, single rust accent (Rhapsody is written in Rust), system fonts only
+   (no webfonts), Tailwind v4 CSS-first (no tailwind.config.js).
    ============================================================================ */
-
-/* ---- self-hosted Geist + Geist Mono (variable, weights 100–900) ---- */
-@font-face {
-  font-family: "Geist";
-  font-style: normal;
-  font-weight: 100 900;
-  font-display: swap;
-  src: url("/fonts/Geist-Variable.woff2") format("woff2");
-}
-@font-face {
-  font-family: "Geist Mono";
-  font-style: normal;
-  font-weight: 100 900;
-  font-display: swap;
-  src: url("/fonts/GeistMono-Variable.woff2") format("woff2");
-}
 
 /* ---- Tailwind v4 theme mapping: semantic utilities -> CSS variables ---- */
 @theme inline {
-  --font-sans: "Geist", -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
-  --font-mono: "Geist Mono", "SF Mono", ui-monospace, SFMono-Regular, monospace;
+  /* System stack only — no webfonts (SF Pro / SF Mono on macOS, graceful fallbacks). */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace;
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -67,91 +61,159 @@
 }
 
 :root {
-  /* ---- surfaces (near-black slate, faint green tint) ---- */
-  --bg-window: #060807;
-  --bg-app: #0a0d0c;
-  --bg-titlebar: #0d100f;
-  --bg-card: #101513;
-  --bg-card-2: #0d1110;
-  --bg-input: #0c0f0e;
-  --bg-raised: #161b19;
-  --bg-hover: #151a18;
-  --bg-active: #1c2320;
+  /* ========================================================================
+     Podium palette — canonical tokens (the spec's Design Tokens table)
+     ======================================================================== */
 
-  /* ---- text ---- */
-  --tx: #e9ede9;
-  --tx-2: #98a39c;
-  --tx-3: #6a736d;
-  --tx-faint: #4b524d;
+  /* ---- backgrounds (warm near-black ramp) ---- */
+  --ground: #141210; /* app / content background */
+  --surface: #1c1916; /* toolbar */
+  --well: #100e0c; /* transcript / log panels */
+  --well-header: #14110f;
+  --well-footer: #0d0b0a;
+  --meta-strip: #161311;
+  --list-footer: #131110;
 
-  /* ---- emerald accent ---- */
-  --em: #10b981;
-  --em-bright: #34d399;
-  --em-dim: #0e8c63;
-  --em-glow: rgba(16, 185, 129, 0.16);
-  --em-soft: rgba(16, 185, 129, 0.1);
-  --on-em: #04140d;
+  /* ---- text ramp ---- */
+  --ink: #ede7e1; /* primary text */
+  --text-2: #d8d1c8; /* transcript prose, enabled icons */
+  --text-muted: #a59c90; /* secondary text (spec "muted"; avoids the shadcn --muted bg token) */
+  --btn-label: #c9c1b8; /* subtle-button labels */
+  --faint: #6e675e; /* annotations, placeholders */
+  --ghost: #57504a; /* timestamps, kv-pairs */
+  --neutral: #8b847b; /* idle / queued */
 
-  /* ---- status ---- */
-  --sky: #38bdf8;
-  --violet: #a78bfa;
-  --amber: #f5b544;
-  --rose: #f4708a;
-  --red: #ef5350;
-  --amber-soft: rgba(245, 181, 68, 0.13);
-  --red-soft: rgba(239, 83, 80, 0.13);
-  --sky-soft: rgba(56, 189, 248, 0.13);
+  /* ---- rust accent (fills vs. text/live) ---- */
+  --rust: #c25b2e; /* fills: primary buttons, toggles, live rules, sparklines */
+  --rust-hover: #b14f27;
+  --rust-text: #e08653; /* live text, links, active nav, pulse dots */
+  --on-rust: #fff6f0; /* text on rust */
 
-  /* ---- lines / elevation ---- */
-  --line: rgba(255, 255, 255, 0.07);
-  --line-2: rgba(255, 255, 255, 0.04);
-  --line-strong: rgba(255, 255, 255, 0.12);
-  --focus: rgba(16, 185, 129, 0.55);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  /* ---- status colors ---- */
+  --sage: #97ae87; /* success, health */
+  --slate: #86a9c6; /* waiting / in review / continued */
+  --amber: #cda35a; /* stopped / paused / interrupted, warnings */
+  --red: #e0574c; /* failed, danger */
+
+  /* ---- tints (pill / row backgrounds) ---- */
+  --tint-rust: rgba(224, 134, 83, 0.12);
+  --tint-sage: rgba(151, 174, 135, 0.1);
+  --tint-amber: rgba(205, 163, 90, 0.1);
+  --tint-red: rgba(224, 87, 76, 0.1);
+  --tint-slate: rgba(134, 169, 198, 0.1);
+  --tint-neutral: rgba(139, 132, 123, 0.1);
+  --tint-playing-row: rgba(194, 91, 46, 0.045);
+  --tint-warn-row: rgba(205, 163, 90, 0.05);
+  --tint-active-nav: rgba(224, 134, 83, 0.09);
+
+  /* ---- hairlines ---- */
+  --hair-row: rgba(255, 255, 255, 0.05);
+  --hair-section: rgba(255, 255, 255, 0.06);
+  --hair-card: rgba(255, 255, 255, 0.07);
+  --hair-control: rgba(255, 255, 255, 0.09);
+  --hair-strong: rgba(255, 255, 255, 0.1);
+  --hair-dashed: rgba(255, 255, 255, 0.12);
+
+  /* ---- focus (rust) ---- */
+  --focus: #c25b2e; /* focus border */
+  --focus-ring: rgba(194, 91, 46, 0.25); /* 3px focus ring */
+
+  /* ---- control border that carries a status color (danger button) ---- */
+  --border-danger: rgba(224, 87, 76, 0.35);
+
+  /* ---- radii ---- */
+  --r-pill: 999px; /* pills / toggles */
+  --r-card: 10px; /* cards / panels */
+  --r-ctrl: 7px; /* buttons / inputs / segments */
+  --r-chip: 5px; /* inner chips */
+  --r-keycap: 4px; /* keycaps / badges */
+  --r-window: 11px;
+
+  /* ---- elevation (spec: no shadows inside the app; overlays keep a soft one) ---- */
+  --shadow-card: none;
   --shadow-pop: 0 18px 48px -12px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 255, 255, 0.06);
   --shadow-sheet: -24px 0 60px -20px rgba(0, 0, 0, 0.7);
 
-  /* ---- shape ---- */
-  --r-window: 11px;
-  --r-card: 14px;
-  --r-ctrl: 9px;
-  --r-pill: 999px;
-
   /* ---- density (comfortable defaults; [data-density="dense"] overrides) ---- */
-  --gut: 28px;
-  --row-h: 38px;
+  --gut: 24px;
+  --row-h: 42px;
 
-  /* ---- shadcn semantic layer, re-pointed onto the package palette ---- */
-  --radius: 0.625rem;
-  --background: var(--bg-app);
-  --foreground: var(--tx);
-  --card: var(--bg-card);
-  --card-foreground: var(--tx);
-  --popover: var(--bg-raised);
-  --popover-foreground: var(--tx);
-  --primary: var(--em-bright);
-  --primary-foreground: var(--on-em);
-  --secondary: var(--bg-raised);
-  --secondary-foreground: var(--tx);
-  --muted: var(--bg-card-2);
-  --muted-foreground: var(--tx-2);
+  /* ========================================================================
+     Legacy INF-225 package aliases -> Podium palette (retired by D2–D7).
+     Keeps not-yet-restructured screens rendering on the warm-dark palette.
+     ======================================================================== */
+
+  /* surfaces */
+  --bg-window: #0e0d0b;
+  --bg-app: var(--ground);
+  --bg-titlebar: var(--surface);
+  --bg-card: var(--card);
+  --bg-card-2: var(--well);
+  --bg-input: #100e0c;
+  --bg-raised: var(--surface);
+  --bg-hover: #221e1a;
+  --bg-active: #2a241f;
+
+  /* text */
+  --tx: var(--ink);
+  --tx-2: var(--text-muted);
+  --tx-3: var(--faint);
+  --tx-faint: var(--ghost);
+
+  /* accent (emerald -> rust) */
+  --em: var(--rust);
+  --em-bright: var(--rust-text);
+  --em-dim: var(--rust-hover);
+  --em-glow: var(--tint-rust);
+  --em-soft: var(--tint-rust);
+  --on-em: var(--on-rust);
+
+  /* status (sky/violet/rose collapse onto the Podium set) */
+  --sky: var(--slate);
+  --violet: var(--slate);
+  --rose: var(--red);
+  --amber-soft: var(--tint-amber);
+  --red-soft: var(--tint-red);
+  --sky-soft: var(--tint-slate);
+
+  /* lines */
+  --line: var(--hair-card);
+  --line-2: var(--hair-section);
+  --line-strong: var(--hair-strong);
+
+  /* ========================================================================
+     shadcn semantic layer, re-pointed onto the Podium palette
+     ======================================================================== */
+  --radius: 0.625rem; /* 10px — the Podium card radius */
+  --background: var(--ground);
+  --foreground: var(--ink);
+  --card: #1a1714; /* settings cards, tables */
+  --card-foreground: var(--ink);
+  --popover: var(--surface);
+  --popover-foreground: var(--ink);
+  --primary: var(--rust);
+  --primary-foreground: var(--on-rust);
+  --secondary: var(--surface);
+  --secondary-foreground: var(--ink);
+  --muted: var(--well);
+  --muted-foreground: var(--text-muted);
   --accent: var(--bg-hover);
-  --accent-foreground: var(--tx);
+  --accent-foreground: var(--ink);
   --destructive: var(--red);
   --destructive-foreground: #ffffff;
-  --border: var(--line);
-  --input: var(--line);
-  --ring: var(--focus);
-  --chart-1: var(--em-bright);
-  --chart-2: var(--sky);
-  --chart-3: var(--em);
+  --border: var(--hair-card);
+  --input: var(--hair-control);
+  --ring: var(--focus-ring);
+  --chart-1: var(--rust);
+  --chart-2: var(--slate);
+  --chart-3: var(--sage);
   --chart-4: var(--amber);
-  --chart-5: var(--violet);
+  --chart-5: var(--rust-text);
 }
 
 [data-density="dense"] {
-  --gut: 20px;
-  --row-h: 34px;
+  --gut: 18px;
+  --row-h: 38px;
 }
 
 @layer base {
@@ -168,25 +230,25 @@
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
-  /* Emerald focus ring on any native control that gains keyboard focus. The design-system
-     primitives (TextInput, Select, …) layer their own ring inline; this covers bare/native
-     controls so they keep a visible focus indicator (the package's 0 0 0 3px --focus ring)
+  /* Rust focus ring on any native control that gains keyboard focus. The design-system
+     primitives (TextInput, Select, …) layer their own inline ring; this covers bare/native
+     controls so they keep a visible focus indicator (the spec's 3px rgba(194,91,46,.25) ring)
      instead of just losing the default outline. */
   input:focus-visible,
   textarea:focus-visible,
   select:focus-visible {
     outline: none;
-    box-shadow: 0 0 0 3px var(--focus);
+    box-shadow: 0 0 0 3px var(--focus-ring);
   }
 }
 
-/* ---- mono treatment (Geist Mono + ss01 alt glyphs) ---- */
+/* ---- mono treatment (system mono, tabular figures for data) ---- */
 .mono {
   font-family: var(--font-mono);
-  font-feature-settings: "ss01";
+  font-variant-numeric: tabular-nums;
 }
 
-/* ---- custom 11px webkit scrollbars (match package) ---- */
+/* ---- custom 11px scrollbars ---- */
 ::-webkit-scrollbar {
   width: 11px;
   height: 11px;
@@ -206,17 +268,31 @@
 }
 
 ::selection {
-  background: rgba(16, 185, 129, 0.28);
+  background: rgba(194, 91, 46, 0.28);
 }
 
-/* ---- keyframes (the 8 package animations) ---- */
-@keyframes pulseDot {
+/* ============================================================================
+   Keyframes. Podium adds `pulse` (any "live" dot) + `blink` (live caret); the
+   remaining animations back the shell's shimmer/sheet/toast surfaces.
+   `prefers-reduced-motion` neutralizes all of them below.
+   ============================================================================ */
+@keyframes pulse {
   0%,
   100% {
-    box-shadow: 0 0 0 0 var(--pulse-color, var(--em-glow));
+    opacity: 1;
   }
-  60% {
-    box-shadow: 0 0 0 5px transparent;
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
   }
 }
 @keyframes spin {
@@ -258,16 +334,6 @@
     opacity: 1;
   }
 }
-@keyframes blink {
-  0%,
-  50% {
-    opacity: 1;
-  }
-  50.01%,
-  100% {
-    opacity: 0;
-  }
-}
 @keyframes toastIn {
   from {
     opacity: 0;
@@ -276,5 +342,17 @@
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+
+/* ---- accessibility: honor reduced-motion (neutralize pulse/blink/spin/…) ---- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }

@@ -1,27 +1,37 @@
 import * as React from "react";
+import { StatusDot } from "./status-dot";
 
-export type PillTone = "neutral" | "emerald" | "amber" | "sky" | "red";
+// Podium pill tones. The legacy names (`emerald`/`sky`) are kept so the not-yet-restructured
+// screens keep compiling, but their VISUALS are re-pointed onto the warm palette: `emerald`
+// (the old success/accent tone) → sage, `sky` (the old info tone) → slate. `rust`/`sage`/`slate`
+// are the canonical Podium names.
+export type PillTone = "neutral" | "emerald" | "amber" | "sky" | "red" | "rust" | "sage" | "slate";
 
 interface ToneStyle {
   bg: string;
   c: string;
-  b: string;
 }
 
 const TONES: Record<PillTone, ToneStyle> = {
-  neutral: { bg: "rgba(255,255,255,.05)", c: "var(--tx-2)", b: "var(--line)" },
-  emerald: { bg: "var(--em-soft)", c: "var(--em-bright)", b: "rgba(16,185,129,.25)" },
-  amber: { bg: "var(--amber-soft)", c: "var(--amber)", b: "rgba(245,181,68,.25)" },
-  sky: { bg: "var(--sky-soft)", c: "var(--sky)", b: "rgba(56,189,248,.25)" },
-  red: { bg: "var(--red-soft)", c: "var(--red)", b: "rgba(239,83,80,.25)" },
+  neutral: { bg: "var(--tint-neutral)", c: "var(--neutral)" },
+  emerald: { bg: "var(--tint-sage)", c: "var(--sage)" },
+  sage: { bg: "var(--tint-sage)", c: "var(--sage)" },
+  amber: { bg: "var(--tint-amber)", c: "var(--amber)" },
+  sky: { bg: "var(--tint-slate)", c: "var(--slate)" },
+  slate: { bg: "var(--tint-slate)", c: "var(--slate)" },
+  red: { bg: "var(--tint-red)", c: "var(--red)" },
+  rust: { bg: "var(--tint-rust)", c: "var(--rust-text)" },
 };
 
 export interface PillProps extends React.HTMLAttributes<HTMLSpanElement> {
   tone?: PillTone;
+  /** Prepend a 5px status dot in the tone color. */
+  dot?: boolean;
 }
 
-// Pill — small generic badge with tonal fills, ported from `ui.jsx`.
-export function Pill({ tone = "neutral", children, style, ...rest }: PillProps) {
+// Pill — small generic badge with a 10–12% tonal tint fill (Podium spec: 11px, radius 999,
+// optional 5px dot, hairline border tinted from the tone color).
+export function Pill({ tone = "neutral", dot, children, style, ...rest }: PillProps) {
   const t = TONES[tone];
   return (
     <span
@@ -29,18 +39,20 @@ export function Pill({ tone = "neutral", children, style, ...rest }: PillProps) 
         display: "inline-flex",
         alignItems: "center",
         gap: 5,
-        height: 22,
+        height: 21,
         padding: "0 9px",
         borderRadius: "var(--r-pill)",
         background: t.bg,
         color: t.c,
-        border: `1px solid ${t.b}`,
-        fontSize: 11.5,
+        border: `1px solid color-mix(in srgb, ${t.c} 22%, transparent)`,
+        fontSize: 11,
         fontWeight: 600,
+        whiteSpace: "nowrap",
         ...style,
       }}
       {...rest}
     >
+      {dot ? <StatusDot color={t.c} size={5} /> : null}
       {children}
     </span>
   );

@@ -16,7 +16,7 @@ describe("StatusDot", () => {
     const { container, rerender } = render(<StatusDot pulse />);
     const dot = container.firstChild as HTMLElement;
     expect(dot.getAttribute("data-pulse")).toBe("true");
-    expect(dot.style.animation).toContain("pulseDot");
+    expect(dot.style.animation).toContain("pulse");
     rerender(<StatusDot />);
     expect((container.firstChild as HTMLElement).style.animation).toBe("none");
   });
@@ -46,10 +46,12 @@ describe("StatusChip + STATUS_META", () => {
     );
     expect(STATUS_META.review.label).toBe("in review");
     expect(STATUS_META.running.pulse).toBe(true);
+    // display-label mapping: the enum key stays "running", the chip reads "playing".
+    expect(STATUS_META.running.label).toBe("playing");
     // stopped uses the amber warn palette (an operator-attention state, not an error).
     expect(STATUS_META.stopped.color).toBe("var(--amber)");
-    // waiting (held dependent, INF-320) uses the neutral sky palette — not error red, not pulsing.
-    expect(STATUS_META.waiting.color).toBe("var(--sky)");
+    // waiting (held dependent, INF-320) uses the benign slate palette — not error red, not pulsing.
+    expect(STATUS_META.waiting.color).toBe("var(--slate)");
     expect(STATUS_META.waiting.pulse).toBeUndefined();
   });
 
@@ -58,9 +60,9 @@ describe("StatusChip + STATUS_META", () => {
     expect(screen.getByText("paused")).toBeTruthy();
   });
 
-  it("formats a count when provided", () => {
+  it("formats a count using the display label (running → playing)", () => {
     render(<StatusChip status="running" count={3} />);
-    expect(screen.getByText("3 running")).toBeTruthy();
+    expect(screen.getByText("3 playing")).toBeTruthy();
   });
 
   it("falls back to idle for an unknown status", () => {
@@ -73,7 +75,8 @@ describe("Pill", () => {
   it("applies tonal colors", () => {
     const { container } = render(<Pill tone="emerald">Healthy</Pill>);
     const pill = container.firstChild as HTMLElement;
-    expect(pill.style.color).toBe("var(--em-bright)");
+    // legacy "emerald" tone re-points onto the Podium success/sage color.
+    expect(pill.style.color).toBe("var(--sage)");
     expect(screen.getByText("Healthy")).toBeTruthy();
   });
 });
@@ -112,13 +115,12 @@ describe("Divider", () => {
 });
 
 describe("display primitives — additional state coverage", () => {
-  it("StatusDot derives the pulse halo color from the dot color", () => {
+  it("StatusDot uses the Podium opacity pulse (2.4s) when live", () => {
     const a = render(<StatusDot pulse />);
-    expect((a.container.firstChild as HTMLElement).style.getPropertyValue("--pulse-color")).toBe("var(--em-glow)");
-    const b = render(<StatusDot color="var(--amber)" pulse />);
-    expect((b.container.firstChild as HTMLElement).style.getPropertyValue("--pulse-color")).toBe(
-      "rgba(120,120,120,.3)",
-    );
+    expect((a.container.firstChild as HTMLElement).style.animation).toContain("pulse 2.4s");
+    // a static dot carries no animation at all
+    const b = render(<StatusDot color="var(--amber)" />);
+    expect((b.container.firstChild as HTMLElement).style.animation).toBe("none");
   });
 
   it("StatusChip honors an explicit label override", () => {
@@ -128,10 +130,13 @@ describe("display primitives — additional state coverage", () => {
 
   it("Pill maps every tone to its accent color", () => {
     const tones = [
-      ["neutral", "var(--tx-2)"],
-      ["emerald", "var(--em-bright)"],
+      ["neutral", "var(--neutral)"],
+      ["emerald", "var(--sage)"],
       ["amber", "var(--amber)"],
-      ["sky", "var(--sky)"],
+      ["sky", "var(--slate)"],
+      ["rust", "var(--rust-text)"],
+      ["sage", "var(--sage)"],
+      ["slate", "var(--slate)"],
     ] as const;
     for (const [tone, color] of tones) {
       const { container, unmount } = render(<Pill tone={tone}>{tone}</Pill>);

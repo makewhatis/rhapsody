@@ -42,20 +42,26 @@ describe("useIsDemoRoute", () => {
 });
 
 describe("PrimitiveGallery", () => {
+  // The rebuilt "Podium" gallery (mock 2f) — the 2f section set plus the retained
+  // verification surfaces (fields, collapsible, skeletons, icons).
   const SECTIONS = [
+    "Tokens",
+    "Type",
     "Buttons",
     "Status",
-    "Pills",
-    "Cards",
+    "Controls",
     "Fields & inputs",
-    "Stepper",
-    "Select",
-    "Toggle & Checkbox",
-    "Chips",
     "Collapsible",
     "Skeletons",
+    "New clusters",
+    "Cards",
     "Icons",
   ];
+
+  it("is titled 'Rhapsody primitives' (copy audit rename)", () => {
+    render(<PrimitiveGallery />);
+    expect(screen.getByRole("heading", { name: "Rhapsody primitives" })).toBeTruthy();
+  });
 
   it("renders a section heading for every primitive group", () => {
     render(<PrimitiveGallery />);
@@ -64,8 +70,11 @@ describe("PrimitiveGallery", () => {
     }
   });
 
-  it("renders the full status set (every STATUS_META label)", () => {
+  it("renders the status set with the running → playing display label", () => {
     render(<PrimitiveGallery />);
+    // "running" enum renders as "playing" (display-label mapping); count chip too.
+    expect(screen.getAllByText("playing").length).toBeGreaterThan(0);
+    expect(screen.getByText("3 playing")).toBeTruthy();
     expect(screen.getAllByText("in review").length).toBeGreaterThan(0);
     expect(screen.getAllByText("completed").length).toBeGreaterThan(0);
     expect(screen.getAllByText("stopped").length).toBeGreaterThan(0);

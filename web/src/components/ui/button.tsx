@@ -3,14 +3,14 @@ import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
-// Button — extended onto the Symphony design package's `ui.jsx` Button. The package
-// variants (primary / ghost / subtle / danger / link) and sizes (sm / md) are added
-// alongside the pre-existing shadcn variants (default / outline / secondary, sizes
-// default / lg / icon) that the legacy dashboard still uses, so nothing is forked.
+// Button — the Podium button set (P10-D1). The package variants (primary / ghost / subtle /
+// danger / link) and sizes (sm / md) sit alongside the pre-existing shadcn variants
+// (default / outline / secondary, sizes default / lg / icon) that the legacy dashboard still
+// uses, so nothing is forked.
 //
 // The CVA default stays variant="default"/size="default" (NOT the package's subtle/md
 // default) so the legacy dashboard's bare <Button> call sites (e.g. SettingsView "Save",
-// EventSearch submit) keep their primary look; new Symphony UI passes explicit variants.
+// EventSearch submit) keep their primary look; new UI passes explicit variants.
 //
 // NOTE on key order: `size` is declared before `variant` so that variant classes are
 // emitted last and win twMerge conflicts — this lets `link` collapse the height/padding
@@ -20,7 +20,7 @@ const buttonVariants = cva(
     "inline-flex items-center justify-center gap-[7px] whitespace-nowrap select-none",
     "rounded-[var(--r-ctrl)] border border-transparent font-medium leading-none tracking-[-0.01em]",
     "transition-all duration-150 ease-[cubic-bezier(.2,.7,.2,1)] cursor-pointer",
-    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)]",
+    "focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-[var(--focus-ring)]",
     "disabled:cursor-default disabled:opacity-45 disabled:[filter:saturate(.4)] disabled:pointer-events-none",
     "[&_svg]:shrink-0",
   ],
@@ -34,16 +34,16 @@ const buttonVariants = cva(
         icon: "h-9 w-9",
       },
       variant: {
-        // package variants
+        // Podium variants (rust accent)
         primary:
-          "bg-[var(--em-bright)] text-[var(--on-em)] font-semibold shadow-[0_1px_0_rgba(255,255,255,.18)_inset,0_6px_18px_-8px_var(--em-glow)] hover:bg-[var(--em)] hover:-translate-y-[0.5px]",
+          "bg-[var(--rust)] text-[var(--on-rust)] font-semibold hover:bg-[var(--rust-hover)]",
         subtle:
-          "bg-[var(--bg-raised)] text-[var(--tx)] border-[var(--line)] hover:bg-[var(--bg-hover)] hover:border-[var(--line-strong)]",
+          "bg-[rgba(255,255,255,.03)] text-[var(--btn-label)] border-[var(--hair-control)] hover:bg-[rgba(255,255,255,.06)] hover:border-[var(--hair-strong)] hover:text-[var(--ink)]",
         ghost:
-          "bg-transparent text-[var(--tx)] border-[var(--line-strong)] hover:bg-[var(--bg-hover)] hover:border-[var(--line-strong)]",
+          "bg-transparent text-[var(--btn-label)] border-transparent hover:bg-[rgba(255,255,255,.04)] hover:text-[var(--ink)]",
         danger:
-          "bg-transparent text-[var(--red)] border-[rgba(239,83,80,.4)] hover:bg-[var(--red-soft)]",
-        link: "bg-transparent text-[var(--em-bright)] h-auto p-0 font-medium hover:text-[var(--em)]",
+          "bg-transparent text-[var(--red)] border-[var(--border-danger)] hover:bg-[var(--tint-red)]",
+        link: "bg-transparent text-[var(--rust-text)] h-auto p-0 font-medium hover:text-[var(--rust-hover)]",
         // legacy shadcn variants (still used by the Runs dashboard components)
         default: "bg-[var(--primary)] text-[var(--primary-foreground)] hover:opacity-90",
         outline:

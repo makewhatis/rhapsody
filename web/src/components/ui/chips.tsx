@@ -2,7 +2,9 @@ import * as React from "react";
 import { StatusDot } from "./status-dot";
 import { X } from "./icons";
 
-export type ChipsTone = "neutral" | "emerald" | "sky" | "amber";
+// Podium tones. Legacy `emerald`/`sky` re-point onto sage/slate (see pill.tsx); `sage`/`slate`/
+// `rust` are the canonical names.
+export type ChipsTone = "neutral" | "emerald" | "sky" | "amber" | "sage" | "slate" | "rust";
 
 export interface ChipsProps {
   items: string[];
@@ -15,10 +17,13 @@ export interface ChipsProps {
 }
 
 const TONE_COLOR: Record<ChipsTone, string> = {
-  neutral: "var(--tx-2)",
-  emerald: "var(--em-bright)",
-  sky: "var(--sky)",
+  neutral: "var(--neutral)",
+  emerald: "var(--sage)",
+  sage: "var(--sage)",
+  sky: "var(--slate)",
+  slate: "var(--slate)",
   amber: "var(--amber)",
+  rust: "var(--rust-text)",
 };
 
 // Chips — tag input. Enter or comma commits the typed value (no duplicates); Backspace on
@@ -62,7 +67,7 @@ export function Chips({ items, onAdd, onRemove, tone = "neutral", placeholder = 
               fontWeight: 500,
               background: bad ? "var(--red-soft)" : "rgba(255,255,255,.05)",
               color: bad ? "var(--red)" : "var(--tx)",
-              border: `1px solid ${bad ? "rgba(239,83,80,.4)" : "var(--line)"}`,
+              border: `1px solid ${bad ? "color-mix(in srgb, var(--red) 40%, transparent)" : "var(--line)"}`,
             }}
           >
             <StatusDot color={bad ? "var(--red)" : toneC} size={6} />

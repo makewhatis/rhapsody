@@ -18,9 +18,9 @@ describe("status-chip waiting status (INF-320)", () => {
     expect(screen.getByText("waiting")).toBeTruthy();
   });
 
-  it("uses a non-error (sky, not red) treatment so it reads as held-by-design", () => {
+  it("uses a non-error (slate, not red) treatment so it reads as held-by-design", () => {
     // A held-on-predecessor ticket is benign — it must not borrow the failed/error red palette.
     expect(STATUS_META.waiting.color).not.toBe(STATUS_META.failed.color);
-    expect(STATUS_META.waiting.color).toBe("var(--sky)");
+    expect(STATUS_META.waiting.color).toBe("var(--slate)");
   });
 });

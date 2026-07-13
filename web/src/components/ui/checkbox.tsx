@@ -7,8 +7,7 @@ export interface CheckboxProps {
   disabled?: boolean;
 }
 
-// Checkbox — small emerald check box. Ported from `ui.jsx`; `role="checkbox"` +
-// `aria-checked` expose the state.
+// Checkbox — small rust check box; `role="checkbox"` + `aria-checked` expose the state.
 export function Checkbox({ checked, onChange, disabled, ...rest }: CheckboxProps) {
   return (
     <button
@@ -21,8 +20,8 @@ export function Checkbox({ checked, onChange, disabled, ...rest }: CheckboxProps
         width: 19,
         height: 19,
         borderRadius: 6,
-        border: `1.5px solid ${checked ? "var(--em)" : "var(--line-strong)"}`,
-        background: checked ? "var(--em)" : "transparent",
+        border: `1.5px solid ${checked ? "var(--rust)" : "var(--line-strong)"}`,
+        background: checked ? "var(--rust)" : "transparent",
         display: "grid",
         placeItems: "center",
         cursor: disabled ? "default" : "pointer",
@@ -33,7 +32,7 @@ export function Checkbox({ checked, onChange, disabled, ...rest }: CheckboxProps
       }}
       {...rest}
     >
-      {checked ? <Check size={12} style={{ color: "var(--on-em)", strokeWidth: 3 }} /> : null}
+      {checked ? <Check size={12} style={{ color: "var(--on-rust)", strokeWidth: 3 }} /> : null}
     </button>
   );
 }

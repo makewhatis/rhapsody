@@ -21,9 +21,9 @@ export interface SelectProps {
 // Values that look like identifiers/paths/slugs render in the mono font.
 const looksMono = (v: string) => /[-_.]/.test(v);
 
-// Select — custom popover select (not the native control). Ported from `ui.jsx`: emerald
-// focus ring on open, rotating chevron, selected + hover option states, optional per-option
-// note, mono detection, and outside-click / mousedown / focusout / Escape-to-close.
+// Select — custom popover select (not the native control): Podium rust focus ring on open,
+// rotating chevron, selected + hover option states, optional per-option note, mono detection,
+// and outside-click / mousedown / focusout / Escape-to-close.
 export function Select({ value, options, onChange, width = 320, placeholder = "Select…", invalid }: SelectProps) {
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement>(null);
@@ -77,13 +77,15 @@ export function Select({ value, options, onChange, width = 320, placeholder = "S
           justifyContent: "space-between",
           gap: 10,
           background: "var(--bg-input)",
-          border: `1px solid ${invalid ? "rgba(239,83,80,.55)" : open ? "var(--focus)" : "var(--line)"}`,
+          border: `1px solid ${
+            invalid ? "color-mix(in srgb, var(--red) 55%, transparent)" : open ? "var(--focus)" : "var(--line)"
+          }`,
           borderRadius: "var(--r-ctrl)",
           color: cur ? "var(--tx)" : "var(--tx-3)",
           fontSize: 13.5,
           padding: "0 12px 0 13px",
           cursor: "pointer",
-          boxShadow: open ? "0 0 0 3px var(--em-soft)" : "none",
+          boxShadow: open ? "0 0 0 3px var(--focus-ring)" : "none",
           transition: "border-color .15s, box-shadow .15s",
           fontFamily: cur && cur.mono !== false && looksMono(String(cur.value)) ? "var(--font-mono)" : "inherit",
           textAlign: "left",
@@ -141,7 +143,7 @@ export function Select({ value, options, onChange, width = 320, placeholder = "S
                   justifyContent: "space-between",
                   gap: 10,
                   padding: "9px 10px",
-                  background: sel ? "var(--em-soft)" : "transparent",
+                  background: sel ? "var(--tint-rust)" : "transparent",
                   border: "none",
                   borderRadius: 7,
                   cursor: "pointer",
@@ -155,7 +157,7 @@ export function Select({ value, options, onChange, width = 320, placeholder = "S
                     style={{
                       fontSize: 13,
                       fontWeight: sel ? 600 : 500,
-                      color: sel ? "var(--em-bright)" : "var(--tx)",
+                      color: sel ? "var(--rust-text)" : "var(--tx)",
                       // honor the per-option mono opt-out, same as the trigger above
                       fontFamily: o.mono !== false && looksMono(String(o.value)) ? "var(--font-mono)" : "inherit",
                       overflow: "hidden",
@@ -167,7 +169,7 @@ export function Select({ value, options, onChange, width = 320, placeholder = "S
                   </span>
                   {o.note ? <span style={{ fontSize: 11.5, color: "var(--tx-3)" }}>{o.note}</span> : null}
                 </span>
-                {sel ? <Check size={15} style={{ color: "var(--em-bright)", flexShrink: 0 }} /> : null}
+                {sel ? <Check size={15} style={{ color: "var(--rust-text)", flexShrink: 0 }} /> : null}
               </button>
             );
           })}

@@ -4,8 +4,7 @@ export interface TextAreaProps extends React.TextareaHTMLAttributes<HTMLTextArea
   mono?: boolean;
 }
 
-// TextArea — multiline field with the emerald focus ring and an optional mono variant.
-// Ported from `ui.jsx`.
+// TextArea — multiline field with the Podium rust focus ring and an optional mono variant.
 export const TextArea = React.forwardRef<HTMLTextAreaElement, TextAreaProps>(
   ({ mono, style, onFocus, onBlur, ...rest }, ref) => {
     const [focus, setFocus] = React.useState(false);
@@ -32,7 +31,7 @@ export const TextArea = React.forwardRef<HTMLTextAreaElement, TextAreaProps>(
           lineHeight: 1.6,
           padding: "12px 14px",
           fontFamily: mono ? "var(--font-mono)" : "inherit",
-          boxShadow: focus ? "0 0 0 3px var(--em-soft)" : "none",
+          boxShadow: focus ? "0 0 0 3px var(--focus-ring)" : "none",
           transition: "border-color .15s, box-shadow .15s",
           ...style,
         }}

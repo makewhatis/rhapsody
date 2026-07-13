@@ -193,14 +193,14 @@ describe("Select", () => {
 
   it("shows the invalid border", () => {
     render(<Select value="" options={opts} onChange={() => {}} invalid />);
-    expect((screen.getByRole("button") as HTMLElement).style.border).toContain("239");
+    expect((screen.getByRole("button") as HTMLElement).style.border).toContain("var(--red)");
   });
 
   it("raises the focus ring and rotates the chevron when open", () => {
     const { container } = render(<Select value="a" options={opts} onChange={() => {}} />);
     const trigger = screen.getByRole("button") as HTMLElement;
     fireEvent.click(trigger);
-    expect(trigger.style.boxShadow).toContain("var(--em-soft)");
+    expect(trigger.style.boxShadow).toContain("var(--focus-ring)");
     expect((container.querySelector("svg") as SVGElement).style.transform).toBe("rotate(180deg)");
   });
 });

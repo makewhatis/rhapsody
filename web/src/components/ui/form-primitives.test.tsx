@@ -48,19 +48,19 @@ describe("Field / FieldError", () => {
 });
 
 describe("TextInput", () => {
-  it("raises the emerald focus ring on focus and clears it on blur", () => {
+  it("raises the rust focus ring on focus and clears it on blur", () => {
     const { container } = render(<TextInput placeholder="x" />);
     const input = container.querySelector("input") as HTMLInputElement;
     expect(input.style.boxShadow).toBe("none");
     fireEvent.focus(input);
-    expect(input.style.boxShadow).toContain("var(--em-soft)");
+    expect(input.style.boxShadow).toContain("var(--focus-ring)");
     fireEvent.blur(input);
     expect(input.style.boxShadow).toBe("none");
   });
 
   it("shows the invalid border", () => {
     const { container } = render(<TextInput invalid />);
-    expect((container.querySelector("input") as HTMLInputElement).style.border).toContain("239");
+    expect((container.querySelector("input") as HTMLInputElement).style.border).toContain("var(--red)");
   });
 
   it("renders a prefix icon and a suffix", () => {
@@ -90,7 +90,7 @@ describe("TextArea", () => {
     const ta = container.querySelector("textarea") as HTMLTextAreaElement;
     expect(ta.style.fontFamily).toContain("--font-mono");
     fireEvent.focus(ta);
-    expect(ta.style.boxShadow).toContain("var(--em-soft)");
+    expect(ta.style.boxShadow).toContain("var(--focus-ring)");
   });
 });
 
@@ -141,7 +141,7 @@ describe("form primitives — additional state coverage", () => {
     const { container } = render(<TextArea />);
     const ta = container.querySelector("textarea") as HTMLTextAreaElement;
     fireEvent.focus(ta);
-    expect(ta.style.boxShadow).toContain("var(--em-soft)");
+    expect(ta.style.boxShadow).toContain("var(--focus-ring)");
     fireEvent.blur(ta);
     expect(ta.style.boxShadow).toBe("none");
   });
@@ -150,6 +150,6 @@ describe("form primitives — additional state coverage", () => {
     const { container } = render(<TextInput invalid />);
     const input = container.querySelector("input") as HTMLInputElement;
     fireEvent.focus(input);
-    expect(input.style.border).toContain("239");
+    expect(input.style.border).toContain("var(--red)");
   });
 });
