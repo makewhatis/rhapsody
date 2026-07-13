@@ -3,8 +3,6 @@ import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { cleanup, render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { StatusDTO } from "@/lib/bindings";
-import { Titlebar } from "@/components/shell/Titlebar";
-import { bridgeHealth } from "@/components/shell/health";
 import { ToastProvider, useToast } from "@/components/shell/Toast";
 
 // --- Mock the Wails bridge + daemon HTTP API for the AppShell integration test ---
@@ -22,7 +20,7 @@ const h = vi.hoisted(() => ({
   startDaemon: vi.fn(async () => {}),
   stopDaemon: vi.fn(async () => {}),
   restartDaemon: vi.fn(async () => {}),
-  toggleMaximise: vi.fn(),
+  openExternal: vi.fn(),
   navHandlers: [] as ((view: string) => void)[],
   credentialStatus: vi.fn(async () => ({ has_token: true })),
   writeInitialConfig: vi.fn(async (_slug: string) => {}),
@@ -36,7 +34,7 @@ vi.mock("@/lib/bindings", () => ({
   startDaemon: h.startDaemon,
   stopDaemon: h.stopDaemon,
   restartDaemon: h.restartDaemon,
-  toggleMaximiseWindow: h.toggleMaximise,
+  openExternal: h.openExternal,
   // The Settings tabs reach app-side capabilities through these bindings; stub them so mounting
   // the General/Projects/Tools panels under the shell doesn't hit a real (absent) Wails bridge.
   probeTools: vi.fn(async () => []),
@@ -135,148 +133,6 @@ import { AppShell } from "@/components/shell/AppShell";
 
 afterEach(cleanup);
 
-const running: StatusDTO = {
-  state: "running",
-  pid: 1,
-  restarts: 0,
-  last_err: "",
-  url: "",
-  healthy: true,
-  agent_count: 0,
-  configured: true,
-};
-
-// Minimal props for the consolidated icon-only titlebar.
-const tbProps = {
-  status: running,
-  health: "healthy" as const,
-  onStart: () => {},
-  onStop: () => {},
-  onRestart: () => {},
-  onToggleSettings: () => {},
-};
-
-describe("Titlebar", () => {
-  it("shows health + activity and gates the icon lifecycle buttons", () => {
-    const onRestart = vi.fn();
-    render(<Titlebar {...tbProps} pollMs={2000} onRestart={onRestart} />);
-    expect(screen.getByText("Healthy")).toBeTruthy();
-    expect(screen.getByText("idle")).toBeTruthy(); // running + 0 agents → "idle"
-    expect(screen.getByText("poll 2s")).toBeTruthy();
-    // running ⇒ Start dim/disabled, Stop + Restart actionable (queried by their aria-label)
-    expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Restart" }));
-    expect(onRestart).toHaveBeenCalledOnce();
-  });
-
-  it("toggles Settings via the gear and reflects the active state", () => {
-    const onToggleSettings = vi.fn();
-    render(<Titlebar {...tbProps} settingsActive onToggleSettings={onToggleSettings} />);
-    const gear = screen.getByRole("button", { name: "Settings" });
-    expect(gear.getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(gear);
-    expect(onToggleSettings).toHaveBeenCalledOnce();
-  });
-
-  it("shows a hover tooltip naming the control", () => {
-    render(<Titlebar {...tbProps} />);
-    // The tooltip bubble is aria-hidden (the button is already named via aria-label), so it lives
-    // outside the a11y tree — query it directly by its role attribute.
-    expect(document.querySelector('[role="tooltip"]')).toBeNull();
-    fireEvent.mouseEnter(screen.getByRole("button", { name: "Settings" }));
-    expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Settings");
-  });
-
-  it("zooms the window on a title-bar double-click, but ignores double-clicks on a control", () => {
-    h.toggleMaximise.mockClear();
-    render(<Titlebar {...tbProps} />);
-    // double-click the bar (via the wordmark) → toggle maximise
-    fireEvent.doubleClick(screen.getByText("Symphony"));
-    expect(h.toggleMaximise).toHaveBeenCalledOnce();
-    // double-click a lifecycle control → no zoom (guarded so the bar action doesn't hijack buttons)
-    h.toggleMaximise.mockClear();
-    fireEvent.doubleClick(screen.getByRole("button", { name: "Restart" }));
-    expect(h.toggleMaximise).not.toHaveBeenCalled();
-  });
-
-  it("renders distinct pills for the split stopped lifecycle states", () => {
-    // not-configured (first run): a neutral "Not configured" pill, not "Offline".
-    const { rerender } = render(
-      <Titlebar
-        {...tbProps}
-        status={{ ...running, state: "stopped", healthy: false, configured: false }}
-        health="not-configured"
-      />,
-    );
-    expect(screen.getByText("Not configured")).toBeTruthy();
-    expect(screen.queryByText("Offline")).toBeNull();
-
-    // stopped + last_err (crashed daemon): an error-tone "Stopped — error" pill carrying --red.
-    rerender(
-      <Titlebar
-        {...tbProps}
-        status={{ ...running, state: "stopped", healthy: false, last_err: "boom" }}
-        health="error"
-      />,
-    );
-    const errPill = screen.getByText("Stopped — error");
-    expect(errPill).toBeTruthy();
-    expect((errPill.closest("span") as HTMLElement).style.color).toBe("var(--red)");
-
-    // plain stopped: still the neutral "Offline" pill.
-    rerender(
-      <Titlebar {...tbProps} status={{ ...running, state: "stopped", healthy: false }} health="offline" />,
-    );
-    expect(screen.getByText("Offline")).toBeTruthy();
-    expect(screen.queryByText("Stopped — error")).toBeNull();
-  });
-
-  it("renders decorative traffic lights in the browser but not under native chrome", () => {
-    const { container, rerender } = render(<Titlebar {...tbProps} status={null} />);
-    const dots = (root: HTMLElement) =>
-      Array.from(root.querySelectorAll("span")).filter((s) => /rgb\(255, 95, 87\)/.test(s.style.background));
-    expect(dots(container).length).toBe(1);
-    rerender(<Titlebar {...tbProps} status={null} nativeChrome />);
-    expect(dots(container).length).toBe(0);
-  });
-});
-
-describe("bridgeHealth", () => {
-  const base: StatusDTO = {
-    state: "running",
-    pid: 1,
-    restarts: 0,
-    last_err: "",
-    url: "",
-    healthy: true,
-    agent_count: 0,
-    configured: true,
-  };
-  it("maps the Wails supervisor status onto a health state", () => {
-    expect(bridgeHealth(null)).toBe("connecting");
-    expect(bridgeHealth({ ...base, healthy: true })).toBe("healthy");
-    // Supervisor still coming up: "starting", or "running" before the first healthy probe — both
-    // read "Connecting…", never "Offline" (a failed-launch signal) or "Degraded".
-    expect(bridgeHealth({ ...base, healthy: false, state: "starting" })).toBe("connecting");
-    expect(bridgeHealth({ ...base, healthy: false, state: "running" })).toBe("connecting");
-    // A clean stop is "offline"…
-    expect(bridgeHealth({ ...base, healthy: false, state: "stopped" })).toBe("offline");
-    // …but the stopped phase is split honestly, mirroring viewForStatus: a first run with no
-    // WORKFLOW.md is "not-configured" (not the same Offline a deliberately-stopped daemon shows),
-    // and a stop carrying a last_err is "error" (the daemon crashed / failed to launch).
-    expect(bridgeHealth({ ...base, healthy: false, state: "stopped", configured: false })).toBe(
-      "not-configured",
-    );
-    expect(bridgeHealth({ ...base, healthy: false, state: "stopped", last_err: "boom" })).toBe("error");
-    // not-configured wins over last_err: a never-configured daemon hasn't run, so "Not configured"
-    // is the truer story than a stale error.
-    expect(
-      bridgeHealth({ ...base, healthy: false, state: "stopped", configured: false, last_err: "boom" }),
-    ).toBe("not-configured");
-  });
-});
-
 describe("Toast", () => {
   function Consumer() {
     const { toast } = useToast();
@@ -326,14 +182,15 @@ describe("AppShell (integration)", () => {
     );
   }
 
-  it("wires the supervisor status + daemon health into the top bar", async () => {
+  it("wires the supervisor status into the toolbar's conductor cluster", async () => {
     renderShell();
-    await waitFor(() => expect(screen.getByText("Healthy")).toBeTruthy());
-    expect(screen.getByText("idle")).toBeTruthy();
-    expect(screen.getByText("poll 2s")).toBeTruthy();
+    // running + 0 agents (via the HTTP /api/v1/state path, no bridge) reads as Idle, with the mono
+    // "daemon healthy · poll 2s" suffix.
+    await waitFor(() => expect(screen.getByText("Idle — watching for tickets")).toBeTruthy());
+    expect(screen.getByText("daemon healthy · poll 2s")).toBeTruthy();
   });
 
-  it("toggles Settings from the titlebar gear (Runs is the main area)", async () => {
+  it("toggles Settings from the toolbar gear (Runs is the main area)", async () => {
     renderShell();
     // default view is Runs (the re-skinned Runs view, INF-227)
     await waitFor(() => expect(screen.getByText("Jobs")).toBeTruthy());
@@ -343,6 +200,14 @@ describe("AppShell (integration)", () => {
     // clicking it again toggles back to Runs
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(screen.getByText("Jobs")).toBeTruthy();
+  });
+
+  it("jumps to the Tools settings tab via the toolbar Tools shortcut", async () => {
+    renderShell();
+    await waitFor(() => expect(screen.getByText("Jobs")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Tools" }));
+    // the Tools tab's own heading confirms the rail switched straight to it
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Tools" })).toBeTruthy());
   });
 
   it("returns to Runs via the Settings 'Back to Runs' link", async () => {

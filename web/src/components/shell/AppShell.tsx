@@ -1,6 +1,5 @@
 import * as React from "react";
-import { Titlebar } from "./Titlebar";
-import { bridgeHealth, type HealthState } from "./health";
+import { Toolbar } from "@/components/Toolbar";
 import { type SettingsTabId, type TopTabId, TOP_PANEL_ID } from "./placeholders";
 import { Settings } from "@/components/settings/Settings";
 import { RunsView } from "@/components/runs/RunsView";
@@ -8,13 +7,13 @@ import { Onboarding } from "@/components/onboarding/Onboarding";
 import { ToastProvider, useToast } from "./Toast";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useStateQuery } from "@/hooks/useStateQuery";
-import { viewForStatus } from "@/lib/daemon-status";
-import { appVersion, hasBridge, onNavigate, onShuttingDown, type VersionDTO } from "@/lib/bindings";
+import { conductorStatus, viewForStatus } from "@/lib/daemon-status";
+import { appVersion, hasBridge, onNavigate, onShuttingDown, openExternal, type VersionDTO } from "@/lib/bindings";
 import { StatusDot } from "@/components/ui";
 
-// AppShell — the macOS window shell that hosts the whole UI: a single top bar carrying the daemon
-// health + poll + icon-only lifecycle controls and a Settings gear, the Runs dashboard as the main
-// area (Settings toggles in over it via the gear), and the toast system.
+// AppShell — the macOS window shell that hosts the whole UI: the single 46px "Podium" toolbar
+// (wordmark, conductor status, Linear/Tools shortcuts, daemon transport, Settings gear) as the first
+// row, the Runs dashboard as the main area (Settings toggles in over it via the gear), and toasts.
 export function AppShell() {
   return (
     <div
@@ -80,17 +79,31 @@ function ShellBody() {
   // hydrates from /api) is unusable. Route into the onboarding wizard, which seeds the config via
   // the WriteInitialConfig binding (no daemon needed). Only ever true under the Wails bridge: a
   // plain browser's null status maps to "loading", not "not-configured".
-  const notConfigured = viewForStatus(daemon.status) === "not-configured";
+  const view = viewForStatus(daemon.status);
+  const notConfigured = view === "not-configured";
 
-  const health: HealthState = bridge
-    ? bridgeHealth(daemon.status)
-    : isError
-      ? "offline"
-      : isLoading || !data
-        ? "connecting"
-        : data.status === "degraded"
-          ? "degraded"
-          : "healthy";
+  // Conductor status: derive from the Wails bridge status when hosted natively, else from the HTTP
+  // /api/v1/state poll (the daemon's own origin / the desktop reverse-proxy). Both feed the same
+  // normalized signals so the toolbar renders one honest "what's the ensemble doing" cluster.
+  const conductor = bridge
+    ? conductorStatus({
+        connecting: view === "loading" || view === "starting",
+        reachable: true, // the local supervisor is always reachable — a stopped daemon reads as Paused
+        running: view === "running",
+        degraded: false, // the bridge status carries only a healthy flag (no degraded phase)
+        agentCount: daemon.status?.agent_count ?? 0,
+        pollMs: data?.poll_interval_ms,
+      })
+    : conductorStatus({
+        connecting: isLoading || !data,
+        reachable: !isError,
+        running: !isError && !!data,
+        degraded: data?.status === "degraded",
+        agentCount: data?.running.length ?? 0,
+        pollMs: data?.poll_interval_ms,
+      });
+  const daemonRunning =
+    conductor.phase === "playing" || conductor.phase === "idle" || conductor.phase === "degraded";
 
   // Run a lifecycle action, then toast on success with an action-appropriate subtitle (the
   // titlebar status reflects any failure).
@@ -104,18 +117,23 @@ function ShellBody() {
 
   return (
     <>
-      <Titlebar
-        status={daemon.status}
-        health={health}
-        pollMs={data?.poll_interval_ms}
+      <Toolbar
+        conductor={conductor}
+        running={daemonRunning}
+        connecting={conductor.phase === "connecting"}
         busy={daemon.busy}
-        nativeChrome={bridge}
         settingsActive={topTab === "settings"}
         onStart={() => lifecycle("Daemon started", "The supervisor is running.", daemon.start)}
         onStop={() => lifecycle("Daemon stopped", "The supervisor is stopped.", daemon.stop)}
         onRestart={() => lifecycle("Daemon restarted", "Daemon reloaded configuration ✓", daemon.restart)}
         // The gear toggles Settings ↔ Runs (Runs is the whole main area; there is no tab strip).
         onToggleSettings={() => setTopTab((t) => (t === "settings" ? "runs" : "settings"))}
+        // Open Linear in the browser; jump straight to the Tools settings tab.
+        onOpenLinear={() => openExternal("https://linear.app")}
+        onOpenTools={() => {
+          setTopTab("settings");
+          setSettingsTab("tools");
+        }}
       />
       {/* Always reserve the vertical scrollbar's width so the centered content (max-width 1180,
           margin auto) never shifts left by a scrollbar width when a tab/run is tall enough to
@@ -247,7 +265,7 @@ function VersionFooter() {
         background: "var(--bg-app)",
       }}
     >
-      Symphony {label}
+      Rhapsody {label}
       {commit}
     </div>
   );
