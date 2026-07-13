@@ -26,6 +26,20 @@ rm -f "$DMGOUT"
 
 app_name="$(basename "$APP")"
 
+# Both create-dmg and `hdiutil create` stage a volume at /Volumes/$VOLNAME. If one is already mounted
+# there — a leftover attachment from an interrupted run, or the app opened from a distributed .dmg —
+# the create fails with "hdiutil: create failed - Operation not permitted". Detach any stale volume at
+# that mountpoint first (best-effort) so the build is self-healing. This machine also hosts the release
+# runner, where an open Rhapsody.dmg would otherwise break the signed-dmg build.
+detach_stale_volume() {
+  local mp="/Volumes/$VOLNAME"
+  [ -d "$mp" ] || return 0
+  echo "make-dmg: a volume is already mounted at $mp; detaching it before packaging" >&2
+  hdiutil detach -force "$mp" >/dev/null 2>&1 \
+    || diskutil unmount force "$mp" >/dev/null 2>&1 \
+    || echo "make-dmg: WARNING could not detach $mp — packaging may fail; eject it manually" >&2
+}
+
 if command -v create-dmg >/dev/null 2>&1; then
   echo "make-dmg: packaging with create-dmg -> $DMGOUT"
   # create-dmg drives Finder via AppleScript and occasionally fails on the first run (a
@@ -39,9 +53,11 @@ if command -v create-dmg >/dev/null 2>&1; then
       --hide-extension "$app_name" \
       "$DMGOUT" "$APP"
   }
+  detach_stale_volume
   if ! attempt; then
     echo "make-dmg: create-dmg failed once; retrying (known Finder/AppleScript flake)..." >&2
     rm -f "$DMGOUT"
+    detach_stale_volume
     attempt
   fi
 else
@@ -53,6 +69,7 @@ else
   mkdir -p "$dmgroot"
   cp -R "$APP" "$dmgroot/"
   ln -s /Applications "$dmgroot/Applications"
+  detach_stale_volume
   hdiutil create -volname "$VOLNAME" -srcfolder "$dmgroot" -ov -format UDZO "$DMGOUT"
   rm -rf "$dmgroot"
 fi
