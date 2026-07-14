@@ -101,7 +101,7 @@ export function JobsList({ rows, pollMs, maxTurns, polling = true, onSelect }: J
                     fontSize: 11.5,
                     fontWeight: 500,
                     background: active ? "rgba(255,255,255,.09)" : "transparent",
-                    color: active ? "var(--ink)" : "var(--muted)",
+                    color: active ? "var(--ink)" : "var(--tx-2)",
                     transition: "background .12s, color .12s",
                   }}
                 >
@@ -255,7 +255,7 @@ function RunRow({ r, maxTurns, onSelect }: RunRowProps) {
         <span
           style={{
             fontSize: 12,
-            color: "var(--muted)",
+            color: "var(--tx-2)",
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -269,7 +269,7 @@ function RunRow({ r, maxTurns, onSelect }: RunRowProps) {
       <div
         style={{
           fontSize: 12,
-          color: "var(--muted)",
+          color: "var(--tx-2)",
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
@@ -299,7 +299,7 @@ function RunRow({ r, maxTurns, onSelect }: RunRowProps) {
       <div
         style={{
           fontSize: 12,
-          color: "var(--muted)",
+          color: "var(--tx-2)",
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
@@ -321,7 +321,7 @@ function RunRow({ r, maxTurns, onSelect }: RunRowProps) {
       {/* Tokens */}
       <div
         className="mono"
-        style={{ fontSize: 11.5, color: r.tokens && r.tokens !== "0" ? "var(--muted)" : "var(--faint)", textAlign: "right" }}
+        style={{ fontSize: 11.5, color: r.tokens && r.tokens !== "0" ? "var(--tx-2)" : "var(--faint)", textAlign: "right" }}
       >
         {r.tokens && r.tokens !== "0" ? r.tokens : EM_DASH}
       </div>
@@ -330,7 +330,7 @@ function RunRow({ r, maxTurns, onSelect }: RunRowProps) {
         className="mono"
         style={{
           fontSize: 11.5,
-          color: r.duration ? (r.durationAccent ? "var(--rust-text)" : "var(--muted)") : "var(--faint)",
+          color: r.duration ? (r.durationAccent ? "var(--rust-text)" : "var(--tx-2)") : "var(--faint)",
           textAlign: "right",
         }}
       >

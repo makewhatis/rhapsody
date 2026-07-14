@@ -131,7 +131,7 @@ export function LogsTab() {
                     fontSize: 11.5,
                     fontWeight: 500,
                     background: active ? "rgba(255,255,255,.09)" : "transparent",
-                    color: active ? "var(--ink)" : "var(--muted)",
+                    color: active ? "var(--ink)" : "var(--tx-2)",
                     transition: "background .12s, color .12s",
                   }}
                 >
