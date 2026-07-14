@@ -47,7 +47,7 @@ const account: LinearIdentity = {
   display_name: "David",
   email: "david@example.com",
   token: "lin_api_••••3f2a",
-  workspace_url_key: "trackai",
+  workspace_url_key: "acme",
 };
 
 function renderTab(over: Partial<GeneralTabProps> = {}) {

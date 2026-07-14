@@ -247,7 +247,7 @@ describe("Onboarding wizard", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "Enter it manually" }));
       fireEvent.change(await screen.findByLabelText("Project slug"), {
-        target: { value: "https://linear.app/trackai/project/rhapsody-app-872639248532/overview" },
+        target: { value: "https://linear.app/acme/project/rhapsody-app-872639248532/overview" },
       });
       // Continue normalizes + advances to the sound check.
       fireEvent.click(screen.getByRole("button", { name: "Continue" }));
@@ -277,7 +277,7 @@ describe("Onboarding wizard", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "Enter it manually" }));
       fireEvent.change(await screen.findByLabelText("Project slug"), {
-        target: { value: "https://linear.app/trackai/team/FOO" },
+        target: { value: "https://linear.app/acme/team/FOO" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 

@@ -140,14 +140,14 @@ describe("onboarding-model", () => {
 
     it("extracts the full slug from a Linear project URL", () => {
       expect(
-        normalizeProjectSlug("https://linear.app/trackai/project/my-project-9c29e9ade060"),
+        normalizeProjectSlug("https://linear.app/acme/project/my-project-9c29e9ade060"),
       ).toEqual({ ok: true, slug: "my-project-9c29e9ade060" });
     });
 
     it("extracts the full slug from a URL with a trailing view segment + query/hash", () => {
       expect(
         normalizeProjectSlug(
-          "https://linear.app/trackai/project/symphony-app-872639248532/overview?tab=1#x",
+          "https://linear.app/acme/project/symphony-app-872639248532/overview?tab=1#x",
         ),
       ).toEqual({ ok: true, slug: "symphony-app-872639248532" });
     });
@@ -162,10 +162,10 @@ describe("onboarding-model", () => {
     it("returns an error for empty input or a URL with no project segment", () => {
       expect(normalizeProjectSlug("")).toMatchObject({ ok: false });
       expect(normalizeProjectSlug("   ")).toMatchObject({ ok: false });
-      expect(normalizeProjectSlug("https://linear.app/trackai/team/FOO")).toMatchObject({
+      expect(normalizeProjectSlug("https://linear.app/acme/team/FOO")).toMatchObject({
         ok: false,
       });
-      expect(normalizeProjectSlug("https://linear.app/trackai/project/")).toMatchObject({
+      expect(normalizeProjectSlug("https://linear.app/acme/project/")).toMatchObject({
         ok: false,
       });
     });

@@ -307,9 +307,9 @@ mod tests {
         let summon = utc(2026, 6, 25, 16, 55, 0);
         let issues = vec![Issue {
             identifier: "AIE-1".into(),
-            // Same repo as polled, but different casing — must still match. (The Go case uses the
-            // pre-purge `vendor-*` names; Rhapsody's brand guard forbids those, so brand-neutral
-            // mixed-case names stand in — the assertion is purely about case-insensitive matching.)
+            // Same repo as polled, but different casing — must still match. (The Go case uses
+            // pre-purge legacy vendor-prefixed names; Rhapsody's brand guard forbids those, so
+            // brand-neutral mixed-case names stand in — the assertion is purely about case-insensitive matching.)
             linked_prs: Some(vec![linked("Acme-Corp", "Neat-Widget", 42, false)]),
             ..Default::default()
         }];
