@@ -171,6 +171,42 @@ out=$(
 )
 check_eq "resolve_asc_key no-op" "UNSET" "$out"
 
+# --- notarize_target_kind (bundle-vs-flat branch selection, TRA-258) ---
+# notarize.sh now notarizes both the .app bundle (zip -> submit the zip -> staple the bundle) and a
+# .dmg/.pkg (submit + staple the file). notarize_target_kind picks the branch by extension alone, so
+# it is unit-testable here without a real bundle, xcrun, or the network.
+
+# 11. A .app target selects the bundle path.
+out=$(
+  scrub_and_source
+  notarize_target_kind /path/to/Rhapsody.app
+)
+check_eq "app -> bundle" "bundle" "$out"
+
+# 12. A .dmg target selects the flat path (unchanged submit + staple the file directly).
+out=$(
+  scrub_and_source
+  notarize_target_kind /path/to/Rhapsody.dmg
+)
+check_eq "dmg -> flat" "flat" "$out"
+
+# 13. A .pkg target also selects the flat path.
+out=$(
+  scrub_and_source
+  notarize_target_kind /path/to/Installer.pkg
+)
+check_eq "pkg -> flat" "flat" "$out"
+
+# 14. An unrecognized target is a loud error (rc 2), not a silent skip — a typo must never quietly
+#     submit/staple the wrong thing.
+rc=0
+out=$(
+  scrub_and_source
+  notarize_target_kind /path/to/Rhapsody.zip 2>/dev/null
+) || rc=$?
+check_eq "unknown target rc" "2" "$rc"
+check_eq "unknown target output" "" "$out"
+
 if [ "$FAILS" -gt 0 ]; then
   echo "FAIL: $FAILS test(s) failed" >&2
   exit 1

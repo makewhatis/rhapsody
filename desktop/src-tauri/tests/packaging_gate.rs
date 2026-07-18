@@ -91,6 +91,22 @@ fn notarize_script_no_op_without_credentials() {
     );
 }
 
+// TRA-258: notarize.sh now also notarizes + staples the `.app` bundle (`_notarize_app`). The no-op
+// gate must hold for that new arg kind too — no credentials means exit 0, before the bundle path
+// ever touches the filesystem / ditto / xcrun — so `make dmg`'s _notarize_app stays green unsigned.
+#[test]
+fn notarize_script_no_op_without_credentials_app_bundle() {
+    let (out, ok) = run_script("notarize.sh", &["/nonexistent/Rhapsody.app"]);
+    assert!(
+        ok,
+        "notarize.sh must exit 0 for a .app when no notary credentials are set; output:\n{out}"
+    );
+    assert!(
+        out.to_lowercase().contains("skip"),
+        "notarize.sh should announce it skipped notarization for the .app; output:\n{out}"
+    );
+}
+
 // The usage guards fire, so a misuse fails loudly rather than silently signing/skipping the wrong
 // target. Mirrors TestSignScriptRequiresArgs.
 #[test]

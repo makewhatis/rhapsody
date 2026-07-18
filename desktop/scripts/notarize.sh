@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# Gated notarization + stapling of the Rhapsody.dmg.
-# Parity port of $REF/desktop/scripts/notarize.sh (Symphony.dmg -> Rhapsody.dmg).
+# Gated notarization + stapling of a Developer-ID target: the Rhapsody.app bundle OR the Rhapsody.dmg.
+# Parity port of $REF/desktop/scripts/notarize.sh (Symphony.dmg -> Rhapsody.dmg), EXTENDED (TRA-258)
+# to also notarize + staple the .app itself. This is an intentional divergence from the Go reference,
+# which staples only the dmg: stapling the .app makes a copied-to-/Applications app validate OFFLINE
+# (the reference relies on an online Gatekeeper check at first launch). See SIGNING.md.
 #
 # No-op (exit 0) unless notary credentials are configured, so an autonomous/unsigned build stays
 # green. Gated INDEPENDENTLY of signing: if APPLE_SIGNING_IDENTITY is set but no notary credentials
-# are, the build still produces a signed-but-unnotarized dmg. When configured, submits the (already
-# signed) dmg to Apple, waits for the result, then staples the ticket so the installer validates
-# offline. The app inside the dmg must already be Developer-ID signed (run sign.sh first) or Apple
-# rejects the submission. See SIGNING.md.
+# are, the build still produces a signed-but-unnotarized target. When configured, submits the
+# (already signed) target to Apple, waits for the result, then staples the ticket so it validates
+# offline. The target must already be Developer-ID signed (run sign.sh first) or Apple rejects the
+# submission.
+#
+# Two target kinds (notarize_target_kind picks the branch by extension):
+#   .app  — notarytool cannot submit a directory, so `ditto -c -k --keepParent` zips the bundle,
+#           the zip is submitted, then the ticket is stapled to the ORIGINAL .app (not the zip).
+#   .dmg / .pkg — submitted + stapled directly (the unchanged, reference behavior).
 #
 # Two credential modes (the API key wins when both are set; a PARTIAL ASC_* trio is a loud error,
 # never a silent fallback):
@@ -22,7 +30,7 @@
 #                     temp file). Keychain profiles are created interactively per-machine, so this
 #                     is the only mode that works on a throwaway runner.
 #
-# Usage: notarize.sh <out.dmg>
+# Usage: notarize.sh <target>          # target is a .app bundle, a .dmg, or a .pkg
 #        source notarize.sh --lib-only   # functions only (notarize_args_test.sh)
 set -euo pipefail
 
@@ -66,13 +74,29 @@ notary_auth_args() {
   return 1
 }
 
+# notarize_target_kind: classify a notarization TARGET by how it must be submitted to Apple, by
+# extension alone (so it is unit-testable without a real bundle/xcrun). Prints "bundle" for a .app
+# (zip with ditto, submit the zip, staple the .app itself) or "flat" for a .dmg/.pkg (submit + staple
+# the file directly). Returns 2 (loud) for anything else so a typo never silently notarizes the wrong
+# thing.
+notarize_target_kind() {
+  case "$1" in
+    *.app) printf 'bundle\n' ;;
+    *.dmg | *.pkg) printf 'flat\n' ;;
+    *)
+      echo "notarize: unrecognized target '$1' (expected a .app bundle, a .dmg, or a .pkg)" >&2
+      return 2
+      ;;
+  esac
+}
+
 # When sourced (`source notarize.sh --lib-only`), stop here: expose the functions without
-# requiring a dmg argument or touching xcrun/the network.
+# requiring a target argument or touching xcrun/the network.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
-DMGOUT="${1:?usage: notarize.sh <out.dmg>}"
+TARGET="${1:?usage: notarize.sh <target: .app | .dmg | .pkg>}"
 
 resolve_asc_key
 auth_rc=0
@@ -84,19 +108,44 @@ elif [ "$auth_rc" -ne 0 ]; then
   exit 1 # notary_auth_args already explained the partial config on stderr
 fi
 
-[ -f "$DMGOUT" ] || { echo "notarize: dmg not found: $DMGOUT (run 'make dmg' first)" >&2; exit 1; }
+# Classify the target (bundle vs flat) before touching the filesystem or Apple; an unknown extension
+# is a loud failure, not a silent skip.
+kind="$(notarize_target_kind "$TARGET")" || exit 1
 
 auth_args=()
 while IFS= read -r arg; do auth_args+=("$arg"); done <<< "$auth_out"
 
-if [ -n "${ASC_KEY_ID:-}" ]; then
-  echo "notarize: submitting $DMGOUT to Apple (notarytool, App Store Connect API key '$ASC_KEY_ID')"
-else
-  echo "notarize: submitting $DMGOUT to Apple (notarytool, profile '$NOTARY_PROFILE')"
-fi
-xcrun notarytool submit "$DMGOUT" "${auth_args[@]}" --wait
+# submit_to_apple <file>: submit an already-signed file (a dmg/pkg, or a zipped .app) to notarytool.
+submit_to_apple() {
+  if [ -n "${ASC_KEY_ID:-}" ]; then
+    echo "notarize: submitting $1 to Apple (notarytool, App Store Connect API key '$ASC_KEY_ID')"
+  else
+    echo "notarize: submitting $1 to Apple (notarytool, profile '$NOTARY_PROFILE')"
+  fi
+  xcrun notarytool submit "$1" "${auth_args[@]}" --wait
+}
 
-echo "notarize: stapling ticket to $DMGOUT"
-xcrun stapler staple "$DMGOUT"
-xcrun stapler validate "$DMGOUT"
-echo "notarize: done (notarized + stapled $DMGOUT)"
+if [ "$kind" = bundle ]; then
+  [ -d "$TARGET" ] || { echo "notarize: app bundle not found: $TARGET (run 'make app' first)" >&2; exit 1; }
+  # notarytool won't accept a directory; zip the bundle (keepParent preserves the .app dir inside the
+  # archive), submit the zip, then staple the ORIGINAL .app — the ticket attaches to the bundle, not
+  # the throwaway zip. A temp DIR (fixed inner name) sidesteps BSD mktemp's trailing-Xs-only rule,
+  # which mangles a `.zip` suffix; the trap removes it even if submission fails under `set -e`.
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/rhapsody-notarize.XXXXXX")"
+  trap 'rm -rf "$tmpdir"' EXIT
+  zip="$tmpdir/$(basename "$TARGET").zip"
+  echo "notarize: zipping bundle $TARGET -> $zip"
+  ditto -c -k --keepParent "$TARGET" "$zip"
+  submit_to_apple "$zip"
+  echo "notarize: stapling ticket to $TARGET"
+  xcrun stapler staple "$TARGET"
+  xcrun stapler validate "$TARGET"
+  echo "notarize: done (notarized + stapled $TARGET)"
+else
+  [ -f "$TARGET" ] || { echo "notarize: file not found: $TARGET (run 'make dmg' first)" >&2; exit 1; }
+  submit_to_apple "$TARGET"
+  echo "notarize: stapling ticket to $TARGET"
+  xcrun stapler staple "$TARGET"
+  xcrun stapler validate "$TARGET"
+  echo "notarize: done (notarized + stapled $TARGET)"
+fi

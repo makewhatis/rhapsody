@@ -18,16 +18,23 @@ repo or CI; this is a local, human-run step.
 
 ## What the gated build does
 
-`make dmg` runs `app → _sign → _dmg → _notarize → verify-icon`. The two gated steps key off
-independent environment variables:
+`make dmg` runs `app → _sign → _notarize_app → _dmg → _notarize → verify-icon`. The gated steps key
+off independent environment variables:
 
 | Variable | When set… | When unset… |
 | --- | --- | --- |
-| `APPLE_SIGNING_IDENTITY` | `_sign` code-signs the **`rhapsodyd` sidecar first, then the app bundle** under the hardened runtime (`--options runtime`), with a secure `--timestamp` and `build/darwin/entitlements.plist`. | `_sign` is a no-op; the dmg contains the Tauri ad-hoc-signed (i.e. unsigned) app. |
-| `NOTARY_PROFILE` | `_notarize` submits the finished dmg to Apple (`notarytool submit --wait`), then `stapler staple`s the ticket. | `_notarize` is a no-op. |
+| `APPLE_SIGNING_IDENTITY` | `_sign` code-signs the **`rhapsodyd` sidecar first, then the app bundle** under the hardened runtime (`--options runtime`), with a secure `--timestamp` and `build/darwin/entitlements.plist`; then, after `_dmg` packages the installer, `make-dmg.sh` **also Developer-ID-signs the dmg itself** (`codesign --force --timestamp`, no `--options runtime` — a disk image isn't executable code). | `_sign` is a no-op; the dmg contains the Tauri ad-hoc-signed (i.e. unsigned) app and the dmg itself is unsigned. |
+| `NOTARY_PROFILE` (or an `ASC_*` API key) | `_notarize_app` notarizes + staples the **`.app`** (zip → `notarytool submit --wait` → `stapler staple` the bundle) so the installed app validates **offline**; `_notarize` then does the same for the finished **dmg**. | both notarize steps are a no-op. |
 
-The two gate **independently**: set only `APPLE_SIGNING_IDENTITY` to get a *signed-but-unnotarized*
-dmg (useful for local testing), or both for a fully distributable installer.
+The gates key **independently**: set only `APPLE_SIGNING_IDENTITY` to get a *signed-but-unnotarized*
+app + dmg (useful for local testing), or add the notary creds for a fully distributable installer.
+
+> **Intentional divergence from the Go reference.** The frozen Symphony/Wails runbook staples **only
+> the dmg** and never signs the dmg image. Rhapsody staples the **`.app` too** and **signs the dmg**
+> (TRA-258). Stapling the app makes a copied-to-`/Applications` app validate **offline** at first
+> launch (the reference relies on an online Gatekeeper check, which warns offline); signing the dmg
+> is what makes `spctl -a -t open` accept the disk image as a "Notarized Developer ID" (a dmg whose
+> only signed content is the app inside is "not signed at all" to Gatekeeper).
 
 Why sign the sidecar separately: `rhapsodyd` is a **distinct Mach-O** copied into
 `Rhapsody.app/Contents/Resources/rhapsodyd`. Under the hardened runtime the app can't load/launch a
@@ -97,8 +104,10 @@ NOTARY_PROFILE=rhapsody-notary \
 make dmg
 ```
 
-This builds the app, signs the sidecar + app, packages `desktop/build/bin/Rhapsody.dmg`, submits it
-for notarization (waits for the result), and staples the ticket.
+This builds the app, signs the sidecar + app, notarizes + staples the **`.app`**, packages
+`desktop/build/bin/Rhapsody.dmg`, signs the dmg, and finally notarizes + staples the **dmg** (each
+`notarytool submit --wait` waits for Apple's result). Both the app and the dmg end up
+signed + notarized + offline-stapled.
 
 > **`create-dmg` needs a GUI session.** The polished installer (`brew install create-dmg`) drives
 > Finder via AppleScript, so run it from a logged-in desktop (not a headless SSH session). Without
@@ -107,16 +116,30 @@ for notarization (waits for the result), and staples the ticket.
 
 ## 5. Verify the result
 
+This mirrors what the `release` workflow's verify step asserts — both the **dmg** and the **app
+inside it** must be accepted as a notarized Developer ID and validate **offline** (TRA-258):
+
 ```sh
-# The dmg is accepted by Gatekeeper (notarized + stapled):
-spctl --assess --type open --context context:primary-signature -v desktop/build/bin/Rhapsody.dmg
+dmg=desktop/build/bin/Rhapsody.dmg
+
+# The dmg is accepted by Gatekeeper as a notarized Developer ID disk image (use --type open, NOT
+# --type install: the latter is for .pkg installers and rejects a .dmg with "no usable signature"):
+spctl --assess --type open --context context:primary-signature -vvv "$dmg"   # -> "Notarized Developer ID"
+
+# The dmg's ticket is stapled (it validates offline):
+xcrun stapler validate "$dmg"
 
 # The app's signature (and its nested sidecar) is valid under the hardened runtime:
 codesign --verify --deep --strict --verbose=2 desktop/target/release/bundle/macos/Rhapsody.app
 codesign -dv --verbose=4 desktop/target/release/bundle/macos/Rhapsody.app   # check Authority + Identifier
 
-# The notarization ticket is stapled (the dmg validates offline):
-xcrun stapler validate desktop/build/bin/Rhapsody.dmg
+# The app INSIDE the dmg is itself a notarized Developer ID executable AND offline-stapled — so a
+# copied-to-/Applications app launches with no Gatekeeper prompt even offline:
+mnt="$(mktemp -d)"
+hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+spctl --assess --type exec -vv "$mnt/Rhapsody.app"      # -> "Notarized Developer ID"
+xcrun stapler validate "$mnt/Rhapsody.app"
+hdiutil detach -force "$mnt"
 ```
 
 `codesign -dv` should report `Authority=Developer ID Application: …`, `TeamIdentifier=TEAMID`, and

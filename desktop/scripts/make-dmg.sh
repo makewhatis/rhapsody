@@ -32,6 +32,20 @@ rm -f "$DMGOUT"
 
 app_name="$(basename "$APP")"
 
+# sign_dmg: Developer-ID-sign the finished dmg (TRA-258). Without this the dmg is "not signed at
+# all" to Gatekeeper even though the app inside is signed — `spctl -a -t open` then reports no usable
+# signature. Gated on APPLE_SIGNING_IDENTITY exactly like sign.sh, so the unsigned default path is a
+# no-op. An intentional divergence from the Go reference, which signs only the app (see SIGNING.md).
+# A dmg is a disk image, not executable code, so no `--options runtime` (that is for the app/sidecar).
+sign_dmg() {
+  if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+    return 0
+  fi
+  echo "make-dmg: signing $DMGOUT (Developer ID '$APPLE_SIGNING_IDENTITY')"
+  codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMGOUT"
+  codesign -dv "$DMGOUT"
+}
+
 # create-dmg stages a volume at /Volumes/$VOLNAME; a leftover attachment from an interrupted run — or
 # the app opened from a distributed .dmg — makes it fail. Detach any stale volume there first.
 detach_stale_volume() {
@@ -79,6 +93,7 @@ if command -v create-dmg >/dev/null 2>&1; then
        --hide-extension "$app_name" \
        "$DMGOUT" "$APP" 2>&1; then
     echo "make-dmg: built $DMGOUT (create-dmg)"
+    sign_dmg
     exit 0
   fi
   echo "make-dmg: create-dmg did not succeed on this host; using the robust image+ditto fallback" >&2
@@ -87,4 +102,5 @@ if command -v create-dmg >/dev/null 2>&1; then
 fi
 
 package_ditto
+sign_dmg
 echo "make-dmg: built $DMGOUT"

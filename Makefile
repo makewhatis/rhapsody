@@ -1,4 +1,4 @@
-.PHONY: test lint fixtures app dmg _sign _dmg _notarize verify-icon print-version
+.PHONY: test lint fixtures app dmg _sign _notarize_app _dmg _notarize verify-icon print-version
 
 test:
 	cargo test --workspace
@@ -56,14 +56,18 @@ app:
 	cp target/release/$(BINARY) "$(APP)/Contents/Resources/$(BINARY)"
 	@echo "Built $(APP) (unsigned) with embedded $(BINARY) sidecar"
 
-# dmg builds the app, (optionally) signs it, packages a drag-to-Applications Rhapsody.dmg installer,
-# (optionally) notarizes + staples it, and confirms the icon flowed through. Signing and notarization
-# are GATED and independent: with no creds the build is UNSIGNED; with APPLE_SIGNING_IDENTITY (+ a
-# NOTARY_PROFILE) set it produces a signed (+ notarized) installer — see desktop/SIGNING.md. Prereqs
-# (beyond `make app`): create-dmg (`brew install create-dmg`) for the polished installer; without it
-# the target falls back to hdiutil (no extra dependency). Output: desktop/build/bin/Rhapsody.dmg.
+# dmg builds the app, (optionally) signs + notarizes + staples BOTH the .app and the dmg, packages a
+# drag-to-Applications Rhapsody.dmg installer, and confirms the icon flowed through. Signing and
+# notarization are GATED and independent: with no creds the build is UNSIGNED; with
+# APPLE_SIGNING_IDENTITY (+ a NOTARY_PROFILE) set it produces a signed (+ notarized) installer — see
+# desktop/SIGNING.md. Order: _sign (sidecar + app) -> _notarize_app (staple the .app so it validates
+# OFFLINE) -> _dmg (build + sign the dmg) -> _notarize (staple the dmg). Stapling the .app is an
+# intentional divergence from the Go reference, which staples only the dmg. Prereqs (beyond
+# `make app`): create-dmg (`brew install create-dmg`) for the polished installer; without it the
+# target falls back to hdiutil (no extra dependency). Output: desktop/build/bin/Rhapsody.dmg.
 dmg: app
 	$(MAKE) _sign
+	$(MAKE) _notarize_app
 	$(MAKE) _dmg
 	$(MAKE) _notarize
 	$(MAKE) verify-icon
@@ -73,8 +77,16 @@ dmg: app
 _sign:
 	bash desktop/scripts/sign.sh "$(APP)" "$(ENTITLEMENTS)"
 
-# _dmg packages an already-built (and, if creds are set, already-signed) $(APP) into $(DMGOUT)
-# (create-dmg, hdiutil fallback). Split out so it can be re-run without rebuilding the whole app.
+# _notarize_app notarizes + staples the .app itself (zip -> submit -> staple the bundle) BEFORE it is
+# packaged into the dmg, so the installed app validates OFFLINE. No-op unless notary creds are set
+# (and the app must already be signed). Intentional divergence from the Go reference, which staples
+# only the dmg. See desktop/SIGNING.md.
+_notarize_app:
+	bash desktop/scripts/notarize.sh "$(APP)"
+
+# _dmg packages an already-built (and, if creds are set, already-signed + stapled) $(APP) into
+# $(DMGOUT) (create-dmg, hdiutil fallback), then Developer-ID-signs the dmg when APPLE_SIGNING_IDENTITY
+# is set. Split out so it can be re-run without rebuilding the whole app.
 _dmg:
 	bash desktop/scripts/make-dmg.sh "$(APP)" "$(DMGOUT)" "$(DMG_VOLNAME)"
 

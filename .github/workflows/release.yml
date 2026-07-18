@@ -137,19 +137,39 @@ jobs:
             fi
           fi
 
-      # RD2 acceptance gate: the stapled ticket validates offline and Gatekeeper reports a notarized
-      # Developer ID. We assert on the "Notarized Developer ID" source line (the definitive signal the
-      # ticket asks for) rather than spctl's exit code, which varies by assessment type across macOS.
-      - name: Verify notarization (stapler + spctl)
+      # RD2 acceptance gate (TRA-258): both the dmg AND the .app inside it are signed, notarized, and
+      # OFFLINE-stapled. We assert on the "Notarized Developer ID" source line (the definitive signal
+      # the ticket asks for) rather than spctl's exit code, which varies by assessment type across
+      # macOS. `-t open` is the correct assessment for a .dmg (the old `-t install` is for .pkg
+      # installers and rejects a .dmg as "no usable signature"); `-t exec` is correct for the .app.
+      - name: Verify notarization (stapler + spctl, dmg + app)
         run: |
           set -euo pipefail
           dmg="desktop/build/bin/Rhapsody.dmg"
-          echo "== xcrun stapler validate =="
+
+          # (a) The dmg's stapled ticket validates OFFLINE — hard gate.
+          echo "== xcrun stapler validate (dmg) =="
           xcrun stapler validate "$dmg"
-          echo "== spctl --assess --type install =="
-          spctl -a -t install -vvv "$dmg" 2>&1 | tee /tmp/spctl.out || true
-          grep -q "Notarized Developer ID" /tmp/spctl.out \
-            || { echo "::error::spctl did not report 'Notarized Developer ID' for $dmg"; exit 1; }
+
+          # (b) Gatekeeper accepts the (now signed + notarized + stapled) dmg as a notarized Developer ID.
+          echo "== spctl -a -t open (dmg) =="
+          spctl -a -t open --context context:primary-signature -vvv "$dmg" 2>&1 | tee /tmp/spctl-dmg.out || true
+          grep -q "Notarized Developer ID" /tmp/spctl-dmg.out \
+            || { echo "::error::spctl -t open did not report 'Notarized Developer ID' for $dmg"; exit 1; }
+
+          # (c) Mount the dmg and verify the .app INSIDE is itself a notarized Developer ID executable
+          # whose ticket is stapled (TRA-258 staples the .app too, so a copied-to-/Applications app
+          # validates offline). Detach on exit whether the checks pass or fail.
+          mnt="$(mktemp -d)"
+          trap 'hdiutil detach -force "$mnt" >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true' EXIT
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+          app="$mnt/Rhapsody.app"
+          echo "== spctl -a -t exec (app inside the dmg) =="
+          spctl -a -t exec -vv "$app" 2>&1 | tee /tmp/spctl-app.out || true
+          grep -q "Notarized Developer ID" /tmp/spctl-app.out \
+            || { echo "::error::spctl -t exec did not report 'Notarized Developer ID' for $app"; exit 1; }
+          echo "== xcrun stapler validate (app) =="
+          xcrun stapler validate "$app"
 
       # Attach the installer + raw daemon + checksums to the Release. --clobber makes re-runs (e.g. a
       # dry-run retried, or a keychain-unlock retry above) overwrite the assets instead of failing.
