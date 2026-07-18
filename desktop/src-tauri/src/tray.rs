@@ -3,9 +3,11 @@
 //! header and which actions are live track the daemon status (refreshed every 2s), wiring
 //! Open / Settings / Start / Stop / Restart / Quit to the [`App`] lifecycle.
 //!
-//! The menu-bar TITLE and the tooltip are rebranded to "Rhapsody" (the Go reference uses the upstream
-//! vendor's Symphony branding); the dynamic status-header text comes from
-//! [`rhapsody_desktop::menu::menu_from_status`], which the D3 tests pin.
+//! The tray renders icon-only (TRA-259): the build always embeds the app icon (TRA-254), so no text
+//! title is set — a "Rhapsody" title is kept only as a fallback for when no icon is embedded. The
+//! tooltip stays "Rhapsody" (the Go reference uses the upstream vendor's Symphony branding); the
+//! dynamic status-header text comes from [`rhapsody_desktop::menu::menu_from_status`], which the D3
+//! tests pin.
 
 use std::time::Duration;
 
@@ -58,14 +60,16 @@ pub fn start_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     )?;
 
     let mut builder = TrayIconBuilder::with_id("rhapsody-tray")
-        .title("Rhapsody")
         .tooltip("Rhapsody")
         .menu(&menu)
         .on_menu_event(|app, event| handle_menu_event(app, event));
-    // Show the app icon in the menu bar when the build embedded one; the title still identifies it if
-    // not. macOS renders the icon as-is (not a template) to match the colored app icon.
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    // Render icon-only when the build embedded an app icon (it always does since TRA-254) — a text
+    // title next to the icon just wastes menu-bar space (TRA-259). macOS renders the icon as-is (not a
+    // template) to match the colored app icon. Only when no icon is embedded do we fall back to a
+    // "Rhapsody" text title so the menu-bar item is still identifiable.
+    match app.default_window_icon() {
+        Some(icon) => builder = builder.icon(icon.clone()),
+        None => builder = builder.title("Rhapsody"),
     }
     let tray = builder.build(app)?;
 
