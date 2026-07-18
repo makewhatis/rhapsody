@@ -122,6 +122,71 @@ xcrun stapler validate desktop/build/bin/Rhapsody.dmg
 `codesign -dv` should report `Authority=Developer ID Application: …`, `TeamIdentifier=TEAMID`, and
 `Identifier=is.makewhat.rhapsody`.
 
+## CI signing from a dedicated keychain (self-hosted runner)
+
+Everything above is a **local, human-run** step. The `release` workflow
+(`.github/workflows/release.yml`) also signs + notarizes the dmg on the self-hosted runner, which
+means it must unlock a keychain **non-interactively** — so the unlock password has to live in the
+`KEYCHAIN_PASSWORD` repo secret. We do **not** put the machine's *login* (laptop) password there.
+Instead a **dedicated keychain** holds only the Developer ID cert + the `rhapsody-notary` profile,
+locked with a random throwaway password. If that secret ever leaks, delete and recreate the one
+keychain — the Mac account is untouched.
+
+**What `release.yml` expects** — these are contracts the workflow hard-codes:
+
+| Thing | Value |
+| --- | --- |
+| Keychain path | `~/Library/Keychains/rhapsody-signing.keychain-db` |
+| Repo **secret** `KEYCHAIN_PASSWORD` | that keychain's random password — **NOT** the login password |
+| Repo **variable** `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Your Name (TEAMID)` |
+| `rhapsody-notary` profile | stored **inside** the dedicated keychain (not the login keychain) |
+
+Before `make dmg`, the workflow unlocks the keychain, adds it to the user search list (so `sign.sh`,
+which pins no keychain, resolves the Developer ID cert from it), and partition-lists the signing key
+for non-interactive `codesign`. It exports `NOTARY_KEYCHAIN=<that keychain>` so `notarize.sh` resolves
+the `rhapsody-notary` profile from it (`--keychain`) rather than notarytool's login-keychain default.
+
+### One-time operator setup (on the runner)
+
+```sh
+# 1. Random password -> becomes the KEYCHAIN_PASSWORD secret (NOT your login password)
+SIGN_PW="$(openssl rand -base64 24)"
+
+# 2. Create + unlock the dedicated keychain, and disable the inactivity auto-lock so it stays
+#    usable across headless runs (the workflow re-unlocks each run regardless).
+KC="$HOME/Library/Keychains/rhapsody-signing.keychain-db"
+security create-keychain -p "$SIGN_PW" "$KC"
+security set-keychain-settings "$KC"
+security unlock-keychain -p "$SIGN_PW" "$KC"
+
+# 3. Import the Developer ID cert + key (export it once from Keychain Access as a .p12 with pw P12_PW)
+security import ~/Downloads/DeveloperID.p12 -k "$KC" -P "$P12_PW" -T /usr/bin/codesign
+
+# 4. Authorize codesign to use the key non-interactively + put the keychain on the search list
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$SIGN_PW" "$KC"
+security list-keychains -d user -s "$KC" login.keychain-db
+
+# 5. Store the notary profile INTO the dedicated keychain (--keychain), not the login default
+xcrun notarytool store-credentials rhapsody-notary \
+  --apple-id "you@example.com" --team-id "TEAMID" \
+  --password "abcd-efgh-ijkl-mnop" --keychain "$KC"   # an app-specific password (appleid.apple.com)
+
+# 6. Publish the secret + identity variable to the repo
+printf '%s' "$SIGN_PW" | gh secret set KEYCHAIN_PASSWORD --repo makewhatis/rhapsody
+gh variable set APPLE_SIGNING_IDENTITY \
+  --body "Developer ID Application: Your Name (TEAMID)" --repo makewhatis/rhapsody
+```
+
+### Rotation
+
+To rotate the keychain password, `security delete-keychain "$KC"` then repeat steps 1–6 with a fresh
+`SIGN_PW`. No other credential (Apple ID, app-specific password, Mac login) changes.
+
+**Unsigned builds are unaffected.** None of this touches the default unsigned path: with
+`APPLE_SIGNING_IDENTITY` unset, `sign.sh`/`notarize.sh` no-op and `make dmg` produces a plain unsigned
+dmg without any keychain access (`NOTARY_KEYCHAIN` is read only inside the `NOTARY_PROFILE` branch,
+which a no-op notarize never reaches).
+
 ## Notes
 
 - **Identity is not hard-coded.** The signing identity comes entirely from `APPLE_SIGNING_IDENTITY`,
@@ -139,7 +204,9 @@ xcrun stapler validate desktop/build/bin/Rhapsody.dmg
 - **CI notarization (throwaway runners).** Keychain profiles are per-machine, so `_notarize` also
   accepts an App Store Connect API key via `ASC_KEY_ID` + `ASC_ISSUER_ID` + `ASC_API_KEY_P8` (or
   `ASC_API_KEY_P8_BASE64`, decoded to a chmod-600 temp file). A partial trio is a loud error, never a
-  silent skip. Rhapsody's own CI never sets these — the signed dmg is a human-gated, local step.
+  silent skip. Rhapsody's release CI never sets these — it signs + notarizes from the dedicated
+  keychain via `NOTARY_PROFILE` + `NOTARY_KEYCHAIN` on the self-hosted runner instead (see
+  [CI signing from a dedicated keychain](#ci-signing-from-a-dedicated-keychain-self-hosted-runner)).
 - **Troubleshooting notarization.** If `notarytool submit` reports `Invalid`, fetch the detailed log
   with `xcrun notarytool log <submission-id> --keychain-profile rhapsody-notary`; the usual causes
   are a missing hardened runtime (`--options runtime`) or an unsigned nested binary — both of which

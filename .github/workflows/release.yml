@@ -85,8 +85,9 @@ jobs:
       # Build + sign + notarize + staple the dmg. Signing turns ON because APPLE_SIGNING_IDENTITY (the
       # Developer ID, held as a repo VARIABLE — not a secret) and NOTARY_PROFILE are set: sign.sh signs
       # the rhapsodyd sidecar then the app under the hardened runtime, notarize.sh submits to Apple +
-      # staples the ticket (desktop/SIGNING.md). The notary profile `rhapsody-notary` is a per-machine
-      # keychain profile that already exists on this self-hosted runner.
+      # staples the ticket (desktop/SIGNING.md). The Developer ID cert AND the `rhapsody-notary` notary
+      # profile live in a DEDICATED signing keychain (rhapsody-signing.keychain-db), unlocked below by
+      # the throwaway KEYCHAIN_PASSWORD secret — never the machine's login (laptop) password (TRA-257).
       - name: Build, sign & notarize the dmg
         env:
           # Repo VARIABLE (not a secret): "Developer ID Application: David Johansen (6FLMY269LR)".
@@ -103,20 +104,32 @@ jobs:
           version="${TAG#v}"   # Makefile stamps VERSION verbatim; strip the tag's leading v (v0.4.0 -> 0.4.0)
           echo "Building signed dmg for tag '$TAG' (VERSION=$version)"
 
-          # Try direct signing first. The self-hosted runner runs under a launchd session whose login
-          # keychain can be locked / its signing key not partitioned for non-interactive codesign, which
-          # surfaces as errSecInternalComponent. ONLY on that specific failure do we unlock the keychain
-          # and authorize codesign/apple-tool to use the key, then retry (least privilege: no keychain
-          # unlock unless the direct attempt actually needs it).
+          # Dedicated signing keychain (TRA-257): holds ONLY the Developer ID cert + the rhapsody-notary
+          # profile, unlocked by the throwaway KEYCHAIN_PASSWORD secret — never the machine's login
+          # (laptop) password. Operator setup is the one-time runbook in desktop/SIGNING.md.
+          SIGNING_KEYCHAIN="$HOME/Library/Keychains/rhapsody-signing.keychain-db"
+          # notarize.sh resolves the rhapsody-notary profile from this keychain (--keychain) instead of
+          # notarytool's login-keychain default. Exported so `make dmg` -> notarize.sh inherits it.
+          export NOTARY_KEYCHAIN="$SIGNING_KEYCHAIN"
+
+          # Prepare the keychain UP FRONT (unconditionally, before make dmg — not only on a codesign
+          # failure): unlock it, add it to the user search list so sign.sh (which pins no keychain)
+          # resolves the Developer ID cert from it, and partition-list the signing key for
+          # non-interactive codesign. -k passes the keychain password so the partition-list change is
+          # non-interactive (no GUI prompt on the headless runner); -s matches signing keys.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+          security list-keychains -d user -s "$SIGNING_KEYCHAIN" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+
+          # Belt-and-suspenders: if codesign still hits errSecInternalComponent (signing key not
+          # reachable non-interactively under this launchd session), re-unlock + re-partition the
+          # dedicated keychain and retry once.
           log="$(mktemp)"
           if ! make dmg VERSION="$version" 2>&1 | tee "$log"; then
             if grep -q errSecInternalComponent "$log"; then
-              echo "codesign hit errSecInternalComponent — unlocking the login keychain for this launchd session"
-              keychain="$HOME/Library/Keychains/login.keychain-db"
-              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-              # -k passes the keychain password so the partition-list change is non-interactive (no GUI
-              # prompt on the headless runner); -s matches signing keys.
-              security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+              echo "codesign hit errSecInternalComponent — re-unlocking + re-partitioning $SIGNING_KEYCHAIN"
+              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+              security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
               make dmg VERSION="$version"
             else
               echo "::error::make dmg failed for a reason other than errSecInternalComponent (see log above)"

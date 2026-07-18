@@ -30,7 +30,7 @@ check_eq() { # name expected actual
 
 # scrub: unset every notary-related variable, then source the lib. Run inside a subshell.
 scrub_and_source() {
-  unset NOTARY_PROFILE ASC_KEY_ID ASC_ISSUER_ID ASC_API_KEY_P8 ASC_API_KEY_P8_BASE64
+  unset NOTARY_PROFILE NOTARY_KEYCHAIN ASC_KEY_ID ASC_ISSUER_ID ASC_API_KEY_P8 ASC_API_KEY_P8_BASE64
   # shellcheck disable=SC1091 # sources the sibling notarize.sh, linted on its own
   . ./notarize.sh --lib-only
 }
@@ -45,6 +45,30 @@ out=$(
 )
 check_eq "profile mode" "--keychain-profile
 rhapsody notary" "$out"
+
+# 1b. NOTARY_KEYCHAIN set in profile mode appends --keychain so the profile resolves from the
+#     dedicated signing keychain deterministically (TRA-257), not the login-keychain default.
+out=$(
+  scrub_and_source
+  NOTARY_PROFILE=rhapsody-notary NOTARY_KEYCHAIN="$HOME/Library/Keychains/rhapsody-signing.keychain-db" notary_auth_args
+)
+check_eq "profile mode + NOTARY_KEYCHAIN" "--keychain-profile
+rhapsody-notary
+--keychain
+$HOME/Library/Keychains/rhapsody-signing.keychain-db" "$out"
+
+# 1c. NOTARY_KEYCHAIN is ignored in API-key mode (the ASC_* branch is untouched by TRA-257).
+out=$(
+  scrub_and_source
+  ASC_KEY_ID=KEYID123 ASC_ISSUER_ID=issuer-uuid ASC_API_KEY_P8=/tmp/k.p8 \
+    NOTARY_KEYCHAIN=/some/kc.keychain-db notary_auth_args
+)
+check_eq "NOTARY_KEYCHAIN ignored in api-key mode" "--key
+/tmp/k.p8
+--key-id
+KEYID123
+--issuer
+issuer-uuid" "$out"
 
 # 2. CI API-key mode: full ASC trio emits --key/--key-id/--issuer.
 out=$(

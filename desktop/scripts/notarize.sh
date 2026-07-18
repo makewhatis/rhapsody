@@ -13,7 +13,10 @@
 # never a silent fallback):
 #
 #   local (default):  NOTARY_PROFILE — a notarytool keychain profile name
-#                     (created via `xcrun notarytool store-credentials <name> ...`)
+#                     (created via `xcrun notarytool store-credentials <name> ...`). If
+#                     NOTARY_KEYCHAIN is also set, the profile is resolved from THAT keychain
+#                     (`--keychain`) rather than notarytool's login-keychain default — used in CI
+#                     to read the profile from the dedicated rhapsody-signing keychain (TRA-257).
 #   CI:               ASC_KEY_ID + ASC_ISSUER_ID + an App Store Connect API key, as a file path
 #                     (ASC_API_KEY_P8) or base64 (ASC_API_KEY_P8_BASE64, decoded to a chmod-600
 #                     temp file). Keychain profiles are created interactively per-machine, so this
@@ -53,6 +56,11 @@ notary_auth_args() {
   fi
   if [ -n "${NOTARY_PROFILE:-}" ]; then
     printf '%s\n' --keychain-profile "$NOTARY_PROFILE"
+    # NOTARY_KEYCHAIN (TRA-257): resolve the profile from a specific keychain (the dedicated
+    # rhapsody-signing keychain in CI), not notarytool's login-keychain default. Unset -> unchanged.
+    if [ -n "${NOTARY_KEYCHAIN:-}" ]; then
+      printf '%s\n' --keychain "$NOTARY_KEYCHAIN"
+    fi
     return 0
   fi
   return 1
