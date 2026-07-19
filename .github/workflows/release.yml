@@ -206,11 +206,11 @@ jobs:
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
-      # Check out the released tag so render-cask.sh matches the shipped release.
+      # Check out the released tag so render-cask.sh matches the shipped release. This job compiles
+      # nothing (pure shell + git + gh), so it needs no rust toolchain / cargo on PATH.
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
-      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Open the Homebrew cask bump PR
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -227,7 +227,17 @@ jobs:
           fi
 
           version="${TAG#v}"
-          echo "Bumping the Homebrew cask to ${version}"
+          branch="bump-rhapsody-${version}"
+          echo "Bumping the Homebrew cask to ${version} (branch ${branch})"
+
+          # Idempotent re-run guard: if a bump PR for this version is already open, do nothing. Keeps a
+          # re-run of the release from hitting a non-fast-forward push on an existing bump branch (we
+          # never force-push).
+          if [ -n "$(GH_TOKEN="$HOMEBREW_TAP_TOKEN" gh pr list --repo makewhatis/homebrew-tap \
+                       --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            echo "A bump PR for ${branch} is already open — nothing to do."
+            exit 0
+          fi
 
           tmp="$(mktemp -d)"
           # Pull the checksum from the SHA256SUMS asset the `build` job attached to this Release.
@@ -250,7 +260,6 @@ jobs:
             exit 0
           fi
 
-          branch="bump-rhapsody-${version}"
           git -C "$tap" config user.name "github-actions[bot]"
           git -C "$tap" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C "$tap" checkout -b "$branch"
