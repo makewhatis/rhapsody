@@ -114,3 +114,46 @@ RHAPSODY_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 ```
 
 The Makefile `app`/`dmg` targets set these from `VERSION` + git (see [Packaging](#packaging-unsigned-app--dmg)).
+
+## Homebrew tap
+
+Rhapsody installs from a single-channel Homebrew cask served out of a public tap
+([makewhatis/homebrew-tap](https://github.com/makewhatis/homebrew-tap)):
+
+```sh
+brew install --cask makewhatis/tap/rhapsody
+```
+
+The cask (`Casks/rhapsody.rb` in the tap) points at the `Rhapsody.dmg` asset on this repo's GitHub
+Release, carries `auto_updates true` (the P11 in-app updater owns upgrades; `brew upgrade` won't clobber
+it), and its `zap` stanza removes `~/.rhapsody` and the `is.makewhat.rhapsody` login-keychain item.
+
+`desktop/scripts/render-cask.sh <version> <sha256>` is the single source of truth for that cask body —
+it authored the committed cask and re-renders it on every release. `render_cask_test.sh` (run by the
+`desktop` job via `src-tauri/tests/packaging_gate.rs`) pins the output. This is a drastically simplified
+descendant of the Go reference's multi-channel `render-cask.sh`: one stable channel from GitHub Releases,
+no `@rc`/`@feature` casks, no internal dist host, no `conflicts_with`, and no `verified:` stanza (Homebrew
+rejects `verified:` as unnecessary when the url and homepage share the github.com domain).
+
+### Release-time auto-bump
+
+`release.yml`'s `homebrew-bump` job (runs after `build` on a real release) regenerates the cask with the
+new version + the `Rhapsody.dmg` checksum from the release's `SHA256SUMS` asset and opens a bump PR
+against the tap. It is **gated on the `HOMEBREW_TAP_TOKEN` secret** and cleanly skips (green, with a
+`::warning::`) until that secret exists — the release itself never goes red for a missing token.
+
+**Operator setup (one time, before the next release):** create a fine-grained PAT with **Contents:
+read+write AND Pull requests: write** on `makewhatis/homebrew-tap`, then:
+
+```sh
+gh secret set HOMEBREW_TAP_TOKEN --repo makewhatis/rhapsody
+```
+
+(`GITHUB_TOKEN` is scoped to this repo and cannot push to the tap, which is why a cross-repo PAT is
+required.) The **initial** cask was published manually, so `brew install` resolves today without the
+token; the token only automates future bumps.
+
+> **Note:** `brew install` downloads the dmg from this repo's Release. While `makewhatis/rhapsody` is a
+> **private** repo the asset is not publicly fetchable (the cask still parses and `brew audit` passes,
+> but the download 404s for anyone unauthenticated). Making the repo — or at least its releases —
+> public is what lets `brew install --cask makewhatis/tap/rhapsody` complete for end users.
