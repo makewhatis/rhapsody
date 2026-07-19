@@ -8,6 +8,13 @@ on:
 # rustup lives in ~/.cargo/bin which is not in the runner's seeded PATH — each rust job adds it.
 jobs:
   lint:
+    # Fork-PR guard (TRA-264): every job runs only on trusted events — a push, or a same-repo
+    # `pull_request` (head repo IS this repo). A fork PR skips all jobs so untrusted code never
+    # executes on the self-hosted Mac runner; its required checks never report, keeping it
+    # unmergeable until a maintainer pulls it to a same-repo branch. Keep this on every job.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -17,6 +24,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +35,9 @@ jobs:
       - run: cargo test --workspace
 
   web:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +62,9 @@ jobs:
   # don't share a filesystem). NOTE: add `boot-e2e` to the branch-protection required contexts to gate
   # merges on it (needs admin, like the lint/test/web contexts — see the PR body).
   boot-e2e:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +80,9 @@ jobs:
   # signed/notarized .app + .dmg are human-gated (P7-D5 / desktop SIGNING). Job name `desktop` is a
   # branch-protection context; keep it stable.
   desktop:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
