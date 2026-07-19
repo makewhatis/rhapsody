@@ -365,7 +365,7 @@ export function GeneralTab({ value, onChange, account, token, onTokenChange, onD
         <Field
           label="Inject into agents"
           inline
-          hint="Add the `symphony` MCP server to every dispatched agent's config so it can query run status instead of reading logs. On by default; turn off to opt out (read tools still work for an operator's own session)."
+          hint="Add Rhapsody's MCP server (registered as `symphony`) to every dispatched agent's config so it can query run status instead of reading logs. On by default; turn off to opt out (read tools still work for an operator's own session)."
         >
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
             <Toggle checked={value.mcpEnabled} onChange={(v) => set("mcpEnabled", v)} aria-label="Agent MCP inject into agents" />
