@@ -174,3 +174,25 @@ fn notarize_args_lib_contract() {
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+// The Homebrew cask renderer (`render-cask.sh`, TRA-241): the single-stable-channel cask text (version
+// + sha256 substitution, the literal `#{version}` interpolation brew evaluates at install time, the
+// zap stanza, and the deliberate simplifications vs the Go reference — no verified:/dist host/@channels)
+// stays pinned by the ported pure-shell test. No network / Ruby / brew is touched. `render-cask.sh`
+// authors the committed cask AND feeds release.yml's release-time auto-bump job.
+#[test]
+fn render_cask_lib_contract() {
+    let script = desktop_dir().join("scripts/render_cask_test.sh");
+    let out = Command::new("bash")
+        .arg(&script)
+        .env_clear()
+        .envs(scrubbed_env())
+        .output()
+        .expect("run render_cask_test.sh");
+    assert!(
+        out.status.success(),
+        "render_cask_test.sh failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
