@@ -55,7 +55,7 @@ const INHERITED_PROMPT =
   'You are an autonomous engineer working ticket {{ issue.identifier }}: "{{ issue.title }}".\n\n' +
   "{{ issue.description }}\n\n" +
   "Implement the change test-first, keep the build and tests green, open a draft PR, move the issue to review when done, " +
-  "and end your final message with a line: `HANDOFF: in-review` — Symphony records the run as completed only when this declaration is present. Do not merge.";
+  "and end your final message with a line: `HANDOFF: in-review` — Rhapsody records the run as completed only when this declaration is present. Do not merge.";
 
 type OverrideKey = keyof UiOverrides;
 // StringOverrideKey is the subset of override keys backed by a Select (string-valued); the
