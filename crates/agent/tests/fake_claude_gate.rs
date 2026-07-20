@@ -17,7 +17,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rhapsody_agent::claude::{Config, Runner};
 use rhapsody_agent::{
@@ -218,24 +218,64 @@ async fn fake_claude_error_matches_error_fixture() {
 // Gate scenario 3 (hang/stalled) — mirrors Go `claude.TestFakeClaudeHangTimesOut` with a short turn
 // deadline (the runner-level analogue of the orchestrator stall timeout) AND asserts the events
 // captured before the kill equal `runs/stalled.jsonl`.
+//
+// Unlike the success/error scenarios — which end on a terminal `result` line, so the capture is
+// bounded by a CONDITION (all output is read before the process exits) — the hang ends on the TURN
+// DEADLINE. The captured transcript is therefore "whatever the stub emitted before the kill", and a
+// single fixed deadline races the child's startup: under load the child may not have emitted (or the
+// runner task may not have been scheduled to read) its leading lines before the kill fires, leaving
+// an EMPTY capture (`runner produced no events` — the TRA-265 flake). So rather than a fixed
+// wall-clock window, POLL: re-run the hang until an attempt captures the fixture's full leading-event
+// sequence, up to a generous cap. Every attempt still trips a genuinely hung child (real
+// `TurnTimeout`, and the runner reaps its process group before returning, so retries leave no
+// orphans) — the stall behavior stays under test; only the race with subprocess startup is removed.
+// The match assertion is unchanged, so a captured-but-wrong stream still fails immediately.
 #[tokio::test]
 async fn fake_claude_hang_matches_stalled_fixture() {
-    let start = std::time::Instant::now();
-    // 3s deadline: generous enough that the stub's process spawn + its three immediate lines are
-    // always captured before the kill (even on a loaded CI runner), short enough to stay fast.
-    let (res, err, raw) =
-        run_stub(stub_path("fake-claude-hang"), Duration::from_secs(3), None).await;
-    assert!(
-        matches!(err, Some(AgentError::TurnTimeout)),
-        "got {err:?}, want TurnTimeout"
-    );
-    assert_eq!(res.status, TURN_TIMED_OUT, "status");
-    assert!(
-        start.elapsed() < Duration::from_secs(10),
-        "hang kill too slow: {:?}",
-        start.elapsed()
-    );
-    assert_matches_fixture(&humanized_events(&raw), "runs/stalled.jsonl");
+    // Per-attempt turn deadline: long enough that an unloaded run captures the stub's three immediate
+    // lines on the first try, short enough that a lost-race retry is cheap. It is NOT the determinism
+    // knob (losing it merely retries) — the poll below is.
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+    // Generous cap on the whole poll. Reaching it means the runner never surfaced its leading events
+    // across dozens of self-cleaning attempts — a genuine failure, not a timing flake.
+    const POLL_CAP: Duration = Duration::from_secs(60);
+
+    let fixture = harness_fixtures::load_json("runs/stalled.jsonl");
+    let want_leading = fixture["events"].as_array().expect("fixture events").len();
+
+    let poll_start = Instant::now();
+    let mut best = 0usize;
+    loop {
+        let attempt_start = Instant::now();
+        let (res, err, raw) = run_stub(stub_path("fake-claude-hang"), ATTEMPT_TIMEOUT, None).await;
+        // The hang always trips the turn deadline, regardless of how much output was captured.
+        assert!(
+            matches!(err, Some(AgentError::TurnTimeout)),
+            "got {err:?}, want TurnTimeout"
+        );
+        assert_eq!(res.status, TURN_TIMED_OUT, "status");
+        assert!(
+            attempt_start.elapsed() < Duration::from_secs(8),
+            "hang kill too slow: {:?}",
+            attempt_start.elapsed()
+        );
+
+        let produced = humanized_events(&raw);
+        best = best.max(produced.len());
+        if produced.len() >= want_leading {
+            // Full leading sequence captured before the kill — assert it matches the fixture.
+            assert_matches_fixture(&produced, "runs/stalled.jsonl");
+            return;
+        }
+        // This attempt lost the subprocess-startup race (captured only `produced.len()` of the
+        // `want_leading` leading events). Retry until we capture the full sequence, or give up at the
+        // cap with a diagnostic.
+        assert!(
+            poll_start.elapsed() < POLL_CAP,
+            "runner never surfaced its {want_leading} leading events within {POLL_CAP:?} \
+             (best attempt captured {best})"
+        );
+    }
 }
 
 // Mirrors Go `claude.TestFakeClaudeCoexistsWithHeldOpenStdin` (INF-250): with a message queued on
