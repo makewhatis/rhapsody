@@ -98,6 +98,12 @@ struct AppInner {
     binary_path: PathBuf,
     /// Where tool-doctor overrides persist (`~/.symphony/tools.json`); `None` when `$HOME` is unset.
     prefs_path: Option<PathBuf>,
+    /// The "install the pending update on the next graceful quit" marker (`~/.symphony/pending-update`),
+    /// co-located with the prefs so it lives with the app's other local state; `None` when `$HOME` is unset.
+    /// Its mere existence is the flag (P11-U1): `update_install` writes it when it refuses an install
+    /// because runs are active, and the quit path installs it when present (the swapped bundle takes
+    /// effect on the next launch — no surprise relaunch mid-quit).
+    pending_update_path: Option<PathBuf>,
     /// The 0600 credential file fallback (`~/.symphony/credentials`), used when the Keychain is unusable.
     cred_path: PathBuf,
     /// The Keychain store the credential methods build fresh (Go's repeated `credential.New()`), behind
@@ -218,11 +224,18 @@ impl App {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        // The pending-update marker sits beside the prefs (same `~/.symphony` dir), so it shares the
+        // prefs' `$HOME`-derived lifetime — no marker when there is nowhere to persist it.
+        let pending_update_path = prefs_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|d| d.join("pending-update"));
         App {
             inner: Arc::new(AppInner {
                 workflow_path,
                 binary_path,
                 prefs_path,
+                pending_update_path,
                 cred_path,
                 keychain,
                 mu: Mutex::new(Mutable {
@@ -589,6 +602,52 @@ impl App {
         match resp.json::<StateBody>().await {
             Ok(body) => body.counts.get("running").copied().unwrap_or(0),
             Err(_) => 0,
+        }
+    }
+
+    // ---- in-app auto-update (P11-U1) ---------------------------------------------------------------
+
+    /// The number of runs the daemon is actively executing right now — the count the updater's install
+    /// guard consults so a self-restart never kills work in flight. It is the same live `/api/v1/state`
+    /// `counts.running` the tray already reads; a not-yet-started or non-Running supervisor (and any
+    /// probe error) yields 0, the safe default (no supervisor → nothing to protect). Because a probe
+    /// failure reads as 0, callers requiring safety MUST pair this with an explicit `force` override
+    /// rather than trusting 0 to mean "definitely idle".
+    pub async fn active_run_count(&self) -> i64 {
+        match self.get_sup() {
+            Some(sup) if sup.status().state == State::Running => self.agent_count(&sup).await,
+            _ => 0,
+        }
+    }
+
+    /// Whether an update install is pending for the next graceful quit (the marker file exists). `false`
+    /// when there is nowhere to persist it (`$HOME` unset) or the file cannot be observed. Mirrors the
+    /// prefs' "missing == default" convention.
+    pub fn pending_update(&self) -> bool {
+        self.inner
+            .pending_update_path
+            .as_deref()
+            .is_some_and(Path::exists)
+    }
+
+    /// Records (or clears) the "install the pending update on next graceful quit" flag by creating or
+    /// removing the marker file (its existence is the flag). A no-op when there is nowhere to persist it
+    /// (`$HOME` unset) — the guard simply cannot defer in that case. Clearing an absent marker is not an
+    /// error (idempotent), matching `os.Remove` + `IsNotExist` in the Go prefs idiom.
+    pub fn set_pending_update(&self, pending: bool) -> Result<(), String> {
+        let Some(path) = self.inner.pending_update_path.as_deref() else {
+            return Ok(());
+        };
+        if pending {
+            // A single byte written 0600 via the shared atomic writer (temp + rename), so a reader never
+            // sees a torn marker and it is owner-only like the sibling prefs/credential files.
+            crate::atomicfile::write_0600(path, b"1").map_err(|e| e.to_string())
+        } else {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
         }
     }
 
@@ -1064,6 +1123,78 @@ mod tests {
         fn set_cred_for_test(&self, cred: Arc<dyn Store>) {
             lock(&self.inner.mu).cred = Some(cred);
         }
+    }
+
+    /// An App whose prefs live under `dir`, so its pending-update marker resolves to `dir/pending-update`
+    /// (the P11-U1 flag path is derived from the prefs dir). `binary_path` is empty so no daemon launches.
+    fn pending_app(dir: &Path) -> App {
+        App::new_with(
+            None,
+            PathBuf::new(),
+            Some(dir.join("tools.json")),
+            PathBuf::new(),
+            Arc::new(credential::new()),
+        )
+    }
+
+    // The pending-update flag persists across App instances via the marker file: set → observed true by a
+    // fresh App, clear → false. This is what lets an install refused mid-run be honored on the next quit.
+    #[test]
+    fn pending_update_flag_round_trips() {
+        let dir = temp_dir();
+        let a = pending_app(&dir);
+        assert!(!a.pending_update(), "a fresh app has no pending update");
+
+        a.set_pending_update(true).expect("set pending");
+        assert!(a.pending_update(), "pending must read back true after set");
+        assert!(
+            pending_app(&dir).pending_update(),
+            "the flag must survive as a file so a later quit (a new App) sees it"
+        );
+
+        a.set_pending_update(false).expect("clear pending");
+        assert!(
+            !a.pending_update(),
+            "pending must read back false after clear"
+        );
+        // Clearing again is idempotent (the marker is already gone) — the quit path may clear twice.
+        a.set_pending_update(false)
+            .expect("clearing an absent marker is not an error");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // With no `$HOME`-derived prefs path there is nowhere to persist the flag: set/clear are no-ops that
+    // never error, and the flag always reads false (the guard simply cannot defer).
+    #[test]
+    fn pending_update_is_a_noop_without_a_path() {
+        let a = test_app(); // no prefs_path → no pending_update_path
+        assert!(!a.pending_update());
+        a.set_pending_update(true)
+            .expect("set is a no-op without a path");
+        assert!(
+            !a.pending_update(),
+            "still false — there is nowhere to record it"
+        );
+        a.set_pending_update(false)
+            .expect("clear is a no-op without a path");
+    }
+
+    // The install guard's run count is 0 whenever the daemon is not actively running — no supervisor
+    // wired yet, and a stopped supervisor — so an idle app never blocks its own update.
+    #[tokio::test]
+    async fn active_run_count_is_zero_when_not_running() {
+        let a = test_app();
+        assert_eq!(
+            a.active_run_count().await,
+            0,
+            "no supervisor → 0 active runs"
+        );
+        a.set_sup(Supervisor::new(Options::default())); // freshly built = Stopped, never probed
+        assert_eq!(
+            a.active_run_count().await,
+            0,
+            "a stopped supervisor → 0 active runs (no /api/v1/state probe)"
+        );
     }
 
     // Only the FIRST close may spawn the stop task: begin_shutdown returns first=true exactly once;

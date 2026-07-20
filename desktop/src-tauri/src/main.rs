@@ -13,6 +13,7 @@ use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
 use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
 use rhapsody_desktop::toolcheck::ToolResult;
+use rhapsody_desktop::update::{self, UpdateState};
 use rhapsody_desktop::windowserver;
 use tauri::{Emitter, Manager};
 use version::VersionDto;
@@ -157,24 +158,35 @@ fn main() {
 }
 
 fn run() -> tauri::Result<()> {
-    let builder = tauri::Builder::default().invoke_handler(tauri::generate_handler![
-        status,
-        app_version,
-        start_daemon,
-        stop_daemon,
-        restart_daemon,
-        probe_tools,
-        set_tool_override,
-        credential_status,
-        set_linear_token,
-        clear_linear_token,
-        start_linear_oauth,
-        list_linear_projects,
-        write_initial_config,
-        open_external,
-        start_log_stream,
-        stop_log_stream
-    ]);
+    let builder = tauri::Builder::default()
+        // P11-U1 in-app auto-update: the updater plugin drives check/download/install with built-in
+        // minisign signature verification against tauri.conf.json's pubkey (the `update_*` commands below
+        // wrap it). The process plugin exposes the JS relaunch/exit the frontend may call; the Rust
+        // install path relaunches via the core `AppHandle::restart`, the same primitive it wraps.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .invoke_handler(tauri::generate_handler![
+            status,
+            app_version,
+            start_daemon,
+            stop_daemon,
+            restart_daemon,
+            probe_tools,
+            set_tool_override,
+            credential_status,
+            set_linear_token,
+            clear_linear_token,
+            start_linear_oauth,
+            list_linear_projects,
+            write_initial_config,
+            open_external,
+            start_log_stream,
+            stop_log_stream,
+            update::update_check,
+            update::update_download,
+            update::update_install,
+            update::active_run_count
+        ]);
     // Serve the top-level window from the embedded `web/` bundle and reverse-proxy its same-origin
     // `/api/*` fetches to the supervised rhapsodyd (the real double-chrome fix, TRA-251). A default
     // client (no request timeout) so a slow but finite API call is never cut short.
@@ -185,6 +197,12 @@ fn run() -> tauri::Result<()> {
             // Owns the Logs view's host-side log-stream bridge (TRA-252); the start/stop_log_stream
             // commands drive it.
             app.manage(LogBridge::default());
+            // Owns the P11-U1 updater session (the checked update + downloaded bytes) shared by the
+            // update_* commands and the quiet launch check.
+            app.manage(UpdateState::default());
+            // Quiet on-launch update check (non-blocking): emits `update:available` if a newer version
+            // exists so the UI can badge the affordance; never delays or fails launch.
+            update::spawn_launch_check(app.handle().clone());
             // The menu-bar tray is built on the main thread (menu items live there). Mirrors
             // OnStartup's a.startTray().
             tray::start_tray(app.handle())?;
@@ -217,6 +235,10 @@ fn run() -> tauri::Result<()> {
                         let h = handle.clone();
                         tauri::async_runtime::spawn(async move {
                             app.drain_daemon(Duration::from_secs(10)).await;
+                            // P11-U1: with the daemon drained (no live work to lose), install any update
+                            // deferred by the active-runs guard so the new bundle is used next launch. A
+                            // no-op when nothing is pending; bounded so it never strands the quit.
+                            update::install_pending_on_quit(h.clone(), app.clone()).await;
                             h.exit(0); // re-enters ExitRequested → Proceed → teardown
                         });
                     }

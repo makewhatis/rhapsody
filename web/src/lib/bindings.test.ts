@@ -15,7 +15,14 @@ import {
   openExternal,
   onNavigate,
   subscribeLogStream,
+  checkForUpdate,
+  downloadUpdate,
+  installUpdate,
+  activeRunCount,
+  onUpdateAvailable,
+  onUpdateDownloadProgress,
 } from "@/lib/bindings";
+import type { UpdateInfo, UpdateDownloadProgress } from "@/lib/bindings";
 
 // A minimal stand-in for @tauri-apps/api/core's Channel: a unique numeric id + a settable onmessage,
 // enough to assert subscribeLogStream wires start/stop_log_stream to the right channel.
@@ -91,6 +98,27 @@ describe("bindings — browser-safe degradation (no Tauri host)", () => {
     await flush();
     expect(invokeMock).not.toHaveBeenCalled();
   });
+
+  it("update wrappers degrade to null/0/no-op and never touch invoke without a host", async () => {
+    expect(await checkForUpdate()).toBeNull();
+    expect(await installUpdate()).toBeNull();
+    expect(await installUpdate(true)).toBeNull();
+    expect(await activeRunCount()).toBe(0);
+    await expect(downloadUpdate()).resolves.toBeUndefined();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("update event subscriptions return unsubscribe no-ops without a host", () => {
+    const a = onUpdateAvailable(() => {});
+    const b = onUpdateDownloadProgress(() => {});
+    expect(typeof a).toBe("function");
+    expect(typeof b).toBe("function");
+    expect(() => {
+      a();
+      b();
+    }).not.toThrow();
+    expect(listenMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("bindings — Tauri host present", () => {
@@ -150,5 +178,61 @@ describe("bindings — Tauri host present", () => {
     unsub();
     await flush(); // the stop is chained on start's resolution
     expect(invokeMock).toHaveBeenCalledWith("stop_log_stream", { streamId: channel.id });
+  });
+
+  it("checkForUpdate invokes update_check and returns its payload", async () => {
+    invokeMock.mockResolvedValueOnce({
+      available: true,
+      version: "0.3.0",
+      current_version: "0.2.0",
+      notes: "Bug fixes",
+    });
+    const info = await checkForUpdate();
+    expect(invokeMock).toHaveBeenCalledWith("update_check");
+    expect(info?.available).toBe(true);
+    expect(info?.version).toBe("0.3.0");
+  });
+
+  it("downloadUpdate invokes update_download", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await downloadUpdate();
+    expect(invokeMock).toHaveBeenCalledWith("update_download");
+  });
+
+  it("installUpdate passes the force flag and returns the blocked-run report", async () => {
+    invokeMock.mockResolvedValueOnce({ installed: false, blocked_active_runs: 2 });
+    const report = await installUpdate(); // defaults to force=false
+    expect(invokeMock).toHaveBeenCalledWith("update_install", { force: false });
+    expect(report?.blocked_active_runs).toBe(2);
+
+    invokeMock.mockResolvedValueOnce({ installed: true, blocked_active_runs: 0 });
+    await installUpdate(true);
+    expect(invokeMock).toHaveBeenLastCalledWith("update_install", { force: true });
+  });
+
+  it("activeRunCount invokes active_run_count and returns the count", async () => {
+    invokeMock.mockResolvedValueOnce(3);
+    expect(await activeRunCount()).toBe(3);
+    expect(invokeMock).toHaveBeenCalledWith("active_run_count");
+  });
+
+  it("onUpdateAvailable subscribes to the update:available event and maps the payload", async () => {
+    let seen: string | undefined;
+    onUpdateAvailable((info) => (seen = info.version));
+    expect(listenMock).toHaveBeenCalledWith("update:available", expect.any(Function));
+    const handler = listenMock.mock.calls[0][1] as (e: { payload: UpdateInfo }) => void;
+    handler({ payload: { available: true, version: "9.9.9", current_version: "1.0.0", notes: "" } });
+    expect(seen).toBe("9.9.9");
+  });
+
+  it("onUpdateDownloadProgress subscribes and forwards progress ticks", async () => {
+    let last: UpdateDownloadProgress | undefined;
+    onUpdateDownloadProgress((p) => (last = p));
+    expect(listenMock).toHaveBeenCalledWith("update:download-progress", expect.any(Function));
+    const handler = listenMock.mock.calls[0][1] as (e: {
+      payload: UpdateDownloadProgress;
+    }) => void;
+    handler({ payload: { downloaded: 512, total: 2048 } });
+    expect(last).toEqual({ downloaded: 512, total: 2048 });
   });
 });

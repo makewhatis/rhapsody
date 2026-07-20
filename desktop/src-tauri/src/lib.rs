@@ -28,4 +28,5 @@ pub mod prefs;
 pub mod supervisor;
 pub mod toolcheck;
 pub mod tooldirs;
+pub mod update;
 pub mod windowserver;
