@@ -23,7 +23,7 @@ export interface UpdatesTabProps {
 // header. All motion is CSS-keyframe based, so the global `prefers-reduced-motion` guard neutralizes
 // it (index.css). Every action degrades to a no-op without the Tauri bridge (plain browser / tests).
 export function UpdatesTab({ updater }: UpdatesTabProps) {
-  const { phase, info, error } = updater;
+  const { phase, info } = updater;
   // "Check for updates" is inert while a check/download/install is already running.
   const busy = phase === "checking" || phase === "downloading" || phase === "installing";
   const notes = info?.notes?.trim() ?? "";
@@ -90,9 +90,6 @@ export function UpdatesTab({ updater }: UpdatesTabProps) {
               </div>
             </Collapsible>
           ) : null}
-          {error ? (
-            <div style={{ fontSize: 12, color: "var(--red)", lineHeight: 1.5 }}>{error}</div>
-          ) : null}
         </div>
       </div>
       <ActiveRunsDialog updater={updater} />
@@ -116,7 +113,7 @@ function StatusBlock({ updater }: { updater: Updater }) {
         <Line
           icon={<CheckCircle size={16} style={{ color: "var(--sage)" }} />}
           title="You're on the latest version"
-          sub={current ? `Rhapsody ${current}` : undefined}
+          sub={current ? `Rhapsody v${current}` : undefined}
         />
       );
     case "available":
@@ -129,7 +126,7 @@ function StatusBlock({ updater }: { updater: Updater }) {
               {version ? <VersionTag version={version} /> : null}
             </span>
           }
-          sub={current ? `You're on ${current}.` : undefined}
+          sub={current ? `You're on v${current}.` : undefined}
           action={
             <Button variant="primary" size="sm" icon={Download} onClick={updater.download}>
               Download
@@ -168,11 +165,13 @@ function StatusBlock({ updater }: { updater: Updater }) {
         />
       );
     case "error":
+      // Any failed operation (check/download/install) lands here; show the host's real message so
+      // the reason isn't hidden behind a generic "check failed".
       return (
         <Line
           dot="var(--red)"
-          title="Update check failed"
-          sub="Rhapsody couldn't reach the update server. Check your connection and try again."
+          title="Update failed"
+          sub={updater.error ?? "Something went wrong. Check your connection and try again."}
         />
       );
     case "idle":
