@@ -196,8 +196,9 @@ pub async fn update_download(
 
 /// Install the update and relaunch into it — UNLESS runs are active and the caller did not `force`, in
 /// which case it refuses, records a pending flag (so [`install_pending_on_quit`] installs on the next
-/// graceful quit), and returns the blocking run count. The relaunch (`AppHandle::restart`, the process
-/// plugin's primitive) diverges, so on the allowed path this never returns normally.
+/// graceful quit), and returns the blocking run count. The relaunch is the core `AppHandle::restart`
+/// (the primitive the process plugin's `relaunch` wraps); it diverges, so on the allowed path this never
+/// returns normally.
 #[tauri::command]
 pub async fn update_install(
     app: State<'_, App>,

@@ -101,7 +101,8 @@ struct AppInner {
     /// The "install the pending update on the next graceful quit" marker (`~/.symphony/pending-update`),
     /// co-located with the prefs so it lives with the app's other local state; `None` when `$HOME` is unset.
     /// Its mere existence is the flag (P11-U1): `update_install` writes it when it refuses an install
-    /// because runs are active, and the quit path installs + relaunches when it is present.
+    /// because runs are active, and the quit path installs it when present (the swapped bundle takes
+    /// effect on the next launch — no surprise relaunch mid-quit).
     pending_update_path: Option<PathBuf>,
     /// The 0600 credential file fallback (`~/.symphony/credentials`), used when the Keychain is unusable.
     cred_path: PathBuf,
