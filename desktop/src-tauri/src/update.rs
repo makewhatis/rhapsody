@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use semver::Version;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
@@ -86,10 +87,49 @@ pub(crate) fn may_install_now(active_run_count: i64, force: bool) -> bool {
     force || active_run_count <= 0
 }
 
+/// The current version the updater must compare `latest.json` against: the Makefile-stamped release
+/// version ([`crate::version::version`], e.g. `"0.2.0"`), parsed as semver. Returns `None` for a
+/// dev/untagged build whose stamp is `"dev"` (not valid semver) — the caller then short-circuits the
+/// check so a dev build never auto-updates.
+///
+/// TRA-266: `tauri-plugin-updater`'s default current version is `package_info().version`, i.e.
+/// `tauri.conf.json`'s STATIC `0.1.0` — never the real release. Comparing `latest.json` against that
+/// made every released app read its own release as "newer" and re-install forever (a perpetual update
+/// loop). This function supplies the real version so the comparison is correct.
+pub(crate) fn updater_current_version(stamped: &str) -> Option<Version> {
+    Version::parse(stamped).ok()
+}
+
 /// Runs a fresh update check and stashes any discovered [`Update`] in `state` (invalidating stale
 /// downloaded bytes) so a later download/install acts on the same one. Returns the metadata for the UI.
+///
+/// The check compares `latest.json` against the STAMPED release version (via the updater's
+/// `version_comparator`), NOT `tauri.conf.json`'s static `0.1.0` — see [`updater_current_version`]
+/// (TRA-266). A dev/untagged build (non-semver stamp) short-circuits to "no update": a dev build must
+/// never auto-update, and its stamp isn't comparable anyway.
 async fn check_into(handle: &AppHandle, state: &UpdateState) -> Result<UpdateInfo, String> {
-    let updater = handle.updater().map_err(|e| e.to_string())?;
+    let cur = crate::version::version();
+    let Some(cur_version) = updater_current_version(cur) else {
+        // Dev/untagged build: skip the check entirely (no auto-update), reporting the stamp verbatim so
+        // the UI still shows what's running. Clear any stashed state to keep the
+        // `current == None ⟹ downloaded == None` invariant.
+        *state.current.lock().await = None;
+        *state.downloaded.lock().await = None;
+        return Ok(UpdateInfo {
+            available: false,
+            version: String::new(),
+            current_version: cur.to_string(),
+            notes: String::new(),
+        });
+    };
+    // Compare `latest.json` against the stamped release version rather than the plugin's default
+    // (`package_info().version` = tauri.conf.json 0.1.0). The comparator's first arg is that default,
+    // which we deliberately ignore in favor of the real version.
+    let updater = handle
+        .updater_builder()
+        .version_comparator(move |_default_version, release| release.version > cur_version)
+        .build()
+        .map_err(|e| e.to_string())?;
     let found = updater.check().await.map_err(|e| e.to_string())?;
     // A new check supersedes any prior download; clear it so install never uses bytes for a stale update.
     *state.downloaded.lock().await = None;
@@ -98,7 +138,9 @@ async fn check_into(handle: &AppHandle, state: &UpdateState) -> Result<UpdateInf
             let info = UpdateInfo {
                 available: true,
                 version: update.version.clone(),
-                current_version: update.current_version.clone(),
+                // Report the STAMPED version, not `update.current_version` (which the plugin fills from
+                // package_info().version = 0.1.0).
+                current_version: cur.to_string(),
                 notes: update.body.clone().unwrap_or_default(),
             };
             *state.current.lock().await = Some(update);
@@ -109,7 +151,7 @@ async fn check_into(handle: &AppHandle, state: &UpdateState) -> Result<UpdateInf
             Ok(UpdateInfo {
                 available: false,
                 version: String::new(),
-                current_version: handle.package_info().version.to_string(),
+                current_version: cur.to_string(),
                 notes: String::new(),
             })
         }
@@ -314,5 +356,46 @@ mod tests {
     #[test]
     fn may_install_now_treats_nonpositive_as_idle() {
         assert!(may_install_now(-1, false));
+    }
+
+    // TRA-266 core: the updater must compare `latest.json` against the STAMPED release version, not
+    // tauri.conf.json's static 0.1.0. A real release stamp parses to the semver we compare against, and
+    // that comparison must have the right sign at each boundary — otherwise a released app either
+    // perpetually re-updates (same version reads as "newer") or never updates.
+    #[test]
+    fn updater_current_version_parses_a_release_stamp() {
+        let cur = updater_current_version("0.2.0").expect("a release stamp is valid semver");
+        assert!(
+            !(Version::parse("0.2.0").unwrap() > cur),
+            "same version is NOT newer → an up-to-date app reports no update (no perpetual loop)"
+        );
+        assert!(
+            Version::parse("0.3.0").unwrap() > cur,
+            "a genuinely newer latest.json IS newer → update offered"
+        );
+        assert!(
+            !(Version::parse("0.1.0").unwrap() > cur),
+            "an older latest.json is NOT newer → no downgrade"
+        );
+    }
+
+    // Dev fallback: `version::version()` returns "dev" on an untagged build (not valid semver). The
+    // updater must skip the check for such builds rather than error — a dev build must never auto-update.
+    // The empty and `v`-prefixed cases document that only a bare semver stamp (what the Makefile emits,
+    // having stripped the leading `v`) drives an update.
+    #[test]
+    fn updater_current_version_skips_non_semver_dev_builds() {
+        assert!(
+            updater_current_version("dev").is_none(),
+            "the untagged 'dev' stamp → skip the check"
+        );
+        assert!(
+            updater_current_version("").is_none(),
+            "an empty stamp → skip the check"
+        );
+        assert!(
+            updater_current_version("v0.2.0").is_none(),
+            "a raw 'v'-prefixed tag is not bare semver → skip (the Makefile strips the 'v')"
+        );
     }
 }

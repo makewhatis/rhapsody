@@ -2660,6 +2660,7 @@ dependencies = [
  "keyring",
  "libc",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml_ng",

@@ -5,7 +5,6 @@
 //! credential / onboarding (D4) and packaging (D5) land in later chain tasks.
 
 mod tray;
-mod version;
 
 use std::time::Duration;
 
@@ -14,9 +13,9 @@ use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
 use rhapsody_desktop::toolcheck::ToolResult;
 use rhapsody_desktop::update::{self, UpdateState};
+use rhapsody_desktop::version::{self, VersionDto};
 use rhapsody_desktop::windowserver;
 use tauri::{Emitter, Manager};
-use version::VersionDto;
 
 /// The current daemon status snapshot for the shell + tray. Mirrors Go `App.Status`
 /// (`$REF/desktop/app.go`): now backed by the live supervisor (D1 shipped a `stopped` stub).
