@@ -93,6 +93,16 @@ describe("Toolbar", () => {
     expect(onToggleSettings).toHaveBeenCalledOnce();
   });
 
+  it("badges the gear with a rust dot when an update is available", () => {
+    render(<Toolbar {...props({ updateAvailable: true })} />);
+    expect(screen.getByRole("img", { name: /update available/i })).toBeTruthy();
+  });
+
+  it("shows no update dot when nothing is pending", () => {
+    render(<Toolbar {...props({ updateAvailable: false })} />);
+    expect(screen.queryByRole("img", { name: /update available/i })).toBeNull();
+  });
+
   it("fires the Linear and Tools shortcuts", () => {
     const onOpenLinear = vi.fn();
     const onOpenTools = vi.fn();

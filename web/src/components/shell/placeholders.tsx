@@ -1,4 +1,4 @@
-export type SettingsTabId = "general" | "projects" | "tools" | "logs";
+export type SettingsTabId = "general" | "projects" | "tools" | "logs" | "updates";
 
 // The shell shows one of two top-level views: the Runs dashboard (default) or Settings. There is
 // no longer a visible tab strip — Runs is the whole main area and the titlebar's gear button

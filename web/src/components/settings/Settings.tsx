@@ -35,11 +35,13 @@ import {
   settingsRailTabId,
   type SettingsTabId,
 } from "@/components/shell/placeholders";
+import type { Updater } from "@/hooks/useUpdater";
 import { GeneralTab } from "./GeneralTab";
 import { ProjectsTab } from "./ProjectsTab";
 import { AddAgentSheet } from "./AddAgentSheet";
 import { ToolsTab } from "./ToolsTab";
 import { LogsTab } from "./LogsTab";
+import { UpdatesTab } from "./UpdatesTab";
 
 // Autosave debounce: coalesce rapid edits (stepper clicks, typing) into one POST after the user
 // pauses. The Save button is retired (mock 2a/2b) — edits persist on their own.
@@ -52,6 +54,7 @@ const SETTINGS_NAV: { id: SettingsTabId; label: string }[] = [
   { id: "projects", label: "Projects" },
   { id: "tools", label: "Tools" },
   { id: "logs", label: "Logs" },
+  { id: "updates", label: "Updates" },
 ];
 
 const TAB_META: Record<SettingsTabId, { title: string; desc: string }> = {
@@ -62,6 +65,7 @@ const TAB_META: Record<SettingsTabId, { title: string; desc: string }> = {
   },
   tools: { title: "Tools", desc: "Detected CLIs and connection health, re-checked on launch." },
   logs: { title: "Logs", desc: "Live daemon process log — polling, dispatch, restarts, and errors." },
+  updates: { title: "Updates", desc: "Keep Rhapsody current — check for, download, and install new versions." },
 };
 
 interface RailItemProps {
@@ -73,12 +77,14 @@ interface RailItemProps {
   badge?: React.ReactNode;
   /** A 6px amber warning dot (e.g. "Tools" while the doctor has warnings — wired in D6). */
   warn?: boolean;
+  /** A 6px rust dot (e.g. "Updates" while an in-app update is pending — P11-U3). */
+  available?: boolean;
 }
 
 // RailItem — a Settings left-rail nav item (mock 2a): text-only, 12.5px, active rust text on the
 // active-nav tint. "Projects" shows a mono count badge; "Tools" shows an amber warning dot when the
 // doctor has warnings.
-function RailItem({ tabId, label, active, onClick, badge, warn }: RailItemProps) {
+function RailItem({ tabId, label, active, onClick, badge, warn, available }: RailItemProps) {
   const [hover, setHover] = React.useState(false);
   return (
     <button
@@ -115,6 +121,14 @@ function RailItem({ tabId, label, active, onClick, badge, warn }: RailItemProps)
         // and testable from the rail without opening the Tools tab.
         <span role="img" aria-label={`${label} — warnings`} style={{ display: "inline-flex" }}>
           <StatusDot color="var(--amber)" size={6} />
+        </span>
+      ) : null}
+      {available ? (
+        // 6px rust dot lit while an in-app update is pending (P11-U3) — the rail-level echo of the
+        // toolbar gear dot, guiding the user to this tab. role="img"+aria-label names the decorative
+        // StatusDot so it is announced and testable from the rail.
+        <span role="img" aria-label={`${label} — available`} style={{ display: "inline-flex" }}>
+          <StatusDot color="var(--rust-text)" size={6} />
         </span>
       ) : null}
       {badge != null ? (
@@ -192,6 +206,8 @@ export interface SettingsProps {
   onTab: (tab: SettingsTabId) => void;
   /** Leave Settings and return to the Runs view (the titlebar gear also toggles this). */
   onBack: () => void;
+  /** The shell-owned update model (P11-U3): drives the "Updates" tab + its rail dot. */
+  updater: Updater;
 }
 
 // Settings — the Settings surface (mock 2a–2d): a 188px rail (← Jobs, nav, count badge, Tools
@@ -200,7 +216,7 @@ export interface SettingsProps {
 // of config — written to the keychain on save). Every edit — General fields, the agent detail
 // editor, the list enable/pause toggle, remove, and Add-agent — is a draft edit AUTOSAVED after a
 // short debounce (the Save button is retired); the header shows "Saving…" → "✓ All changes saved".
-export function Settings({ tab, onTab, onBack }: SettingsProps) {
+export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
   const cfg = useTypedConfigQuery();
   const identity = useLinearIdentity();
   const linearProjects = useLinearProjects();
@@ -384,15 +400,17 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
     // deliberately not a dependency (adding it would re-arm the timer every render).
   }, [draft, token, dirty, saveBlocked, saving]);
 
-  // Tools and Logs are read-only, daemon-direct panels: they don't read the config draft, so they
-  // render before the config load/skeleton guards (and hide the autosave indicator below).
-  const readOnlyTab = tab === "tools" || tab === "logs";
+  // Tools, Logs, and Updates are read-only, config-independent panels: they don't read the config
+  // draft, so they render before the config load/skeleton guards (and hide the autosave indicator).
+  const readOnlyTab = tab === "tools" || tab === "logs" || tab === "updates";
 
   let body: React.ReactNode;
   if (tab === "tools") {
     body = <ToolsTab />;
   } else if (tab === "logs") {
     body = <LogsTab />;
+  } else if (tab === "updates") {
+    body = <UpdatesTab updater={updater} />;
   } else if (cfg.isError || (cfg.data && !cfg.data.global)) {
     body = <ComingSoonPanel note="Couldn't load the daemon configuration. Is the daemon running?" />;
   } else if (!draft || !uiGlobal) {
@@ -503,6 +521,8 @@ export function Settings({ tab, onTab, onBack }: SettingsProps) {
                 // The Tools warning dot lights whenever the preflight/doctor probe reports a warning
                 // (a required CLI missing from PATH or unhealthy) — derived from the shared doctor query.
                 warn={s.id === "tools" ? toolsWarn : undefined}
+                // The Updates rust dot echoes the toolbar gear dot while an in-app update is pending.
+                available={s.id === "updates" ? updater.pending : undefined}
               />
             ))}
           </div>

@@ -14,6 +14,8 @@ export interface ToolbarProps {
   busy?: boolean;
   /** Settings is the active route — lights the gear rust. */
   settingsActive?: boolean;
+  /** An in-app update is waiting on the user — badges the gear with a rust dot (P11-U3). */
+  updateAvailable?: boolean;
   onStart: () => void;
   onStop: () => void;
   onRestart: () => void;
@@ -40,6 +42,7 @@ export function Toolbar({
   connecting = false,
   busy = false,
   settingsActive = false,
+  updateAvailable = false,
   onStart,
   onStop,
   onRestart,
@@ -108,7 +111,7 @@ export function Toolbar({
 
       <Divider />
 
-      <GearButton active={settingsActive} onClick={onToggleSettings} />
+      <GearButton active={settingsActive} onClick={onToggleSettings} updateAvailable={updateAvailable} />
     </div>
   );
 }
@@ -230,8 +233,18 @@ function TransportCell({
   );
 }
 
-// GearButton — the 30×28 Settings gear. Muted by default; rust while any Settings route is active.
-function GearButton({ active, onClick }: { active: boolean; onClick: () => void }) {
+// GearButton — the 30×28 Settings gear. Muted by default; rust while any Settings route is active. A
+// rust dot rides the top-right corner when an in-app update is waiting (P11-U3), guiding the user to
+// the Settings "Updates" surface without stealing the gear's own active/hover tint.
+function GearButton({
+  active,
+  onClick,
+  updateAvailable,
+}: {
+  active: boolean;
+  onClick: () => void;
+  updateAvailable: boolean;
+}) {
   const [hover, setHover] = React.useState(false);
   return (
     <button
@@ -242,6 +255,7 @@ function GearButton({ active, onClick }: { active: boolean; onClick: () => void 
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
+        position: "relative",
         width: 30,
         height: 28,
         display: "grid",
@@ -255,6 +269,17 @@ function GearButton({ active, onClick }: { active: boolean; onClick: () => void 
       }}
     >
       <Settings size={16} />
+      {updateAvailable ? (
+        // role="img" + aria-label gives the decorative StatusDot an accessible, testable name so the
+        // pending update is announced from the toolbar (mirrors the rail's Tools warning-dot idiom).
+        <span
+          role="img"
+          aria-label="Update available"
+          style={{ position: "absolute", top: 3, right: 3, display: "inline-flex" }}
+        >
+          <StatusDot color="var(--rust-text)" size={6} />
+        </span>
+      ) : null}
     </button>
   );
 }
