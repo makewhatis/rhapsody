@@ -1,7 +1,8 @@
 //! P11-U1 in-app auto-update — the Tauri commands the dashboard drives, backed by `tauri-plugin-updater`
-//! (check → download → install) and `tauri-plugin-process` (the post-install relaunch). This is a
-//! Rhapsody-only feature with NO Go parity reference; the sole daemon-side input is the live active-run
-//! count ([`App::active_run_count`]), the same `/api/v1/state` `counts.running` the tray reads.
+//! (check → download → install). The post-install relaunch uses the core `AppHandle::restart` (the same
+//! primitive `tauri-plugin-process`, registered in `main`, exposes to the frontend as `relaunch`). This
+//! is a Rhapsody-only feature with NO Go parity reference; the sole daemon-side input is the live
+//! active-run count ([`App::active_run_count`]), the same `/api/v1/state` `counts.running` the tray reads.
 //!
 //! Signature verification is Tauri's BUILT-IN minisign check against `plugins.updater.pubkey`
 //! (tauri.conf.json), performed inside `Update::download`/`install` — a tampered or wrong-key artifact is
@@ -122,8 +123,10 @@ async fn check_into(handle: &AppHandle, state: &UpdateState) -> Result<UpdateInf
 /// next launch. Returns `Err` on any failure, leaving the app on its current version.
 async fn install_update(handle: &AppHandle, state: &UpdateState, app: &App) -> Result<(), String> {
     // Ensure an Update is available to act on: reuse the last check's, else check now (the quiet launch
-    // check usually already stashed one).
-    if state.current.lock().await.is_none() {
+    // check usually already stashed one). Bind the emptiness to a `bool` so the guard is released at the
+    // `;` before `check_into` re-locks the same mutex (a held guard across the check would deadlock).
+    let needs_check = state.current.lock().await.is_none();
+    if needs_check {
         check_into(handle, state).await?;
     }
     let current = state.current.lock().await;

@@ -159,9 +159,10 @@ fn main() {
 
 fn run() -> tauri::Result<()> {
     let builder = tauri::Builder::default()
-        // P11-U1 in-app auto-update: the updater plugin (check/download/install + built-in minisign
-        // signature verification against tauri.conf.json's pubkey) and the process plugin (the relaunch
-        // primitive the post-install restart uses). The `update_*` commands below wrap them.
+        // P11-U1 in-app auto-update: the updater plugin drives check/download/install with built-in
+        // minisign signature verification against tauri.conf.json's pubkey (the `update_*` commands below
+        // wrap it). The process plugin exposes the JS relaunch/exit the frontend may call; the Rust
+        // install path relaunches via the core `AppHandle::restart`, the same primitive it wraps.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
