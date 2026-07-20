@@ -196,3 +196,25 @@ fn render_cask_lib_contract() {
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+// The Tauri updater manifest renderer (`render-latest-json.sh`, TRA-261/P11-U2): the latest.json body
+// tauri-plugin-updater consumes (version / notes / pub_date / platforms."darwin-aarch64".{signature,
+// url}), input flow-through, and the fail-loud shape validation, pinned by the ported pure-shell test.
+// No network / signing key is touched. `render-latest-json.sh` is release.yml's single source of truth
+// for the manifest it uploads next to the notarized Rhapsody.app.tar.gz.
+#[test]
+fn render_latest_json_lib_contract() {
+    let script = desktop_dir().join("scripts/render_latest_json_test.sh");
+    let out = Command::new("bash")
+        .arg(&script)
+        .env_clear()
+        .envs(scrubbed_env())
+        .output()
+        .expect("run render_latest_json_test.sh");
+    assert!(
+        out.status.success(),
+        "render_latest_json_test.sh failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}

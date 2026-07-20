@@ -189,6 +189,73 @@ jobs:
             dist/Rhapsody.dmg dist/rhapsodyd dist/SHA256SUMS \
             --clobber
 
+      # TRA-261 (P11-U2): publish the in-app auto-update channel for the release the steps above just
+      # signed + notarized + stapled. tauri-plugin-updater (wired in TRA-260/U1) polls the endpoint in
+      # tauri.conf.json — releases/latest/download/latest.json — and, when it names a newer version,
+      # downloads platforms."darwin-aarch64".url (a gzipped tarball of the app) and verifies it against
+      # platforms."darwin-aarch64".signature (minisign) using the pubkey pinned in tauri.conf.json. A
+      # bad/absent signature aborts the update, so nothing unsigned is ever installed.
+      #
+      # We build the tarball HERE, from the notarized + stapled bundle `make dmg` produced, rather than
+      # via the bundler's `createUpdaterArtifacts` at `cargo tauri build` time: that runs BEFORE
+      # sign.sh/notarize.sh, so its tarball would carry the Tauri-ad-hoc-signed, unstapled app — which
+      # Gatekeeper would reject once the updater swapped it in. `cargo tauri signer sign` produces the
+      # identical minisign signature the bundler would, against the same pubkey.
+      #
+      # Gated on TAURI_SIGNING_PRIVATE_KEY (the updater keypair — a human prerequisite, see
+      # desktop/README.md "Auto-update"): with no key this cleanly no-ops, leaving the
+      # dmg/binary/SHA256SUMS release above untouched (the release never goes red for a missing key).
+      - name: Publish updater artifacts (tar.gz + latest.json)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set — skipping the updater artifacts (Rhapsody.app.tar.gz + latest.json) for ${TAG}. Set the updater keypair secrets TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD to enable the in-app auto-update channel (see desktop/README.md 'Auto-update')."
+            exit 0
+          fi
+
+          app="desktop/target/release/bundle/macos/Rhapsody.app"
+          [ -d "$app" ] || { echo "::error::notarized app bundle not found at $app (the make dmg step must run first)"; exit 1; }
+
+          version="${TAG#v}"   # Makefile stamps VERSION verbatim; strip the tag's leading v (v0.4.0 -> 0.4.0)
+          rm -rf dist-updater && mkdir -p dist-updater
+          tarball="$PWD/dist-updater/Rhapsody.app.tar.gz"
+
+          # Gzip the notarized + stapled bundle with Rhapsody.app at the tar root — the archive shape
+          # tauri-plugin-updater extracts. COPYFILE_DISABLE=1 suppresses BSD tar's AppleDouble (._*)
+          # sidecars: the Developer ID signature (Contents/_CodeSignature/) and the stapled
+          # notarization ticket (Contents/CodeResources) are regular FILES inside the bundle, so they
+          # survive; the only xattrs would be local-run Gatekeeper state, which CI never creates.
+          ( cd "$(dirname "$app")" && COPYFILE_DISABLE=1 tar -czf "$tarball" "$(basename "$app")" )
+
+          # Minisign the tarball with the updater private key (read from env). Writes <tarball>.sig —
+          # the single-line base64 blob latest.json's signature field carries verbatim.
+          cargo tauri signer sign "$tarball"
+          sig="$(cat "${tarball}.sig")"
+          [ -n "$sig" ] || { echo "::error::empty updater signature for $tarball"; exit 1; }
+
+          # Render latest.json (validated + escaped by the single-source-of-truth renderer, pinned by
+          # render_latest_json_test.sh). url points at THIS release's uploaded tarball asset.
+          pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          url="https://github.com/${REPO}/releases/download/${TAG}/Rhapsody.app.tar.gz"
+          notes="Rhapsody ${version}. Release notes: https://github.com/${REPO}/releases/tag/${TAG}"
+          desktop/scripts/render-latest-json.sh "$version" "$pub_date" "$sig" "$url" "$notes" \
+            > dist-updater/latest.json
+          echo "== latest.json =="
+          cat dist-updater/latest.json
+
+          # Attach the updater channel next to the dmg/binary/SHA256SUMS uploaded above. --clobber so a
+          # retried dry-run overwrites the assets instead of failing on the existing ones.
+          gh release upload "$TAG" \
+            "$tarball" dist-updater/latest.json \
+            --clobber
+
   # TRA-241 (P8-RD3): after a REAL release, open a version+sha bump PR against the public Homebrew tap
   # (makewhatis/homebrew-tap) so `brew install --cask makewhatis/tap/rhapsody` tracks the new dmg. The
   # cask body is regenerated by the SAME desktop/scripts/render-cask.sh that authored the committed
