@@ -7,6 +7,7 @@ import { Onboarding } from "@/components/onboarding/Onboarding";
 import { ToastProvider, useToast } from "./Toast";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useStateQuery } from "@/hooks/useStateQuery";
+import { useUpdater } from "@/hooks/useUpdater";
 import { conductorStatus, viewForStatus } from "@/lib/daemon-status";
 import { appVersion, hasBridge, onNavigate, onShuttingDown, openExternal, type VersionDTO } from "@/lib/bindings";
 import { StatusDot } from "@/components/ui";
@@ -66,6 +67,9 @@ function ShellBody() {
   const daemon = useDaemonStatus();
   const { toast } = useToast();
   const { data, isLoading, isError } = useStateQuery();
+  // The single in-app update model (P11-U3): the toolbar gear dot and the Settings "Updates" surface
+  // share this one instance so a check/download in the panel and the gear badge never disagree.
+  const updater = useUpdater();
 
   // The macOS tray's "Open Dashboard" / "Settings…" items emit tray:navigate; switch the
   // active route to match (a no-op in a plain browser, where the Wails runtime is absent).
@@ -138,6 +142,7 @@ function ShellBody() {
           connecting={conductor.phase === "connecting"}
           busy={daemon.busy}
           settingsActive={topTab === "settings"}
+          updateAvailable={updater.pending}
           onStart={() => lifecycle("Daemon started", "The supervisor is running.", daemon.start)}
           onStop={() => lifecycle("Daemon stopped", "The supervisor is stopped.", daemon.stop)}
           onRestart={() => lifecycle("Daemon restarted", "Daemon reloaded configuration ✓", daemon.restart)}
@@ -191,7 +196,7 @@ function ShellBody() {
             {topTab === "runs" ? (
               <RunsView />
             ) : (
-              <Settings tab={settingsTab} onTab={setSettingsTab} onBack={() => setTopTab("runs")} />
+              <Settings tab={settingsTab} onTab={setSettingsTab} onBack={() => setTopTab("runs")} updater={updater} />
             )}
           </div>
         )}

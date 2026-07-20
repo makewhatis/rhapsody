@@ -66,6 +66,15 @@ vi.mock("@/lib/bindings", () => ({
       h.shutdownHandlers = h.shutdownHandlers.filter((f) => f !== cb);
     };
   },
+  // P11-U3: the shell mounts useUpdater for the gear dot + Settings "Updates" surface; stub the U1
+  // update bindings so mounting the shell doesn't hit the (absent) Tauri bridge. Default: nothing
+  // pending — the launch-check event never fires, so the gear dot stays dark in these tests.
+  checkForUpdate: vi.fn(async () => null),
+  downloadUpdate: vi.fn(async () => {}),
+  installUpdate: vi.fn(async () => null),
+  activeRunCount: vi.fn(async () => 0),
+  onUpdateAvailable: () => () => {},
+  onUpdateDownloadProgress: () => () => {},
 }));
 
 vi.mock("@/lib/api", async (orig) => {

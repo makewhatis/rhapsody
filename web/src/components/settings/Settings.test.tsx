@@ -84,6 +84,27 @@ vi.mock("@/lib/bindings", () => ({
 import { Settings } from "@/components/settings/Settings";
 import { ToastProvider } from "@/components/shell/Toast";
 import type { SettingsTabId } from "@/components/shell/placeholders";
+import type { Updater } from "@/hooks/useUpdater";
+
+// An inert, idle updater: Settings takes one (the shell owns the single instance), but the config
+// autosave suite doesn't exercise it — a no-op stub keeps those tests focused.
+function stubUpdater(over: Partial<Updater> = {}): Updater {
+  return {
+    phase: "idle",
+    info: null,
+    progress: null,
+    error: null,
+    activeRunsPrompt: null,
+    pending: false,
+    check: vi.fn(),
+    download: vi.fn(),
+    requestInstall: vi.fn(),
+    confirmInstallNow: vi.fn(),
+    deferToQuit: vi.fn(),
+    dismissPrompt: vi.fn(),
+    ...over,
+  };
+}
 
 // Comfortably past the Settings autosave debounce (600ms) — used to assert a BLOCKED draft never
 // POSTs even after the window elapses.
@@ -91,17 +112,17 @@ const AUTOSAVE_WAIT_MS = 800;
 
 // Stateful harness so clicking a rail tab actually switches the active tab (the real shell owns
 // the tab state) while keeping the Settings instance — and its pending-token state — mounted.
-function Harness({ initial, onBack }: { initial: SettingsTabId; onBack?: () => void }) {
+function Harness({ initial, onBack, updater }: { initial: SettingsTabId; onBack?: () => void; updater?: Updater }) {
   const [tab, setTab] = React.useState<SettingsTabId>(initial);
-  return <Settings tab={tab} onTab={setTab} onBack={onBack ?? (() => {})} />;
+  return <Settings tab={tab} onTab={setTab} onBack={onBack ?? (() => {})} updater={updater ?? stubUpdater()} />;
 }
 
-function renderSettings(tab: SettingsTabId) {
+function renderSettings(tab: SettingsTabId, updater?: Updater) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <ToastProvider>
-        <Harness initial={tab} />
+        <Harness initial={tab} updater={updater} />
       </ToastProvider>
     </QueryClientProvider>,
   );
@@ -198,6 +219,28 @@ describe("Settings (autosave controller)", () => {
     await screen.findByText("No agents yet"); // back to the (now empty) list as a pending edit
     await waitFor(() => expect(h.saveTypedConfig).toHaveBeenCalledTimes(1), { timeout: 2000 });
     expect(h.saveTypedConfig.mock.calls[0][1]).toHaveLength(0);
+  });
+});
+
+describe("Settings rail (Updates — P11-U3)", () => {
+  it("opens the Updates surface with a manual check (independent of the daemon config)", async () => {
+    const check = vi.fn();
+    renderSettings("updates", stubUpdater({ phase: "idle", check }));
+    expect(await screen.findByText("Software updates")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    expect(check).toHaveBeenCalledOnce();
+  });
+
+  it("lights the rail's Updates rust dot when an update is pending", async () => {
+    renderSettings("general", stubUpdater({ phase: "available", pending: true }));
+    await screen.findByText("Linear connection");
+    expect(await screen.findByRole("img", { name: "Updates — available" })).toBeTruthy();
+  });
+
+  it("leaves the Updates rail dot dark when nothing is pending", async () => {
+    renderSettings("general", stubUpdater({ phase: "idle", pending: false }));
+    await screen.findByText("Linear connection");
+    expect(screen.queryByRole("img", { name: "Updates — available" })).toBeNull();
   });
 });
 
