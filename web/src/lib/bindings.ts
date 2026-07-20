@@ -183,6 +183,82 @@ export function onNavigate(cb: (view: string) => void): () => void {
   return () => void pending.then((un) => un());
 }
 
+// ---- P11-U1 in-app auto-update -------------------------------------------------------------------
+
+// UpdateInfo mirrors the Rust update::UpdateInfo: the result of a check. When `available` is false the
+// app is up to date and `version`/`notes` are empty. Signature verification is the host's built-in
+// minisign check (tauri.conf.json pubkey) — a bad artifact fails download/install, never reaching here.
+export interface UpdateInfo {
+  available: boolean;
+  version: string; // the announced version (empty when none)
+  current_version: string; // the running app version
+  notes: string; // release notes / changelog body (empty when none)
+}
+
+// UpdateDownloadProgress mirrors the Rust update::DownloadProgress event payload: cumulative bytes
+// downloaded and (when the server reported a Content-Length) the total, so the UI can show a bar.
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null; // null → indeterminate (no Content-Length)
+}
+
+// InstallReport mirrors the Rust update::InstallReport: the outcome of installUpdate. When the install
+// proceeds the app relaunches, so `installed` is rarely observed true; the meaningful signal is
+// `blocked_active_runs > 0` — the install was refused because runs are active and was deferred to the
+// next graceful quit (a pending flag was persisted).
+export interface InstallReport {
+  installed: boolean;
+  blocked_active_runs: number;
+}
+
+// checkForUpdate asks the host to check the release feed for a newer version, returning its metadata (or
+// null in a plain browser with no bridge). Rejects on a network / manifest error so the caller can retry.
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  if (!tauriAvailable()) return null;
+  return invoke<UpdateInfo>("update_check");
+}
+
+// downloadUpdate downloads the checked update (emitting progress via onUpdateDownloadProgress) and caches
+// the verified bytes for installUpdate. Requires a prior checkForUpdate (or the quiet launch check).
+// A no-op in a plain browser; rejects on a download / signature error.
+export async function downloadUpdate(): Promise<void> {
+  if (!tauriAvailable()) return;
+  await invoke("update_download");
+}
+
+// installUpdate installs the update and relaunches into it — UNLESS runs are active and `force` is false,
+// in which case it refuses, persists a pending flag (install on next graceful quit), and returns the
+// blocking run count in `blocked_active_runs`. On the allowed path the app relaunches, so this usually
+// does not resolve. Returns null in a plain browser (no bridge).
+export async function installUpdate(force = false): Promise<InstallReport | null> {
+  if (!tauriAvailable()) return null;
+  return invoke<InstallReport>("update_install", { force });
+}
+
+// activeRunCount returns how many runs the daemon is actively executing right now — the count the install
+// guard consults, so the UI can warn "N runs active — installing will restart the app" before confirming.
+// Returns 0 when the bridge is absent (plain browser / tests).
+export async function activeRunCount(): Promise<number> {
+  if (!tauriAvailable()) return 0;
+  return (await invoke<number>("active_run_count")) ?? 0;
+}
+
+// onUpdateAvailable subscribes to the quiet on-launch check's `update:available` event so the UI can
+// badge the update affordance without the user asking. Returns an unsubscribe; a no-op when no bridge.
+export function onUpdateAvailable(cb: (info: UpdateInfo) => void): () => void {
+  if (!tauriAvailable()) return () => {};
+  const pending = listen<UpdateInfo>("update:available", (e) => cb(e.payload));
+  return () => void pending.then((un) => un());
+}
+
+// onUpdateDownloadProgress subscribes to the `update:download-progress` event emitted per chunk during
+// downloadUpdate, so the UI can render a progress bar. Returns an unsubscribe; a no-op when no bridge.
+export function onUpdateDownloadProgress(cb: (p: UpdateDownloadProgress) => void): () => void {
+  if (!tauriAvailable()) return () => {};
+  const pending = listen<UpdateDownloadProgress>("update:download-progress", (e) => cb(e.payload));
+  return () => void pending.then((un) => un());
+}
+
 // LogStreamMsg is one frame the desktop host forwards over the log-stream Channel (Rust
 // logbridge::LogMsg, `kind`-tagged): `open`/`reconnecting` mirror EventSource's onopen/onerror for the
 // status dot, while `epoch`/`line` carry the same two SSE frame kinds the browser path handles (the
