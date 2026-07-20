@@ -69,3 +69,21 @@ idempotent `sed` (the two default strings above) to those files after capturing 
 so `make fixtures` re-derives the committed state deterministically. Every other golden — including
 the Go-written transcript paths in `api/history.json` + `db/go-daemon-rows.json` — stays a byte-exact
 record of Go's output, and the red-on-drift canary is unchanged.
+
+### Rotating daemon file logs in `logging.dir` (TRA-267)
+
+The Rust daemon writes its process log as **rotating files** into the resolved `logging.dir`
+(default `~/.rhapsody/logs`): daily rotation with the 7 most recent files retained (older ones
+pruned), so the log is bounded and never grows without limit. This is a new file layer added
+alongside — not replacing — the stderr fmt layer and the in-memory `LogBuffer` ring (the Logs tab);
+it is independent of OTLP export and present whether or not telemetry is enabled. Setup is
+best-effort: if the dir can't be created or the appender can't be built, the file layer is skipped
+with one stderr warning and startup continues.
+
+| Behavior | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `logging.dir` | config-only field; no file writer (logs go to stderr / journald) | rotating file logs written here |
+
+This makes the Settings › General "Logs path" setting real — in Go it was plumbed through config and
+shown in the UI but nothing ever wrote files to it. The retention count (7) is hardcoded; no new
+config field is added, keeping the config schema at parity with Go.
