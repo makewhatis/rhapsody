@@ -26,6 +26,14 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/makewhatis/rhapsody/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNBRURDN0UwOTAxMEQ3NzcKUldSMzF4Q1E0TWZ0T3Zuc2FjdE8vdjZrMmVzemFBMUJXTVRiMmJCYzVKWndDWXFib0ttUDcxZ1cK"
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "app",

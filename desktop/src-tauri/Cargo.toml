@@ -17,6 +17,16 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # `tray-icon` enables the menu-bar tray (TrayIconBuilder) the D3 shell owns — $REF/desktop/tray.go.
 tauri = { version = "2", features = ["tray-icon"] }
+# P11-U1 in-app auto-update (this task has no Go parity — a Rhapsody-only feature). `tauri-plugin-updater`
+# drives check → download → install with Tauri's BUILT-IN minisign signature verification against the
+# `plugins.updater.pubkey` in tauri.conf.json (a tampered/mismatched artifact is rejected before install).
+# `tauri-plugin-process` supplies the relaunch primitive the post-install restart uses. Both are the
+# Tauri-official 2.x plugins, pinned to the same major as `tauri`; the two new direct deps are the ones
+# the P11 plan (Task U1) anticipates. NOTE: these produce NO updater artifacts at build time —
+# `bundle.createUpdaterArtifacts` is deliberately left unset so the unsigned `make app` CI build needs no
+# signing key (the signed release artifacts are a later, human-gated release-pipeline concern).
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 # The D2 sidecar supervisor + same-origin api proxy (parity port of $REF/desktop/internal/supervisor
 # + $REF/desktop/apiproxy.go). Every crate below is ALREADY in this workspace's Cargo.lock, pulled in
