@@ -29,4 +29,9 @@ pub mod supervisor;
 pub mod toolcheck;
 pub mod tooldirs;
 pub mod update;
+// `version` is the compiled-in build stamp. It lives in the LIB (not the bin) so BOTH the footer DTO
+// (main.rs) AND the updater (update.rs) read ONE stamp — the updater must compare against the real
+// release version, not tauri.conf.json's static 0.1.0 (TRA-266). build.rs marks the RHAPSODY_* env
+// vars rerun-if-env-changed for the whole crate build, so `option_env!` here still reads the stamp.
+pub mod version;
 pub mod windowserver;
