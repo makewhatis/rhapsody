@@ -115,6 +115,47 @@ RHAPSODY_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 
 The Makefile `app`/`dmg` targets set these from `VERSION` + git (see [Packaging](#packaging-unsigned-app--dmg)).
 
+## Auto-update (in-app updater channel)
+
+Rhapsody updates itself in place via [`tauri-plugin-updater`](https://v2.tauri.app/plugin/updater/)
+(the backend + guarded install flow landed in **P11-U1**; `src/update.rs`). Each GitHub Release carries
+two extra assets that drive it (**P11-U2**, `release.yml`'s `build` job):
+
+- **`Rhapsody.app.tar.gz`** — a gzipped tarball of the **signed + notarized + stapled** `Rhapsody.app`,
+  built *after* `make dmg` (from `desktop/target/release/bundle/macos/Rhapsody.app`, not the bundler's
+  build-time artifact, which predates signing/notarization).
+- **`latest.json`** — the manifest the plugin polls at
+  `https://github.com/makewhatis/rhapsody/releases/latest/download/latest.json` (the endpoint pinned in
+  `src-tauri/tauri.conf.json`). When its `version` is newer than the running app, the plugin downloads
+  `platforms."darwin-aarch64".url` (the tarball) and verifies it against
+  `platforms."darwin-aarch64".signature` (a **minisign** signature) using the `pubkey` pinned in
+  `tauri.conf.json`. A bad or absent signature aborts the update — nothing unsigned is ever installed.
+  `darwin-aarch64` is the only shipped target (Rhapsody is Apple-Silicon-only).
+
+`desktop/scripts/render-latest-json.sh <version> <pub_date> <signature> <url> [notes]` is the single
+source of truth for the manifest body; `render_latest_json_test.sh` (run by the `desktop` job via
+`src-tauri/tests/packaging_gate.rs`) pins it. The signature is produced by `cargo tauri signer sign`
+over the tarball — the same minisign key + format the bundler's `createUpdaterArtifacts` would use.
+
+The whole step is **gated on the updater keypair** and cleanly no-ops (green, with a `::warning::`) when
+it is absent, so the dmg/binary release never goes red for a missing key. The cask's `auto_updates true`
+(see [Homebrew tap](#homebrew-tap)) makes `brew upgrade` defer to this in-app channel.
+
+**Operator setup (one time):** the updater **public** key is already committed in `tauri.conf.json`
+(pinned in U1). Set the matching **private** key + its password as repo secrets so `build` can sign the
+tarball:
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY --repo makewhatis/rhapsody          # the minisign private key…
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --repo makewhatis/rhapsody # …and its password
+```
+
+The private key **must pair with the committed `pubkey`** (a fresh `cargo tauri signer generate` would
+mismatch it, and every client would reject the update). Rotating the keypair means updating **both** the
+secret and the committed `pubkey` — which changes the app, so it ships in a subsequent release. Confirm
+the wiring with a `workflow_dispatch` dry-run against a draft/prerelease tag (same as the dmg dry-run):
+it uploads `Rhapsody.app.tar.gz` + `latest.json` next to the installer assets.
+
 ## Homebrew tap
 
 Rhapsody installs from a single-channel Homebrew cask served out of a public tap
