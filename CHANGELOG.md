@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/makewhatis/rhapsody/compare/v0.2.1...v0.2.2) (2026-07-21)
+
+
+### Bug Fixes
+
+* grant core:window:allow-start-dragging so the window can be dragged ([#13](https://github.com/makewhatis/rhapsody/issues/13)) ([1677443](https://github.com/makewhatis/rhapsody/commit/16774439318d1f7c7d1b23b28d639af1ad170f86))
+
 ## [0.2.1](https://github.com/makewhatis/rhapsody/compare/v0.2.0...v0.2.1) (2026-07-21)
 
 
