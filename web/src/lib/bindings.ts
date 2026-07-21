@@ -11,6 +11,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { LinearProject } from "@/lib/api";
 
 export interface StatusDTO {
@@ -136,19 +137,28 @@ export async function listLinearProjects(): Promise<LinearProject[]> {
   return (await invoke<LinearProject[]>("list_linear_projects")) ?? [];
 }
 
-// pickDirectory opens a native folder chooser for a path field, returning the chosen absolute path.
-// The Tauri shell does not expose a native picker command (parity with the reference, where the
-// picker was an OPTIONAL Go binding absent in the current build), so this degrades to "" and the
-// field keeps its manually-typed value — callers apply the result only when non-empty.
-export async function pickDirectory(_title: string): Promise<string> {
-  return "";
+// pickDirectory opens the native folder chooser (tauri-plugin-dialog) for a path field, returning the
+// chosen absolute path. Degrades to "" when the Tauri bridge is absent (plain browser / vite dev /
+// unit test) so callers apply the result only when non-empty and the manually-typed value survives.
+export async function pickDirectory(title: string): Promise<string> {
+  if (!tauriAvailable()) return "";
+  return normalizePickResult(await open({ directory: true, multiple: false, title }));
 }
 
-// pickFile opens a native file chooser for a tool's executable-path override, returning the chosen
-// absolute file path. Degrades to "" for the same reason as pickDirectory (no native-picker command);
+// pickFile opens the native file chooser (tauri-plugin-dialog) for a tool's executable-path override,
+// returning the chosen absolute file path. Degrades to "" for the same reason as pickDirectory;
 // callers apply the result only when non-empty, so the manual-entry field stays usable.
-export async function pickFile(_title: string): Promise<string> {
-  return "";
+export async function pickFile(title: string): Promise<string> {
+  if (!tauriAvailable()) return "";
+  return normalizePickResult(await open({ directory: false, multiple: false, title }));
+}
+
+// normalizePickResult flattens the dialog `open()` result to a single path string. With
+// `multiple: false` the plugin returns the selected path or `null` (cancelled); an array only ever
+// arises with `multiple: true`, but we defend against it so the return type stays a plain string.
+function normalizePickResult(result: string | string[] | null): string {
+  if (result === null) return "";
+  return Array.isArray(result) ? (result[0] ?? "") : result;
 }
 
 // installTool asks the supervisor to install/update a required CLI (Tools tab action). The shell has
