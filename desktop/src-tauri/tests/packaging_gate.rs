@@ -154,6 +154,38 @@ fn entitlements_plist_valid_and_has_key() {
     }
 }
 
+// TRA-269: the ACL half of the window-drag path. `data-tauri-drag-region` (asserted present on the
+// toolbar by web/src/components/Toolbar.test.tsx) invokes Tauri v2's internal `startDragging`
+// command, which is gated by the `core:window:allow-start-dragging` permission. `core:default` pulls
+// in `core:window:default`, whose 28 perms are all read/query ops — it does NOT include
+// `allow-start-dragging` — so without an explicit grant the drag is silently denied by the ACL and
+// the packaged window can't be moved by its title bar (maximize still works: it's a native overlay
+// action outside the permission system). Pin the grant so a future reskin can't drop it again.
+// (Tauri-desktop-only; no Go analogue.) We deliberately do NOT require `allow-start-resize-dragging`:
+// under `titleBarStyle: "Overlay"` the window keeps its native decorations, so the OS handles resize.
+#[test]
+fn capabilities_grant_window_start_dragging() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/default.json");
+    let data = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "capabilities/default.json must exist at {}: {e}",
+            path.display()
+        )
+    });
+    let manifest: serde_json::Value =
+        serde_json::from_str(&data).expect("capabilities/default.json must be valid JSON");
+    let perms = manifest["permissions"]
+        .as_array()
+        .expect("capabilities/default.json must have a `permissions` array");
+    const GRANT: &str = "core:window:allow-start-dragging";
+    assert!(
+        perms.iter().any(|p| p.as_str() == Some(GRANT)),
+        "capabilities/default.json must grant {GRANT:?} so `data-tauri-drag-region` can drag the \
+         window (Tauri v2 gates it behind this permission; core:default does not include it); \
+         permissions = {perms:?}"
+    );
+}
+
 // The notarize.sh sourceable-lib arg construction (dual credential modes, precedence, the loud
 // partial-config error, base64 key decoding). Runs the ported shell test, which scrubs its own
 // notary env and never touches xcrun/the network. Additive over the Go package (which unit-tests the
