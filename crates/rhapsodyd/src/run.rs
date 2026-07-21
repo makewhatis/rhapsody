@@ -78,7 +78,10 @@ where
     // load reports config errors). The synthetic default applies `OTEL_*` env even when the workflow
     // fails to load OR decode, so env-only telemetry configuration still takes effect on a config error.
     let otel_cfg = resolve_boot_otel(&flags.path);
-    let tel = telemetry::init(&otel_cfg, stderr.clone());
+    // Resolve the process-log dir (TRA-267): the daemon writes rotating file logs into `logging.dir`
+    // (default `~/.rhapsody/logs`), independent of OTLP export. Best-effort, like `resolve_boot_otel`.
+    let log_dir = resolve_boot_logdir(&flags.path);
+    let tel = telemetry::init(&otel_cfg, Some(&log_dir), stderr.clone());
     // Install the composed subscriber as the process default so the orchestrator + server tasks log
     // through it (Go passes `tel.Logger` explicitly; the Rust crates use the global `tracing`
     // subscriber). Best-effort: a repeat install (a test process running `run` more than once) is a
@@ -360,6 +363,29 @@ fn load_resolved(path: &Path) -> Option<Config> {
     resolve(cfg, &workflow_dir(path)).ok()
 }
 
+/// Resolves the daemon's process-log dir for the boot (TRA-267), best-effort: the resolved
+/// `logging.dir` when the workflow loads + decodes + resolves, else the resolved default
+/// `~/.rhapsody/logs` — obtained by resolving a blank config, so it reuses the exact tilde-expand /
+/// absolutize / default logic in `rhapsody_config::resolve` (mirrors how `resolve_boot_otel` falls
+/// back to its synthetic base). Passed to `telemetry::init` as the rolling-file log target.
+fn resolve_boot_logdir(path: &Path) -> PathBuf {
+    let dir = load_resolved(path)
+        .or_else(|| {
+            // Fallback: resolve a defaulted-but-unresolved config (empty WORKFLOW.md front matter run
+            // through `decode`) so the default inherits the exact `logging.dir` default +
+            // normalization from `rhapsody_config`, mirroring `resolve_boot_otel`'s synthetic base.
+            let blank = decode(&workflow::Definition {
+                config: workflow::YamlMap::new(),
+                prompt_template: String::new(),
+            })
+            .ok()?;
+            resolve(blank, &workflow_dir(path)).ok()
+        })
+        .map(|cfg| cfg.logging.dir)
+        .unwrap_or_default();
+    PathBuf::from(dir)
+}
+
 /// Resolves the Linear key owner (the user whose assigned issues Rhapsody processes) for the startup
 /// banner. Best-effort: any load / decode / network failure returns `""` (the banner then shows a
 /// generic key-owner fallback) and never blocks startup, since the candidate filter binds to the key
@@ -422,6 +448,26 @@ mod tests {
     }
 
     const OFF_STORAGE: &str = "storage:\n  path: \"off\"\n";
+
+    // TRA-267: `resolve_boot_logdir` returns the configured `logging.dir` when the workflow resolves,
+    // and falls back to the resolved `~/.rhapsody/logs` default when the config path is bad/missing.
+    // Hermetic without an `unsafe { set_var }`: the expected default is derived from the process's own
+    // `$HOME` (the workspace's established env-test idiom — see the config crate's resolve tests).
+    #[test]
+    fn resolve_boot_logdir_configured_and_default() {
+        // Configured: a valid workflow's resolved `logging.dir` (the temp `logs` dir) is returned.
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        assert_eq!(resolve_boot_logdir(&wf), dir.child("logs"));
+
+        // Bad/missing config path: falls back to the resolved `~/.rhapsody/logs` default.
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let bad = dir.child("does-not-exist").join("WORKFLOW.md");
+        assert_eq!(
+            resolve_boot_logdir(&bad),
+            PathBuf::from(format!("{home}/.rhapsody/logs")),
+        );
+    }
 
     /// Runs the daemon until a short deadline, then cancels ctx and awaits a clean exit, returning the
     /// code (mirrors Go's `context.WithTimeout` daemon tests). `buf` captures stderr.
