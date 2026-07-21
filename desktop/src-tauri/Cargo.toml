@@ -87,6 +87,11 @@ libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 http = "1"
 bytes = "1"
+# serde_json (TRA-269): the capabilities-ACL regression test in tests/packaging_gate.rs parses
+# capabilities/default.json to assert the window-drag grant is present. Already a regular dependency
+# (same version/features) — repeating it here only grants the separate integration-test crate extern
+# access; no new crate is added.
+serde_json = "1"
 
 [features]
 # `fakedaemon` gates the compile of the supervisor test-stub bin below. It is a DEFAULT feature, so a
