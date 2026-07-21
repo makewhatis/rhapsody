@@ -164,6 +164,10 @@ fn run() -> tauri::Result<()> {
         // install path relaunches via the core `AppHandle::restart`, the same primitive it wraps.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // TRA-268: the native folder/file chooser for Settings' "Logs path" + Tools executable-path
+        // pickers (frontend calls `open` from @tauri-apps/plugin-dialog). Gated by `dialog:allow-open`
+        // in capabilities/default.json — without that grant the IPC is silently denied at runtime.
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             status,
             app_version,

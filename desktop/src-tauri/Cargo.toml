@@ -27,6 +27,12 @@ tauri = { version = "2", features = ["tray-icon"] }
 # signing key (the signed release artifacts are a later, human-gated release-pipeline concern).
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# tauri-plugin-dialog (TRA-268): the native folder/file chooser behind Settings' "Logs path" and the
+# Tools-tab executable-path pickers (bindings.ts `pickDirectory`/`pickFile`). Before this the pickers
+# were dead stubs (a leftover from the TRA-251 Wails→Tauri shell migration). Tauri-official 2.x plugin,
+# pinned to the same major as `tauri`; the `dialog:allow-open` permission is granted in
+# capabilities/default.json (a Tauri v2 gotcha — without it the dialog IPC is silently denied).
+tauri-plugin-dialog = "2"
 # semver (TRA-266): parse the Makefile-stamped RHAPSODY_VERSION so the updater compares latest.json
 # against the REAL release version, not tauri.conf.json's static 0.1.0 (see update.rs). This is the
 # SAME semver crate `tauri-plugin-updater` already uses for `RemoteRelease.version`, so its

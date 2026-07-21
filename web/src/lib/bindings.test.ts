@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   hasBridge,
   getStatus,
@@ -21,6 +22,8 @@ import {
   activeRunCount,
   onUpdateAvailable,
   onUpdateDownloadProgress,
+  pickDirectory,
+  pickFile,
 } from "@/lib/bindings";
 import type { UpdateInfo, UpdateDownloadProgress } from "@/lib/bindings";
 
@@ -35,12 +38,14 @@ vi.mock("@tauri-apps/api/core", () => {
   return { invoke: vi.fn(), Channel };
 });
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 // Flush the microtask queue so subscribeLogStream's promise-chained stop (start.then(stop)) settles.
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 const invokeMock = vi.mocked(invoke);
 const listenMock = vi.mocked(listen);
+const openMock = vi.mocked(open);
 
 function setBridge(present: boolean) {
   if (present) (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {};
@@ -50,6 +55,7 @@ function setBridge(present: boolean) {
 beforeEach(() => {
   invokeMock.mockReset();
   listenMock.mockReset();
+  openMock.mockReset();
   listenMock.mockResolvedValue(() => {});
 });
 
@@ -106,6 +112,12 @@ describe("bindings — browser-safe degradation (no Tauri host)", () => {
     expect(await activeRunCount()).toBe(0);
     await expect(downloadUpdate()).resolves.toBeUndefined();
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("pickDirectory/pickFile resolve to '' and never open a native dialog without a host", async () => {
+    expect(await pickDirectory("Choose logs folder")).toBe("");
+    expect(await pickFile("Choose git executable")).toBe("");
+    expect(openMock).not.toHaveBeenCalled();
   });
 
   it("update event subscriptions return unsubscribe no-ops without a host", () => {
@@ -223,6 +235,35 @@ describe("bindings — Tauri host present", () => {
     const handler = listenMock.mock.calls[0][1] as (e: { payload: UpdateInfo }) => void;
     handler({ payload: { available: true, version: "9.9.9", current_version: "1.0.0", notes: "" } });
     expect(seen).toBe("9.9.9");
+  });
+
+  it("pickDirectory opens a folder chooser and returns the chosen path", async () => {
+    openMock.mockResolvedValueOnce("/Users/me/logs");
+    expect(await pickDirectory("Choose logs folder")).toBe("/Users/me/logs");
+    expect(openMock).toHaveBeenCalledWith({
+      directory: true,
+      multiple: false,
+      title: "Choose logs folder",
+    });
+  });
+
+  it("pickFile opens a file chooser and returns the chosen path", async () => {
+    openMock.mockResolvedValueOnce("/usr/local/bin/git");
+    expect(await pickFile("Choose git executable")).toBe("/usr/local/bin/git");
+    expect(openMock).toHaveBeenCalledWith({
+      directory: false,
+      multiple: false,
+      title: "Choose git executable",
+    });
+  });
+
+  it("normalizes a cancelled (null) pick and an array result to a single string", async () => {
+    openMock.mockResolvedValueOnce(null); // user cancelled the dialog
+    expect(await pickDirectory("t")).toBe("");
+    openMock.mockResolvedValueOnce(["/first/path", "/second/path"]); // defensive: multiple:false never arrays
+    expect(await pickFile("t")).toBe("/first/path");
+    openMock.mockResolvedValueOnce([]); // empty array → ""
+    expect(await pickFile("t")).toBe("");
   });
 
   it("onUpdateDownloadProgress subscribes and forwards progress ticks", async () => {
