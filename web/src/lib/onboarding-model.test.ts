@@ -49,7 +49,7 @@ describe("onboarding-model", () => {
 
   describe("model select", () => {
     it("defaults to the model the daemon seeds into a fresh config", () => {
-      expect(DEFAULT_MODEL).toBe("claude-opus-4-8");
+      expect(DEFAULT_MODEL).toBe("claude-opus-5");
       expect(MODEL_OPTIONS.some((o) => o.value === DEFAULT_MODEL)).toBe(true);
     });
 

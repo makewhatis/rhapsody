@@ -114,10 +114,10 @@ describe("Onboarding wizard", () => {
       expect((screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement).disabled).toBe(false);
     });
 
-    it("shows the model select defaulting to the compact opus-4-8 label", async () => {
+    it("shows the model select defaulting to the compact opus-5 label", async () => {
       render(<Onboarding onConfigured={vi.fn()} />);
       await screen.findByRole("radio", { name: "Rhapsody" });
-      expect(screen.getByText("opus-4-8")).toBeTruthy();
+      expect(screen.getByText("opus-5")).toBeTruthy();
     });
 
     it("← Back clears the stored token and returns to step 1", async () => {
