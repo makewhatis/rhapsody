@@ -280,14 +280,22 @@ impl Orchestrator {
             .map_or(std::time::Duration::ZERO, |e| e.stall_timeout)
     }
 
-    /// Returns the active / canceled / terminal state sets for a running entry: its owning project's
-    /// when stamped and resolvable, else the top-level sets (mirrors [`stall_timeout_for`]). Used by
-    /// [`Orchestrator::on_worker_exit`] to classify a clean exit (INF-266 / INF-272). Returns owned
-    /// clones so the caller holds no borrow of `self.eff`. Mirrors Go `statesFor`.
+    /// Returns the active / canceled / terminal / review state sets for a running entry: its owning
+    /// project's when stamped and resolvable, else the top-level sets (mirrors [`stall_timeout_for`]).
+    /// Used by [`Orchestrator::on_worker_exit`] to classify a clean exit (INF-266 / INF-272 /
+    /// TRA-279). Returns owned clones so the caller holds no borrow of `self.eff`. Mirrors Go
+    /// `statesFor`, plus the `review` set Go's classifier never received (TRA-279) — it is read from
+    /// the SAME resolved/effective source as the other three, so a per-project `review_states`
+    /// override is honored rather than the global tracker config.
     pub(crate) fn states_for(
         &self,
         re: &RunningEntry,
-    ) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+    ) -> (
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+    ) {
         if !re.project_slug.is_empty()
             && let Some(p) = self
                 .eff
@@ -298,6 +306,7 @@ impl Orchestrator {
                 p.active_states.clone(),
                 p.canceled_states.clone(),
                 p.terminal_states.clone(),
+                p.review_states.clone(),
             );
         }
         match self.eff.as_ref() {
@@ -305,8 +314,14 @@ impl Orchestrator {
                 e.active_states.clone(),
                 e.canceled_states.clone(),
                 e.terminal_states.clone(),
+                e.review_states.clone(),
             ),
-            None => (HashSet::new(), HashSet::new(), HashSet::new()),
+            None => (
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+            ),
         }
     }
 

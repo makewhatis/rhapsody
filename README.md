@@ -87,3 +87,22 @@ with one stderr warning and startup continues.
 This makes the Settings › General "Logs path" setting real — in Go it was plumbed through config and
 shown in the UI but nothing ever wrote files to it. The retention count (7) is hardcoded; no new
 config field is added, keeping the config schema at parity with Go.
+
+### `review_states` classifies a clean worker exit (TRA-279)
+
+Go's `classifyCleanExit` never receives `review_states`. An agent that follows its prompt — open a
+draft PR, move the issue to review — and then ends a turn without emitting a `HANDOFF:` marker leaves
+the ticket in the configured review state, which falls through Go's branch chain to a catch-all that
+records the run `stopped` / `"ticket moved externally"`. Nothing external happened, and the work
+succeeded. Rhapsody threads the owning project's effective `review_states` into the classifier and
+adds a branch for it.
+
+| Clean exit, undeclared hand-off, ticket in a configured review state | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| stored outcome / error | `stopped` / `"ticket moved externally"` | `completed` / `""` |
+
+The branch sits **after** the cancel/terminal/declared checks and **before** the catch-all, so
+cancel-type and Done-type states keep their existing semantics and a move to any other non-active
+state is still `"ticket moved externally"`. With `review_states` unset — the Go default — behavior is
+byte-identical to the reference. No new `OUTCOME_*` constant is introduced; the missing hand-off
+declaration is preserved as a `tracing::warn!` naming the run, issue and state.
