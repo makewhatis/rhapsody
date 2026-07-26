@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/makewhatis/rhapsody/compare/v0.3.0...v0.3.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* classify a clean exit into a configured review state as completed ([#18](https://github.com/makewhatis/rhapsody/issues/18)) ([7a0edf8](https://github.com/makewhatis/rhapsody/commit/7a0edf8c85a582737b885c7d2aea78f1cfddd4ca))
+
 ## [0.3.0](https://github.com/makewhatis/rhapsody/compare/v0.2.2...v0.3.0) (2026-07-26)
 
 
