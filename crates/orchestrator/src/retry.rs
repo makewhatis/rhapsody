@@ -180,6 +180,34 @@ enum Recheck {
     Gone,
 }
 
+/// The configured review state a clean exit left the ticket parked in — but only when that is what
+/// [`classify_clean_exit`]'s review branch actually keys on. A state that is ALSO terminal is decided
+/// by the earlier terminal branch (and a cancel-type state is terminal by definition), so a terminal
+/// sample yields `None`. The sibling branches test both samples with a plain `||` and need no
+/// tie-break because they return constants; this one returns a value, so when BOTH samples are review
+/// states it reports the worker's own per-turn refresh — the sample the agent itself last observed.
+/// Both state arguments must already be [`normalize_state`]d.
+///
+/// Shared by the classifier and [`Orchestrator::on_worker_exit`]'s undeclared-hand-off warning so the
+/// two can never disagree about what counts as "parked in review" (TRA-279).
+fn parked_review_state<'a>(
+    review: &HashSet<String>,
+    terminal: &HashSet<String>,
+    w_st: &'a str,
+    s_st: &'a str,
+) -> Option<&'a str> {
+    if terminal.contains(w_st) || terminal.contains(s_st) {
+        return None;
+    }
+    if review.contains(w_st) {
+        return Some(w_st);
+    }
+    if review.contains(s_st) {
+        return Some(s_st);
+    }
+    None
+}
+
 /// Maps a clean worker exit to its stored outcome (taxonomy v2, INF-272) from the two freshest
 /// ticket-state samples (the worker's per-turn refresh + reconcile's snapshot; either may be newer —
 /// INF-266) plus whether the agent declared hand-off. The ticket is treated as having LEFT the active
@@ -187,10 +215,19 @@ enum Recheck {
 /// (a `canceled_states` entry that isn't terminal must not hijack classification); a cancel-type
 /// sample wins over a Done-type sample. `release == false` means the segment is `continued` and the
 /// claim is kept for the continuation. Mirrors Go `classifyCleanExit`.
+///
+/// DIVERGENCE from Go v0.4.0 (TRA-279): Go's classifier never receives `review_states`, so a run whose
+/// agent followed its prompt — open the PR, move the ticket to review — and then ended a turn without
+/// emitting a `HANDOFF:` marker fell through to the catch-all and was recorded
+/// `stopped` / "ticket moved externally", blaming an external actor for the agent's own move. The
+/// `review` branch below sits AFTER `declared` and BEFORE the catch-all, so behavior changes only when
+/// the state is genuinely in the configured review set; with `review_states` unset (the Go default)
+/// classification is byte-identical to the reference.
 pub(crate) fn classify_clean_exit(
     active: &HashSet<String>,
     canceled: &HashSet<String>,
     terminal: &HashSet<String>,
+    review: &HashSet<String>,
     declared: bool,
     worker_state: &str,
     snap_state: &str,
@@ -215,6 +252,11 @@ pub(crate) fn classify_clean_exit(
         return (store::OUTCOME_COMPLETED.to_string(), true, String::new());
     }
     if declared {
+        return (store::OUTCOME_COMPLETED.to_string(), true, String::new());
+    }
+    if parked_review_state(review, terminal, &w_st, &s_st).is_some() {
+        // The ticket is parked in a configured review state — the expected end state for a
+        // review-gated run, whether the agent declared hand-off or moved it itself. Not external.
         return (store::OUTCOME_COMPLETED.to_string(), true, String::new());
     }
     (
@@ -420,15 +462,37 @@ impl Orchestrator {
             // The two freshest state samples: the worker's per-turn refresh (e.last_state) and
             // reconcile's snapshot (re.issue.state). classify_clean_exit treats the ticket as having
             // LEFT the active set if EITHER reports a non-active state (INF-266).
-            let (active, canceled, terminal) = self.states_for(&re);
+            let (active, canceled, terminal, review) = self.states_for(&re);
             let (outcome, release, reason) = classify_clean_exit(
                 &active,
                 &canceled,
                 &terminal,
+                &review,
                 e.declared_handoff,
                 &e.last_state,
                 &re.issue.state,
             );
+            // The run parked the ticket in review but never confirmed it was finished. The outcome
+            // stays `completed` (the review state IS the intended end state — TRA-279), but the
+            // missing declaration is the diagnostic signal the old "ticket moved externally" reason
+            // used to carry, so surface it here rather than inventing a new outcome. `release &&
+            // !declared` with a non-terminal review sample can only be the classifier's review branch.
+            if release && !e.declared_handoff {
+                let (w_st, s_st) = (
+                    normalize_state(&e.last_state),
+                    normalize_state(&re.issue.state),
+                );
+                if let Some(st) = parked_review_state(&review, &terminal, &w_st, &s_st) {
+                    tracing::warn!(
+                        run_id = re.run_id,
+                        issue_id = %e.issue_id,
+                        issue_identifier = %re.issue.identifier,
+                        state = %st,
+                        project_slug = %re.project_slug,
+                        "run ended in review state without a HANDOFF declaration; recording completed"
+                    );
+                }
+            }
             if release {
                 // Left the active set: declared hand-off (completed), external non-terminal move
                 // (stopped), a Done-type terminal (completed), or a cancel-type terminal (stopped).
@@ -783,120 +847,320 @@ mod tests {
     use rhapsody_store::Store;
     use rhapsody_tracker::fake::Fake;
 
-    // Mirrors Go `TestClassifyCleanExit` (taxonomy v2, INF-272 / INF-266).
+    /// One [`classify_clean_exit`] table case. A named struct (rather than a wider tuple) keeps the
+    /// review-set column readable and mirrors Go `TestClassifyCleanExit`'s anonymous struct table.
+    struct ClassifyCase {
+        name: &'static str,
+        worker_state: &'static str,
+        snap_state: &'static str,
+        declared: bool,
+        /// This case's `review_states`, already normalized — production feeds the classifier the
+        /// `normalize_set`-lowered effective set, so the table's entries are lowercase too while the
+        /// `worker_state` / `snap_state` inputs stay mixed-case to exercise the normalization.
+        review: &'static [&'static str],
+        want_outcome: &'static str,
+        want_release: bool,
+        want_reason: &'static str,
+    }
+
+    // Mirrors Go `TestClassifyCleanExit` (taxonomy v2, INF-272 / INF-266), extended with the
+    // review-state branch (TRA-279) that Go v0.4.0 lacks — see the divergence note on
+    // `classify_clean_exit`.
     #[test]
     fn classify_clean_exit_taxonomy_v2() {
         let active = set_of(&["todo", "in progress"]);
         let canceled = set_of(&["cancelled", "duplicate"]);
         let terminal = set_of(&["done", "cancelled", "duplicate"]);
-        // (name, worker_state, snap_state, declared, want_outcome, want_release, want_reason)
-        let cases: &[(&str, &str, &str, bool, &str, bool, &str)] = &[
-            (
-                "both active, declared",
-                "In Progress",
-                "Todo",
-                true,
-                store::OUTCOME_CONTINUED,
-                false,
-                "",
-            ),
-            (
-                "both empty",
-                "",
-                "",
-                false,
-                store::OUTCOME_CONTINUED,
-                false,
-                "",
-            ),
-            (
-                "left to In Review, declared",
-                "In Review",
-                "Todo",
-                true,
-                store::OUTCOME_COMPLETED,
-                true,
-                "",
-            ),
-            (
-                "left to In Review, undeclared",
-                "In Review",
-                "Todo",
-                false,
-                store::OUTCOME_STOPPED,
-                true,
-                "ticket moved externally",
-            ),
-            (
-                "left to Done (no cancel), undeclared",
-                "Done",
-                "In Progress",
-                false,
-                store::OUTCOME_COMPLETED,
-                true,
-                "",
-            ),
-            (
-                "left to Done, declared",
-                "Done",
-                "In Progress",
-                true,
-                store::OUTCOME_COMPLETED,
-                true,
-                "",
-            ),
-            (
-                "left to Cancelled",
-                "Cancelled",
-                "In Progress",
-                false,
-                store::OUTCOME_STOPPED,
-                true,
-                "ticket cancelled",
-            ),
-            (
-                "left to Duplicate",
-                "In Progress",
-                "Duplicate",
-                true,
-                store::OUTCOME_STOPPED,
-                true,
-                "ticket cancelled",
-            ),
-            (
-                "conflicting Done/Cancelled, cancel wins",
-                "Done",
-                "Cancelled",
-                true,
-                store::OUTCOME_STOPPED,
-                true,
-                "ticket cancelled",
-            ),
-            (
-                "canceled-but-not-terminal misconfig, undeclared",
-                "Parked",
-                "Todo",
-                false,
-                store::OUTCOME_STOPPED,
-                true,
-                "ticket moved externally",
-            ),
+        const REVIEW: &[&str] = &["in review"];
+        let cases: &[ClassifyCase] = &[
+            ClassifyCase {
+                name: "both active, declared",
+                worker_state: "In Progress",
+                snap_state: "Todo",
+                declared: true,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_CONTINUED,
+                want_release: false,
+                want_reason: "",
+            },
+            ClassifyCase {
+                name: "both empty",
+                worker_state: "",
+                snap_state: "",
+                declared: false,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_CONTINUED,
+                want_release: false,
+                want_reason: "",
+            },
+            ClassifyCase {
+                name: "left to In Review, declared",
+                worker_state: "In Review",
+                snap_state: "Todo",
+                declared: true,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_COMPLETED,
+                want_release: true,
+                want_reason: "",
+            },
+            // THE BUG (TRA-279): the agent moved the ticket to review itself and ended its turn
+            // without a HANDOFF marker. That is the intended end state of a review-gated run, not an
+            // external actor.
+            ClassifyCase {
+                name: "left to In Review, undeclared, review configured",
+                worker_state: "In Review",
+                snap_state: "Todo",
+                declared: false,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_COMPLETED,
+                want_release: true,
+                want_reason: "",
+            },
+            // Back-compat: with the feature unconfigured, classification is byte-identical to Go.
+            ClassifyCase {
+                name: "left to In Review, review set EMPTY",
+                worker_state: "In Review",
+                snap_state: "Todo",
+                declared: false,
+                review: &[],
+                want_outcome: store::OUTCOME_STOPPED,
+                want_release: true,
+                want_reason: "ticket moved externally",
+            },
+            // The reconcile snapshot is the sample that left the active set, and it is uppercased —
+            // the review test must run on the NORMALIZED state, like every sibling branch.
+            ClassifyCase {
+                name: "snapshot sample in review, mixed case, undeclared",
+                worker_state: "",
+                snap_state: "IN REVIEW",
+                declared: false,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_COMPLETED,
+                want_release: true,
+                want_reason: "",
+            },
+            ClassifyCase {
+                name: "left to Done (no cancel), undeclared",
+                worker_state: "Done",
+                snap_state: "In Progress",
+                declared: false,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_COMPLETED,
+                want_release: true,
+                want_reason: "",
+            },
+            ClassifyCase {
+                name: "left to Done, declared",
+                worker_state: "Done",
+                snap_state: "In Progress",
+                declared: true,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_COMPLETED,
+                want_release: true,
+                want_reason: "",
+            },
+            ClassifyCase {
+                name: "left to Cancelled",
+                worker_state: "Cancelled",
+                snap_state: "In Progress",
+                declared: false,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_STOPPED,
+                want_release: true,
+                want_reason: "ticket cancelled",
+            },
+            ClassifyCase {
+                name: "left to Duplicate",
+                worker_state: "In Progress",
+                snap_state: "Duplicate",
+                declared: true,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_STOPPED,
+                want_release: true,
+                want_reason: "ticket cancelled",
+            },
+            ClassifyCase {
+                name: "conflicting Done/Cancelled, cancel wins",
+                worker_state: "Done",
+                snap_state: "Cancelled",
+                declared: true,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_STOPPED,
+                want_release: true,
+                want_reason: "ticket cancelled",
+            },
+            ClassifyCase {
+                name: "canceled-but-not-terminal misconfig, undeclared",
+                worker_state: "Parked",
+                snap_state: "Todo",
+                declared: false,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_STOPPED,
+                want_release: true,
+                want_reason: "ticket moved externally",
+            },
+            ClassifyCase {
+                name: "left to a non-review, non-terminal state, undeclared",
+                worker_state: "Blocked",
+                snap_state: "Todo",
+                declared: false,
+                review: REVIEW,
+                want_outcome: store::OUTCOME_STOPPED,
+                want_release: true,
+                want_reason: "ticket moved externally",
+            },
+            // Branch ordering: a review state that is ALSO terminal is decided by the earlier
+            // terminal branch (same outcome, but it must not be the review branch that fires — the
+            // undeclared-hand-off warning keys on that distinction).
+            ClassifyCase {
+                name: "review state that is also terminal follows terminal semantics",
+                worker_state: "Done",
+                snap_state: "In Progress",
+                declared: false,
+                review: &["done"],
+                want_outcome: store::OUTCOME_COMPLETED,
+                want_release: true,
+                want_reason: "",
+            },
+            // Branch ordering: cancel-type still wins over the new review branch.
+            ClassifyCase {
+                name: "review state that is also cancel-type + terminal stays cancelled",
+                worker_state: "Cancelled",
+                snap_state: "In Progress",
+                declared: false,
+                review: &["cancelled"],
+                want_outcome: store::OUTCOME_STOPPED,
+                want_release: true,
+                want_reason: "ticket cancelled",
+            },
         ];
         // A canceled_states entry that is NOT terminal must not hijack classification.
         let canceled_misconfig = set_of(&["cancelled", "duplicate", "parked"]);
-        for &(name, ws, ss, declared, want_o, want_r, want_reason) in cases {
-            let cset = if name == "canceled-but-not-terminal misconfig, undeclared" {
+        for c in cases {
+            let cset = if c.name == "canceled-but-not-terminal misconfig, undeclared" {
                 &canceled_misconfig
             } else {
                 &canceled
             };
-            let (got, release, reason) =
-                classify_clean_exit(&active, cset, &terminal, declared, ws, ss);
+            let review = set_of(c.review);
+            let (got, release, reason) = classify_clean_exit(
+                &active,
+                cset,
+                &terminal,
+                &review,
+                c.declared,
+                c.worker_state,
+                c.snap_state,
+            );
             assert_eq!(
                 (got.as_str(), release, reason.as_str()),
-                (want_o, want_r, want_reason),
-                "{name}"
+                (c.want_outcome, c.want_release, c.want_reason),
+                "{}",
+                c.name
             );
+        }
+    }
+
+    /// TRA-279 end-to-end at the `on_worker_exit` seam: the exact shape of run 35 / TRA-278 — the
+    /// agent opened its PR, moved the ticket to the configured review state itself, then ended a turn
+    /// without a `HANDOFF:` marker. The run must be stored `completed` with no error, and the claim
+    /// must be released rather than a continuation scheduled.
+    #[test]
+    fn on_worker_exit_review_state_undeclared_records_completed() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store_handle: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store_handle));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = set_of(&["in review"]);
+        }
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: st,
+            err_msg: String::new(),
+            last_state: "In Review".into(),
+            declared_handoff: false,
+        });
+
+        assert!(
+            !o.retry_attempts.contains_key("1"),
+            "a review-state exit must release, not schedule a continuation"
+        );
+        assert!(!o.claimed.contains("1"), "claim must be released");
+        let runs = store_handle
+            .list_runs(rhapsody_store::RunFilter::default())
+            .expect("list runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, store::OUTCOME_COMPLETED);
+        assert_eq!(runs[0].error, "", "no 'ticket moved externally' diagnosis");
+    }
+
+    /// The review set must come from the OWNING PROJECT's effective config, not the global tracker
+    /// config: a project whose `review_states` override is `{qa}` completes on QA, while a sibling
+    /// project that overrides review off keeps the legacy "ticket moved externally" classification.
+    #[test]
+    fn on_worker_exit_review_state_honors_per_project_override() {
+        let mut qa = proj_with_tracker("qa-proj", Arc::new(Fake::new()), "p");
+        qa.review_states = set_of(&["qa"]);
+        let mut none = proj_with_tracker("no-review-proj", Arc::new(Fake::new()), "p");
+        none.review_states = HashSet::new();
+        let (mut o, _) = orch_for_retry_multi(vec![qa, none], 10);
+        let store_handle: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store_handle));
+        // The top-level set is deliberately EMPTY, so a global-config read would misclassify the
+        // QA exit and an inherited-from-global read would misclassify the override-off exit.
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = HashSet::new();
+        }
+
+        for (id, ident, slug, state, want_outcome, want_err) in [
+            ("1", "QA-1", "qa-proj", "QA", store::OUTCOME_COMPLETED, ""),
+            (
+                "2",
+                "NR-1",
+                "no-review-proj",
+                "QA",
+                store::OUTCOME_STOPPED,
+                "ticket moved externally",
+            ),
+        ] {
+            o.dispatch_issue(
+                issue(id, ident, "Todo"),
+                None,
+                Some(DispatchRoute {
+                    slug: slug.to_string(),
+                    group: slug.to_string(),
+                    repo: String::new(),
+                    model: String::new(),
+                    workspace_mode: String::new(),
+                }),
+                String::new(),
+            );
+            let st = o.running[id].started_at;
+            o.on_worker_exit(EvWorkerExit {
+                issue_id: id.into(),
+                failed: false,
+                started_at: st,
+                err_msg: String::new(),
+                last_state: state.into(),
+                declared_handoff: false,
+            });
+            let runs = store_handle
+                .list_runs(rhapsody_store::RunFilter {
+                    issue: ident.to_string(),
+                    ..Default::default()
+                })
+                .expect("list runs");
+            assert_eq!(runs.len(), 1, "{ident}");
+            assert_eq!(runs[0].outcome, want_outcome, "{ident}");
+            assert_eq!(runs[0].error, want_err, "{ident}");
         }
     }
 
