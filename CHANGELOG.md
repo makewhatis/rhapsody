@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/makewhatis/rhapsody/compare/v0.2.2...v0.3.0) (2026-07-26)
+
+
+### Features
+
+* add Claude Opus 5 as the default model and refresh the model picker ([#16](https://github.com/makewhatis/rhapsody/issues/16)) ([536f1bf](https://github.com/makewhatis/rhapsody/commit/536f1bfc65deca3c28ace74878194c4da0fe9f20))
+
 ## [0.2.2](https://github.com/makewhatis/rhapsody/compare/v0.2.1...v0.2.2) (2026-07-21)
 
 
