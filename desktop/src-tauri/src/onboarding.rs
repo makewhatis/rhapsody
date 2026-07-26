@@ -105,7 +105,7 @@ pub fn render_initial_workflow(project_slug: &str) -> Result<Vec<u8>, Error> {
             max_concurrent_agents: 1,
         },
         claude: Claude {
-            model: "claude-opus-4-8",
+            model: "claude-opus-5",
             turn_timeout_ms: 21_600_000,
         },
         // Persist run history under ~/.rhapsody so it survives reboots (also the resolved default;

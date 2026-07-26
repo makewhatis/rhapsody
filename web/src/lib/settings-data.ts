@@ -10,7 +10,7 @@ import type { SelectOption } from "@/components/ui/select";
 // the fallback when a global field is unset. `backoff` is a UI retry strategy (see settings-model
 // for the mapping onto the daemon's `max_retry_backoff_ms`).
 export const GLOBAL_DEFAULTS = {
-  model: "claude-opus-4-8",
+  model: "claude-opus-5",
   effort: "high",
   permission: "acceptEdits",
   maxConcurrent: 3,
@@ -28,10 +28,11 @@ export const GLOBAL_DEFAULTS = {
 } as const;
 
 export const MODELS: SelectOption[] = [
-  { value: "claude-fable-5", label: "claude-fable-5", note: "Latest & most capable" },
+  { value: "claude-fable-5", label: "claude-fable-5", note: "Most capable" },
+  { value: "claude-opus-5", label: "claude-opus-5", note: "Default — flagship" },
   { value: "claude-opus-4-8", label: "claude-opus-4-8", note: "Previous flagship" },
-  { value: "claude-sonnet-4-6", label: "claude-sonnet-4-6", note: "Balanced" },
-  { value: "claude-haiku-4-2", label: "claude-haiku-4-2", note: "Fast & cheap" },
+  { value: "claude-sonnet-5", label: "claude-sonnet-5", note: "Balanced" },
+  { value: "claude-haiku-4-5", label: "claude-haiku-4-5", note: "Fast & cheap" },
 ];
 
 export const EFFORTS: SelectOption[] = [
