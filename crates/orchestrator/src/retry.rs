@@ -183,9 +183,10 @@ enum Recheck {
 /// The configured review state a clean exit left the ticket parked in — but only when that is what
 /// [`classify_clean_exit`]'s review branch actually keys on. A state that is ALSO terminal is decided
 /// by the earlier terminal branch (and a cancel-type state is terminal by definition), so a terminal
-/// sample yields `None`. The worker's own per-turn refresh wins over reconcile's snapshot when both
-/// are review states, matching the sample precedence of the surrounding branches. Both arguments must
-/// already be [`normalize_state`]d.
+/// sample yields `None`. The sibling branches test both samples with a plain `||` and need no
+/// tie-break because they return constants; this one returns a value, so when BOTH samples are review
+/// states it reports the worker's own per-turn refresh — the sample the agent itself last observed.
+/// Both state arguments must already be [`normalize_state`]d.
 ///
 /// Shared by the classifier and [`Orchestrator::on_worker_exit`]'s undeclared-hand-off warning so the
 /// two can never disagree about what counts as "parked in review" (TRA-279).
