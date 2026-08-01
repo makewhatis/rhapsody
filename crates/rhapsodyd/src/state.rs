@@ -160,6 +160,15 @@ impl StateProvider for DaemonState {
             Err(other) => Err(ConfigValidateError::Other(other.to_string())),
         }
     }
+
+    fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>> {
+        // The daemon does not yet cache the loaded registry off the control loop: that plumbing
+        // (an orchestrator/`ControlHandle` `capabilities_registry` field seeded from
+        // `~/.rhapsody/capabilities.yaml`) lands with the capabilities-registry-into-daemon-state
+        // task (BO-12). Until then the endpoint honestly serves `[]` rather than re-reading + seeding
+        // the file from an HTTP read handler; wiring here becomes a one-line delegate to the handle.
+        None
+    }
 }
 
 #[cfg(test)]

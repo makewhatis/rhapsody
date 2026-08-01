@@ -23,6 +23,7 @@ use rhapsody_config::effective_json;
 use rhapsody_config::workflow::{load, save};
 
 use crate::config_view::{ConfigPostReq, build_typed_definition, classify_config_error};
+use crate::handlers::require_get;
 use crate::responses::{write_error, write_error_fields, write_json};
 use crate::server::StateProvider;
 
@@ -45,6 +46,28 @@ pub(crate) async fn handle_config(
             "method_not_allowed",
             "use GET to read or POST to update config",
             Some("GET, HEAD, POST"),
+        ),
+    }
+}
+
+/// `GET /api/v1/capabilities` — the agent-capabilities registry (name/label/description/instruction)
+/// so a UI can render the opt-in checkbox list without hardcoding the options. Serves the running
+/// daemon's registry, or an empty `[]` when none is loaded yet. Registered method-agnostically (like
+/// every read route), so a non-GET yields a 405 envelope rather than the SPA fallback's 404.
+/// Rhapsody-only — no Go v0.4.0 counterpart (`capabilities` has no Go analog), so there is no capture
+/// fixture; the handler shape follows the existing read handlers.
+pub(crate) async fn handle_capabilities(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    match provider.capabilities_registry() {
+        Some(registry) => write_json(StatusCode::OK, &registry),
+        None => write_json(
+            StatusCode::OK,
+            &Vec::<rhapsody_config::capabilities::CapabilityDef>::new(),
         ),
     }
 }
@@ -153,6 +176,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use rhapsody_config::capabilities::{CapabilityDef, default_capabilities};
     use serde_json::{Value, json};
 
     use crate::new_handler;
@@ -720,6 +744,50 @@ projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n\
         );
     }
 
+    // A typed Save must not silently drop capabilities. Per-project capabilities round-trips through
+    // the typed view (it is surfaced omitempty in projects[]); global (tracker) capabilities is NOT in
+    // the typed `global` view (BO-10 keeps it out for Go byte-parity), so — like `pr_label` and other
+    // unexposed global knobs — it must be PRESERVED from the on-disk base across a GET→POST→GET, never
+    // clobbered by the (absent ⇒ empty) request value.
+    #[tokio::test]
+    async fn config_post_typed_preserves_capabilities() {
+        const MD: &str = "---\n\
+tracker:\n  kind: linear\n  api_key: $HOME\n  active_states:\n    - Todo\n  terminal_states:\n    - Done\n  capabilities:\n    - code-review\n\
+repo: git@github.com:o/infra.git\n\
+agent:\n  backend: claude\n\
+projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    capabilities:\n      - simplify\n      - deep-research\n\
+---\nBody.\n";
+        let wf = TempWorkflow::new(MD);
+        let base = spawn(&wf.path()).await;
+        let got = get_config_ok(&base).await;
+        // Per-project capabilities IS surfaced in the typed projects view (omitempty, non-empty here).
+        assert_eq!(
+            got["projects"][0]["capabilities"],
+            json!(["simplify", "deep-research"]),
+            "per-project capabilities must be surfaced in the typed projects view"
+        );
+        let resp = post_config(&base, &got).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+        let after = get_config_ok(&base).await;
+        // Global (tracker) capabilities survives the Save (preserved from base like pr_label).
+        assert_eq!(
+            after["config"]["tracker"]["capabilities"],
+            json!(["code-review"]),
+            "global tracker.capabilities must survive a typed Save"
+        );
+        // Per-project capabilities round-trips (write path + persisted on disk).
+        assert_eq!(
+            after["projects"][0]["capabilities"],
+            json!(["simplify", "deep-research"]),
+            "per-project capabilities must round-trip a typed Save"
+        );
+        assert_eq!(
+            after["config"]["projects"][0]["capabilities"],
+            json!(["simplify", "deep-research"]),
+            "per-project capabilities must persist on disk"
+        );
+    }
+
     // Mirrors Go `TestConfigPostTypedLegacySingleCollapses`: a legacy single-project config
     // (tracker.project_slug, no projects:) GET→POST(verbatim) stays single-form on disk + typed-stable.
     #[tokio::test]
@@ -745,5 +813,64 @@ projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n\
         );
         assert_eq!(got1["global"], after["global"], "typed view not stable");
         assert_eq!(got1["projects"], after["projects"], "typed view not stable");
+    }
+
+    // ------- /api/v1/capabilities (Rhapsody-only endpoint; no Go mirror) -------
+
+    /// Spawn a router over `provider` (the capabilities endpoint needs no WORKFLOW.md on disk).
+    async fn spawn_provider(provider: FakeProvider) -> String {
+        spawn_router(new_handler(Arc::new(provider), None)).await
+    }
+
+    // A loaded registry is served verbatim: 200 + a JSON array that deserializes back to the exact
+    // Vec<CapabilityDef> the daemon holds (here the bundled defaults).
+    #[tokio::test]
+    async fn capabilities_endpoint_returns_registry() {
+        let provider =
+            FakeProvider::ok(empty_snapshot()).with_capabilities_registry(default_capabilities());
+        let base = spawn_provider(provider).await;
+        let resp = reqwest::get(format!("{base}/api/v1/capabilities"))
+            .await
+            .expect("GET /capabilities");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let text = resp.text().await.expect("body");
+        let got: Vec<CapabilityDef> = serde_json::from_str(&text).expect("json");
+        assert_eq!(got, default_capabilities());
+    }
+
+    // With no registry loaded (the FakeProvider default, and the pre-BO-12 daemon path), the endpoint
+    // still answers 200 with an empty array rather than erroring.
+    #[tokio::test]
+    async fn capabilities_endpoint_empty_when_none() {
+        let base = spawn_provider(FakeProvider::ok(empty_snapshot())).await;
+        let resp = reqwest::get(format!("{base}/api/v1/capabilities"))
+            .await
+            .expect("GET /capabilities");
+        assert_eq!(resp.status(), 200);
+        let got: Vec<CapabilityDef> =
+            serde_json::from_str(&resp.text().await.expect("body")).expect("json");
+        assert!(got.is_empty(), "no loaded registry must serve []");
+    }
+
+    // Method-agnostic route: a non-GET yields the 405 envelope (Allow: GET, HEAD), not the SPA 404.
+    #[tokio::test]
+    async fn capabilities_method_not_allowed() {
+        let base = spawn_provider(FakeProvider::ok(empty_snapshot())).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/capabilities"))
+            .send()
+            .await
+            .expect("POST /capabilities");
+        assert_eq!(resp.status(), 405);
+        assert_eq!(
+            resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
     }
 }

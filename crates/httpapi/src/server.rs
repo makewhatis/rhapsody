@@ -17,7 +17,7 @@ use rhapsody_orchestrator::{
 };
 
 use crate::handlers::{handle_healthz, handle_refresh, handle_state};
-use crate::handlers_config::handle_config;
+use crate::handlers_config::{handle_capabilities, handle_config};
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_issue_history, handle_metrics, handle_run_detail,
     handle_run_events, handle_run_transcript,
@@ -128,6 +128,12 @@ pub trait StateProvider: Send + Sync {
     /// maps it to a field code, the legacy path surfaces it as `invalid_config`). Mirrors Go
     /// `ValidateConfig` (Decode → Resolve → ValidateDispatch → buildEffective).
     fn validate_config(&self, def: &Definition) -> Result<(), ConfigValidateError>;
+
+    /// The agent-capabilities registry (`GET /api/v1/capabilities`), so a UI can render the opt-in
+    /// checkbox list without hardcoding the options. `Some(registry)` ⇒ the daemon's loaded registry;
+    /// `None` ⇒ no registry loaded yet, which the handler serves as an empty `[]`. Rhapsody-only (no
+    /// Go v0.4.0 counterpart — this whole endpoint is a Rhapsody addition).
+    fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>>;
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -248,6 +254,10 @@ where
         // Read-write config (H3): GET returns the on-disk WORKFLOW.md view; POST validates + atomically
         // rewrites it (the watcher then hot-reloads). Loopback-only by server construction.
         .route("/api/v1/config", any(handle_config))
+        // Agent-capabilities registry (Rhapsody-only, no Go v0.4.0 counterpart): GET returns the
+        // registry so the Settings UI can render the opt-in checkbox list. Method-agnostic like the
+        // other read routes; the handler guards GET/HEAD.
+        .route("/api/v1/capabilities", any(handle_capabilities))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.
