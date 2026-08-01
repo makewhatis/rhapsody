@@ -32,6 +32,7 @@ function g(): GlobalConfigDTO {
     github_summons: false,
     milestone: "",
     labels: [],
+    capabilities: [],
     prompt: "p",
     prompt_file: "",
     git_flow: "any",

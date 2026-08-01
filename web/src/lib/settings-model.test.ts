@@ -69,6 +69,7 @@ function makeGlobal(over: Partial<GlobalConfigDTO> = {}): GlobalConfigDTO {
     github_summons: false,
     milestone: "",
     labels: [],
+    capabilities: [],
     prompt: "global prompt",
     prompt_file: "",
     git_flow: "graphite",
@@ -289,6 +290,7 @@ describe("toUiAgents", () => {
         max_concurrent_agents: 2,
         milestone: "v1",
         labels: [],
+        capabilities: [],
         prompt: "global prompt",
         prompt_file: "",
         git_flow: "graphite",
@@ -686,6 +688,58 @@ describe("applyUiAgent", () => {
     ui.labels = [];
     // An empty list means "no override" → inherit (undefined), not "require no labels"
     expect(applyUiAgent(p, ui, gWithLabels).labels).toBeUndefined();
+  });
+});
+
+// Capabilities mirrors the labels plumbing exactly (BO-14): surfaced read-only on the global for the
+// inherited hint, bound to the project's RAW override in the editor, and written back only when it
+// diverges from the global. These mirror the labels round-trip coverage above.
+describe("capabilities (mirrors labels plumbing, BO-14)", () => {
+  const g = makeGlobal();
+
+  it("surfaces the global capabilities read-only and rides through applyUiGlobal untouched", () => {
+    const ui = toUiGlobal(g);
+    expect(toUiGlobal(makeGlobal({ capabilities: ["code-review"] })).capabilities).toEqual(["code-review"]);
+    expect(applyUiGlobal(makeGlobal({ capabilities: ["code-review"] }), ui).capabilities).toEqual(["code-review"]);
+  });
+
+  it("surfaces a project's OWN capabilities (raw), not the merged global default", () => {
+    const gWith = makeGlobal({ capabilities: ["code-review", "simplify"] });
+    const p: ProjectConfigDTO = { name: "A", slugs: ["a"], enabled: true, overrides: {} };
+    const ui = toUiAgents([p], gWith, [], [])[0];
+    // No per-project override → empty checklist (inherits at the daemon); the inherited value is
+    // surfaced separately via toUiGlobal.capabilities for the editor's hint.
+    expect(ui.capabilities).toEqual([]);
+    expect(toUiGlobal(gWith).capabilities).toEqual(["code-review", "simplify"]);
+  });
+
+  it("writes a per-project capabilities override only when it diverges; empty/equal collapses to inherit", () => {
+    const gWith = makeGlobal({ capabilities: ["code-review"] });
+    const p: ProjectConfigDTO = { name: "A", slugs: ["a"], enabled: true, overrides: {} };
+    const ui = toUiAgents([p], gWith, [], [])[0];
+
+    // Equal to the global → inherit (undefined).
+    ui.capabilities = ["code-review"];
+    expect(applyUiAgent(p, ui, gWith).capabilities).toBeUndefined();
+
+    // Empty → inherit (undefined), not "require none".
+    ui.capabilities = [];
+    expect(applyUiAgent(p, ui, gWith).capabilities).toBeUndefined();
+
+    // Diverges → written as a per-project override.
+    ui.capabilities = ["simplify", "code-review"];
+    expect(applyUiAgent(p, ui, gWith).capabilities).toEqual(["simplify", "code-review"]);
+  });
+
+  it("removing a project's only capability clears the field instead of re-inheriting the global", () => {
+    const gWith = makeGlobal({ capabilities: ["code-review"] });
+    const orig: ProjectConfigDTO = { name: "A", slugs: ["a"], enabled: true, overrides: {}, capabilities: ["simplify"] };
+    const ui = toUiAgents([orig], gWith, [], [])[0];
+    expect(ui.capabilities).toEqual(["simplify"]);
+    const dto = applyUiAgent(orig, { ...ui, capabilities: [] }, gWith);
+    expect(dto.capabilities).toBeUndefined(); // saved as "inherit"
+    const after = toUiAgents([dto], gWith, [], [])[0];
+    expect(after.capabilities).toEqual([]); // checkbox gone — NOT flipped to ["code-review"]
   });
 });
 
