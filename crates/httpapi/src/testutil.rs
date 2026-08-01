@@ -63,6 +63,9 @@ pub(crate) struct FakeProvider {
     /// The WORKFLOW.md path the config endpoints read/write (Go's `fakeProvider.workflowPath`); its
     /// parent dir is the `resolve` base in [`validate_config`].
     workflow_path: String,
+    /// The canned agent-capabilities registry `GET /api/v1/capabilities` serves. `None` ⇒ the
+    /// handler's empty-registry (`[]`) path.
+    capabilities_registry: Option<Vec<rhapsody_config::capabilities::CapabilityDef>>,
 }
 
 impl FakeProvider {
@@ -96,6 +99,7 @@ impl FakeProvider {
                 operations: Vec::new(),
             },
             workflow_path: String::new(),
+            capabilities_registry: None,
         }
     }
 
@@ -199,6 +203,15 @@ impl FakeProvider {
         self.workflow_path = path.into();
         self
     }
+
+    /// Set the canned capabilities registry `GET /api/v1/capabilities` serves (unset ⇒ the `[]` path).
+    pub(crate) fn with_capabilities_registry(
+        mut self,
+        registry: Vec<rhapsody_config::capabilities::CapabilityDef>,
+    ) -> Self {
+        self.capabilities_registry = Some(registry);
+        self
+    }
 }
 
 #[async_trait]
@@ -282,6 +295,10 @@ impl StateProvider for FakeProvider {
         let mut cfg = resolve(cfg, &dir).map_err(|e| ConfigValidateError::Other(e.to_string()))?;
         validate(&mut cfg).map_err(ConfigValidateError::Validation)?;
         Ok(())
+    }
+
+    fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>> {
+        self.capabilities_registry.clone()
     }
 }
 
