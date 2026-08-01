@@ -59,6 +59,8 @@ pub struct EffectiveConfig {
     pub milestone: String,
     /// Empty ⇒ no label filter for this project.
     pub labels: Vec<String>,
+    /// Empty ⇒ no extra practices beyond whatever's in the prompt template.
+    pub capabilities: Vec<String>,
     /// `""` ⇒ `"any"` (no enforcement); `"graphite"` ⇒ inject the guard hook.
     pub git_flow: String,
     /// Resolved workspace-provisioning policy: always non-empty after resolve (`"worktree"` default).
@@ -174,6 +176,7 @@ fn effective_of(config: &Config, project: Option<&Project>) -> EffectiveConfig {
         max_concurrent_agents: 0,
         milestone: config.tracker.milestone.clone(),
         labels: config.tracker.labels.clone(),
+        capabilities: config.tracker.capabilities.clone(),
         git_flow: config.git_flow.clone(),
         // workspace_mode / dependency_mode / dep_mode_prompt_file / claim_mode seed from the global
         // value; a per-project override (below) wins, and the defaults are materialized last.
@@ -241,6 +244,9 @@ fn apply_project_overrides(eff: &mut EffectiveConfig, config: &Config, p: &Proje
     }
     if !p.labels.is_empty() {
         eff.labels = p.labels.clone();
+    }
+    if !p.capabilities.is_empty() {
+        eff.capabilities = p.capabilities.clone();
     }
     if !p.git_flow.is_empty() {
         eff.git_flow = p.git_flow.clone();
@@ -400,6 +406,26 @@ mod tests {
             Some("top-ms"),
             "inherited"
         );
+    }
+
+    // Capabilities (a Rhapsody-only field with no Go v0.4.0 counterpart) is plumbed exactly like
+    // `labels`: a non-empty per-project value wins, an empty one inherits the top-level tracker value.
+    // Built from `base_cfg()` rather than the plan sketch's `Config::default()` (the typed `Config`
+    // has no `Default` impl, and deriving one would cascade through its non-`Default` sub-structs).
+    #[test]
+    fn effective_for_capabilities_project_override_wins() {
+        let mut config = base_cfg();
+        config.tracker.capabilities = vec!["code-review".to_string()];
+        let project = Project {
+            capabilities: vec!["deep-research".to_string(), "simplify".to_string()],
+            ..Default::default()
+        };
+
+        let eff = effective_for(&config, Some(&project));
+        assert_eq!(eff.capabilities, vec!["deep-research", "simplify"]);
+
+        let eff_no_override = effective_for(&config, Some(&Project::default()));
+        assert_eq!(eff_no_override.capabilities, vec!["code-review"]);
     }
 
     // Mirrors Go `TestResolveProjectsSingleProjectSynthesized`.

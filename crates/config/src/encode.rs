@@ -75,6 +75,7 @@ fn raw_from_config(c: &Config) -> Raw {
     r.tracker.review_promote_state = c.tracker.review_promote_state.clone();
     r.tracker.milestone = c.tracker.milestone.clone();
     r.tracker.labels = c.tracker.labels.clone();
+    r.tracker.capabilities = c.tracker.capabilities.clone();
     r.tracker.dependency_mode = c.tracker.dependency_mode.clone();
     r.tracker.dep_mode_prompt_file = c.tracker.dep_mode_prompt_file.clone();
     r.tracker.claim_mode = c.tracker.claim_mode.clone();
@@ -206,6 +207,7 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.max_concurrent_agents.is_none()
         && p.milestone.is_empty()
         && p.labels.is_empty()
+        && p.capabilities.is_empty()
         && p.dependency_mode.is_empty()
         && p.dep_mode_prompt_file.is_empty()
         && p.claim_mode.is_empty()
@@ -236,6 +238,7 @@ fn raw_project_from_project(p: &Project) -> RawProject {
         max_concurrent_agents: p.max_concurrent_agents,
         milestone: p.milestone.clone(),
         labels: p.labels.clone(),
+        capabilities: p.capabilities.clone(),
         enabled: p.enabled,
     };
     if let Some(ov) = &p.claude {
