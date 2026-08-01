@@ -94,6 +94,7 @@ pub struct Tracker {
     pub review_promote_state: String,
     pub milestone: String,
     pub labels: Vec<String>,
+    pub capabilities: Vec<String>,
     /// `"" | "disabled" | "graphite" | "dag"` — empty ⇒ inherit/default at resolve (INF-318).
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
@@ -271,6 +272,7 @@ pub struct Project {
     pub max_concurrent_agents: Option<i64>,
     pub milestone: String,
     pub labels: Vec<String>,
+    pub capabilities: Vec<String>,
     pub git_flow: String,
     pub workspace_mode: String,
     pub dependency_mode: String,
@@ -371,6 +373,7 @@ pub(crate) struct RawTracker {
     pub review_promote_state: String,
     pub milestone: String,
     pub labels: Vec<String>,
+    pub capabilities: Vec<String>,
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
     pub claim_mode: String,
@@ -510,6 +513,7 @@ pub(crate) struct RawProject {
     pub max_concurrent_agents: Option<i64>,
     pub milestone: String,
     pub labels: Vec<String>,
+    pub capabilities: Vec<String>,
     pub enabled: Option<bool>,
 }
 
