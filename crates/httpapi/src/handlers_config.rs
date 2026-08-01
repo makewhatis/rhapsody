@@ -788,6 +788,68 @@ projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    capabilities:\n  
         );
     }
 
+    // The per-project capabilities WRITE path must honor an EDIT, not just a verbatim round-trip: the
+    // UI changing the checkbox list to a value DIFFERENT from disk must persist. This guards
+    // project_from_json against sourcing capabilities from the slug-matched base project (the way its
+    // hooks/claude-override neighbors are sourced), which would silently discard every UI edit while
+    // still passing a verbatim round-trip test.
+    #[tokio::test]
+    async fn config_post_typed_edits_per_project_capabilities() {
+        const MD: &str = "---\n\
+tracker:\n  kind: linear\n  api_key: $HOME\n  active_states:\n    - Todo\n  terminal_states:\n    - Done\n\
+repo: git@github.com:o/infra.git\n\
+agent:\n  backend: claude\n\
+projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    capabilities:\n      - simplify\n  - name: Core Bot\n    slugs:\n      - core\n\
+---\nBody.\n";
+        let wf = TempWorkflow::new(MD);
+        let base = spawn(&wf.path()).await;
+        let mut got = get_config_ok(&base).await;
+        // Precondition: project 0 carries [simplify]; project 1 carries none (omitempty ⇒ absent).
+        assert_eq!(got["projects"][0]["capabilities"], json!(["simplify"]));
+        assert!(
+            got["projects"][1].get("capabilities").is_none(),
+            "project 1 starts with no capabilities"
+        );
+
+        // EDIT: change project 0 to a DIFFERENT set, and ADD one to the previously-empty project 1.
+        got["projects"][0]["capabilities"] = json!(["code-review", "deep-research"]);
+        got["projects"][1]["capabilities"] = json!(["security-review"]);
+        let resp = post_config(&base, &got).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+
+        let after = get_config_ok(&base).await;
+        assert_eq!(
+            after["projects"][0]["capabilities"],
+            json!(["code-review", "deep-research"]),
+            "an edited per-project capabilities list must persist (sourced from the request, not base)"
+        );
+        assert_eq!(
+            after["projects"][1]["capabilities"],
+            json!(["security-review"]),
+            "a capability added to a previously-empty project must persist"
+        );
+        // Persisted on disk (the verbatim config block), for both the changed and the newly-added one.
+        assert_eq!(
+            after["config"]["projects"][0]["capabilities"],
+            json!(["code-review", "deep-research"])
+        );
+        assert_eq!(
+            after["config"]["projects"][1]["capabilities"],
+            json!(["security-review"])
+        );
+
+        // CLEAR: emptying project 0's list drops it from the typed projects view (omitempty).
+        let mut cleared = after.clone();
+        cleared["projects"][0]["capabilities"] = json!([]);
+        let resp = post_config(&base, &cleared).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+        let after2 = get_config_ok(&base).await;
+        assert!(
+            after2["projects"][0].get("capabilities").is_none(),
+            "clearing per-project capabilities must drop it from the typed projects view"
+        );
+    }
+
     // Mirrors Go `TestConfigPostTypedLegacySingleCollapses`: a legacy single-project config
     // (tracker.project_slug, no projects:) GET→POST(verbatim) stays single-form on disk + typed-stable.
     #[tokio::test]
