@@ -384,8 +384,9 @@ impl Orchestrator {
 
     /// Arms the live retry timer for `key`, firing [`Event::Retry`] with `issue_id: key` after
     /// `delay_ms` clamped to `[0, MAX_RETRY_DELAY_MS]` (Go `time.AfterFunc(delay, () => o.events <-
-    /// evRetry{key})`). THE ONLY place
-    /// a retry timer is armed — every arming path (runtime [`schedule_retry_for`], boot-recovery
+    /// evRetry{key})`).
+    ///
+    /// THE ONLY place a retry timer is armed — every arming path (runtime [`schedule_retry_for`], boot-recovery
     /// [`re_arm_retry`](Orchestrator::re_arm_retry) / [`arm_immediate_retry`](Orchestrator::arm_immediate_retry),
     /// and [`requeue_recovered`](Orchestrator::requeue_recovered)) goes through here, so a new path
     /// cannot silently ship an inert retry (TRA-316: the recovery paths recorded the entry but armed
