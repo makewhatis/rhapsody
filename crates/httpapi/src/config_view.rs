@@ -187,6 +187,7 @@ struct ProjectReq {
     repo: String,
     milestone: String,
     labels: Vec<String>,
+    capabilities: Vec<String>,
     /// Presence-pointer: absent ⇒ inherit the default (enabled), `Some(false)` ⇒ paused.
     enabled: Option<bool>,
     active_states: Vec<String>,
@@ -281,6 +282,12 @@ fn apply_typed_config(base: &Config, req: &ConfigPostReq) -> Config {
     out.tracker.github_summons = g.github_summons;
     out.tracker.milestone = g.milestone.clone();
     out.tracker.labels = g.labels.clone();
+    // tracker.capabilities is NOT surfaced in the typed `global` GET view (BO-10 keeps it out for Go
+    // byte-parity — the frozen Go v0.4.0 config goldens have no such field). So, like `pr_label` and
+    // the other unexposed global knobs, it is deliberately NOT overwritten here: the `base.clone()`
+    // above preserves the on-disk value across a Save, rather than a verbatim round-trip (which cannot
+    // echo back a field the view never emitted) silently clearing it. Per-project `capabilities` IS
+    // surfaced (projects[] omitempty) and so is round-tripped in `project_from_json`.
 
     out.polling.interval_ms = g.polling.interval_ms;
 
@@ -358,6 +365,7 @@ fn project_from_json(base: &Config, pj: &ProjectReq) -> Project {
         prompt: pj.prompt.clone(),
         prompt_file: pj.prompt_file.clone(),
         labels: pj.labels.clone(),
+        capabilities: pj.capabilities.clone(),
         ..Project::default()
     };
     // git_flow / workspace_mode / dependency_mode / dep_mode_prompt_file / claim_mode are surfaced in
