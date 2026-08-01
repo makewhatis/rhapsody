@@ -30,8 +30,8 @@ use rhapsody_telemetry as telemetry;
 use rhapsody_tracker as tracker;
 
 use crate::bootcfg::{
-    assignee_label, banner_color_enabled, open_store, resolve_banner_data, resolve_server_port,
-    workflow_dir,
+    assignee_label, banner_color_enabled, open_store, resolve_banner_data,
+    resolve_capabilities_path, resolve_server_port, workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -101,12 +101,25 @@ where
     // Open the durable store from the resolved config + --db / --no-store, and inject it before Run
     // (the Rust orchestrator defers disk store-open to the daemon). A best-effort load failure leaves
     // the config `None`, so open_store falls back to Noop and Run's own reload reports the error.
-    let store = open_store(
-        load_resolved(&flags.path).as_ref(),
-        &flags.db,
-        flags.no_store,
-    );
+    let resolved = load_resolved(&flags.path);
+    let store = open_store(resolved.as_ref(), &flags.db, flags.no_store);
     o.set_store(store);
+    // Load the agent-capabilities registry (~/.rhapsody/capabilities.yaml, colocated with the durable
+    // store), seeding defaults on first run, and inject it before Run (BO-12). Best-effort: a load
+    // failure — or no on-disk store home (--no-store / off / :memory:) — leaves the registry `None`, so
+    // capability rendering is a no-op, never a startup failure. Reuses the SAME resolved store path the
+    // store-open above uses for `rhapsody.db`, which keeps the run tests (storage off) hermetic.
+    if let Some(caps_path) = resolve_capabilities_path(resolved.as_ref(), &flags.db, flags.no_store)
+    {
+        match rhapsody_config::capabilities::load_or_seed(&caps_path) {
+            Ok(reg) => o.capabilities_registry = Some(reg),
+            Err(e) => tracing::warn!(
+                err = %e,
+                path = %caps_path.display(),
+                "capabilities registry load failed; capabilities disabled"
+            ),
+        }
+    }
     // Install the lifetime ctx BEFORE snapshotting the off-loop handle, so the handle's stop/resume/
     // message reply-waits are bounded by the real ctx (not the never-cancelling default). `Run`
     // re-sets the same ctx below.
