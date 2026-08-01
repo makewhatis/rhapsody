@@ -124,7 +124,10 @@ impl Orchestrator {
         };
         self.claimed.insert(key.clone());
         let due_at = DateTime::from_timestamp_millis(rr.due_at_ms).unwrap_or_else(zero_time);
-        let delay_ms = rr.due_at_ms - (self.now)().timestamp_millis();
+        // `due_at_ms` is an unbounded store column: saturate rather than let a corrupt row overflow the
+        // subtraction (a debug-build panic on the control task, or a release wrap to a huge POSITIVE
+        // delay — i.e. a timer armed years out, the very "never fires" symptom this arming fixes).
+        let delay_ms = rr.due_at_ms.saturating_sub((self.now)().timestamp_millis());
         self.retry_attempts.insert(
             key.clone(),
             RetryEntry {
@@ -821,6 +824,27 @@ mod tests {
             o.retry_timers.contains_key("MT-1"),
             "a requeued recovered retry must be re-armed, not left inert"
         );
+    }
+
+    // TRA-316 self-review: `due_at_ms` is an unbounded store column, and its delay now feeds a real
+    // `tokio::time::sleep`. Both extremes must arm without panicking — `i64::MIN` must not underflow
+    // the `due - now` subtraction, and `i64::MAX` must not overflow the `Instant` the sleep adds to.
+    #[tokio::test]
+    async fn boot_recovery_survives_a_corrupt_due_at() {
+        let now = utc(2026, 1, 1, 12, 0, 0);
+        let st = mem_store();
+        seed_retry(&st, "MT-MIN", i64::MIN, 0);
+        seed_retry(&st, "MT-MAX", i64::MAX, 0);
+
+        let (mut o, _) = recovery_orch(Arc::clone(&st), Arc::new(Fake::new()), now);
+        let mut rx = live_loop(&mut o);
+        o.boot_recovery();
+
+        assert!(o.retry_timers.contains_key("MT-MIN") && o.retry_timers.contains_key("MT-MAX"));
+        // Absurdly past-due clamps to zero and fires; absurdly future-due clamps to the ceiling and
+        // stays armed (never firing is the deadlock; firing early is safe — `on_retry` re-validates).
+        assert_eq!(next_retry(&mut rx).await.issue_id, "MT-MIN");
+        assert!(rx.try_recv().is_err(), "the far-future row must not fire");
     }
 
     // Mirrors Go `TestBootRecoveryEmptyStoreIsNoop`.

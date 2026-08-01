@@ -67,6 +67,15 @@ pub struct EvWorkerExit {
     pub declared_handoff: bool,
 }
 
+/// The ceiling on an armed retry delay. A real retry is minutes-scale by construction (the 1s
+/// continuation cadence, or `max_retry_backoff_ms`), so a longer delay can only come from a corrupt
+/// `due_at_ms` read back from the store — an unbounded `INTEGER` column. Handing such a value to
+/// `tokio::time::sleep` would overflow the `Instant` it is added to and panic the control task, so it
+/// is clamped here instead: firing a nonsense row EARLY is safe, because
+/// [`Orchestrator::on_retry`] re-validates it against live Linear and releases the claim if the issue
+/// is no longer eligible, whereas never firing is the TRA-316 deadlock itself.
+const MAX_RETRY_DELAY_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 /// The stable identity + project routing for a scheduled retry. Go passes these as four positional
 /// args to `scheduleRetryFor` (`id`, `identifier`, `slug`, `repo`); they are bundled here so the
 /// method keeps an idiomatic arity. `id` is the opaque map key (== the running/event id), `identifier`
@@ -374,7 +383,8 @@ impl Orchestrator {
     }
 
     /// Arms the live retry timer for `key`, firing [`Event::Retry`] with `issue_id: key` after
-    /// `max(0, delay_ms)` (Go `time.AfterFunc(delay, () => o.events <- evRetry{key})`). THE ONLY place
+    /// `delay_ms` clamped to `[0, MAX_RETRY_DELAY_MS]` (Go `time.AfterFunc(delay, () => o.events <-
+    /// evRetry{key})`). THE ONLY place
     /// a retry timer is armed — every arming path (runtime [`schedule_retry_for`], boot-recovery
     /// [`re_arm_retry`](Orchestrator::re_arm_retry) / [`arm_immediate_retry`](Orchestrator::arm_immediate_retry),
     /// and [`requeue_recovered`](Orchestrator::requeue_recovered)) goes through here, so a new path
@@ -404,7 +414,8 @@ impl Orchestrator {
         let fire_id = key.to_string();
         // A past-due entry (every boot-recovered `arm_immediate_retry`, and any row whose `due_at`
         // elapsed while the daemon was down) clamps to zero and fires immediately, never underflows.
-        let delay = std::time::Duration::from_millis(delay_ms.max(0) as u64);
+        // The upper clamp bounds a `due_at_ms` read back from the store — see `MAX_RETRY_DELAY_MS`.
+        let delay = std::time::Duration::from_millis(delay_ms.clamp(0, MAX_RETRY_DELAY_MS) as u64);
         let timer = tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {
