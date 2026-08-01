@@ -45,6 +45,7 @@ import {
   type UiGlobal,
   type UiOverrides,
 } from "@/lib/settings-model";
+import { CapabilitiesChecklist } from "./CapabilitiesChecklist";
 import { OverrideField, type OverrideMode } from "./OverrideField";
 import { PromptSource } from "./PromptSource";
 
@@ -218,6 +219,17 @@ export function AgentDetail({ agent: a, global, linearProjects, mode, onChange, 
               </span>
             ) : null}
           </div>
+        </Field>
+        <Field
+          label="Capabilities"
+          optional
+          hint="Extra practices this project's tickets should follow before handoff (code review, simplify, etc). A ticket can add more via a rhapsody:<name> Linear label; it can never remove one required here."
+        >
+          <CapabilitiesChecklist
+            selected={a.capabilities}
+            onChange={(next) => set("capabilities", next)}
+            inheritedDefault={global.capabilities}
+          />
         </Field>
       </SectionCard>
 

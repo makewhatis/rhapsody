@@ -23,6 +23,7 @@ const global: UiGlobal = {
   gitFlow: "any",
   workspaceMode: "worktree",
   labels: [],
+  capabilities: [],
   dependencyMode: "disabled",
   claimMode: "assignee",
   githubSummons: false,
