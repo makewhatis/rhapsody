@@ -10,6 +10,7 @@
 //! [`Definition`](workflow::Definition) into a defaulted (but not yet resolved or
 //! validated) [`Config`].
 
+pub mod capabilities;
 pub mod decode;
 pub mod effective_json;
 pub mod encode;

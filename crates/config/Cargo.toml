@@ -25,6 +25,9 @@ chrono = "0.4"
 # Golden parity assertions for the effective-config view (C6): load the committed fixtures and
 # apply the shared `normalize` rules (Task R5).
 harness-fixtures = { path = "../harness-fixtures" }
+# tempfile: scratch dirs for the capabilities load_or_seed round-trip tests. Pinned to the
+# version already locked in the workspace (transitively via native-tls).
+tempfile = "3.27.0"
 
 [lints]
 workspace = true
