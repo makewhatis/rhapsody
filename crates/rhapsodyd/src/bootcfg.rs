@@ -4,7 +4,7 @@
 //! presentation data (server port + storage + otel + resolved projects). Kept as pure functions over
 //! the workflow path / resolved config so the boot and the tests drive them the same way.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Duration;
@@ -86,6 +86,32 @@ pub fn open_store(
             tracing::error!(path = %path, err = %e, "open store failed; continuing with persistence disabled");
             Arc::new(Noop)
         }
+    }
+}
+
+/// Resolves the path of the agent-capabilities registry file (`capabilities.yaml`, BO-12), colocated
+/// with the durable store in Rhapsody's runtime home (`~/.rhapsody/capabilities.yaml` for the default
+/// on-disk store). Reuses the SAME resolved `storage.path` the store-open path uses for `rhapsody.db`
+/// (`--db` override wins, via [`parse_store_path`]), so a custom store location keeps the registry
+/// alongside it and tests stay hermetic. Returns `None` when there is no on-disk store directory to
+/// anchor the file to — a disabled (`--no-store` / `off`) or in-memory (`:memory:`) store, or a failed
+/// config load — in which case the daemon runs without a registry and capability rendering is a no-op
+/// rather than seeding a file with no natural home. Mirrors [`open_store`]'s path decision.
+pub fn resolve_capabilities_path(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    if no_store {
+        return None;
+    }
+    let mut path = db_override.to_string();
+    if path.is_empty() {
+        path = cfg?.storage.path.clone();
+    }
+    match parse_store_path(&path) {
+        StorePath::Disk(p) => p.parent().map(|d| d.join("capabilities.yaml")),
+        StorePath::Off | StorePath::InMemory => None,
     }
 }
 
@@ -313,6 +339,36 @@ mod tests {
             d.projects[0].billing_guard,
             "billing guard defaults to enabled"
         );
+    }
+
+    // BO-12: the capabilities registry colocates with the on-disk store; disabled / in-memory / a
+    // failed load yield None so the daemon runs without a registry (capability rendering a no-op).
+    #[test]
+    fn resolve_capabilities_path_variants() {
+        // Default (unset) storage resolves to ~/.rhapsody/rhapsody.db → capabilities.yaml sits beside it.
+        let dir = TempDir::new();
+        let ws = dir.child("ws");
+        let wf = write_wf(&dir, &valid_wf(&ws));
+        let cfg = resolve(
+            decode(&workflow::load(&wf).expect("load")).expect("decode"),
+            &workflow_dir(&wf),
+        )
+        .expect("resolve");
+        let got = resolve_capabilities_path(Some(&cfg), "", false).expect("on-disk default → Some");
+        assert!(
+            got.ends_with(".rhapsody/capabilities.yaml"),
+            "default path should be ~/.rhapsody/capabilities.yaml, got {}",
+            got.display()
+        );
+        // --db override wins and colocates the registry with the overridden store dir.
+        let over =
+            resolve_capabilities_path(None, "/tmp/somewhere/store.db", false).expect("--db → Some");
+        assert_eq!(over, PathBuf::from("/tmp/somewhere/capabilities.yaml"));
+        // Disabled / in-memory / no config → None (registry off, capabilities a no-op).
+        assert_eq!(resolve_capabilities_path(Some(&cfg), "", true), None); // --no-store
+        assert_eq!(resolve_capabilities_path(None, "off", false), None);
+        assert_eq!(resolve_capabilities_path(None, ":memory:", false), None);
+        assert_eq!(resolve_capabilities_path(None, "", false), None); // failed load (cfg None)
     }
 
     // Mirrors Go `TestResolveBannerStorageVariants`.
