@@ -100,6 +100,7 @@ vi.mock("@/lib/api", async (orig) => {
     github_summons: false,
     milestone: "",
     labels: [],
+    capabilities: [],
     prompt: "p",
     prompt_file: "",
     git_flow: "",
