@@ -13,7 +13,8 @@
 //! handler rather than earlier.
 
 use rhapsody_store::{
-    DayRollup, EventHit, EventQuery, EventRow, RunFilter, RunMessage, RunSummary, StoreError,
+    DayRollup, DayTotals, EventHit, EventQuery, EventRow, RunFilter, RunMessage, RunSummary,
+    StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -24,6 +25,12 @@ use rhapsody_store::{
 pub trait HistoryStore: Send + Sync {
     /// Paged/filterable recent runs (`GET /api/v1/history`). Mirrors Go `ListRuns`.
     fn list_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError>;
+    /// One row per issue — each issue's latest matching run, paged by ISSUE
+    /// (`GET /api/v1/history/issues`, TRA-320). Rhapsody-only; Go has no issue-level listing.
+    fn list_issue_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError>;
+    /// Whole-store run/token/runtime totals over a window (`GET /api/v1/history/summary`,
+    /// TRA-320). Rhapsody-only; Go has no day-summary endpoint.
+    fn day_totals(&self, since: &str, now: &str) -> Result<DayTotals, StoreError>;
     /// A single issue's run history, most-recent first (`GET /api/v1/issues/{id}/history`). Mirrors
     /// Go `IssueHistory`.
     fn issue_history(
@@ -56,6 +63,12 @@ pub trait HistoryStore: Send + Sync {
 impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     fn list_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
         rhapsody_store::Store::list_runs(self, f)
+    }
+    fn list_issue_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
+        rhapsody_store::Store::list_issue_runs(self, f)
+    }
+    fn day_totals(&self, since: &str, now: &str) -> Result<DayTotals, StoreError> {
+        rhapsody_store::Store::day_totals(self, since, now)
     }
     fn issue_history(
         &self,

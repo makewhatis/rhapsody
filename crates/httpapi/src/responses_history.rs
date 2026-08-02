@@ -13,7 +13,7 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_orchestrator::{EventRecord, RunningRow};
-use rhapsody_store::{DayRollup, EventHit, EventRow, RunSummary};
+use rhapsody_store::{DayRollup, DayTotals, EventHit, EventRow, RunSummary};
 use serde_json::{Value, json};
 
 /// Bounds the activity timeline a finished run's detail carries, matching the live snapshot's
@@ -177,6 +177,35 @@ pub(crate) fn history_response(runs: &[RunSummary], next_offset: Option<i64>) ->
     json!({
         "runs": Value::Array(runs.iter().map(run_summary_json).collect()),
         "next_offset": next_offset,
+    })
+}
+
+/// `{issues:[…], next_offset:…}` — the `GET /api/v1/history/issues` payload (TRA-320). Each entry is
+/// a full run summary: the LATEST run of one issue. Same envelope shape as `history_response`, under
+/// a distinct key so a client can never mistake an issue-paged listing for a run-paged one.
+/// Rhapsody-only — Go has no issue-level listing.
+pub(crate) fn issue_runs_response(runs: &[RunSummary], next_offset: Option<i64>) -> Value {
+    json!({
+        "issues": Value::Array(runs.iter().map(run_summary_json).collect()),
+        "next_offset": next_offset,
+    })
+}
+
+/// The `GET /api/v1/history/summary` payload (TRA-320): whole-store totals over the runs that
+/// started at or after `since`, echoed back so the client can confirm which window it was served.
+/// `total_tokens` is the cache-INCLUSIVE billed total (`cached = total − in − out`), unchanged in
+/// meaning from the per-run column. `rhythm` is the most recent runs' `total_tokens`, oldest→newest.
+/// Rhapsody-only — Go has no day-summary endpoint.
+pub(crate) fn history_summary_response(since: &str, t: &DayTotals, rhythm: &[i64]) -> Value {
+    json!({
+        "since": since,
+        "runs": t.runs,
+        "completed": t.completed,
+        "input_tokens": t.input_tokens,
+        "output_tokens": t.output_tokens,
+        "total_tokens": t.total_tokens,
+        "seconds": t.seconds,
+        "rhythm": Value::Array(rhythm.iter().map(|v| json!(v)).collect()),
     })
 }
 

@@ -611,6 +611,16 @@ mod tests {
         fn list_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
             self.0.list_runs(f)
         }
+        fn list_issue_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
+            self.0.list_issue_runs(f)
+        }
+        fn day_totals(
+            &self,
+            since: &str,
+            now: &str,
+        ) -> Result<rhapsody_store::DayTotals, StoreError> {
+            self.0.day_totals(since, now)
+        }
         fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
             self.0.get_run(run_id)
         }

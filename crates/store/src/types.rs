@@ -226,6 +226,29 @@ pub struct DayRollup {
     pub total_tokens: i64,
 }
 
+/// DayTotals is the whole-store aggregation over the runs that STARTED within a window — the
+/// header "today" figures (TRA-320). Computed in SQL over every matching row so the numbers never
+/// depend on which page of `/api/v1/history` a client happened to fetch.
+///
+/// `seconds` mirrors the dashboard's per-run rule exactly: an in-flight (`outcome = "running"`) run
+/// contributes its elapsed time against the caller-supplied `now`, a finished run contributes
+/// `ended_at - started_at`, and a row whose timestamps don't parse contributes 0. Rows are unique by
+/// run id, so the de-duplication the client used to do by hand is structural here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DayTotals {
+    /// Runs that started within the window.
+    pub runs: i64,
+    /// Of those, the ones whose stored outcome is `completed`.
+    pub completed: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// The cache-INCLUSIVE billed total (`input + output + cache_creation + cache_read`), NOT
+    /// `input + output` — the same meaning the `runs.total_tokens` column carries per row.
+    pub total_tokens: i64,
+    /// Whole seconds of run time in the window (in-flight runs counted as elapsed-so-far).
+    pub seconds: i64,
+}
+
 /// RunMessage is one operator message sent to a run's agent (INF-250). `body` is the operator's
 /// ORIGINAL text; the prompt-side labeled wrapper is applied at admission and is NOT stored.
 /// `status` is sent | delivered | expired; `delivered_turn` is set only once the runner actually

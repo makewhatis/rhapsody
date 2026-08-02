@@ -19,8 +19,8 @@ use rhapsody_orchestrator::{
 use crate::handlers::{handle_healthz, handle_refresh, handle_state};
 use crate::handlers_config::handle_config;
 use crate::handlers_history::{
-    handle_event_search, handle_history, handle_issue_history, handle_metrics, handle_run_detail,
-    handle_run_events, handle_run_transcript,
+    handle_event_search, handle_history, handle_history_summary, handle_issue_history,
+    handle_issue_runs, handle_metrics, handle_run_detail, handle_run_events, handle_run_transcript,
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
@@ -252,6 +252,12 @@ where
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.
         .route("/api/v1/history", any(handle_history))
+        // Rhapsody-only history surfaces (TRA-320): an ISSUE-paged listing (one row per issue) and
+        // whole-store day totals, so the dashboard's Jobs list and header cells stop being derived
+        // from whatever run page the client happened to fetch. Both are static paths, so they never
+        // contend with `/api/v1/history` itself.
+        .route("/api/v1/history/issues", any(handle_issue_runs))
+        .route("/api/v1/history/summary", any(handle_history_summary))
         .route("/api/v1/events", any(handle_event_search))
         .route("/api/v1/metrics", any(handle_metrics))
         .route("/api/v1/runs/{id}/events", any(handle_run_events))
