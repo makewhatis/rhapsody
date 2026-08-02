@@ -106,3 +106,42 @@ cancel-type and Done-type states keep their existing semantics and a move to any
 state is still `"ticket moved externally"`. With `review_states` unset — the Go default — behavior is
 byte-identical to the reference. No new `OUTCOME_*` constant is introduced; the missing hand-off
 declaration is preserved as a `tracing::warn!` naming the run, issue and state.
+
+### Honest history paging + store-computed dashboard aggregates (TRA-320)
+
+Go's `handleHistory` derives `next_offset` from the limit the CALLER sent, while the store applies
+`defaultRunLimit = 50` whenever the caller sends none. A request with no `limit` therefore returns a
+silently truncated 50-row page **and** `next_offset: null` — the rest of the history is unreachable
+without guessing a limit. Observed against a live daemon holding 192 runs: the dashboard read the
+truncated page as the whole store and reported 3 jobs and 5.4M tokens today against a real 76 issues
+and 53.9M.
+
+| `GET /api/v1/history` with 192 rows stored | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `?limit=50` | 50 rows, `next_offset: 50` | unchanged |
+| *(no limit)* | 50 rows, `next_offset: null` | 50 rows, **`next_offset: 50`** |
+| `?limit=500` | 192 rows, `next_offset: null` | unchanged |
+
+`next_offset` is now computed from the page size the store ACTUALLY applied
+(`rhapsody_store::effective_run_limit`, the single source of truth for the `<= 0 ⇒ default` rule).
+The default limit itself is unchanged at 50 — raising it would move the truncation cliff without
+removing it, and would leave `next_offset` still lying on the default path.
+
+Two **additive** Rhapsody-only endpoints support the dashboard; no existing payload changes shape,
+and the `api/history.json` golden is untouched:
+
+| Endpoint | Serves |
+| --- | --- |
+| `GET /api/v1/history/issues` | one row per issue (its latest matching run), paged by **issue** |
+| `GET /api/v1/history/summary?since=` | whole-store run/token/runtime totals for a window |
+
+Both exist because the dashboard's two headline surfaces cannot be derived correctly from a
+run-paged fetch at any page size. An issue-grouped Jobs list built by grouping runs lets one ticket
+in a retry loop consume the entire page — 90 failures hid 73 other issues — and header totals folded
+over a page report a sample as a total. Grouping and aggregation therefore happen in SQL.
+
+The day boundary for `/history/summary` is **local, not UTC**: the caller sends its own local
+midnight as `since` (the dashboard does), and omitting it falls back to the daemon host's local
+midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would
+silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
+meaning, so the header's `cached = total − in − out` reconciliation still adds up.

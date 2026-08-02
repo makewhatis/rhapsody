@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useStateQuery } from "@/hooks/useStateQuery";
-import { useHistory } from "@/hooks/useHistory";
+import { useDaySummary, useIssueRuns } from "@/hooks/useHistory";
 import { useLinearProjects, useTypedConfigQuery } from "@/hooks/useConfig";
 import { useNow } from "@/hooks/useNow";
 import { mergeJobs } from "@/lib/runs-model";
@@ -18,7 +18,10 @@ import { RunDetail } from "./RunDetail";
 export function RunsView() {
   const { data: state } = useStateQuery();
   const pollMs = state?.poll_interval_ms;
-  const history = useHistory({}, { refetchInterval: pollMs ?? 2000 });
+  // The Jobs list reads the ISSUE-level listing and the header reads the daemon's day totals — two
+  // queries with two jobs, because one issue-grouped list and one set of totals cannot both be
+  // derived correctly from a single run-paged fetch (TRA-320).
+  const issues = useIssueRuns({}, { refetchInterval: pollMs ?? 2000 });
   const projects = useLinearProjects().data ?? [];
   // Seat capacity ("of N seats") + the "/max" turn cell come from the resolved daemon config; both
   // fall back to omitted (no seat annotation / bare turn count) while the config is still loading.
@@ -27,6 +30,7 @@ export function RunsView() {
   const maxConcurrent = config?.global?.agent.max_concurrent_agents ?? 0;
   const maxTurns = config?.global?.agent.max_turns;
   const nowMs = useNow(1000);
+  const summary = useDaySummary(nowMs, { refetchInterval: pollMs ?? 2000 });
   const [openRunId, setOpenRunId] = React.useState<number | null>(null);
 
   if (openRunId != null) {
@@ -48,12 +52,18 @@ export function RunsView() {
     );
   }
 
-  const historyRuns = history.data?.runs ?? [];
-  const rows = mergeJobs(state, historyRuns, projects, nowMs);
+  const issueRuns = issues.data?.issues ?? [];
+  const rows = mergeJobs(state, issueRuns, projects, nowMs);
 
   return (
     <div style={{ minWidth: 0 }}>
-      <RunsStatTiles state={state} history={historyRuns} nowMs={nowMs} maxConcurrent={maxConcurrent} live />
+      <RunsStatTiles
+        state={state}
+        summary={summary.data}
+        rows={issueRuns}
+        maxConcurrent={maxConcurrent}
+        live
+      />
       <JobsList rows={rows} pollMs={pollMs} maxTurns={maxTurns} polling onSelect={setOpenRunId} />
     </div>
   );
