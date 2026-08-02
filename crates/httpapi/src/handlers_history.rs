@@ -43,11 +43,11 @@ pub(crate) async fn handle_history(
     if let Some(resp) = require_get(&method) {
         return resp;
     }
-    let (f, offset) = match run_filter_from_query(&q) {
-        Ok(v) => v,
+    let f = match run_filter_from_query(&q) {
+        Ok(f) => f,
         Err(resp) => return *resp,
     };
-    let effective_limit = effective_run_limit(f.limit);
+    let (offset, effective_limit) = (f.offset, effective_run_limit(f.limit));
     let runs = match provider.history().list_runs(f) {
         Ok(runs) => runs,
         Err(_) => return store_error("history query failed"),
@@ -73,11 +73,11 @@ pub(crate) async fn handle_issue_runs(
     if let Some(resp) = require_get(&method) {
         return resp;
     }
-    let (f, offset) = match run_filter_from_query(&q) {
-        Ok(v) => v,
+    let f = match run_filter_from_query(&q) {
+        Ok(f) => f,
         Err(resp) => return *resp,
     };
-    let effective_limit = effective_run_limit(f.limit);
+    let (offset, effective_limit) = (f.offset, effective_run_limit(f.limit));
     let runs = match provider.history().list_issue_runs(f) {
         Ok(runs) => runs,
         Err(_) => return store_error("issue listing query failed"),
@@ -159,22 +159,18 @@ fn next_offset(returned: usize, offset: i64, effective_limit: i64) -> Option<i64
 }
 
 /// Parse the shared `issue`/`outcome`/`since`/`project`/`limit`/`offset` query params into a
-/// [`RunFilter`], returning the validated offset alongside it (paging math needs the value even when
-/// the filter is moved into the store call). `limit`/`offset` must be non-negative when present.
-fn run_filter_from_query(q: &HashMap<String, String>) -> Result<(RunFilter, i64), Box<Response>> {
-    let limit = parse_non_neg_int(qget(q, "limit"), "limit")?;
-    let offset = parse_non_neg_int(qget(q, "offset"), "offset")?;
-    Ok((
-        RunFilter {
-            issue: qget(q, "issue").to_string(),
-            outcome: qget(q, "outcome").to_string(),
-            since: qget(q, "since").to_string(),
-            project: qget(q, "project").to_string(),
-            limit,
-            offset,
-        },
-        offset,
-    ))
+/// [`RunFilter`]. `limit`/`offset` must be non-negative integers when present (else a 400 envelope).
+/// Shared by `/history` and `/history/issues`, which take identical filters and differ only in what
+/// a page counts.
+fn run_filter_from_query(q: &HashMap<String, String>) -> Result<RunFilter, Box<Response>> {
+    Ok(RunFilter {
+        issue: qget(q, "issue").to_string(),
+        outcome: qget(q, "outcome").to_string(),
+        since: qget(q, "since").to_string(),
+        project: qget(q, "project").to_string(),
+        limit: parse_non_neg_int(qget(q, "limit"), "limit")?,
+        offset: parse_non_neg_int(qget(q, "offset"), "offset")?,
+    })
 }
 
 /// Midnight of the DAEMON host's current local day, as a UTC RFC3339 instant — the `/history/summary`
