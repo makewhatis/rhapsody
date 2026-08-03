@@ -221,8 +221,20 @@ fn days_ago_rfc3339(days: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Default page size for history run queries (Go `defaultRunLimit`).
-const DEFAULT_RUN_LIMIT: i64 = 50;
+/// Default page size for history run queries (Go `defaultRunLimit`). Public because the HTTP layer
+/// must know the page size that will ACTUALLY be applied in order to report `next_offset` honestly
+/// — a caller that sends no `limit` still gets a bounded page, and telling it otherwise loses every
+/// row past the first page (TRA-320). Resolve it through [`effective_run_limit`] rather than
+/// re-deriving the `<= 0` rule at the call site.
+pub const DEFAULT_RUN_LIMIT: i64 = 50;
+
+/// The page size a run query will actually apply for a requested `limit`: the caller's value when
+/// positive, else [`DEFAULT_RUN_LIMIT`]. Single source of truth for the default, shared by
+/// [`Store::list_runs`]/[`Store::issue_history`]/[`Store::list_issue_runs`] and by the history
+/// handler that derives `next_offset` from it (TRA-320).
+pub fn effective_run_limit(limit: i64) -> i64 {
+    if limit <= 0 { DEFAULT_RUN_LIMIT } else { limit }
+}
 /// Default limit for the cross-run event search (Go `defaultEventLimit`).
 const DEFAULT_EVENT_LIMIT: i64 = 100;
 
@@ -257,6 +269,37 @@ fn map_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
         usage_estimated: row.get(18)?,
         team_id: row.get(19)?,
     })
+}
+
+/// Build the ` WHERE …` clause (empty string when unfiltered) and its bound arguments for a
+/// [`RunFilter`], in the column order Go's `ListRuns` appends them. Shared by [`Store::list_runs`]
+/// and [`Store::list_issue_runs`] so run-paged and issue-paged listings can never drift on which
+/// rows they select — only on how they page (TRA-320).
+fn run_filter_where(f: &RunFilter) -> (String, Vec<Value>) {
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut args: Vec<Value> = Vec::new();
+    if !f.issue.is_empty() {
+        clauses.push("issue_identifier = ?");
+        args.push(Value::Text(f.issue.clone()));
+    }
+    if !f.outcome.is_empty() {
+        clauses.push("outcome = ?");
+        args.push(Value::Text(f.outcome.clone()));
+    }
+    if !f.since.is_empty() {
+        clauses.push("started_at >= ?");
+        args.push(Value::Text(f.since.clone()));
+    }
+    if !f.project.is_empty() {
+        clauses.push("project_slug = ?");
+        args.push(Value::Text(f.project.clone()));
+    }
+    let sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    (sql, args)
 }
 
 /// Escape LIKE wildcards so a user's literal `%` or `_` matches literally (paired with `ESCAPE
@@ -563,39 +606,79 @@ impl Store for Sqlite {
     }
 
     fn list_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
-        let mut where_clauses: Vec<&str> = Vec::new();
-        let mut args: Vec<Value> = Vec::new();
-        if !f.issue.is_empty() {
-            where_clauses.push("issue_identifier = ?");
-            args.push(Value::Text(f.issue.clone()));
-        }
-        if !f.outcome.is_empty() {
-            where_clauses.push("outcome = ?");
-            args.push(Value::Text(f.outcome.clone()));
-        }
-        if !f.since.is_empty() {
-            where_clauses.push("started_at >= ?");
-            args.push(Value::Text(f.since.clone()));
-        }
-        if !f.project.is_empty() {
-            where_clauses.push("project_slug = ?");
-            args.push(Value::Text(f.project.clone()));
-        }
-        let limit = if f.limit <= 0 {
-            DEFAULT_RUN_LIMIT
-        } else {
-            f.limit
-        };
+        let (where_sql, mut args) = run_filter_where(&f);
+        let limit = effective_run_limit(f.limit);
         let offset = if f.offset < 0 { 0 } else { f.offset };
-        let mut q = format!("SELECT {RUN_COLS} FROM runs");
-        if !where_clauses.is_empty() {
-            q.push_str(" WHERE ");
-            q.push_str(&where_clauses.join(" AND "));
-        }
-        q.push_str(" ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?");
+        let q = format!(
+            "SELECT {RUN_COLS} FROM runs{where_sql} \
+             ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
         args.push(Value::Integer(limit));
         args.push(Value::Integer(offset));
         self.query_runs(&q, args)
+    }
+
+    fn list_issue_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
+        let (where_sql, mut args) = run_filter_where(&f);
+        let limit = effective_run_limit(f.limit);
+        let offset = if f.offset < 0 { 0 } else { f.offset };
+        // ROW_NUMBER() over the per-issue partition keeps only each issue's newest matching run, so
+        // LIMIT/OFFSET page over ISSUES. The partition key sends an unattributed run (empty
+        // identifier) to a partition of its own — `run:<id>` can never collide with a real Linear
+        // identifier — so those rows stay individual instead of collapsing into one synthetic row.
+        // Because the kept row IS each partition's newest, ordering the survivors by started_at is
+        // already "most recent activity first".
+        let q = format!(
+            "SELECT {RUN_COLS} FROM (
+               SELECT {RUN_COLS}, ROW_NUMBER() OVER (
+                        PARTITION BY CASE WHEN issue_identifier = '' THEN 'run:' || id
+                                          ELSE 'issue:' || issue_identifier END
+                        ORDER BY started_at DESC, id DESC
+                      ) AS rn
+                 FROM runs{where_sql}
+             )
+              WHERE rn = 1
+              ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        args.push(Value::Integer(limit));
+        args.push(Value::Integer(offset));
+        self.query_runs(&q, args)
+    }
+
+    fn day_totals(&self, since: &str, now: &str) -> Result<DayTotals, StoreError> {
+        // Per-run runtime mirrors the dashboard rule this replaces: an in-flight run counts its
+        // elapsed time against `now`, a finished one counts ended_at - started_at. strftime yields
+        // NULL for an unparseable/empty timestamp, and SUM skips NULLs, so a malformed row
+        // contributes 0 seconds rather than poisoning the total (the client also scored it 0).
+        // COUNT/SUM run over every matching row in the table — never over a page.
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN outcome = ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(
+                      max(0, CAST(strftime('%s', CASE WHEN outcome = ?2 THEN ?3 ELSE ended_at END)
+                                  AS INTEGER)
+                           - CAST(strftime('%s', started_at) AS INTEGER))), 0)
+               FROM runs
+              WHERE started_at >= ?4",
+        )?;
+        let totals = stmt.query_row(
+            params![OUTCOME_COMPLETED, OUTCOME_RUNNING, now, since],
+            |row| {
+                Ok(DayTotals {
+                    runs: row.get(0)?,
+                    completed: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                    seconds: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(totals)
     }
 
     fn issue_history(
@@ -604,7 +687,7 @@ impl Store for Sqlite {
         project: &str,
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError> {
-        let limit = if limit <= 0 { DEFAULT_RUN_LIMIT } else { limit };
+        let limit = effective_run_limit(limit);
         if project.is_empty() {
             let q = format!(
                 "SELECT {RUN_COLS} FROM runs WHERE issue_identifier = ? \
@@ -1443,6 +1526,306 @@ mod tests {
             page0[0].id, page1[0].id,
             "paging returned the same row twice"
         );
+    }
+
+    // TRA-320 — the paging default is a shared, observable rule, not a private `<= 0` branch
+    // duplicated at every call site: the HTTP layer resolves it to report `next_offset` honestly.
+    #[test]
+    fn effective_run_limit_resolves_the_default() {
+        assert_eq!(effective_run_limit(0), DEFAULT_RUN_LIMIT, "0 => default");
+        assert_eq!(
+            effective_run_limit(-7),
+            DEFAULT_RUN_LIMIT,
+            "negative => default"
+        );
+        assert_eq!(effective_run_limit(1), 1, "positive => verbatim");
+        assert_eq!(effective_run_limit(500), 500, "positive => verbatim");
+    }
+
+    // TRA-320 Defect 3, mirroring the observed incident: TRA-309 failed 90 times in a clone-retry
+    // loop and reduced a 10-issue jobs list to 3 rows. Paging by ISSUE must return one row per
+    // issue regardless of how many runs each produced.
+    #[test]
+    fn list_issue_runs_pages_by_issue_not_by_run() {
+        let st = open_mem();
+        let seed = |ident: &str, started: &str, outcome: &str| {
+            let id = st
+                .start_run(RunStart {
+                    issue_identifier: ident.into(),
+                    started_at: started.into(),
+                    ..Default::default()
+                })
+                .expect("start");
+            st.end_run(
+                id,
+                RunEnd {
+                    outcome: outcome.into(),
+                    ended_at: started.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+            id
+        };
+        // Nine quiet issues, one run each, earliest.
+        for i in 0..9 {
+            seed(
+                &format!("TRA-4{i:02}"),
+                &format!("2026-08-01T01:{i:02}:00Z"),
+                OUTCOME_COMPLETED,
+            );
+        }
+        // The noisy issue: 90 failures in a retry loop, all NEWER — exactly the observed incident.
+        let mut newest_noisy = 0;
+        for i in 0..90 {
+            newest_noisy = seed(
+                "TRA-309",
+                &format!("2026-08-01T{:02}:{:02}:00Z", 2 + i / 60, i % 60),
+                OUTCOME_FAILED,
+            );
+        }
+
+        // A run-paged fetch is exactly the broken behavior: the first default page is all TRA-309,
+        // and the nine other issues are unrendered.
+        let by_run = st.list_runs(RunFilter::default()).expect("list_runs");
+        assert_eq!(by_run.len(), DEFAULT_RUN_LIMIT as usize);
+        let distinct_by_run: std::collections::HashSet<_> =
+            by_run.iter().map(|r| r.issue_identifier.as_str()).collect();
+        assert_eq!(
+            distinct_by_run.len(),
+            1,
+            "precondition: the run-paged page is entirely the noisy issue"
+        );
+
+        // Issue-paged: 10 rows, one per issue, on the FIRST page.
+        let by_issue = st
+            .list_issue_runs(RunFilter::default())
+            .expect("list_issue_runs");
+        assert_eq!(by_issue.len(), 10, "one row per issue on the first page");
+        let distinct: std::collections::HashSet<_> = by_issue
+            .iter()
+            .map(|r| r.issue_identifier.as_str())
+            .collect();
+        assert_eq!(distinct.len(), 10, "every row is a different issue");
+        // The kept row is each issue's NEWEST run, and most-recent activity sorts first.
+        assert_eq!(
+            by_issue[0].issue_identifier, "TRA-309",
+            "most recent activity first"
+        );
+        assert_eq!(
+            by_issue[0].id, newest_noisy,
+            "the newest run represents the issue"
+        );
+    }
+
+    // TRA-320 — issue paging counts ISSUES, and unattributed runs (empty identifier) are never
+    // collapsed into one synthetic row.
+    #[test]
+    fn list_issue_runs_paging_and_unattributed_rows() {
+        let st = open_mem();
+        let seed = |ident: &str, started: &str| {
+            st.start_run(RunStart {
+                issue_identifier: ident.into(),
+                started_at: started.into(),
+                ..Default::default()
+            })
+            .expect("start")
+        };
+        for i in 0..3 {
+            seed("MT-1", &format!("2026-01-01T00:0{i}:00Z"));
+        }
+        seed("MT-2", "2026-01-01T01:00:00Z");
+        // Two unattributed runs: distinct rows, not one merged "" group.
+        seed("", "2026-01-01T02:00:00Z");
+        seed("", "2026-01-01T03:00:00Z");
+
+        let all = st.list_issue_runs(RunFilter::default()).expect("all");
+        assert_eq!(all.len(), 4, "MT-1 + MT-2 + two unattributed rows");
+        assert_eq!(
+            all.iter().filter(|r| r.issue_identifier.is_empty()).count(),
+            2
+        );
+
+        let page0 = st
+            .list_issue_runs(RunFilter {
+                limit: 2,
+                offset: 0,
+                ..Default::default()
+            })
+            .expect("page0");
+        let page1 = st
+            .list_issue_runs(RunFilter {
+                limit: 2,
+                offset: 2,
+                ..Default::default()
+            })
+            .expect("page1");
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page1.len(), 2);
+        let ids: std::collections::HashSet<_> =
+            page0.iter().chain(page1.iter()).map(|r| r.id).collect();
+        assert_eq!(ids.len(), 4, "the two pages don't overlap");
+
+        // Filters apply before grouping, exactly as they do for the run-paged listing.
+        let scoped = st
+            .list_issue_runs(RunFilter {
+                issue: "MT-1".into(),
+                ..Default::default()
+            })
+            .expect("scoped");
+        assert_eq!(scoped.len(), 1, "one row for the one matching issue");
+        assert_eq!(
+            scoped[0].started_at, "2026-01-01T00:02:00Z",
+            "its newest run"
+        );
+    }
+
+    // TRA-320 Defect 2: the day totals are a whole-store SUM, not a fold over a page — with more
+    // runs than one page they must still match a direct aggregate.
+    #[test]
+    fn day_totals_aggregate_the_whole_store_not_a_page() {
+        let st = open_mem();
+        // 120 finished runs today (> 2 default pages), each 60s and 1000 total tokens.
+        for i in 0..120 {
+            let id = st
+                .start_run(RunStart {
+                    issue_identifier: format!("MT-{i}"),
+                    started_at: format!("2026-08-01T{:02}:{:02}:00Z", i / 60, i % 60),
+                    ..Default::default()
+                })
+                .expect("start");
+            st.end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: format!("2026-08-01T{:02}:{:02}:00Z", (i + 1) / 60, (i + 1) % 60),
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    total_tokens: 1000,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        }
+        // One run BEFORE the window — must not be counted.
+        let old = st
+            .start_run(RunStart {
+                issue_identifier: "MT-old".into(),
+                started_at: "2026-07-31T23:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start old");
+        st.end_run(
+            old,
+            RunEnd {
+                outcome: OUTCOME_COMPLETED.into(),
+                ended_at: "2026-07-31T23:30:00Z".into(),
+                total_tokens: 999_999,
+                ..Default::default()
+            },
+        )
+        .expect("end old");
+
+        let got = st
+            .day_totals("2026-08-01T00:00:00Z", "2026-08-01T12:00:00Z")
+            .expect("day_totals");
+        assert_eq!(got.runs, 120, "every run in the window, not one page");
+        assert_eq!(got.completed, 120);
+        assert_eq!(got.input_tokens, 120 * 10);
+        assert_eq!(got.output_tokens, 120 * 20);
+        assert_eq!(got.total_tokens, 120 * 1000);
+        assert_eq!(got.seconds, 120 * 60);
+
+        // Cross-check against a direct SQL aggregate over the same window.
+        let conn = st.lock();
+        let (runs, tokens): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM runs \
+                   WHERE started_at >= '2026-08-01T00:00:00Z'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("direct sum");
+        assert_eq!(
+            (got.runs, got.total_tokens),
+            (runs, tokens),
+            "matches a direct SUM"
+        );
+    }
+
+    // TRA-320 — an in-flight run contributes elapsed-so-far (measured against `now`), counted once;
+    // a row with an unparseable/absent end contributes 0 rather than poisoning the sum.
+    #[test]
+    fn day_totals_include_in_flight_elapsed_once() {
+        let st = open_mem();
+        let running = st
+            .start_run(RunStart {
+                issue_identifier: "MT-live".into(),
+                started_at: "2026-08-01T10:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start running");
+        st.update_run_progress(
+            running,
+            RunProgress {
+                turns: 3,
+                input_tokens: 5,
+                output_tokens: 7,
+                total_tokens: 100,
+                ..Default::default()
+            },
+        )
+        .expect("progress");
+        let done = st
+            .start_run(RunStart {
+                issue_identifier: "MT-done".into(),
+                started_at: "2026-08-01T09:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start done");
+        st.end_run(
+            done,
+            RunEnd {
+                outcome: OUTCOME_COMPLETED.into(),
+                ended_at: "2026-08-01T09:00:30Z".into(),
+                total_tokens: 50,
+                ..Default::default()
+            },
+        )
+        .expect("end done");
+
+        let got = st
+            .day_totals("2026-08-01T00:00:00Z", "2026-08-01T10:05:00Z")
+            .expect("day_totals");
+        assert_eq!(got.runs, 2, "the live row is counted exactly once");
+        assert_eq!(got.completed, 1);
+        assert_eq!(got.total_tokens, 150, "live progress + finished total");
+        assert_eq!(
+            got.seconds,
+            5 * 60 + 30,
+            "live elapsed (5m) + finished span (30s)"
+        );
+
+        // A `now` BEFORE the live run started clamps ITS elapsed to 0 (never negative), leaving
+        // only the finished run's 30s span.
+        let clamped = st
+            .day_totals("2026-08-01T00:00:00Z", "2026-08-01T08:00:00Z")
+            .expect("clamped");
+        assert_eq!(
+            clamped.seconds, 30,
+            "live elapsed clamped at 0, finished span kept"
+        );
+    }
+
+    // TRA-320 — an empty window matches nothing and yields all-zero totals (not an error), so a
+    // fresh install renders "0" rather than failing the header.
+    #[test]
+    fn day_totals_empty_window_is_zero() {
+        let st = open_mem();
+        let got = st
+            .day_totals("2999-01-01T00:00:00Z", "2999-01-01T01:00:00Z")
+            .expect("day_totals");
+        assert_eq!(got, DayTotals::default());
     }
 
     // Mirror TestIssueHistory: per-issue history with an optional project scope.

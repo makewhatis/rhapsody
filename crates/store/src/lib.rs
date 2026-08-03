@@ -13,7 +13,7 @@ mod sqlite;
 mod types;
 
 pub use noop::Noop;
-pub use sqlite::Sqlite;
+pub use sqlite::{DEFAULT_RUN_LIMIT, Sqlite, effective_run_limit};
 pub use types::*;
 
 /// The resolved storage mode for the durable history + recovery store.
@@ -131,6 +131,19 @@ pub trait Store {
 
     // --- history / queries (read-only, for the HTTP API) ---
     fn list_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError>;
+    /// One row per issue — the LATEST run of each `issue_identifier` matching `f`, most-recent
+    /// first, paged by ISSUE (`f.limit`/`f.offset` count issues, not runs). The issue-grouped
+    /// dashboard list reads this instead of grouping a run-paged fetch, so a single issue in a
+    /// retry loop occupies exactly one row and cannot crowd other issues off the page (TRA-320).
+    ///
+    /// Runs with an empty `issue_identifier` are unattributed and are NOT grouped together: each
+    /// stays its own row, matching the client-side grouping this replaces.
+    fn list_issue_runs(&self, f: RunFilter) -> Result<Vec<RunSummary>, StoreError>;
+    /// Whole-store token/runtime/run-count totals over the runs that started at or after `since`
+    /// (an RFC3339 lower bound on `started_at`, compared as a string exactly like [`RunFilter::since`]).
+    /// `now` is the RFC3339 instant an in-flight run's elapsed time is measured against. Backs the
+    /// dashboard's header "today" cells, which must never be a fold over one fetched page (TRA-320).
+    fn day_totals(&self, since: &str, now: &str) -> Result<DayTotals, StoreError>;
     fn issue_history(
         &self,
         identifier: &str,

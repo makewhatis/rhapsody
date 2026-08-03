@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { LinearProject, RunSummary, StateResponse } from "@/lib/api";
+import type { DaySummary, LinearProject, RunSummary, StateResponse } from "@/lib/api";
 import {
   deriveStatTiles,
   failureSubLabel,
@@ -22,7 +22,6 @@ import {
 // today/not-today split is deterministic regardless of the machine's clock.
 const NOW = new Date(2026, 5, 7, 12, 0, 0).getTime();
 const todayAt = (h: number, m = 0) => new Date(2026, 5, 7, h, m, 0).toISOString();
-const yesterdayAt = (h: number) => new Date(2026, 5, 6, h, 0, 0).toISOString();
 
 function state(over: Partial<StateResponse> = {}): StateResponse {
   return {
@@ -53,6 +52,22 @@ function runningSession(over: Partial<StateResponse["running"][number]> = {}) {
     input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
+    ...over,
+  };
+}
+
+// The daemon's day summary: a SQL aggregate over every run in the local day, which is what the
+// header cells now read instead of folding whatever page the client holds. (TRA-320)
+function daySummary(over: Partial<DaySummary> = {}): DaySummary {
+  return {
+    since: new Date(2026, 5, 7, 0, 0, 0).toISOString().slice(0, 19) + "Z",
+    runs: 0,
+    completed: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    seconds: 0,
+    rhythm: [],
     ...over,
   };
 }
@@ -100,9 +115,9 @@ describe("outcomeToStatus", () => {
 
 describe("deriveStatTiles", () => {
   it("always returns the four cells in order: running, completed, tokens, runtime", () => {
-    const cells = deriveStatTiles(undefined, [], NOW, 4);
+    const cells = deriveStatTiles(undefined, undefined, [], 4);
     expect(cells.map((t) => t.key)).toEqual(["running", "completed", "tokens", "runtime"]);
-    // With no data the counters are zeroed, not crashing on undefined state.
+    // With no data the counters are zeroed, not crashing on an undefined state/summary.
     expect(cells[0].value).toBe("0");
     expect(cells[1].value).toBe("0");
     expect(cells[2].value).toBe("0");
@@ -117,7 +132,7 @@ describe("deriveStatTiles", () => {
         runningSession({ project: "alpha" }),
       ],
     });
-    const playing = deriveStatTiles(s, [], NOW, 4)[0];
+    const playing = deriveStatTiles(s, daySummary(), [], 4)[0];
     expect(playing.label).toBe("Playing");
     expect(playing.value).toBe("3");
     expect(playing.sub).toBe("of 4 seats"); // seat math: playing of maxConcurrent
@@ -127,55 +142,45 @@ describe("deriveStatTiles", () => {
 
   it("omits the seat annotation when the seat capacity is unknown (config still loading)", () => {
     const s = state({ running: [runningSession({ project: "alpha" })] });
-    expect(deriveStatTiles(s, [], NOW, 0)[0].sub).toBe("");
+    expect(deriveStatTiles(s, daySummary(), [], 0)[0].sub).toBe("");
   });
 
   it("counts store-running rows that are absent from the live snapshot in the Playing cell", () => {
     const s = state({ running: [runningSession({ run_id: 1, project: "alpha" })] });
-    const history = [
+    const rows = [
       // still running in the store but dropped from the snapshot — must still count
       summary({ id: 2, outcome: "running", project_slug: "beta" }),
-      // the live run's own history twin (id 1) must NOT be double-counted
+      // the live run's own store twin (id 1) must NOT be double-counted
       summary({ id: 1, outcome: "running", project_slug: "alpha" }),
       summary({ id: 3, outcome: "completed" }),
     ];
-    const playing = deriveStatTiles(s, history, NOW, 4)[0];
+    const playing = deriveStatTiles(s, daySummary(), rows, 4)[0];
     expect(playing.value).toBe("2"); // 1 live + 1 store-running (id 2); id 1 deduped
     expect(playing.sub).toBe("of 4 seats");
   });
 
-  it("counts completed runs in the Completed cell with the 'hand-off verified' annotation", () => {
-    const history = [
-      summary({ outcome: "completed" }),
-      summary({ outcome: "completed" }),
-      summary({ outcome: "stopped" }),
-      summary({ outcome: "failed" }),
-    ];
-    const completed = deriveStatTiles(state(), history, NOW, 4)[1];
+  it("reads today's completed count from the daemon summary, scoped in the subtext", () => {
+    const completed = deriveStatTiles(state(), daySummary({ completed: 37 }), [], 4)[1];
     expect(completed.label).toBe("Completed");
-    expect(completed.value).toBe("2");
-    expect(completed.sub).toBe("hand-off verified"); // copy audit: drop the leading "agent"
+    expect(completed.value).toBe("37");
+    expect(completed.sub).toBe("today · hand-off verified");
     expect(completed.accent).toBeUndefined();
   });
 
-  it("sums today's tokens from today's running + finished runs, ignoring all-time codex_totals", () => {
+  it("reads today's tokens from the daemon summary, ignoring all-time codex_totals", () => {
     const s = state({
       // codex_totals is an all-time cumulative figure (persisted across daemon restarts); the
       // today tiles must NOT use it, or they would double-count + conflate prior days.
       codex_totals: { input_tokens: 999_999, output_tokens: 999_999, total_tokens: 999_999, seconds_running: 999_999 },
-      running: [
-        runningSession({ run_id: 5, started_at: todayAt(11), input_tokens: 400_000, output_tokens: 600_000, total_tokens: 1_000_000 }),
-      ],
+      running: [runningSession({ run_id: 5, started_at: todayAt(11), total_tokens: 1_000_000 })],
     });
-    const history = [
-      summary({ id: 7, outcome: "completed", started_at: todayAt(9), input_tokens: 1000, output_tokens: 2000, total_tokens: 3000 }),
-      // the live run also has a history row (id 5) — counted once (the live row wins)
-      summary({ id: 5, outcome: "running", started_at: todayAt(11), input_tokens: 123, output_tokens: 123, total_tokens: 123 }),
-      // yesterday's run is excluded from "today"
-      summary({ id: 8, outcome: "completed", started_at: yesterdayAt(9), input_tokens: 5000, output_tokens: 5000, total_tokens: 5000 }),
-    ];
-    const tokens = deriveStatTiles(s, history, NOW, 4)[2];
-    expect(tokens.value).toBe("1.0M"); // 1_000_000 (live) + 3_000 = 1_003_000 -> 1.0M
+    const tokens = deriveStatTiles(
+      s,
+      daySummary({ input_tokens: 401_000, output_tokens: 602_000, total_tokens: 1_003_000 }),
+      [],
+      4,
+    )[2];
+    expect(tokens.value).toBe("1.0M");
     // Three-part reconciling sub: in · out · cached. Here cache = total − in − out =
     // 1_003_000 − 401_000 − 602_000 = 0, so this also covers the zero-cache form "0 cached". (INF-282)
     expect(tokens.sub).toBe("401.0k in · 602.0k out · 0 cached");
@@ -184,42 +189,70 @@ describe("deriveStatTiles", () => {
   it("subtext reconciles to the headline when cache tokens dominate (in · out · cached sum to total)", () => {
     // Repro of the bug: a huge cache-inclusive headline over tiny in/out. The sub must surface the
     // cached portion so in + out + cached == the headline total. (INF-282)
-    const s = state({
-      running: [
-        runningSession({
-          run_id: 5,
-          started_at: todayAt(11),
-          input_tokens: 44_000,
-          output_tokens: 205_500,
-          // total is cache-inclusive: cache = 38_200_000 − 44_000 − 205_500 = 37_950_500
-          total_tokens: 38_200_000,
-        }),
-      ],
-    });
-    const tokens = deriveStatTiles(s, [], NOW, 4)[2];
+    const tokens = deriveStatTiles(
+      state(),
+      // total is cache-inclusive: cache = 38_200_000 − 44_000 − 205_500 = 37_950_500
+      daySummary({ input_tokens: 44_000, output_tokens: 205_500, total_tokens: 38_200_000 }),
+      [],
+      4,
+    )[2];
     expect(tokens.value).toBe("38.2M");
     expect(tokens.sub).toBe("44.0k in · 205.5k out · 38.0M cached"); // 37_950_500 -> 38.0M
     // The raw figures reconcile exactly to the headline total.
     expect(44_000 + 205_500 + 37_950_500).toBe(38_200_000);
   });
 
-  it("sums today's runtime from running elapsed + finished durations and counts today's runs", () => {
+  it("reads today's runtime and run count from the daemon summary", () => {
     const s = state({
       // ignored: all-time cumulative
       codex_totals: { input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 999_999 },
-      running: [runningSession({ run_id: 5, started_at: new Date(NOW - 600_000).toISOString() })], // elapsed 600s
+      running: [runningSession({ run_id: 5, started_at: new Date(NOW - 600_000).toISOString() })],
     });
-    const history = [
-      // 30 min finished run today -> 1800s
-      summary({ id: 7, outcome: "completed", started_at: todayAt(10), ended_at: todayAt(10, 30) }),
-      // the live run's history twin (id 5) — de-duplicated
-      summary({ id: 5, outcome: "running", started_at: new Date(NOW - 600_000).toISOString() }),
-      // yesterday -> excluded
-      summary({ id: 8, outcome: "completed", started_at: yesterdayAt(8), ended_at: yesterdayAt(9) }),
-    ];
-    const runtime = deriveStatTiles(s, history, NOW, 4)[3];
-    expect(runtime.value).toBe("40m 0s"); // 600 (live elapsed) + 1800 (finished) = 2400s
-    expect(runtime.sub).toBe("across 2 runs"); // live run 5 + finished run 7 (dup 5 + yesterday 8 excluded)
+    const runtime = deriveStatTiles(s, daySummary({ seconds: 2400, runs: 2 }), [], 4)[3];
+    expect(runtime.value).toBe("40m 0s");
+    expect(runtime.sub).toBe("across 2 runs");
+  });
+
+  it("singularizes the run-count subtext for a single run", () => {
+    const runtime = deriveStatTiles(state(), daySummary({ seconds: 60, runs: 1 }), [], 4)[3];
+    expect(runtime.sub).toBe("across 1 run");
+  });
+
+  // The core TRA-320 Defect 2 regression. The header used to fold the fetched rows, so a store
+  // holding 105 runs today rendered 5.4M tokens against a real 53.9M once the 50-row default page
+  // truncated the input. The totals must now be a property of the STORE, identical no matter how
+  // many rows this client happens to hold.
+  it("renders identical totals whether the client fetched 1 row or 4 pages of rows", () => {
+    const s = state({ running: [runningSession({ run_id: 5, total_tokens: 7 })] });
+    const totals = daySummary({
+      runs: 105,
+      completed: 61,
+      input_tokens: 1_200_000,
+      output_tokens: 800_000,
+      total_tokens: 53_900_000,
+      seconds: 13_422,
+    });
+    const onePage = Array.from({ length: 1 }, (_, i) => summary({ id: i + 100, total_tokens: 1 }));
+    const fourPages = Array.from({ length: 200 }, (_, i) =>
+      summary({ id: i + 100, total_tokens: 999_999 }),
+    );
+
+    const small = deriveStatTiles(s, totals, onePage, 4);
+    const large = deriveStatTiles(s, totals, fourPages, 4);
+
+    // The three store-derived cells are byte-identical across wildly different fetched-row sets.
+    expect(small.slice(1)).toEqual(large.slice(1));
+    expect(small[2].value).toBe("53.9M"); // the real figure, not the 10x under-report
+    expect(small[1].value).toBe("61");
+    expect(small[3].sub).toBe("across 105 runs");
+  });
+
+  it("renders zeros rather than a stale fold while the summary is still loading", () => {
+    const rows = [summary({ id: 1, total_tokens: 500_000, outcome: "completed" })];
+    const cells = deriveStatTiles(state(), undefined, rows, 4);
+    expect(cells[1].value).toBe("0");
+    expect(cells[2].value).toBe("0");
+    expect(cells[3].value).toBe("0s");
   });
 });
 
@@ -261,40 +294,28 @@ describe("filterCounts", () => {
 });
 
 describe("rhythmBars", () => {
-  it("returns per-run token heights for today's runs, oldest→newest, normalized to the max", () => {
-    const history = [
-      summary({ id: 1, started_at: todayAt(9), total_tokens: 1000 }),
-      summary({ id: 2, started_at: todayAt(11), total_tokens: 4000 }),
-      summary({ id: 3, started_at: todayAt(10), total_tokens: 2000 }),
-      // yesterday's run is excluded from today's rhythm
-      summary({ id: 4, started_at: yesterdayAt(9), total_tokens: 8000 }),
-    ];
-    // sorted oldest→newest: 1000, 2000, 4000; normalized by the max (4000)
-    expect(rhythmBars(state(), history, NOW)).toEqual([0.25, 0.5, 1]);
+  it("normalizes the daemon's per-run token series to the busiest run of the window", () => {
+    // The daemon serves the series already ordered oldest→newest and capped, so the last bar is
+    // the most recent run. (TRA-320)
+    expect(rhythmBars(daySummary({ rhythm: [1000, 2000, 4000] }))).toEqual([0.25, 0.5, 1]);
   });
 
-  it("de-duplicates a live run against its history twin (the live row wins)", () => {
-    const s = state({
-      running: [runningSession({ run_id: 5, started_at: todayAt(11), total_tokens: 3000 })],
-    });
-    const history = [
-      summary({ id: 7, started_at: todayAt(9), outcome: "completed", total_tokens: 1500 }),
-      summary({ id: 5, started_at: todayAt(11), outcome: "running", total_tokens: 3000 }), // twin of the live row
-    ];
-    // two bars (id 5 counted once): 1500 then 3000 → [0.5, 1]
-    expect(rhythmBars(s, history, NOW)).toEqual([0.5, 1]);
+  it("returns [] when nothing ran today, or while the summary is still loading", () => {
+    expect(rhythmBars(daySummary({ rhythm: [] }))).toEqual([]);
+    expect(rhythmBars(undefined)).toEqual([]);
   });
 
-  it("returns [] when there are no runs today (nothing to visualize)", () => {
-    expect(rhythmBars(state(), [], NOW)).toEqual([]);
-    expect(rhythmBars(state(), [summary({ started_at: yesterdayAt(9), total_tokens: 100 })], NOW)).toEqual([]);
+  it("returns [] when today's runs have spent no tokens yet (no signal to draw)", () => {
+    expect(rhythmBars(daySummary({ rhythm: [0, 0, 0] }))).toEqual([]);
   });
 
-  it("keeps only the most recent 14 runs so the sparkline stays compact", () => {
-    const history = Array.from({ length: 20 }, (_, i) =>
-      summary({ id: i + 1, started_at: todayAt(1, i), total_tokens: 1000 }),
-    );
-    expect(rhythmBars(state(), history, NOW)).toHaveLength(14);
+  it("clamps a negative token figure rather than drawing a bar below the baseline", () => {
+    expect(rhythmBars(daySummary({ rhythm: [-5, 100] }))).toEqual([0, 1]);
+  });
+
+  it("draws one bar per run the daemon returned (it applies the 14-run cap server-side)", () => {
+    const rhythm = Array.from({ length: 14 }, () => 1000);
+    expect(rhythmBars(daySummary({ rhythm }))).toHaveLength(14);
   });
 });
 
@@ -343,6 +364,30 @@ describe("resolveProject", () => {
 });
 
 describe("mergeJobs", () => {
+  // TRA-320 Defect 3, mirroring the observed incident. Fed the ISSUE-level listing (one row per
+  // issue), a ticket that produced 90 failures occupies exactly one job row and displaces nobody.
+  // The old input was a run-paged fetch, where those 90 rows consumed the whole 50-row page and the
+  // list rendered 3 jobs while 73 other issues sat unfetched.
+  it("renders one row per issue when fed the issue-level listing, however noisy an issue is", () => {
+    const issueRows = [
+      // TRA-309's LATEST run — the daemon collapsed its other 89 attempts server-side.
+      summary({ id: 191, issue_identifier: "TRA-309", outcome: "failed", started_at: todayAt(11) }),
+      ...Array.from({ length: 9 }, (_, i) =>
+        summary({
+          id: 100 + i,
+          issue_identifier: `TRA-4${String(i).padStart(2, "0")}`,
+          outcome: "completed",
+          started_at: todayAt(9, i),
+        }),
+      ),
+    ];
+    const rows = mergeJobs(state(), issueRows, PROJECTS, NOW);
+    expect(rows).toHaveLength(10); // ten issues visible, not three
+    expect(new Set(rows.map((r) => r.issue)).size).toBe(10);
+    expect(rows[0].issue).toBe("TRA-309"); // most recent activity first
+    expect(rows[0].status).toBe("failed");
+  });
+
   it("merges live running sessions with history, dedups by run id (live wins)", () => {
     const s = state({
       running: [

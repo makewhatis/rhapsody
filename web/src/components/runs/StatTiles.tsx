@@ -1,11 +1,13 @@
 import { StatusDot } from "@/components/ui/status-dot";
-import type { RunSummary, StateResponse } from "@/lib/api";
+import type { DaySummary, RunSummary, StateResponse } from "@/lib/api";
 import { deriveStatTiles, rhythmBars, type StatTile } from "@/lib/runs-model";
 
 export interface RunsStatTilesProps {
   state: StateResponse | undefined;
-  history: RunSummary[];
-  nowMs: number;
+  /** Daemon-computed totals for today, over the WHOLE store — never a fold over a page (TRA-320). */
+  summary: DaySummary | undefined;
+  /** The issue-level rows, consulted only for the Playing cell's store-running fallback. */
+  rows: RunSummary[];
   /** Max concurrent agents (the seat capacity) → the Playing cell's "of N seats" annotation. */
   maxConcurrent: number;
   /** Whether the data is live (polling). When false (e.g. under the Wails host) the Playing pulse
@@ -15,10 +17,10 @@ export interface RunsStatTilesProps {
 
 // RunsStatTiles — the "instrument strip": a full-width band of four hairline-separated cells
 // (Playing · Completed · Tokens today + rhythm sparkline · Runtime today), derived from the live
-// snapshot + today's history. Replaces the former 4-up card row. (P10-D3 / mock 1a)
-export function RunsStatTiles({ state, history, nowMs, maxConcurrent, live = true }: RunsStatTilesProps) {
-  const cells = deriveStatTiles(state, history, nowMs, maxConcurrent);
-  const bars = rhythmBars(state, history, nowMs);
+// snapshot + the daemon's day summary. Replaces the former 4-up card row. (P10-D3 / mock 1a)
+export function RunsStatTiles({ state, summary, rows, maxConcurrent, live = true }: RunsStatTilesProps) {
+  const cells = deriveStatTiles(state, summary, rows, maxConcurrent);
+  const bars = rhythmBars(summary);
   return (
     <div
       style={{

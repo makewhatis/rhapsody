@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchRunMessages, fetchState, resumeRun, sendRunMessage, stopRun } from "@/lib/api";
+import {
+  fetchDaySummary,
+  fetchIssueRuns,
+  fetchRunMessages,
+  fetchState,
+  localDayStartISO,
+  resumeRun,
+  sendRunMessage,
+  stopRun,
+} from "@/lib/api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -153,5 +162,93 @@ describe("fetchState defensive coalescing (INF-320)", () => {
     vi.stubGlobal("fetch", fetchMock);
     const s = await fetchState();
     expect(s.blocked).toEqual(blocked);
+  });
+});
+
+// TRA-320 — the issue-level listing and the daemon-computed day summary. Both exist so the
+// dashboard stops deriving an issue-grouped list and a set of totals from one run-paged fetch.
+describe("issue listing + day summary (TRA-320)", () => {
+  it("fetchIssueRuns GETs /history/issues and passes the shared history filters through", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ issues: [], next_offset: 50 }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const r = await fetchIssueRuns({ project: "core", outcome: "failed", limit: 50 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/history/issues?outcome=failed&project=core&limit=50",
+      expect.anything(),
+    );
+    expect(r.next_offset).toBe(50);
+  });
+
+  it("fetchIssueRuns tolerates a null/omitted issues array so the table can map safely", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const r = await fetchIssueRuns({});
+    expect(r.issues).toEqual([]);
+    expect(r.next_offset).toBeNull();
+  });
+
+  it("localDayStartISO renders the LOCAL midnight as a whole-second RFC3339 UTC instant", () => {
+    // Local, not UTC: the header cells have always counted a local day, and moving the sum into
+    // the daemon must not shift that boundary. The local calendar fields confirm the boundary.
+    const now = new Date(2026, 7, 2, 14, 33, 12).getTime();
+    const iso = localDayStartISO(now);
+    expect(iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/); // seconds precision, no millis
+    const parsed = new Date(iso);
+    expect(parsed.getFullYear()).toBe(2026);
+    expect(parsed.getMonth()).toBe(7);
+    expect(parsed.getDate()).toBe(2);
+    expect(parsed.getHours()).toBe(0);
+    expect(parsed.getMinutes()).toBe(0);
+    expect(parsed.getSeconds()).toBe(0);
+  });
+
+  it("fetchDaySummary sends its own local midnight as `since`", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            since: "2026-08-02T07:00:00Z",
+            runs: 105,
+            completed: 61,
+            input_tokens: 1_200_000,
+            output_tokens: 800_000,
+            total_tokens: 53_900_000,
+            seconds: 13_422,
+            rhythm: [1, 2, 3],
+          }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const now = new Date(2026, 7, 2, 14, 33, 12).getTime();
+    const s = await fetchDaySummary(now);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/history/summary?since=${encodeURIComponent(localDayStartISO(now))}`,
+      expect.anything(),
+    );
+    expect(s.total_tokens).toBe(53_900_000);
+    expect(s.runs).toBe(105);
+  });
+
+  it("fetchDaySummary tolerates an omitted rhythm array", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            since: "2026-08-02T07:00:00Z",
+            runs: 0,
+            completed: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            seconds: 0,
+          }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await fetchDaySummary(Date.now())).rhythm).toEqual([]);
   });
 });

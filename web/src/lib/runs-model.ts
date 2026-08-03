@@ -4,7 +4,7 @@
 // the redesigned `runs.jsx` view renders.
 
 import type { StatusKey } from "@/components/ui/status-chip";
-import type { LinearProject, LogEntry, RunSummary, StateResponse } from "@/lib/api";
+import type { DaySummary, LinearProject, LogEntry, RunSummary, StateResponse } from "@/lib/api";
 import { elapsedSeconds, formatDuration, formatTokens, runDuration } from "@/lib/format";
 import { repoShortName } from "@/lib/project";
 import { projShort } from "@/lib/settings-model";
@@ -45,87 +45,57 @@ export interface StatTile {
   pulse?: boolean;
 }
 
-// isSameLocalDay reports whether an RFC3339 timestamp falls on the same local calendar day as
-// the reference epoch ms. An empty/invalid timestamp is never "today".
-function isSameLocalDay(iso: string, nowMs: number): boolean {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return false;
-  const a = new Date(t);
-  const b = new Date(nowMs);
-  return (
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate()
-  );
-}
+// The local-day predicate and the per-run duration this module used to fold over history rows now
+// live in the daemon (`Store::day_totals`), which applies the SAME rules — a local day boundary
+// (the client's own, sent as `since`) and elapsed-so-far for an in-flight run — across every row in
+// the store rather than one page of them. See `lib/api.ts` localDayStartISO. (TRA-320)
 
-// durationSeconds returns whole seconds between two RFC3339 timestamps (0 on invalid/negative).
-function durationSeconds(startedISO: string, endedISO: string): number {
-  const start = Date.parse(startedISO);
-  const end = Date.parse(endedISO);
-  if (Number.isNaN(start) || Number.isNaN(end)) return 0;
-  return Math.max(0, Math.floor((end - start) / 1000));
-}
-
-// deriveStatTiles computes the four instrument-strip cells from the live state snapshot plus the
-// history rows, sourcing everything from the real API (never the mock):
+// deriveStatTiles computes the four instrument-strip cells, sourcing everything from the real API
+// (never the mock):
 //   - Playing   : live `state.running` + store-running rows absent from the snapshot, deduped,
 //                 annotated with the seat math ("of N seats", N = maxConcurrent).
-//   - Completed : runs whose stored outcome is `completed` (taxonomy v2 — replaces "In review").
-//   - Tokens    : today's in/out/total tokens, summed per-run over the runs that STARTED today
-//                 (live running rows + finished history rows, de-duplicated).
-//   - Runtime   : today's total seconds (running rows' elapsed + finished rows' durations) and
-//                 the count of runs that started today.
+//   - Completed : runs that completed today (from `summary`).
+//   - Tokens    : today's in/out/total tokens (from `summary`).
+//   - Runtime   : today's total seconds and the count of runs that started today (from `summary`).
+//
+// The three "today" cells read a DAEMON-computed aggregate over the whole store rather than folding
+// the rows this client happens to hold. Folding a page was the 10x token under-report of TRA-320:
+// the store's default page is 50 runs, and a busy day is many times that, so the header silently
+// reported a sample as a total. A page is the wrong input for a total at ANY page size — fetching
+// more rows would only raise the threshold at which the same lie recurs.
+//
+// `rows` is still consulted, but only for the Playing cell, which is a point-in-time count of live
+// work and not a total: any run still marked running IS the latest run of its issue, so the
+// issue-level listing carries it. We deliberately do NOT use codex_totals for the token cells: it is
+// a process-lifetime cumulative total persisted across daemon restarts
+// (internal/orchestrator/persist.go), so it would both double-count today's finished runs and
+// conflate all-time history into a "today" label.
 export function deriveStatTiles(
   state: StateResponse | undefined,
-  history: RunSummary[],
-  nowMs: number,
+  summary: DaySummary | undefined,
+  rows: RunSummary[],
   maxConcurrent: number,
 ): StatTile[] {
   const running = state?.running ?? [];
   const liveRunIds = new Set<number>();
   for (const r of running) if (r.run_id > 0) liveRunIds.add(r.run_id);
 
-  // The Playing cell counts the live snapshot PLUS any history rows still running but momentarily
+  // The Playing cell counts the live snapshot PLUS any store rows still running but momentarily
   // absent from the snapshot (deduped by run id), so it stays consistent with the merged jobs list
   // and never under-reads after a snapshot blip.
-  const storeRunning = history.filter(
+  const storeRunning = rows.filter(
     (h) => h.outcome === "running" && !(h.id > 0 && liveRunIds.has(h.id)),
   );
   const runningCount = running.length + storeRunning.length;
-  const completedCount = history.filter((r) => r.outcome === "completed").length;
 
-  // "Today" aggregates sum per-run over the runs that STARTED today, de-duplicated (a live run that
-  // also has a history row counts once — the live row wins). We deliberately do NOT use
-  // codex_totals: it is a process-lifetime cumulative total persisted across daemon restarts
-  // (internal/orchestrator/persist.go), so adding it would both double-count today's finished runs
-  // and conflate all-time history into a "today" label.
-  let inToday = 0;
-  let outToday = 0;
-  let totalToday = 0;
-  let secondsToday = 0;
-  let runsToday = 0;
-
-  for (const r of running) {
-    if (!isSameLocalDay(r.started_at, nowMs)) continue;
-    inToday += r.input_tokens;
-    outToday += r.output_tokens;
-    totalToday += r.total_tokens;
-    secondsToday += elapsedSeconds(r.started_at, nowMs);
-    runsToday += 1;
-  }
-  for (const h of history) {
-    if (h.id > 0 && liveRunIds.has(h.id)) continue; // already counted as a live row
-    if (!isSameLocalDay(h.started_at, nowMs)) continue;
-    inToday += h.input_tokens;
-    outToday += h.output_tokens;
-    totalToday += h.total_tokens;
-    secondsToday +=
-      h.outcome === "running"
-        ? elapsedSeconds(h.started_at, nowMs)
-        : durationSeconds(h.started_at, h.ended_at);
-    runsToday += 1;
-  }
+  // Absent summary (first paint / a failed poll) renders zeros rather than a stale fold — an honest
+  // "nothing known yet" beats a confidently wrong number, which is the whole lesson of this bug.
+  const completedCount = summary?.completed ?? 0;
+  const inToday = summary?.input_tokens ?? 0;
+  const outToday = summary?.output_tokens ?? 0;
+  const totalToday = summary?.total_tokens ?? 0;
+  const secondsToday = summary?.seconds ?? 0;
+  const runsToday = summary?.runs ?? 0;
 
   return [
     {
@@ -142,8 +112,11 @@ export function deriveStatTiles(
     {
       key: "completed",
       label: "Completed",
+      // Scoped to today, like its two neighbours, and stated in the subtext so the cell is not read
+      // as an all-time figure. It used to count completed rows in the fetched page — a number that
+      // meant neither "today" nor "all time", only "however much history this client had". (TRA-320)
       value: String(completedCount),
-      sub: "hand-off verified",
+      sub: "today · hand-off verified",
     },
     {
       key: "tokens",
@@ -166,38 +139,22 @@ export function deriveStatTiles(
   ];
 }
 
-// rhythmBars derives the token "rhythm" sparkline in the Tokens-today cell: one bar per run STARTED
-// today (live running rows + finished history rows, de-duplicated by run id exactly like the token
-// totals above), oldest→newest so the last/brightest bar is the most recent. Each bar is the run's
-// total tokens normalized to the busiest run of the window (0..1). Capped at the most recent
-// RHYTHM_MAX runs so the strip stays compact; empty when nothing ran today (no rhythm to draw).
-const RHYTHM_MAX = 14;
-
-export function rhythmBars(
-  state: StateResponse | undefined,
-  history: RunSummary[],
-  nowMs: number,
-): number[] {
-  const liveRunIds = new Set<number>();
-  for (const r of state?.running ?? []) if (r.run_id > 0) liveRunIds.add(r.run_id);
-
-  const runs: { at: number; tokens: number }[] = [];
-  for (const r of state?.running ?? []) {
-    if (!isSameLocalDay(r.started_at, nowMs)) continue;
-    runs.push({ at: parseMs(r.started_at), tokens: r.total_tokens });
-  }
-  for (const h of history) {
-    if (h.id > 0 && liveRunIds.has(h.id)) continue; // already counted as a live row
-    if (!isSameLocalDay(h.started_at, nowMs)) continue;
-    runs.push({ at: parseMs(h.started_at), tokens: h.total_tokens });
-  }
-  if (runs.length === 0) return [];
-
-  runs.sort((a, b) => a.at - b.at); // oldest → newest (last bar is the most recent)
-  const recent = runs.slice(-RHYTHM_MAX);
-  const max = Math.max(...recent.map((r) => r.tokens));
+// rhythmBars derives the token "rhythm" sparkline in the Tokens-today cell: one bar per run started
+// today, oldest→newest so the last/brightest bar is the most recent. Each bar is the run's total
+// tokens normalized to the busiest run of the window (0..1); empty when nothing ran today, or when
+// nothing has spent tokens yet (no rhythm to draw).
+//
+// The series comes from `summary.rhythm` — the daemon's most-recent-N runs, capped and ordered
+// server-side. Unlike the token TOTALS this is legitimately a bounded window rather than an
+// aggregate ("the last N runs" IS the answer, not a sample of it), but deriving it in the daemon
+// alongside the totals keeps every header figure on one query and one definition of "today".
+// (TRA-320)
+export function rhythmBars(summary: DaySummary | undefined): number[] {
+  const tokens = summary?.rhythm ?? [];
+  if (tokens.length === 0) return [];
+  const max = Math.max(...tokens);
   if (max <= 0) return []; // no token signal yet → no rhythm
-  return recent.map((r) => r.tokens / max);
+  return tokens.map((t) => Math.max(0, t) / max);
 }
 
 // --- Unified jobs list (merged Live + History) ---
@@ -380,13 +337,19 @@ export function jobStatus(
 
 // mergeJobs merges the live running sessions (`state.running`), the pending retries/continuations
 // (`state.retrying`, surfaced as synthetic queued rows — this is the until-now-ignored signal that
-// keeps a job "running" between continuation segments), and the finished history rows into a
-// JOB-centric list: one row per issue_identifier (rows with an empty identifier stay individual,
-// keyed by run id). Each group's status is derived by `jobStatus`; running jobs sort first, then by
-// most-recent activity. (taxonomy v2, INF-272)
+// keeps a job "running" between continuation segments), and the stored rows into a JOB-centric
+// list: one row per issue_identifier (rows with an empty identifier stay individual, keyed by run
+// id). Each group's status is derived by `jobStatus`; running jobs sort first, then by most-recent
+// activity. (taxonomy v2, INF-272)
+//
+// `rows` MUST be the ISSUE-level listing (`useIssueRuns` / GET /api/v1/history/issues): each issue's
+// latest run, paged by issue. Feeding it a run-paged fetch is what TRA-320 fixed — one ticket in a
+// clone-retry loop produced 90 of the 50 rows on the page, so the list rendered 3 jobs while 73
+// other issues sat unfetched. The grouping below cannot recover an issue whose rows never arrived,
+// and asking for a bigger run page only raises the count at which the same failure returns.
 export function mergeJobs(
   state: StateResponse | undefined,
-  history: RunSummary[],
+  rows: RunSummary[],
   projects: LinearProject[],
   nowMs: number,
 ): JobRow[] {
@@ -471,7 +434,7 @@ export function mergeJobs(
     });
   }
 
-  for (const h of history) {
+  for (const h of rows) {
     if (h.id > 0 && liveIds.has(h.id)) continue; // already represented by the live row
     const live = h.outcome === "running";
     merged.push({

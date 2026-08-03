@@ -58,6 +58,12 @@ impl Store for Noop {
     fn list_runs(&self, _f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
         Ok(Vec::new())
     }
+    fn list_issue_runs(&self, _f: RunFilter) -> Result<Vec<RunSummary>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn day_totals(&self, _since: &str, _now: &str) -> Result<DayTotals, StoreError> {
+        Ok(DayTotals::default())
+    }
     fn issue_history(
         &self,
         _identifier: &str,

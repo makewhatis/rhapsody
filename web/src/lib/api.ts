@@ -149,6 +149,31 @@ export interface HistoryResponse {
   next_offset: number | null;
 }
 
+// IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —
+// that issue's LATEST run — paged by issue. The Jobs list reads this instead of grouping a
+// run-paged fetch, so an issue in a retry loop occupies one row rather than filling the page and
+// hiding every other issue. `next_offset` follows the same rule as HistoryResponse, counting issues.
+export interface IssueRunsResponse {
+  issues: RunSummary[];
+  next_offset: number | null;
+}
+
+// DaySummary is the GET /api/v1/history/summary payload (TRA-320): whole-store totals over the runs
+// that STARTED at or after `since`, computed in the daemon's SQL rather than folded over whatever
+// page the client happens to hold. `total_tokens` is the cache-INCLUSIVE billed total, so the
+// header's `cached = total − in − out` reconciliation still adds up. `rhythm` is the most recent
+// runs' token totals, oldest→newest, for the sparkline.
+export interface DaySummary {
+  since: string;
+  runs: number;
+  completed: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  seconds: number;
+  rhythm: number[];
+}
+
 // IssueHistoryResponse is the GET /api/v1/issues/<id>/history payload.
 export interface IssueHistoryResponse {
   issue_identifier: string;
@@ -352,6 +377,40 @@ export async function fetchHistory(f: HistoryFilter): Promise<HistoryResponse> {
   h.runs ??= [];
   h.next_offset ??= null;
   return h;
+}
+
+// fetchIssueRuns lists ONE run per issue (each issue's latest), paged by issue — the Jobs list's
+// query. Reuses historyQuery: /history/issues takes exactly the same filters as /history and differs
+// only in what a page counts. (TRA-320)
+export async function fetchIssueRuns(f: HistoryFilter): Promise<IssueRunsResponse> {
+  const r = await getJSON<IssueRunsResponse>(`/api/v1/history/issues${historyQuery(f)}`);
+  // Defensive: tolerate a server that omits/nulls issues so the table can .map() safely.
+  r.issues ??= [];
+  r.next_offset ??= null;
+  return r;
+}
+
+// localDayStartISO renders the start of the LOCAL calendar day containing `nowMs` as a whole-second
+// RFC3339 UTC instant — the `since` the dashboard sends to /history/summary. Local, not UTC: the
+// header cells have always counted a local day, and moving the sum into the daemon must not
+// silently shift that boundary for anyone off UTC. Seconds precision (no milliseconds) because the
+// daemon compares `since` against RFC3339 timestamps stored at seconds precision.
+export function localDayStartISO(nowMs: number): string {
+  const d = new Date(nowMs);
+  d.setHours(0, 0, 0, 0);
+  return `${d.toISOString().slice(0, 19)}Z`;
+}
+
+// fetchDaySummary reads the daemon-computed totals for the day containing `nowMs`. These are a SQL
+// aggregate over every run in the window, so they are identical no matter how much history the
+// client has fetched — the whole point of TRA-320's Defect 2.
+export async function fetchDaySummary(nowMs: number): Promise<DaySummary> {
+  const since = localDayStartISO(nowMs);
+  const s = await getJSON<DaySummary>(
+    `/api/v1/history/summary?since=${encodeURIComponent(since)}`,
+  );
+  s.rhythm ??= [];
+  return s;
 }
 
 export async function fetchIssueHistory(identifier: string): Promise<IssueHistoryResponse> {

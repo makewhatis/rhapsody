@@ -8,6 +8,8 @@ const h = vi.hoisted(() => ({
   bridge: false,
   state: vi.fn(),
   history: vi.fn(),
+  issueRuns: vi.fn(),
+  daySummary: vi.fn(),
   linearProjects: vi.fn(),
   typedConfig: vi.fn(),
   runDetail: vi.fn(),
@@ -23,6 +25,8 @@ vi.mock("@/lib/api", async (orig) => {
     ...actual,
     fetchState: () => h.state(),
     fetchHistory: () => h.history(),
+    fetchIssueRuns: () => h.issueRuns(),
+    fetchDaySummary: () => h.daySummary(),
     fetchLinearProjects: () => h.linearProjects(),
     fetchTypedConfig: () => h.typedConfig(),
     fetchRunDetail: (id: number) => h.runDetail(id),
@@ -70,6 +74,19 @@ beforeEach(() => {
     blocked: [],
   });
   h.history.mockResolvedValue({ runs: [summary()], next_offset: null });
+  // The Jobs list reads the ISSUE-level listing and the header reads the daemon's day totals; the
+  // run-paged /history feeds neither any more. (TRA-320)
+  h.issueRuns.mockResolvedValue({ issues: [summary()], next_offset: null });
+  h.daySummary.mockResolvedValue({
+    since: "2026-06-05T00:00:00Z",
+    runs: 1,
+    completed: 1,
+    input_tokens: 50,
+    output_tokens: 92,
+    total_tokens: 142_100,
+    seconds: 4920,
+    rhythm: [142_100],
+  });
   h.linearProjects.mockResolvedValue([]);
   // The instrument strip's "of N seats" + the "/max" turn cell read the resolved daemon config.
   h.typedConfig.mockResolvedValue({
@@ -148,10 +165,10 @@ describe("RunsView", () => {
   it("polls the daemon over /api under the Wails bridge too (the AssetServer proxies /api to the sidecar)", async () => {
     h.bridge = true;
     renderView();
-    // the history row arrives → the HTTP queries fired even under the app host
+    // the job row arrives → the HTTP queries fired even under the app host
     expect(await screen.findByText("CORE-112")).toBeTruthy();
     expect(h.state).toHaveBeenCalled();
-    expect(h.history).toHaveBeenCalled();
+    expect(h.issueRuns).toHaveBeenCalled();
     // the list is live, not paused
     expect(screen.queryByText("live updates paused")).toBeNull();
   });

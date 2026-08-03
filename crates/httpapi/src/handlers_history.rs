@@ -11,13 +11,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
-use rhapsody_store::{EventQuery, RunFilter};
+use rhapsody_store::{EventQuery, RunFilter, effective_run_limit};
 
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
 use crate::responses::{write_error, write_json};
 use crate::responses_history::{
-    event_search_response, history_response, issue_history_response, metrics_response,
-    run_detail_from_running, run_detail_from_summary, run_events_response, run_transcript_json,
+    event_search_response, history_response, history_summary_response, issue_history_response,
+    issue_runs_response, metrics_response, run_detail_from_running, run_detail_from_summary,
+    run_events_response, run_transcript_json,
 };
 use crate::server::StateProvider;
 
@@ -26,10 +27,14 @@ use crate::server::StateProvider;
 const METRICS_DEFAULT_DAYS: i64 = 30;
 
 /// `GET /api/v1/history?issue=&outcome=&project=&since=&limit=&offset=`: a paged, filterable list of
-/// recent runs. `limit`/`offset` must be non-negative integers when present (else 400). `next_offset`
-/// is set (offset+limit) only when a bounded full page (`limit>0`) came back, so the client knows
-/// another page exists — the store applies its own default when `limit<=0`, which we cannot observe
-/// from here. Mirrors Go `handleHistory`.
+/// recent runs. `limit`/`offset` must be non-negative integers when present (else 400).
+///
+/// `next_offset` is derived from the page size the store ACTUALLY applied — `effective_run_limit`,
+/// which resolves an absent/`<=0` limit to the store's own default — not from whether the caller
+/// happened to send one. Go computes it from the requested limit alone, so its default path reports
+/// `next_offset: null` on a page the store silently truncated and every row past the first page
+/// becomes unreachable; that under-reported a 192-run store as 50 runs (TRA-320). This is a
+/// deliberate divergence from Go `handleHistory` — see README "Divergences".
 pub(crate) async fn handle_history(
     method: Method,
     State(provider): State<Arc<dyn StateProvider>>,
@@ -38,30 +43,153 @@ pub(crate) async fn handle_history(
     if let Some(resp) = require_get(&method) {
         return resp;
     }
-    let limit = match parse_non_neg_int(qget(&q, "limit"), "limit") {
-        Ok(n) => n,
+    let f = match run_filter_from_query(&q) {
+        Ok(f) => f,
         Err(resp) => return *resp,
     };
-    let offset = match parse_non_neg_int(qget(&q, "offset"), "offset") {
-        Ok(n) => n,
-        Err(resp) => return *resp,
-    };
-    let f = RunFilter {
-        issue: qget(&q, "issue").to_string(),
-        outcome: qget(&q, "outcome").to_string(),
-        since: qget(&q, "since").to_string(),
-        project: qget(&q, "project").to_string(),
-        limit,
-        offset,
-    };
+    let (offset, effective_limit) = (f.offset, effective_run_limit(f.limit));
     let runs = match provider.history().list_runs(f) {
         Ok(runs) => runs,
         Err(_) => return store_error("history query failed"),
     };
-    // next_offset is meaningful only when the caller bounded the page (limit>0) and a full page came
-    // back — the effective page size is the requested limit.
-    let next = (limit > 0 && runs.len() as i64 == limit).then_some(offset + limit);
-    write_json(StatusCode::OK, &history_response(&runs, next))
+    write_json(
+        StatusCode::OK,
+        &history_response(&runs, next_offset(runs.len(), offset, effective_limit)),
+    )
+}
+
+/// `GET /api/v1/history/issues?issue=&outcome=&project=&since=&limit=&offset=`: the same filters as
+/// `/history`, but ONE row per issue — each issue's latest matching run — paged by issue, so an
+/// issue in a retry loop occupies one row instead of crowding every other issue off the page
+/// (TRA-320). `next_offset` follows the same effective-limit rule as `/history`, counting issues.
+///
+/// Rhapsody-only: Go has no issue-level listing, and the dashboard's issue-grouped Jobs list used to
+/// group a run-paged fetch client-side — which is what made one noisy ticket hide 73 others.
+pub(crate) async fn handle_issue_runs(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let f = match run_filter_from_query(&q) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
+    };
+    let (offset, effective_limit) = (f.offset, effective_run_limit(f.limit));
+    let runs = match provider.history().list_issue_runs(f) {
+        Ok(runs) => runs,
+        Err(_) => return store_error("issue listing query failed"),
+    };
+    write_json(
+        StatusCode::OK,
+        &issue_runs_response(&runs, next_offset(runs.len(), offset, effective_limit)),
+    )
+}
+
+/// `GET /api/v1/history/summary?since=`: whole-store run/token/runtime totals over the runs that
+/// STARTED at or after `since`, plus the token totals of the most recent [`SUMMARY_RHYTHM_RUNS`] of
+/// them (the dashboard's rhythm sparkline). Backs the header "today" cells, which must never be a
+/// fold over one fetched page at any page size (TRA-320).
+///
+/// `since` is the CALLER's day boundary, which is deliberately a LOCAL one: the dashboard sends its
+/// own local midnight (as a UTC RFC3339 instant), preserving the local-day semantics the client-side
+/// fold had. Omitting it falls back to the DAEMON host's local midnight — the same wall clock in the
+/// single-machine deployment this dashboard serves. Neither path uses a UTC day boundary; that would
+/// silently shift the numbers for anyone not on UTC. An unparseable `since` is a 400 rather than a
+/// silent whole-table sum. Rhapsody-only; Go has no day-summary endpoint.
+pub(crate) async fn handle_history_summary(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let raw_since = qget(&q, "since");
+    let since = if raw_since.is_empty() {
+        local_day_start()
+    } else {
+        match chrono::DateTime::parse_from_rfc3339(raw_since) {
+            Ok(t) => t
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            Err(_) => {
+                return write_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_param",
+                    "since must be an RFC3339 timestamp",
+                    None,
+                );
+            }
+        }
+    };
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let history = provider.history();
+    let totals = match history.day_totals(&since, &now) {
+        Ok(t) => t,
+        Err(_) => return store_error("history summary query failed"),
+    };
+    // The rhythm series is the ONE figure that is legitimately a bounded window rather than a total:
+    // it draws the most recent N runs, so a most-recent-first page of exactly N is the whole answer.
+    // Rendered oldest→newest so the last (brightest) bar is the most recent run.
+    let recent = match history.list_runs(RunFilter {
+        since: since.clone(),
+        limit: SUMMARY_RHYTHM_RUNS,
+        ..RunFilter::default()
+    }) {
+        Ok(runs) => runs,
+        Err(_) => return store_error("history summary query failed"),
+    };
+    let rhythm: Vec<i64> = recent.iter().rev().map(|r| r.total_tokens).collect();
+    write_json(
+        StatusCode::OK,
+        &history_summary_response(&since, &totals, &rhythm),
+    )
+}
+
+/// How many recent runs the summary's rhythm series carries — the dashboard sparkline's bar cap.
+const SUMMARY_RHYTHM_RUNS: i64 = 14;
+
+/// `offset + effective_limit` when a FULL page came back (so another page may exist), else `None`.
+/// `effective_limit` must be the page size the store actually applied, never the raw request value.
+fn next_offset(returned: usize, offset: i64, effective_limit: i64) -> Option<i64> {
+    (effective_limit > 0 && returned as i64 == effective_limit).then_some(offset + effective_limit)
+}
+
+/// Parse the shared `issue`/`outcome`/`since`/`project`/`limit`/`offset` query params into a
+/// [`RunFilter`]. `limit`/`offset` must be non-negative integers when present (else a 400 envelope).
+/// Shared by `/history` and `/history/issues`, which take identical filters and differ only in what
+/// a page counts.
+fn run_filter_from_query(q: &HashMap<String, String>) -> Result<RunFilter, Box<Response>> {
+    Ok(RunFilter {
+        issue: qget(q, "issue").to_string(),
+        outcome: qget(q, "outcome").to_string(),
+        since: qget(q, "since").to_string(),
+        project: qget(q, "project").to_string(),
+        limit: parse_non_neg_int(qget(q, "limit"), "limit")?,
+        offset: parse_non_neg_int(qget(q, "offset"), "offset")?,
+    })
+}
+
+/// Midnight of the DAEMON host's current local day, as a UTC RFC3339 instant — the `/history/summary`
+/// fallback when the caller sends no `since`. Local, not UTC: see [`handle_history_summary`].
+///
+/// Panic-free: the instant is derived by shifting the naive local midnight by the host's CURRENT
+/// UTC offset, so there is no ambiguous `LocalResult` to unwrap. On a DST spring-forward day that
+/// skips 00:00 the boundary lands an hour off for that one day rather than the handler failing.
+fn local_day_start() -> String {
+    use chrono::Offset;
+    let now = chrono::Local::now();
+    let shift = chrono::TimeDelta::try_seconds(now.offset().fix().local_minus_utc() as i64)
+        .unwrap_or_default();
+    let midnight = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| naive.and_utc() - shift)
+        .unwrap_or_else(Utc::now);
+    midnight.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// `GET /api/v1/issues/{id}/history?limit=&project=`: a single issue's run history (most-recent
@@ -331,11 +459,15 @@ fn parse_non_neg_int(raw: &str, field: &str) -> Result<i64, Box<Response>> {
 mod tests {
     use std::sync::Arc;
 
+    use super::{SUMMARY_RHYTHM_RUNS, local_day_start};
     use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
     use rhapsody_agent::LogEntry;
     use rhapsody_orchestrator::{EventRecord, Snapshot, TokenCounts, Totals};
-    use rhapsody_store::{EventRow, OUTCOME_COMPLETED, RunEnd, RunStart, Sqlite, Store, StorePath};
-    use serde_json::Value;
+    use rhapsody_store::{
+        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, RunEnd, RunProgress, RunStart, Sqlite,
+        Store, StorePath,
+    };
+    use serde_json::{Value, json};
 
     use crate::new_handler;
     use crate::testutil::{
@@ -351,6 +483,30 @@ mod tests {
 
     fn rfc3339(t: chrono::DateTime<Utc>) -> String {
         t.to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    /// Seed one completed run for `issue` starting (and ending) at `started`, returning its id.
+    /// The lightweight seeder the TRA-320 paging/aggregate tests use to build stores larger than one
+    /// page, where only the identity + timestamp of each row matters.
+    fn seed_run_at(store: &Sqlite, issue: &str, started: &str) -> i64 {
+        let id = store
+            .start_run(RunStart {
+                issue_identifier: issue.into(),
+                started_at: started.into(),
+                ..Default::default()
+            })
+            .expect("start run");
+        store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: started.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end run");
+        id
     }
 
     /// Seed one completed run (MT-1) + two events into `store`, returning the run id. Mirrors Go
@@ -486,10 +642,19 @@ mod tests {
         assert_eq!(r["outcome"], "completed");
         assert_eq!(r["total_tokens"], 150);
         assert_eq!(r["project_slug"], "core");
-        assert_eq!(body["next_offset"], Value::Null, "unbounded page => null");
+        // One row against the store's 50-row default page: the table is genuinely exhausted, so
+        // there is no next page. (Updated from "unbounded page => null" — no page is unbounded;
+        // the store always applies a limit, and next_offset now reflects the one it applied. TRA-320)
+        assert_eq!(
+            body["next_offset"],
+            Value::Null,
+            "1 row < the default page => exhausted"
+        );
     }
 
-    // Mirrors Go `TestHistoryPagingNextOffset`.
+    // Mirrors Go `TestHistoryPagingNextOffset`, extended for TRA-320: `next_offset` is derived from
+    // the page size actually applied, so a full page yields one whether or not the caller asked for
+    // a limit. Go computes it from the requested limit alone and reports null on the default path.
     #[tokio::test]
     async fn history_paging_next_offset() {
         let store = mem_store();
@@ -497,6 +662,336 @@ mod tests {
         let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
         let (_s, body) = get_json(&format!("{base}/api/v1/history?limit=1")).await;
         assert_eq!(body["next_offset"], 1, "limit=1 full page => next_offset 1");
+        // An explicit offset carries through.
+        let (_s, body) = get_json(&format!("{base}/api/v1/history?limit=1&offset=0")).await;
+        assert_eq!(body["next_offset"], 1);
+    }
+
+    // TRA-320 Defect 1, the direct regression: with MORE runs than the store's default page and NO
+    // `limit` in the request, the response must NOT claim the history is exhausted. Before the fix
+    // this returned 50 rows with next_offset: null and the remaining rows were unreachable without
+    // guessing a limit.
+    #[tokio::test]
+    async fn history_default_page_reports_next_offset() {
+        let store = mem_store();
+        let total = DEFAULT_RUN_LIMIT + 12;
+        for i in 0..total {
+            seed_run_at(
+                &store,
+                &format!("MT-{i}"),
+                &format!("2026-08-01T00:{:02}:00Z", i % 60),
+            );
+        }
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (_s, body) = get_json(&format!("{base}/api/v1/history")).await;
+        assert_eq!(
+            body["runs"].as_array().expect("runs").len() as i64,
+            DEFAULT_RUN_LIMIT,
+            "the store's default page is applied"
+        );
+        assert_eq!(
+            body["next_offset"], DEFAULT_RUN_LIMIT,
+            "a full default page must advertise the next page, not null"
+        );
+
+        // Walking that offset reaches the rest, and the final short page terminates the walk.
+        let (_s, body) =
+            get_json(&format!("{base}/api/v1/history?offset={DEFAULT_RUN_LIMIT}")).await;
+        assert_eq!(
+            body["runs"].as_array().expect("runs").len() as i64,
+            total - DEFAULT_RUN_LIMIT
+        );
+        assert_eq!(
+            body["next_offset"],
+            Value::Null,
+            "genuinely exhausted => null"
+        );
+    }
+
+    // TRA-320 — an explicit limit that exactly exhausts the table still reports null: the rule is
+    // "a FULL page may have more", and a full page that happens to be the whole table is caught by
+    // the follow-up request, exactly as Go's contract intends.
+    #[tokio::test]
+    async fn history_explicit_limit_beyond_the_table_is_exhausted() {
+        let store = mem_store();
+        for i in 0..3 {
+            seed_run_at(
+                &store,
+                &format!("MT-{i}"),
+                &format!("2026-08-01T00:0{i}:00Z"),
+            );
+        }
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+        let (_s, body) = get_json(&format!("{base}/api/v1/history?limit=500")).await;
+        assert_eq!(body["runs"].as_array().expect("runs").len(), 3);
+        assert_eq!(body["next_offset"], Value::Null, "3 of 500 => exhausted");
+    }
+
+    // TRA-320 Defect 3, mirroring the observed incident: one issue with 90 runs and nine quiet
+    // issues must render as TEN job rows on the first page, not three.
+    #[tokio::test]
+    async fn issue_runs_one_row_per_issue() {
+        let store = mem_store();
+        for i in 0..9 {
+            seed_run_at(
+                &store,
+                &format!("TRA-4{i:02}"),
+                &format!("2026-08-01T01:{i:02}:00Z"),
+            );
+        }
+        for i in 0..90 {
+            seed_run_at(
+                &store,
+                "TRA-309",
+                &format!("2026-08-01T{:02}:{:02}:00Z", 2 + i / 60, i % 60),
+            );
+        }
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        // The run-paged view is the broken behavior it replaces: one issue fills the whole page.
+        let (_s, runs_body) = get_json(&format!("{base}/api/v1/history")).await;
+        let visible: std::collections::HashSet<String> = runs_body["runs"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .map(|r| {
+                r["issue_identifier"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            visible.len(),
+            1,
+            "precondition: run paging hides the other issues"
+        );
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let issues = body["issues"].as_array().expect("issues array");
+        assert_eq!(issues.len(), 10, "ten issues, not three");
+        let idents: std::collections::HashSet<String> = issues
+            .iter()
+            .map(|r| {
+                r["issue_identifier"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(idents.len(), 10, "every row is a distinct issue");
+        assert_eq!(
+            issues[0]["issue_identifier"], "TRA-309",
+            "most recent activity first"
+        );
+        assert_eq!(
+            body["next_offset"],
+            Value::Null,
+            "10 of a 50-issue page => exhausted"
+        );
+    }
+
+    // TRA-320 — the issue listing pages by ISSUE and reports next_offset on the same effective-limit
+    // rule as /history.
+    #[tokio::test]
+    async fn issue_runs_paging_next_offset() {
+        let store = mem_store();
+        for i in 0..4 {
+            seed_run_at(
+                &store,
+                &format!("MT-{i}"),
+                &format!("2026-08-01T00:0{i}:00Z"),
+            );
+            seed_run_at(
+                &store,
+                &format!("MT-{i}"),
+                &format!("2026-08-01T01:0{i}:00Z"),
+            );
+        }
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+        let (_s, body) = get_json(&format!("{base}/api/v1/history/issues?limit=2")).await;
+        assert_eq!(body["issues"].as_array().expect("issues").len(), 2);
+        assert_eq!(body["next_offset"], 2, "full page of issues => next offset");
+        let (_s, body) = get_json(&format!("{base}/api/v1/history/issues?limit=2&offset=2")).await;
+        assert_eq!(body["issues"].as_array().expect("issues").len(), 2);
+        let (_s, body) = get_json(&format!("{base}/api/v1/history/issues?limit=2&offset=4")).await;
+        assert_eq!(
+            body["issues"].as_array().expect("issues").len(),
+            0,
+            "4 issues total"
+        );
+    }
+
+    // TRA-320 — the issue listing validates limit/offset exactly like /history.
+    #[tokio::test]
+    async fn issue_runs_invalid_limit_400() {
+        let base = spawn(FakeProvider::ok(empty_snapshot())).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues?limit=-1")).await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "invalid_param");
+    }
+
+    // TRA-320 Defect 2: the day totals are computed over the WHOLE store, so they are identical
+    // whether a client fetched one page or four — and they match a direct SUM over the window.
+    #[tokio::test]
+    async fn history_summary_totals_are_page_independent() {
+        let store = mem_store();
+        let total_runs = DEFAULT_RUN_LIMIT * 2 + 5; // more than two default pages
+        for i in 0..total_runs {
+            let id = store
+                .start_run(RunStart {
+                    issue_identifier: format!("MT-{i}"),
+                    started_at: format!("2026-08-01T{:02}:{:02}:00Z", i / 60, i % 60),
+                    ..Default::default()
+                })
+                .expect("start");
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: "completed".into(),
+                        ended_at: format!("2026-08-01T{:02}:{:02}:00Z", (i + 1) / 60, (i + 1) % 60),
+                        input_tokens: 3,
+                        output_tokens: 7,
+                        total_tokens: 1000,
+                        ..Default::default()
+                    },
+                )
+                .expect("end");
+        }
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let url = format!("{base}/api/v1/history/summary?since=2026-08-01T00:00:00Z");
+        let (status, body) = get_json(&url).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["since"], "2026-08-01T00:00:00Z",
+            "the window is echoed back"
+        );
+        assert_eq!(
+            body["runs"], total_runs,
+            "every run in the window, not one page"
+        );
+        assert_eq!(body["completed"], total_runs);
+        assert_eq!(body["input_tokens"], total_runs * 3);
+        assert_eq!(body["output_tokens"], total_runs * 7);
+        assert_eq!(body["total_tokens"], total_runs * 1000);
+        assert_eq!(body["seconds"], total_runs * 60);
+
+        // Identical regardless of how much history the client has fetched — the point of the fix.
+        for page in ["limit=1", "limit=50", "limit=200"] {
+            let (_s, page_body) = get_json(&format!("{base}/api/v1/history?{page}")).await;
+            let fetched = page_body["runs"].as_array().expect("runs").len();
+            let (_s, again) = get_json(&url).await;
+            assert_eq!(
+                again["total_tokens"], body["total_tokens"],
+                "totals moved after fetching {fetched} rows"
+            );
+        }
+
+        // The rhythm series is capped at the sparkline's bar count and runs oldest→newest.
+        let rhythm = body["rhythm"].as_array().expect("rhythm array");
+        assert_eq!(rhythm.len(), SUMMARY_RHYTHM_RUNS as usize);
+        assert!(rhythm.iter().all(|v| v == &Value::from(1000)));
+    }
+
+    // TRA-320 — an in-flight run contributes its elapsed time and live token progress, counted once.
+    #[tokio::test]
+    async fn history_summary_includes_in_flight_runs() {
+        let store = mem_store();
+        let started = Utc::now() - ChronoDuration::seconds(120);
+        let running = store
+            .start_run(RunStart {
+                issue_identifier: "MT-live".into(),
+                started_at: started.to_rfc3339_opts(SecondsFormat::Secs, true),
+                ..Default::default()
+            })
+            .expect("start");
+        store
+            .update_run_progress(
+                running,
+                RunProgress {
+                    turns: 2,
+                    input_tokens: 11,
+                    output_tokens: 13,
+                    total_tokens: 900,
+                    ..Default::default()
+                },
+            )
+            .expect("progress");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        // RFC3339 with a `Z` suffix carries no `+`, so it needs no percent-encoding here.
+        let since = rfc3339(started - ChronoDuration::seconds(60));
+        let (_s, body) = get_json(&format!("{base}/api/v1/history/summary?since={since}")).await;
+        assert_eq!(body["runs"], 1, "the in-flight run is counted exactly once");
+        assert_eq!(body["completed"], 0);
+        assert_eq!(body["total_tokens"], 900, "live progress is included");
+        let seconds = body["seconds"].as_i64().expect("seconds");
+        assert!(
+            (115..=180).contains(&seconds),
+            "elapsed-so-far should be ~120s, got {seconds}"
+        );
+    }
+
+    // TRA-320 — a store with nothing in the window answers all-zero rather than erroring, and an
+    // unparseable `since` is a 400 rather than a silent whole-table sum.
+    #[tokio::test]
+    async fn history_summary_empty_window_and_bad_since() {
+        let store = mem_store();
+        seed_completed_run(&store);
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!(
+            "{base}/api/v1/history/summary?since=2999-01-01T00:00:00Z"
+        ))
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["runs"], 0);
+        assert_eq!(body["total_tokens"], 0);
+        assert_eq!(body["seconds"], 0);
+        assert_eq!(body["rhythm"], json!([]), "no runs => no rhythm bars");
+
+        let (status, body) =
+            get_json(&format!("{base}/api/v1/history/summary?since=yesterday")).await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "invalid_param");
+    }
+
+    // TRA-320 — with no `since` the daemon falls back to ITS OWN local midnight, so a run that
+    // started today is in the window and one from a week ago is not.
+    #[tokio::test]
+    async fn history_summary_defaults_to_the_daemon_local_day() {
+        let store = mem_store();
+        store
+            .start_run(RunStart {
+                issue_identifier: "MT-today".into(),
+                started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                ..Default::default()
+            })
+            .expect("today");
+        store
+            .start_run(RunStart {
+                issue_identifier: "MT-old".into(),
+                started_at: (Utc::now() - ChronoDuration::days(7))
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+                ..Default::default()
+            })
+            .expect("old");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/history/summary")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["runs"], 1,
+            "only today's run falls in the default window"
+        );
+        assert_eq!(
+            body["since"],
+            local_day_start(),
+            "the daemon's local midnight"
+        );
     }
 
     // Mirrors Go `TestHistoryInvalidLimit400`.
