@@ -67,6 +67,15 @@ pub struct EvWorkerExit {
     pub declared_handoff: bool,
 }
 
+/// The ceiling on an armed retry delay. A real retry is minutes-scale by construction (the 1s
+/// continuation cadence, or `max_retry_backoff_ms`), so a longer delay can only come from a corrupt
+/// `due_at_ms` read back from the store — an unbounded `INTEGER` column. Handing such a value to
+/// `tokio::time::sleep` would overflow the `Instant` it is added to and panic the control task, so it
+/// is clamped here instead: firing a nonsense row EARLY is safe, because
+/// [`Orchestrator::on_retry`] re-validates it against live Linear and releases the claim if the issue
+/// is no longer eligible, whereas never firing is the TRA-316 deadlock itself.
+const MAX_RETRY_DELAY_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 /// The stable identity + project routing for a scheduled retry. Go passes these as four positional
 /// args to `scheduleRetryFor` (`id`, `identifier`, `slug`, `repo`); they are bundled here so the
 /// method keeps an idiomatic arity. `id` is the opaque map key (== the running/event id), `identifier`
@@ -373,6 +382,52 @@ impl Orchestrator {
         }
     }
 
+    /// Arms the live retry timer for `key`, firing [`Event::Retry`] with `issue_id: key` after
+    /// `delay_ms` clamped to `[0, MAX_RETRY_DELAY_MS]` (Go `time.AfterFunc(delay, () => o.events <-
+    /// evRetry{key})`).
+    ///
+    /// THE ONLY place a retry timer is armed — every arming path (runtime [`schedule_retry_for`], boot-recovery
+    /// [`re_arm_retry`](Orchestrator::re_arm_retry) / [`arm_immediate_retry`](Orchestrator::arm_immediate_retry),
+    /// and [`requeue_recovered`](Orchestrator::requeue_recovered)) goes through here, so a new path
+    /// cannot silently ship an inert retry (TRA-316: the recovery paths recorded the entry but armed
+    /// nothing, so the retry never fired while its claim kept `select_dispatch` skipping the issue —
+    /// a permanent deadlock a restart could not clear).
+    ///
+    /// `key` MUST be the string the [`RetryEntry`] is keyed by in
+    /// [`retry_attempts`](Orchestrator::retry_attempts): the opaque issue id for a live entry, the
+    /// IDENTIFIER for a boot-recovered one (whose `issue_id` is empty until the first fire resolves
+    /// it). The timer key, the entry key, and the fired [`EvRetry::issue_id`] must all agree or
+    /// [`on_retry`](Orchestrator::on_retry) looks up an entry that isn't there and drops the retry.
+    ///
+    /// Arms ONLY when the daemon is live — `o.ctx` is set exactly when a control loop is running to
+    /// receive the fire. The off-loop unit tests drive `on_retry` / `on_worker_exit` directly with a
+    /// nil `o.ctx` and no runtime to spawn onto; they assert on `retry_attempts`, not the timer.
+    pub(crate) fn arm_retry_timer(&mut self, key: &str, delay_ms: i64) {
+        // Never strand a timer already armed for this key (a re-arm of the same entry): the replaced
+        // `JoinHandle` would otherwise be dropped without aborting, leaving a detached task alive.
+        if let Some(prev) = self.retry_timers.remove(key) {
+            prev.abort();
+        }
+        let Some(mut ctx) = self.ctx.clone() else {
+            return; // off-loop: nothing is receiving, and there is no runtime to spawn onto
+        };
+        let events = self.events.clone();
+        let fire_id = key.to_string();
+        // A past-due entry (every boot-recovered `arm_immediate_retry`, and any row whose `due_at`
+        // elapsed while the daemon was down) clamps to zero and fires immediately, never underflows.
+        // The upper clamp bounds a `due_at_ms` read back from the store — see `MAX_RETRY_DELAY_MS`.
+        let delay = std::time::Duration::from_millis(delay_ms.clamp(0, MAX_RETRY_DELAY_MS) as u64);
+        let timer = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {
+                    let _ = events.send(Event::Retry(EvRetry { issue_id: fire_id }));
+                }
+                _ = ctx.cancelled() => {}
+            }
+        });
+        self.retry_timers.insert(key.to_string(), timer);
+    }
+
     /// (Re)schedules a retry for `t.id` after `delay_ms` (upstream §8.4) with explicit project routing,
     /// so the retry re-fetches from the right slug and re-checks the right per-project caps. Records the
     /// [`RetryEntry`] (with the wall-clock due time + the last-known `iss`), keeps the claim, and
@@ -405,24 +460,8 @@ impl Orchestrator {
                 recovered: false,
             },
         );
-        // Arm the live retry timer (Go `time.AfterFunc(delayMS, () => o.events <- evRetry{id})`),
-        // ONLY when the daemon is live — `o.ctx` is set exactly when a control loop is running to
-        // receive the fire. The off-loop unit tests drive `on_retry` / `on_worker_exit` directly with a
-        // nil `o.ctx` and no runtime to spawn onto; they assert on `retry_attempts`, not the timer.
-        if let Some(mut ctx) = self.ctx.clone() {
-            let events = self.events.clone();
-            let fire_id = t.id.to_string();
-            let delay = std::time::Duration::from_millis(delay_ms.max(0) as u64);
-            let timer = tokio::spawn(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {
-                        let _ = events.send(Event::Retry(EvRetry { issue_id: fire_id }));
-                    }
-                    _ = ctx.cancelled() => {}
-                }
-            });
-            self.retry_timers.insert(t.id.to_string(), timer);
-        }
+        // Arm the live retry timer, keyed by the opaque id this entry is keyed by.
+        self.arm_retry_timer(t.id, delay_ms);
         // Persist the retry row (keyed by identifier) + claim=retry_queued so a restart re-arms this
         // timer and keeps the claim (Phase 4 §3.8).
         self.persist_retry(t.identifier, attempt, due_at_ms, err_str, t.project_slug);
