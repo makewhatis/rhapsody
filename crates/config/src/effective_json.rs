@@ -179,6 +179,13 @@ fn build_global(c: &Config) -> Value {
         ("github_summons", Value::Bool(c.tracker.github_summons)),
         ("milestone", s(&c.tracker.milestone)),
         ("labels", slice_or_null(&c.tracker.labels)),
+        // NOTE: `capabilities` is a Rhapsody-only field (no Go v0.4.0 counterpart). Unlike `labels`,
+        // it is deliberately NOT surfaced in the always-emitted global config view: doing so would
+        // inject a `"capabilities": null` key into the `GET /api/v1/config` body and break byte-parity
+        // with the captured Go v0.4.0 config goldens (there is no legitimate recapture path — the
+        // frozen reference has no such field). Same rationale as `mcp.allow_handoff` (TRA-242), which
+        // is likewise kept out of this view. Surfacing it belongs with the httpapi/web ticket (which
+        // owns the golden-affecting config-view shape), not this config-crate plumbing task.
         ("prompt", s(&c.prompt_template)),
         ("prompt_file", s(&c.prompt_file)),
         ("git_flow", s(&c.git_flow)),
@@ -238,6 +245,9 @@ fn build_projects(c: &Config) -> Vec<Value> {
         insert_if_non_empty(&mut entry, "milestone", &p.milestone);
         if !p.labels.is_empty() {
             entry.insert("labels".into(), str_array(&p.labels));
+        }
+        if !p.capabilities.is_empty() {
+            entry.insert("capabilities".into(), str_array(&p.capabilities));
         }
         entry.insert("enabled".into(), Value::Bool(enabled));
         if !p.active_states.is_empty() {
