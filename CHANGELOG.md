@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/makewhatis/rhapsody/compare/v0.3.1...v0.3.2) (2026-08-13)
+
+
+### Features
+
+* **config:** add capabilities field mirroring labels (BO-10) ([131bbc8](https://github.com/makewhatis/rhapsody/commit/131bbc81de80244f05cb957b6083f9b4e7fca3e0))
+
 ## [0.3.1](https://github.com/makewhatis/rhapsody/compare/v0.3.0...v0.3.1) (2026-07-26)
 
 
