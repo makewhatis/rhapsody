@@ -302,7 +302,13 @@ function VersionFooter() {
   // Collapse to one line in the common case where the shell and the daemon ship from the same build;
   // show both only when they actually disagree, which IS the drift worth noticing.
   const same = appLabel !== "" && appLabel === daemonLabel;
-  const builtAt = daemon?.built_at && daemon.built_at !== "unknown" ? `daemon built ${daemon.built_at}` : undefined;
+  // Both build times on hover. The shell's was the previous tooltip and stays available; the
+  // daemon's is the one that dates a stale binary, which is the whole point of the stamp.
+  const times = [
+    app?.build_time && app.build_time !== "unknown" ? `app built ${app.build_time}` : "",
+    daemon?.built_at && daemon.built_at !== "unknown" ? `daemon built ${daemon.built_at}` : "",
+  ].filter(Boolean);
+  const builtAt = times.length > 0 ? times.join(" · ") : undefined;
 
   return (
     <div

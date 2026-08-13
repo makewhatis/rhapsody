@@ -13,6 +13,13 @@ const UNSET = ["", "dev", "none", "unknown"];
 // builds by eye; the full one stays in the API payload.
 export function stamp(version: string, commit: string): string {
   const v = UNSET.includes(version) ? "dev" : version.startsWith("v") ? version : `v${version}`;
-  const c = UNSET.includes(commit) ? "" : ` · ${commit.slice(0, 7)}`;
+  const c = UNSET.includes(commit) ? "" : ` · ${shortCommit(commit)}`;
   return `${v}${c}`;
+}
+
+// shortCommit abbreviates the daemon's full 40-char SHA, and ONLY that. The desktop shell already
+// stamps a short SHA carrying a "-dirty" suffix (Makefile: `$(COMMIT)$(DIRTY)`), so truncating
+// unconditionally would silently drop that marker and show a modified build as a clean one.
+function shortCommit(commit: string): string {
+  return /^[0-9a-f]{40}$/i.test(commit) ? commit.slice(0, 7) : commit;
 }

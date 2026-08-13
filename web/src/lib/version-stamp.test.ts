@@ -9,8 +9,8 @@ describe("stamp", () => {
   });
 
   it("prefixes a bare release version with v (the shell reports '1.2.0', the daemon 'v1.2.0')", () => {
-    expect(stamp("1.2.0", "abcdef1234")).toBe("v1.2.0 · abcdef1");
-    expect(stamp("v1.2.0", "abcdef1234")).toBe("v1.2.0 · abcdef1");
+    expect(stamp("1.2.0", "581e281")).toBe("v1.2.0 · 581e281");
+    expect(stamp("v1.2.0", "581e281")).toBe("v1.2.0 · 581e281");
   });
 
   // Each source has its own "not stamped" sentinel; none may reach the screen as an identity.
@@ -24,6 +24,18 @@ describe("stamp", () => {
 
   it("keeps a real version when only the commit is unstamped", () => {
     expect(stamp("v0.3.1", "unknown")).toBe("v0.3.1");
+  });
+
+  // The shell stamps `$(COMMIT)$(DIRTY)` — an already-short SHA plus a "-dirty" marker. Truncating
+  // that to 7 chars would show a modified build as a clean one, so only a full 40-char SHA (the
+  // daemon's format) is abbreviated.
+  it("preserves the shell's -dirty marker instead of truncating it away", () => {
+    expect(stamp("dev", "581e281-dirty")).toBe("dev · 581e281-dirty");
+  });
+
+  it("abbreviates only a full 40-character SHA", () => {
+    expect(stamp("v1.0.0", "581e28193d420970a04d545e65087ebf9bbc45e4")).toBe("v1.0.0 · 581e281");
+    expect(stamp("v1.0.0", "581e281")).toBe("v1.0.0 · 581e281");
   });
 
   // The footer collapses to one line when the two builds match and shows both when they do not, so
