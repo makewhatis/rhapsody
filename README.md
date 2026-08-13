@@ -107,6 +107,40 @@ state is still `"ticket moved externally"`. With `review_states` unset — the G
 byte-identical to the reference. No new `OUTCOME_*` constant is introduced; the missing hand-off
 declaration is preserved as a `tracing::warn!` naming the run, issue and state.
 
+### Reportable build identity — `GET /api/v1/version` (STUDIO-380)
+
+The daemon answers `/state` with `status: ok` regardless of how old the binary is, so "Rhapsody is
+running" and "Rhapsody is current" were indistinguishable from the outside. A daemon ran for a month
+on a build that predated eight merges — including the TRA-279 fix above, which it had built for
+itself — and the drift surfaced only when someone hand-audited runs and found successful ones
+recorded `stopped` / `"ticket moved externally"`.
+
+| Question | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| "which build is this daemon?" | unanswerable — no endpoint, no version in any payload | `GET /api/v1/version` |
+
+```json
+{ "version": "v0.3.1-8-g581e281", "commit": "581e281…", "built_at": "2026-08-13T16:10:35Z" }
+```
+
+Baked in at compile time by `crates/httpapi/build.rs`. Every probe is best-effort and reports the
+`"unknown"` sentinel rather than failing the build, so the crate still compiles outside a git
+checkout; `RHAPSODY_BUILD_{COMMIT,VERSION,TIME}` and `SOURCE_DATE_EPOCH` override the probes for a
+reproducible or source-tarball build.
+
+This is an **additive endpoint, deliberately not a field on `/api/v1/state`**. `/state` is a byte-parity
+port of Go `toStateJSON` pinned to the committed `api/state.json` golden, and that golden is
+recaptured from the frozen Go daemon — which will never emit a build identity. A field there could be
+made green only by hand-editing the fixture or loosening the assertion, both of which are drift
+laundering. A separate route leaves every existing payload and golden untouched, following the
+precedent TRA-320 set. No existing payload changes shape.
+
+The dashboard footer reports the daemon stamp alongside the desktop shell's own (`appVersion()`),
+collapsing to one line when they match and showing both when they diverge — they are separate
+binaries and the sidecar can drift from the shell. Because it is served over the loopback API rather
+than the Tauri bridge, the stamp now also renders in a plain browser, where the footer previously
+showed nothing.
+
 ### Honest history paging + store-computed dashboard aggregates (TRA-320)
 
 Go's `handleHistory` derives `next_offset` from the limit the CALLER sent, while the store applies

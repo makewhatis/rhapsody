@@ -12,6 +12,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use rhapsody_orchestrator::snapshot_json;
 
+use crate::build_info;
 use crate::responses::{HealthzJson, write_error, write_json};
 use crate::server::StateProvider;
 
@@ -56,6 +57,17 @@ pub(crate) async fn handle_state(
             None,
         ),
     }
+}
+
+/// `GET /api/v1/version` — this daemon's build identity (`version`/`commit`/`built_at`). Rhapsody-only
+/// (STUDIO-380); no Go counterpart. State-free like `/healthz`, so it answers even while the
+/// orchestrator is wedged — which is exactly when an operator wants to know what is running. See
+/// [`crate::build_info`] for why this is its own route rather than a field on `/state`.
+pub(crate) async fn handle_version(method: Method) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    write_json(StatusCode::OK, &build_info::current())
 }
 
 /// `POST /api/v1/refresh` — request a coalesced poll+reconcile tick and return 202. The provider's
@@ -203,6 +215,48 @@ mod tests {
             .await
             .expect("HEAD /healthz");
         assert_eq!(resp.status(), 200);
+    }
+
+    // ------- version endpoint (STUDIO-380; Rhapsody-only, no Go counterpart) -------
+
+    // The endpoint serves all three identity fields as JSON. This is the surface an operator (and the
+    // dashboard header) reads to answer "is the daemon I am talking to current?" — the question that
+    // had no answer when a month-stale binary kept reporting `status: ok`.
+    #[tokio::test]
+    async fn version_endpoint() {
+        let base = spawn(FakeProvider::ok(empty_snapshot())).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/version")).await;
+        assert_eq!(status, 200);
+        for key in ["version", "commit", "built_at"] {
+            let value = body[key].as_str().unwrap_or_default();
+            assert!(!value.is_empty(), "{key} must be a non-empty string");
+        }
+    }
+
+    // A wedged orchestrator must not hide the build identity: `/state` 503s when the snapshot times
+    // out, and that is precisely when an operator asks what is running. The handler takes no state,
+    // so a failing provider changes nothing here.
+    #[tokio::test]
+    async fn version_endpoint_answers_when_snapshot_unavailable() {
+        let base = spawn(FakeProvider::failing("boom")).await;
+        let (status, _body) = get_json(&format!("{base}/api/v1/state")).await;
+        assert_eq!(status, 503, "precondition: /state is unavailable");
+
+        let (status, body) = get_json(&format!("{base}/api/v1/version")).await;
+        assert_eq!(status, 200);
+        assert!(body["commit"].is_string());
+    }
+
+    // Shares the read-only method guard with every other GET route.
+    #[tokio::test]
+    async fn version_method_not_allowed() {
+        let base = spawn(FakeProvider::ok(empty_snapshot())).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/version"))
+            .send()
+            .await
+            .expect("POST /api/v1/version");
+        assert_eq!(resp.status(), 405);
     }
 
     // ------- state endpoint (mirrors server_test.go) -------
