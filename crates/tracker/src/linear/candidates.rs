@@ -7,7 +7,8 @@
 //! by-states); [`resolve_milestone_id`] resolves + caches a configured milestone name/UUID to its
 //! Linear id.
 
-use super::{Client, LinearError, LinearErrorKind, RawIssue, query};
+use super::decode::IssueNodes;
+use super::{Client, LinearError, LinearErrorKind, query};
 use crate::TrackerError;
 use regex::Regex;
 use rhapsody_core::Issue;
@@ -38,7 +39,9 @@ pub(super) struct IssuesPage {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub(super) struct IssuesConnection {
-    pub nodes: Vec<RawIssue>,
+    /// Decoded one issue at a time so a single undecodable issue is dropped rather than blanking
+    /// the whole project's candidates (STUDIO-406) — see [`IssueNodes`].
+    pub nodes: IssueNodes,
     #[serde(rename = "pageInfo")]
     pub page_info: PageInfo,
 }
@@ -51,17 +54,15 @@ pub(super) struct PageInfo {
     pub has_next_page: bool,
     /// The end cursor, or `""` when absent OR explicitly `null`. Linear (and the R3 `linear-stub`)
     /// returns `endCursor: null` on a final/empty page; Go's `encoding/json` decodes a JSON null
-    /// into a `string` field as the zero value `""`, so [`null_to_empty`] reproduces that (a plain
-    /// `String` field would reject the null, diverging from the Go adapter — surfaced by T5's stub
-    /// gate). `has_next_page` gates its use, so a "" end cursor is only ever read on the last page.
-    #[serde(rename = "endCursor", deserialize_with = "null_to_empty")]
+    /// into a `string` field as the zero value `""`, so [`null_to_empty`](super::decode::null_to_empty)
+    /// reproduces that (a plain `String` field would reject the null, diverging from the Go adapter —
+    /// surfaced by T5's stub gate). `has_next_page` gates its use, so a "" end cursor is only ever
+    /// read on the last page.
+    #[serde(
+        rename = "endCursor",
+        deserialize_with = "super::decode::null_to_empty"
+    )]
     pub end_cursor: String,
-}
-
-/// Deserializes a possibly-`null` GraphQL string into a `String` (null → `""`), the mirror of Go's
-/// `encoding/json` decoding a JSON null into a `string` field as the zero value.
-fn null_to_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// The `projectMilestones` connection shape returned by [`query::QUERY_PROJECT_MILESTONES`].
@@ -83,7 +84,9 @@ struct MilestonesConnection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct MilestoneNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     name: String,
 }
 
@@ -169,7 +172,8 @@ pub(super) async fn paginate(
             vars.insert((*k).to_string(), v.clone());
         }
         let page: IssuesPage = c.do_graphql(query, Some(Value::Object(vars))).await?;
-        for n in page.issues.nodes {
+        page.issues.nodes.warn_dropped("candidate fetch");
+        for n in page.issues.nodes.kept {
             out.push(c.normalize_issue(n));
         }
         if !page.issues.page_info.has_next_page {
@@ -572,6 +576,53 @@ mod tests {
                 .iter()
                 .all(|s| s.as_deref() == Some("proj")),
             "projectSlug var must be sent on every page"
+        );
+    }
+
+    // STUDIO-406: a real Linear page carrying `sourceType: null` on an attachment must decode and
+    // dispatch normally — this is the exact payload shape that silently disabled whole projects.
+    #[tokio::test]
+    async fn fetch_candidates_decodes_null_attachment_fields() {
+        let (c, _server) = new_test_client(|_req| {
+            MockResp::ok(
+                r#"{"data":{"issues":{"nodes":[
+                    {"id":"1","identifier":"STUDIO-398","title":"t","state":{"name":"In Review"},
+                     "attachments":{"nodes":[{"sourceType":null,"metadata":{"url":"https://github.com/makewhatis/flux/pull/58","status":null}}]}}
+                ],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}"#,
+            )
+        })
+        .await;
+        let got = c
+            .fetch_candidate_issues()
+            .await
+            .expect("a null-bearing candidate page must decode");
+        assert_eq!(got.len(), 1, "the issue must remain dispatchable");
+        assert_eq!(got[0].identifier, "STUDIO-398");
+    }
+
+    // STUDIO-406: one undecodable issue must be DROPPED, not fail the whole project's fetch. Before
+    // this, a single bad node made every sibling in the project invisible to the poller forever.
+    #[tokio::test]
+    async fn fetch_candidates_drops_undecodable_issue_keeps_siblings() {
+        let (c, _server) = new_test_client(|_req| {
+            MockResp::ok(
+                r#"{"data":{"issues":{"nodes":[
+                    {"id":"1","identifier":"MT-1","title":"first","state":{"name":"Todo"}},
+                    {"id":"2","identifier":"MT-BAD","title":"undecodable","priority":"not-a-number","state":{"name":"Todo"}},
+                    {"id":"3","identifier":"MT-3","title":"third","state":{"name":"Todo"}}
+                ],"pageInfo":{"hasNextPage":false,"endCursor":"x"}}}}"#,
+            )
+        })
+        .await;
+        let got = c
+            .fetch_candidate_issues()
+            .await
+            .expect("one bad node must not fail the fetch");
+        let ids: Vec<&str> = got.iter().map(|i| i.identifier.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["MT-1", "MT-3"],
+            "siblings of an undecodable issue must stay dispatchable"
         );
     }
 

@@ -50,9 +50,12 @@ struct WorkflowStatesConn {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct WorkflowStateNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     name: String,
     #[serde(rename = "type")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     kind: String,
     position: f64,
 }

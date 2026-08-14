@@ -27,6 +27,7 @@ static PR_NUMBER_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"/pu
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawName {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     name: String,
 }
 
@@ -40,28 +41,35 @@ struct RawNodes<T> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawTeam {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawAssignee {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
     #[serde(rename = "displayName")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     display_name: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawMilestone {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     name: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawRelIssue {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     identifier: String,
     state: RawName,
 }
@@ -70,6 +78,7 @@ struct RawRelIssue {
 #[serde(default)]
 struct RawRelation {
     #[serde(rename = "type")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     rel_type: String,
     issue: RawRelIssue,
 }
@@ -79,13 +88,18 @@ struct RawRelation {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawMetadata {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     url: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     status: String,
     #[serde(rename = "updatedAt")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     updated_at: String,
     #[serde(rename = "mergedAt")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     merged_at: String,
     #[serde(rename = "createdAt")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     created_at: String,
 }
 
@@ -93,6 +107,7 @@ struct RawMetadata {
 #[serde(default)]
 struct RawAttachment {
     #[serde(rename = "sourceType")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     source_type: String,
     metadata: RawMetadata,
 }
@@ -101,7 +116,9 @@ struct RawAttachment {
 #[serde(default)]
 struct RawComment {
     #[serde(rename = "createdAt")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     created_at: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     body: String,
 }
 
@@ -110,8 +127,11 @@ struct RawComment {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct RawIssue {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     identifier: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     title: String,
     description: Option<String>,
     priority: Option<f64>,
@@ -140,6 +160,13 @@ impl RawIssue {
     /// are private to this module.
     pub(in crate::linear) fn git_branch_name(&self) -> Option<&str> {
         self.branch_name.as_deref()
+    }
+
+    /// The issue's Linear `identifier` (e.g. `STUDIO-406`). Exposed for the sibling `decode` module,
+    /// whose tests assert which issues survived a partially-undecodable page.
+    #[cfg(test)]
+    pub(in crate::linear) fn identifier(&self) -> &str {
+        &self.identifier
     }
 }
 
@@ -637,6 +664,47 @@ mod tests {
         );
         let pr101 = prs.iter().find(|p| p.number == 101).expect("PR 101");
         assert!(!pr101.merged, "PR 101 should be merged=false");
+    }
+
+    // STUDIO-406: Linear sends `null` for nullable Strings, and Go's encoding/json decodes a JSON
+    // null into a `string` field as the zero value "". A plain Rust `String` REJECTS it, which made
+    // one attachment fail the whole page decode — silently disabling every project holding an
+    // in-review issue with a PR attachment. Every plain-String field in the response structs must
+    // therefore tolerate null, exactly like Go.
+    #[test]
+    fn normalize_tolerates_null_strings_like_go() {
+        let raw = r#"{
+          "id": "u", "identifier": "STUDIO-398", "title": "t", "state": { "name": "In Review" },
+          "team": { "id": null },
+          "labels": { "nodes": [ { "name": null } ] },
+          "inverseRelations": { "nodes": [ { "type": null, "issue": { "id": null, "identifier": null, "state": { "name": null } } } ] },
+          "attachments": { "nodes": [
+            { "sourceType": null, "metadata": { "url": null, "status": null, "updatedAt": null, "mergedAt": null, "createdAt": null } },
+            { "sourceType": "github", "metadata": { "url": "https://github.com/makewhatis/flux/pull/58", "status": null, "updatedAt": "2026-08-14T04:55:31.000Z", "mergedAt": null, "createdAt": null } }
+          ] },
+          "comments": { "nodes": [ { "createdAt": null, "body": null } ] }
+        }"#;
+        let iss = norm_client("").normalize_issue(
+            serde_json::from_str(raw)
+                .expect("a null-bearing payload must decode, as it does in Go"),
+        );
+        // The null-sourceType attachment is simply not a GitHub PR; the real one still registers.
+        assert!(iss.linked_pr, "the github PR attachment must still be seen");
+        let prs = iss.linked_prs.as_deref().unwrap_or_default();
+        assert_eq!(prs.len(), 1, "exactly one linked PR");
+        assert_eq!(prs[0].number, 58);
+        assert!(!prs[0].merged, "null mergedAt/status → not merged");
+        assert_eq!(
+            iss.latest_pr_activity_at,
+            Some(Utc.with_ymd_and_hms(2026, 8, 14, 4, 55, 31).unwrap())
+        );
+        // Null strings land as the Go zero value, not an error.
+        assert_eq!(iss.team_id, "");
+        assert_eq!(iss.labels.as_deref(), Some([String::new()].as_slice()));
+        assert!(
+            iss.blocked_by.is_none(),
+            "a null relation type is not \"blocks\""
+        );
     }
 
     // Mirrors Go TestNormalizeNoLinkedPR.

@@ -61,6 +61,7 @@ struct CommentCreateNode {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct CommentIdNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
 }
 
@@ -81,6 +82,7 @@ struct AssigneeIssue {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct AssigneeUser {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
 }
 
@@ -109,9 +111,12 @@ struct CommentsConn {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct CommentNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     body: String,
     #[serde(rename = "createdAt")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     created_at: String,
 }
 

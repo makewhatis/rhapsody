@@ -13,6 +13,7 @@ mod by_states;
 mod candidates;
 mod claim;
 mod client;
+mod decode;
 mod errors;
 mod move_state;
 mod normalize;

@@ -31,6 +31,13 @@ use crate::orchestrator::Orchestrator;
 /// ctx (`o.ctx`) still aborts it on shutdown.
 const PROJECT_WARNING_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many CONSECUTIVE failed candidate fetches a project must accumulate before the failure is
+/// surfaced as a warning (STUDIO-406). One failed tick is ordinary (a Linear blip, a timeout) and
+/// self-heals; a sustained streak means no ticket in that project can dispatch at all, which is
+/// indistinguishable from "nothing is queued" unless it is surfaced. Three ticks is long enough to
+/// ride out a transient outage and short enough that a human sees the real thing within minutes.
+pub(crate) const FETCH_FAILURE_WARN_AFTER: u32 = 3;
+
 /// The per-project snapshot the warning resolver works from, captured on the control task (from
 /// `eff.projects`) BEFORE the async resolver runs, so the resolver never reads loop-owned state
 /// off-loop. Mirrors Go `projectWarnInput`.
@@ -76,6 +83,22 @@ pub(crate) struct WarningsState {
 struct WarningMaps {
     slug: HashMap<String, Vec<String>>,
     file: HashMap<String, Vec<String>>,
+    /// Producer 3 (STUDIO-406) — the consecutive-candidate-fetch-failure streak per project group.
+    /// Unlike the other two this is NOT recomputed by a background pass: the poll loop records each
+    /// tick's verdict directly, so it carries no generation guard (there is no slower-older-pass to
+    /// lose a race to) and is keyed/cleared per group rather than replaced wholesale.
+    fetch: HashMap<String, FetchFailure>,
+}
+
+/// One project's live candidate-fetch failure streak.
+#[derive(Debug, Clone)]
+struct FetchFailure {
+    /// Consecutive failed fetches; reset to 0 by the first success.
+    streak: u32,
+    /// The project slug whose fetch is failing (a multi-slug project names the slug that broke).
+    slug: String,
+    /// The most recent error, quoted into the warning so the cause is visible without the log.
+    err: String,
 }
 
 impl WarningsState {
@@ -119,9 +142,31 @@ impl WarningsState {
             .unwrap_or_default()
     }
 
+    /// Records one FAILED candidate fetch for a project group, advancing its streak. Once the streak
+    /// reaches [`FETCH_FAILURE_WARN_AFTER`] the project carries a warning (see [`merged_for`]).
+    /// Called from the poll loop on every failing tick. STUDIO-406.
+    pub(crate) fn record_fetch_failure(&self, group: &str, slug: &str, err: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        let e = m.fetch.entry(group.to_string()).or_insert(FetchFailure {
+            streak: 0,
+            slug: slug.to_string(),
+            err: String::new(),
+        });
+        e.streak = e.streak.saturating_add(1);
+        e.slug = slug.to_string();
+        e.err = err.to_string();
+    }
+
+    /// Clears a project group's fetch-failure streak — called on every SUCCESSFUL candidate fetch, so
+    /// a recovered project drops its warning on the next tick. STUDIO-406.
+    pub(crate) fn clear_fetch_failures(&self, group: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        m.fetch.remove(group);
+    }
+
     /// The merged warnings for a group (empty when none): missing-prompt-file flags first, then the
-    /// unmatched-slug advisories. A fresh slice so callers never alias the stored maps. Mirrors Go
-    /// `projectWarningsFor`.
+    /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406). A fresh slice so
+    /// callers never alias the stored maps. Mirrors Go `projectWarningsFor`, plus the fetch producer.
     pub(crate) fn merged_for(&self, group: &str) -> Vec<String> {
         let m = self.maps.read().unwrap_or_else(|e| e.into_inner());
         let file = m.file.get(group);
@@ -132,6 +177,15 @@ impl WarningsState {
         }
         if let Some(s) = slug {
             out.extend_from_slice(s);
+        }
+        // Appended LAST so the pre-existing producers keep their golden ordering.
+        if let Some(f) = m.fetch.get(group)
+            && f.streak >= FETCH_FAILURE_WARN_AFTER
+        {
+            out.push(format!(
+                "candidate fetch for slug {:?} has failed {} times in a row — no issue in this project can dispatch (last error: {})",
+                f.slug, f.streak, f.err
+            ));
         }
         out
     }
@@ -810,6 +864,103 @@ mod tests {
         assert!(
             o.project_warnings_for("bad").is_empty(),
             "resolver skipped without a live ctx"
+        );
+    }
+
+    // STUDIO-406: a project whose candidate fetch keeps failing is invisible — no ticket in it can
+    // dispatch, yet nothing surfaces outside an ERROR log line. Repeated failure must reach the
+    // per-project warnings the dashboard already renders.
+    #[test]
+    fn repeated_fetch_failure_surfaces_as_a_project_warning() {
+        let o = Orchestrator::new("WORKFLOW.md");
+        let err = "linear_unknown_payload: decode data: invalid type: null, expected a string";
+
+        // Below the threshold a blip stays quiet — a single failed tick is normal.
+        for _ in 1..FETCH_FAILURE_WARN_AFTER {
+            o.warnings.record_fetch_failure("g", "f01292d2f808", err);
+            assert!(
+                o.project_warnings_for("g").is_empty(),
+                "a transient failure must not raise a warning"
+            );
+        }
+
+        // Crossing it surfaces one warning naming the slug, the streak, and the error.
+        o.warnings.record_fetch_failure("g", "f01292d2f808", err);
+        let w = o.project_warnings_for("g");
+        assert_eq!(w.len(), 1, "expected exactly one fetch warning: {w:?}");
+        assert!(w[0].contains("f01292d2f808"), "names the slug: {}", w[0]);
+        assert!(
+            w[0].contains(&FETCH_FAILURE_WARN_AFTER.to_string()),
+            "reports the streak: {}",
+            w[0]
+        );
+        assert!(w[0].contains("invalid type: null"), "quotes it: {}", w[0]);
+
+        // The streak keeps counting up, still as ONE warning (not one per tick).
+        o.warnings.record_fetch_failure("g", "f01292d2f808", err);
+        let w = o.project_warnings_for("g");
+        assert_eq!(w.len(), 1, "the warning must not accumulate: {w:?}");
+        assert!(
+            w[0].contains(&(FETCH_FAILURE_WARN_AFTER + 1).to_string()),
+            "the streak advances: {}",
+            w[0]
+        );
+
+        // A successful fetch clears it immediately.
+        o.warnings.clear_fetch_failures("g");
+        assert!(
+            o.project_warnings_for("g").is_empty(),
+            "a recovered project must clear its warning"
+        );
+    }
+
+    // The fetch producer must be independent of the other two: it neither clobbers them nor is
+    // clobbered by a reload's slug/file store.
+    #[test]
+    fn fetch_warnings_merge_with_the_other_producers() {
+        let o = Orchestrator::new("WORKFLOW.md");
+        o.warnings.store_slug(
+            o.warnings.bump_slug_gen(),
+            HashMap::from([("g".to_string(), vec!["slug advisory".to_string()])]),
+        );
+        for _ in 0..FETCH_FAILURE_WARN_AFTER {
+            o.warnings.record_fetch_failure("g", "s", "boom");
+        }
+        assert_eq!(
+            o.project_warnings_for("g").len(),
+            2,
+            "slug advisory + fetch warning"
+        );
+        // A later reload re-storing slug warnings must not drop the fetch warning.
+        o.warnings.store_slug(
+            o.warnings.bump_slug_gen(),
+            HashMap::from([("g".to_string(), vec!["slug advisory".to_string()])]),
+        );
+        assert_eq!(
+            o.project_warnings_for("g").len(),
+            2,
+            "fetch warning survives"
+        );
+    }
+
+    // Two projects fail independently: clearing one must not clear the other.
+    #[test]
+    fn fetch_failures_are_tracked_per_project() {
+        let o = Orchestrator::new("WORKFLOW.md");
+        for _ in 0..FETCH_FAILURE_WARN_AFTER {
+            o.warnings
+                .record_fetch_failure("flux", "f01292d2f808", "boom");
+            o.warnings
+                .record_fetch_failure("tally", "aabbccddeeff", "boom");
+        }
+        assert_eq!(o.project_warnings_for("flux").len(), 1);
+        assert_eq!(o.project_warnings_for("tally").len(), 1);
+        o.warnings.clear_fetch_failures("flux");
+        assert!(o.project_warnings_for("flux").is_empty());
+        assert_eq!(
+            o.project_warnings_for("tally").len(),
+            1,
+            "an unrelated project's warning must be untouched"
         );
     }
 
