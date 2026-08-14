@@ -55,7 +55,8 @@ pub(super) async fn fetch_blocked_backlog_issues(c: &Client) -> Result<Vec<Issue
                 vars.insert("milestoneID".into(), Value::from(id.clone()));
             }
             let page: IssuesPage = c.do_graphql(&query, Some(Value::Object(vars))).await?;
-            for n in page.issues.nodes {
+            page.issues.nodes.warn_dropped("blocked-backlog fetch");
+            for n in page.issues.nodes.kept {
                 out.push(c.normalize_issue(n));
             }
             if !page.issues.page_info.has_next_page {
@@ -85,7 +86,8 @@ pub(super) async fn fetch_issue_branch_by_id(
         let vars = serde_json::json!({ "ids": [id], "first": 1 });
         let page: super::by_ids::IdsPage =
             c.do_graphql(query::QUERY_BRANCH_BY_ID, Some(vars)).await?;
-        let Some(n) = page.issues.nodes.into_iter().next() else {
+        page.issues.nodes.warn_dropped("fetch issue branch by id");
+        let Some(n) = page.issues.nodes.kept.into_iter().next() else {
             return Ok((String::new(), 0));
         };
         let branch = n.git_branch_name().unwrap_or_default().to_string();

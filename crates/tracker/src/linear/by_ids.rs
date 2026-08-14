@@ -5,7 +5,8 @@
 //! depend on. Empty IDs short-circuits with no API call; the running set is bounded by concurrency
 //! so no pagination is needed.
 
-use super::{Client, RawIssue, query};
+use super::decode::IssueNodes;
+use super::{Client, query};
 use crate::TrackerError;
 use rhapsody_core::Issue;
 use serde::Deserialize;
@@ -20,7 +21,9 @@ pub(super) struct IdsPage {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub(super) struct IdsConnection {
-    pub nodes: Vec<RawIssue>,
+    /// Lenient per-node decode (STUDIO-406) — one undecodable issue must not blank a whole
+    /// reconciliation read.
+    pub nodes: IssueNodes,
 }
 
 /// FetchIssueStatesByIDs returns minimal normalized issues for the given tracker IDs. Empty IDs
@@ -35,9 +38,11 @@ pub(super) async fn fetch_issue_states_by_ids(
     super::client::traced(crate::tracker_span!("fetch_issue_states"), async move {
         let vars = serde_json::json!({ "ids": ids, "first": ids.len() });
         let page: IdsPage = c.do_graphql(query::QUERY_BY_IDS, Some(vars)).await?;
+        page.issues.nodes.warn_dropped("fetch issue states by id");
         Ok(page
             .issues
             .nodes
+            .kept
             .into_iter()
             .map(|n| c.normalize_issue(n))
             .collect())

@@ -29,10 +29,14 @@ struct ProjectsConnection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ProjectNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     name: String,
     #[serde(rename = "slugId")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     slug_id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     color: String,
     teams: TeamsConnection,
 }
@@ -46,7 +50,9 @@ struct TeamsConnection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct TeamNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     key: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     name: String,
 }
 

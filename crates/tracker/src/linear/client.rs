@@ -201,10 +201,14 @@ struct ViewerResp {
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct ViewerNode {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     id: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     name: String,
     #[serde(rename = "displayName")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     display_name: String,
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     email: String,
     organization: OrganizationNode,
 }
@@ -213,6 +217,7 @@ struct ViewerNode {
 #[serde(default)]
 struct OrganizationNode {
     #[serde(rename = "urlKey")]
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
     url_key: String,
 }
 
