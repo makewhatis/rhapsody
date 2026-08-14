@@ -4,6 +4,7 @@ import {
   fetchIssueRuns,
   fetchRunMessages,
   fetchState,
+  fetchVersion,
   localDayStartISO,
   resumeRun,
   sendRunMessage,
@@ -250,5 +251,27 @@ describe("issue listing + day summary (TRA-320)", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     expect((await fetchDaySummary(Date.now())).rhythm).toEqual([]);
+  });
+});
+
+describe("fetchVersion", () => {
+  it("GETs /api/v1/version and returns the daemon's build identity", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            version: "v0.3.1-8-g581e281",
+            commit: "581e28193d420970a04d545e65087ebf9bbc45e4",
+            built_at: "2026-08-13T16:10:35Z",
+          }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const v = await fetchVersion();
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/version", expect.anything());
+    expect(v.commit).toBe("581e28193d420970a04d545e65087ebf9bbc45e4");
+    expect(v.version).toBe("v0.3.1-8-g581e281");
+    expect(v.built_at).toBe("2026-08-13T16:10:35Z");
   });
 });

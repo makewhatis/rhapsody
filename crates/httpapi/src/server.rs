@@ -16,7 +16,7 @@ use rhapsody_orchestrator::{
     StopResult,
 };
 
-use crate::handlers::{handle_healthz, handle_refresh, handle_state};
+use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_version};
 use crate::handlers_config::handle_config;
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_history_summary, handle_issue_history,
@@ -242,6 +242,9 @@ where
     Router::new()
         .route("/healthz", any(handle_healthz))
         .route("/api/v1/state", any(handle_state))
+        // Build identity (STUDIO-380): which commit this daemon was built from. Additive and
+        // state-free — `/state` is golden-pinned to the Go daemon's payload and cannot carry it.
+        .route("/api/v1/version", any(handle_version))
         // Coalesced poll+reconcile trigger (H3): POST-only, 202. Registered method-agnostically so a
         // GET yields a 405 envelope rather than the SPA fallback.
         .route("/api/v1/refresh", any(handle_refresh))

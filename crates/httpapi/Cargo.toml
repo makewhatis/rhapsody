@@ -5,6 +5,12 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[build-dependencies]
+# chrono: renders the build timestamp `build.rs` bakes in as RFC3339 UTC, the same format every
+# timestamp on the API already uses. Already in Cargo.lock (core/orchestrator/store) — no new external
+# crate enters; it is a BUILD dependency only, so nothing is added to the daemon's runtime tree.
+chrono = "0.4"
+
 [dependencies]
 # axum: the loopback JSON API + embedded-dashboard server (Go `internal/httpapi` uses net/http +
 # ServeMux; the Rust port targets axum, the P6 plan's named server framework). Version 0.8 matches

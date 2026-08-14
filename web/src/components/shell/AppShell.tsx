@@ -10,6 +10,8 @@ import { useStateQuery } from "@/hooks/useStateQuery";
 import { useUpdater } from "@/hooks/useUpdater";
 import { conductorStatus, viewForStatus } from "@/lib/daemon-status";
 import { appVersion, hasBridge, onNavigate, onShuttingDown, openExternal, type VersionDTO } from "@/lib/bindings";
+import { type DaemonVersion, fetchVersion } from "@/lib/api";
+import { stamp } from "@/lib/version-stamp";
 import { StatusDot } from "@/components/ui";
 
 // The centred, padded content container used by Settings + the onboarding wizard. The Jobs view
@@ -274,20 +276,44 @@ function ShutdownOverlay() {
 }
 
 // VersionFooter — a dim build stamp pinned to the bottom of the window so it's always clear which
-// build is running (release version + git SHA + build time on hover). Renders nothing in a plain
-// browser, where the Wails bridge (and thus the stamp) is absent.
+// build is running (release version + git SHA + build time on hover).
+//
+// It reports TWO builds, because they are separate binaries that drift apart: the desktop shell
+// (appVersion(), via the Tauri bridge) and the rhapsodyd daemon (GET /api/v1/version, STUDIO-380).
+// The daemon's is the one that matters — it decides how runs are classified — and it was previously
+// unreportable, which let a month-stale daemon keep answering `status: ok` indistinguishably from a
+// current one. The daemon stamp is fetched over the same loopback API as everything else, so unlike
+// the shell stamp it also renders in a plain browser.
 function VersionFooter() {
-  const [v, setV] = React.useState<VersionDTO | null>(null);
+  const [app, setApp] = React.useState<VersionDTO | null>(null);
+  const [daemon, setDaemon] = React.useState<DaemonVersion | null>(null);
   React.useEffect(() => {
-    void appVersion().then(setV);
+    void appVersion().then(setApp);
+    // A daemon that is down or too old to serve this route simply leaves the stamp off; the footer
+    // is diagnostic furniture and must never surface an error or white-screen the shell.
+    void fetchVersion()
+      .then(setDaemon)
+      .catch(() => {});
   }, []);
-  if (!v) return null;
-  const label = !v.version || v.version === "dev" ? "dev" : `v${v.version}`;
-  const commit = v.commit && v.commit !== "none" ? ` · ${v.commit}` : "";
+  if (!app && !daemon) return null;
+
+  const appLabel = app ? stamp(app.version, app.commit) : "";
+  const daemonLabel = daemon ? stamp(daemon.version, daemon.commit) : "";
+  // Collapse to one line in the common case where the shell and the daemon ship from the same build;
+  // show both only when they actually disagree, which IS the drift worth noticing.
+  const same = appLabel !== "" && appLabel === daemonLabel;
+  // Both build times on hover. The shell's was the previous tooltip and stays available; the
+  // daemon's is the one that dates a stale binary, which is the whole point of the stamp.
+  const times = [
+    app?.build_time && app.build_time !== "unknown" ? `app built ${app.build_time}` : "",
+    daemon?.built_at && daemon.built_at !== "unknown" ? `daemon built ${daemon.built_at}` : "",
+  ].filter(Boolean);
+  const builtAt = times.length > 0 ? times.join(" · ") : undefined;
+
   return (
     <div
       className="mono"
-      title={v.build_time && v.build_time !== "unknown" ? `built ${v.build_time}` : undefined}
+      title={builtAt}
       style={{
         flexShrink: 0,
         padding: "5px 16px",
@@ -298,8 +324,13 @@ function VersionFooter() {
         background: "var(--bg-app)",
       }}
     >
-      Rhapsody {label}
-      {commit}
+      {appLabel !== "" && <>Rhapsody {appLabel}</>}
+      {!same && daemonLabel !== "" && (
+        <>
+          {appLabel !== "" && " · "}
+          daemon {daemonLabel}
+        </>
+      )}
     </div>
   );
 }

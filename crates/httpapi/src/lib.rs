@@ -40,6 +40,7 @@
 //!
 //! The route registration + method-agnostic 405 semantics live in [`server`]'s `build_router`.
 
+mod build_info;
 mod config_view;
 mod handlers;
 mod handlers_config;

@@ -266,6 +266,22 @@ export async function fetchState(): Promise<StateResponse> {
 // fetchRunDetail fetches one run's unified detail by run id (GET /api/v1/runs/{id}). It
 // serves a running run (live snapshot) and a finished run (history store) identically — the
 // caller polls while outcome === "running" and goes static once it terminates.
+// DaemonVersion is the payload of GET /api/v1/version: which commit the DAEMON was built from
+// (STUDIO-380). Distinct from the desktop shell's VersionDTO — the shell and the rhapsodyd sidecar
+// are separate binaries that can drift apart, and it is the daemon's build that decides how runs are
+// classified. Every field is always present; an unstamped build reports "unknown".
+export interface DaemonVersion {
+  version: string; // nearest release tag + distance, e.g. "v0.3.1" or "v0.3.1-8-g581e281"
+  commit: string; // full git SHA, or "unknown"
+  built_at: string; // RFC3339 UTC, or "unknown"
+}
+
+// fetchVersion reads the daemon's build identity. Unlike the shell's appVersion() this works in a
+// plain browser, since it is served over the same loopback API as everything else.
+export async function fetchVersion(): Promise<DaemonVersion> {
+  return getJSON<DaemonVersion>("/api/v1/version");
+}
+
 export async function fetchRunDetail(runID: number): Promise<RunDetail> {
   const d = await getJSON<RunDetail>(`/api/v1/runs/${runID}`);
   // Defensive: tolerate a server that omits/nulls recent_events so the timeline can .map().
