@@ -665,6 +665,8 @@ impl Orchestrator {
             idx: usize,
             tracker: Arc<dyn Tracker>,
             slug: String,
+            /// The warning key (STUDIO-406) — warnings are per project GROUP, not per slug.
+            group: String,
             gh_summons: bool,
             gh_owner: String,
             gh_repo: String,
@@ -683,6 +685,7 @@ impl Orchestrator {
                 idx,
                 tracker: Arc::clone(&p.tracker),
                 slug: p.slug.clone(),
+                group: p.group.clone(),
                 gh_summons: p.github_summons,
                 gh_owner: p.gh_owner.clone(),
                 gh_repo: p.gh_repo.clone(),
@@ -690,6 +693,9 @@ impl Orchestrator {
             .collect();
         let src = self.gh_source.as_deref();
         let since = self.gh_since();
+        // Shared with the off-loop resolver tasks; the poll loop records each project's fetch
+        // verdict into it (STUDIO-406).
+        let warnings = Arc::clone(&self.warnings);
         async {
             let mut tagged: Vec<TaggedIssue> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -699,9 +705,17 @@ impl Orchestrator {
                 std::collections::HashMap::new();
             for p in projs {
                 let issues = match p.tracker.fetch_candidate_issues().await {
-                    Ok(i) => i,
+                    Ok(i) => {
+                        // Recovered (or never broken): drop any streak so the warning clears.
+                        warnings.clear_fetch_failures(&p.group);
+                        i
+                    }
                     Err(e) => {
+                        // A sustained streak makes the whole project undispatchable, which looks
+                        // exactly like "nothing is queued" from outside. Surface it on the project
+                        // status too, not only at ERROR in the log (STUDIO-406).
                         tracing::error!(project_slug = %p.slug, err = %e, "candidate fetch failed for project; skipping it this tick");
+                        warnings.record_fetch_failure(&p.group, &p.slug, &e.to_string());
                         continue;
                     }
                 };
@@ -1396,6 +1410,44 @@ mod tests {
             "only project B's issue should dispatch when A errors"
         );
         assert_eq!(entries[0].issue.id, "b1");
+    }
+
+    // STUDIO-406: a project whose fetch keeps failing must SURFACE on its project status, not just in
+    // the log. Before this, 1616 consecutive failures were invisible outside a 13MB daemon log while
+    // the project's tickets sat in Todo looking healthy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn on_tick_repeated_project_fetch_failure_surfaces_a_warning() {
+        let mut ta = Fake::new();
+        ta.candidates_err = Some(TrackerError::Other(
+            "linear_unknown_payload: decode data: invalid type: null, expected a string"
+                .to_string(),
+        ));
+        let ta = Arc::new(ta);
+        let (mut o, _spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::clone(&ta), "promptA")], 10);
+
+        // Below the threshold: still quiet.
+        for _ in 1..crate::warnings::FETCH_FAILURE_WARN_AFTER {
+            o.on_tick().await;
+            assert!(
+                o.project_statuses()[0].warnings.is_empty(),
+                "a short failure streak must not warn yet"
+            );
+        }
+
+        // Crossing it surfaces the warning on GET /api/v1/projects' backing status.
+        o.on_tick().await;
+        let w = &o.project_statuses()[0].warnings;
+        assert_eq!(w.len(), 1, "expected a fetch-failure warning: {w:?}");
+        assert!(
+            w[0].contains("has failed") && w[0].contains("invalid type: null"),
+            "the warning must name the streak and the cause: {}",
+            w[0]
+        );
+
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
     }
 
     // Mirrors Go `TestOnTickDedupByIDFirstWins`: a duplicate issue id across projects dispatches once
