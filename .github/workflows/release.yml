@@ -3,7 +3,10 @@ name: release
 # release-please keeps a rolling release PR open on main: every feat:/fix: merge updates it, and
 # merging that PR cuts a vX.Y.Z tag + GitHub Release + CHANGELOG entry. release-please-config.json and
 # .release-please-manifest.json define the flat single-package setup (path ".", `simple` release-type —
-# tag/release/CHANGELOG only, no source-file rewrites in a virtual Cargo workspace). The Makefile's
+# tag/release/CHANGELOG only, no source-file rewrites in a virtual Cargo workspace). While we're pre-1.0
+# both bump-*-pre-major flags are on, so feat: bumps the patch and a breaking change bumps the minor —
+# routine shipping stays on 0.x.Y and never burns a minor. Cut a deliberate minor/major with a
+# `Release-As: 0.5.0` footer on a commit. The Makefile's
 # VERSION default consumes the resulting tag (leading `v` stripped) — see TRA-239. The `build` job
 # below (TRA-240) turns that tag into a signed + notarized Rhapsody.dmg and uploads it to the Release.
 on:
