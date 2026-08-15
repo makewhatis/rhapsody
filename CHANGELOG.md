@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/makewhatis/rhapsody/compare/v0.3.2...v0.3.3) (2026-08-15)
+
+
+### Bug Fixes
+
+* null attachment fields no longer make a project invisible to the poller (STUDIO-408) ([#28](https://github.com/makewhatis/rhapsody/issues/28)) ([f00bb27](https://github.com/makewhatis/rhapsody/commit/f00bb276d23d0b2449da6039f28feddb201e0713))
+
 ## [0.3.2](https://github.com/makewhatis/rhapsody/compare/v0.3.1...v0.3.2) (2026-08-13)
 
 
