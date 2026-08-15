@@ -1,0 +1,55 @@
+name: pr-title
+
+# STUDIO-408: gate every PR on its TITLE being a conventional-commit subject release-please can parse.
+#
+# The title is the thing to validate, not the branch's commits: this repo squash-merges, so GitHub
+# writes the PR title (plus " (#N)") onto main as the squash subject, and that subject is all
+# release-please ever sees. #27 landed as "STUDIO-406: stop a null attachment field ... (#27)",
+# release-please could not parse it, and the release + signed dmg + Homebrew cask bump + manifest
+# update were all skipped — with a green workflow and no error anywhere. This job turns that silence
+# into a red check on the PR that would cause it. The full rationale + failure text lives in
+# harness/release/check-pr-title.sh, which is pinned by harness/release/pr_title_test.sh.
+#
+# Its own workflow rather than a job in ci.yml, because it needs `types: [... edited ...]` so a
+# retitle re-runs the check — adding that trigger to ci.yml would re-run the whole macOS matrix
+# (lint/test/web/boot-e2e/desktop) every time someone edits a PR title or body.
+on:
+  pull_request:
+    # opened/synchronize/reopened: report a status on each head SHA (branch protection needs one).
+    # edited: a retitle does not move the SHA, so without it a fixed — or newly broken — title would
+    # never be re-checked.
+    types: [opened, edited, reopened, synchronize]
+
+# Read-only: this job checks out the repo for the validator script and reads the title from the event
+# payload. It writes nothing.
+permissions:
+  contents: read
+
+# Per-PR, cancel-in-progress: unlike every other workflow here, `edited` fires without a new commit, so
+# a few quick title corrections would otherwise queue several runs — each one taking the single
+# self-hosted Mac runner ahead of the lint/test/web jobs that actually need it. Only the newest title
+# matters, and it reports on the same head SHA, so superseding an in-flight run is safe.
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Job id `pr-title` is the branch-protection context name. Add it to the required checks alongside
+  # lint/test/web (needs admin — see the PR body) or a bad title still merges.
+  pr-title:
+    # Same fork-PR guard as ci.yml: on the self-hosted Mac runner every job runs only for a same-repo
+    # PR, so a fork PR skips all of them and stays unmergeable until a maintainer pulls it to a
+    # same-repo branch — at which point this check runs on that PR's title.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      # Prove the validator itself still behaves before trusting its verdict — the case table is what
+      # keeps "accepts" aligned with the types release-please actually recognises.
+      - run: harness/release/pr_title_test.sh
+      - name: Check the PR title is a conventional-commit subject
+        # Via env, never inlined into the script: a PR title is attacker-controlled text and
+        # `${{ ... }}` interpolation inside a `run:` block is a shell-injection hole.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: harness/release/check-pr-title.sh "$PR_TITLE"

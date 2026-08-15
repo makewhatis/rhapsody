@@ -55,6 +55,48 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # STUDIO-408: a push to main that release-please neither released nor opened/updated a release PR
+      # for is otherwise INVISIBLE — the job is green and says nothing, which is how 0.3.3 went missing
+      # (#27's squash subject carried no conventional type, so release-please skipped it and nobody
+      # noticed until `brew upgrade` had nothing to offer). Surface it as a warning annotation + a job
+      # summary naming the subject that produced nothing.
+      #
+      # A WARNING, not a failure: a `chore:`/`docs:`/`test:`-only merge legitimately releases nothing,
+      # and a red release workflow on those would be routine false noise that trains everyone to ignore
+      # it. The hard gate belongs one step earlier, on the PR title, where the bad subject can still be
+      # fixed — that is the `pr-title` workflow. This step is the backstop for whatever bypasses it
+      # (a direct push to main, an admin merge, a merge commit).
+      - name: Report when nothing was releasable
+        if: >-
+          github.event_name == 'push' &&
+          steps.release.outputs.releases_created != 'true' &&
+          steps.release.outputs.prs_created != 'true'
+        env:
+          # Via env, never inlined into the script: a commit message is untrusted text and `${{ ... }}`
+          # interpolation inside a `run:` block is a shell-injection hole.
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          subject="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          echo "::warning title=No release proposed::release-please found nothing releasable in \"${subject}\" — no release PR, no tag, no signed dmg, no Homebrew cask bump, no manifest update. Expected for a chore:/docs:-only merge; if this was a fix:/feat:, its squash subject was probably not a conventional-commit subject (see the pr-title check)."
+          {
+            echo "### No release proposed"
+            echo
+            echo "release-please created no release and opened/updated no release PR for this push."
+            echo
+            echo '```'
+            echo "${subject}"
+            echo '```'
+            echo
+            echo "That is expected when the merge was \`chore:\`/\`docs:\`/\`test:\`-only. If it was meant"
+            echo "to ship something, the subject above is most likely not a conventional-commit subject —"
+            echo "release-please logs \`commit could not be parsed\` and stops, so the tag, the signed dmg,"
+            echo "the Homebrew cask bump and \`.release-please-manifest.json\` are all skipped silently."
+            echo
+            echo "Fix forward by landing a conventional commit describing the change (an empty commit is"
+            echo "fine), and check why the \`pr-title\` gate did not catch it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # TRA-240 (P8-RD2): on a real release (release-please cut a tag this run) OR a manual workflow_dispatch
   # dry-run against an existing draft/prerelease tag, build the desktop app, sign + notarize the dmg with
   # the runner's Developer ID, verify Gatekeeper acceptance, and attach the installer assets to the
