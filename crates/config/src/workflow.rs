@@ -156,7 +156,7 @@ pub fn save(path: &Path, def: &Definition) -> io::Result<()> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let (file, tmp_path) = create_temp(dir)?;
+    let (file, tmp_path) = create_temp(dir, "workflow")?;
     match write_temp_and_rename(file, &tmp_path, &data, perm, path) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -170,13 +170,15 @@ pub fn save(path: &Path, def: &Definition) -> io::Result<()> {
 /// Process-global counter feeding unique temp-file names in [`create_temp`].
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Creates a uniquely named `.workflow-*.tmp` file in `dir`, owner-only (0600),
-/// mirroring Go's `os.CreateTemp(dir, ".workflow-*.tmp")`.
-fn create_temp(dir: &Path) -> io::Result<(fs::File, PathBuf)> {
+/// Creates a uniquely named `.<prefix>-*.tmp` file in `dir`, owner-only (0600),
+/// mirroring Go's `os.CreateTemp(dir, ".<prefix>-*.tmp")`. Shared by every
+/// `~/.rhapsody` file writer that needs the atomic write convention below
+/// (`save` here, and [`crate::capabilities::load_or_seed`]'s registry writes).
+pub(crate) fn create_temp(dir: &Path, prefix: &str) -> io::Result<(fs::File, PathBuf)> {
     let pid = std::process::id();
     for _ in 0..10_000u64 {
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = dir.join(format!(".workflow-{pid}-{n}.tmp"));
+        let candidate = dir.join(format!(".{prefix}-{pid}-{n}.tmp"));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -196,7 +198,7 @@ fn create_temp(dir: &Path) -> io::Result<(fs::File, PathBuf)> {
 
 /// Writes `data` to the temp file, chmods it to `perm`, then renames it over
 /// `dest`. The temp handle is closed before chmod/rename, mirroring save.go.
-fn write_temp_and_rename(
+pub(crate) fn write_temp_and_rename(
     mut file: fs::File,
     tmp_path: &Path,
     data: &[u8],
