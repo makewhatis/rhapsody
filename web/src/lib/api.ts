@@ -583,6 +583,9 @@ export interface GlobalConfigDTO {
   github_summons: boolean;
   milestone: string;
   labels: string[];
+  /** Global agent-capabilities default (tracker.capabilities): the extra practices every agent
+   *  inherits. Mirrors the `labels` plumbing (BO-10/BO-13); surfaced as an opt-in checklist. */
+  capabilities: string[];
   prompt: string;
   /** Global prompt-source-file path. Empty => use the inline `prompt`; when set it WINS (read per-run). */
   prompt_file: string;
@@ -647,6 +650,8 @@ export interface EffectiveConfigDTO {
   max_concurrent_agents: number;
   milestone: string;
   labels: string[];
+  /** Resolved agent-capabilities (the agent's own list, else the inherited global). Display-only. */
+  capabilities: string[];
   prompt: string;
   /** Resolved prompt-source-file path (the agent's override, else the inherited global). */
   prompt_file: string;
@@ -670,6 +675,8 @@ export interface ProjectConfigDTO {
   repo?: string;
   milestone?: string;
   labels?: string[] | null;
+  /** Per-agent capabilities override (absent/null => inherit the global `capabilities`). */
+  capabilities?: string[] | null;
   enabled: boolean | null;
   active_states?: string[] | null;
   terminal_states?: string[] | null;
@@ -808,4 +815,21 @@ export interface ProjectStatus {
 export async function fetchProjectStatuses(): Promise<ProjectStatus[]> {
   const r = await getJSON<{ projects?: ProjectStatus[] }>("/api/v1/projects");
   return r.projects ?? [];
+}
+
+// --- Agent-capabilities registry (BO-11/BO-13; Rhapsody-only, no Go v0.4.0 mirror) ---
+
+// CapabilityDefDTO is one row of GET /api/v1/capabilities: an opt-in practice the per-project
+// config screen renders as a checklist. The daemon also serves an `instruction` field (the prompt
+// text it injects); the UI only needs the human-facing name/label/description, so we omit it.
+export interface CapabilityDefDTO {
+  name: string;
+  label: string;
+  description: string;
+}
+
+// fetchCapabilitiesRegistry lists the daemon's capability registry so the config UI can render the
+// checklist without hardcoding options. Serves [] when no registry is loaded yet.
+export async function fetchCapabilitiesRegistry(): Promise<CapabilityDefDTO[]> {
+  return getJSON<CapabilityDefDTO[]>("/api/v1/capabilities");
 }

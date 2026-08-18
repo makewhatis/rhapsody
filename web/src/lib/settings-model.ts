@@ -90,6 +90,10 @@ export interface UiGlobal {
    *  so the per-agent "Required labels" editor can show the inherited value when its own list is
    *  empty. Preserved verbatim on save via applyUiGlobal's `...g` base spread. */
   labels: string[];
+  /** Global agent-capabilities default (tracker.capabilities). Like `labels`, surfaced read-only so
+   *  the per-agent capabilities checklist can show the inherited value; preserved verbatim on save
+   *  via applyUiGlobal's `...g` base spread. (BO-10/BO-14) */
+  capabilities: string[];
   /** Global dependency-sequencing mode ("disabled" | "graphite" | "dag"); the default every agent
    *  inherits. Seed "disabled" (opt-in orchestration; not git_flow-derived). (INF-318/INF-320) */
   dependencyMode: string;
@@ -121,6 +125,8 @@ export interface UiAgent {
   repoShort: string;
   milestone: string;
   labels: string[];
+  /** Per-agent capabilities list (the RAW per-project override; empty => inherit the global). */
+  capabilities: string[];
   enabled: boolean;
   status: string;
   running: number;
@@ -211,6 +217,7 @@ export function toUiGlobal(g: GlobalConfigDTO): UiGlobal {
     gitFlow: coalesce(g.git_flow, GLOBAL_DEFAULTS.gitFlow),
     workspaceMode: coalesce(g.workspace_mode, GLOBAL_DEFAULTS.workspaceMode),
     labels: g.labels ?? [],
+    capabilities: g.capabilities ?? [],
     // A blank/unset dependency_mode coalesces to the flat "disabled" seed — never git_flow-derived.
     dependencyMode: coalesce(g.dependency_mode ?? "", GLOBAL_DEFAULTS.dependencyMode),
     // A blank/unset claim_mode coalesces to the "assignee" seed (today's assignee-locked fetch).
@@ -514,6 +521,9 @@ export function toUiAgent(
     // the per-project list so removing the last chip empties the field instead of re-displaying the
     // inherited global default. The inherited value is surfaced via UiGlobal.labels for the hint.
     labels: p.labels ?? [],
+    // Capabilities bind to the project's RAW override too (empty => inherit the global), so removing
+    // the last checkbox empties the field instead of re-showing the inherited global default.
+    capabilities: p.capabilities ?? [],
     enabled,
     status,
     running,
@@ -568,6 +578,7 @@ export function applyUiAgent(
     repo: strOverride(ui.repo, g.repo),
     milestone: strOverride(ui.milestone, g.milestone),
     labels: listOverride(ui.labels, g.labels),
+    capabilities: listOverride(ui.capabilities, g.capabilities),
     enabled: ui.enabled,
     active_states: listOverride(ui.activeStates, g.active_states),
     terminal_states: listOverride(ui.terminalStates, g.terminal_states),
