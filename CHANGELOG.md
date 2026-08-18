@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.4](https://github.com/makewhatis/rhapsody/compare/v0.3.3...v0.3.4) (2026-08-18)
+
+
+### Features
+
+* **config:** add capabilities registry module (BO-11) ([991f964](https://github.com/makewhatis/rhapsody/commit/991f964678d8ae82cb8a8da926c7b97b6e8c6794))
+* **config:** add capabilities registry module (BO-11) ([cbfb707](https://github.com/makewhatis/rhapsody/commit/cbfb707be65ff82ab361293af8dfe18735ccba0e))
+* **config:** evolvable capabilities registry, atomic writes (review feedback) ([465e57e](https://github.com/makewhatis/rhapsody/commit/465e57e06f67ed9780b773ee1b8350f711c33c4e))
+* **httpapi:** capabilities in config CRUD + registry endpoint (BO-13) ([0fb78ba](https://github.com/makewhatis/rhapsody/commit/0fb78baf7abd18d5081b7fec9bc482ed7f1733d4))
+* **httpapi:** capabilities in config CRUD + registry endpoint (BO-13) ([be515fe](https://github.com/makewhatis/rhapsody/commit/be515fe152be57e1a17b17c2738bf00efdc09de3))
+* **orchestrator:** resolve, prepend, and thread capabilities into turn-1 prompt (BO-12) ([31fcefe](https://github.com/makewhatis/rhapsody/commit/31fcefeb2fefc57e5a5d24320c95d54cdc39ed3c))
+* **orchestrator:** resolve, prepend, and thread capabilities into turn-1 prompt (BO-12) ([7c4dff8](https://github.com/makewhatis/rhapsody/commit/7c4dff8a98b715576f5d6032eda8ec0a9ab3f846))
+* **web:** capabilities checklist in the per-project config screen (BO-14) ([5527e38](https://github.com/makewhatis/rhapsody/commit/5527e38458c6e3e96ad3c9108da428f631525038))
+* **web:** capabilities checklist in the per-project config screen (BO-14) ([8850a03](https://github.com/makewhatis/rhapsody/commit/8850a034e1034422d952a80e0c782144ed5f12b1))
+
 ## [0.3.3](https://github.com/makewhatis/rhapsody/compare/v0.3.2...v0.3.3) (2026-08-15)
 
 
