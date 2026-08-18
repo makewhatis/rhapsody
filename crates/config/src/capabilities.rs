@@ -4,13 +4,20 @@
 //! [`default_capabilities`] into `~/.rhapsody/capabilities.yaml` on first read.
 
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
+
+use crate::workflow::{create_temp, write_temp_and_rename};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityDef {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub label: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub instruction: String,
 }
 
@@ -86,20 +93,57 @@ pub fn default_capabilities() -> Vec<CapabilityDef> {
 }
 
 /// Loads `~/.rhapsody/capabilities.yaml`, seeding it with [`default_capabilities`]
-/// if it doesn't exist yet.
+/// if it doesn't exist yet. On every read, any bundled default whose `name`
+/// isn't already present in the file is appended and the merged result is
+/// written back — so the registry evolves across upgrades (new bundled
+/// capabilities reach existing users, and an empty/truncated file self-heals)
+/// while file entries always win: a user's edits to a built-in, or an entirely
+/// custom entry, are never overwritten.
 pub fn load_or_seed(path: &Path) -> Result<Vec<CapabilityDef>, CapabilitiesError> {
+    let defaults = default_capabilities();
     if !path.exists() {
-        let defaults = default_capabilities();
-        let yaml = serde_yaml_ng::to_string(&defaults)
-            .map_err(|e| CapabilitiesError::Parse(e.to_string()))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| CapabilitiesError::Io(e.to_string()))?;
-        }
-        std::fs::write(path, yaml).map_err(|e| CapabilitiesError::Io(e.to_string()))?;
+        write_registry(path, &defaults)?;
         return Ok(defaults);
     }
     let text = std::fs::read_to_string(path).map_err(|e| CapabilitiesError::Io(e.to_string()))?;
-    serde_yaml_ng::from_str(&text).map_err(|e| CapabilitiesError::Parse(e.to_string()))
+    let mut loaded: Vec<CapabilityDef> =
+        serde_yaml_ng::from_str(&text).map_err(|e| CapabilitiesError::Parse(e.to_string()))?;
+    let existing: std::collections::HashSet<&str> =
+        loaded.iter().map(|c| c.name.as_str()).collect();
+    let missing: Vec<CapabilityDef> = defaults
+        .into_iter()
+        .filter(|d| !existing.contains(d.name.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        loaded.extend(missing);
+        write_registry(path, &loaded)?;
+    }
+    Ok(loaded)
+}
+
+/// Serializes `registry` to YAML and writes it to `path` atomically, reusing
+/// the crate's `~/.rhapsody` write convention (temp file + chmod + rename, so
+/// a watcher never observes a half-written file — see [`crate::workflow::save`]).
+/// The parent directory is created owner-only (0700), matching how the daemon
+/// creates `~/.rhapsody` itself: this may be the first code to touch it.
+fn write_registry(path: &Path, registry: &[CapabilityDef]) -> Result<(), CapabilitiesError> {
+    let yaml =
+        serde_yaml_ng::to_string(registry).map_err(|e| CapabilitiesError::Parse(e.to_string()))?;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| CapabilitiesError::Io(e.to_string()))?;
+    let (file, tmp_path) =
+        create_temp(dir, "capabilities").map_err(|e| CapabilitiesError::Io(e.to_string()))?;
+    write_temp_and_rename(file, &tmp_path, yaml.as_bytes(), 0o600, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        CapabilitiesError::Io(e.to_string())
+    })
 }
 
 /// Renders the selected capability names (in registry order) into a prompt
@@ -137,8 +181,22 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// Exercises the actual bytes written to disk, not just the in-memory
+    /// return value: the second call re-reads what the first call wrote,
+    /// so a serialized-shape regression (missing key, serializer swap) would
+    /// fail here even though the first call's return value never touches disk.
     #[test]
-    fn load_or_seed_reads_existing_file_without_overwriting() {
+    fn load_or_seed_round_trips_through_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capabilities.yaml");
+        let seeded = load_or_seed(&path).expect("seed");
+        let reloaded = load_or_seed(&path).expect("reload from disk");
+        assert_eq!(seeded, reloaded);
+        assert_eq!(reloaded, default_capabilities());
+    }
+
+    #[test]
+    fn load_or_seed_keeps_custom_entries_and_appends_missing_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("capabilities.yaml");
         let custom = vec![CapabilityDef {
@@ -149,7 +207,74 @@ mod tests {
         }];
         std::fs::write(&path, serde_yaml_ng::to_string(&custom).unwrap()).unwrap();
         let loaded = load_or_seed(&path).expect("load");
-        assert_eq!(loaded, custom);
+        // The custom entry survives, unmodified, in its original position...
+        assert_eq!(loaded[0], custom[0]);
+        // ...and every bundled default the file was missing gets appended.
+        for def in default_capabilities() {
+            assert!(
+                loaded.iter().any(|c| c.name == def.name),
+                "missing default {:?} was not appended",
+                def.name
+            );
+        }
+        // The merge is written back — a second load sees the same set, not a
+        // growing one.
+        let reloaded = load_or_seed(&path).expect("reload");
+        assert_eq!(loaded, reloaded);
+    }
+
+    /// The scenario `load_or_seed`'s merge-by-name exists for: an
+    /// already-seeded file from an older release, missing a capability a
+    /// newer `default_capabilities()` added. It must reach existing users
+    /// on the next load rather than staying stuck at the seed-time set.
+    #[test]
+    fn load_or_seed_evolves_an_older_seeded_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capabilities.yaml");
+        let mut stale = default_capabilities();
+        let dropped = stale.pop().expect("defaults are non-empty");
+        std::fs::write(&path, serde_yaml_ng::to_string(&stale).unwrap()).unwrap();
+
+        let loaded = load_or_seed(&path).expect("load");
+        assert!(loaded.iter().any(|c| c.name == dropped.name));
+        assert_eq!(loaded.len(), default_capabilities().len());
+    }
+
+    /// A present-but-empty file (0 bytes truncated, or genuinely `[]`) must
+    /// self-heal back to the full default set rather than yielding zero
+    /// practices forever.
+    #[test]
+    fn load_or_seed_self_heals_an_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capabilities.yaml");
+        std::fs::write(&path, "[]\n").unwrap();
+        let loaded = load_or_seed(&path).expect("load");
+        assert_eq!(loaded, default_capabilities());
+    }
+
+    /// `#[serde(default)]` on every field means a hand-edited entry missing
+    /// some keys degrades to empty strings for those keys rather than
+    /// rejecting the whole file — matching `render_section`'s own
+    /// no-op-over-hard-error contract for the registry.
+    #[test]
+    fn capability_def_tolerates_partial_entries() {
+        let parsed: Vec<CapabilityDef> = serde_yaml_ng::from_str("- name: custom\n").unwrap();
+        assert_eq!(parsed[0].name, "custom");
+        assert_eq!(parsed[0].label, "");
+        assert_eq!(parsed[0].description, "");
+        assert_eq!(parsed[0].instruction, "");
+    }
+
+    #[test]
+    fn capabilities_io_error_has_stable_prefix() {
+        let err = CapabilitiesError::Io("boom".to_string());
+        assert!(err.to_string().starts_with("capabilities_io_error:"));
+    }
+
+    #[test]
+    fn capabilities_parse_error_has_stable_prefix() {
+        let err = CapabilitiesError::Parse("boom".to_string());
+        assert!(err.to_string().starts_with("capabilities_parse_error:"));
     }
 
     #[test]
