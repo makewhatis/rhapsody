@@ -307,11 +307,42 @@ impl Orchestrator {
             };
             stack_context = crate::promote::stack_context_hint(&h.branch, h.pr_number, &ws_mode);
         }
+        // Additive: project defaults ∪ this ticket's rhapsody:* labels.
+        // A capability the registry doesn't recognize is a no-op, never a failure.
+        let capability_names: Vec<String> = {
+            let mut names: Vec<String> = match &route {
+                Some(r) => self
+                    .eff
+                    .as_ref()
+                    .and_then(|e| e.project_by_slug(&r.slug))
+                    .map(|p| p.capabilities.clone())
+                    .unwrap_or_default(),
+                None => self
+                    .eff
+                    .as_ref()
+                    .map(|e| e.capabilities.clone())
+                    .unwrap_or_default(),
+            };
+            for l in iss.labels.iter().flatten() {
+                if let Some(name) = l.strip_prefix("rhapsody:")
+                    && !names.iter().any(|n| n == name)
+                {
+                    names.push(name.to_string());
+                }
+            }
+            names
+        };
+        let capabilities_section = self
+            .capabilities_registry
+            .as_ref()
+            .map(|reg| rhapsody_config::capabilities::render_section(&capability_names, reg))
+            .unwrap_or_default();
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
         re.started_at = (self.now)();
         re.retry_attempt = attempt_norm;
         re.stack_context = stack_context;
+        re.capabilities_section = capabilities_section;
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
         re.model = match &route {
@@ -351,6 +382,7 @@ impl Orchestrator {
         // Snapshot the routing + started_at the real spawn needs before `re` moves into `o.running`.
         let project_slug = re.project_slug.clone();
         let stack_context = re.stack_context.clone();
+        let capabilities_section = re.capabilities_section.clone();
         let started_at = re.started_at;
         // Hand the entry to the injected TEST seam (Go `o.spawn(...)`) BEFORE moving it into
         // `o.running` — the borrow of `self.spawn` must not alias `self.running`. In production
@@ -368,6 +400,7 @@ impl Orchestrator {
                 attempt,
                 project_slug,
                 stack_context,
+                capabilities_section,
                 started_at,
             );
         }
@@ -1137,6 +1170,62 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, store::OUTCOME_COMPLETED);
         assert_eq!(runs[0].error, "", "no 'ticket moved externally' diagnosis");
+    }
+
+    // BO-12: dispatch computes the ADDITIVE capability set (project defaults ∪ the ticket's
+    // `rhapsody:*` labels), rendered (in REGISTRY order) through the registry into the running entry's
+    // first-turn capability section. Unknown `rhapsody:*` names and non-`rhapsody:` labels contribute
+    // nothing; a `None` registry makes the whole thing a no-op.
+    #[test]
+    fn dispatch_computes_additive_capability_section() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        // Project default carries `simplify`; the registry orders `code-review` BEFORE `simplify`.
+        if let Some(eff) = o.eff.as_mut() {
+            eff.capabilities = vec!["simplify".to_string()];
+        }
+        o.capabilities_registry = Some(rhapsody_config::capabilities::default_capabilities());
+        // The ticket adds `rhapsody:code-review` (unioned), a non-`rhapsody:` label (ignored), and an
+        // unknown `rhapsody:bogus` (rendered to nothing).
+        let iss = Issue {
+            labels: Some(vec![
+                "rhapsody:code-review".to_string(),
+                "backend".to_string(),
+                "rhapsody:bogus".to_string(),
+            ]),
+            ..issue("1", "MT-1", "Todo")
+        };
+        o.dispatch_issue(iss, None, None, String::new());
+
+        let section = o.running["1"].capabilities_section.clone();
+        assert!(
+            section.starts_with("## Required practices for this ticket"),
+            "section = {section:?}"
+        );
+        let cr = section
+            .find("review your own diff")
+            .expect("code-review (from the ticket label) must render");
+        let simp = section
+            .find("unnecessary abstraction")
+            .expect("simplify (from the project default) must render");
+        assert!(
+            cr < simp,
+            "capabilities render in REGISTRY order (code-review before simplify), not selection order"
+        );
+        assert!(
+            !section.contains("bogus"),
+            "an unknown rhapsody:* capability renders nothing"
+        );
+
+        // With no registry the section is empty (capabilities become a no-op).
+        let (mut o2, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        if let Some(eff) = o2.eff.as_mut() {
+            eff.capabilities = vec!["simplify".to_string()];
+        }
+        o2.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        assert_eq!(
+            o2.running["1"].capabilities_section, "",
+            "no registry ⇒ empty section"
+        );
     }
 
     /// The review set must come from the OWNING PROJECT's effective config, not the global tracker

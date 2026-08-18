@@ -65,6 +65,10 @@ pub struct ResolvedProject {
     /// This project's normalized required-label set (match-ANY, case-insensitive); resolved from the
     /// project's effective labels (per-project override, else inherited global). Empty ⇒ no filter.
     pub labels: HashSet<String>,
+    /// This project's default capability names (registry keys), in config order — order matters for
+    /// rendering, so it is a `Vec`, not a set. Prepended (registry-rendered) to a dispatched agent's
+    /// turn-1 prompt, additively unioned with the ticket's `rhapsody:*` labels (BO-12).
+    pub capabilities: Vec<String>,
     /// The per-project normalized cancel-type set (INF-272); a state classifies as cancel-type only
     /// when it is ALSO in `terminal_states`.
     pub canceled_states: HashSet<String>,
@@ -127,6 +131,10 @@ pub struct Effective {
     /// no label filter. Per-project sets live on [`ResolvedProject::labels`]; this is the fallback
     /// for the legacy single-project path.
     pub labels: HashSet<String>,
+    /// The top-level/default capability names (registry keys), in config order — the fallback for the
+    /// legacy single-project path, mirroring `labels`. Per-project sets live on
+    /// [`ResolvedProject::capabilities`]. Order matters for rendering, so it is a `Vec` (BO-12).
+    pub capabilities: Vec<String>,
     pub per_state_limits: HashMap<String, i64>,
     pub max_concurrent: i64,
     pub prompt_file: String,
@@ -434,6 +442,7 @@ pub fn build_effective_with_runner(
             active_states: normalize_set(&rp.eff.active_states),
             terminal_states: normalize_set(&rp.eff.terminal_states),
             labels: normalize_set(&rp.eff.labels),
+            capabilities: rp.eff.capabilities.clone(),
             canceled_states: normalize_set(&rp.eff.canceled_states),
             review_states: normalize_set(&rp.eff.review_states),
             per_state_limits: cfg.agent.max_concurrent_agents_by_state.clone(),
@@ -474,6 +483,7 @@ pub fn build_effective_with_runner(
         summon_token: cfg.tracker.summon_token.clone(),
         review_promote_state: cfg.tracker.review_promote_state.clone(),
         labels: normalize_set(&cfg.tracker.labels),
+        capabilities: cfg.tracker.capabilities.clone(),
         per_state_limits: cfg.agent.max_concurrent_agents_by_state.clone(),
         max_concurrent: cfg.agent.max_concurrent_agents,
         max_turns: cfg.agent.max_turns,

@@ -75,6 +75,11 @@ pub struct RunningEntry {
     /// every dispatch except a graphite-mode auto-promote (INF-318).
     pub stack_context: String,
 
+    /// The rendered capability-instruction text prepended to the worker's first-turn prompt (BO-12).
+    /// Computed at dispatch from the owning project's default capabilities ∪ the ticket's `rhapsody:*`
+    /// labels, rendered through the capabilities registry. Empty when nothing resolves.
+    pub capabilities_section: String,
+
     /// The `latest_summon_at` of the most recent mid-run summons already delivered to this run's
     /// mailbox (INF-448). The poll-side router delivers a summons only when it is strictly after BOTH
     /// `started_at` and this watermark, then advances it — so a stable summons is injected at most
@@ -144,6 +149,7 @@ impl RunningEntry {
             project_repo: String::new(),
             model: String::new(),
             stack_context: String::new(),
+            capabilities_section: String::new(),
             last_delivered_summon_at: zero_time(),
             thread_id: String::new(),
             session_id: String::new(),
@@ -253,6 +259,12 @@ pub struct Orchestrator {
     /// (O7). Mirrors Go `eff *effective` (nil until the first `reloadFromDisk`). Rebuilt and swapped
     /// atomically on reload — the swap is the control task's, so no lock is needed.
     pub eff: Option<Effective>,
+
+    /// The agent-capabilities registry loaded from `~/.rhapsody/capabilities.yaml` at daemon startup
+    /// (BO-12). `None` when the daemon runs without a durable on-disk home (tests / storage disabled) or
+    /// when the file fails to load — in which case capability rendering is a no-op, never a hard failure.
+    /// [`dispatch_issue`](Orchestrator::dispatch_issue) renders the per-run capability section through it.
+    pub capabilities_registry: Option<Vec<rhapsody_config::capabilities::CapabilityDef>>,
 
     /// Live workers, keyed by opaque issue id.
     pub running: HashMap<String, RunningEntry>,
@@ -425,6 +437,7 @@ impl Orchestrator {
             // `o.spawn = o.spawnWorker`). O5's handler tests + O7's loop tests inject a recorder.
             spawn: None,
             eff: None,
+            capabilities_registry: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),

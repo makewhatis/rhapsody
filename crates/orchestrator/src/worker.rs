@@ -101,6 +101,9 @@ pub struct WorkerDeps {
     pub workspace_mode: String,
     /// The graphite-mode predecessor stacking hint, prepended to the FIRST-turn prompt only (INF-318).
     pub stack_context: String,
+    /// Rendered capability-instruction text, prepended to the FIRST-turn prompt
+    /// only, same as `stack_context`.
+    pub capabilities_section: String,
     /// The GitHub label name the post-run labeler adds to every PR in this run's stack (AIE-301).
     pub pr_label: String,
     /// The review state a declared HANDOFF parks the ticket in (a review-state name; `None` ⇒ the
@@ -204,10 +207,12 @@ pub(crate) fn resolve_prompt_template(
 }
 
 /// Renders the full template on the first turn and returns fixed continuation guidance on later turns
-/// (upstream §7.1, §12.3). A non-empty `stack_context` is prepended (as plain text) to the FIRST-turn
-/// prompt only (INF-318). Mirrors Go `buildTurnPrompt`.
+/// (upstream §7.1, §12.3). Non-empty `capabilities_section` (BO-12) and `stack_context` (INF-318) are
+/// prepended (as plain text, capabilities first) to the FIRST-turn prompt only. Mirrors Go
+/// `buildTurnPrompt`.
 pub(crate) fn build_turn_prompt(
     tmpl: &str,
+    capabilities_section: &str,
     stack_context: &str,
     iss: &Issue,
     attempt: Option<i32>,
@@ -215,10 +220,17 @@ pub(crate) fn build_turn_prompt(
 ) -> Result<String, rhapsody_config::prompt::RenderError> {
     if turn <= 1 {
         let rendered = rhapsody_config::prompt::render(tmpl, iss, attempt)?;
-        if !stack_context.is_empty() {
-            return Ok(format!("{stack_context}\n\n{rendered}"));
+        let mut out = String::new();
+        if !capabilities_section.is_empty() {
+            out.push_str(capabilities_section);
+            out.push_str("\n\n");
         }
-        return Ok(rendered);
+        if !stack_context.is_empty() {
+            out.push_str(stack_context);
+            out.push_str("\n\n");
+        }
+        out.push_str(&rendered);
+        return Ok(out);
     }
     Ok(CONTINUATION_GUIDANCE.to_string())
 }
@@ -401,8 +413,14 @@ impl WorkerDeps {
         let mut last_result = String::new();
         let mut issue = issue;
         loop {
-            let p = match build_turn_prompt(prompt_tmpl, &self.stack_context, &issue, attempt, turn)
-            {
+            let p = match build_turn_prompt(
+                prompt_tmpl,
+                &self.capabilities_section,
+                &self.stack_context,
+                &issue,
+                attempt,
+                turn,
+            ) {
                 Ok(p) => p,
                 Err(e) => return (issue.state.clone(), last_result, Some(e.into())),
             };
@@ -538,6 +556,7 @@ mod tests {
             git_flow: String::new(),
             workspace_mode: String::new(),
             stack_context: String::new(),
+            capabilities_section: String::new(),
             pr_label: String::new(),
             review_handoff_state: None,
         }
@@ -580,11 +599,11 @@ mod tests {
     #[test]
     fn build_turn_prompt_first_vs_continuation() {
         let iss = issue("", "MT-1", "Todo");
-        let first =
-            build_turn_prompt("Work {{ issue.identifier }}", "", &iss, None, 1).expect("render");
+        let first = build_turn_prompt("Work {{ issue.identifier }}", "", "", &iss, None, 1)
+            .expect("render");
         assert_eq!(first, "Work MT-1");
-        let cont =
-            build_turn_prompt("Work {{ issue.identifier }}", "", &iss, None, 2).expect("render");
+        let cont = build_turn_prompt("Work {{ issue.identifier }}", "", "", &iss, None, 2)
+            .expect("render");
         assert_eq!(cont, CONTINUATION_GUIDANCE);
     }
 
@@ -594,12 +613,36 @@ mod tests {
     fn build_turn_prompt_stack_context() {
         let iss = issue("", "MT-2", "Todo");
         let stack = "STACK ON: feat/mt-1 (PR #7) — create your branch stacked on this predecessor.";
-        let first =
-            build_turn_prompt("Work {{ issue.identifier }}", stack, &iss, None, 1).expect("render");
+        let first = build_turn_prompt("Work {{ issue.identifier }}", "", stack, &iss, None, 1)
+            .expect("render");
         assert_eq!(first, format!("{stack}\n\nWork MT-2"));
-        let cont =
-            build_turn_prompt("Work {{ issue.identifier }}", stack, &iss, None, 2).expect("render");
+        let cont = build_turn_prompt("Work {{ issue.identifier }}", "", stack, &iss, None, 2)
+            .expect("render");
         assert_eq!(cont, CONTINUATION_GUIDANCE);
+    }
+
+    // The capability section prepends the first-turn prompt only; continuation turns are unchanged.
+    #[test]
+    fn build_turn_prompt_capabilities_section() {
+        let iss = issue("", "MT-3", "Todo");
+        let caps = "## Required practices for this ticket\n\nReview your own diff.";
+        let first = build_turn_prompt("Work {{ issue.identifier }}", caps, "", &iss, None, 1)
+            .expect("render");
+        assert_eq!(first, format!("{caps}\n\nWork MT-3"));
+        let cont = build_turn_prompt("Work {{ issue.identifier }}", caps, "", &iss, None, 2)
+            .expect("render");
+        assert_eq!(cont, CONTINUATION_GUIDANCE);
+    }
+
+    // Capabilities render FIRST, then the stack context, then the rendered prompt (BO-12).
+    #[test]
+    fn build_turn_prompt_capabilities_and_stack_context_both_present() {
+        let iss = issue("", "MT-4", "Todo");
+        let caps = "## Required practices for this ticket\n\nReview your own diff.";
+        let stack = "STACK ON: feat/mt-1 (PR #7) — create your branch stacked on this predecessor.";
+        let first = build_turn_prompt("Work {{ issue.identifier }}", caps, stack, &iss, None, 1)
+            .expect("render");
+        assert_eq!(first, format!("{caps}\n\n{stack}\n\nWork MT-4"));
     }
 
     // Mirrors Go `TestResolvePromptTemplate`: inline when no file; repo-relative reads from the
