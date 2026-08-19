@@ -286,6 +286,11 @@ impl Orchestrator {
                 }
             }
         }
+        // BO-59: while the dispatch credential probe reports the backend dead, ALL dispatch is paused;
+        // surface that as a per-project advisory so an operator reading the project status sees the
+        // cause (the log stream is the primary surface). Empty while healthy → the wire shape and the
+        // existing status fixtures are unaffected.
+        let credential_dead = self.credential_probe_dead();
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -302,14 +307,18 @@ impl Orchestrator {
             } else {
                 PROJECT_STATUS_RUNNING
             };
+            // Per-project advisories merged from the two off-loop resolvers (INF-277 slug + INF-279
+            // prompt-file), recorded by O7's `warnings` resolver. Empty until a resolver stores one.
+            let mut warnings = self.project_warnings_for(group);
+            if credential_dead {
+                warnings.push(crate::preflight::CREDENTIAL_DEAD_WARNING.to_string());
+            }
             out.push(ProjectStatus {
                 slug: group.clone(),
                 name: g.name.clone(),
                 status: status.to_string(),
                 running: g.running,
-                // Per-project advisories merged from the two off-loop resolvers (INF-277 slug + INF-279
-                // prompt-file), recorded by O7's `warnings` resolver. Empty until a resolver stores one.
-                warnings: self.project_warnings_for(group),
+                warnings,
             });
         }
         out

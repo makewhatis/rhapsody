@@ -523,6 +523,15 @@ impl Orchestrator {
             self.schedule_tick(poll);
             return;
         }
+        // BO-59: agent credential-liveness preflight. A dead backend credential (e.g. an expired Claude
+        // OAuth login) skips ALL dispatch WITHOUT claiming anything, so an infrastructure fault fails
+        // fast instead of claim→dispatch→die every ~5 min. Runs BEFORE candidate fetch (nothing is
+        // claimed); cached per TTL; logs the transition + rate-limits the steady-state repeat itself, so
+        // this call site stays quiet rather than error-logging every 30s forever.
+        if !self.credential_preflight().await {
+            self.schedule_tick(poll);
+            return;
+        }
         // symphony.poll wraps this tick's candidate fetch + dispatch decisions (a short control-loop
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).

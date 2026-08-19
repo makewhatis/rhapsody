@@ -25,7 +25,9 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // `std::io::stderr` (the fn) is a `MakeWriter` — the daemon's log/banner/error sink.
-    let code = rhapsodyd::run::run(ctx, &args, std::io::stderr, is_terminal).await;
+    // `install_probe: true` — the real daemon runs the BO-59 dispatch credential-liveness probe (the
+    // hermetic `run()` unit tests pass `false` so they never shell out to a real `claude`).
+    let code = rhapsodyd::run::run(ctx, &args, std::io::stderr, is_terminal, true).await;
     std::process::exit(code);
 }
 

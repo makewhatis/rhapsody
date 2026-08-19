@@ -49,6 +49,7 @@ pub mod message;
 pub mod obslog;
 pub mod orchestrator;
 pub mod persist;
+pub mod preflight;
 pub mod promote;
 pub mod reads;
 pub mod reconcile;
@@ -82,6 +83,9 @@ pub use effective::{Effective, ResolvedProject, build_effective, build_effective
 pub use handoff::HandoffResult;
 pub use message::RunMessageResult;
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
+pub use preflight::{
+    ClaudeCredentialProbe, CredentialProbe, PROBE_TIMEOUT, ProbeOutcome, ProbeRequest,
+};
 pub use reads::{Identity, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
 pub use reload::ReloadError;
