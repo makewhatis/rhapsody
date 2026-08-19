@@ -191,29 +191,45 @@ impl CredentialProbe for ClaudeCredentialProbe {
         cmd.kill_on_drop(true);
 
         match cmd.output().await {
-            Ok(out) if out.status.success() && stdout_is_ok(&out.stdout) => ProbeOutcome::Healthy,
-            Ok(out) => ProbeOutcome::Dead(probe_failure_reason(&out)),
+            Ok(out) => classify_probe(
+                out.status.success(),
+                out.status.code(),
+                &out.stdout,
+                &out.stderr,
+            ),
             Err(e) => ProbeOutcome::Dead(format!("could not launch claude probe: {e}")),
         }
     }
 }
 
-/// Whether the probe's stdout carries the `OK` reply (trimmed, on any line).
+/// Derives the liveness verdict from a completed probe process (pure, so the core "exit 0 with `OK` =
+/// live, else dead" contract is unit-tested without spawning a real `claude`). Live iff the process
+/// exited 0 AND printed the `OK` reply on stdout; otherwise dead, with an operator-facing reason built
+/// from the exit code + a trimmed stderr tail (the OAuth-expired incident ends on a verbatim stderr
+/// line). Taking primitives (not a `std::process::Output`, whose `ExitStatus` has no portable test
+/// constructor) keeps it directly testable.
+fn classify_probe(success: bool, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> ProbeOutcome {
+    if success && stdout_is_ok(stdout) {
+        ProbeOutcome::Healthy
+    } else {
+        ProbeOutcome::Dead(probe_failure_reason(code, stderr))
+    }
+}
+
+/// Whether the probe's stdout carries the `OK` reply — the exact token on some line (trimmed), NOT a
+/// substring (so a banner like `OKAY`/`not ok` never passes).
 fn stdout_is_ok(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout)
         .lines()
         .any(|l| l.trim() == PROBE_OK)
 }
 
-/// A concise operator-facing reason for a failed probe: the exit status plus a trimmed tail of stderr
-/// (the OAuth-expired incident ends on a verbatim stderr line).
-fn probe_failure_reason(out: &std::process::Output) -> String {
-    let code = out
-        .status
-        .code()
+/// A concise operator-facing reason for a failed probe: the exit status plus a trimmed tail of stderr.
+fn probe_failure_reason(code: Option<i32>, stderr: &[u8]) -> String {
+    let code = code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".to_string());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(stderr);
     let trimmed = stderr.trim();
     let n = trimmed.chars().count();
     let tail: String = trimmed.chars().skip(n.saturating_sub(400)).collect();
@@ -450,6 +466,68 @@ mod tests {
             "the tracker key is withheld by value even under a custom var name"
         );
         assert!(names.contains(&"KEEP"));
+    }
+
+    // --- production verdict derivation: exit code + stdout → verdict (requirement 1's real path) ----
+
+    #[test]
+    fn classify_probe_maps_exit_and_stdout_to_verdict() {
+        // exit 0 with `OK` on stdout → live.
+        assert!(matches!(
+            classify_probe(true, Some(0), b"OK\n", b""),
+            ProbeOutcome::Healthy
+        ));
+        // `OK` among other lines still counts.
+        assert!(matches!(
+            classify_probe(true, Some(0), b"warming up\nOK\n", b""),
+            ProbeOutcome::Healthy
+        ));
+        // The incident: a NON-ZERO exit is dead even if stdout somehow contained OK, and the reason
+        // carries the exit code + the stderr tail an operator needs.
+        match classify_probe(
+            false,
+            Some(1),
+            b"OK\n",
+            b"OAuth session expired and could not be refreshed\n",
+        ) {
+            ProbeOutcome::Dead(reason) => {
+                assert!(
+                    reason.contains("exited 1"),
+                    "reason names the exit code: {reason}"
+                );
+                assert!(
+                    reason.contains("OAuth session expired"),
+                    "reason carries the stderr tail: {reason}"
+                );
+            }
+            ProbeOutcome::Healthy => panic!("a non-zero exit must be classified dead"),
+        }
+        // exit 0 but stdout lacks the OK token → dead (a broken / differently-behaving probe).
+        assert!(matches!(
+            classify_probe(true, Some(0), b"something else\n", b""),
+            ProbeOutcome::Dead(_)
+        ));
+        // killed by a signal (no exit code) with no stderr → dead with a generic reason.
+        match classify_probe(false, None, b"", b"") {
+            ProbeOutcome::Dead(reason) => {
+                assert!(
+                    reason.contains("signal") && reason.contains("without OK"),
+                    "{reason}"
+                );
+            }
+            ProbeOutcome::Healthy => panic!("a signalled probe must be dead"),
+        }
+    }
+
+    #[test]
+    fn stdout_is_ok_requires_the_exact_token_not_a_substring() {
+        assert!(stdout_is_ok(b"OK"));
+        assert!(stdout_is_ok(b"OK\n"));
+        assert!(stdout_is_ok(b"  OK  \n"));
+        assert!(stdout_is_ok(b"blah\nOK\nblah"));
+        assert!(!stdout_is_ok(b"OKAY"), "a substring must not pass");
+        assert!(!stdout_is_ok(b"not ok"));
+        assert!(!stdout_is_ok(b""));
     }
 
     // --- backend gating (requirement 3) ------------------------------------------------------------
