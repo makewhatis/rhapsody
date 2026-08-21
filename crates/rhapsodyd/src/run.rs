@@ -44,8 +44,16 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// Returns the process exit code (Go's `run` `int`): `0` on a clean shutdown, `1` on a fatal boot /
 /// run error, `2` on a flag-parse error. `stderr` is any `MakeWriter` (the binary passes
 /// `std::io::stderr`; tests pass a capture buffer); `is_terminal` reports whether that stream is a
-/// TTY (for the banner's ANSI-color decision). Mirrors Go `run`.
-pub async fn run<W>(ctx: CancelWait, args: &[String], stderr: W, is_terminal: bool) -> i32
+/// TTY (for the banner's ANSI-color decision). `install_probe` installs the production dispatch
+/// credential-liveness probe (BO-59) — `true` for the real binary, `false` for the hermetic daemon
+/// tests, which must not shell out to a real `claude`. Mirrors Go `run`.
+pub async fn run<W>(
+    ctx: CancelWait,
+    args: &[String],
+    stderr: W,
+    is_terminal: bool,
+    install_probe: bool,
+) -> i32
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
 {
@@ -120,6 +128,17 @@ where
             ),
         }
     }
+    // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
+    // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
+    // dispatched children get, so a dead agent credential (e.g. an expired Claude OAuth login) skips
+    // dispatch WITHOUT claiming — an infrastructure fault fails fast instead of claim→dispatch→die every
+    // ~5 min. Gated off for the hermetic daemon tests, which must not shell out to a real `claude`.
+    if install_probe {
+        o.set_credential_probe(std::sync::Arc::new(
+            rhapsody_orchestrator::ClaudeCredentialProbe,
+        ));
+    }
+
     // Install the lifetime ctx BEFORE snapshotting the off-loop handle, so the handle's stop/resume/
     // message reply-waits are bounded by the real ctx (not the never-cancelling default). `Run`
     // re-sets the same ctx below.
@@ -489,7 +508,7 @@ mod tests {
         let ctx = signal.wait();
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let buf = buf.clone();
-        let handle = tokio::spawn(async move { run(ctx, &argv, buf, false).await });
+        let handle = tokio::spawn(async move { run(ctx, &argv, buf, false, false).await });
         tokio::time::sleep(Duration::from_millis(250)).await;
         signal.cancel();
         tokio::time::timeout(Duration::from_secs(5), handle)
@@ -502,7 +521,7 @@ mod tests {
     async fn run_now(args: &[&str], buf: &SharedBuf) -> i32 {
         let signal = CancelSignal::new();
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        run(signal.wait(), &argv, buf.clone(), false).await
+        run(signal.wait(), &argv, buf.clone(), false, false).await
     }
 
     // Mirrors Go `TestRunStartsDaemonAndStopsCleanly` (storage forced off to stay hermetic — the
