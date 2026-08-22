@@ -315,7 +315,8 @@ pub struct Config {
     pub git_flow: String,
     /// Global workspace-provisioning policy: `"" (== "worktree")` or `"clone"` (INF-418).
     pub workspace_mode: String,
-    /// GitHub label the post-run labeler adds; defaults to `"symphony"` in Decode (AIE-301).
+    /// GitHub label the post-run labeler adds; defaults to `"rhapsody"` in Decode (Rhapsody
+    /// divergence from Go's `"symphony"`, AIE-301).
     pub pr_label: String,
 }
 

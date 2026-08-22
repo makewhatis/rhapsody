@@ -143,7 +143,7 @@ pub struct Effective {
     /// always non-empty post-resolve). INF-418.
     pub workspace_mode: String,
     /// The GitHub label name the post-run labeler adds to every PR in a run's stack (default
-    /// `"symphony"`; blank/absent inherits the default — there is no config disable). Daemon-wide.
+    /// `"rhapsody"`; blank/absent inherits the default — there is no config disable). Daemon-wide.
     /// AIE-301.
     pub pr_label: String,
     /// The top-level/legacy effective DAG policy (always non-empty post-resolve);
