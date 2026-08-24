@@ -124,6 +124,9 @@ pub fn apply_github_summons(
         // repo can be named below — that ticket can never be re-engaged by a GitHub summons, and it
         // is otherwise completely silent.
         let mut iss_other_repo = 0usize;
+        // The distinct repos those PRs DO live in — the operator needs the repo to point the project
+        // at, not just the count. Only grows for a foreign PR, which is the rare case.
+        let mut iss_pr_repos: Vec<String> = Vec::new();
         for pr in &prs {
             // Skip PRs from a different repo — `by_pr` only holds data for owner/repo, so a matching PR
             // number from another repo would falsely advance `latest_summon_at` and trigger a spurious
@@ -132,6 +135,10 @@ pub fn apply_github_summons(
             if !pr.owner.eq_ignore_ascii_case(owner) || !pr.repo.eq_ignore_ascii_case(repo) {
                 other_repo += 1;
                 iss_other_repo += 1;
+                let name = format!("{}/{}", pr.owner, pr.repo);
+                if !iss_pr_repos.contains(&name) {
+                    iss_pr_repos.push(name);
+                }
                 continue;
             }
             if pr.merged {
@@ -157,7 +164,8 @@ pub fn apply_github_summons(
         if iss_other_repo > 0 && iss_other_repo == prs.len() {
             tracing::info!(
                 issue_identifier = %iss.identifier,
-                repo = %format!("{owner}/{repo}"),
+                polled_repo = %format!("{owner}/{repo}"),
+                pr_repos = %iss_pr_repos.join(", "),
                 linked_prs = prs.len(),
                 "github-summons: issue's linked PRs are all in another repo; summons on them can never re-engage it"
             );
@@ -170,7 +178,7 @@ pub fn apply_github_summons(
         repo = %format!("{owner}/{repo}"),
         hits = by_pr.len(),
         issues = issue_count,
-        linked_prs = linked,
+        linked_prs_total = linked,
         skipped_other_repo = other_repo,
         skipped_merged = merged,
         skipped_no_hit = no_hit,
@@ -525,7 +533,7 @@ mod tests {
         assert_eq!(f.get("repo").map(String::as_str), Some("o/r"));
         assert_eq!(f.get("hits").map(String::as_str), Some("1"));
         assert_eq!(f.get("issues").map(String::as_str), Some("3"));
-        assert_eq!(f.get("linked_prs").map(String::as_str), Some("3"));
+        assert_eq!(f.get("linked_prs_total").map(String::as_str), Some("3"));
         assert_eq!(f.get("skipped_other_repo").map(String::as_str), Some("1"));
         assert_eq!(f.get("skipped_merged").map(String::as_str), Some("1"));
         assert_eq!(f.get("skipped_no_hit").map(String::as_str), Some("1"));
@@ -565,8 +573,13 @@ mod tests {
             Some("STUDIO-569")
         );
         assert_eq!(
-            f.get("repo").map(String::as_str),
+            f.get("polled_repo").map(String::as_str),
             Some("studio49dev/other-repo")
+        );
+        assert_eq!(
+            f.get("pr_repos").map(String::as_str),
+            Some("studio49dev/studio-infra"),
+            "the line must name the repo the PRs actually live in, not just the count"
         );
         assert_eq!(f.get("linked_prs").map(String::as_str), Some("1"));
     }
