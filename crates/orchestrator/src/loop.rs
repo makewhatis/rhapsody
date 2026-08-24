@@ -1526,3 +1526,10 @@ mod tests {
         assert_eq!(tr.candidate_calls(), 1, "legacy tracker polled once");
     }
 }
+
+// The loop-level github-summons enrichment tests (Go `ghenrich_loop_test.go`) + the STUDIO-574
+// end-to-end regression. A child module so it can drive the private `poll_all_projects`, exactly as
+// Go's same-package test file calls `pollAllProjects`.
+#[cfg(test)]
+#[path = "ghenrich_loop.rs"]
+mod ghenrich_loop;
