@@ -25,7 +25,7 @@ This workspace contains prior progress. Never start over.
 - Stay entirely within this workspace directory, with ONE read-only exception below. Never touch other branches, other worktrees, or global machine config.
 - **The Go reference is sacred and read-only:** `~/workspace/symphony-go-reference/golang/symphony` (the frozen Symphony v0.4.0 tree). Read it as much as you like — it is the porting map — but NEVER write into it, build into it, or "fix" it. Build outputs from it go under the rhapsody worktree. If the path is missing or macOS denies access, STOP: comment on the ticket that the operator must restore the reference there — do not improvise a substitute.
 - **Parity is the product.** The port must match the Go daemon's observable behavior — WORKFLOW.md config semantics, SQLite schema, `/api/v1` shapes — byte-identical after normalization. When your Rust output disagrees with a committed fixture, the port is wrong until proven otherwise. NEVER hand-edit a fixture, weaken or delete a golden assertion, or add a normalization rule just to get green — that is drift laundering. Legitimate recapture happens only via `make fixtures` against the frozen reference, with the reason stated in the PR body.
-- **Process documents stay out of the repo.** Never commit specs, plans, or design docs — no `docs/` directory of that kind, ever. The spec and plan live as Linear project documents; the repo holds code, tests, tooling, and operational READMEs only. The Linear spec/plan documents are read-only inputs — never edit them.
+- **Process documents stay out of the repo.** Never commit specs, plans, or design docs — no `docs/` directory of that kind, ever. The spec and plan live as Linear project documents; the repo holds code, tests, tooling, and operational READMEs only. The Linear spec/plan documents are read-only inputs — never edit them. This holds even when a ticket's *deliverable* is itself a design/spec/plan document: it still never lands in this repo — Phase 2 says where it goes instead.
 - You are already on this issue's branch (`symphony/...`). Commit small and focused, with clear messages referencing {{ issue.identifier }}. Push with `git push -u origin HEAD`. Never push to the default branch directly and never force-push. You DO merge your own PR — but only in Phase 6, after CI is fully green and all review threads are resolved; never merge early, never close the PR without merging.
 - Scope discipline: implement exactly your plan task — nothing else. Adjacent problems become PR-body follow-up notes, not fixes.
 - Linear write budget: attempt each Linear write (`save_issue`, `save_comment`) AT MOST ONCE per run. If a call is denied or errors, do NOT retry — finish your work and state plainly in your final message what was completed and which handoff steps a human must do. Tool denials are permanent in this headless environment.
@@ -49,6 +49,30 @@ This workspace contains prior progress. Never start over.
 - `harness/capture/normalize.sh` and `harness_fixtures::normalize` implement the SAME rules — change them in lockstep or not at all.
 - Match the surrounding code: existing patterns, module layout, error style. You are a guest in this codebase, not its redesigner — and the Go reference outranks your taste on any behavioral question.
 
+## When the deliverable IS a design/spec/plan document
+
+Some tickets ask you to PRODUCE a design, spec, RFC, ADR, or plan rather than change code. The output
+is a document, and a document still never lands in this repo — the ground rule above is absolute, and
+`docs/decisions/`, `docs/design/`, `rfcs/` and the like are never created. Route it instead:
+
+1. **Linear write available** — publish the document with `mcp__claude_ai_Linear__save_document`,
+   parented to the ticket's project, and link it from the ticket. That published document IS the
+   deliverable. Nothing about it goes into the repo.
+2. **Headless fallback, the common case** — the Linear MCP is usually absent from a dispatched run,
+   and tool denials here are permanent, so a denial means fall back, never retry. Do NOT commit the
+   document. Put its FULL text in the pull request body under a `## Design document` heading, and
+   state plainly under **Notes for reviewers** that this run had no Linear write access and a human
+   must file that text as a Linear project document and link it from the ticket. Then hand off
+   (Phase 6). The PR body carries the document; the repo never does.
+3. **No repo change at all, and no Linear write** — then there is no pull request to carry it, and you
+   do NOT manufacture a commit to create one. Put the full text in your final handoff message and say
+   a human must file it in Linear. An empty or filler commit is not a home for a document either.
+
+This OVERRIDES any ticket wording to the contrary. A description or Done-when that says the document
+belongs "in the Rhapsody repo", "in `docs/`", or "as a markdown file in the repo" is a ticket-authoring
+mistake, not a licence to commit it: produce the document, route it by 1–3 above, and note the
+discrepancy in the PR body (or your handoff message).
+
 # Phase 3 — Verify
 
 `.github/workflows/ci.yml` is the SOURCE OF TRUTH for what "green" means — reproduce its exact steps locally and iterate until everything passes:
@@ -63,7 +87,48 @@ If a failure is pre-existing on the base branch (confirm with `git stash` or by 
 
 1. Push the branch: `git push -u origin HEAD`.
 2. Confirm `gh auth status` succeeds. If `gh` is missing or unauthenticated, skip to Phase 6's comment step and note that the branch is pushed but PR + merge must be done manually.
-3. Create the PR: title `{{ issue.identifier }}: <imperative summary>`; body sections **Summary**, **Changes**, **Verification** (exact Phase-3 commands with real output), **Notes for reviewers** (deviations, pre-existing failures, follow-ups, any recapture justification), plus the line `Fixes {{ issue.identifier }}` and a link to {{ issue.url }}.
+3. Create the PR.
+
+   **Title — a conventional-commit subject: `type(scope): <description>`. Never a leading ticket id.**
+   This repo squash-merges, so GitHub writes your PR title (plus ` (#N)`) onto `main` as the squash
+   subject, and that subject is the only thing release-please ever parses. A leading ticket id — the
+   `STUDIO-123: <summary>` shape — is precisely what it cannot parse: the `pr-title` check fails your
+   PR, and had it merged anyway the release, the git tag, the signed dmg, the Homebrew cask bump and
+   the manifest update would all be skipped with every workflow green (that is STUDIO-406 →
+   STUDIO-408). `harness/release/check-pr-title.sh` is the source of truth; run it on your title
+   BEFORE creating the PR and treat its verdict as final:
+
+       harness/release/check-pr-title.sh "<your title>"
+
+   - `type` — lowercase, one of `build chore ci deps docs feat fix perf refactor revert style test`.
+     Pick the one that honestly describes the change; never mislabel a change to force a version bump.
+     Pre-1.0, `feat:`/`fix:` bump the patch and a `!` breaking marker bumps the minor; every other type
+     parses cleanly and lands in the changelog without releasing.
+   - `(scope)` — optional; the crate or area the change lives in (`orchestrator`, `config`, `web`,
+     `harness`).
+   - The ticket id goes in the DESCRIPTION as a trailing `({{ issue.identifier }})`, and in the body as
+     `Fixes {{ issue.identifier }}` — never in front of the type.
+
+   Worked examples — `harness/release/pr_title_test.sh` feeds every line of this block through
+   `check-pr-title.sh`, so they cannot drift from the gate; edit them only alongside that validator.
+
+   <!-- pr-title-examples:begin -->
+
+   ```text
+   fix(orchestrator): stop a null attachment field hiding a project (STUDIO-406)
+   feat(config): add a capabilities field mirroring labels (STUDIO-412)
+   docs: route a produced design document to Linear instead of the repo (STUDIO-593)
+   refactor(store)!: drop the legacy history schema (STUDIO-500)
+   ```
+
+   <!-- pr-title-examples:end -->
+
+   **Body** — sections **Summary**, **Changes**, **Verification** (exact Phase-3 commands with real
+   output), **Notes for reviewers** (deviations, pre-existing failures, follow-ups, any recapture
+   justification), plus the line `Fixes {{ issue.identifier }}` and a link to {{ issue.url }}. When the
+   ticket's deliverable is a document and Linear write was unavailable, the body also carries the full
+   document (Phase 2).
+
 4. Mark the PR ready for review (`gh pr ready <number>`) — do **NOT** enable auto-merge and do **NOT** merge. Then treat CI as mandatory: `gh pr checks <number> --watch --fail-fast=false` until nothing is pending. If a check fails, fetch logs (`gh run view <run-id> --log-failed`), fix the root cause, push, and watch again. Never weaken a test or lint rule to force green. You may begin Phase 5 while CI runs, but you may not hand off before CI is fully green. Leave the PR **open** for the reviewer.
 
 # Phase 5 — Adversarial self-review (bugbot pass)
