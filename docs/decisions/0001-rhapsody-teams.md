@@ -34,9 +34,11 @@ Two findings from the code shape the whole design and are worth stating before a
   is rows in the `events` table that already exists.
 - **Everything Teams needs for messaging already exists and is already durable.**
   `symphony_send_message` → `POST /api/v1/runs/{id}/message` → the `run_messages` table, with a
-  bounded 16-deep mailbox and a `not_running` error for a run that is not live. That *is* the
-  state-aware handshake the ticket asks us to steal from herdr, minus the resident PTY pane,
-  and it leaves a durable trace, which is exactly what herdr does not.
+  bounded 16-deep mailbox and a `not_running` error for a run that is not live. That is herdr's
+  `agent_send` — with a durable trace, which is exactly what herdr's pane I/O does not leave. Its
+  `agent_status` half Rhapsody also already has, derived rather than stored
+  (`symphony_run_status`). Only the blocking `agent_wait` is missing, and §6.3 argues we should
+  keep it that way.
 
 ---
 
