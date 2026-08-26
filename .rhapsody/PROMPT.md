@@ -56,14 +56,19 @@ is a document, and a document still never lands in this repo — the ground rule
 `docs/decisions/`, `docs/design/`, `rfcs/` and the like are never created. Route it instead:
 
 1. **Linear write available** — publish the document with `mcp__claude_ai_Linear__save_document`,
-   parented to the ticket's project, and link it from the ticket. That published document IS the
-   deliverable. Nothing about it goes into the repo.
+   parented to the ticket's project. That published document IS the deliverable; nothing about it goes
+   into the repo. Link it from the ticket by putting its URL in the Phase 6 summary comment — that is
+   the one `save_comment` you already spend, so route 1 costs a single extra write and never eats the
+   Linear write budget the handoff needs.
 2. **Headless fallback, the common case** — the Linear MCP is usually absent from a dispatched run,
    and tool denials here are permanent, so a denial means fall back, never retry. Do NOT commit the
    document. Put its FULL text in the pull request body under a `## Design document` heading, and
    state plainly under **Notes for reviewers** that this run had no Linear write access and a human
    must file that text as a Linear project document and link it from the ticket. Then hand off
-   (Phase 6). The PR body carries the document; the repo never does.
+   (Phase 6). The PR body carries the document; the repo never does. A GitHub PR body is capped at
+   65,536 characters — if the document does not fit, keep the summary and the handoff note in the body
+   and continue the remaining sections as `gh pr comment` posts on the same PR, in order. Length is
+   never a reason to put it in a file: an oversized document is still not a repo file.
 3. **No repo change at all, and no Linear write** — then there is no pull request to carry it, and you
    do NOT manufacture a commit to create one. Put the full text in your final handoff message and say
    a human must file it in Linear. An empty or filler commit is not a home for a document either.

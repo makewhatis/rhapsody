@@ -132,8 +132,10 @@ else
   # The mandate itself, not just the examples: a backticked title template starting with the issue-id
   # placeholder (`{{ issue.identifier }}: ...`) is the rejected form. Prose that merely NAMES that
   # shape does not match — the placeholder there is closed by a backtick, not followed by a colon and
-  # a description.
-  if grep -q '`{{ issue.identifier }}:[^`]' "$prompt"; then
+  # a description. The internal padding is deliberately flexible: liquid renders `{{issue.identifier}}`
+  # and `{{ issue.identifier }}` identically, so a guard that only knew one spelling would let the
+  # other reintroduce the break.
+  if grep -qE '`\{\{ *issue\.identifier *\}\}:[^`]' "$prompt"; then
     echo "FAIL - $prompt still mandates a leading-ticket-id PR title, the shape this validator rejects"
     fail=1
   else
