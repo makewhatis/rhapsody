@@ -233,6 +233,20 @@ impl Orchestrator {
         }
     }
 
+    /// Publishes the current snapshot to the always-readable `snapshot_pub` cell (STUDIO-551).
+    ///
+    /// MUST run on the control task (it calls [`build_snapshot`](Self::build_snapshot), which reads
+    /// the loop-owned state). The control loop calls this after every event it handles and mid-tick
+    /// right after `reconcile`, so `GET /api/v1/state` reads a last-known-good snapshot off-loop
+    /// instead of queueing behind a network-bound tick. The send is infallible in practice (the
+    /// orchestrator owns a `watch::Sender`, which never fails on a live channel); a `watch` send only
+    /// errors when every receiver is gone, which is not a condition worth surfacing here.
+    pub(crate) fn publish_snapshot(&self) {
+        let _ = self
+            .snapshot_pub
+            .send(Some(std::sync::Arc::new(self.build_snapshot())));
+    }
+
     /// Rolls up per-project live status from the resolved project set + the running map (INF-224).
     /// One entry per project (deduped by the stable group key), in declaration order. Status priority:
     /// config-disabled => paused; else >=1 in-flight agent => running (or review when those agents sit

@@ -213,8 +213,6 @@ pub enum Event {
     Retry(EvRetry),
     /// A WORKFLOW.md change observed by the watcher (Go `evReload`).
     Reload,
-    /// A request for the API state snapshot, built on the loop (Go `evSnapshot`).
-    Snapshot { reply: oneshot::Sender<Snapshot> },
     /// A request for the race-free workspace-GC plan (Go `evWorkspaceGC`).
     WorkspaceGc {
         reply: oneshot::Sender<WorkspaceGcPlan>,
@@ -402,6 +400,9 @@ impl Orchestrator {
         else {
             return; // the receiver was already taken (loop already running) — defensive
         };
+        // Publish the boot state BEFORE the first tick so `/api/v1/state` answers with the adopted
+        // runs immediately (`boot_recovery` already ran) rather than 503-ing until tick 1 lands.
+        self.publish_snapshot();
         self.schedule_tick(Duration::ZERO);
         loop {
             tokio::select! {
@@ -410,7 +411,14 @@ impl Orchestrator {
                     return;
                 }
                 ev = rx.recv() => match ev {
-                    Some(ev) => self.handle(ev).await,
+                    Some(ev) => {
+                        self.handle(ev).await;
+                        // Republish after EVERY event (STUDIO-551): the snapshot the HTTP layer reads
+                        // then tracks the loop's own state as closely as the loop itself, and the only
+                        // window in which it lags is the inside of a long, network-bound tick — which
+                        // is exactly the window that used to starve `/state` entirely.
+                        self.publish_snapshot();
+                    }
                     None => {
                         self.shutdown(&mut rx).await;
                         return;
@@ -431,9 +439,6 @@ impl Orchestrator {
             }
             Event::Retry(e) => self.on_retry(e).await,
             Event::Reload => self.on_reload(),
-            Event::Snapshot { reply } => {
-                let _ = reply.send(self.build_snapshot());
-            }
             Event::WorkspaceGc { reply } => {
                 let _ = reply.send(self.build_workspace_gc_plan());
             }
@@ -518,6 +523,10 @@ impl Orchestrator {
     pub(crate) async fn on_tick(&mut self) {
         let poll = self.poll_interval();
         self.reconcile().await;
+        // Reconcile is the network-bound half of the tick AND the half that retires finished runs;
+        // republish here so `/state` reflects them without waiting for fetch-candidates + dispatch
+        // to finish (STUDIO-551).
+        self.publish_snapshot();
         if let Err(e) = self.validate() {
             tracing::error!(err = %e, "dispatch preflight validation failed; skipping dispatch");
             self.schedule_tick(poll);
@@ -949,13 +958,22 @@ impl Orchestrator {
 }
 
 impl ControlHandle {
-    /// Requests the API state snapshot, built on the control task (Go's HTTP layer sends `evSnapshot`).
-    /// The P6 `/api/v1/state` surface; provided here so O7 owns the round-trip. Returns `None` if the
-    /// loop is gone.
-    pub async fn snapshot(&self) -> Option<Snapshot> {
-        let (tx, rx) = oneshot::channel();
-        self.events.send(Event::Snapshot { reply: tx }).ok()?;
-        rx.await.ok()
+    /// The API state snapshot: the LAST value the control task published, read straight off the
+    /// shared cell with no control-channel round-trip (STUDIO-551). The P6 `/api/v1/state` surface.
+    ///
+    /// Returns `None` — which the HTTP layer renders as the 503 `snapshot_unavailable` envelope, the
+    /// same body the old round-trip produced on timeout — when the control loop is not serving:
+    /// either it has exited (the event channel's receiver is dropped) or it has not published its
+    /// first snapshot yet. Otherwise it always answers immediately, so a tick spending seconds in
+    /// `reconcile` can no longer starve the dashboard's status poll into rendering "Idle".
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        if self.events.is_closed() {
+            return None; // the control loop is gone (the daemon is shutting down)
+        }
+        // Clone the `Arc` under the borrow, then deep-clone outside it, so a reader never holds the
+        // watch's lock across the (allocating) `Snapshot` clone.
+        let latest = self.snapshot_pub.borrow().clone();
+        latest.map(|s| (*s).clone())
     }
 
     /// Requests the race-free workspace-GC plan, built on the control task (Go `evWorkspaceGC`). Backs
@@ -1054,12 +1072,12 @@ mod tests {
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::{
         DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,
-        proj_with_tracker, record_entries, set_of,
+        proj_with_tracker, record_entries, running_entry, set_of,
     };
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     /// Wires an orchestrator with fakes and a recording spawn that increments a counter and simulates
     /// an immediate clean worker exit (Go `newLoopOrch`), bypassing the disk load (sets `eff` directly).
@@ -1524,6 +1542,140 @@ mod tests {
             "legacy path should leave projectSlug empty"
         );
         assert_eq!(tr.candidate_calls(), 1, "legacy tracker polled once");
+    }
+
+    // ---- STUDIO-551: `/api/v1/state` is decoupled from the control-loop tick ----------------------
+
+    /// A snapshot read BEFORE the control loop has published anything is unavailable, so the HTTP
+    /// layer still renders the 503 `snapshot_unavailable` envelope rather than a bogus "0 agents"
+    /// view assembled from a never-populated cell.
+    #[tokio::test]
+    async fn snapshot_before_the_first_publish_is_unavailable() {
+        let (o, _spawned) = new_loop_orch(Fake::new(), Duration::from_millis(20));
+        let handle = o.control();
+        assert!(
+            handle.snapshot().is_none(),
+            "nothing published yet ⇒ snapshot unavailable"
+        );
+    }
+
+    /// Once the control loop has exited, the snapshot goes unavailable again (in Go the round-trip
+    /// failed to enqueue); the cell must not keep serving a last-known view for a daemon that is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_after_the_loop_exits_is_unavailable() {
+        let (mut o, _spawned) = new_loop_orch(Fake::new(), Duration::from_millis(20));
+        let signal = CancelSignal::new();
+        o.ctx = Some(signal.wait());
+        let handle = o.control();
+        let loop_ctx = signal.wait();
+        // The orchestrator is DROPPED when the task ends — the same teardown the daemon performs.
+        let task = tokio::spawn(async move {
+            o.run_loaded(loop_ctx).await;
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handle.snapshot().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop never published a snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        signal.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("loop did not stop on cancel")
+            .expect("loop task panicked");
+        assert!(
+            handle.snapshot().is_none(),
+            "the control loop is gone ⇒ snapshot unavailable"
+        );
+    }
+
+    /// The regression this ticket exists for: the control loop processes one event to completion, so
+    /// a tick parked in `reconcile`'s network round-trip used to head-of-line-block the snapshot
+    /// request until `/state` timed out — which the desktop tray and the web toolbar both rendered as
+    /// "Idle" while agents were in fact running. The snapshot must now answer immediately, and with
+    /// the TRUE running count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_is_served_while_a_tick_is_in_flight() {
+        // A tracker whose reconcile round-trip parks until released — a stand-in for a slow Linear
+        // call. The gate suspends the control task's future exactly the way an in-flight network
+        // call does; the counter records that reconcile really did reach the tracker.
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_hook = Arc::clone(&entered);
+        let (release, gate) = watch::channel(false);
+        let mut tr = Fake::new();
+        tr.states_by_ids_gate = Some(gate);
+        tr.states_by_ids_func = Some(Box::new(move |_ids| {
+            entered_hook.store(true, Ordering::SeqCst);
+            Ok(Vec::new())
+        }));
+
+        let (mut o, _spawned) = new_loop_orch(tr, Duration::from_millis(20));
+        // One in-flight agent: both the reason reconcile calls the tracker at all, and the count the
+        // dashboard must keep showing while the tick is stalled.
+        let mut re = running_entry(issue("1", "MT-1", "In Progress"), "", "");
+        re.started_at = (o.now)();
+        re.last_event_at = re.started_at;
+        o.running.insert("1".to_string(), re);
+
+        let signal = CancelSignal::new();
+        o.ctx = Some(signal.wait());
+        let handle = o.control();
+        let loop_ctx = signal.wait();
+        let task = tokio::spawn(async move {
+            o.run_loaded(loop_ctx).await;
+        });
+
+        // Wait until the tick is definitively parked inside reconcile's tracker round-trip. The gate
+        // clones a receiver for exactly the duration of the awaited call, so a SECOND receiver
+        // existing is precisely "reconcile is stalled on the tracker right now".
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while release.receiver_count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reconcile never reached the tracker gate"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // The control channel really IS head-of-line-blocked right now — this round-trip cannot be
+        // answered until the tick finishes. That is precisely the starvation `/api/v1/state` used to
+        // sit in, and the reason a 2s-timeout probe came back empty and rendered as "Idle".
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                handle.worktree_in_use(None, "/nowhere".to_string()),
+            )
+            .await
+            .is_err(),
+            "a control-channel round-trip must still be blocked by the in-flight tick"
+        );
+
+        // The snapshot, however, no longer rides that channel.
+        let snap = handle
+            .snapshot()
+            .expect("snapshot must be served while a tick is in flight");
+        assert_eq!(
+            snap.running.len(),
+            1,
+            "the in-flight agent must still be reported, not collapsed to 0"
+        );
+        assert_eq!(snap.running[0].issue_identifier, "MT-1");
+
+        // Releasing the gate lets the stalled tick finish; the run must then wind down cleanly.
+        let _ = release.send(true);
+        signal.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("loop did not stop on cancel")
+            .expect("loop task panicked");
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the parked call must have been reconcile's tracker round-trip"
+        );
     }
 }
 
