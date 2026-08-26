@@ -30,7 +30,8 @@ Two findings from the code shape the whole design and are worth stating before a
   a fresh DB and applying the migrations produces a dump *byte-identical* to
   `harness/fixtures/schema.sql`, and `crates/harness-fixtures/src/lib.rs` separately asserts
   that file holds *exactly* six tables. Teams therefore adds no column to `runs`, no seventh
-  table, and no row shape to the parity store. Its state is a sidecar.
+  table, and no row shape to the parity store. Its config is files; its record of what happened
+  is rows in the `events` table that already exists.
 - **Everything Teams needs for messaging already exists and is already durable.**
   `symphony_send_message` → `POST /api/v1/runs/{id}/message` → the `run_messages` table, with a
   bounded 16-deep mailbox and a `not_running` error for a run that is not live. That *is* the
@@ -44,7 +45,7 @@ Two findings from the code shape the whole design and are worth stating before a
 | Concept | Lives in | Cardinality | Owned by |
 | --- | --- | --- | --- |
 | **Profile** | `~/.rhapsody/teams/profiles/<name>.md` | shared | ships as a default, then the user |
-| **Identity** | a roster entry in `~/.rhapsody/teams.yaml` + a memory bank + `assignments` rows | one per teammate | the user |
+| **Identity** | a roster entry in `~/.rhapsody/teams.yaml` + a memory bank + its `teams.route` events | one per teammate | the user |
 | **Manager** | a pure function in `crates/orchestrator`, called once inside `dispatch_issue` | one per team, and it is not a component | Rhapsody |
 
 The split is enforced by putting the three in **three different kinds of storage**, so
@@ -88,10 +89,16 @@ So Teams config is **a file of its own**, following the `capabilities.yaml` prec
 non-parity data:
 
 ```
-~/.rhapsody/teams.yaml              the toggle, the roster, the manager, the memory backend
+~/.rhapsody/teams.yaml                 the toggle, the roster, the manager, the memory backend
 ~/.rhapsody/teams/profiles/<name>.md   one profile per file: front matter + prompt body
-~/.rhapsody/teams/teams.db          the assignments sidecar (NOT rhapsody.db)
 ```
+
+**And nothing else.** In particular, no `assignments` table and no second SQLite file — see §6.5
+and §7 (T3): the routing decision is recorded as a `teams.route` row in the existing `events`
+table, which `GET /api/v1/events` and `symphony_events`' substring search already expose. "What
+has Alice done" is answerable from that on day one. An index for it is a slice of its own,
+triggered by the query actually being slow rather than by anticipating that it will be — the same
+discipline STUDIO-569 applied in refusing a registry service and a second Neon instance.
 
 One deliberate divergence from `capabilities.rs`: **`teams.yaml` is not seeded on first read.**
 `load_or_seed` writes `capabilities.yaml` the first time the daemon reads it, which is
@@ -106,7 +113,7 @@ file. `teams.yaml` is created only by an explicit enable (Settings toggle, or
 enabled: false
 
 manager:
-  mode: labels             # off | labels | labels+model      (default: labels)
+  mode: labels             # off | labels | labels+model      (default: labels; `off` = §3.5)
   default_identity: ""     # who takes a ticket nothing matches; empty ⇒ run without an identity
   model: ""                # consulted ONLY in labels+model, and only on a Tier-1 miss
   max_tokens: 4000         # hard cap on the arbitration turn
@@ -168,7 +175,7 @@ break state promotion in a way that looks like a Linear outage.
 | 1 | `~/.rhapsody/teams.yaml` | absent ⇒ `Teams::disabled()`; never seeded | unit test: absent path ⇒ disabled, no file created |
 | 2 | `WORKFLOW.md` front matter | no new `Raw` field at all | existing `encode`/`decode` round-trip tests unchanged |
 | 3 | `GET /api/v1/config`, `/projects` | no new key in `effective_json` | `api/config.json`, `api/projects.json` goldens unchanged |
-| 4 | `rhapsody.db` | no column, no table; sidecar only | `schema_matches_committed_golden` + `canary_schema_has_all_tables` unchanged |
+| 4 | `rhapsody.db` | no column, no table, no new row *kind* when off | `schema_matches_committed_golden` + `canary_schema_has_all_tables` unchanged |
 | 5 | Turn-1 prompt | `teammate_section` empty ⇒ the `if !x.is_empty()` guard in `build_turn_prompt` skips it | prompt byte-identical; the exact mechanism BO-12 proved for `capabilities_section` |
 | 6 | Dispatch | `route()` not called; the new `WorkerDeps` field is `String::new()` | same shape BO-12 used; existing dispatch tests unchanged |
 | 7 | MCP | `teams_*` routes **removed from the router** when off | `list_tools` byte-identical; the `allow_handoff` mechanism at `crates/mcp/src/server.rs:69–80` |
@@ -196,17 +203,18 @@ fn route(roster: &Roster, iss: &Issue, load: &LoadSnapshot) -> Routed
 
 Every property that turns a router into a second EM is absent by construction:
 
-- **It has no store.** It cannot persist an intention. The `assignments` row is written *after*
-  dispatch and is past tense — "run 412 was Alice" — never "Alice should get STUDIO-x". A row
-  exists only if a run exists.
+- **It has no store.** It cannot persist an intention. The `teams.route` event is written *after*
+  dispatch and is past tense — "run 412 was Alice" — never "Alice should get STUDIO-x". It is a
+  row on a run, so it cannot exist unless the run does.
 - **It cannot enlarge or reorder the work.** It runs after `select_dispatch` / `eligible` /
   `global_slots`. Delete the router and the identical set of issues dispatches in the identical
   order; only `identity` is unset.
 - **It cannot say "not yet."** `Routed` is `{ identity: Option<String>, reason: RouteReason }`.
   There is **no `Defer`, no `Queue`, no `Retry` variant, and there never may be.** That missing
   variant is the entire defence, and it is checkable in code review by reading one enum.
-- **It holds no idea of what is in flight.** `LoadSnapshot` is *derived at call time* from the
-  same `running` map `global_slots` reads. It is a read of Rhapsody's state, never a copy.
+- **It holds no idea of what is in flight.** `LoadSnapshot` is *derived at call time* from
+  `Orchestrator.running` — the same `HashMap<String, RunningEntry>` the concurrency accounting
+  counts before handing `global_slots` a number. It is a read of Rhapsody's state, never a copy.
 
 STUDIO-297 produced duplicate PRs because a second source of *assignment* competed with Linear.
 Here Linear still assigns: the issue is in an active state, assigned or claimed exactly as
@@ -221,9 +229,17 @@ not choose tickets.
 ### 3.2 How it decides — three tiers, cheapest first
 
 **Tier 0 — explicit (0 turns).** A Linear label `rhapsody:@alice` names the identity outright.
-This reuses the `rhapsody:*` label convention BO-12 already established for capabilities, so it
-is one more prefix in a namespace that exists. Deterministic, and auditable *in Linear*, which
-matters: the assignment is visible where the work lives.
+Deterministic, and auditable *in Linear*, which matters: the assignment is visible where the work
+lives.
+
+⚠️ **`rhapsody:*` is not a free prefix, and this makes it a shared namespace.**
+`crates/orchestrator/src/retry.rs:327` already strips `rhapsody:` from every ticket label and
+looks the remainder up in the BO-11 capabilities registry, so `rhapsody:@alice` reaches the
+capability resolver too. It is harmless today — `retry.rs:1177` documents an unknown `rhapsody:*`
+name as a silent no-op, and `@` cannot be a capability name, which makes it a clean discriminator
+— but that no-op is now **load-bearing for two consumers**. Anyone tempted to turn an unknown
+`rhapsody:*` label into a hard error or a warning would silently break Teams routing. Whichever
+implementation lands second owns a test pinning the split.
 
 **Tier 1 — labels → identity (0 turns).** Each roster entry declares `labels:`. Score each
 identity by `|ticket.labels ∩ identity.labels|`; highest wins. Ties break by (a) fewest live
@@ -279,6 +295,21 @@ the ticket dispatches **exactly as it does today** — no identity, no bank, no 
 section, byte-identical to Teams-off — and an event `teams.unrouted` is recorded. Refusal is
 not an option under consideration: a Teams feature that can withhold work is a second queue,
 and it fails closed against the user's actual intent, which is that the ticket gets done.
+
+### 3.5 `manager.mode: off` — single-identity Teams
+
+`off` is not "the same as the feature being disabled". With `enabled: true`, `mode: off` and a
+`default_identity`, **every ticket runs as that one teammate** — their profile, their bank, their
+work history — and no routing decision is ever made.
+
+That is a real configuration and it is probably the right first thing to try. It isolates the two
+questions the feature actually asks: *does a named agent with a durable profile and a memory bank
+produce better work?* and *can a router pick the right one?* Answering the first without the
+second is cheaper, and if the answer is no then routing was never worth building.
+
+With `mode: off` and no `default_identity`, nothing routes and nothing is prepended — behaviour
+identical to `enabled: false`, and that combination is worth a startup warning rather than a
+silent no-op.
 
 ---
 
@@ -414,7 +445,8 @@ headline finding: *the gap is not identity or wake, it is reachability*, and a w
 no route to memory is just a cron job.
 
 So Teams v1 is designed to be **useful with no memory at all**: named routing, real profiles,
-and per-identity work history that comes free from `assignments ⋈ runs` (§6). `backend:
+and per-identity work history that comes free from `teams.route` events joined to their runs
+(§6.5). `backend:
 hindsight` becomes selectable when studio-infra's **S1** (expose the service on the tailnet)
 lands. That is a dependency, stated, and it is why the slice plan puts memory fourth.
 
@@ -503,7 +535,10 @@ plausible later layer and is explicitly out of scope for v1.
 1. **`run_messages`** — the message text verbatim, with run id and timestamp. Already in the
    parity schema, already durable.
 2. **`events`** — a `teams.message` row so the exchange appears in the run timeline and in
-   `GET /api/v1/events`. An existing table and an existing column; no schema change.
+   `GET /api/v1/events`. An existing table and an existing column; no schema change. This is the
+   same table `teams.route` writes to, and between the two they are the whole durable record of
+   who was asked to do what and who told whom — searchable by `symphony_events` without a store
+   of Teams' own.
 3. **The ticket or the PR** — if the exchange changed a decision, the agent's *existing*
    obligation to say so on the PR covers it.
 
@@ -559,8 +594,9 @@ Each stands alone and each is useful if the next never happens.
   *Useful alone:* a user can author, fork and inspect profiles before anything routes.
 
 - **T3 — Deterministic routing and the prompt prepend.** `route()` as a pure function, Tier 0 +
-  Tier 1 only. `teammate_section` prepended in `build_turn_prompt`. The `assignments` row in the
-  sidecar plus a `teams.route` event.
+  Tier 1 only. `teammate_section` prepended in `build_turn_prompt`. The decision recorded as a
+  `teams.route` event — **and nothing else**: no sidecar store, no new table, no new file. Work
+  history is `events` filtered by identity, which `symphony_events` can already search.
   **This is the smallest version of the whole feature that works, and the recommendation is to
   ship T1–T3 and stop until it has been used for a week** — mirroring 569's S2 verdict that one
   agent, by hand, for a week is what decides whether the rest is worth building.
@@ -587,7 +623,8 @@ Each stands alone and each is useful if the next never happens.
 - **T8 — The invalidation surface.** `teams_invalidate` plus a dashboard button. After T5,
   because before it there is nothing to invalidate.
 
-**Deferred, named, and not slices:** `teams_ask` (needs an issue-less run path, §6.6);
+**Deferred, named, and not slices:** an `assignments` index over `teams.route` events, if and
+when that query is measurably slow (§2.1); `teams_ask` (needs an issue-less run path, §6.6);
 broadcast (§6.6); a local memory backend (§5.4); portable keypair identity (§6.4); per-project
 rosters (needs a `Raw` field, a `prune_empty`-correct encode, and an `effective_json`
 decision — the `capabilities` precedent shows exactly how, and the note at
