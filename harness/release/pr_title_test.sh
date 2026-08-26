@@ -104,6 +104,43 @@ else
   fail=1
 fi
 
+# --- the run prompt must mandate a title this validator accepts (STUDIO-593) ----------------------
+# .rhapsody/PROMPT.md tells every Rhapsody run how to title its PR. It used to mandate
+# "<ticket-id>: <summary>" — the one shape this validator rejects — so every run failed `pr-title` on
+# its first attempt and then self-corrected. Pinning the prompt's worked examples here means the
+# instruction and the gate that judges it cannot drift apart again.
+prompt="$here/../../.rhapsody/PROMPT.md"
+if [ ! -f "$prompt" ]; then
+  echo "FAIL - prompt examples: $prompt is missing"
+  fail=1
+else
+  examples=0
+  # Everything between the pr-title-examples markers, minus the markers, the code fence and blanks.
+  while IFS= read -r line; do
+    accepts "$line"
+    examples=$((examples + 1))
+  done < <(sed -n '/pr-title-examples:begin/,/pr-title-examples:end/p' "$prompt" \
+             | sed -e 's/^[[:space:]]*//' -e '/^<!--/d' -e '/^```/d' -e '/^$/d')
+
+  if [ "$examples" -lt 1 ]; then
+    echo "FAIL - prompt examples: no titles between the pr-title-examples markers in $prompt"
+    fail=1
+  else
+    echo "ok   - all $examples PR-title example(s) in .rhapsody/PROMPT.md are accepted"
+  fi
+
+  # The mandate itself, not just the examples: a backticked title template starting with the issue-id
+  # placeholder (`{{ issue.identifier }}: ...`) is the rejected form. Prose that merely NAMES that
+  # shape does not match — the placeholder there is closed by a backtick, not followed by a colon and
+  # a description.
+  if grep -q '`{{ issue.identifier }}:[^`]' "$prompt"; then
+    echo "FAIL - $prompt still mandates a leading-ticket-id PR title, the shape this validator rejects"
+    fail=1
+  else
+    echo "ok   - .rhapsody/PROMPT.md does not mandate a leading-ticket-id PR title"
+  fi
+fi
+
 # --- usage --------------------------------------------------------------------------------------
 # No argument at all is an operator/workflow wiring error, NOT a bad title: exit 2 so a mis-wired
 # workflow can never be mistaken for (or reported as) a rejected title.
