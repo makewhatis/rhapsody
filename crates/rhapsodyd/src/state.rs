@@ -90,11 +90,12 @@ impl DaemonState {
 #[async_trait]
 impl StateProvider for DaemonState {
     async fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
-        // `None` means the control loop is gone (the daemon is shutting down); Go's `Snapshot(ctx)`
-        // surfaces that as an error the handler renders 503 `snapshot_unavailable`.
+        // `None` means the control loop is not serving — it is gone (the daemon is shutting down) or
+        // has not published its first snapshot yet; Go's `Snapshot(ctx)` surfaces that as an error the
+        // handler renders 503 `snapshot_unavailable`. The read itself is off-loop (STUDIO-551), so it
+        // never waits on the control task's current tick.
         self.handle
             .snapshot()
-            .await
             .ok_or_else(|| SnapshotError::new("daemon is not running"))
     }
 

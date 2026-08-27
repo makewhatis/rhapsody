@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use rhapsody_core::{Issue, normalize_state};
 use rhapsody_store::{self as store, Store};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 
 use crate::control_loop::{CancelSignal, CancelWait, DEFAULT_RETENTION_DAYS, Event, WaitGroup};
 use crate::effective::Effective;
@@ -349,6 +350,13 @@ pub struct Orchestrator {
     /// `Mutex` solely so the `Orchestrator` stays `Sync` (a bare receiver is `!Sync`); the loop takes
     /// it on the control task. Go's loop ranges the channel directly with no separate handle.
     pub(crate) events_rx: Mutex<Option<UnboundedReceiver<Event>>>,
+    /// The always-readable published runtime snapshot (STUDIO-551) — the `GET /api/v1/state` source.
+    /// The control task republishes it after every event it handles (and mid-tick, right after
+    /// `reconcile`); the off-loop [`ControlHandle`](crate::stop::ControlHandle) READS the latest value
+    /// without touching the control channel, so `/state` can never be starved behind a network-bound
+    /// tick. `None` until the loop publishes its first snapshot, which keeps the pre-loop
+    /// "snapshot unavailable" 503 that the `evSnapshot` round-trip used to produce via its timeout.
+    pub(crate) snapshot_pub: watch::Sender<Option<Arc<crate::snapshot::Snapshot>>>,
     /// The orchestrator lifetime cancellation (Go `ctx context.Context`), set at the start of the
     /// control loop before the HTTP server accepts requests. `None` until the loop starts (some unit
     /// tests round-trip without it); read off-loop by Stop/Resume reply waits + the warning resolver.
@@ -470,6 +478,8 @@ impl Orchestrator {
             mailboxes: Mutex::new(HashMap::new()),
             events,
             events_rx: Mutex::new(Some(events_rx)),
+            // Nothing is published until the control loop starts (see the field docs).
+            snapshot_pub: watch::channel(None).0,
             ctx: None,
             tick_timer: None,
             retry_timers: HashMap::new(),

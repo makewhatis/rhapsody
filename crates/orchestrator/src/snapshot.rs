@@ -233,6 +233,24 @@ impl Orchestrator {
         }
     }
 
+    /// Publishes the current snapshot to the always-readable `snapshot_pub` cell (STUDIO-551).
+    ///
+    /// MUST run on the control task (it calls [`build_snapshot`](Self::build_snapshot), which reads
+    /// the loop-owned state). The control loop calls this after every event it handles and mid-tick
+    /// right after `reconcile`, so `GET /api/v1/state` reads a last-known-good snapshot off-loop
+    /// instead of queueing behind a network-bound tick.
+    ///
+    /// `send_replace`, not `send`: a `watch` send FAILS — leaving the cell holding its previous value
+    /// — when no receiver currently exists, and every [`ControlHandle`](crate::stop::ControlHandle)
+    /// being momentarily dropped is not a reason to stop tracking state. With `send` the cell would
+    /// freeze there and the next `control()` would `subscribe()` onto a stale snapshot; `send_replace`
+    /// always stores, so a handle taken at any time reads the newest published view.
+    pub(crate) fn publish_snapshot(&self) {
+        let _prev = self
+            .snapshot_pub
+            .send_replace(Some(std::sync::Arc::new(self.build_snapshot())));
+    }
+
     /// Rolls up per-project live status from the resolved project set + the running map (INF-224).
     /// One entry per project (deduped by the stable group key), in declaration order. Status priority:
     /// config-disabled => paused; else >=1 in-flight agent => running (or review when those agents sit
@@ -436,6 +454,30 @@ mod tests {
         assert_eq!(r.transcript_path, "/logs/MT-1/latest.jsonl");
         assert_eq!(r.recent_events.len(), 1);
         assert_eq!(r.recent_events[0].event, "turn_completed");
+    }
+
+    // STUDIO-551: publishing must keep tracking state even while NO `ControlHandle` exists. A `watch`
+    // send fails outright when there are no receivers and leaves the cell holding its previous value,
+    // so with `send` the cell would freeze and a handle taken later would `subscribe()` onto a stale
+    // snapshot. `send_replace` always stores, so the newest view is always what a new handle reads.
+    #[test]
+    fn publish_snapshot_keeps_tracking_without_a_live_handle() {
+        let mut o = orch_for_snapshot();
+        o.publish_snapshot(); // no handle has ever been taken
+        let mut re = running_entry(issue("1", "MT-1", "In Progress"), "", "");
+        re.started_at = (o.now)();
+        o.running.insert("1".to_string(), re);
+        o.publish_snapshot();
+
+        let snap = o
+            .control()
+            .snapshot()
+            .expect("a handle taken after the fact must see a published snapshot");
+        assert_eq!(
+            snap.running.len(),
+            1,
+            "the handle must read the NEWEST published snapshot, not a frozen earlier one"
+        );
     }
 
     // Mirrors Go `TestBuildSnapshotRunningAndRetrying`.

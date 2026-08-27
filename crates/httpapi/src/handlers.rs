@@ -16,10 +16,15 @@ use crate::build_info;
 use crate::responses::{HealthzJson, write_error, write_json};
 use crate::server::StateProvider;
 
-/// Bounds how long a `/state` request waits on the orchestrator control task. Mirrors Go
-/// `snapshotTimeout` (2s): the HTTP layer owns the deadline (Go wraps the request ctx), so even a
+/// Bounds how long a `/state` request waits on its [`StateProvider`](crate::StateProvider). Mirrors
+/// Go `snapshotTimeout` (2s): the HTTP layer owns the deadline (Go wraps the request ctx), so even a
 /// wedged provider yields a prompt 503 rather than hanging the desktop supervisor's readiness poll.
 /// `pub(crate)` so the run-detail handler (H2), which also consults the snapshot, shares the deadline.
+///
+/// Since STUDIO-551 the daemon's provider reads an off-loop published snapshot and so never actually
+/// approaches this deadline — a tick in flight no longer starves `/state`. The deadline stays as the
+/// generic backstop the trait boundary deserves (a provider is free to be slow); it is no longer the
+/// thing standing between a busy control loop and a 503.
 pub(crate) const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `GET /healthz` — a cheap, state-free liveness/readiness probe for the desktop supervisor. Never

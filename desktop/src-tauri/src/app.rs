@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -115,6 +116,13 @@ struct AppInner {
     save_mu: Mutex<()>,
     /// Short-timeout client for the `/api/v1/state` agent-count probe (Go's `http.DefaultClient`).
     http: reqwest::Client,
+    /// The last agent count a `/api/v1/state` probe actually RESOLVED (STUDIO-551). A probe that
+    /// times out, 503s, or fails to parse yields no count at all, and rendering that absence as `0`
+    /// is what made the tray and the toolbar flash "Idle" mid-run. Callers fall back to this value so
+    /// a transient probe failure holds the last honest count instead of inventing an idle daemon.
+    /// Reset to 0 whenever the supervisor is observed not Running, so a stopped daemon cannot leave a
+    /// stale count behind.
+    last_agent_count: AtomicI64,
 }
 
 /// Owns the daemon supervisor and the app lifecycle. Cheap to [`Clone`] (an `Arc` handle); all
@@ -247,6 +255,7 @@ impl App {
                 }),
                 save_mu: Mutex::new(()),
                 http,
+                last_agent_count: AtomicI64::new(0),
             }),
         }
     }
@@ -518,6 +527,7 @@ impl App {
         let sup = match self.get_sup() {
             Some(s) => s,
             None => {
+                self.forget_agent_count();
                 return StatusDto {
                     state: State::Stopped.as_str().to_string(),
                     pid: 0,
@@ -543,7 +553,11 @@ impl App {
         };
         if st.state == State::Running {
             dto.healthy = sup.healthy().await;
-            dto.agent_count = self.agent_count(&sup).await;
+            // Hold the last resolved count when the probe does not answer — never render a transient
+            // `/api/v1/state` failure as a definitive zero (STUDIO-551).
+            dto.agent_count = self.agent_count_or_last(&sup.url()).await;
+        } else {
+            self.forget_agent_count();
         }
         dto
     }
@@ -565,58 +579,91 @@ impl App {
             Some(sup) => {
                 let st = sup.status();
                 let agents = if st.state == State::Running {
-                    self.agent_count(&sup).await
+                    self.agent_count_or_last(&sup.url()).await
                 } else {
+                    self.forget_agent_count();
                     0
                 };
                 (st, agents)
             }
-            None => (
-                Status {
-                    state: State::Stopped,
-                    pid: 0,
-                    restarts: 0,
-                    last_err: String::new(),
-                },
-                0,
-            ),
+            None => {
+                self.forget_agent_count();
+                (
+                    Status {
+                        state: State::Stopped,
+                        pid: 0,
+                        restarts: 0,
+                        last_err: String::new(),
+                    },
+                    0,
+                )
+            }
         };
         menu_from_status(&st, agents, self.configured())
     }
 
-    /// Fetches the live running-agent count from the daemon's `/api/v1/state`; 0 on any error (the
-    /// daemon may be momentarily unavailable). Mirrors Go `agentCount`.
-    async fn agent_count(&self, sup: &Supervisor) -> i64 {
-        let url = format!("{}/api/v1/state", sup.url());
-        let resp = match self.inner.http.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => return 0,
-        };
+    /// Probes the live running-agent count from the daemon's `/api/v1/state`.
+    ///
+    /// `None` means the probe did not RESOLVE a count — a transport error (including this client's
+    /// 2s timeout), a non-200 (e.g. the 503 `snapshot_unavailable` envelope), or an unparseable body.
+    /// That is deliberately distinct from `Some(0)`, "the daemon says nothing is running": collapsing
+    /// the two is what made the tray and the web toolbar render a definitive "Idle" for a daemon that
+    /// had three agents in flight (STUDIO-551). Callers that must render a number use
+    /// [`agent_count_or_last`](Self::agent_count_or_last). Mirrors Go `agentCount`, minus its
+    /// error-to-zero collapse.
+    async fn agent_count(&self, base_url: &str) -> Option<i64> {
+        let url = format!("{base_url}/api/v1/state");
+        let resp = self.inner.http.get(&url).send().await.ok()?;
         if resp.status() != reqwest::StatusCode::OK {
-            return 0;
+            return None;
         }
         #[derive(serde::Deserialize)]
         struct StateBody {
             counts: HashMap<String, i64>,
         }
-        match resp.json::<StateBody>().await {
-            Ok(body) => body.counts.get("running").copied().unwrap_or(0),
-            Err(_) => 0,
+        // A 200 whose body simply carries no `running` key IS an answer of zero; only a body we could
+        // not parse at all is "unknown".
+        let body = resp.json::<StateBody>().await.ok()?;
+        Some(body.counts.get("running").copied().unwrap_or(0))
+    }
+
+    /// The agent count to RENDER: the freshly probed count when the probe resolved, else the last one
+    /// that did (STUDIO-551). A resolved probe also refreshes the cache, so the fallback only ever
+    /// serves a value the daemon really reported.
+    async fn agent_count_or_last(&self, base_url: &str) -> i64 {
+        match self.agent_count(base_url).await {
+            Some(n) => {
+                self.inner.last_agent_count.store(n, Ordering::Relaxed);
+                n
+            }
+            None => self.inner.last_agent_count.load(Ordering::Relaxed),
         }
+    }
+
+    /// Forgets the cached agent count. Called whenever the supervisor is observed not Running, so a
+    /// stopped or restarting daemon can never be rendered with a stale count from its previous life.
+    fn forget_agent_count(&self) {
+        self.inner.last_agent_count.store(0, Ordering::Relaxed);
     }
 
     // ---- in-app auto-update (P11-U1) ---------------------------------------------------------------
 
     /// The number of runs the daemon is actively executing right now — the count the updater's install
     /// guard consults so a self-restart never kills work in flight. It is the same live `/api/v1/state`
-    /// `counts.running` the tray already reads; a not-yet-started or non-Running supervisor (and any
-    /// probe error) yields 0, the safe default (no supervisor → nothing to protect). Because a probe
-    /// failure reads as 0, callers requiring safety MUST pair this with an explicit `force` override
-    /// rather than trusting 0 to mean "definitely idle".
+    /// `counts.running` the tray already reads, with the same "hold the last resolved count" fallback
+    /// (STUDIO-551): a probe that times out or 503s no longer reads as "definitely idle", which for
+    /// this caller means an install is refused rather than allowed to kill work in flight. A
+    /// not-yet-started or non-Running supervisor still yields 0 — there is genuinely nothing to
+    /// protect, and the cache is cleared with it.
     pub async fn active_run_count(&self) -> i64 {
         match self.get_sup() {
-            Some(sup) if sup.status().state == State::Running => self.agent_count(&sup).await,
-            _ => 0,
+            Some(sup) if sup.status().state == State::Running => {
+                self.agent_count_or_last(&sup.url()).await
+            }
+            _ => {
+                self.forget_agent_count();
+                0
+            }
         }
     }
 
@@ -1629,5 +1676,141 @@ mod tests {
             "WORKFLOW.md must NOT be written when the sidecar is missing (configured stays false)"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- STUDIO-551: a failed `/api/v1/state` probe is "unknown", never a definitive zero --------
+
+    /// A minimal `/api/v1/state` stand-in: answers every request with the given status + body.
+    async fn start_state_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use http_body_util::Full;
+        use hyper::body::{Bytes, Incoming};
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind state stub");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let service = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from(body)))
+                                .expect("build response"),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (url, handle)
+    }
+
+    // A 200 with a real count resolves; a 200 whose body carries no `running` key IS an answer of
+    // zero; a 503 (the daemon's `snapshot_unavailable` envelope), an unparseable body, and an
+    // unreachable daemon all resolve to NOTHING — never to a count.
+    #[tokio::test]
+    async fn agent_count_distinguishes_unknown_from_zero() {
+        let app = test_app();
+
+        let (url, srv) = start_state_server(200, r#"{"counts":{"running":3}}"#).await;
+        assert_eq!(
+            app.agent_count(&url).await,
+            Some(3),
+            "a 200 resolves its count"
+        );
+        srv.abort();
+
+        let (url, srv) = start_state_server(200, r#"{"counts":{}}"#).await;
+        assert_eq!(
+            app.agent_count(&url).await,
+            Some(0),
+            "a 200 with no running key is a genuine zero"
+        );
+        srv.abort();
+
+        let (url, srv) =
+            start_state_server(503, r#"{"error":{"code":"snapshot_unavailable"}}"#).await;
+        assert_eq!(
+            app.agent_count(&url).await,
+            None,
+            "a 503 must NOT read as zero agents"
+        );
+        srv.abort();
+
+        let (url, srv) = start_state_server(200, "not json").await;
+        assert_eq!(
+            app.agent_count(&url).await,
+            None,
+            "an unparseable body must NOT read as zero agents"
+        );
+        srv.abort();
+
+        // Nothing listening at all: a transport error is also "unknown".
+        assert_eq!(
+            app.agent_count("http://127.0.0.1:1").await,
+            None,
+            "an unreachable daemon must NOT read as zero agents"
+        );
+    }
+
+    // The rendered count holds the last RESOLVED value across a transient probe failure, so the tray
+    // and the web toolbar cannot flash "Idle" while agents are in fact running. Forgetting the cache
+    // (what the callers do whenever the supervisor is not Running) drops back to 0.
+    #[tokio::test]
+    async fn agent_count_or_last_holds_the_last_resolved_count() {
+        let app = test_app();
+        assert_eq!(
+            app.agent_count_or_last("http://127.0.0.1:1").await,
+            0,
+            "with nothing ever resolved, the fallback is 0"
+        );
+
+        let (url, srv) = start_state_server(200, r#"{"counts":{"running":3}}"#).await;
+        assert_eq!(app.agent_count_or_last(&url).await, 3);
+        srv.abort();
+
+        let (url, srv) =
+            start_state_server(503, r#"{"error":{"code":"snapshot_unavailable"}}"#).await;
+        assert_eq!(
+            app.agent_count_or_last(&url).await,
+            3,
+            "a 503 must hold the last resolved count, not render Idle"
+        );
+        srv.abort();
+
+        assert_eq!(
+            app.agent_count_or_last("http://127.0.0.1:1").await,
+            3,
+            "an unreachable daemon must hold the last resolved count too"
+        );
+
+        // A resolved zero DOES take effect — the daemon really said nothing is running.
+        let (url, srv) = start_state_server(200, r#"{"counts":{"running":0}}"#).await;
+        assert_eq!(app.agent_count_or_last(&url).await, 0);
+        srv.abort();
+
+        let (url, srv) = start_state_server(200, r#"{"counts":{"running":2}}"#).await;
+        assert_eq!(app.agent_count_or_last(&url).await, 2);
+        srv.abort();
+        app.forget_agent_count();
+        assert_eq!(
+            app.agent_count_or_last("http://127.0.0.1:1").await,
+            0,
+            "a stopped daemon must not leave a stale count behind"
+        );
     }
 }

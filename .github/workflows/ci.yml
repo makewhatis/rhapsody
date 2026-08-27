@@ -22,6 +22,12 @@ jobs:
       - run: rustup show   # installs the toolchain pinned by rust-toolchain.toml
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # STUDIO-599: prompt text has no compiler, so the invariants of `.rhapsody/PROMPT.md` (design
+      # records dual-written to ~/.rhapsody/docs/, that directory as a read-only exception, never
+      # committing a process document, stopping rather than reconstructing an unreadable required
+      # input) are pinned by a case table instead. Cheap and bash-only — it rides the existing `lint`
+      # job rather than adding a branch-protection context that would not be required.
+      - run: harness/prompt/prompt_test.sh
 
   test:
     if: >-
