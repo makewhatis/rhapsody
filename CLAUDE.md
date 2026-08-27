@@ -54,7 +54,7 @@ read that first when working in a crate you don't know):
 | `orchestrator` | The daemon's heart — dispatch, turn loop, retry, one `Orchestrator` struct grown across many files |
 | `store` | Durable history/restart-recovery (SQLite via `rusqlite`, WAL) or `Noop` when storage is off |
 | `httpapi` | Loopback JSON API + embedded React dashboard, read-only except `/refresh` |
-| `mcp` | `rhapsody mcp` — thin read-mostly MCP facade over the daemon's own HTTP API |
+| `mcp` | `rhapsodyd mcp` — thin read-mostly MCP facade over the daemon's own HTTP API |
 | `telemetry` | Optional OpenTelemetry export; a no-op (never fails the daemon) when disabled |
 | `rhapsodyd` | The daemon binary — signal handling, delegates to `run::run` |
 
