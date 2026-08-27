@@ -136,6 +136,11 @@ present "save_document is the history container and never the deliverable" \
 # worse than the single-write route this replaced, so the comment is unconditional.
 present_i "a failed save_document still posts the summary comment carrying the path" \
           'still post the summary comment'
+# Phase 6 is where the comment is actually written, so it is the copy a run has in front of it when a
+# write fails. It must DEFER to the rule above, not restate a summary of it that can go stale — which
+# is exactly what happened once on this branch.
+present_i "Phase 6 defers to Phase 2's denial rule instead of restating it" \
+          "apply Phase 2's denial rule"
 
 # The PR body stays dead as a home for the document (unchanged from STUDIO-599).
 absent "the deliverable no longer lives in the pull request body" \
