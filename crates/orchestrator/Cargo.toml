@@ -42,7 +42,9 @@ async-trait = "0.1"
 # retry timers, and off-loop warning resolvers use `rt` (`tokio::spawn` / `JoinHandle`); the runtime
 # itself is provided by the `rhapsodyd` binary. Anticipated by the P5 plan's dep set; already in
 # Cargo.lock (agent/workspace/tracker depend on it).
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+# `process`: BO-59's dispatch credential probe spawns `claude -p 'reply with exactly: OK'` as an async
+# child (kill-on-drop so a timed-out probe is reaped). Already built for the `agent` crate's runner.
+tokio = { version = "1", features = ["sync", "time", "rt", "process"] }
 # serde_json powers the O4 `snapshot_json` view — the `/api/v1/state` wire render (`render(&Snapshot)
 # -> serde_json::Value`, mirroring Go httpapi `toStateJSON`). Following the config crate's
 # `effective_json` convention, the domain crate owns its wire view + parity gate and P6 reuses it

@@ -393,6 +393,22 @@ pub struct Orchestrator {
     /// Whether a store was injected via [`set_store`](Orchestrator::set_store) (Go `storeInjected`),
     /// short-circuiting `Run`'s disk-open path so tests / callers own the store lifecycle.
     pub(crate) store_injected: bool,
+
+    // --- BO-59: dispatch credential-liveness preflight (Rhapsody-only; see `preflight.rs`). ---
+    /// The injectable credential-liveness probe seam. `None` disables the credential preflight →
+    /// dispatch is byte-identical to the pre-feature behavior (the default for tests and any build that
+    /// does not install one). Production installs a [`ClaudeCredentialProbe`](crate::preflight::ClaudeCredentialProbe)
+    /// via [`set_credential_probe`](Orchestrator::set_credential_probe).
+    pub(crate) cred_probe: Option<Arc<dyn crate::preflight::CredentialProbe>>,
+    /// The cached credential-probe verdict for the dispatch preflight. Mutated only by on_tick's
+    /// `credential_preflight` on the single control task, so it needs no lock. `None` until the first
+    /// probe.
+    pub(crate) probe_cache: Option<crate::preflight::ProbeCache>,
+    /// The per-probe timeout bound: a probe that does not answer within this is treated as "cannot
+    /// verify → skip dispatch" (fail closed), well under the poll interval so a hang never wedges the
+    /// tick. A field (not a const) so tests can shrink it; defaulted to
+    /// [`PROBE_TIMEOUT`](crate::preflight::PROBE_TIMEOUT).
+    pub(crate) probe_timeout: std::time::Duration,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -473,6 +489,11 @@ impl Orchestrator {
             retention_loaded: Arc::new(AtomicBool::new(false)),
             warnings: Arc::new(WarningsState::default()),
             store_injected: false,
+            // BO-59: no credential probe by default → the preflight is a no-op and dispatch is
+            // byte-identical to the pre-feature behavior. The daemon installs the real probe at startup.
+            cred_probe: None,
+            probe_cache: None,
+            probe_timeout: crate::preflight::PROBE_TIMEOUT,
         }
     }
 
