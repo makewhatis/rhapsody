@@ -483,6 +483,35 @@ mod tests {
         );
     }
 
+    // STUDIO-603: the Linear comment path accepts EITHER brand spelling, whichever is configured —
+    // proving `new` wires `compile_summon_matcher` (not the single-token builder). The shipped
+    // `@symphony` default therefore detects an `@rhapsody` summons and vice versa.
+    #[test]
+    fn normalize_summon_detects_either_brand_token() {
+        let raw = |body: &str| {
+            format!(
+                r#"{{
+          "id": "u", "identifier": "MT-9", "title": "t", "state": {{ "name": "In Review" }},
+          "labels": {{ "nodes": [] }}, "inverseRelations": {{ "nodes": [] }},
+          "comments": {{ "nodes": [
+            {{ "createdAt": "2026-06-03T10:00:00.000Z", "body": "{body}" }}
+          ] }}
+        }}"#
+            )
+        };
+        // "" => `new` applies the `@symphony` default; "@rhapsody" is the name the daemon ships under.
+        for configured in ["", "@symphony", "@rhapsody"] {
+            for body in ["@symphony please retry", "@rhapsody please retry"] {
+                let iss = norm_client(configured).normalize_issue(parse(&raw(body)));
+                assert!(
+                    iss.latest_summon_at.is_some(),
+                    "configured {configured:?} must detect {body:?}"
+                );
+                assert_eq!(iss.latest_summon_body, body);
+            }
+        }
+    }
+
     // Mirrors Go TestNormalizeSummonDetection.
     #[test]
     fn normalize_summon_detection() {

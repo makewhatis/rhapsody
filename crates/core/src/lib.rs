@@ -12,7 +12,10 @@ pub mod summon;
 
 pub use issue::{BlockerRef, Comment, Issue, LinkedPRRef, normalize_state};
 pub use project::{Project, Viewer};
-pub use summon::compile_summon_re;
+pub use summon::{
+    SUMMON_TOKEN_RHAPSODY, SUMMON_TOKEN_SYMPHONY, compile_summon_matcher, compile_summon_re,
+    compile_summon_set, summon_tokens,
+};
 
 #[cfg(test)]
 mod tests {
