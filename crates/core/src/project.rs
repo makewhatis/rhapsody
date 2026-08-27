@@ -16,7 +16,7 @@ pub struct Project {
 }
 
 /// `Viewer` is the resolved owner of the configured tracker API key — the user whose assigned
-/// issues Symphony works. It backs the "connected as" identity surface (INF-224). `name` is the
+/// issues the daemon works. It backs the "connected as" identity surface (INF-224). `name` is the
 /// account's full name; `display_name` is the shorter handle Linear shows inline.
 ///
 /// `Default` is derived (beyond the base derive set) for the same reason [`crate::Issue`] carries

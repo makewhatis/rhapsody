@@ -1,6 +1,6 @@
 //! claude — the Claude Code agent backend (parity port of Go `internal/agent/claude`).
 //!
-//! Symphony drives `claude` headlessly as a subprocess and maps its stream-json output to the
+//! Rhapsody drives `claude` headlessly as a subprocess and maps its stream-json output to the
 //! normalized [`crate`] agent events (design-spec §8; upstream §10). This module ports the pieces
 //! that are pure and backend-shaped:
 //!
@@ -27,6 +27,6 @@ pub use billing::{
     BILLING_ENV_VARS, TRACKER_ENV_VARS, billing_guard_enabled, billing_guard_ok, scrub_env,
     scrubbed_env_vars,
 };
-pub use mcpinject::{MERGED_MCP_CONFIG_NAME, append_me_env, inject_symphony_mcp};
+pub use mcpinject::{MERGED_MCP_CONFIG_NAME, append_me_env, inject_daemon_mcp};
 pub use parse::{Classified, classify};
 pub use runner::Runner;

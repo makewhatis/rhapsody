@@ -1,5 +1,5 @@
-//! runtimeport — parity port of Go `internal/runtimeport`: publishes and reads the Symphony
-//! daemon's live loopback HTTP port.
+//! runtimeport — parity port of Go `internal/runtimeport`: publishes and reads the daemon's
+//! live loopback HTTP port.
 //!
 //! The daemon's observability/API server can bind a port that does NOT match `server.port` in
 //! WORKFLOW.md: the desktop app launches the daemon with a dynamic `--port <n>` (and `--port 0` asks

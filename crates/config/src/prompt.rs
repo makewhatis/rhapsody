@@ -4,7 +4,7 @@
 //! body is a Liquid template (upstream §5.4, §12) rendered with `issue` + `attempt` bindings
 //! under strict-variables semantics: an unknown variable, an unknown key on a bound object, or an
 //! unknown filter is a rendering error — never a silently-empty expansion. An empty body falls
-//! back to a fixed default prompt. This is the contract for every template Symphony users have
+//! back to a fixed default prompt. This is the contract for every template operators have
 //! written (the live Tally/Booch/Rhapsody prompts), so it must match the Go daemon.
 
 use chrono::{DateTime, SecondsFormat, Utc};

@@ -235,24 +235,24 @@ fn claude_config_from_cfg(cfg: &Config) -> claude::Config {
         ultracode: cfg.claude.ultracode,
         tracker_api_key: cfg.tracker.api_key.clone(),
         // MCP injection into the dispatched agent (INF-473, default-on via `cfg.mcp.enabled`). The
-        // binary is the running daemon's own path; the workflow path lets the child `symphony mcp`
+        // binary is the running daemon's own path; the workflow path lets the child `<daemon> mcp`
         // resolve the SAME server.port.
         inject_mcp: cfg.mcp.enabled,
-        symphony_bin: symphony_bin_path(),
+        daemon_bin: daemon_bin_path(),
         workflow_path: cfg.workflow_path.clone(),
     }
 }
 
-/// Returns the running daemon binary's absolute path (the injected `symphony` MCP server's
-/// command). On the rare failure it logs and returns `""` so injection is skipped rather than
-/// pointing at a bad command. Mirrors Go `symphonyBinPath` (`os.Executable`).
-fn symphony_bin_path() -> String {
+/// Returns the running daemon binary's absolute path (the injected MCP server's `command`). On the
+/// rare failure it logs and returns `""` so injection is skipped rather than pointing at a bad
+/// command. Mirrors Go `symphonyBinPath` (`os.Executable`).
+fn daemon_bin_path() -> String {
     match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
             tracing::warn!(
                 err = %e,
-                "mcp injection: could not resolve symphony binary path; skipping injection"
+                "mcp injection: could not resolve daemon binary path; skipping injection"
             );
             String::new()
         }
