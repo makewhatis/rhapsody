@@ -16,6 +16,11 @@
 #   * A run that cannot read a required input STOPS and hands off; it never reconstructs the input.
 #   * None of this weakens the absolute rule that specs, plans and design docs never land in the repo —
 #     the directory sits outside the repo precisely so that rule can stand.
+#   * A statement of FACT about the repo can rot into a falsehood while every word around it stays
+#     true. STUDIO-602: the prompt told every run the daemon binary was `symphonyd` — once as a fact
+#     and once as a non-negotiable — long after the tree had renamed it. A run that took the
+#     non-negotiable literally would defend a binary that does not exist, or flag the real one as a
+#     violation. Such statements are checked against the tree, never against a literal in this file.
 #
 # No dependencies beyond bash + git. Run from anywhere: `harness/prompt/prompt_test.sh`.
 set -euo pipefail
@@ -124,6 +129,70 @@ if [ -n "$tracked" ]; then
 else
   ok "the repo tracks no docs/ or rfcs/ process-document tree"
 fi
+
+# --- the sidecar binary name the prompt states matches the one the tree builds (STUDIO-602) ---------
+# Derived from the tree on every run, never written as a literal here: a literal would have to be
+# edited by the same rename that moved the tree, which is exactly the edit that got missed. The
+# contract is `BINARY_NAME` in the desktop supervisor — the constant the app resolves the sidecar by —
+# and it is cross-checked against the crate that actually builds a binary of that name.
+resolve_rs="$root/desktop/src-tauri/src/supervisor/resolve.rs"
+
+# The name the desktop app resolves the sidecar by.
+binary_name="$(sed -n 's/.*BINARY_NAME[^=]*= *"\([^"]*\)".*/\1/p' "$resolve_rs" 2>/dev/null | head -1)"
+
+# The binary each workspace crate builds: a `[[bin]]` name override if present, else the package name.
+# Exactly one crate must build `$binary_name`, or the sidecar the desktop app looks for is not built.
+crate_bin_name() {
+  awk '
+    /^[[:space:]]*\[/ { tbl=$1 }
+    (tbl=="[package]" || tbl=="[[bin]]") && /^[[:space:]]*name[[:space:]]*=/ {
+      if (!match($0, /"[^"]*"/)) next
+      v = substr($0, RSTART + 1, RLENGTH - 2)
+      if (tbl=="[[bin]]") { print v; exit }    # an override wins outright
+      pkg = v
+    }
+    END { if (pkg != "") print pkg }
+  ' "$1"
+}
+
+producers=""
+for manifest in "$root"/crates/*/Cargo.toml; do
+  [ -f "$manifest" ] || continue
+  if [ "$(crate_bin_name "$manifest")" = "$binary_name" ] && [ -n "$binary_name" ]; then
+    producers="$producers $(basename "$(dirname "$manifest")")"
+  fi
+done
+
+if [ -z "$binary_name" ]; then
+  bad "the daemon binary name can be derived from $resolve_rs (no BINARY_NAME found — did it move?)"
+elif [ "$(printf '%s' "$producers" | wc -w | tr -d ' ')" != "1" ]; then
+  bad "exactly one crate builds the '$binary_name' sidecar (found:${producers:-" none"})"
+else
+  ok "the '$binary_name' sidecar is built by crates/$(printf '%s' "$producers" | tr -d ' ')"
+fi
+
+# stated_binary <description> <sed-extract-expression> — pull the binary name the prompt states at one
+# position and require it to equal the derived one. An empty extract fails too: the phrasing that
+# carries the claim was reworded away, and a reworded claim is unchecked until this test is updated
+# alongside it.
+stated_binary() {
+  local desc="$1" extract="$2" stated
+  stated="$(sed -n "$extract" "$prompt" | head -1)"
+  if [ -z "$stated" ]; then
+    bad "$desc (the prompt no longer states it in the expected phrasing)"
+  elif [ "$stated" != "$binary_name" ]; then
+    bad "$desc (prompt says '$stated', the tree builds '$binary_name')"
+  else
+    ok "$desc ('$stated')"
+  fi
+}
+
+# Both places the prompt makes the claim. Checked separately: the first is a statement of fact in the
+# repo tour, the second is a NON-NEGOTIABLE a run is told to defend, and either can rot alone.
+stated_binary "the repo tour names the bin crate the tree actually builds" \
+              's/.*plus the `\([^`]*\)` bin crate.*/\1/p'
+stated_binary "the non-negotiable names the binary the tree actually builds" \
+              's/.*the binary stays `\([^`]*\)`.*/\1/p'
 
 if [ "$fail" -ne 0 ]; then
   echo "prompt_test: FAILED"
