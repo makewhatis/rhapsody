@@ -383,16 +383,24 @@ pub const TOOL_PREFIX_RHAPSODY: &str = "rhapsody_";
 /// name and description differ; dispatch is by map key and the generated handlers never read their
 /// own name, so an aliased call behaves identically.
 ///
-/// Call this LAST, after any gating `remove_route`: aliases are derived from what actually survived,
-/// so a disabled write tool gets no alias and its gate cannot be walked around by spelling the tool
-/// the other way. A pre-existing `rhapsody_*` route (there is none today) would be left untouched
-/// rather than clobbered.
+/// Call this LAST, after any gating: aliases are derived from what actually survived, so a disabled
+/// write tool gets no alias and its gate cannot be walked around by spelling the tool the other way.
+/// A pre-existing `rhapsody_*` route (there is none today) is left untouched rather than clobbered.
+///
+/// The gate is honored for BOTH ways rmcp can close one. `Facade::new` gates by `remove_route`, so a
+/// gated tool is simply absent from the map here. `has_route` additionally excludes a route closed
+/// by `disable_route`, which leaves the route IN the map and suppresses it by name — aliasing such a
+/// route would mint a differently-named copy that the disabled-name check no longer catches. Nothing
+/// disables routes today; the filter is what keeps that future switch from silently reopening a gate.
 fn register_brand_aliases(router: &mut ToolRouter<Facade>) {
     let aliases: Vec<_> = router
         .map
         .iter()
         .filter_map(|(name, route)| {
             let suffix = name.strip_prefix(TOOL_PREFIX_SYMPHONY)?;
+            if !router.has_route(name) {
+                return None;
+            }
             let alias_name = format!("{TOOL_PREFIX_RHAPSODY}{suffix}");
             if router.map.contains_key(alias_name.as_str()) {
                 return None;
@@ -401,7 +409,7 @@ fn register_brand_aliases(router: &mut ToolRouter<Facade>) {
             // A short description keeps the doubled tool list cheap in the agent's context; the
             // authoritative wording stays on the tool being aliased.
             alias.attr.description =
-                Some(format!("Alias of `{name}` — identical behaviour.").into());
+                Some(format!("Alias of `{name}` — identical behavior.").into());
             alias.attr.name = alias_name.into();
             Some(alias)
         })
@@ -577,6 +585,27 @@ mod tests {
             "alias set must mirror the original set exactly: {names:?}"
         );
         let _ = client.cancel().await;
+    }
+
+    // A route closed with `disable_route` (rather than `remove_route`) gets NO alias either.
+    // Nothing disables routes today; this pins the invariant so switching the gating style later
+    // cannot silently mint a differently-named copy that walks around the gate.
+    #[test]
+    fn disabled_route_gets_no_alias() {
+        let mut router = Facade::read_router();
+        router.merge(Facade::write_router());
+        assert!(
+            router.disable_route("symphony_stop"),
+            "precondition: symphony_stop should be newly disabled"
+        );
+        register_brand_aliases(&mut router);
+        assert!(
+            !router.map.contains_key("rhapsody_stop"),
+            "a disabled route must not be aliased: {:?}",
+            router.map.keys().collect::<Vec<_>>()
+        );
+        // A sibling that is NOT disabled still gets its alias.
+        assert!(router.map.contains_key("rhapsody_state"));
     }
 
     // An aliased call reaches the SAME handler as the tool it aliases — the alias shares the

@@ -144,6 +144,18 @@ mod tests {
         );
     }
 
+    // The degenerate empty set fails CLOSED: it compiles, and it matches nothing. A bare empty
+    // alternation would instead match almost any text, silently turning every comment into a
+    // summons. Unreachable from `compile_summon_matcher`/`compile_summon_re`, but `compile_summon_set`
+    // is public.
+    #[test]
+    fn empty_set_compiles_and_never_matches() {
+        let re = compile_summon_set(&[]).expect("empty set still compiles");
+        for body in ["", "@symphony fix the CI error", "anything at all", " "] {
+            assert!(!re.is_match(body), "empty set must not match {body:?}");
+        }
+    }
+
     // A token carrying a regex metacharacter stays a literal in the alternation (escape parity
     // with the single-token builder).
     #[test]
