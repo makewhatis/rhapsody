@@ -66,11 +66,23 @@ fn mcp_server_from_args(
     let opts = Options {
         // "me" defaults: PR3's runner env injection sets these on dispatched workers so
         // symphony_run / symphony_ticket / symphony_run_status default to the worker's own run.
-        default_run_id: getenv("SYMPHONY_RUN_ID"),
-        default_issue: getenv("SYMPHONY_ISSUE"),
+        // STUDIO-603: the runner emits BOTH spellings, and either is accepted here.
+        default_run_id: first_set(&getenv, "RUN_ID"),
+        default_issue: first_set(&getenv, "ISSUE"),
         now: None,
     };
     Ok(Facade::new(&cfg, client, opts))
+}
+
+/// Reads the "me" identity variable `suffix` under either brand prefix, preferring the `RHAPSODY_`
+/// spelling and falling back to `SYMPHONY_` (STUDIO-603). The runner sets both to the same value, so
+/// the precedence only matters for an environment where an operator set just one — and either wins.
+fn first_set(getenv: impl Fn(&str) -> String, suffix: &str) -> String {
+    let rhapsody = getenv(&format!("RHAPSODY_{suffix}"));
+    if !rhapsody.is_empty() {
+        return rhapsody;
+    }
+    getenv(&format!("SYMPHONY_{suffix}"))
 }
 
 /// Resolves the MCP workflow path, mirroring the daemon's resolution: a positional arg wins, else
@@ -147,6 +159,37 @@ mod tests {
             mcp_server_from_args(&args, getenv).is_ok(),
             "mcp_server_from_args should build the facade for a valid workflow"
         );
+    }
+
+    // STUDIO-603: the "me" identity is read under EITHER brand prefix — the RHAPSODY_ spelling wins
+    // when both are set (the runner sets both to the same value), and SYMPHONY_ alone still works.
+    #[test]
+    fn first_set_accepts_either_brand_prefix() {
+        let only_symphony = |k: &str| match k {
+            "SYMPHONY_RUN_ID" => "7".to_string(),
+            _ => String::new(),
+        };
+        assert_eq!(first_set(only_symphony, "RUN_ID"), "7");
+
+        let only_rhapsody = |k: &str| match k {
+            "RHAPSODY_RUN_ID" => "9".to_string(),
+            _ => String::new(),
+        };
+        assert_eq!(first_set(only_rhapsody, "RUN_ID"), "9");
+
+        let both = |k: &str| match k {
+            "RHAPSODY_RUN_ID" => "9".to_string(),
+            "SYMPHONY_RUN_ID" => "7".to_string(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            first_set(both, "RUN_ID"),
+            "9",
+            "RHAPSODY_ wins when both set"
+        );
+
+        // Neither set (a coordinator session) stays empty, not a literal fallback.
+        assert_eq!(first_set(no_env, "ISSUE"), "");
     }
 
     // A bad workflow path surfaces the load error (the `symphony mcp:` dispatch marker is added by

@@ -113,15 +113,21 @@ fn load_mcp_doc(ws_path: &str, base: &str) -> Result<Doc, AgentError> {
     Ok(doc.unwrap_or_default())
 }
 
-/// Appends the agent's "me" identity env (`SYMPHONY_ISSUE` / `SYMPHONY_RUN_ID`) so the injected
-/// `symphony mcp` can default its tools to this run (INF-473). Only known (non-empty / non-zero)
-/// values are added — a coordinator session has neither.
+/// Appends the agent's "me" identity env so the injected daemon MCP server can default its tools to
+/// this run (INF-473). Only known (non-empty / non-zero) values are added — a coordinator session
+/// has neither.
+///
+/// STUDIO-603: each variable is emitted under BOTH the `SYMPHONY_*` and the `RHAPSODY_*` spelling,
+/// with identical values. Purely additive — a child reading either wins, so an agent or MCP server
+/// still looking for `SYMPHONY_RUN_ID` is unaffected. Nothing is removed here.
 pub fn append_me_env(mut env: Vec<String>, issue: &str, run_id: i64) -> Vec<String> {
     if !issue.is_empty() {
         env.push(format!("SYMPHONY_ISSUE={issue}"));
+        env.push(format!("RHAPSODY_ISSUE={issue}"));
     }
     if run_id != 0 {
         env.push(format!("SYMPHONY_RUN_ID={run_id}"));
+        env.push(format!("RHAPSODY_RUN_ID={run_id}"));
     }
     env
 }
@@ -299,6 +305,38 @@ mod tests {
             none,
             vec!["A=1".to_string()],
             "empty identity injects nothing"
+        );
+    }
+
+    // STUDIO-603: the identity is ALSO emitted under the RHAPSODY_* spelling, same values, and the
+    // known/unknown gating applies to both spellings together.
+    #[test]
+    fn append_me_env_emits_both_spellings() {
+        let got = append_me_env(vec!["A=1".to_string()], "INF-42", 7);
+        for want in [
+            "SYMPHONY_ISSUE=INF-42",
+            "RHAPSODY_ISSUE=INF-42",
+            "SYMPHONY_RUN_ID=7",
+            "RHAPSODY_RUN_ID=7",
+        ] {
+            assert!(got.contains(&want.to_string()), "{want} missing: {got:?}");
+        }
+        // A run id without an issue adds only the run-id pair (and vice versa).
+        let run_only = append_me_env(vec![], "", 7);
+        assert_eq!(
+            run_only,
+            vec![
+                "SYMPHONY_RUN_ID=7".to_string(),
+                "RHAPSODY_RUN_ID=7".to_string()
+            ]
+        );
+        let issue_only = append_me_env(vec![], "INF-42", 0);
+        assert_eq!(
+            issue_only,
+            vec![
+                "SYMPHONY_ISSUE=INF-42".to_string(),
+                "RHAPSODY_ISSUE=INF-42".to_string()
+            ]
         );
     }
 }
