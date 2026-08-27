@@ -7,6 +7,9 @@
 //! protocol error), so the model can see it and self-correct — daemon down ⇒ a clear
 //! `daemon_unreachable`. The opt-in write tools (`symphony_send_message` / `_stop` / `_resume`) are
 //! registered by a later phase (M2); this phase is read-only.
+//!
+//! STUDIO-603: every registered tool is ALSO listed under a `rhapsody_*` alias of the same handler
+//! ([`register_brand_aliases`]) — additively, so both spellings work and nothing is removed.
 
 use crate::client::{Client, FacadeError};
 use chrono::{DateTime, Utc};
@@ -79,6 +82,10 @@ impl Facade {
         if !cfg.mcp.allow_handoff {
             tool_router.remove_route("symphony_handoff");
         }
+        // STUDIO-603: register the `rhapsody_*` aliases LAST — after the gating removals above — so
+        // a disabled write tool has no alias either and the gate cannot be walked around by
+        // spelling the tool the other way. See [`register_brand_aliases`].
+        register_brand_aliases(&mut tool_router);
         Self {
             client,
             opts,
@@ -359,6 +366,51 @@ fn hex_upper(nibble: u8) -> char {
         .to_ascii_uppercase()
 }
 
+// --- brand aliases (STUDIO-603) ---------------------------------------------------------------
+
+/// The tool-name prefix every agent-facing tool has carried since the Go daemon. Still registered,
+/// still listed, still callable — this ticket removes nothing.
+pub const TOOL_PREFIX_SYMPHONY: &str = "symphony_";
+
+/// The tool-name prefix Rhapsody ships under, registered ADDITIVELY alongside
+/// [`TOOL_PREFIX_SYMPHONY`] so a prompt can name either spelling (STUDIO-603).
+pub const TOOL_PREFIX_RHAPSODY: &str = "rhapsody_";
+
+/// Registers a `rhapsody_*` alias for every `symphony_*` tool currently in `router`.
+///
+/// The alias CLONES the route, so it shares the original's handler `Arc` and input schema outright
+/// — one implementation, two names, and the alias cannot drift from the tool it aliases. Only the
+/// name and description differ; dispatch is by map key and the generated handlers never read their
+/// own name, so an aliased call behaves identically.
+///
+/// Call this LAST, after any gating `remove_route`: aliases are derived from what actually survived,
+/// so a disabled write tool gets no alias and its gate cannot be walked around by spelling the tool
+/// the other way. A pre-existing `rhapsody_*` route (there is none today) would be left untouched
+/// rather than clobbered.
+fn register_brand_aliases(router: &mut ToolRouter<Facade>) {
+    let aliases: Vec<_> = router
+        .map
+        .iter()
+        .filter_map(|(name, route)| {
+            let suffix = name.strip_prefix(TOOL_PREFIX_SYMPHONY)?;
+            let alias_name = format!("{TOOL_PREFIX_RHAPSODY}{suffix}");
+            if router.map.contains_key(alias_name.as_str()) {
+                return None;
+            }
+            let mut alias = route.clone();
+            // A short description keeps the doubled tool list cheap in the agent's context; the
+            // authoritative wording stays on the tool being aliased.
+            alias.attr.description =
+                Some(format!("Alias of `{name}` — identical behaviour.").into());
+            alias.attr.name = alias_name.into();
+            Some(alias)
+        })
+        .collect();
+    for alias in aliases {
+        router.add_route(alias);
+    }
+}
+
 // --- tool argument structs (server.go's `*Args`) ----------------------------------------------
 // Every field is optional (Go `,omitempty`): `#[serde(default)]` so an empty `{}` deserializes.
 
@@ -487,6 +539,62 @@ mod tests {
                 "read tool {want:?} not registered: {names:?}"
             );
         }
+        let _ = client.cancel().await;
+    }
+
+    // STUDIO-603: every registered `symphony_*` tool is ALSO listed under its `rhapsody_*` alias,
+    // and nothing is removed — the two name sets are exactly parallel.
+    #[tokio::test]
+    async fn brand_aliases_mirror_every_tool() {
+        let facade = Facade::new(&test_config(), Client::for_port(0), Options::default());
+        let client = connect(facade).await;
+        let tools = client.list_all_tools().await.expect("list tools");
+        let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+
+        let symphony: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with(TOOL_PREFIX_SYMPHONY))
+            .collect();
+        assert!(
+            !symphony.is_empty(),
+            "no symphony_* tools registered at all: {names:?}"
+        );
+        for n in &symphony {
+            let alias = n.replacen(TOOL_PREFIX_SYMPHONY, TOOL_PREFIX_RHAPSODY, 1);
+            assert!(
+                names.contains(&alias),
+                "{n} has no {alias} alias: {names:?}"
+            );
+        }
+        // Exactly parallel: no orphan alias without an original.
+        let rhapsody: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with(TOOL_PREFIX_RHAPSODY))
+            .collect();
+        assert_eq!(
+            symphony.len(),
+            rhapsody.len(),
+            "alias set must mirror the original set exactly: {names:?}"
+        );
+        let _ = client.cancel().await;
+    }
+
+    // An aliased call reaches the SAME handler as the tool it aliases — the alias shares the
+    // original's handler Arc, so it cannot diverge.
+    #[tokio::test]
+    async fn alias_call_hits_the_same_handler() {
+        let facade = Facade::new(&test_config(), Client::for_port(0), Options::default());
+        let client = connect(facade).await;
+        let via_symphony = client
+            .call_tool(call("symphony_state"))
+            .await
+            .expect("call symphony_state");
+        let via_rhapsody = client
+            .call_tool(call("rhapsody_state"))
+            .await
+            .expect("call rhapsody_state");
+        assert_eq!(via_symphony.is_error, via_rhapsody.is_error);
+        assert_eq!(result_text(&via_symphony), result_text(&via_rhapsody));
         let _ = client.cancel().await;
     }
 
