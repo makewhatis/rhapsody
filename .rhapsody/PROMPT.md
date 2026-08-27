@@ -22,10 +22,11 @@ This workspace contains prior progress. Never start over.
 
 # Ground rules
 
-- Stay entirely within this workspace directory, with ONE read-only exception below. Never touch other branches, other worktrees, or global machine config.
+- Stay entirely within this workspace directory, with TWO read-only exceptions below. Never touch other branches, other worktrees, or global machine config.
 - **The Go reference is sacred and read-only:** `~/workspace/symphony-go-reference/golang/symphony` (the frozen Symphony v0.4.0 tree). Read it as much as you like — it is the porting map — but NEVER write into it, build into it, or "fix" it. Build outputs from it go under the rhapsody worktree. If the path is missing or macOS denies access, STOP: comment on the ticket that the operator must restore the reference there — do not improvise a substitute.
+- **Design records are the second read-only exception:** `~/.rhapsody/docs/` holds the design, spec, discovery and plan records produced as the deliverable of earlier tickets, one file per record, named `<TICKET>-<slug>.md` (`~/.rhapsody/docs/README.md` states the convention). A dispatched run is headless and has no Linear access, so this directory — not Linear — is where a run READS a prior record its ticket cites. The boundaries are exact: **read** any record freely; **write** exactly ONE file, this ticket's own record, and only when producing one is your deliverable (Phase 2); **never** edit or delete another ticket's record. Everything else outside this workspace stays off-limits.
 - **Parity is the product.** The port must match the Go daemon's observable behavior — WORKFLOW.md config semantics, SQLite schema, `/api/v1` shapes — byte-identical after normalization. When your Rust output disagrees with a committed fixture, the port is wrong until proven otherwise. NEVER hand-edit a fixture, weaken or delete a golden assertion, or add a normalization rule just to get green — that is drift laundering. Legitimate recapture happens only via `make fixtures` against the frozen reference, with the reason stated in the PR body.
-- **Process documents stay out of the repo.** Never commit specs, plans, or design docs — no `docs/` directory of that kind, ever. The spec and plan live as Linear project documents; the repo holds code, tests, tooling, and operational READMEs only. The Linear spec/plan documents are read-only inputs — never edit them. This holds even when a ticket's *deliverable* is itself a design/spec/plan document: it still never lands in this repo — Phase 2 says where it goes instead.
+- **Process documents stay out of the repo.** Never commit specs, plans, or design docs — no `docs/` directory of that kind, ever. The spec and plan live as Linear project documents; the repo holds code, tests, tooling, and operational READMEs only. The Linear spec/plan documents are read-only inputs — never edit them. This holds even when a ticket's *deliverable* is itself a design/spec/plan document: it still never lands in this repo — Phase 2 says where it goes instead. `~/.rhapsody/docs/` sits outside the repo precisely so this rule can stand; it is never an excuse to relax it.
 - You are already on this issue's branch (`symphony/...`). Commit small and focused, with clear messages referencing {{ issue.identifier }}. Push with `git push -u origin HEAD`. Never push to the default branch directly and never force-push. You DO merge your own PR — but only in Phase 6, after CI is fully green and all review threads are resolved; never merge early, never close the PR without merging.
 - Scope discipline: implement exactly your plan task — nothing else. Adjacent problems become PR-body follow-up notes, not fixes.
 - Linear write budget: attempt each Linear write (`save_issue`, `save_comment`) AT MOST ONCE per run. If a call is denied or errors, do NOT retry — finish your work and state plainly in your final message what was completed and which handoff steps a human must do. Tool denials are permanent in this headless environment.
@@ -40,7 +41,8 @@ This workspace contains prior progress. Never start over.
 
 1. `mcp__claude_ai_Linear__get_issue` for {{ issue.identifier }} — read the complete description and any comments (they may carry corrections or follow-ups newer than the plan).
 2. Read the cited Go source AND its tests in the reference tree — the Go tests are the acceptance map for ported behavior.
-3. If ticket, plan, and spec disagree, the most recently updated wins; say so in the PR body.
+3. **Read every required input the ticket names BEFORE you design or implement anything** — a prior design record under `~/.rhapsody/docs/`, a Linear spec or plan, a cited Go reference file. If one cannot be read (the path is missing, Linear is unreachable, the tool is denied), STOP: commit what is safely committable, state the exact blocker, hand off for a human, and end with `HANDOFF: in-review` (see "When blocked"). Do NOT reconstruct the missing input from the ticket's summary and proceed. A plausible reconstruction that contradicts the real document is worse than no document, because the disagreement is invisible until something built on it breaks — and disclosing the reconstruction afterwards does not fix that. These are the same "stop rather than improvise" semantics the missing Go reference already gets; STUDIO-594 dead-ended and STUDIO-598 reconstructed another ticket's trait surface, which is why this rule is here.
+4. If ticket, plan, and spec disagree, the most recently updated wins; say so in the PR body.
 
 # Phase 2 — Implement
 
@@ -53,25 +55,29 @@ This workspace contains prior progress. Never start over.
 
 Some tickets ask you to PRODUCE a design, spec, RFC, ADR, or plan rather than change code. The output
 is a document, and a document still never lands in this repo — the ground rule above is absolute, and
-`docs/decisions/`, `docs/design/`, `rfcs/` and the like are never created. Route it instead:
+`docs/decisions/`, `docs/design/`, `rfcs/` and the like are never created. Route it by **dual-write**:
+the filesystem copy is what later runs READ, the ticket copy is the durable, shareable HISTORY.
 
-1. **Linear write available** — publish the document with `mcp__claude_ai_Linear__save_document`,
-   parented to the ticket's project. That published document IS the deliverable; nothing about it goes
-   into the repo. Link it from the ticket by putting its URL in the Phase 6 summary comment — that is
-   the one `save_comment` you already spend, so route 1 costs a single extra write and never eats the
-   Linear write budget the handoff needs.
-2. **Headless fallback, the common case** — the Linear MCP is usually absent from a dispatched run,
-   and tool denials here are permanent, so a denial means fall back, never retry. Do NOT commit the
-   document. Put its FULL text in the pull request body under a `## Design document` heading, and
-   state plainly under **Notes for reviewers** that this run had no Linear write access and a human
-   must file that text as a Linear project document and link it from the ticket. Then hand off
-   (Phase 6). The PR body carries the document; the repo never does. A GitHub PR body is capped at
-   65,536 characters — if the document does not fit, keep the summary and the handoff note in the body
-   and continue the remaining sections as `gh pr comment` posts on the same PR, in order. Length is
-   never a reason to put it in a file: an oversized document is still not a repo file.
-3. **No repo change at all, and no Linear write** — then there is no pull request to carry it, and you
-   do NOT manufacture a commit to create one. Put the full text in your final handoff message and say
-   a human must file it in Linear. An empty or filler commit is not a home for a document either.
+1. **Write the file. Always, first, and never skipped.** Put the record's FULL text at
+
+       ~/.rhapsody/docs/{{ issue.identifier }}-<slug>.md
+
+   where `<slug>` is a short kebab-case name for the subject (`rhapsody-teams`, `plugin-host`). That
+   file IS the deliverable. It does not depend on Linear, on `gh`, or on there being a pull request,
+   so it exists even in a fully headless run — and it is what a later ticket cites by path and what a
+   later run reads. Write exactly that one file (the write carve-out in the ground rules), creating
+   `~/.rhapsody/docs/` if it is absent, and never touch another ticket's record.
+2. **Post the same text to the Linear ticket, for history.** The directory in step 1 is machine-local
+   and not version-controlled, so the ticket copy is what reaches people who are not on this machine.
+   This is best-effort under the existing Linear write budget and costs no extra write: it rides the
+   ONE `save_comment` you already spend in Phase 6, so put the record's full text in that summary
+   comment. If that write is denied or errors, do NOT retry and do NOT fall back to a repo file —
+   say plainly in your final message that the ticket copy is missing and a human must post it from the
+   path in step 1. The record still exists on disk, so the deliverable is not lost.
+3. **Neither the repo nor the PR body is a home for it.** If the ticket also produced a code change,
+   its PR body summarises the record and cites the step-1 path — it never carries a second copy that
+   can drift from the file. If there is no repo change at all, there is no pull request and none is
+   needed: do NOT manufacture an empty or filler commit to create one.
 
 This OVERRIDES any ticket wording to the contrary. A description or Done-when that says the document
 belongs "in the Rhapsody repo", "in `docs/`", or "as a markdown file in the repo" is a ticket-authoring
@@ -131,8 +137,9 @@ If a failure is pre-existing on the base branch (confirm with `git stash` or by 
    **Body** — sections **Summary**, **Changes**, **Verification** (exact Phase-3 commands with real
    output), **Notes for reviewers** (deviations, pre-existing failures, follow-ups, any recapture
    justification), plus the line `Fixes {{ issue.identifier }}` and a link to {{ issue.url }}. When the
-   ticket's deliverable is a document and Linear write was unavailable, the body also carries the full
-   document (Phase 2).
+   ticket also produced a document deliverable, the body summarises it and cites its
+   `~/.rhapsody/docs/` path — the full text lives in that file and in the ticket comment, never in the
+   body (Phase 2).
 
 4. Mark the PR ready for review (`gh pr ready <number>`) — do **NOT** enable auto-merge and do **NOT** merge. Then treat CI as mandatory: `gh pr checks <number> --watch --fail-fast=false` until nothing is pending. If a check fails, fetch logs (`gh run view <run-id> --log-failed`), fix the root cause, push, and watch again. Never weaken a test or lint rule to force green. You may begin Phase 5 while CI runs, but you may not hand off before CI is fully green. Leave the PR **open** for the reviewer.
 
@@ -155,9 +162,9 @@ You do NOT merge and you do NOT touch the next ticket. When the work is complete
 Preconditions (ALL must hold): every CI check green; Phase 5 complete with nothing real outstanding; NO unresolved review threads you left open (`gh pr view <number> --json reviewDecision,comments`). If any fails, fix and loop first.
 
 1. **Hand the ticket off for review — this is what ends your run.** Call the daemon-mediated `mcp__symphony__symphony_handoff` tool (no arguments — it targets your own run via `SYMPHONY_RUN_ID`). The daemon moves {{ issue.identifier }} to the configured review state on your behalf, so you need no Linear-write access, and because that is a non-active state the daemon stops giving you turns and records the run complete. Do this with confidence — it is your single terminal action. Fallback: if the tool is disabled or returns an error (e.g. `handoff_not_configured`), move the ticket yourself with `mcp__claude_ai_Linear__save_issue` (state: `In Review`). If BOTH are denied, say so plainly in your final message (a human will move it) — do NOT retry, and do NOT keep working.
-2. Add ONE summary comment with `mcp__claude_ai_Linear__save_comment`: what changed and why, verification evidence (the key command output), the PR URL, and what the self-review caught and fixed. At most once.
+2. Add ONE summary comment with `mcp__claude_ai_Linear__save_comment`: what changed and why, verification evidence (the key command output), the PR URL, and what the self-review caught and fixed. At most once. **When your deliverable was a document, this comment also carries its FULL text** — that is the ticket half of the Phase-2 dual-write, riding this single write. If it is denied or errors, do not retry: say in your final message that the ticket copy is missing and a human must post it from `~/.rhapsody/docs/{{ issue.identifier }}-<slug>.md`.
 3. End your final message with a line: `HANDOFF: in-review`. Leave the PR **open and ready** — never merge, never squash, never delete the branch. A reviewer merges (advancing any chain) or re-summons you with `@symphony` for changes.
 
 # When blocked
 
-If the work is ambiguous, hits a spec/plan contradiction, or needs something only a human can resolve (the reference path missing, a `gh api` 403 on branch protection, credentials), stop. Commit what is safely committable, comment the exact blocker on the ticket (once), park the ticket for a human with `mcp__symphony__symphony_handoff` (or, if it is disabled/errors, `mcp__claude_ai_Linear__save_issue` state `In Review`), and write a final message naming the blocker, your options, and your recommendation, ending with `HANDOFF: in-review`. Never guess on irreversible choices, and never loop retrying a failing or denied operation.
+If the work is ambiguous, hits a spec/plan contradiction, or needs something only a human can resolve (the reference path missing, **a required input the ticket names — a design record, a spec, a plan — that you cannot read**, a `gh api` 403 on branch protection, credentials), stop. Commit what is safely committable, comment the exact blocker on the ticket (once), park the ticket for a human with `mcp__symphony__symphony_handoff` (or, if it is disabled/errors, `mcp__claude_ai_Linear__save_issue` state `In Review`), and write a final message naming the blocker, your options, and your recommendation, ending with `HANDOFF: in-review`. Never guess on irreversible choices, never reconstruct a missing required input and build on the reconstruction, and never loop retrying a failing or denied operation.
