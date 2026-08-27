@@ -62,7 +62,7 @@ absent "the workspace rule no longer claims a single read-only exception" \
 present "the workspace rule counts TWO read-only exceptions" \
         'TWO read-only exceptions'
 present "the docs directory is named as the second read-only exception" \
-        '(second read-only exception|read-only exception).*~/\.rhapsody/docs/|~/\.rhapsody/docs/.*read-only exception'
+        'read-only exception.*~/\.rhapsody/docs/|~/\.rhapsody/docs/.*read-only exception'
 
 # --- the write carve-out is exactly one file, this ticket's own -------------------------------------
 present_i "the run may write exactly ONE file in that directory" \
@@ -75,8 +75,14 @@ present "a produced record is routed to ~/.rhapsody/docs/<TICKET>-<slug>.md" \
         '~/\.rhapsody/docs/\{\{ *issue\.identifier *\}\}-<slug>\.md'
 present_i "the routing is described as a dual-write (filesystem + ticket)" \
           'dual-write'
-present_i "the ticket copy rides the single Phase-6 save_comment" \
-          'save_comment'
+# NOT a bare `save_comment` grep: that token already appears in the ground rules' write budget and in
+# Phase 6 step 2 regardless of this change, so it would stay green with the ticket half of the
+# dual-write deleted. Same for a bare `dual-write`, which the Phase-2 intro also says. Pin the
+# instruction and the property that makes it affordable — that it costs no second Linear write.
+present_i "the record's ticket copy is posted to Linear for history" \
+          'Post the same text to the Linear ticket'
+present_i "the ticket copy costs no extra Linear write" \
+          'costs no extra write'
 
 # The deliverable must no longer DEPEND on a Linear write or on a pull request existing. Both of the
 # superseded routes are pinned as absent: publishing the document as a Linear document, and carrying
@@ -84,7 +90,7 @@ present_i "the ticket copy rides the single Phase-6 save_comment" \
 absent "the deliverable no longer depends on publishing a Linear document" \
        'save_document'
 absent "the deliverable no longer lives in the pull request body" \
-       'full text in the pull request body'
+       '(full|whole|entire) (text|document).*in the pull request body|document.{0,20}under a .## Design document'
 
 # --- a required input that cannot be read stops the run ---------------------------------------------
 # Two distinct places, checked separately on purpose: Phase 1 has to MANDATE the read, and "When
@@ -107,7 +113,7 @@ present_i "building on a reconstruction is forbidden in the blocked path too" \
 present "specs, plans and design docs still never get committed" \
         'Never commit specs, plans, or design docs'
 present_i "the docs directory is explicitly not a licence to relax that rule" \
-          '~/\.rhapsody/docs/. sits outside the repo'
+          'sits outside the repo precisely so this rule can stand'
 
 # The rule, enforced against the repo itself rather than only asserted in prose: no process-document
 # directory is tracked. (`docs/` under a component — desktop/, harness/ — is that component's
