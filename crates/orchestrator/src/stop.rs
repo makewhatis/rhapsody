@@ -77,6 +77,11 @@ pub struct ResumePlan {
 #[derive(Clone)]
 pub struct ControlHandle {
     pub(crate) events: tokio::sync::mpsc::UnboundedSender<crate::control_loop::Event>,
+    /// The read side of the orchestrator's published-snapshot cell (STUDIO-551). Read by
+    /// [`ControlHandle::snapshot`] with no control-channel round-trip, so `GET /api/v1/state` is
+    /// never queued behind a network-bound tick. A `watch::Receiver` is cheap to clone and to read.
+    pub(crate) snapshot_pub:
+        tokio::sync::watch::Receiver<Option<std::sync::Arc<crate::snapshot::Snapshot>>>,
     pub(crate) ctx: crate::control_loop::CancelWait,
     /// The top-level effective tracker snapshotted at [`Orchestrator::control`] time (Go reads
     /// `o.eff.tracker` off-loop; the Rust snapshot avoids aliasing the loop-owned `o.eff`). `None`
@@ -108,6 +113,7 @@ impl crate::orchestrator::Orchestrator {
     pub fn control(&self) -> ControlHandle {
         ControlHandle {
             events: self.events.clone(),
+            snapshot_pub: self.snapshot_pub.subscribe(),
             ctx: self.ctx.clone().unwrap_or_default(),
             tracker: self.eff.as_ref().map(|e| std::sync::Arc::clone(&e.tracker)),
             store: std::sync::Arc::clone(&self.store),

@@ -100,6 +100,12 @@ pub struct Fake {
 
     /// When set, overrides `fetch_issue_states_by_ids`. Takes precedence over `by_id`/`by_id_err`.
     pub states_by_ids_func: Option<StatesByIdsFn>,
+    /// When set, `fetch_issue_states_by_ids` AWAITS this gate (until it carries `true`) before it
+    /// produces a result — an async stand-in for a slow Linear round-trip. It suspends the CALLING
+    /// FUTURE rather than blocking its thread, which is what an in-flight network call really does,
+    /// so a test can park the orchestrator's control task inside `reconcile` and observe what the
+    /// rest of the daemon can still answer while it is stalled (STUDIO-551).
+    pub states_by_ids_gate: Option<tokio::sync::watch::Receiver<bool>>,
 
     /// `viewer` / `projects` back the INF-224 read surfaces (`resolve_viewer` / `list_projects`);
     /// the `*_err` fields, when set, are returned instead.
@@ -262,6 +268,16 @@ impl Tracker for Fake {
         self.lock().by_id_calls += 1;
         if ids.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(gate) = &self.states_by_ids_gate {
+            let mut gate = gate.clone();
+            // `borrow()`'s guard is dropped before each `await`; a dropped sender (`Err`) opens the
+            // gate rather than parking forever, so a test that forgets to release cannot wedge.
+            while !*gate.borrow() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
         }
         if let Some(func) = &self.states_by_ids_func {
             return func(ids);
