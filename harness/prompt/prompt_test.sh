@@ -85,10 +85,12 @@ present_i "the routing is described as a dual-write (filesystem + ticket)" \
 # NOT a bare `save_comment` grep: that token already appears in the ground rules' write budget and in
 # Phase 6 step 2 regardless of this change, so it would stay green with the ticket half of the
 # dual-write deleted. Same for a bare `dual-write`, which the Phase-2 intro also says. Pin the
-# instruction and the property that makes it affordable — that it costs no second Linear write.
+# instruction, plus the property that keeps the SMALL-record case affordable. That property is now
+# branch-specific, not universal — a large record deliberately pays a second Linear write for its
+# document — so the check names the branch it pins rather than overstating its subject.
 present_i "the ticket always gets a copy of the record, for history" \
           'Give the ticket a copy, sized to the record'
-present_i "the ticket copy costs no extra Linear write" \
+present_i "an inlined ticket copy costs no extra Linear write" \
           'costs no extra write'
 
 # --- the deliverable never DEPENDS on a Linear write (STUDIO-600) ---------------------------------
@@ -128,6 +130,12 @@ present "a large record's full text is published as a Linear document" \
         'mcp__claude_ai_Linear__save_document`, parented to the ticket'
 present "save_document is the history container and never the deliverable" \
         '`save_document` is the HISTORY container and never the deliverable'
+
+# A large record takes TWO Linear writes, which fail independently. Dropping the summary comment
+# because the DOCUMENT write failed would strand the path citation and leave the worst case strictly
+# worse than the single-write route this replaced, so the comment is unconditional.
+present_i "a failed save_document still posts the summary comment carrying the path" \
+          'still post the summary comment'
 
 # The PR body stays dead as a home for the document (unchanged from STUDIO-599).
 absent "the deliverable no longer lives in the pull request body" \

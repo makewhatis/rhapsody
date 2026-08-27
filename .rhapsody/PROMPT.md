@@ -84,10 +84,17 @@ the filesystem copy is what later runs READ, the ticket copy is the durable, sha
      Here `save_document` is the HISTORY container and never the deliverable: the step-1 file is
      already on disk and did not wait for it.
 
-   Both routes are best-effort under the existing Linear write budget. If a write is denied or errors,
-   do NOT retry and do NOT fall back to a repo file — say plainly in your final message that the ticket
-   copy is missing and a human must post it from the path in step 1. The record still exists on disk,
-   so the deliverable is not lost.
+   Both routes are best-effort under the existing Linear write budget, and a denial never triggers a
+   retry or a fall back to a repo file. The two writes fail independently, so say which one failed:
+
+   * `save_document` denied or errored — **still post the summary comment**, which carries the path.
+     The ticket copy is not missing, only its full text: say in your final message that the ticket has
+     the summary and the path but not the full text, and a human must publish it from step 1's file.
+   * The `save_comment` itself denied or errored — then the ticket has no copy at all: say plainly in
+     your final message that the ticket copy is missing and a human must post it from the path in
+     step 1.
+
+   Either way the record still exists on disk, so the deliverable is not lost.
 3. **Neither the repo nor the PR body is a home for it.** If the ticket also produced a code change,
    its PR body summarises the record and cites the step-1 path — it never carries a second copy that
    can drift from the file. If there is no repo change at all, there is no pull request and none is
