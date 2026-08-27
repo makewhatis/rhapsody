@@ -137,31 +137,54 @@ fi
 # and it is cross-checked against the crate that actually builds a binary of that name.
 resolve_rs="$root/desktop/src-tauri/src/supervisor/resolve.rs"
 
-# The name the desktop app resolves the sidecar by.
-binary_name="$(sed -n 's/.*BINARY_NAME[^=]*= *"\([^"]*\)".*/\1/p' "$resolve_rs" 2>/dev/null | head -1)"
+# first_line <text> — the first line of a captured blob. Used instead of `| head -1` throughout this
+# section: the script runs under `set -euo pipefail`, where a `head` that closes the pipe early can
+# SIGPIPE its producer, and where a failing producer (a source file that moved) aborts the whole
+# script at the assignment — silently, before the check below can report WHY. Capture, then slice.
+first_line() { printf '%s' "${1%%$'\n'*}"; }
 
-# The binary each workspace crate builds: a `[[bin]]` name override if present, else the package name.
-# Exactly one crate must build `$binary_name`, or the sidecar the desktop app looks for is not built.
-crate_bin_name() {
-  awk '
+# The name the desktop app resolves the sidecar by.
+binary_name="$(first_line "$(sed -n 's/.*BINARY_NAME[^=]*= *"\([^"]*\)".*/\1/p' "$resolve_rs" 2>/dev/null || true)")"
+
+# crate_bin_names <manifest> <has-src-main> — every binary the crate can build, one per line.
+# NOT "the `[[bin]]` override, else the package name": with `autobins` (default on 2018+ editions) an
+# explicit `[[bin]]` does not replace the `src/main.rs` target, cargo builds BOTH. Treating an added
+# helper binary as having renamed the sidecar would turn this red on a change that broke nothing, and
+# a guard that cries wolf gets deleted — which would undo the whole point of this section. So it is a
+# membership test over the full set: every `[[bin]]` name, plus the package name when `src/main.rs`
+# exists and no `[[bin]]` has claimed that path (cargo's own suppression rule).
+crate_bin_names() {
+  awk -v has_main="$2" '
+    function val(  ) { return match($0, /"[^"]*"/) ? substr($0, RSTART + 1, RLENGTH - 2) : "" }
     /^[[:space:]]*\[/ { tbl=$1 }
-    (tbl=="[package]" || tbl=="[[bin]]") && /^[[:space:]]*name[[:space:]]*=/ {
-      if (!match($0, /"[^"]*"/)) next
-      v = substr($0, RSTART + 1, RLENGTH - 2)
-      if (tbl=="[[bin]]") { print v; exit }    # an override wins outright
-      pkg = v
+    tbl=="[package]" && /^[[:space:]]*name[[:space:]]*=/ { if (pkg == "") pkg = val() }
+    tbl=="[[bin]]"   && /^[[:space:]]*name[[:space:]]*=/ { v = val(); if (v != "") names[++n] = v }
+    tbl=="[[bin]]"   && /^[[:space:]]*path[[:space:]]*=/ { if (val() ~ /(^|\/)src\/main\.rs$/) main_claimed = 1 }
+    END {
+      for (i = 1; i <= n; i++) print names[i]
+      if (pkg != "" && has_main == "1" && !main_claimed) print pkg
     }
-    END { if (pkg != "") print pkg }
   ' "$1"
 }
 
+# Exactly one crate must build `$binary_name`, or the sidecar the desktop app looks for is not built
+# (none), or two crates disagree about who owns the name (more than one).
 producers=""
-for manifest in "$root"/crates/*/Cargo.toml; do
-  [ -f "$manifest" ] || continue
-  if [ "$(crate_bin_name "$manifest")" = "$binary_name" ] && [ -n "$binary_name" ]; then
-    producers="$producers $(basename "$(dirname "$manifest")")"
-  fi
-done
+if [ -n "$binary_name" ]; then
+  for manifest in "$root"/crates/*/Cargo.toml; do
+    [ -f "$manifest" ] || continue
+    crate_dir="$(dirname "$manifest")"
+    has_main=0; [ -f "$crate_dir/src/main.rs" ] && has_main=1
+    # Captured, then compared line by line — deliberately not `| grep -Fxq`, which exits on the first
+    # match and can SIGPIPE the awk feeding it; under `pipefail` that reads back as "no match".
+    while IFS= read -r bin_nm; do
+      if [ "$bin_nm" = "$binary_name" ]; then
+        producers="$producers $(basename "$crate_dir")"
+        break
+      fi
+    done <<<"$(crate_bin_names "$manifest" "$has_main" 2>/dev/null || true)"
+  done
+fi
 
 if [ -z "$binary_name" ]; then
   bad "the daemon binary name can be derived from $resolve_rs (no BINARY_NAME found — did it move?)"
@@ -177,7 +200,7 @@ fi
 # alongside it.
 stated_binary() {
   local desc="$1" extract="$2" stated
-  stated="$(sed -n "$extract" "$prompt" | head -1)"
+  stated="$(first_line "$(sed -n "$extract" "$prompt" 2>/dev/null || true)")"
   if [ -z "$stated" ]; then
     bad "$desc (the prompt no longer states it in the expected phrasing)"
   elif [ "$stated" != "$binary_name" ]; then
