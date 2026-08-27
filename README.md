@@ -62,6 +62,7 @@ OTLP collector. Affects the same config goldens as the path divergence above.
 **Out of scope (unchanged live wire contracts):** the `SYMPHONY_RUN_ID` / `SYMPHONY_ISSUE` (and
 sibling) agent env vars, the `symphony_*` MCP tool names, the `symphony/<key>` git branch prefix,
 and the `@symphony` summon token — all cross-process contracts that a path rebrand must not break.
+STUDIO-603 later ALIASED most of these (see below); none was removed.
 
 **Fixture policy:** the config goldens (`harness/fixtures/config/*.json` + `api/config.json`) encode
 the daemon's resolved DEFAULTS, which now diverge. `harness/capture/capture.sh` applies a documented,
@@ -69,6 +70,41 @@ idempotent `sed` (the two default strings above) to those files after capturing 
 so `make fixtures` re-derives the committed state deterministically. Every other golden — including
 the Go-written transcript paths in `api/history.json` + `db/go-daemon-rows.json` — stays a byte-exact
 record of Go's output, and the red-on-drift canary is unchanged.
+
+### Both brand spellings accepted on every contract (STUDIO-603)
+
+Every name that crosses a process boundary now accepts a `rhapsody` spelling **as well as** the
+`symphony` one. This is strictly additive — nothing was removed, and no existing config, hook, or
+prompt changes behavior. Deprecation and removal is a later ticket.
+
+| Contract | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| Agent "me" identity env | `SYMPHONY_ISSUE` / `SYMPHONY_RUN_ID` | **both**, plus `RHAPSODY_ISSUE` / `RHAPSODY_RUN_ID` |
+| Lifecycle-hook env | `SYMPHONY_REPO` / `_PROJECT` / `_ISSUE` | **both**, plus the `RHAPSODY_*` trio |
+| Agent-facing MCP tools | 11 × `symphony_*` | **both**, plus 11 × `rhapsody_*` aliases of the same handlers |
+| Summon token matching | the one configured token | the configured token; either brand token accepts **both** |
+
+The MCP aliases are derived from the router AFTER the `cfg.mcp` gating removals, so a disabled write
+tool has no alias either — the opt-in gate cannot be walked around by spelling the tool the other
+way. On the read side, `rhapsodyd mcp` resolves its "me" defaults from either prefix.
+
+The summon pair is symmetric and narrow: configuring **either** `@symphony` or `@rhapsody` accepts
+both, so the shipped default answers to the new name and no in-flight `@symphony` comment is missed.
+A token that is neither brand (e.g. `@bot`) is matched VERBATIM and is never expanded — an operator
+who narrowed the token did so precisely so the daemon would not answer to another bot's mentions.
+
+**Deliberately unchanged (still `symphony`, by decision):**
+
+- The merged MCP **server key** in `.symphony-mcp.json`, which determines the agent's tool namespace
+  (`mcp__symphony__*`). A second server entry would duplicate every tool; renaming the key would
+  break any prompt naming `mcp__symphony__symphony_handoff`, including `.rhapsody/PROMPT.md`. The
+  approach is proposed in the STUDIO-603 PR body rather than picked silently.
+- `summon_token` (`@symphony`) and `otel.service_name` (`symphony`) as **resolved `decode` defaults**
+  — both appear in the `api/config.json` + `config/*.json` goldens captured from the frozen Go
+  daemon, so they are frozen by PARITY, not merely by compatibility. What a NEW user receives is
+  fixed at the seed instead: the desktop onboarding writes `summon_token: '@rhapsody'` and
+  `service_name: rhapsody` explicitly into the initial WORKFLOW.md, and the summon matcher accepts
+  both spellings regardless of which default resolved.
 
 ### Rotating daemon file logs in `logging.dir` (TRA-267)
 
