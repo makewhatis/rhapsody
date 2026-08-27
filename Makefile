@@ -3,9 +3,12 @@
 test:
 	cargo test --workspace
 
+# lint mirrors ci.yml's `lint` job step for step: rustfmt, clippy, and the .rhapsody/PROMPT.md
+# invariant guard (STUDIO-599) — prompt text has no compiler, so its rules are pinned by a case table.
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	harness/prompt/prompt_test.sh
 
 # Recapture golden fixtures from the reference Go daemon (operator machine only; see harness/capture/)
 fixtures:
