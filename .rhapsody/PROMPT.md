@@ -29,7 +29,7 @@ This workspace contains prior progress. Never start over.
 - **Process documents stay out of the repo.** Never commit specs, plans, or design docs — no `docs/` directory of that kind, ever. The spec and plan live as Linear project documents; the repo holds code, tests, tooling, and operational READMEs only. The Linear spec/plan documents are read-only inputs — never edit them. This holds even when a ticket's *deliverable* is itself a design/spec/plan document: it still never lands in this repo — Phase 2 says where it goes instead. `~/.rhapsody/docs/` sits outside the repo precisely so this rule can stand; it is never an excuse to relax it.
 - You are already on this issue's branch (`symphony/...`). Commit small and focused, with clear messages referencing {{ issue.identifier }}. Push with `git push -u origin HEAD`. Never push to the default branch directly and never force-push. You DO merge your own PR — but only in Phase 6, after CI is fully green and all review threads are resolved; never merge early, never close the PR without merging.
 - Scope discipline: implement exactly your plan task — nothing else. Adjacent problems become PR-body follow-up notes, not fixes.
-- Linear write budget: attempt each Linear write (`save_issue`, `save_comment`) AT MOST ONCE per run. If a call is denied or errors, do NOT retry — finish your work and state plainly in your final message what was completed and which handoff steps a human must do. Tool denials are permanent in this headless environment.
+- Linear write budget: attempt each Linear write (`save_issue`, `save_comment`, `save_document`) AT MOST ONCE per run. If a call is denied or errors, do NOT retry — finish your work and state plainly in your final message what was completed and which handoff steps a human must do. Tool denials are permanent in this headless environment.
 - Evidence before claims: never state that tests pass without having just run them. Quote real command output in the PR body and handoff comment.
 
 # Phase 0 — Orient
@@ -67,13 +67,27 @@ the filesystem copy is what later runs READ, the ticket copy is the durable, sha
    so it exists even in a fully headless run — and it is what a later ticket cites by path and what a
    later run reads. Write exactly that one file (the write carve-out in the ground rules), creating
    `~/.rhapsody/docs/` if it is absent, and never touch another ticket's record.
-2. **Post the same text to the Linear ticket, for history.** The directory in step 1 is machine-local
-   and not version-controlled, so the ticket copy is what reaches people who are not on this machine.
-   This is best-effort under the existing Linear write budget and costs no extra write: it rides the
-   ONE `save_comment` you already spend in Phase 6, so put the record's full text in that summary
-   comment. If that write is denied or errors, do NOT retry and do NOT fall back to a repo file —
-   say plainly in your final message that the ticket copy is missing and a human must post it from the
-   path in step 1. The record still exists on disk, so the deliverable is not lost.
+2. **Give the ticket a copy, sized to the record.** The directory in step 1 is machine-local and not
+   version-controlled, so the ticket copy is what reaches people who are not on this machine. It is
+   HISTORY, never the deliverable: step 1 has already happened, and nothing in step 1 waits on it.
+   The ONE `save_comment` you already spend in Phase 6 always carries a summary of the record plus its
+   `~/.rhapsody/docs/` path — never a 50KB paste. Where the record's FULL text goes depends on size:
+
+   * **Under 10,000 characters** — inline the full text in that same summary comment. One write, done,
+     and the ticket copy costs no extra write.
+   * **10,000 characters or more** — publish the full text as a Linear document with
+     `mcp__claude_ai_Linear__save_document`, parented to the ticket's project, and put that document's
+     URL in the summary comment. Records really do run this large — the ones already in
+     `~/.rhapsody/docs/` reach past 50KB — a document-sized comment is unwieldy to read and to scroll
+     past on the ticket, and Linear documents no comment-size limit at all, so pasting one is a bet on
+     undocumented behaviour as well.
+     Here `save_document` is the HISTORY container and never the deliverable: the step-1 file is
+     already on disk and did not wait for it.
+
+   Both routes are best-effort under the existing Linear write budget. If a write is denied or errors,
+   do NOT retry and do NOT fall back to a repo file — say plainly in your final message that the ticket
+   copy is missing and a human must post it from the path in step 1. The record still exists on disk,
+   so the deliverable is not lost.
 3. **Neither the repo nor the PR body is a home for it.** If the ticket also produced a code change,
    its PR body summarises the record and cites the step-1 path — it never carries a second copy that
    can drift from the file. If there is no repo change at all, there is no pull request and none is
@@ -162,7 +176,7 @@ You do NOT merge and you do NOT touch the next ticket. When the work is complete
 Preconditions (ALL must hold): every CI check green; Phase 5 complete with nothing real outstanding; NO unresolved review threads you left open (`gh pr view <number> --json reviewDecision,comments`). If any fails, fix and loop first.
 
 1. **Hand the ticket off for review — this is what ends your run.** Call the daemon-mediated `mcp__symphony__symphony_handoff` tool (no arguments — it targets your own run via `SYMPHONY_RUN_ID`). The daemon moves {{ issue.identifier }} to the configured review state on your behalf, so you need no Linear-write access, and because that is a non-active state the daemon stops giving you turns and records the run complete. Do this with confidence — it is your single terminal action. Fallback: if the tool is disabled or returns an error (e.g. `handoff_not_configured`), move the ticket yourself with `mcp__claude_ai_Linear__save_issue` (state: `In Review`). If BOTH are denied, say so plainly in your final message (a human will move it) — do NOT retry, and do NOT keep working.
-2. Add ONE summary comment with `mcp__claude_ai_Linear__save_comment`: what changed and why, verification evidence (the key command output), the PR URL, and what the self-review caught and fixed. At most once. **When your deliverable was a document, this comment also carries its FULL text** — that is the ticket half of the Phase-2 dual-write, riding this single write. If it is denied or errors, do not retry: say in your final message that the ticket copy is missing and a human must post it from `~/.rhapsody/docs/{{ issue.identifier }}-<slug>.md`.
+2. Add ONE summary comment with `mcp__claude_ai_Linear__save_comment`: what changed and why, verification evidence (the key command output), the PR URL, and what the self-review caught and fixed. At most once. **When your deliverable was a document, this comment carries the ticket half of the Phase-2 dual-write**: always a summary plus the record's `~/.rhapsody/docs/{{ issue.identifier }}-<slug>.md` path, and then, by the size rule in Phase 2, either its full text inline (under 10,000 characters) or the URL of the Linear document you published for it. If a write is denied or errors, do not retry: say in your final message that the ticket copy is missing and a human must post it from that path.
 3. End your final message with a line: `HANDOFF: in-review`. Leave the PR **open and ready** — never merge, never squash, never delete the branch. A reviewer merges (advancing any chain) or re-summons you with `@symphony` for changes.
 
 # When blocked
