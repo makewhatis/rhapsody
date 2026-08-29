@@ -1,7 +1,7 @@
 # CLAUDE.md — crates/orchestrator
 
 Parity port of Go `internal/orchestrator` — one Go package split across 26 source files, all
-mutating a single `Orchestrator` struct. The Rust port mirrors that file split one-to-one (34
+mutating a single `Orchestrator` struct. The Rust port mirrors that file split one-to-one (35
 files under `src/`, one per Go source file plus a couple of Rust-only internal ports — see below);
 resist the urge to further decompose or merge modules; the file boundary IS the port boundary and
 every file's own top-of-file doc comment names its exact Go source. Read that comment first when
@@ -43,7 +43,7 @@ the `Orchestrator` struct itself. Concretely:
   try to hold a borrow of `self.eff` across an `.await` — follow the existing owned-locals pattern
   instead of fighting the borrow checker with `Arc<Mutex<..>>`.
 
-## Module groups (34 files)
+## Module groups (35 files)
 
 - **Core state**: `orchestrator.rs` (the `Orchestrator` struct + `RunningEntry`/`EventRecord`),
   `effective.rs` (`Config` → `Effective`/`ResolvedProject`, rebuilt+swapped on reload).
@@ -77,6 +77,14 @@ the `Orchestrator` struct itself. Concretely:
   `internal/obslog`; `internal/ghsummons` above is a third): `liveness.rs` and `obslog.rs`. These
   exist because the Go packages have no dedicated Rust crate and the orchestrator is their sole
   consumer — don't extract them into new crates without checking nothing else needs them first.
+- **Rhapsody Teams** (STUDIO-639…644; no Go counterpart — design record
+  `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`): `teams.rs` is the T3a dispatch router — a pure,
+  sync, zero-I/O `route()` called from `dispatch_issue`. `triage.rs` is the T3b **off-loop** triage
+  task: it holds no `Orchestrator`, sends no control event and takes no lock the control task takes,
+  which is exactly why the design puts the feature's one model turn there (§0.11.2 — a model call on
+  the dispatch path was the STUDIO-551 head-of-line class). Spawned at the composition root
+  (`rhapsodyd/run.rs`) beside the prune scheduler, and only for `manager.mode: labels+model`. It is
+  NOT a fourth state seam: it never touches orchestrator state at all.
 - **Cross-cutting constants**: `backoff.rs` (retry-cadence math), `telemetry_attrs.rs` (the
   bounded metric-label cardinality contract — project/model/outcome/reason only; never add an
   issue/run/session id here, that's a correctness bug, not a style nit).
