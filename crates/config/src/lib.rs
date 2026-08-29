@@ -15,6 +15,7 @@ pub mod decode;
 pub mod effective_json;
 pub mod encode;
 pub mod model;
+pub mod profiles;
 pub mod projects;
 pub mod prompt;
 pub mod resolve;
