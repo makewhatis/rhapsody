@@ -621,12 +621,14 @@ pub fn check_roster(teams: &Teams, dir: &Path) -> Vec<RosterIssue> {
 }
 
 /// Renders `resolved` as a self-contained profile file with `extends: none` —
-/// the text `rhapsodyd teams fork` materialises (§4).
+/// what `rhapsodyd teams fork` materialises (§4).
 ///
 /// Every front-matter key is emitted, including the empty ones, so the forked
 /// file is a complete document the user can edit rather than a fragment they
-/// have to remember the schema for.
-pub fn fork_text(resolved: &ResolvedProfile) -> Result<String, ProfileError> {
+/// have to remember the schema for. Returning a [`Definition`] lets the caller
+/// write it with [`workflow::save`], reusing the crate's atomic-write
+/// convention (temp file in the same dir, 0600, rename over).
+pub fn fork_definition(resolved: &ResolvedProfile) -> Definition {
     use serde_yaml_ng::Value;
     let mut config = YamlMap::new();
     config.insert(Value::from("extends"), Value::from("none"));
@@ -652,11 +654,16 @@ pub fn fork_text(resolved: &ResolvedProfile) -> Result<String, ProfileError> {
                 .collect(),
         ),
     );
-    let def = Definition {
+    Definition {
         config,
         prompt_template: resolved.prompt.clone(),
-    };
-    let bytes = workflow::marshal(&def).map_err(|e| ProfileError::Parse(e.to_string()))?;
+    }
+}
+
+/// [`fork_definition`] rendered to the file text it will be written as.
+pub fn fork_text(resolved: &ResolvedProfile) -> Result<String, ProfileError> {
+    let bytes = workflow::marshal(&fork_definition(resolved))
+        .map_err(|e| ProfileError::Parse(e.to_string()))?;
     String::from_utf8(bytes).map_err(|e| ProfileError::Parse(e.to_string()))
 }
 

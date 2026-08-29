@@ -121,6 +121,22 @@ pub fn resolve_teams_path(
     resolve_runtime_home_file(cfg, db_override, no_store, "teams.yaml")
 }
 
+/// Resolves the Rhapsody Teams PROFILES directory (`teams/profiles/`, STUDIO-642), colocated with
+/// the durable store beside `teams.yaml` (design record
+/// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §1's storage table). `None` (a disabled /
+/// in-memory store, or a failed config load) means there is nothing to anchor to.
+///
+/// Naming the directory does not create it: loading, resolving and `teams show` are strictly
+/// read-only, and a profiles directory that does not exist simply means every profile resolves to
+/// its built-in (§4). Only `rhapsodyd teams fork` ever creates it.
+pub fn resolve_profiles_dir(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, "teams").map(|d| d.join("profiles"))
+}
+
 /// The shared path decision behind [`resolve_capabilities_path`] and [`resolve_teams_path`]: `file`
 /// sits in the directory of the resolved on-disk store (`--db` override wins over `storage.path`),
 /// so a custom store location keeps its sidecar files alongside it and tests stay hermetic. `None`
@@ -433,6 +449,43 @@ mod tests {
         assert_eq!(resolve_teams_path(None, "", false), None); // failed load (cfg None)
         // Resolving only NAMES a path; that nothing ever creates it is proven at the real boundary by
         // `run::tests::run_seeds_capabilities_but_never_seeds_teams_yaml`, which boots the daemon.
+    }
+
+    /// The profiles directory sits BESIDE `teams.yaml` in the one runtime home
+    /// (STUDIO-642; design record §1's storage table), and resolving it only
+    /// names a path — nothing here creates it.
+    #[test]
+    fn resolve_profiles_dir_sits_beside_teams_yaml() {
+        let dir = TempDir::new();
+        let ws = dir.child("ws");
+        let wf = write_wf(&dir, &valid_wf(&ws));
+        let cfg = resolve(
+            decode(&workflow::load(&wf).expect("load")).expect("decode"),
+            &workflow_dir(&wf),
+        )
+        .expect("resolve");
+        let got = resolve_profiles_dir(Some(&cfg), "", false).expect("on-disk default → Some");
+        assert!(
+            got.ends_with(".rhapsody/teams/profiles"),
+            "default should be ~/.rhapsody/teams/profiles, got {}",
+            got.display()
+        );
+        let teams = resolve_teams_path(Some(&cfg), "", false).expect("teams.yaml → Some");
+        assert_eq!(
+            got.parent().and_then(|p| p.parent()),
+            teams.parent(),
+            "the profiles dir must live beside teams.yaml"
+        );
+        assert!(!got.exists(), "resolving must not create {}", got.display());
+        // --db override wins, and the same off/in-memory/no-config rules apply.
+        assert_eq!(
+            resolve_profiles_dir(None, "/tmp/somewhere/store.db", false).expect("--db → Some"),
+            PathBuf::from("/tmp/somewhere/teams/profiles")
+        );
+        assert_eq!(resolve_profiles_dir(Some(&cfg), "", true), None); // --no-store
+        assert_eq!(resolve_profiles_dir(None, "off", false), None);
+        assert_eq!(resolve_profiles_dir(None, ":memory:", false), None);
+        assert_eq!(resolve_profiles_dir(None, "", false), None);
     }
 
     // Mirrors Go `TestResolveBannerStorageVariants`.

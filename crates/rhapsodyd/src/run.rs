@@ -64,6 +64,15 @@ where
         return crate::mcp::run_mcp(ctx, &args[1..], stderr).await;
     }
 
+    // `rhapsodyd teams <show|fork> <name>` inspects and forks Rhapsody Teams profiles instead of
+    // running the daemon (STUDIO-642; design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`,
+    // §4). Dispatched here for the same reason `mcp` is: the daemon's run-lock and flag parsing stay
+    // untouched, and `rhapsodyd <workflow>` behaves identically. Rhapsody-only — Go v0.4.0 has no
+    // Teams feature and therefore no counterpart verb.
+    if args.first().map(String::as_str) == Some("teams") {
+        return crate::teams::run_teams(&args[1..], std::io::stdout(), stderr.make_writer());
+    }
+
     let flags = match parse_flags(args) {
         Ok(f) => f,
         Err(msg) => {
@@ -147,6 +156,7 @@ where
                 rhapsody_config::teams::Teams::disabled()
             }
         });
+        report_profile_issues(o.teams.as_ref(), &teams_path);
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
     // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
@@ -409,6 +419,50 @@ fn resolve_boot_otel(path: &Path) -> telemetry::Config {
 
 /// Loads + decodes + resolves the workflow config for the store-open path (`None` on any failure, so
 /// the store falls back to Noop and Run's reload reports the error).
+/// Reports what an operator needs to know about the roster's profiles at boot, in ONE warning line
+/// per category (STUDIO-642; design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §4):
+///
+///   * a roster entry naming a profile that does not resolve — the "broken agent discovered at
+///     dispatch time" §4 exists to prevent, reported here per T1's disable-loudly semantics;
+///   * a PINNED profile whose built-in has moved on. §4 is explicit that drift is **reported, never
+///     merged**: nothing here rewrites a user's file, and nothing silently upgrades a pin.
+///
+/// Read-only and never seeding: the profiles directory sits beside `teams.yaml`, and an absent one
+/// simply means every profile resolves to its built-in.
+fn report_profile_issues(teams: Option<&rhapsody_config::teams::Teams>, teams_path: &Path) {
+    let Some(teams) = teams.filter(|t| !t.roster.is_empty()) else {
+        return;
+    };
+    let Some(dir) = teams_path
+        .parent()
+        .map(|d| d.join("teams").join("profiles"))
+    else {
+        return;
+    };
+    let (mut broken, mut drifted) = (Vec::new(), Vec::new());
+    for issue in rhapsody_config::profiles::check_roster(teams, &dir) {
+        match issue {
+            i @ rhapsody_config::profiles::RosterIssue::Unresolvable { .. } => {
+                broken.push(i.to_string())
+            }
+            i @ rhapsody_config::profiles::RosterIssue::Drift { .. } => drifted.push(i.to_string()),
+        }
+    }
+    if !broken.is_empty() {
+        tracing::warn!(
+            profiles = %broken.join("; "),
+            dir = %dir.display(),
+            "teams roster names profiles that do not resolve; those identities have no prompt"
+        );
+    }
+    if !drifted.is_empty() {
+        tracing::warn!(
+            profiles = %drifted.join("; "),
+            "teams profiles are pinned behind their built-in; run `rhapsodyd teams show <name>` to see the resolved prompt (reported, never merged)"
+        );
+    }
+}
+
 fn load_resolved(path: &Path) -> Option<Config> {
     let def = workflow::load(path).ok()?;
     let cfg = decode(&def).ok()?;
@@ -716,6 +770,53 @@ mod tests {
         assert!(
             !dir.child("teams.yaml").exists(),
             "teams.yaml must NEVER be seeded: an absent file is Teams' off state and shipped state"
+        );
+    }
+
+    // STUDIO-642 (Teams T2), design §4: `rhapsodyd teams …` is dispatched at the very top of `run`,
+    // beside `mcp`, so it never reaches flag parsing or the run-lock. An unknown verb is the cheapest
+    // proof the branch was taken: it exits non-zero with the `symphony teams:` marker rather than
+    // treating "teams" as a workflow path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_dispatches_to_teams() {
+        let buf = SharedBuf::new();
+        let code = run_now(&["teams", "no-such-verb"], &buf).await;
+        assert_ne!(code, 0, "expected non-zero exit for an unknown teams verb");
+        assert!(
+            buf.contents().contains("symphony teams:"),
+            "stderr = {:?}, want the teams dispatch marker",
+            buf.contents()
+        );
+    }
+
+    // STUDIO-642, design §4's never-create-on-read rule: booting the daemon with a roster that names
+    // profiles resolves them (which is what produces the drift / unknown-profile warnings) and must
+    // still leave `teams/profiles/` absent. Only `rhapsodyd teams fork` ever creates it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_never_creates_the_profiles_dir() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n  - name: bob\n    profile: nosuch\n",
+        )
+        .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "a roster naming an unknown profile must not fail the boot; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            !dir.child("teams").exists(),
+            "resolving the roster's profiles must never create {}",
+            dir.child("teams").display()
         );
     }
 
