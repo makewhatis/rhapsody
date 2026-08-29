@@ -267,6 +267,17 @@ pub struct Orchestrator {
     /// [`dispatch_issue`](Orchestrator::dispatch_issue) renders the per-run capability section through it.
     pub capabilities_registry: Option<Vec<rhapsody_config::capabilities::CapabilityDef>>,
 
+    /// The Rhapsody Teams config loaded from `~/.rhapsody/teams.yaml` at daemon startup (STUDIO-639,
+    /// design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`). `None` when the daemon runs
+    /// without a durable on-disk home to anchor the file to (tests / storage disabled); otherwise the
+    /// loaded config, which is [`Teams::disabled`](rhapsody_config::teams::Teams::disabled) when the
+    /// file is absent (the shipped state, §2.1), malformed, or invalid.
+    ///
+    /// **Nothing reads this yet.** T1 carries the toggle and the roster inert; routing (T3a), triage
+    /// (T3b) and memory (T4) are the slices that consume it. Any future consumer must gate on
+    /// `.enabled` — `Some(..)` only means a file location existed, not that Teams is on.
+    pub teams: Option<rhapsody_config::teams::Teams>,
+
     /// Live workers, keyed by opaque issue id.
     pub running: HashMap<String, RunningEntry>,
     /// Issue ids currently claimed (dispatched or in a claim election), a set.
@@ -462,6 +473,7 @@ impl Orchestrator {
             spawn: None,
             eff: None,
             capabilities_registry: None,
+            teams: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),
