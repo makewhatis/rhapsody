@@ -318,8 +318,10 @@ where
     shutdown.cancel();
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
-    // The triage task is cancelled by the same signal; a cycle in flight finishes its current await
-    // and returns. Bounded, so a hung model turn cannot hold the daemon's shutdown open.
+    // The triage task is cancelled by the same signal, and checks it between model turns as well as
+    // between cycles. The wait is still BOUNDED: a turn already in flight can take up to
+    // `manager.timeout_ms`, and a shutdown must never be held open by one — `kill_on_drop` reaps the
+    // child when the runtime tears the task down.
     if let Some(t) = triage_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }

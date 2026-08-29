@@ -10,3 +10,8 @@ coverage/
 # only the .gitkeep anchor is, so rust-embed's #[folder = "web-dist/"] compiles on a clean checkout.
 /crates/httpapi/web-dist/*
 !/crates/httpapi/web-dist/.gitkeep
+# The claude backend writes this MCP server manifest into the run's working directory so the
+# dispatched agent can reach `rhapsodyd mcp`. It holds absolute, machine-local paths and is
+# regenerated per run, so it is never committed — a dispatched run working IN this repo would
+# otherwise sweep it up.
+/.symphony-mcp.json

@@ -89,6 +89,21 @@ const BYTES_PER_TOKEN: usize = 4;
 /// prompt the model can answer rather than an empty string.
 const MIN_PROMPT_BYTES: usize = 2048;
 
+/// The turn timeout used when `manager.timeout_ms` is absent or non-positive. It is §2.2's own
+/// default, restated here rather than imported because the point is the FALLBACK, not the schema:
+/// `timeout_ms: 0` would otherwise make `tokio::time::timeout` fire before the process could
+/// answer, silently turning `labels+model` into "triage never works" with only a warning per cycle.
+const FALLBACK_TIMEOUT_MS: u64 = 5000;
+
+/// `manager.timeout_ms` as a [`Duration`], with the non-positive fallback above applied.
+fn turn_timeout(timeout_ms: i64) -> Duration {
+    Duration::from_millis(if timeout_ms > 0 {
+        timeout_ms as u64
+    } else {
+        FALLBACK_TIMEOUT_MS
+    })
+}
+
 /// What the model is asked, and the bounds it is asked under (§2.2's `manager.model` /
 /// `max_tokens` / `timeout_ms`). Built fresh per turn by [`triage_cycle`].
 #[derive(Debug, Clone)]
@@ -236,7 +251,7 @@ where
         if ctx.is_cancelled() {
             return;
         }
-        let outcome = triage_cycle(&deps).await;
+        let outcome = triage_cycle(&ctx, &deps).await;
         if outcome.is_failure() {
             failures += 1;
             tracing::warn!(
@@ -255,7 +270,7 @@ where
 /// A failure stops the cycle rather than moving to the next ticket: whatever failed (the model, the
 /// tracker) is almost certainly still failing, and burning the rest of the backlog against it is
 /// the hot loop. The already-labelled tickets keep their labels; the rest are picked up next cycle.
-pub(crate) async fn triage_cycle<TF>(deps: &TriageDeps<TF>) -> CycleOutcome
+pub(crate) async fn triage_cycle<TF>(ctx: &CancelWait, deps: &TriageDeps<TF>) -> CycleOutcome
 where
     TF: Fn() -> Option<TriageTarget>,
 {
@@ -274,6 +289,26 @@ where
     if candidates.is_empty() {
         return CycleOutcome::Idle;
     }
+    // Without a team there is nothing to find-or-create the label in, so those tickets are dropped
+    // BEFORE the cap rather than inside the loop — otherwise a run of team-less tickets could eat a
+    // whole cycle's budget and starve the tickets behind them, cycle after cycle. One aggregated
+    // line per cycle, not one per ticket: the condition persists, so per-ticket lines would repeat
+    // forever in `/api/v1/logs`.
+    let (actionable, team_less): (Vec<&Issue>, Vec<&Issue>) =
+        candidates.into_iter().partition(|i| !i.team_id.is_empty());
+    if !team_less.is_empty() {
+        tracing::warn!(
+            count = team_less.len(),
+            issues = %team_less.iter().map(|i| i.identifier.as_str()).collect::<Vec<_>>().join(","),
+            "teams triage skipping tickets with no team id (the identity label cannot be resolved)"
+        );
+    }
+    // Every candidate was unactionable: skip the load read too rather than spend a Linear call on a
+    // cycle that cannot write anything.
+    if actionable.is_empty() {
+        return CycleOutcome::Idle;
+    }
+
     // Load is ADVISORY input to the turn, so a failed load read degrades to "everybody looks idle"
     // rather than failing the cycle — a triage decision without load counts is still much better
     // than no decision.
@@ -289,22 +324,17 @@ where
     };
 
     let mut labelled = 0usize;
-    for iss in candidates.into_iter().take(MAX_PER_CYCLE) {
-        // Without a team there is nothing to find-or-create the label in. Skipping keeps the ticket
-        // a candidate for a later pass rather than burning a model turn we could not act on.
-        if iss.team_id.is_empty() {
-            tracing::warn!(
-                issue = %iss.identifier,
-                "teams triage skipping a ticket with no team id (the label cannot be resolved)"
-            );
-            continue;
+    for iss in actionable.into_iter().take(MAX_PER_CYCLE) {
+        // A shutdown must not have to wait out a whole cycle of bounded model turns.
+        if ctx.is_cancelled() {
+            break;
         }
         let req = TriageRequest {
             command: deps.agent_command.clone(),
             billing_guard: deps.billing_guard,
             tracker_api_key: deps.tracker_api_key.clone(),
             model: deps.teams.manager.model.clone(),
-            timeout: Duration::from_millis(deps.teams.manager.timeout_ms.max(0) as u64),
+            timeout: turn_timeout(deps.teams.manager.timeout_ms),
             prompt: build_prompt(&deps.teams, iss, &load),
         };
         let decision = match deps.arbiter.arbitrate(&req).await {
@@ -521,10 +551,12 @@ impl TriageArbiter for ClaudeTriageArbiter {
 
         let mut cmd = tokio::process::Command::new(&name);
         cmd.args(&base_args);
-        cmd.arg("-p").arg(&req.prompt);
+        // `--model` goes BEFORE `-p <prompt>`: a flag trailing the prompt is at the mercy of the
+        // CLI's positional parsing, and a mis-parsed flag would fail every turn.
         if !req.model.is_empty() {
             cmd.arg("--model").arg(&req.model);
         }
+        cmd.arg("-p").arg(&req.prompt);
         cmd.env_clear();
         for kv in &env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -1000,7 +1032,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::Labelled(1));
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(1)
+        );
         let calls = tr.add_label_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].issue_id, "i1");
@@ -1026,7 +1061,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::Idle);
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Idle
+        );
         assert!(
             arbiter.prompts().is_empty(),
             "no candidates ⇒ no model turn"
@@ -1049,7 +1087,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::Idle);
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Idle
+        );
         assert!(
             tr.add_label_calls().is_empty(),
             "an unvalidated identity must never be written"
@@ -1078,7 +1119,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::ModelFailure);
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::ModelFailure
+        );
         assert_eq!(
             arbiter.prompts().len(),
             2,
@@ -1111,7 +1155,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::Labelled(2));
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(2)
+        );
         let prompts = arbiter.prompts();
         assert!(
             prompts[0].contains("- alice — profile: swe; skills: rust; open tickets: 0"),
@@ -1138,7 +1185,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::TrackerFailure);
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::TrackerFailure
+        );
         assert!(arbiter.prompts().is_empty());
     }
 
@@ -1158,7 +1208,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::Labelled(1));
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(1)
+        );
         assert!(arbiter.prompts()[0].contains("open tickets: 0"));
     }
 
@@ -1178,7 +1231,10 @@ mod tests {
             Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
         );
 
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::Labelled(1));
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(1)
+        );
         assert_eq!(
             arbiter.prompts().len(),
             1,
@@ -1207,8 +1263,79 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&d).await,
+            triage_cycle(&CancelWait::default(), &d).await,
             CycleOutcome::Labelled(MAX_PER_CYCLE)
+        );
+    }
+
+    // `timeout_ms: 0` must not silently turn `labels+model` into "triage never works": a zero
+    // Duration would make every turn time out before the process could answer.
+    #[test]
+    fn turn_timeout_falls_back_for_a_non_positive_value() {
+        assert_eq!(turn_timeout(1500), Duration::from_millis(1500));
+        assert_eq!(turn_timeout(0), Duration::from_millis(FALLBACK_TIMEOUT_MS));
+        assert_eq!(turn_timeout(-1), Duration::from_millis(FALLBACK_TIMEOUT_MS));
+    }
+
+    // The per-cycle cap counts tickets the pass can ACT on. Team-less tickets are dropped before the
+    // cap, so a run of them cannot eat a cycle's budget and starve the tickets behind them — which,
+    // repeated every cycle, would be a permanent starvation rather than a delay.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn team_less_tickets_do_not_consume_the_cycle_cap() {
+        let mut tr = Fake::new();
+        tr.candidates = (0..MAX_PER_CYCLE)
+            .map(|i| {
+                let mut iss = labelled(&format!("no-team-{i}"), &["rust"]);
+                iss.team_id = String::new();
+                iss
+            })
+            .chain([labelled("real-1", &["rust"]), labelled("real-2", &["rust"])])
+            .collect();
+        let tr = Arc::new(tr);
+        let arbiter =
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("alice")]);
+        let d = deps(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(2),
+            "both actionable tickets must be triaged despite {MAX_PER_CYCLE} team-less ones ahead of them"
+        );
+        assert_eq!(
+            tr.add_label_calls()
+                .iter()
+                .map(|c| c.issue_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["real-1".to_string(), "real-2".to_string()]
+        );
+    }
+
+    // A cancelled ctx stops the cycle at the next ticket boundary, so shutdown never has to wait out
+    // a whole cycle of bounded model turns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_ctx_stops_the_cycle() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rust"]), labelled("i2", &["rust"])];
+        let tr = Arc::new(tr);
+        let arbiter =
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("alice")]);
+        let d = deps(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+        let signal = crate::control_loop::CancelSignal::new();
+        let ctx = signal.wait();
+        signal.cancel();
+
+        assert_eq!(triage_cycle(&ctx, &d).await, CycleOutcome::Idle);
+        assert!(
+            arbiter.prompts().is_empty(),
+            "a cancelled ctx must spend no model turn"
         );
     }
 
@@ -1225,7 +1352,10 @@ mod tests {
             interval: Duration::from_millis(5),
             max_backoff_ms: 20,
         };
-        assert_eq!(triage_cycle(&d).await, CycleOutcome::Idle);
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Idle
+        );
     }
 
     // ── the schedule ────────────────────────────────────────────────────────────────────────────
