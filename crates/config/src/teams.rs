@@ -254,12 +254,15 @@ impl Teams {
     }
 
     /// Parses YAML into [`Teams`], applying the §2.2 defaults to absent keys.
-    /// A present-but-empty file (`""`, `{}`, `null`) is the fully-defaulted —
-    /// i.e. disabled — config rather than a parse error.
+    ///
+    /// Every field is `#[serde(default)]`, which covers three shapes an
+    /// operator's file actually takes: a key that is absent, a key written with
+    /// nothing under it (`manager:` — a null, which is what commenting out the
+    /// sub-keys leaves behind), and a wholly empty/`---`-only document. All
+    /// three are the fully-defaulted — i.e. disabled — config, not a parse
+    /// error. `parses_null_valued_blocks` and `empty_file_applies_schema_defaults`
+    /// pin that, since it is serde's behaviour rather than ours.
     fn parse(text: &str) -> Result<Self, TeamsError> {
-        if text.trim().is_empty() {
-            return Ok(Self::disabled());
-        }
         serde_yaml_ng::from_str(text).map_err(|e| TeamsError::Parse(e.to_string()))
     }
 
@@ -356,6 +359,28 @@ mod tests {
             assert_eq!(t.memory.recall_top_k, 8, "({text:?})");
             assert!(t.roster.is_empty(), "({text:?})");
             assert_eq!(t, Teams::disabled(), "({text:?})");
+        }
+    }
+
+    /// A key written with nothing under it — `manager:` with its sub-keys
+    /// commented out — is a YAML *null*, not an absent key, and is the shape an
+    /// operator's half-edited file actually takes. It must default, not fail:
+    /// `#[serde(default)]` covers it today, and this pins that so a serde /
+    /// serde_yaml_ng bump cannot quietly turn a plausible file into a parse
+    /// error that disables Teams.
+    #[test]
+    fn parses_null_valued_blocks() {
+        for text in [
+            "manager:\nmemory:\nroster:\n",
+            "enabled: true\nmanager:\n",
+            "enabled: true\nroster:\n",
+            "enabled: true\nmemory:\n",
+            "# every line commented out\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert_eq!(t.manager, Manager::default(), "({text:?})");
+            assert_eq!(t.memory, Memory::default(), "({text:?})");
+            assert!(t.roster.is_empty(), "({text:?})");
         }
     }
 
@@ -678,5 +703,25 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&t).expect("serialize");
         assert_eq!(Teams::parse(&yaml).expect("reparse"), t);
         t.validate().expect("the round-tripped value is valid");
+
+        // `labels+model` is the one enum value whose YAML scalar form is not
+        // obvious (the `+`), and `hindsight` the one backend a round-trip has
+        // not otherwise touched — so round-trip those too, and assert the wire
+        // spelling is the schema's, not serde's derived variant name.
+        let other = Teams {
+            manager: Manager {
+                mode: ManagerMode::LabelsModel,
+                ..Manager::default()
+            },
+            memory: Memory {
+                backend: MemoryBackend::Hindsight,
+                ..Memory::default()
+            },
+            ..Teams::disabled()
+        };
+        let yaml = serde_yaml_ng::to_string(&other).expect("serialize");
+        assert!(yaml.contains("labels+model"), "wire spelling: {yaml}");
+        assert!(yaml.contains("hindsight"), "wire spelling: {yaml}");
+        assert_eq!(Teams::parse(&yaml).expect("reparse"), other);
     }
 }

@@ -431,9 +431,8 @@ mod tests {
         assert_eq!(resolve_teams_path(None, "off", false), None);
         assert_eq!(resolve_teams_path(None, ":memory:", false), None);
         assert_eq!(resolve_teams_path(None, "", false), None); // failed load (cfg None)
-        // Resolving is pure: it must not have created the file it names.
-        assert!(!got.exists() || got.is_file());
-        assert!(!PathBuf::from("/tmp/somewhere/teams.yaml").exists());
+        // Resolving only NAMES a path; that nothing ever creates it is proven at the real boundary by
+        // `run::tests::run_seeds_capabilities_but_never_seeds_teams_yaml`, which boots the daemon.
     }
 
     // Mirrors Go `TestResolveBannerStorageVariants`.
