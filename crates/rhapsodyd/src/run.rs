@@ -31,7 +31,8 @@ use rhapsody_tracker as tracker;
 
 use crate::bootcfg::{
     assignee_label, banner_color_enabled, open_store, resolve_banner_data,
-    resolve_capabilities_path, resolve_server_port, resolve_teams_path, workflow_dir,
+    resolve_capabilities_path, resolve_profiles_dir, resolve_server_port, resolve_teams_path,
+    workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -142,8 +143,9 @@ where
     // Best-effort, and NEVER seeded: an absent file is the off state and the shipped state (§2.1), so
     // unlike the capabilities registry above this never creates the file it reads. A malformed or
     // invalid file yields `Teams::disabled()` plus ONE loud log line — never a startup failure. No
-    // on-disk store home (--no-store / off / :memory:) leaves the field `None`. Nothing downstream
-    // reads it yet: T1 carries the toggle and the roster inert.
+    // on-disk store home (--no-store / off / :memory:) leaves the field `None`. STUDIO-643 makes
+    // `dispatch_issue` its first consumer (routing); the profiles directory is resolved alongside so
+    // a routed identity's profile can be rendered into the turn-1 prompt.
     if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
         o.teams = Some(match rhapsody_config::teams::Teams::try_load(&teams_path) {
             Ok(t) => t,
@@ -156,7 +158,9 @@ where
                 rhapsody_config::teams::Teams::disabled()
             }
         });
+        o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
+        report_inert_manager(o.teams.as_ref());
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
     // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
@@ -459,6 +463,28 @@ fn report_profile_issues(teams: Option<&rhapsody_config::teams::Teams>, teams_pa
         tracing::warn!(
             profiles = %drifted.join("; "),
             "teams profiles are pinned behind their built-in; run `rhapsodyd teams show <name>` to see the resolved prompt (reported, never merged)"
+        );
+    }
+}
+
+/// §3.5's named startup warning: `enabled: true` with `manager.mode: off` and NO
+/// `default_identity` is "behaviour identical to `enabled: false`" — nothing routes and nothing is
+/// prepended. That is a real combination to reach by half-editing a file, and the design says it is
+/// "worth a startup warning rather than a silent no-op" (STUDIO-643; design record
+/// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §3.5).
+///
+/// `mode: off` WITH a `default_identity` is the opposite — single-identity Teams, "probably the right
+/// first thing to try" — so it is deliberately not warned about.
+fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    if teams.enabled
+        && teams.manager.mode == rhapsody_config::teams::ManagerMode::Off
+        && teams.manager.default_identity.is_empty()
+    {
+        tracing::warn!(
+            "teams is enabled but manager.mode is `off` with no manager.default_identity: nothing \
+             will route and no teammate section will be prepended, which is exactly the behaviour \
+             of `enabled: false`. Set manager.default_identity to run every ticket as one teammate."
         );
     }
 }

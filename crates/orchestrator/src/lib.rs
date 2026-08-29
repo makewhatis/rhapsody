@@ -61,6 +61,7 @@ pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;
 pub mod stop;
+pub mod teams;
 pub mod telemetry_attrs;
 pub mod warnings;
 pub mod worker;
