@@ -386,11 +386,15 @@ impl Orchestrator {
             .find(|i| i.name == identity)
             .map(|i| i.profile.clone())
             .unwrap_or_default();
-        // No profile named, or nowhere to resolve one from: the header alone.
-        // `teams_profiles_dir` is `None` only when the daemon has no on-disk
-        // runtime home, which is also the only way `self.teams` could have been
-        // set without one — in production the two are wired together.
-        let (Some(dir), false) = (self.teams_profiles_dir.as_ref(), profile.is_empty()) else {
+        // This identity names no profile: the header alone.
+        if profile.is_empty() {
+            return teammate_section(identity, "");
+        }
+        // Nowhere to resolve one from: the header alone. `teams_profiles_dir` is
+        // `None` only when the daemon has no on-disk runtime home, which is also
+        // the only way `self.teams` could have been set without one — in
+        // production the two are resolved together at boot.
+        let Some(dir) = self.teams_profiles_dir.as_ref() else {
             return teammate_section(identity, "");
         };
         match rhapsody_config::profiles::resolve(dir, &profile) {

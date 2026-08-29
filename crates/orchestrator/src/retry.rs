@@ -344,14 +344,16 @@ impl Orchestrator {
         // every field below untouched and this dispatch byte-identical to today. Sync and pure: the
         // decision is `crate::teams::route`, plain data in, no I/O and above all no network call on
         // the single control task (§0.11.2).
-        let teams = self.route_teams(&iss);
+        // NB: `route` (the parameter) is the owning PROJECT's snapshot — an unrelated sense of the
+        // word. `teams_dispatch` is named in full so the two cannot be conflated at a glance.
+        let teams_dispatch = self.route_teams(&iss);
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
         re.started_at = (self.now)();
         re.retry_attempt = attempt_norm;
         re.stack_context = stack_context;
         re.capabilities_section = capabilities_section;
-        if let Some(td) = &teams {
+        if let Some(td) = &teams_dispatch {
             re.identity = td.identity.clone();
             re.teammate_section = td.section.clone();
         }
@@ -385,7 +387,7 @@ impl Orchestrator {
         // AFTER the run row exists: the decision is a row ON a run, so it cannot be written before
         // one (§3.1 — the router has no store and can persist no intention). A zero `run_id` (store
         // disabled / `start_run` failed) makes this a no-op.
-        if let Some(td) = &teams {
+        if let Some(td) = &teams_dispatch {
             self.record_route_event(&mut re, td);
         }
         // Per-run operator-message mailbox (INF-250): buffered so a brief delivery lag doesn't reject
