@@ -18,6 +18,7 @@ pub mod model;
 pub mod projects;
 pub mod prompt;
 pub mod resolve;
+pub mod teams;
 pub mod validate;
 pub mod workflow;
 
