@@ -212,7 +212,7 @@ pub enum TeamsError {
 /// is interpolated into a `rhapsody:@<name>` Linear label (§0.11.1) and into a
 /// `<bank_prefix><name>` bank id (§2.2). Widening it later would be a
 /// compatibility break in two external namespaces at once.
-fn is_label_safe(name: &str) -> bool {
+pub(crate) fn is_label_safe(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_lowercase() => {}
