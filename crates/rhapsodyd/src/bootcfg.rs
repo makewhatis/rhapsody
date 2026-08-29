@@ -102,6 +102,35 @@ pub fn resolve_capabilities_path(
     db_override: &str,
     no_store: bool,
 ) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, "capabilities.yaml")
+}
+
+/// Resolves the path of the Rhapsody Teams config file (`teams.yaml`, STUDIO-639), colocated with the
+/// durable store by exactly the same rule as [`resolve_capabilities_path`] — Teams is user-editable,
+/// non-parity data in its own file, following the BO-11 `capabilities.yaml` precedent (design record
+/// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §2.1). `None` (a disabled / in-memory store, or a
+/// failed config load) means the daemon runs with no Teams file to anchor, i.e. Teams stays off.
+///
+/// Unlike the capabilities registry, an absent `teams.yaml` is NEVER created: absence is the off
+/// state and the shipped state (§2.1), so this only ever names a path that may or may not exist.
+pub fn resolve_teams_path(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, "teams.yaml")
+}
+
+/// The shared path decision behind [`resolve_capabilities_path`] and [`resolve_teams_path`]: `file`
+/// sits in the directory of the resolved on-disk store (`--db` override wins over `storage.path`),
+/// so a custom store location keeps its sidecar files alongside it and tests stay hermetic. `None`
+/// when there is no on-disk store directory to anchor to. Mirrors [`open_store`]'s path decision.
+fn resolve_runtime_home_file(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+    file: &str,
+) -> Option<PathBuf> {
     if no_store {
         return None;
     }
@@ -110,7 +139,7 @@ pub fn resolve_capabilities_path(
         path = cfg?.storage.path.clone();
     }
     match parse_store_path(&path) {
-        StorePath::Disk(p) => p.parent().map(|d| d.join("capabilities.yaml")),
+        StorePath::Disk(p) => p.parent().map(|d| d.join(file)),
         StorePath::Off | StorePath::InMemory => None,
     }
 }
@@ -369,6 +398,42 @@ mod tests {
         assert_eq!(resolve_capabilities_path(None, "off", false), None);
         assert_eq!(resolve_capabilities_path(None, ":memory:", false), None);
         assert_eq!(resolve_capabilities_path(None, "", false), None); // failed load (cfg None)
+    }
+
+    // STUDIO-639 (Teams T1): teams.yaml colocates with the on-disk store by exactly the same rule as
+    // capabilities.yaml (design §2.1); disabled / in-memory / a failed load yield None so the daemon
+    // runs with no Teams file to anchor and Teams stays off. Resolving a path never touches the disk —
+    // teams.yaml is never seeded (§2.1), unlike the capabilities registry.
+    #[test]
+    fn resolve_teams_path_variants() {
+        let dir = TempDir::new();
+        let ws = dir.child("ws");
+        let wf = write_wf(&dir, &valid_wf(&ws));
+        let cfg = resolve(
+            decode(&workflow::load(&wf).expect("load")).expect("decode"),
+            &workflow_dir(&wf),
+        )
+        .expect("resolve");
+        let got = resolve_teams_path(Some(&cfg), "", false).expect("on-disk default → Some");
+        assert!(
+            got.ends_with(".rhapsody/teams.yaml"),
+            "default path should be ~/.rhapsody/teams.yaml, got {}",
+            got.display()
+        );
+        // It lands in the SAME directory the capabilities registry does — one runtime home.
+        let caps = resolve_capabilities_path(Some(&cfg), "", false).expect("caps → Some");
+        assert_eq!(got.parent(), caps.parent());
+        // --db override wins and colocates teams.yaml with the overridden store dir.
+        let over = resolve_teams_path(None, "/tmp/somewhere/store.db", false).expect("--db → Some");
+        assert_eq!(over, PathBuf::from("/tmp/somewhere/teams.yaml"));
+        // Disabled / in-memory / no config → None (no home ⇒ Teams off).
+        assert_eq!(resolve_teams_path(Some(&cfg), "", true), None); // --no-store
+        assert_eq!(resolve_teams_path(None, "off", false), None);
+        assert_eq!(resolve_teams_path(None, ":memory:", false), None);
+        assert_eq!(resolve_teams_path(None, "", false), None); // failed load (cfg None)
+        // Resolving is pure: it must not have created the file it names.
+        assert!(!got.exists() || got.is_file());
+        assert!(!PathBuf::from("/tmp/somewhere/teams.yaml").exists());
     }
 
     // Mirrors Go `TestResolveBannerStorageVariants`.

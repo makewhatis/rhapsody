@@ -26,13 +26,15 @@ use std::path::Path;
 
 /// How the manager decides which identity takes a ticket (§2.2, §3.2, §3.5).
 /// Config only in T1 — nothing consumes it yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ManagerMode {
     /// Single-identity Teams: no routing at all (§3.5).
     #[serde(rename = "off")]
     Off,
     /// Deterministic only: the ticket's `rhapsody:@<name>` label, then
-    /// roster-labels ∩ ticket-labels (§0.11.2 Tier 0 + fallback).
+    /// roster-labels ∩ ticket-labels (§0.11.2 Tier 0 + fallback). The §2.2
+    /// default.
+    #[default]
     #[serde(rename = "labels")]
     Labels,
     /// Deterministic, plus an off-loop triage model turn for tickets no label
@@ -41,30 +43,20 @@ pub enum ManagerMode {
     LabelsModel,
 }
 
-impl Default for ManagerMode {
-    fn default() -> Self {
-        Self::Labels
-    }
-}
-
 /// Where a teammate's memory bank lives (§2.2, §5.4). Config only in T1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MemoryBackend {
     /// No memory at all.
     #[serde(rename = "none")]
     None,
-    /// On-disk banks under `memory.path` — the laptop-native default (§5.4).
+    /// On-disk banks under `memory.path` — the laptop-native default (§5.4),
+    /// and so the §2.2 default.
+    #[default]
     #[serde(rename = "local")]
     Local,
     /// A remote Hindsight MCP endpoint (§5.4); the T8 slice.
     #[serde(rename = "hindsight")]
     Hindsight,
-}
-
-impl Default for MemoryBackend {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 /// `manager.max_tokens` — the hard cap on the (future) triage arbitration turn.
@@ -185,7 +177,7 @@ pub struct Identity {
 /// [`Teams::default`] is [`Teams::disabled`]: the schema's own defaults with
 /// `enabled: false`, which is exactly what an absent file means (§2.1) and what
 /// an empty-but-present file parses to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Teams {
     /// The one toggle the whole feature lives behind (§2). Default false.
     #[serde(default)]
@@ -196,17 +188,6 @@ pub struct Teams {
     pub memory: Memory,
     #[serde(default)]
     pub roster: Vec<Identity>,
-}
-
-impl Default for Teams {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            manager: Manager::default(),
-            memory: Memory::default(),
-            roster: Vec::new(),
-        }
-    }
 }
 
 /// Why a `teams.yaml` was rejected. The daemon boot turns any of these into ONE

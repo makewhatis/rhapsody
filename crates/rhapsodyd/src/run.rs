@@ -31,7 +31,7 @@ use rhapsody_tracker as tracker;
 
 use crate::bootcfg::{
     assignee_label, banner_color_enabled, open_store, resolve_banner_data,
-    resolve_capabilities_path, resolve_server_port, workflow_dir,
+    resolve_capabilities_path, resolve_server_port, resolve_teams_path, workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -127,6 +127,26 @@ where
                 "capabilities registry load failed; capabilities disabled"
             ),
         }
+    }
+    // Load the Rhapsody Teams config (~/.rhapsody/teams.yaml, colocated with the durable store) and
+    // inject it before Run (STUDIO-639; design record ~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md).
+    // Best-effort, and NEVER seeded: an absent file is the off state and the shipped state (§2.1), so
+    // unlike the capabilities registry above this never creates the file it reads. A malformed or
+    // invalid file yields `Teams::disabled()` plus ONE loud log line — never a startup failure. No
+    // on-disk store home (--no-store / off / :memory:) leaves the field `None`. Nothing downstream
+    // reads it yet: T1 carries the toggle and the roster inert.
+    if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
+        o.teams = Some(match rhapsody_config::teams::Teams::try_load(&teams_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    path = %teams_path.display(),
+                    "teams config load failed; teams disabled"
+                );
+                rhapsody_config::teams::Teams::disabled()
+            }
+        });
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
     // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
@@ -663,6 +683,68 @@ mod tests {
         assert!(
             !dir.child("ws").join("symphony.db").exists(),
             "storage.path: off must not create a symphony.db file"
+        );
+    }
+
+    // STUDIO-639 (Teams T1), design §2.1: a `teams.yaml` that is NOT there stays not there. This is
+    // the deliberate divergence from the `capabilities.yaml` precedent — `load_or_seed` writes its
+    // file on first read, and a disabled feature must not. The test boots the real daemon against an
+    // on-disk store so BOTH sidecar paths resolve into the same temp dir, then asserts the asymmetry
+    // directly: capabilities.yaml appears (proving the path resolution really reached this dir and the
+    // test is not vacuous), teams.yaml does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_seeds_capabilities_but_never_seeds_teams_yaml() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "daemon should exit 0 on cancel; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            dir.child("capabilities.yaml").exists(),
+            "the capabilities registry IS seeded beside the store — if this fails the sidecar path \
+             never resolved here and the teams.yaml assertion below proves nothing"
+        );
+        assert!(
+            !dir.child("teams.yaml").exists(),
+            "teams.yaml must NEVER be seeded: an absent file is Teams' off state and shipped state"
+        );
+    }
+
+    // STUDIO-639 (Teams T1), design §2.1: a malformed teams.yaml disables Teams LOUDLY and the daemon
+    // still starts and stops cleanly — a broken optional config file is never a startup failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_starts_cleanly_with_a_malformed_teams_yaml() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        // `roster` as a scalar where a sequence belongs: YAML that cannot become a `Teams`.
+        std::fs::write(dir.child("teams.yaml"), "enabled: true\nroster: \"nope\"\n")
+            .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "a malformed teams.yaml must not fail the boot; stderr={}",
+            buf.contents()
+        );
+        // And the daemon did not "repair" the file by overwriting it — it is left exactly as written,
+        // for the operator to fix.
+        assert_eq!(
+            std::fs::read_to_string(dir.child("teams.yaml")).expect("read back"),
+            "enabled: true\nroster: \"nope\"\n"
         );
     }
 
