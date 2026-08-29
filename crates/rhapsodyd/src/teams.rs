@@ -30,12 +30,33 @@ use crate::bootcfg::{resolve_profiles_dir, resolve_teams_path};
 /// convention `run_mcp` established). Returns the process exit code: 0 on
 /// success, 1 on any failure — including an unknown verb, since a mistyped verb
 /// that exited 0 would look like it had done something.
-pub fn run_teams<O, E>(args: &[String], mut stdout: O, mut stderr: E) -> i32
+pub fn run_teams<O, E>(args: &[String], stdout: O, stderr: E) -> i32
 where
     O: Write,
     E: Write,
 {
-    match teams_command(args, &|k| std::env::var(k).unwrap_or_default()) {
+    run_teams_with(
+        args,
+        &|k| std::env::var(k).unwrap_or_default(),
+        stdout,
+        stderr,
+    )
+}
+
+/// [`run_teams`] with the environment injected, so the tests exercise the real
+/// stream/exit-code contract against a hermetic temp home instead of mutating
+/// the process environment out from under a parallel test.
+fn run_teams_with<O, E>(
+    args: &[String],
+    getenv: &dyn Fn(&str) -> String,
+    mut stdout: O,
+    mut stderr: E,
+) -> i32
+where
+    O: Write,
+    E: Write,
+{
+    match teams_command(args, getenv) {
         Ok(out) => {
             let _ = write!(stdout, "{out}");
             0
@@ -50,7 +71,7 @@ where
 /// Resolves the paths the verbs work against, then dispatches. Factored out of
 /// [`run_teams`] so the verbs are unit-testable without hijacking stdout.
 fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<String, String> {
-    let (teams_path, profiles_dir) = resolve_paths(getenv);
+    let (teams_path, profiles_dir) = resolve_paths(getenv)?;
     let verb = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or(&[]);
     match verb {
@@ -64,16 +85,25 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
 }
 
 /// Locates `teams.yaml` and the profiles directory the same way the daemon does
-/// — anchored to the resolved store home — falling back to the DEFAULTS when no
-/// workflow can be loaded, so `teams show swe` still prints the built-in from a
-/// directory that has no `WORKFLOW.md`.
-fn resolve_paths(getenv: &dyn Fn(&str) -> String) -> (PathBuf, PathBuf) {
+/// — anchored to the resolved store home. A directory with no `WORKFLOW.md` is
+/// fine (see [`load_config`]: the defaults still land on `~/.rhapsody`).
+///
+/// When there is no on-disk store home to anchor to — `storage.path` is `off` or
+/// `:memory:`, or the workflow will not decode — this is an ERROR rather than a
+/// guess. The obvious fallback, a relative `./teams/profiles/`, would mean
+/// `teams fork` quietly creating directories in whatever directory the operator
+/// happened to be standing in, which is exactly the kind of surprise write §4's
+/// read-only posture exists to avoid.
+fn resolve_paths(getenv: &dyn Fn(&str) -> String) -> Result<(PathBuf, PathBuf), String> {
     let cfg = load_config(getenv);
-    let teams_path =
-        resolve_teams_path(cfg.as_ref(), "", false).unwrap_or_else(|| PathBuf::from("teams.yaml"));
-    let profiles_dir = resolve_profiles_dir(cfg.as_ref(), "", false)
-        .unwrap_or_else(|| PathBuf::from("teams").join("profiles"));
-    (teams_path, profiles_dir)
+    resolve_teams_path(cfg.as_ref(), "", false)
+        .zip(resolve_profiles_dir(cfg.as_ref(), "", false))
+        .ok_or_else(|| {
+            "no Rhapsody runtime home to read profiles from: the workflow does not decode, or \
+             storage.path is `off`/`:memory:`. Point SYMPHONY_WORKFLOW at a workflow with an \
+             on-disk storage.path."
+                .to_string()
+        })
 }
 
 /// Loads + decodes + resolves the workflow the daemon would use (`SYMPHONY_WORKFLOW`,
@@ -165,12 +195,18 @@ fn render_show(identity: Option<&str>, r: &ResolvedProfile) -> String {
         "tools:        {} (parsed, unused in this slice)\n",
         list_field(&r.tools, r.provenance.tools)
     ));
+    // A fork has no base, so a `{{ base }}` token in one splices nothing. Say
+    // that, rather than claiming a splice the `base: none` line contradicts.
+    let has_base = r.provenance.base.is_some();
     out.push_str(&format!(
         "body:         {}\n",
         match r.provenance.body {
             BodyOrigin::Base => "from the base (the overlay body is empty)",
             BodyOrigin::Overlay => "from the overlay (replaces the base wholesale)",
-            BodyOrigin::Spliced => "the overlay, with the base spliced in at {{ base }}",
+            BodyOrigin::Spliced if has_base =>
+                "the overlay, with the base spliced in at {{ base }}",
+            BodyOrigin::Spliced =>
+                "from the overlay; its {{ base }} spliced nothing, because a fork has no base",
         }
     ));
     out.push_str("\n--- resolved prompt ---\n");
@@ -469,32 +505,60 @@ mod tests {
         );
     }
 
+    /// With no on-disk store home to anchor to, the verbs REFUSE rather than
+    /// guessing at a relative `./teams/profiles/` — a `fork` that created
+    /// directories in whatever directory the operator was standing in would be
+    /// exactly the surprise write §4's read-only posture exists to avoid.
+    #[test]
+    fn no_runtime_home_is_an_error_not_a_cwd_relative_guess() {
+        let dir = TempDir::new();
+        let wf = dir.child("WORKFLOW.md");
+        std::fs::write(
+            &wf,
+            "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nstorage:\n  path: \":memory:\"\n---\nDo it.\n",
+        )
+        .expect("write WORKFLOW.md");
+        let env = wf.to_string_lossy().into_owned();
+        for args in [vec!["show", "swe"], vec!["fork", "swe"]] {
+            let err = run(&args, &env).expect_err("must refuse without a runtime home");
+            assert!(err.contains("no Rhapsody runtime home"), "err = {err}");
+        }
+        assert!(
+            !dir.path.join("teams").exists() && !Path::new("teams").exists(),
+            "nothing may be created when there is no runtime home"
+        );
+    }
+
     /// `run_teams` prints the report to stdout on success and the marked error
     /// to stderr on failure, with the exit codes the dispatch contract needs.
     #[test]
     fn run_teams_writes_the_right_stream_and_code() {
         let dir = TempDir::new();
         let (env, _) = hermetic(&dir);
-        // SAFETY-adjacent: this test sets the process env, so it reads it back
-        // through the same public entry point the binary uses.
-        unsafe { std::env::set_var("SYMPHONY_WORKFLOW", &env[0]) };
+        let getenv = getenv_for(&env[0]);
+
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_teams(&["show".to_string(), "swe".to_string()], &mut out, &mut err);
+        let code = run_teams_with(
+            &["show".to_string(), "swe".to_string()],
+            &getenv,
+            &mut out,
+            &mut err,
+        );
         assert_eq!(code, 0);
         assert!(String::from_utf8_lossy(&out).contains("--- resolved prompt ---"));
         assert!(err.is_empty());
 
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_teams(
+        let code = run_teams_with(
             &["show".to_string(), "nobody".to_string()],
+            &getenv,
             &mut out,
             &mut err,
         );
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(String::from_utf8_lossy(&err).starts_with("symphony teams: "));
-        unsafe { std::env::remove_var("SYMPHONY_WORKFLOW") };
     }
 }
