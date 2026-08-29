@@ -81,6 +81,24 @@ pub struct RunningEntry {
     /// labels, rendered through the capabilities registry. Empty when nothing resolves.
     pub capabilities_section: String,
 
+    /// The Rhapsody Teams identity this run was routed to (STUDIO-643, T3a; design record
+    /// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §3.1). Empty when Teams is off or when
+    /// nobody was routed — in which case the run is byte-identical to a Teams-off dispatch.
+    ///
+    /// **In memory only.** The `runs` table is frozen: this is never persisted as a column, and the
+    /// decision's per-run record is the `teams.route` / `teams.unrouted` *events* row instead
+    /// (§3.4). Its one live consumer is
+    /// [`LoadSnapshot::from_running`](crate::teams::LoadSnapshot::from_running), which counts live
+    /// runs per identity so the router's tie-break can prefer the least busy teammate.
+    pub identity: String,
+
+    /// The rendered teammate section prepended to the worker's first-turn prompt (STUDIO-643) — the
+    /// identity header plus the identity's resolved profile text. Empty when Teams is off, when
+    /// nobody was routed, or when the profile failed to resolve; the `if !x.is_empty()` guard in
+    /// `build_turn_prompt` then skips it and the prompt is byte-identical (§2.4 row 5), exactly as
+    /// `capabilities_section` behaves.
+    pub teammate_section: String,
+
     /// The `latest_summon_at` of the most recent mid-run summons already delivered to this run's
     /// mailbox (INF-448). The poll-side router delivers a summons only when it is strictly after BOTH
     /// `started_at` and this watermark, then advances it — so a stable summons is injected at most
@@ -151,6 +169,8 @@ impl RunningEntry {
             model: String::new(),
             stack_context: String::new(),
             capabilities_section: String::new(),
+            identity: String::new(),
+            teammate_section: String::new(),
             last_delivered_summon_at: zero_time(),
             thread_id: String::new(),
             session_id: String::new(),
@@ -277,6 +297,16 @@ pub struct Orchestrator {
     /// (T3b) and memory (T4) are the slices that consume it. Any future consumer must gate on
     /// `.enabled` — `Some(..)` only means a file location existed, not that Teams is on.
     pub teams: Option<rhapsody_config::teams::Teams>,
+
+    /// The Rhapsody Teams PROFILES directory (`<runtime home>/teams/profiles/`, STUDIO-642),
+    /// resolved at daemon startup beside [`teams`](Orchestrator::teams). `None` when the daemon runs
+    /// without a durable on-disk home — the same condition that leaves `teams` `None`, so in
+    /// production the two are set together.
+    ///
+    /// Read-only and never created: an absent directory simply means every profile resolves to its
+    /// built-in (§4). `dispatch_issue` resolves the routed identity's profile through it (T3a); a
+    /// failure logs and drops the section rather than failing the run.
+    pub teams_profiles_dir: Option<std::path::PathBuf>,
 
     /// Live workers, keyed by opaque issue id.
     pub running: HashMap<String, RunningEntry>,
@@ -474,6 +504,7 @@ impl Orchestrator {
             eff: None,
             capabilities_registry: None,
             teams: None,
+            teams_profiles_dir: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),

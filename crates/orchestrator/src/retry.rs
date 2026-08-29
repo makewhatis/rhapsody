@@ -337,12 +337,24 @@ impl Orchestrator {
             .as_ref()
             .map(|reg| rhapsody_config::capabilities::render_section(&capability_names, reg))
             .unwrap_or_default();
+        // Rhapsody Teams routing (STUDIO-643, T3a; design record
+        // `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §3.1). Called ONCE, HERE — after the
+        // issue was selected and its slot taken, so routing can only ever DECORATE a run that is
+        // already going to happen. `None` (Teams off, or §3.5's `mode: off` with no default) leaves
+        // every field below untouched and this dispatch byte-identical to today. Sync and pure: the
+        // decision is `crate::teams::route`, plain data in, no I/O and above all no network call on
+        // the single control task (§0.11.2).
+        let teams = self.route_teams(&iss);
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
         re.started_at = (self.now)();
         re.retry_attempt = attempt_norm;
         re.stack_context = stack_context;
         re.capabilities_section = capabilities_section;
+        if let Some(td) = &teams {
+            re.identity = td.identity.clone();
+            re.teammate_section = td.section.clone();
+        }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
         re.model = match &route {
@@ -370,6 +382,12 @@ impl Orchestrator {
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
         self.persist_start_run(&mut re, attempt_norm);
+        // AFTER the run row exists: the decision is a row ON a run, so it cannot be written before
+        // one (§3.1 — the router has no store and can persist no intention). A zero `run_id` (store
+        // disabled / `start_run` failed) makes this a no-op.
+        if let Some(td) = &teams {
+            self.record_route_event(&mut re, td);
+        }
         // Per-run operator-message mailbox (INF-250): buffered so a brief delivery lag doesn't reject
         // an operator's message; a full mailbox (`OPERATOR_MAILBOX_CAP`) rejects backlog_full. Go
         // carries this channel on the running entry; the Rust `mpsc` split makes it a side map keyed by
@@ -383,6 +401,7 @@ impl Orchestrator {
         let project_slug = re.project_slug.clone();
         let stack_context = re.stack_context.clone();
         let capabilities_section = re.capabilities_section.clone();
+        let teammate_section = re.teammate_section.clone();
         let started_at = re.started_at;
         // Hand the entry to the injected TEST seam (Go `o.spawn(...)`) BEFORE moving it into
         // `o.running` — the borrow of `self.spawn` must not alias `self.running`. In production
@@ -401,6 +420,7 @@ impl Orchestrator {
                 project_slug,
                 stack_context,
                 capabilities_section,
+                teammate_section,
                 started_at,
             );
         }
