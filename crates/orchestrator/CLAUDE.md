@@ -60,7 +60,9 @@ the `Orchestrator` struct itself. Concretely:
   reuses the same slot/label gates).
 - **Run lifecycle**: `retry.rs` (retry queue + worker-exit classification), `worker.rs` (one agent
   attempt, off-loop task), `agentupdate.rs` (folds a worker event into `RunningEntry` + totals),
-  `message.rs` (operator→live-run mailbox delivery + mid-run summons routing), `handoff.rs`
+  `message.rs` (operator→live-run mailbox delivery, mid-run summons routing, and STUDIO-649's
+  reopen seed — the Rhapsody-only half that hands a reopening summons to the run it triggered),
+  `handoff.rs`
   (daemon-mediated review handoff, TRA-242 — an addition beyond Go Symphony, see the pitfall note
   below), `stop.rs` (Stop/Resume).
 - **Reconciliation**: `reconcile.rs` (pure decision: refreshed state → `ReconcileAction`) vs.

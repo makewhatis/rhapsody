@@ -224,3 +224,28 @@ on the first retain and at no other time.
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside
 this repo.
+
+### A reopening summons reaches the run it triggers (STUDIO-649)
+
+Go delivers a summon comment's TEXT to exactly one place: a run that is already alive when the
+comment lands (`deliverMidRunSummons`, INF-448). That router requires the summons to be strictly
+newer than the run's start — but a summons that *reopens* a review-state ticket is, by construction,
+older than the run it starts, so it is skipped forever. `promoteAndDispatch` then dispatched a fresh
+run carrying the prompt and the ticket description and nothing else, and the reviewer's instructions
+were dropped precisely when they mattered most.
+
+| Summons on a ticket with no live run | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| reopen fires (ticket promoted, fresh run dispatched) | yes | yes (unchanged) |
+| the summon comment's body reaches that run | **no — discarded** | seeded into the run's operator mailbox |
+
+Rhapsody's reopen dispatch path seeds the new run's mailbox with `Issue.latest_summon_body` through
+the *same* INF-250 admission path the mid-run route uses (`deliverToMailbox`): the wrapped body on
+the bounded mailbox, the reviewer's original words persisted as a `run_messages` row. A body-less
+summons seeds the same generic fallback nudge the mid-run route uses. The per-run
+`last_delivered_summon_at` watermark is advanced on success, so the two routes agree the summons is
+spent and neither can deliver it twice.
+
+Nothing else moves: the reopen *gate* (INF-448) is untouched, the turn-1 prompt is byte-identical
+(no template change), only the newest summons is delivered (the same contract as mid-run), and no
+config field, endpoint or golden is added or changed.
