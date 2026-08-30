@@ -1235,32 +1235,82 @@ mod tests {
     }
 
     // The other half of the endpoint contract: `backend: hindsight` with NO endpoint keeps the
-    // pre-T8 warn-and-memoryless behaviour, and says which key is missing.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_hindsight_backend_with_no_endpoint_warns_and_runs_memoryless() {
+    // pre-T8 warn-and-memoryless behaviour, and the warning says which key is missing — the whole
+    // point of updating that message, since the old one blamed an unimplemented slice.
+    //
+    // A SCOPED subscriber (`with_default`), not the daemon's stderr: `run` installs the process's
+    // one global subscriber, so a log-content assertion made through `run_briefly` would depend on
+    // which test in the binary booted first. This calls the composition-root function directly.
+    #[test]
+    fn a_hindsight_backend_with_no_endpoint_warns_and_runs_memoryless() {
+        use rhapsody_config::teams::{Identity, MemoryBackend as BackendKind, Teams};
+        use std::sync::{Arc as StdArc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Recorder(StdArc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push(format!("{}={value:?}", field.name()));
+                    }
+                }
+                if let Ok(mut got) = self.0.lock() {
+                    event.record(&mut V(&mut got));
+                }
+            }
+        }
+
         let dir = TempDir::new();
-        let wf = write_wf(&dir, "", "");
-        let db = dir.child("rhapsody.db");
-        std::fs::write(
-            dir.child("teams.yaml"),
-            "enabled: true\nmemory:\n  backend: hindsight\nroster:\n  - name: alice\n",
-        )
-        .expect("write teams.yaml");
-        let buf = SharedBuf::new();
-        assert_eq!(
-            run_briefly(
-                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
-                &buf
-            )
-            .await,
-            0,
-            "stderr={}",
-            buf.contents()
+        let flags = Flags {
+            port: -1,
+            db: dir.child("rhapsody.db").to_string_lossy().into_owned(),
+            no_store: false,
+            no_color: false,
+            path: PathBuf::from("WORKFLOW.md"),
+        };
+        let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
+        let mut teams = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        teams.memory.backend = BackendKind::Hindsight;
+
+        let rec = Recorder::default();
+        let subscriber = tracing_subscriber::registry().with(rec.clone());
+        let mut o = rhapsody_orchestrator::Orchestrator::new(String::new());
+        let wiring = tracing::subscriber::with_default(subscriber, || {
+            install_teams_memory(&mut o, &teams, cfg.as_ref(), &flags)
+        });
+
+        assert!(
+            wiring.is_none(),
+            "there is no bank to dial, so no task to spawn"
         );
-        let logged = buf.contents();
+        assert!(o.teams_prefetch.is_none());
+        assert!(o.teams_bank.is_none());
+        assert!(
+            o.teams_memory.is_some(),
+            "the off-loop tools still answer — as no-ops"
+        );
+        let logged = rec.0.lock().expect("logged").join(" | ");
         assert!(
             logged.contains("memory.endpoint") && logged.contains("no memory"),
-            "the warning must name the missing key: {logged}"
+            "the warning must name the missing key and say what it cost: {logged}"
         );
     }
 
