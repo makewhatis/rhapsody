@@ -62,6 +62,16 @@ pub struct HandoffPlan {
     pub team_id: String,
     pub identifier: String,
     pub review_state: String,
+    /// The review-quorum fan-out to fire once the review-state move SUCCEEDS (STUDIO-659, T7;
+    /// design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.12). `None` whenever the
+    /// quorum does not fire — which is every handoff on an installation that has not opted in, and
+    /// the common case even on one that has (see
+    /// [`plan_quorum`](Orchestrator::plan_quorum) for the four gates).
+    ///
+    /// Decided HERE, on the control task, from state already in memory — the reviewers, the PR and
+    /// the target state are all resolved before this struct exists — so the handoff itself never
+    /// waits on the quorum and the quorum never reaches into loop-owned state.
+    pub quorum: Option<crate::quorum::QuorumRequest>,
 }
 
 impl Orchestrator {
@@ -84,6 +94,11 @@ impl Orchestrator {
             team_id: re.issue.team_id.clone(),
             identifier: re.issue.identifier.clone(),
             review_state: self.review_handoff_state(&re.project_slug),
+            // §0.12's trigger: "a teammate's handoff with a linked PR". This is that moment, and it
+            // is the moment the daemon EXECUTES rather than merely infers, which is why the design
+            // chose it over "PR opened" (the PR exists mid-run, long before it is reviewable) or
+            // "review posted" (that is the quorum's output, not its input).
+            quorum: self.plan_quorum(re),
         }
     }
 
@@ -170,7 +185,33 @@ impl ControlHandle {
         if !res.move_err.is_empty() {
             tracing::error!(issue_identifier = %res.identifier, err = %res.move_err, "handoff: review-state move failed");
         }
+        // The review quorum fires only on a handoff that actually LANDED (STUDIO-659, §0.12): a
+        // move the tracker refused is not a handoff, and fanning review tickets out for a ticket
+        // still sitting in an active state would ask two teammates to review work whose author is
+        // about to keep going. The send itself cannot fail meaningfully — the channel is unbounded,
+        // so it never blocks the agent's tool call, and a closed one only means the daemon is
+        // already shutting down.
+        if res.move_err.is_empty() {
+            self.request_quorum(plan.quorum);
+        }
         Ok(res)
+    }
+
+    /// Hands a planned fan-out to the off-loop quorum task (STUDIO-659, T7). A no-op when the
+    /// quorum did not fire, when no task is running, or when that task has already stopped —
+    /// none of which is worth failing the handoff over: the ticket has moved, the run is winding
+    /// down, and a missed fan-out costs a review, not the work.
+    fn request_quorum(&self, req: Option<crate::quorum::QuorumRequest>) {
+        let (Some(req), Some(tx)) = (req, self.quorum.as_ref()) else {
+            return;
+        };
+        let identifier = req.parent_identifier.clone();
+        if tx.send(req).is_err() {
+            tracing::warn!(
+                issue_identifier = %identifier,
+                "handoff: the teams review-quorum task is gone; no review was requested"
+            );
+        }
     }
 
     /// The off-loop by-NAME `MoveIssueState` for handoff, resolving the tracker exactly like

@@ -590,6 +590,11 @@ impl Orchestrator {
             // so a recall rendered during THIS tick's dispatch can attach a ticket's current state
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
             self.record_issue_states(tagged.iter().map(|t| &t.iss));
+            // Rhapsody Teams review quorum (STUDIO-659, T7): the same snapshot, for the other
+            // consumer — per-identity load and each ticket's open PR / marker label, so a handoff
+            // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
+            // the quorum off (§0.12).
+            self.record_quorum_state(tagged.iter().map(|t| &t.iss));
             let (picked, reopen) = self.select_dispatch_multi_with_reopens(tagged);
             // Pool-mode picks (INF-477) win the single-claimant claim BEFORE dispatch; assignee-mode
             // picks dispatch immediately. Build owned routes before the `&mut self` dispatch.
@@ -650,6 +655,7 @@ impl Orchestrator {
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
+        self.record_quorum_state(issues.iter());
         let (active, reopen) = self.select_dispatch_with_reopens(issues);
         if self
             .eff

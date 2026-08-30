@@ -110,6 +110,16 @@ pub struct ControlHandle {
     /// control task, and an event-channel round-trip would queue it behind the current tick — the
     /// head-of-line class the T3a/T3b split already exists to avoid.
     pub(crate) teams_memory: Option<std::sync::Arc<crate::teamsmemory::TeamsMemory>>,
+    /// The off-loop review-quorum task's inbox, cloned from
+    /// [`Orchestrator::quorum_tx`](crate::orchestrator::Orchestrator) (STUDIO-659, T7). `None`
+    /// whenever the quorum is off — so on a default installation a handoff cannot even represent a
+    /// fan-out, let alone perform one.
+    ///
+    /// It lives on the handle rather than being sent through [`Self::events`] because the fan-out
+    /// must be gated on the review-state move SUCCEEDING, and that move runs here, off-loop, after
+    /// the control round-trip has already returned. Sending it back through the loop would put a
+    /// tracker-write decision behind the current tick for no benefit.
+    pub(crate) quorum: Option<tokio::sync::mpsc::UnboundedSender<crate::quorum::QuorumRequest>>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -132,6 +142,7 @@ impl crate::orchestrator::Orchestrator {
             retention_days: std::sync::Arc::clone(&self.retention_days),
             retention_loaded: std::sync::Arc::clone(&self.retention_loaded),
             teams_memory: self.teams_memory.as_ref().map(std::sync::Arc::clone),
+            quorum: self.quorum_tx.clone(),
         }
     }
 }
