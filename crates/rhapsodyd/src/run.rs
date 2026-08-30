@@ -635,6 +635,10 @@ fn install_teams_memory(
     // one identity's memory. Only the absence of an on-disk runtime home turns it off.
     let room = resolve_room_dir(resolved, &flags.db, flags.no_store)
         .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
+    // A backstop rather than a live branch: this function is only reached from inside
+    // `resolve_teams_path(..).is_some()`, which already required the same runtime home, so today
+    // `room` is always `Some` here. It stays because the two resolutions are independent and a
+    // future call site need not carry that guarantee.
     if room.is_none() {
         tracing::warn!(
             "teams room: there is no on-disk runtime home to anchor ~/.rhapsody/teams/room/ to \

@@ -37,6 +37,15 @@
 //!   module never derives it and there is no code path by which a run can supply
 //!   one — the same rule §5.1 puts on a retained record's provenance.
 //!
+//! # One consequence of day-partitioning, stated
+//!
+//! A message's log file is chosen from its own `at`, and [`Cursor`] orders files chronologically by
+//! their stems. So a message appended with an `at` OLDER than a reader's watermark is one that
+//! reader never catches up on. Every writer in this daemon stamps `Utc::now()`, so this needs a
+//! clock that went backwards — and when it happens the room loses a paragraph while Linear, the
+//! ledger, is unaffected. That is the same trade the no-fsync stance above makes, named here so it
+//! is a decision rather than a surprise.
+//!
 //! # Sync, and why the signature is the proof (§0.10)
 //!
 //! [`RoomLog`] is **sync**, unlike [`MemoryBackend`](crate::memory::MemoryBackend),
@@ -477,6 +486,14 @@ impl LocalRoom {
             .append(true)
             .open(&path)
             .map_err(|e| RoomError::Io(format!("open log {}: {e}", path.display())))?;
+        // A torn tail — a previous write cut short by a crash, which the no-fsync stance above
+        // explicitly accepts — leaves the file without its final newline. Appending straight onto
+        // it would splice this message into the broken one and lose BOTH: the corrupt line is
+        // skipped loudly on read, and this good message would be inside it. One byte separates
+        // them, so the damage stays confined to the line that was already lost.
+        if needs_leading_newline(&path) {
+            line.insert(0, '\n');
+        }
         f.write_all(line.as_bytes())
             .map_err(|e| RoomError::Io(format!("append log {}: {e}", path.display())))?;
         Ok(format!("{stem}:{seq}"))
@@ -580,6 +597,16 @@ impl RoomLog for LocalRoom {
         limit: usize,
     ) -> Result<CaughtUp, RoomError> {
         LocalRoom::read_since(self, reader, cursor, limit)
+    }
+}
+
+/// Whether `path` ends mid-line, so the next append must start a fresh one. An absent or empty
+/// file needs nothing; an unreadable one is treated as intact, because guessing a newline into a
+/// file we cannot read would be its own corruption.
+fn needs_leading_newline(path: &Path) -> bool {
+    match std::fs::read(path) {
+        Ok(bytes) => !bytes.is_empty() && bytes.last() != Some(&b'\n'),
+        Err(_) => false,
     }
 }
 
@@ -1084,6 +1111,31 @@ mod tests {
             Some("d5"),
             "the five oldest days fall off the scan, not the newest"
         );
+    }
+
+    /// A torn tail — the crash the no-fsync stance explicitly accepts — costs the room the line
+    /// that was cut short and NOTHING else. Without the leading-newline guard the next append would
+    /// splice itself into the broken line and be lost with it.
+    #[test]
+    fn an_append_after_a_torn_tail_does_not_join_the_broken_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = room(dir.path());
+        post(&r, "manager", 29, 9, "before the crash");
+        // Simulate a write cut short mid-line: no trailing newline.
+        let path = r.root().join("2026-08-29.jsonl");
+        let mut text = std::fs::read_to_string(&path).expect("read");
+        text.push_str("{\"from\":\"manager\",\"to\":\"*\",\"at\":\"2026-");
+        std::fs::write(&path, text).expect("write");
+
+        post(&r, "manager", 29, 12, "after the crash");
+
+        let got = r.read_since("alice", &Cursor::default(), 0).expect("read");
+        assert_eq!(
+            bodies(&got),
+            vec!["before the crash", "after the crash"],
+            "the good message after a torn tail must survive"
+        );
+        assert_eq!(got.skipped.len(), 1, "exactly the torn line is lost");
     }
 
     /// A file whose name is not `<stem>.jsonl` is not a log file, and a stray

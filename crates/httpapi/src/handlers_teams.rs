@@ -53,11 +53,22 @@ pub(crate) struct RecallParams {
 /// `GET /api/v1/teams/room?limit=` (STUDIO-650, T5).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct RoomParams {
-    /// How many of the newest posts to return. Absent or `0` ⇒ the room's own default window; any
-    /// value is clamped to its ceiling, so this parameter can widen nothing (§0.5's
-    /// "bounded read window, non-negotiable").
+    /// How many of the newest posts to return. Absent, empty, `0` or unparseable ⇒ the room's own
+    /// default window; any value is clamped to its ceiling, so this parameter can widen nothing
+    /// (§0.5's "bounded read window, non-negotiable").
+    ///
+    /// Carried as a `String` and parsed here rather than typed `usize`, because a typed field would
+    /// make `?limit=abc` fail axum's own extractor and answer with ITS error body instead of this
+    /// crate's `{error, message}` envelope — a wire-shape inconsistency no other read route has. A
+    /// garbage limit is a request for the default window, not a 400.
     #[serde(default)]
-    limit: usize,
+    limit: String,
+}
+
+impl RoomParams {
+    fn limit(&self) -> usize {
+        self.limit.trim().parse().unwrap_or(0)
+    }
 }
 
 /// `POST /api/v1/teams/invalidate` body.
@@ -155,7 +166,7 @@ pub(crate) async fn handle_teams_room(
     if let Some(resp) = require_get(&method) {
         return resp;
     }
-    match provider.teams_room(params.limit).await {
+    match provider.teams_room(params.limit()).await {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -614,6 +625,34 @@ mod tests {
             MAX_ROOM_WINDOW,
             "the ceiling cannot be widened from the wire"
         );
+    }
+
+    /// An unparseable `limit` is a request for the DEFAULT window, not a 400 — so the route keeps
+    /// answering in this crate's envelope rather than falling through to axum's own extractor
+    /// error body, which no other read route here does.
+    #[tokio::test]
+    async fn room_tolerates_a_garbage_limit() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        room.append(&RoomMessage::room("@manager", chrono::Utc::now(), "news"))
+            .expect("append");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+
+        for q in ["?limit=abc", "?limit=", "?limit=-3"] {
+            let resp = reqwest::get(format!("{url}/api/v1/teams/room{q}"))
+                .await
+                .expect("GET");
+            assert_eq!(resp.status(), 200, "{q} should serve the default window");
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["messages"].as_array().map(Vec::len),
+                Some(1),
+                "{q}: {body}"
+            );
+        }
     }
 
     /// A daemon with Teams enabled but no room configured answers as an EMPTY room, not an error:
