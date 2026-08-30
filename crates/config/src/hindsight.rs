@@ -717,7 +717,15 @@ fn normalize_base(endpoint: &str) -> Result<String, MemoryError> {
     if let Some(stripped) = base.strip_suffix("/mcp") {
         base = stripped.trim_end_matches('/');
     }
-    if base.len() <= "https://".len() {
+    // The authority must be non-empty. Checked by splitting off the scheme rather than by
+    // comparing the whole string's length against `"https://".len()`, which would also reject a
+    // perfectly good `http://x` — a one-character host is unusual, not invalid, and a URL check
+    // that is wrong about the short case tends to be wrong about others too.
+    let authority = base
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    if authority.split('/').next().unwrap_or_default().is_empty() {
         return Err(MemoryError::Invalid(format!(
             "memory.endpoint {endpoint:?} names no host"
         )));
@@ -1430,6 +1438,13 @@ mod tests {
                 "https://hindsight.example.ts.net",
             ),
             ("  http://127.0.0.1:8888/mcp  ", "http://127.0.0.1:8888"),
+            // A one-character host is unusual, not invalid.
+            ("http://x", "http://x"),
+            // A base with a path prefix keeps it; only a `/mcp` tail is stripped.
+            (
+                "https://gw.example/hindsight/",
+                "https://gw.example/hindsight",
+            ),
         ] {
             assert_eq!(normalize_base(given).expect(given), want, "({given:?})");
         }
@@ -1440,6 +1455,7 @@ mod tests {
             "ftp://hindsight.example.ts.net",
             "https://hindsight.example.ts.net?x=1",
             "https://",
+            "https:///no/host",
         ] {
             assert!(normalize_base(bad).is_err(), "({bad:?}) should be refused");
         }

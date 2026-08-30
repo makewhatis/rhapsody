@@ -49,7 +49,7 @@
 //! with the tailnet down is exact — the team remembers nothing new until it comes
 //! back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -92,10 +92,14 @@ pub const PREFETCH_TTL: Duration = Duration::from_secs(10 * 60);
 /// same value and for the same reason.
 const MAX_PER_CYCLE: usize = 10;
 
-/// The most entries the cache will hold. The candidate set is already bounded by
-/// [`MAX_PER_CYCLE`] per cycle and replaced wholesale each cycle, so this is a
-/// backstop against a future caller that merges instead of replacing — the bound
-/// is stated rather than inferred from the caller's good behaviour.
+/// The most entries the cache will hold.
+///
+/// A cycle recalls at most [`MAX_PER_CYCLE`] candidates but CARRIES the entries
+/// of every other live candidate ([`PrefetchCache::sync`]), so the cache does
+/// grow past one cycle's window — which is exactly what makes a rotating window
+/// worth having, and exactly why this bound is a real ceiling rather than a
+/// backstop. Comfortably above `MAX_PER_CYCLE`, so several cycles of rotation
+/// accumulate before anything is dropped.
 pub const MAX_CACHE_ENTRIES: usize = 64;
 
 /// The most fact content, in bytes, the whole cache will hold. Every cached byte
@@ -169,25 +173,78 @@ impl PrefetchCache {
         Some(entry.facts.clone())
     }
 
-    /// **Replaces** the whole cache with `fresh`, bounded first.
+    /// Installs this cycle's `fresh` results and **evicts everything whose ticket
+    /// is no longer a live candidate**.
     ///
-    /// Replace, never merge — the `record_issue_states` precedent (§0.11.3): a
-    /// ticket that has left the candidate set must stop being served from a
-    /// stale entry, and a map that only ever grows would quietly hand a dispatch
-    /// facts recalled for a ticket nobody is working any more. Eviction is
-    /// therefore not a separate pass; it is what replacement *is*.
+    /// The eviction rule is `record_issue_states`'s (§0.11.3): being absent from
+    /// the candidate set is meaningful, so a map that only ever grew would
+    /// quietly hand a dispatch facts recalled for a ticket nobody is working any
+    /// more. `live` — not `fresh` — is what defines "still a candidate", and the
+    /// distinction is load-bearing: a cycle recalls at most [`MAX_PER_CYCLE`]
+    /// candidates but *sees* all of them, so keying eviction on `fresh` would
+    /// evict the entries for every candidate this cycle did not get to and the
+    /// eleventh ticket on a busy board would never hold a cached recall at all.
+    /// Carrying them lets [`prefetch_cycle`]'s rotating window cover the whole
+    /// set across cycles, which is what makes "nothing is skipped, only spread"
+    /// true rather than merely intended.
     ///
-    /// The bounded map is built before the lock is taken, so the write lock is
-    /// held for one move and a concurrent [`try_get`](Self::try_get) is
-    /// essentially never turned away.
-    pub fn replace(&self, fresh: Vec<(PrefetchKey, Vec<Fact>)>, now: DateTime<Utc>) {
-        let bounded = bound(fresh, now);
-        if let Ok(mut guard) = self.entries.write() {
-            *guard = bounded;
+    /// A carried entry keeps its ORIGINAL timestamp, so carrying can extend
+    /// nothing past [`PREFETCH_TTL`]; a stale one is dropped here as well as
+    /// refused by [`try_get`](Self::try_get).
+    ///
+    /// The new map is built before the lock is taken, so the write lock is held
+    /// for one move and a concurrent `try_get` is essentially never turned away.
+    pub fn sync(
+        &self,
+        fresh: Vec<(PrefetchKey, Vec<Fact>)>,
+        live: &HashSet<PrefetchKey>,
+        now: DateTime<Utc>,
+    ) {
+        // Snapshot what survives under the read lock, then release it: the whole
+        // rebuild happens outside any lock.
+        let mut carried: Vec<(PrefetchKey, Entry)> = match self.entries.read() {
+            Ok(guard) => guard
+                .iter()
+                .filter(|(k, e)| live.contains(*k) && !is_stale(e.at, now))
+                .map(|(k, e)| (k.clone(), e.clone()))
+                .collect(),
+            // A poisoned lock carries nothing; the next cycle refills.
+            Err(_) => Vec::new(),
+        };
+        // Newest first, so which carried entries a bound drops is deterministic
+        // rather than whatever order the map happened to hash them into.
+        carried.sort_by(|a, b| {
+            b.1.at
+                .cmp(&a.1.at)
+                .then_with(|| a.0.ticket.cmp(&b.0.ticket))
+        });
+
+        let mut next: HashMap<PrefetchKey, Entry> = HashMap::new();
+        let mut bytes = 0usize;
+        // This cycle's answers first: they are the freshest, and a fresh entry
+        // must win over a carried copy of the same key.
+        for (key, facts) in fresh {
+            insert_bounded(&mut next, &mut bytes, key, Entry { facts, at: now });
         }
-        // A poisoned lock leaves the previous contents in place, which the TTL
-        // will retire on its own. There is nothing better to do here and nothing
-        // worth failing a background cycle over.
+        for (key, entry) in carried {
+            if !next.contains_key(&key) {
+                insert_bounded(&mut next, &mut bytes, key, entry);
+            }
+        }
+        if let Ok(mut guard) = self.entries.write() {
+            *guard = next;
+        }
+        // A poisoned write lock leaves the previous contents in place, which the
+        // TTL will retire on its own. There is nothing better to do here and
+        // nothing worth failing a background cycle over.
+    }
+
+    /// [`sync`](Self::sync) where `fresh` IS the whole live set — "these entries
+    /// and no others". The shape the dispatch-path tests want, and the shape a
+    /// cycle that routed nothing uses to clear the cache.
+    pub fn replace(&self, fresh: Vec<(PrefetchKey, Vec<Fact>)>, now: DateTime<Utc>) {
+        let live: HashSet<PrefetchKey> = fresh.iter().map(|(k, _)| k.clone()).collect();
+        self.sync(fresh, &live, now);
     }
 
     /// How many entries are cached. Test/observability only — never consulted by
@@ -214,28 +271,28 @@ fn is_stale(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     }
 }
 
-/// Applies [`MAX_CACHE_ENTRIES`] and [`MAX_CACHE_BYTES`] to a cycle's results.
+/// Inserts one entry if it fits [`MAX_CACHE_ENTRIES`] and [`MAX_CACHE_BYTES`].
 ///
-/// Entries are taken in the order the cycle produced them, which is candidate
-/// order — so what a bound drops is the tail of the backlog, the tickets least
-/// likely to dispatch this tick, rather than an arbitrary hash-map slice. An
-/// entry whose facts would breach the byte ceiling is dropped whole rather than
-/// truncated: half a fact set is a prompt nobody can reason about.
-fn bound(fresh: Vec<(PrefetchKey, Vec<Fact>)>, now: DateTime<Utc>) -> HashMap<PrefetchKey, Entry> {
-    let mut out = HashMap::with_capacity(fresh.len().min(MAX_CACHE_ENTRIES));
-    let mut bytes = 0usize;
-    for (key, facts) in fresh {
-        if out.len() >= MAX_CACHE_ENTRIES {
-            break;
-        }
-        let cost: usize = facts.iter().map(|f| f.content.len()).sum();
-        if bytes + cost > MAX_CACHE_BYTES {
-            continue;
-        }
-        bytes += cost;
-        out.insert(key, Entry { facts, at: now });
+/// Callers offer entries best-first (this cycle's results, then carried ones
+/// newest-first), so what a bound drops is the least useful tail rather than an
+/// arbitrary hash-map slice. An entry whose facts would breach the byte ceiling
+/// is skipped **whole** rather than truncated — half a fact set is a prompt
+/// nobody can reason about — and a later, smaller entry may still fit.
+fn insert_bounded(
+    out: &mut HashMap<PrefetchKey, Entry>,
+    bytes: &mut usize,
+    key: PrefetchKey,
+    entry: Entry,
+) {
+    if out.len() >= MAX_CACHE_ENTRIES {
+        return;
     }
-    out
+    let cost: usize = entry.facts.iter().map(|f| f.content.len()).sum();
+    if *bytes + cost > MAX_CACHE_BYTES {
+        return;
+    }
+    *bytes += cost;
+    out.insert(key, entry);
 }
 
 /// The live tracker one cycle reads candidates from. Mirrors
@@ -332,6 +389,10 @@ where
         "teams memory prefetch task started (off-loop; dispatch never waits on it)"
     );
     let mut failures: i64 = 0;
+    // Where the next cycle's window starts (see `prefetch_cycle`). Owned by the
+    // schedule so a cycle stays a pure function of its inputs plus this one
+    // number, which is also what lets a test drive a cycle at a chosen offset.
+    let mut cursor: usize = 0;
     loop {
         // Back off AT LEAST the normal cadence: retrying a down bank sooner than
         // we would poll a healthy one is the hot loop the design forbids.
@@ -349,7 +410,7 @@ where
         if ctx.is_cancelled() {
             return;
         }
-        let outcome = prefetch_cycle(&ctx, &deps).await;
+        let outcome = prefetch_cycle(&ctx, &deps, &mut cursor).await;
         if outcome.is_failure() {
             failures += 1;
             // LOUD, because the symptom otherwise is a team that silently stops
@@ -368,7 +429,8 @@ where
 }
 
 /// One prefetch pass: fetch candidates, route each with the **existing pure
-/// [`route`]**, recall from the remote bank, and replace the cache.
+/// [`route`]**, recall from the remote bank for a rotating window of them, and
+/// sync the cache to the live candidate set.
 ///
 /// Routing here is the same function dispatch will run, on the same ticket, so a
 /// hit is a hit for the identity that actually takes the ticket. The one input it
@@ -377,7 +439,17 @@ where
 /// label-overlap tier. A tie broken differently here is a cache miss at dispatch
 /// — no memory section, the safe degradation — never a wrong teammate's facts,
 /// because the key carries the identity the facts were recalled for.
-pub(crate) async fn prefetch_cycle<TF>(ctx: &CancelWait, deps: &PrefetchDeps<TF>) -> CycleOutcome
+/// `cursor` is where this cycle's window starts, and is advanced past what it
+/// covered. It exists because a cycle recalls at most [`MAX_PER_CYCLE`]
+/// candidates: a fixed window would re-recall the same first ten every minute
+/// and never reach the eleventh, so the window rotates and the cache carries
+/// what it already holds for the candidates outside it
+/// ([`PrefetchCache::sync`]).
+pub(crate) async fn prefetch_cycle<TF>(
+    ctx: &CancelWait,
+    deps: &PrefetchDeps<TF>,
+    cursor: &mut usize,
+) -> CycleOutcome
 where
     TF: Fn() -> Option<PrefetchTarget>,
 {
@@ -393,14 +465,35 @@ where
     };
     let routed = routed_candidates(&deps.teams, &issues);
     if routed.is_empty() {
-        // Nothing routes anywhere: replace with an empty cache rather than
-        // leaving yesterday's entries to age out. Being absent from the candidate
-        // set is meaningful (§0.11.3).
+        // Nothing routes anywhere: clear the cache rather than leaving
+        // yesterday's entries to age out. Being absent from the candidate set is
+        // meaningful (§0.11.3).
         deps.cache.replace(Vec::new(), (deps.now)());
+        *cursor = 0;
         return CycleOutcome::Idle;
     }
-    let mut fresh: Vec<(PrefetchKey, Vec<Fact>)> = Vec::with_capacity(routed.len());
-    for (identity, iss) in routed.into_iter().take(MAX_PER_CYCLE) {
+    // Every routed candidate is still LIVE and keeps whatever the cache holds
+    // for it, whether or not this cycle's window reaches it. Only tickets that
+    // have left the candidate set are evicted.
+    let live: HashSet<PrefetchKey> = routed
+        .iter()
+        .map(|(identity, iss)| PrefetchKey::new(identity, &iss.identifier))
+        .collect();
+    // The rotating window. `routed` is in candidate order, which is stable
+    // across cycles, so advancing the cursor is what makes coverage fair.
+    let start = *cursor % routed.len();
+    let take = MAX_PER_CYCLE.min(routed.len());
+    let window: Vec<(String, &Issue)> = routed
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(take)
+        .map(|(identity, iss)| (identity.clone(), *iss))
+        .collect();
+    *cursor = start + take;
+
+    let mut fresh: Vec<(PrefetchKey, Vec<Fact>)> = Vec::with_capacity(window.len());
+    for (identity, iss) in window {
         // A shutdown must not have to wait out a whole cycle of remote recalls.
         if ctx.is_cancelled() {
             break;
@@ -436,15 +529,13 @@ where
                     "teams memory prefetch: the remote bank failed; keeping what this cycle \
                      already recalled and backing off"
                 );
-                if !fresh.is_empty() {
-                    deps.cache.replace(fresh, (deps.now)());
-                }
+                deps.cache.sync(fresh, &live, (deps.now)());
                 return CycleOutcome::BankFailure;
             }
         }
     }
     let n = fresh.len();
-    deps.cache.replace(fresh, (deps.now)());
+    deps.cache.sync(fresh, &live, (deps.now)());
     if n == 0 {
         CycleOutcome::Idle
     } else {
@@ -674,7 +765,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            prefetch_cycle(&CancelWait::default(), &d).await,
+            prefetch_cycle(&CancelWait::default(), &d, &mut 0).await,
             CycleOutcome::Prefetched(2)
         );
         assert_eq!(
@@ -715,7 +806,7 @@ mod tests {
             Arc::clone(&cache),
             0,
         );
-        prefetch_cycle(&CancelWait::default(), &first).await;
+        prefetch_cycle(&CancelWait::default(), &first, &mut 0).await;
         assert_eq!(cache.len(), 2);
 
         let second = deps(
@@ -725,7 +816,7 @@ mod tests {
             Arc::clone(&cache),
             1,
         );
-        prefetch_cycle(&CancelWait::default(), &second).await;
+        prefetch_cycle(&CancelWait::default(), &second, &mut 0).await;
         assert_eq!(cache.len(), 1);
         assert!(cache.try_get("alice", "MT-1", at(2)).is_some());
         assert!(
@@ -747,7 +838,7 @@ mod tests {
             Arc::clone(&cache),
             0,
         );
-        prefetch_cycle(&CancelWait::default(), &d).await;
+        prefetch_cycle(&CancelWait::default(), &d, &mut 0).await;
         assert_eq!(cache.len(), 1);
 
         let idle = deps(
@@ -758,10 +849,106 @@ mod tests {
             1,
         );
         assert_eq!(
-            prefetch_cycle(&CancelWait::default(), &idle).await,
+            prefetch_cycle(&CancelWait::default(), &idle, &mut 0).await,
             CycleOutcome::Idle
         );
         assert!(cache.is_empty());
+    }
+
+    /// **The bug the rotating window fixes.** With more candidates than one
+    /// cycle recalls, a fixed window would re-recall the same first
+    /// `MAX_PER_CYCLE` every minute and the ones past it would NEVER hold a
+    /// cached recall — so `dispatch_issue` would silently render no memory
+    /// section for them forever, on exactly the busy board where memory helps
+    /// most. Successive cycles must cover the whole set.
+    #[tokio::test]
+    async fn the_window_rotates_so_every_candidate_is_eventually_cached() {
+        let n = MAX_PER_CYCLE + 3;
+        let issues: Vec<Issue> = (0..n)
+            .map(|i| issue(&i.to_string(), &format!("MT-{i}"), &["rust"]))
+            .collect();
+        let cache = Arc::new(PrefetchCache::new());
+        let mut cursor = 0usize;
+        for cycle in 0..2 {
+            let d = deps(
+                teams(true, BackendKind::Hindsight),
+                bank_with(&[("alice", vec![fact("f1", "x")])]),
+                tracker(issues.clone()),
+                Arc::clone(&cache),
+                cycle,
+            );
+            prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await;
+        }
+        // Two cycles of 10 cover 13 candidates.
+        for i in 0..n {
+            assert!(
+                cache.try_get("alice", &format!("MT-{i}"), at(2)).is_some(),
+                "MT-{i} was never cached after two cycles (cache has {} entries)",
+                cache.len()
+            );
+        }
+    }
+
+    /// The other half of that fix: a candidate this cycle's window did NOT reach
+    /// keeps what the cache already holds for it, because it is still live. Only
+    /// a ticket that left the candidate set is evicted — which is the eviction
+    /// rule `record_issue_states` actually states.
+    #[tokio::test]
+    async fn a_live_candidate_outside_the_window_keeps_its_entry() {
+        let issues: Vec<Issue> = (0..MAX_PER_CYCLE + 1)
+            .map(|i| issue(&i.to_string(), &format!("MT-{i}"), &["rust"]))
+            .collect();
+        let cache = Arc::new(PrefetchCache::new());
+        let mut cursor = 0usize;
+        let first = deps(
+            teams(true, BackendKind::Hindsight),
+            bank_with(&[("alice", vec![fact("f1", "x")])]),
+            tracker(issues.clone()),
+            Arc::clone(&cache),
+            0,
+        );
+        prefetch_cycle(&CancelWait::default(), &first, &mut cursor).await;
+        assert!(cache.try_get("alice", "MT-0", at(1)).is_some());
+
+        // Cycle two's window starts at MT-10 and wraps, so MT-1..MT-9 are live
+        // but untouched. They must still be served.
+        let second = deps(
+            teams(true, BackendKind::Hindsight),
+            bank_with(&[("alice", vec![fact("f1", "x")])]),
+            tracker(issues),
+            Arc::clone(&cache),
+            1,
+        );
+        prefetch_cycle(&CancelWait::default(), &second, &mut cursor).await;
+        for i in 0..=MAX_PER_CYCLE {
+            assert!(
+                cache.try_get("alice", &format!("MT-{i}"), at(2)).is_some(),
+                "MT-{i} lost its entry to a cycle that simply did not reach it"
+            );
+        }
+    }
+
+    /// A carried entry keeps its ORIGINAL timestamp, so carrying can never
+    /// extend a fact set past the TTL — otherwise a ticket that stayed a
+    /// candidate would be served from a recall made hours ago.
+    #[test]
+    fn carrying_does_not_refresh_a_timestamp() {
+        let cache = PrefetchCache::new();
+        let key = PrefetchKey::new("alice", "MT-1");
+        let live: HashSet<PrefetchKey> = [key.clone()].into_iter().collect();
+        cache.sync(vec![(key.clone(), vec![fact("f1", "x")])], &live, at(0));
+
+        let ttl = PREFETCH_TTL.as_secs() as i64;
+        // Carried, repeatedly, right up to the boundary.
+        cache.sync(Vec::new(), &live, at(ttl - 1));
+        assert!(cache.try_get("alice", "MT-1", at(ttl)).is_some());
+        // And past it, the carry itself drops it.
+        cache.sync(Vec::new(), &live, at(ttl + 1));
+        assert!(cache.try_get("alice", "MT-1", at(ttl + 1)).is_none());
+        assert!(
+            cache.is_empty(),
+            "a stale entry is dropped by the sync, not merely refused"
+        );
     }
 
     // ── degradation ─────────────────────────────────────────────────────────────────────────────
@@ -788,7 +975,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            prefetch_cycle(&CancelWait::default(), &d).await,
+            prefetch_cycle(&CancelWait::default(), &d, &mut 0).await,
             CycleOutcome::BankFailure
         );
         assert_eq!(
@@ -812,7 +999,7 @@ mod tests {
             Arc::clone(&cache),
             0,
         );
-        prefetch_cycle(&CancelWait::default(), &ok).await;
+        prefetch_cycle(&CancelWait::default(), &ok, &mut 0).await;
 
         let broken = deps(
             teams(true, BackendKind::Hindsight),
@@ -822,7 +1009,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            prefetch_cycle(&CancelWait::default(), &broken).await,
+            prefetch_cycle(&CancelWait::default(), &broken, &mut 0).await,
             CycleOutcome::TrackerFailure
         );
         assert!(cache.try_get("alice", "MT-1", at(2)).is_some());
@@ -880,7 +1067,7 @@ mod tests {
             now: Box::new(|| at(0)),
         };
         assert_eq!(
-            prefetch_cycle(&CancelWait::default(), &d).await,
+            prefetch_cycle(&CancelWait::default(), &d, &mut 0).await,
             CycleOutcome::BankFailure
         );
         assert!(cache.try_get("alice", "MT-1", at(1)).is_some());
