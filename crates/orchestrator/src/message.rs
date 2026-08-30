@@ -13,6 +13,12 @@
 //! into the live run's mailbox, closing the half of the summon dead zone where a comment posted
 //! mid-run never reached the live agent.
 //!
+//! [`Orchestrator::seed_reopen_summons`] closes the OTHER half (STUDIO-649, a Rhapsody-only addition —
+//! Go's `promoteAndDispatch` has no counterpart): a summons that REOPENS a review-state ticket is by
+//! construction older than the run it triggers, so the mid-run router's "newer than the run start"
+//! test skips it forever and the fresh run never saw the reviewer's instructions. The reopen dispatch
+//! path seeds that run's mailbox with the same body, through the same admission path.
+//!
 //! Deviations from the Go source, all behavior-preserving:
 //!   * Go's per-run mailbox is a field on the `runningEntry` (`chan string`); a Rust
 //!     [`tokio::sync::mpsc`] channel splits into a non-`Clone`/non-`Sync` receiver + a sender, so the
@@ -28,6 +34,7 @@
 //!     reply await, with `handle_run_message` unchanged as the on-loop body.
 //!   * Diagnostics log via `tracing` (as the sibling crates do) instead of a threaded `slog` logger.
 
+use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use rhapsody_core::Issue;
@@ -40,8 +47,11 @@ use crate::select::TaggedIssue;
 /// (INF-250). Mirrors Go `operatorMailboxCap`.
 pub(crate) const OPERATOR_MAILBOX_CAP: usize = 16;
 
-/// Delivered when a mid-run summons has no comment body available (a tracker source that only surfaces
-/// the timestamp). Mirrors Go `midRunSummonFallback`.
+/// Delivered when a summons has no comment body available (a tracker source that only surfaces the
+/// timestamp). Mirrors Go `midRunSummonFallback`; STUDIO-649's reopen seed reuses it verbatim rather
+/// than inventing a second nudge for the same "we know you were summoned, go read the ticket" case.
+/// Its "mid-run" wording still reads true on the reopen path: by the time the agent sees it, its run
+/// IS live and the newest comments are what it must re-read.
 const MID_RUN_SUMMON_FALLBACK: &str =
     "a human summoned you mid-run — re-read this ticket's newest comments for updated instructions";
 
@@ -213,6 +223,56 @@ impl Orchestrator {
             } else {
                 tracing::info!(issue_identifier = %identifier, run_id, "mid-run summons deferred: operator mailbox full; will retry next tick");
             }
+        }
+    }
+
+    /// Seeds the operator mailbox of a run that a REVIEW-REOPEN just dispatched with the body of the
+    /// summons that TRIGGERED the reopen (STUDIO-649). A reopening summons is always older than the
+    /// run it starts, so [`deliver_mid_run_summons`](Orchestrator::deliver_mid_run_summons) — which
+    /// requires `summon_at > re.started_at` — can never deliver it; without this the fresh run got the
+    /// prompt and the ticket description and nothing else, and a reviewer's instructions were dropped
+    /// on the floor precisely when they mattered most.
+    ///
+    /// Reuses [`deliver_to_mailbox`](Orchestrator::deliver_to_mailbox), so the same INF-250 admission
+    /// applies: the WRAPPED body goes on the bounded mailbox ([`OPERATOR_MAILBOX_CAP`]) and the
+    /// ORIGINAL body is persisted as a "sent" `run_messages` row. An empty body seeds
+    /// [`MID_RUN_SUMMON_FALLBACK`], exactly as the mid-run route does. Advancing the per-run
+    /// `last_delivered_summon_at` watermark on success is what makes the two routes agree that this
+    /// summons is spent, so neither can deliver it twice; a rejected (full/absent mailbox) admission
+    /// leaves the watermark unadvanced.
+    ///
+    /// Called from `promote_and_dispatch` (`loop.rs`) immediately AFTER `dispatch_issue` — the entry
+    /// and its mailbox must exist first. There is no await between the two, so this runs before the
+    /// control task can yield; and because the worker holds the SAME receiver across every turn, a
+    /// message queued while it is still provisioning its workspace is drained at the first turn
+    /// regardless. Rhapsody-only: Go's `promoteAndDispatch` has no counterpart (see README
+    /// "Divergences").
+    pub(crate) fn seed_reopen_summons(
+        &mut self,
+        issue_id: &str,
+        summon_at: DateTime<Utc>,
+        body: &str,
+    ) {
+        let Some(re) = self.running.get(issue_id) else {
+            return; // promote succeeded but nothing was dispatched — nothing to seed.
+        };
+        if summon_at <= re.last_delivered_summon_at {
+            return; // already delivered this (or a newer) summons to this run
+        }
+        let (run_id, identifier) = (re.run_id, re.issue.identifier.clone());
+        let body = if body.is_empty() {
+            MID_RUN_SUMMON_FALLBACK
+        } else {
+            body
+        };
+        let admitted = self.deliver_to_mailbox(re, body).1;
+        if admitted {
+            if let Some(re) = self.running.get_mut(issue_id) {
+                re.last_delivered_summon_at = summon_at;
+            }
+            tracing::info!(issue_identifier = %identifier, run_id, summon_at = %summon_at, "reopening summons seeded into the fresh run");
+        } else {
+            tracing::info!(issue_identifier = %identifier, run_id, "reopening summons NOT seeded: operator mailbox unavailable");
         }
     }
 
@@ -718,5 +778,91 @@ mod tests {
             .mailbox_try_recv("ID-1")
             .expect("tagged mid-run summons must be delivered");
         assert!(got.contains("fix the MTU"), "payload = {got:?}");
+    }
+
+    // STUDIO-649: the summons that TRIGGERS a reopen predates the run it starts, so the mid-run
+    // router skips it forever. `seed_reopen_summons` hands it to the fresh run through the SAME
+    // INF-250 admission path: wrapped on the mailbox, original body persisted, watermark advanced.
+    #[tokio::test]
+    async fn reopen_summon_seeded_into_the_fresh_run() {
+        let (mut o, base) = midrun_harness();
+        let run_id = o.running.get("ID-1").expect("running").run_id;
+        // Older than the run it triggered — exactly the case `deliver_mid_run_summons` drops.
+        let summon = base - Duration::hours(1);
+
+        o.seed_reopen_summons("ID-1", summon, "@symphony also rename the cosmetic names");
+
+        let got = o
+            .mailbox_try_recv("ID-1")
+            .expect("the reopening summons must reach the fresh run");
+        assert!(
+            got.contains("OPERATOR MESSAGE") && got.contains("rename the cosmetic names"),
+            "mailbox payload = {got:?}, want the wrapped summons body"
+        );
+        let msgs = o
+            .store()
+            .list_run_messages(run_id)
+            .expect("list run messages");
+        assert_eq!(msgs.len(), 1, "expected exactly one persisted run_message");
+        assert_eq!(
+            msgs[0].body, "@symphony also rename the cosmetic names",
+            "persisted body must be the ORIGINAL (unwrapped) summons body"
+        );
+        assert_eq!(
+            o.running
+                .get("ID-1")
+                .expect("running")
+                .last_delivered_summon_at,
+            summon,
+            "watermark should equal the seeded summons' time"
+        );
+
+        // The watermark now bars the mid-run router from re-delivering the same summons.
+        let cand = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            latest_summon_at: Some(summon),
+            latest_summon_body: "@symphony also rename the cosmetic names".into(),
+            ..Default::default()
+        };
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        assert!(
+            o.mailbox_try_recv("ID-1").is_none(),
+            "the seeded summons must not be delivered a second time"
+        );
+        // …and re-seeding the same (or an older) summons is a no-op too.
+        o.seed_reopen_summons("ID-1", summon, "@symphony also rename the cosmetic names");
+        assert!(
+            o.mailbox_try_recv("ID-1").is_none(),
+            "re-seeding a summons at or before the watermark must be a no-op"
+        );
+    }
+
+    // STUDIO-649: a reopening summons whose source could not surface a body still nudges the fresh
+    // run, with the SAME fallback text the mid-run route uses.
+    #[tokio::test]
+    async fn reopen_summon_fallback_body() {
+        let (mut o, base) = midrun_harness();
+        o.seed_reopen_summons("ID-1", base - Duration::hours(1), "");
+        let got = o
+            .mailbox_try_recv("ID-1")
+            .expect("a body-less reopening summons must still be seeded (fallback)");
+        assert!(
+            got.contains(MID_RUN_SUMMON_FALLBACK),
+            "payload = {got:?}, want the generic fallback nudge"
+        );
+    }
+
+    // STUDIO-649: seeding an issue with no live run (the promote succeeded but dispatch did not
+    // record an entry) is a silent no-op, never a panic.
+    #[tokio::test]
+    async fn reopen_summon_without_a_live_run_is_a_noop() {
+        let (mut o, base) = midrun_harness();
+        o.seed_reopen_summons("ID-NOPE", base, "@symphony hello?");
+        assert!(
+            o.mailbox_try_recv("ID-NOPE").is_none(),
+            "an issue with no live run has no mailbox to seed"
+        );
     }
 }
