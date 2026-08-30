@@ -593,6 +593,49 @@ impl Orchestrator {
         format!("{section}\n\n{memory}")
     }
 
+    /// Binds a just-dispatched run to the provenance a later `teams_retain` is
+    /// stamped from (§5.1). A no-op when there is no Teams memory runtime, when
+    /// the run wears no identity, or when there is no run row to name.
+    ///
+    /// The workspace directory is resolved here, on the control task, because it
+    /// is a pure path computation ([`Manager::path_for`]) over data dispatch
+    /// already holds — no filesystem access. The `git rev-parse` that turns it
+    /// into a commit SHA happens later, off-loop, on the HTTP task that serves
+    /// the retain.
+    pub(crate) fn bind_teams_run(&self, re: &RunningEntry) {
+        let Some(mem) = self.teams_memory.as_ref() else {
+            return;
+        };
+        let workspace_dir = self
+            .eff
+            .as_ref()
+            .map(|eff| {
+                let repo = if re.project_repo.is_empty() {
+                    eff.cfg.repo.clone()
+                } else {
+                    re.project_repo.clone()
+                };
+                eff.workspace.path_for(&repo, &re.issue.identifier)
+            })
+            .unwrap_or_default();
+        mem.bind_run(
+            re.run_id,
+            crate::teamsmemory::RunProvenance {
+                identity: re.identity.clone(),
+                ticket: re.issue.identifier.clone(),
+                workspace_dir,
+            },
+        );
+    }
+
+    /// Releases a finished run's binding, so a completed run cannot keep
+    /// retaining and the roster's derived status stays live.
+    pub(crate) fn release_teams_run(&self, re: &RunningEntry) {
+        if let Some(mem) = self.teams_memory.as_ref() {
+            mem.release_run(re.run_id);
+        }
+    }
+
     /// Records the ticket states this tick's poller observed, for §5.2's
     /// re-grounding of recalled facts (T4).
     ///

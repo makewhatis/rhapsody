@@ -390,6 +390,11 @@ impl Orchestrator {
         if let Some(td) = &teams_dispatch {
             self.record_route_event(&mut re, td);
         }
+        // Bind the run to its identity for the off-loop `teams_retain` (STUDIO-645, T4): the tool
+        // takes `content` and nothing else, so the host must already know who this run is before
+        // the agent can ask to record anything. Two map writes, no I/O, and skipped entirely for a
+        // run with no identity or no run row — such a run simply cannot retain (§5.1).
+        self.bind_teams_run(&re);
         // Per-run operator-message mailbox (INF-250): buffered so a brief delivery lag doesn't reject
         // an operator's message; a full mailbox (`OPERATOR_MAILBOX_CAP`) rejects backlog_full. Go
         // carries this channel on the running entry; the Rust `mpsc` split makes it a side map keyed by
@@ -538,6 +543,7 @@ impl Orchestrator {
         let Some(re) = self.running.remove(&e.issue_id) else {
             return;
         };
+        self.release_teams_run(&re);
         let dur = ((self.now)() - re.started_at)
             .num_nanoseconds()
             .unwrap_or(0) as f64

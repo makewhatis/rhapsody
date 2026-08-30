@@ -333,6 +333,18 @@ pub struct Orchestrator {
     /// forbade.
     pub issue_states: HashMap<String, String>,
 
+    /// The **off-loop** Teams memory runtime (STUDIO-645, T4): the loaded config, the constructed
+    /// backend, and the live run → identity binding a `teams_retain` is stamped from. Shared by
+    /// `Arc` with the daemon's HTTP layer.
+    ///
+    /// This is the fourth sanctioned off-loop seam (see `crates/orchestrator/CLAUDE.md`), and it
+    /// exists because §5.1 requires a retain to be "best-effort, never fatal, **never blocking the
+    /// control task**". The control task's only interaction with it is two `HashMap` operations —
+    /// [`bind_run`](crate::teamsmemory::TeamsMemory::bind_run) at dispatch and
+    /// [`release_run`](crate::teamsmemory::TeamsMemory::release_run) at run exit — with no I/O and
+    /// no lock held across an `.await`. `None` when the daemon has no Teams runtime at all.
+    pub teams_memory: Option<Arc<crate::teamsmemory::TeamsMemory>>,
+
     /// Live workers, keyed by opaque issue id.
     pub running: HashMap<String, RunningEntry>,
     /// Issue ids currently claimed (dispatched or in a claim election), a set.
@@ -532,6 +544,7 @@ impl Orchestrator {
             teams_profiles_dir: None,
             teams_bank: None,
             issue_states: HashMap::new(),
+            teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),

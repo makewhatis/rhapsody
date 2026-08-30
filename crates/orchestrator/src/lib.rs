@@ -62,6 +62,7 @@ pub mod snapshot;
 pub mod snapshot_json;
 pub mod stop;
 pub mod teams;
+pub mod teamsmemory;
 pub mod telemetry_attrs;
 pub mod triage;
 pub mod warnings;

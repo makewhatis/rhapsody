@@ -289,6 +289,19 @@ mod tests {
     use super::*;
     use crate::testutil::TempDir;
 
+    /// The newest shipped version of a built-in profile. Used instead of a
+    /// hardcoded `@1` so a designed built-in bump (T4 shipped v2) moves these
+    /// assertions with the registry rather than breaking them — the version
+    /// these tests care about is "the latest", not a particular number.
+    fn newest_builtin(name: &str) -> u32 {
+        rhapsody_config::profiles::builtin_profiles()
+            .iter()
+            .filter(|b| b.name == name)
+            .map(|b| b.version)
+            .max()
+            .unwrap_or_else(|| panic!("no built-in profile named {name:?}"))
+    }
+
     /// Points the verbs at a hermetic store home by writing a WORKFLOW.md whose
     /// `storage.path` sits under `dir`, and returns the resolved profiles dir.
     fn hermetic(dir: &TempDir) -> (Vec<String>, PathBuf) {
@@ -329,7 +342,10 @@ mod tests {
         let out = run(&["show", "swe"], &env[0]).expect("show swe");
         assert!(out.contains("profile:      swe"), "out = {out}");
         assert!(
-            out.contains("base:         swe@1 (tracking latest)"),
+            out.contains(&format!(
+                "base:         swe@{} (tracking latest)",
+                newest_builtin("swe")
+            )),
             "out = {out}"
         );
         assert!(out.contains("overlay:      none"), "out = {out}");
@@ -409,7 +425,10 @@ mod tests {
         assert!(!profiles_dir.exists());
 
         let out = run(&["fork", "sre"], &env[0]).expect("fork sre");
-        assert!(out.contains("forked sre from sre@1"), "out = {out}");
+        assert!(
+            out.contains(&format!("forked sre from sre@{}", newest_builtin("sre"))),
+            "out = {out}"
+        );
 
         let path = profiles_dir.join("sre.md");
         let text = std::fs::read_to_string(&path).expect("read forked file");
@@ -454,7 +473,10 @@ mod tests {
         );
 
         let out = run(&["fork", "swe", "--force"], &env[0]).expect("--force overwrites");
-        assert!(out.contains("forked swe from swe@1"), "out = {out}");
+        assert!(
+            out.contains(&format!("forked swe from swe@{}", newest_builtin("swe"))),
+            "out = {out}"
+        );
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.starts_with("---\nextends: none\n"), "text = {text}");
         assert!(

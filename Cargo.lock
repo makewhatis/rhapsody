@@ -1699,6 +1699,7 @@ dependencies = [
  "rhapsody-store",
  "rhapsody-tracker",
  "rhapsody-workspace",
+ "serde",
  "serde_json",
  "serde_yaml_ng",
  "thiserror 2.0.18",
