@@ -48,7 +48,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, Record};
 use rhapsody_config::room::{AUDIENCE_ROOM, Cursor, Message, RoomError, RoomLog};
 use rhapsody_config::teams::Teams;
@@ -145,8 +145,11 @@ pub struct PostView {
     pub from: String,
     /// The wire audience: a teammate's name, or [`AUDIENCE_ROOM`] for the room.
     pub to: String,
-    /// The host clock at append time.
-    pub at: DateTime<Utc>,
+    /// The host clock at append time, rendered EXACTLY as the log line renders it (RFC 3339,
+    /// second precision, `Z`). A `DateTime<Utc>` here would echo sub-second precision the log
+    /// never stored, so this response and a later `GET /api/v1/teams/room` would disagree about
+    /// the timestamp of the same message.
+    pub at: String,
     /// The refs the poster attached (§0.10 — what proves it).
     pub refs: Vec<String>,
     /// How many LIVE runs the direct message also reached in their mailbox, wearing the teammate
@@ -372,7 +375,8 @@ impl TeamsMemory {
             id,
             from: prov.identity,
             to: msg.to.as_wire().to_string(),
-            at: now,
+            // The log's own rendering, so this view and a later room read agree byte for byte.
+            at: msg.at.to_rfc3339_opts(SecondsFormat::Secs, true),
             refs: msg.refs,
             delivered: 0,
         })

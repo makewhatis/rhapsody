@@ -18,7 +18,12 @@
 //! 2. **Direct-to-live delivery, wearing the teammate wrap.** When the post named a teammate and
 //!    that teammate has a live run, the body ALSO lands in that run's mailbox through the INF-250
 //!    admission ([`admit_to_mailbox`](crate::orchestrator::Orchestrator::admit_to_mailbox)), so the
-//!    answer arrives inside the turn rather than on the next waking.
+//!    answer arrives inside the turn rather than on the next waking. That admission also persists
+//!    the recipient's `run_messages` row — §6.5's first recording leg, and *required* rather than
+//!    optional: `persist_run_message_delivered` marks the oldest still-"sent" row when the runner
+//!    reports a stdin write, so a delivery with no row would mis-stamp the NEXT operator message's
+//!    `delivered_turn`. The row stores the WRAPPED text, because `run_messages` has no author
+//!    column and a bare body there would read back as the operator's.
 //!
 //! # The teammate wrap is the security-relevant half (§0.11.4)
 //!
@@ -134,10 +139,16 @@ impl Orchestrator {
         }
         // Collect the targets first: the admission borrows `&self` while `running` is also what we
         // are iterating, and a stable, sorted list is what makes the delivery order deterministic.
+        //
+        // The POSTING run is excluded even when it wears the addressed identity. A teammate may
+        // legitimately address its own identity — a note its next run catches up on — but echoing
+        // it back into the mailbox of the run that is writing it right now would push the agent's
+        // own words into its own stdin stream, dressed as a peer's. Any OTHER live run of that
+        // identity still hears it, which is what addressing the teammate meant.
         let mut targets: Vec<(i64, String)> = self
             .running
             .iter()
-            .filter(|(_, re)| re.identity == post.to)
+            .filter(|(_, re)| re.identity == post.to && re.run_id != post.from_run_id)
             .map(|(id, re)| (re.run_id, id.clone()))
             .collect();
         targets.sort_unstable();
@@ -147,9 +158,10 @@ impl Orchestrator {
             let Some(re) = self.running.get(&issue_id) else {
                 continue;
             };
-            // `persist_as: None` — the room log is this message's durable record; see
-            // `admit_to_mailbox`.
-            if self.admit_to_mailbox(re, &wrapped, None).1 {
+            // The WRAPPED text is what is persisted as well as delivered (§6.5's `run_messages`
+            // leg): the table has no author column, so storing the bare body would read back, in
+            // the one place a human reviews a run's messages, as something the operator said.
+            if self.admit_to_mailbox(re, &wrapped, &wrapped).1 {
                 delivered += 1;
                 tracing::info!(
                     from = %post.from, to = %post.to, run_id,
@@ -180,11 +192,11 @@ impl Orchestrator {
             return;
         };
         re.event_seq += 1;
-        let (run_id, seq, at) = (
-            re.run_id,
-            re.event_seq,
-            crate::persist::rfc3339(re.started_at),
-        );
+        // `(self.now)()`, NOT `re.started_at`. `record_route_event` may use the run's start because
+        // it is written AT dispatch; a post happens mid-run, and stamping it with the run's start
+        // would sort it to the top of the timeline and claim it happened before the work did.
+        let (run_id, seq) = (re.run_id, re.event_seq);
+        let at = crate::persist::rfc3339((self.now)());
         let audience = if post.to.is_empty() {
             rhapsody_config::room::AUDIENCE_ROOM
         } else {
@@ -489,8 +501,9 @@ mod tests {
     }
 
     /// The poster's run gets ONE `teams.message` timeline row — a data value in the existing `kind`
-    /// column, naming the audience and the log line it mirrors. The RECIPIENT's run gets no
-    /// `run_messages` row: peer speech is not operator speech, in the timeline either.
+    /// column, naming the audience and the log line it mirrors — and the RECIPIENT's run gets the
+    /// `run_messages` row §6.5's first leg calls for, carrying the ATTRIBUTED text so it cannot read
+    /// back as something the operator said.
     #[tokio::test]
     async fn a_post_writes_one_teams_message_row_on_the_posters_run() {
         let Harness {
@@ -498,9 +511,14 @@ mod tests {
         } = post_harness(&["alice", "bob"]);
         let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
         let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
+        // A fixed clock an hour AFTER the runs started, so the row's `at` proves it was stamped at
+        // POST time rather than copied off the run's `started_at`.
+        let started_at = o.running.get("ID-B").expect("running").started_at;
+        let posted_at = started_at + chrono::Duration::hours(1);
+        o.now = Box::new(move || posted_at);
 
         let view = mem
-            .post_for_run(bob_run, "heads up", "alice", &[], Utc::now())
+            .post_for_run(bob_run, "heads up", "alice", &[], posted_at)
             .expect("post");
         o.handle_teams_post(&TeamsPost::from_view(bob_run, &view, "heads up"));
         o.stop_event_writer(); // drain the batched writer
@@ -510,15 +528,82 @@ mod tests {
             rows.iter().filter(|(k, _)| k == EVENT_MESSAGE).collect();
         assert_eq!(mine.len(), 1, "exactly one timeline row: {rows:?}");
         assert_eq!(mine[0].1, format!("to=alice id={}", view.id));
+        assert_eq!(
+            store
+                .run_events(bob_run)
+                .expect("run events")
+                .into_iter()
+                .find(|e| e.kind == EVENT_MESSAGE)
+                .map(|e| e.at),
+            Some(crate::persist::rfc3339(posted_at)),
+            "the row is stamped when the post happened, not when the run started"
+        );
         assert!(
             events_of(store.as_ref(), alice_run)
                 .iter()
                 .all(|(k, _)| k != EVENT_MESSAGE),
             "the row belongs to the POSTER's run, not the recipient's"
         );
+        let recipient_rows = store.list_run_messages(alice_run).expect("list");
+        assert_eq!(
+            recipient_rows.len(),
+            1,
+            "§6.5's `run_messages` leg: one row per admission, which is also what keeps \
+             `persist_run_message_delivered`'s FIFO marking honest"
+        );
         assert!(
-            store.list_run_messages(alice_run).expect("list").is_empty(),
-            "a teammate message is not an operator message and must not be filed as one"
+            recipient_rows[0].body.contains("TEAMMATE MESSAGE from bob"),
+            "the stored text must carry its author: {:?}",
+            recipient_rows[0].body
+        );
+        assert!(
+            recipient_rows[0].body.contains("heads up"),
+            "and the message itself: {:?}",
+            recipient_rows[0].body
+        );
+    }
+
+    /// **A teammate delivery must not steal the next operator message's `delivered_turn`.**
+    /// `persist_run_message_delivered` marks the OLDEST still-"sent" row when the runner reports a
+    /// stdin write, so row order has to match mailbox order. Queue a teammate message ahead of an
+    /// operator one, report two writes, and both rows must end up marked with the turn they were
+    /// actually written on — which only holds because every admission persists a row.
+    #[tokio::test]
+    async fn a_teammate_delivery_does_not_steal_the_next_operator_messages_turn() {
+        let Harness {
+            mut o, store, mem, ..
+        } = post_harness(&["alice", "bob"]);
+        let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
+        let bob_run = dispatch_as(&mut o, "ID-B", "MT-2", "bob");
+
+        // Teammate message first, operator message second — the order that would mis-stamp.
+        let view = mem
+            .post_for_run(bob_run, "peer question", "alice", &[], Utc::now())
+            .expect("post");
+        o.handle_teams_post(&TeamsPost::from_view(bob_run, &view, "peer question"));
+        o.send_run_message(alice_run, "operator instruction");
+
+        // The runner reports the two stdin writes, in mailbox order.
+        for turn in [2, 3] {
+            o.on_agent_update(crate::agentupdate::AgentUpdate {
+                issue_id: "ID-A".into(),
+                ev: rhapsody_agent::Event {
+                    event_type: rhapsody_agent::EVENT_OPERATOR_MESSAGE.into(),
+                    turn,
+                    ..Default::default()
+                },
+            });
+        }
+
+        let rows = store.list_run_messages(alice_run).expect("list");
+        assert_eq!(rows.len(), 2, "one row per admission: {rows:?}");
+        assert!(rows[0].body.contains("TEAMMATE MESSAGE from bob"));
+        assert_eq!(rows[0].delivered_turn, Some(2));
+        assert_eq!(rows[1].body, "operator instruction");
+        assert_eq!(
+            rows[1].delivered_turn,
+            Some(3),
+            "the operator's row must carry the turn ITS text was written on"
         );
     }
 
@@ -616,6 +701,41 @@ mod tests {
             let got = o.mailbox_try_recv(id).unwrap_or_default();
             assert!(got.contains("TEAMMATE MESSAGE from bob"), "{id}: {got}");
         }
+    }
+
+    /// A run that addresses its OWN identity does not get its own words back mid-turn. The post is
+    /// in the log for the next waking (and for any other live run of that identity), but the
+    /// writing run's own mailbox is left alone.
+    #[tokio::test]
+    async fn a_run_does_not_deliver_a_post_back_into_its_own_mailbox() {
+        let Harness {
+            mut o, room, mem, ..
+        } = post_harness(&["alice"]);
+        let a1 = dispatch_as(&mut o, "ID-A1", "MT-1", "alice");
+        dispatch_as(&mut o, "ID-A2", "MT-2", "alice");
+
+        let view = mem
+            .post_for_run(a1, "note to self", "alice", &[], Utc::now())
+            .expect("post");
+        let delivered = o.handle_teams_post(&TeamsPost::from_view(a1, &view, "note to self"));
+
+        assert_eq!(
+            delivered, 1,
+            "the OTHER live alice hears it, and only that one"
+        );
+        assert!(
+            o.mailbox_try_recv("ID-A1").is_none(),
+            "the writing run must not receive its own words back mid-turn"
+        );
+        assert!(o.mailbox_try_recv("ID-A2").is_some());
+        assert_eq!(
+            room.read_since("alice", &Cursor::default(), 10)
+                .expect("read")
+                .messages
+                .len(),
+            1,
+            "it is still in the log for the next waking"
+        );
     }
 
     /// A body-supplied author is ignored, the way T4's retain test proves it for a record's

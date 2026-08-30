@@ -150,19 +150,23 @@ impl Orchestrator {
     /// router ([`deliver_mid_run_summons`](Orchestrator::deliver_mid_run_summons), INF-448) so there is
     /// exactly ONE admission path honoring [`OPERATOR_MAILBOX_CAP`]. Mirrors Go `deliverToMailbox`.
     pub(crate) fn deliver_to_mailbox(&self, re: &RunningEntry, body: &str) -> (i64, bool) {
-        self.admit_to_mailbox(re, &operator_wrap(body), Some(body))
+        self.admit_to_mailbox(re, &operator_wrap(body), body)
     }
 
     /// The ONE mailbox admission: a non-blocking send of `wrapped` (a full — or absent, for
-    /// legacy/test-injected entries — mailbox rejects), then an optional best-effort persist of
-    /// `persist_as` as a `run_messages` row.
+    /// legacy/test-injected entries — mailbox rejects), then a best-effort persist of `persist_as`
+    /// as a `run_messages` row.
     ///
-    /// `persist_as: Some(original)` is the operator path ([`deliver_to_mailbox`](Orchestrator::deliver_to_mailbox)),
-    /// where the store keeps the operator's own words while the mailbox carries the wrapper.
-    /// `None` is STUDIO-653's teammate path: a peer message's durable record is the room log, and a
-    /// `run_messages` row would file peer speech in the very table the run-detail view labels
-    /// operator messages — re-creating, in the timeline, exactly the authority confusion the
-    /// teammate wrap exists to prevent (§0.11.4).
+    /// The two arguments are separate because the operator path stores the operator's OWN words
+    /// while the mailbox carries the wrapper; STUDIO-653's teammate path passes the wrapped text
+    /// for both, because `run_messages` has no author column and a bare body there would read back
+    /// as the operator's.
+    ///
+    /// **Every admission persists a row, and that is load-bearing rather than incidental:**
+    /// [`persist_run_message_delivered`](Orchestrator::persist_run_message_delivered) marks the
+    /// OLDEST still-"sent" row when the runner reports a stdin write, so the row order must match
+    /// the mailbox order. An admission that skipped its row would make the next operator message's
+    /// `delivered_turn` the turn some OTHER message was written.
     ///
     /// Split out of `deliver_to_mailbox` so the wrapper is the CALLER's choice while
     /// [`OPERATOR_MAILBOX_CAP`] stays the single bound both paths honour. Mirrors Go
@@ -171,7 +175,7 @@ impl Orchestrator {
         &self,
         re: &RunningEntry,
         wrapped: &str,
-        persist_as: Option<&str>,
+        persist_as: &str,
     ) -> (i64, bool) {
         let sent = {
             let mailboxes = self
@@ -186,10 +190,7 @@ impl Orchestrator {
         if !sent {
             return (0, false);
         }
-        match persist_as {
-            Some(body) => (self.persist_run_message(re, body), true),
-            None => (0, true),
-        }
+        (self.persist_run_message(re, persist_as), true)
     }
 
     /// Returns the opaque issue id of the live run whose `run_id` matches, or `""` when none does
