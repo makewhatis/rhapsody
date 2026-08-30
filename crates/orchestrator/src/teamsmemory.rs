@@ -302,11 +302,21 @@ impl TeamsMemory {
                 "identity is required".to_string(),
             ));
         }
+        // The query is offered BOTH ways, and it has to be.
+        //
+        // As a title it contributes its 4+-character tokens, which is what a
+        // prose query ("the mirror lock") needs. But as a title ALONE, the most
+        // obvious use of this tool silently failed: `"MT-9"` splits into `mt`
+        // and `9`, both under the token threshold, so recalling by ticket
+        // identifier returned nothing at all — empty, with no error to notice,
+        // while the fact sat in the bank. Offering it as `ticket` too lets an
+        // exact identifier match score outright.
+        //
+        // This cannot broaden recall into "return everything": `ticket` only
+        // scores on an exact `f.ticket` match or a whole-string containment, so
+        // a prose query that names no ticket adds nothing through this field.
         let q = Query {
-            // A tool caller's free text is a title-shaped query, not a ticket
-            // identifier — but a query that IS a ticket still matches, because
-            // the scorer looks for it in the record body too.
-            ticket: String::new(),
+            ticket: query.trim().to_string(),
             labels: Vec::new(),
             title: query.to_string(),
             top_k: usize::try_from(self.teams.memory.recall_top_k).unwrap_or(0),
@@ -640,6 +650,43 @@ mod tests {
             .await
             .expect("invalidate");
         assert!(!again.invalidated);
+    }
+
+    /// **Querying by ticket identifier must work** — it is the most obvious use
+    /// of `teams_recall`, and the one an agent reaches for first.
+    ///
+    /// It did not: the scorer only counts title tokens of 4+ characters, so
+    /// `"MT-9"` splits into `mt` and `9`, both below the threshold, and the tool
+    /// returned NOTHING while the fact sat right there in the bank. Silently
+    /// empty, with no error to notice. The query is therefore offered as the
+    /// ticket too, which an exact `f.ticket` match scores outright.
+    #[tokio::test]
+    async fn recall_by_ticket_identifier_finds_the_fact() {
+        let dir = TempDir::new();
+        let mem = local(&dir, teams_on(vec![ident("alice")]));
+        mem.bind_run(7, bound("alice", "MT-9"));
+        mem.retain_for_run(7, "the mirror lock is per-repo", now())
+            .await
+            .expect("retain");
+
+        for query in ["MT-9", "mt-9", "MT-9 mirror lock"] {
+            let got = mem.recall("alice", query).await.expect("recall");
+            assert_eq!(
+                got.facts.len(),
+                1,
+                "recalling by ticket {query:?} must find the fact, got {got:?}"
+            );
+        }
+        // A short query that names nothing still matches nothing — offering the
+        // query as a ticket must not turn recall into "return everything".
+        assert!(
+            mem.recall("alice", "zz-1")
+                .await
+                .expect("recall")
+                .facts
+                .is_empty(),
+            "an unrelated ticket query must still recall nothing"
+        );
     }
 
     /// A missing record is a NotFound, distinguishable from a backend failure so
