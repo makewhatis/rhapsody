@@ -156,8 +156,16 @@ recorded `stopped` / `"ticket moved externally"`.
 | "which build is this daemon?" | unanswerable — no endpoint, no version in any payload | `GET /api/v1/version` |
 
 ```json
-{ "version": "v0.3.1-8-g581e281", "commit": "581e281…", "built_at": "2026-08-13T16:10:35Z" }
+{ "version": "v0.3.1-8-g581e281", "commit": "581e281…", "built_at": "2026-08-13T16:10:35Z", "teams_enabled": false }
 ```
+
+`teams_enabled` (STUDIO-652) is the one **runtime** bit alongside the build identity, and it is here
+for a specific reason. The dashboard must know whether Rhapsody Teams is on before it may fetch any
+`/api/v1/teams*` route, and asking a Teams endpoint whether Teams is on would be exactly the
+poll-to-learn-it-is-off a Teams-off app must not do. `/api/v1/state` is byte-pinned to the Go golden
+and can carry no Rhapsody-only key at all, while this route is already additive and already fetched
+once at shell mount — so the gate costs no request of its own. A daemon that predates the field
+omits it, which clients read as off.
 
 Baked in at compile time by `crates/httpapi/build.rs`. Every probe is best-effort and reports the
 `"unknown"` sentinel rather than failing the build, so the crate still compiles outside a git
@@ -259,8 +267,8 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
 | Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/`, no `teams/room/` |
 
-Six **additive** Rhapsody-only endpoints back the Teams tools; no existing payload changes shape
-and no golden moves. Each answers `409 teams_disabled` when Teams is off:
+Seven **additive** Rhapsody-only endpoints back the Teams tools and the dashboard; no existing
+payload changes shape and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 
 | Endpoint | Serves |
 | --- | --- |
@@ -270,6 +278,7 @@ and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 | `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host |
 | `GET /api/v1/teams/room?limit=` | the newest posts in the team room, bounded; advances no cursor |
 | `POST /api/v1/runs/{id}/post` | post to the team room as a live run, `from` stamped by the host |
+| `GET /api/v1/teams` | the dashboard's one view: the roster with derived status, the manager mode and the memory backend (STUDIO-652) |
 
 The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_retain`,
 `teams_room_read` and `teams_post`. `teams_retain` takes `content` and nothing else on purpose: the
@@ -347,6 +356,26 @@ not. `rhapsody:quorum-requested` on the parent is the idempotency record, so a r
 review fixes never fans out twice. The trigger is the **daemon-mediated handoff above**, the moment
 the daemon executes rather than infers; an agent that moves its own ticket through the Linear-MCP
 fallback is not observed.
+
+**The dashboard surface** (STUDIO-652) is where an operator sees all of this. It adds one more
+endpoint, `GET`/`POST /api/v1/teams/config`, which is the **only** Teams route not gated on Teams
+being enabled — it is how a disabled daemon gets enabled, and off is the only state from which
+anyone would open it. It follows `POST /api/v1/config`'s discipline instead: the daemon validates a
+candidate with the same `Teams::validate` it applies at boot, writes atomically only when valid, and
+leaves the on-disk file untouched on a rejection, surfacing its own complaint verbatim. **The
+never-seed rule is unchanged** — reading it creates nothing, and `teams.yaml` appears only when
+someone explicitly saves one. Because Teams config is boot-loaded (there is no watcher on
+`teams.yaml`, unlike `WORKFLOW.md`), the response carries `restart_required` and the UI says so.
+
+With Teams off the dashboard is byte-for-byte what it was: no status chip, no panel, and **zero**
+requests against `/api/v1/teams*`, because the gate is the `teams_enabled` field above. With Teams
+on, the app shows the roster with each teammate's live runs (linking to that run's existing detail
+view), a read-only tail of the room, and each identity's memory with a per-record
+invalidate-with-reason button. Room posts and recalled facts are rendered as quoted,
+provenance-prefixed data — they are untrusted content that reaches every teammate's prompt, so the
+app never renders them as bare prose. The panel has **no compose box**: teammates post through
+`teams_post` (STUDIO-653), but a post from the *app* has no run identity, so it could only be a
+*human* post, and that provenance question is still open.
 
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside

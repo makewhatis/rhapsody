@@ -39,6 +39,7 @@ import type { Updater } from "@/hooks/useUpdater";
 import { GeneralTab } from "./GeneralTab";
 import { ProjectsTab } from "./ProjectsTab";
 import { AddAgentSheet } from "./AddAgentSheet";
+import { TeamsTab } from "./TeamsTab";
 import { ToolsTab } from "./ToolsTab";
 import { LogsTab } from "./LogsTab";
 import { UpdatesTab } from "./UpdatesTab";
@@ -52,6 +53,7 @@ const AUTOSAVE_DEBOUNCE_MS = 600;
 const SETTINGS_NAV: { id: SettingsTabId; label: string }[] = [
   { id: "general", label: "General" },
   { id: "projects", label: "Projects" },
+  { id: "teams", label: "Teams" },
   { id: "tools", label: "Tools" },
   { id: "logs", label: "Logs" },
   { id: "updates", label: "Updates" },
@@ -62,6 +64,10 @@ const TAB_META: Record<SettingsTabId, { title: string; desc: string }> = {
   projects: {
     title: "Projects",
     desc: "Each agent watches one Linear project and runs coding agents on its tickets.",
+  },
+  teams: {
+    title: "Teams",
+    desc: "Named teammates with their own profiles, memory and a shared room — off until you create teams.yaml.",
   },
   tools: { title: "Tools", desc: "Detected CLIs and connection health, re-checked on launch." },
   logs: { title: "Logs", desc: "Live daemon process log — polling, dispatch, restarts, and errors." },
@@ -402,10 +408,14 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
 
   // Tools, Logs, and Updates are read-only, config-independent panels: they don't read the config
   // draft, so they render before the config load/skeleton guards (and hide the autosave indicator).
-  const readOnlyTab = tab === "tools" || tab === "logs" || tab === "updates";
+  // "Teams" joins them (STUDIO-652): it reads teams.yaml, not WORKFLOW.md, and it deliberately has
+  // no autosave — autosaving a file whose ABSENCE is the off state would create it on open.
+  const readOnlyTab = tab === "tools" || tab === "logs" || tab === "updates" || tab === "teams";
 
   let body: React.ReactNode;
-  if (tab === "tools") {
+  if (tab === "teams") {
+    body = <TeamsTab />;
+  } else if (tab === "tools") {
     body = <ToolsTab />;
   } else if (tab === "logs") {
     body = <LogsTab />;

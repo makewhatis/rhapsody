@@ -21,7 +21,7 @@ use rhapsody_httpapi::{
 };
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, RetainView, RoomView, RosterView, TeamsMemory,
-    TeamsMemoryError,
+    TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
     CancelWait, ControlHandle, HandoffResult, Identity, ReadsError, RefreshResult, ReloadError,
@@ -81,6 +81,15 @@ pub struct DaemonState {
     /// The read-only history view, narrowed once from the handle's shared store (stable for the
     /// daemon's lifetime — the store is injected before `Run`).
     history: Arc<dyn HistoryStore>,
+    /// Where this daemon reads `teams.yaml`, for the enable flow's `GET`/`POST
+    /// /api/v1/teams/config` (STUDIO-652). Empty ⇒ no on-disk runtime home, so there is no
+    /// `teams.yaml` to read or write and the endpoint says so.
+    ///
+    /// Carried HERE rather than on `ControlHandle` because it is a boot-time path the control loop
+    /// has no use for: `run::run` already resolves it (to decide whether to load Teams at all), and
+    /// threading it through the orchestrator would give the control task a field only the HTTP task
+    /// ever reads.
+    teams_config_path: String,
 }
 
 impl DaemonState {
@@ -88,7 +97,19 @@ impl DaemonState {
     /// `o.control()`) BEFORE the orchestrator moves into the control-loop task.
     pub fn new(handle: ControlHandle) -> Self {
         let history: Arc<dyn HistoryStore> = Arc::new(HistoryView(handle.store()));
-        Self { handle, history }
+        Self {
+            handle,
+            history,
+            teams_config_path: String::new(),
+        }
+    }
+
+    /// Names the `teams.yaml` the enable flow reads and writes (STUDIO-652) — the same path
+    /// `run::run` resolved to decide whether to load Teams at boot, so the endpoint and the daemon
+    /// can never disagree about which file matters.
+    pub fn with_teams_config_path(mut self, path: impl Into<String>) -> Self {
+        self.teams_config_path = path.into();
+        self
     }
 }
 
@@ -192,6 +213,21 @@ impl StateProvider for DaemonState {
     /// daemon with `enabled: false` gives.
     async fn teams_roster(&self) -> Result<RosterView, TeamsMemoryError> {
         self.teams_memory()?.roster()
+    }
+
+    /// The dashboard's one view (STUDIO-652) — the roster plus the settings that make it legible.
+    async fn teams_overview(&self) -> Result<TeamsView, TeamsMemoryError> {
+        self.teams_memory()?.overview()
+    }
+
+    /// The gate the dashboard reads off `GET /api/v1/version` before it fetches any Teams route
+    /// (STUDIO-652). A field read on the shared config — no control-loop round-trip.
+    fn teams_enabled(&self) -> bool {
+        self.handle.teams_memory().is_some_and(|mem| mem.enabled())
+    }
+
+    fn teams_config_path(&self) -> &str {
+        &self.teams_config_path
     }
 
     /// The room's read side (STUDIO-650, T5) — the fifth Teams surface, and read-only in the

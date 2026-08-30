@@ -390,6 +390,10 @@ fn recall_query(teams: &Teams, iss: &Issue) -> Query {
         labels: iss.labels.clone().unwrap_or_default(),
         title: iss.title.clone(),
         top_k: usize::try_from(teams.memory.recall_top_k).unwrap_or(0),
+        // Never a browse: a dispatch recall is a SEARCH for what bears on this ticket, and
+        // "everything this teammate remembers" is not that. Spelled out rather than defaulted so
+        // the turn-1 prompt's scoring is visibly unchanged by STUDIO-652's browse surface.
+        browse: false,
     }
 }
 

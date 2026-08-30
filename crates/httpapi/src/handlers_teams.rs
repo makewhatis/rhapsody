@@ -15,6 +15,15 @@
 //! | `POST /api/v1/runs/{id}/retain` | `teams_retain {content}` |
 //! | `GET /api/v1/teams/room` | `teams_room_read {limit?}` (STUDIO-650, T5) |
 //! | `POST /api/v1/runs/{id}/post` | `teams_post {body, to?, refs?}` (STUDIO-653, T6) |
+//! | `GET /api/v1/teams` | the dashboard's one view (STUDIO-652) |
+//! | `GET`/`POST /api/v1/teams/config` | the dashboard's enable flow (STUDIO-652) |
+//!
+//! `/api/v1/teams/config` is the ONE route here that is **not** gated on Teams being enabled, and
+//! it has to be: it is how a disabled daemon gets enabled, and off is the only state from which
+//! anyone would open it. It follows `POST /api/v1/config`'s discipline instead — validate with the
+//! daemon's own `Teams::validate`, atomically rewrite only when valid, and leave the on-disk file
+//! untouched on a rejection. §2.1's never-seed rule survives intact: nothing here writes unless a
+//! human explicitly POSTs a config.
 //!
 //! Retain is deliberately **run-scoped in its path**, following
 //! `/api/v1/runs/{id}/handoff`: the run id is what the host resolves the
@@ -33,8 +42,9 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
+use rhapsody_config::teams::{Teams, TeamsError};
 use rhapsody_orchestrator::teamsmemory::TeamsMemoryError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::handlers::{require_get, require_post};
 use crate::handlers_runaction::parse_run_id;
@@ -290,6 +300,153 @@ pub(crate) async fn handle_run_post(
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
+}
+
+/// `GET /api/v1/teams` — the ONE view the dashboard renders (STUDIO-652): the roster with each
+/// identity's derived status, plus the manager mode and memory backend that make it legible.
+pub(crate) async fn handle_teams(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    match provider.teams_overview().await {
+        Ok(view) => write_json(StatusCode::OK, &view),
+        Err(e) => teams_error(&e),
+    }
+}
+
+/// Caps a `teams.yaml` POST. A roster is a handful of short records; 256 KiB bounds abuse on the
+/// loopback socket while sitting far above any real file. (`/api/v1/config` allows 1 MiB because a
+/// WORKFLOW.md carries a whole prompt body; this file carries none.)
+const MAX_TEAMS_CONFIG_BODY: usize = 1 << 18;
+
+/// `GET`/`POST /api/v1/teams/config` — the enable flow's read and write of `teams.yaml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct TeamsConfigView {
+    /// Where this daemon reads `teams.yaml`.
+    pub path: String,
+    /// Whether the file exists at all. **`false` is the shipped state** (§2.1): absent ≡ disabled,
+    /// and reading this endpoint does not change that — nothing here seeds.
+    pub present: bool,
+    /// Why a PRESENT file did not load, verbatim from the daemon's own loader; empty when it did
+    /// (or when there is none). Surfaced rather than swallowed, because a `teams.yaml` the daemon
+    /// rejected reads as "Teams is off" everywhere else in the app, which is indistinguishable
+    /// from never having written one.
+    pub error: String,
+    /// The loaded config, or the schema defaults (i.e. disabled) when there is no file. Always
+    /// present, so an editor has something to render either way.
+    pub config: Teams,
+    /// Teams config is **boot-loaded**: `run::run` reads `teams.yaml` once before `Run` and there
+    /// is no watcher on it, unlike `WORKFLOW.md`. A save therefore takes effect on the next daemon
+    /// start, and the UI has to say so. Carried as a field rather than assumed by the client so the
+    /// day the daemon does hot-reload it, the note disappears by itself.
+    pub restart_required: bool,
+}
+
+/// `POST /api/v1/teams/config` body — `{"config": {...}}`, mirroring `/api/v1/config`'s envelope
+/// so the two config writes read the same on the wire.
+#[derive(Debug, Default, Deserialize)]
+struct TeamsConfigReq {
+    #[serde(default)]
+    config: Teams,
+}
+
+/// `GET`/`POST /api/v1/teams/config`, dispatched by method (the shape `handle_config` uses).
+pub(crate) async fn handle_teams_config(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    body: Bytes,
+) -> Response {
+    match method {
+        Method::GET | Method::HEAD => teams_config_get(provider.as_ref()),
+        Method::POST => teams_config_post(provider.as_ref(), &body),
+        _ => write_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "use GET to read or POST to write teams.yaml",
+            Some("GET, HEAD, POST"),
+        ),
+    }
+}
+
+/// The current on-disk `teams.yaml`, or the disabled default plus `present: false`.
+fn teams_config_get(provider: &dyn StateProvider) -> Response {
+    let path = provider.teams_config_path();
+    if path.is_empty() {
+        return no_teams_config_home();
+    }
+    let p = std::path::Path::new(path);
+    let present = p.exists();
+    let (config, error) = match Teams::try_load(p) {
+        Ok(teams) => (teams, String::new()),
+        // A present-but-rejected file is reported WITH its reason and WITH the off state, not as a
+        // 500: the daemon booted through exactly this and is running disabled, so the endpoint
+        // reports what the daemon did rather than a failure the daemon did not have.
+        Err(err) => (Teams::disabled(), err.to_string()),
+    };
+    write_json(
+        StatusCode::OK,
+        &TeamsConfigView {
+            path: path.to_string(),
+            present,
+            error,
+            config,
+            restart_required: true,
+        },
+    )
+}
+
+/// Validate → (only if valid) atomically write → echo what is now on disk.
+fn teams_config_post(provider: &dyn StateProvider, body: &Bytes) -> Response {
+    let path = provider.teams_config_path();
+    if path.is_empty() {
+        return no_teams_config_home();
+    }
+    if body.len() > MAX_TEAMS_CONFIG_BODY {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "request body exceeds 256 KiB",
+            None,
+        );
+    }
+    let req: TeamsConfigReq = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(err) => return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None),
+    };
+    // `Teams::save` validates first and writes nothing on a rejection, so a bad edit can never
+    // replace a working file — and the complaint is the daemon's own, verbatim, rather than a
+    // second implementation of the same rules that could disagree with the one that decides
+    // whether the file loads at boot.
+    match Teams::save(std::path::Path::new(path), &req.config) {
+        Ok(()) => teams_config_get(provider),
+        Err(err @ (TeamsError::Invalid(_) | TeamsError::Parse(_))) => write_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_teams_config",
+            err.to_string(),
+            None,
+        ),
+        Err(err) => write_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "teams_config_write_error",
+            err.to_string(),
+            None,
+        ),
+    }
+}
+
+/// A daemon with no on-disk runtime home (`--no-store`, `storage.path: off` / `:memory:`) has
+/// nowhere to keep a `teams.yaml`, so the enable flow says that rather than guessing a path and
+/// writing somewhere the daemon will never read.
+fn no_teams_config_home() -> Response {
+    write_error(
+        StatusCode::CONFLICT,
+        "teams_config_unavailable",
+        "this daemon has no on-disk runtime home, so it has no teams.yaml to read or write",
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -589,6 +746,288 @@ mod tests {
             let resp = reqwest::get(&format!("{url}{path}")).await.expect("GET");
             assert_eq!(resp.status(), 405, "{path}");
         }
+    }
+
+    // ── the dashboard surface (STUDIO-652) ─────────────────────────────────────────────────────
+
+    /// `GET /api/v1/teams` — the ONE view the dashboard renders: the roster with derived status,
+    /// plus the manager mode and memory backend that make it legible.
+    #[tokio::test]
+    async fn the_overview_serves_the_roster_manager_mode_and_backend() {
+        let dir = TempDir::new();
+        let mem = teams_memory(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn_with(mem).await;
+        let view = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams"))
+                .await
+                .expect("GET teams"),
+        )
+        .await;
+        assert_eq!(view["enabled"], true);
+        assert_eq!(view["manager_mode"], "labels");
+        assert_eq!(view["backend"], "local");
+        assert_eq!(view["roster"][0]["name"], "alice");
+        assert_eq!(view["roster"][0]["live_runs"], 1);
+        assert_eq!(view["roster"][0]["tickets"][0], "MT-9");
+    }
+
+    /// Teams off ⇒ `teams_disabled` and a GET-only route, exactly like every other Teams surface.
+    #[tokio::test]
+    async fn the_overview_is_disabled_without_a_teams_runtime() {
+        let url = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
+        let resp = reqwest::get(&format!("{url}/api/v1/teams"))
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 409);
+        assert_eq!(err_code(resp).await, "teams_disabled");
+
+        let dir = TempDir::new();
+        let on = spawn_with(teams_memory(&dir)).await;
+        assert_eq!(
+            post(&format!("{on}/api/v1/teams"), "{}").await.status(),
+            405
+        );
+    }
+
+    /// **`GET /api/v1/version` carries the gate** (STUDIO-652): the dashboard learns Teams is off
+    /// from the request it already makes at mount, so a Teams-off app never touches
+    /// `/api/v1/teams*` at all. The build fields are untouched beside it.
+    #[tokio::test]
+    async fn the_version_endpoint_carries_the_teams_gate() {
+        let off = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
+        let body = body_json(
+            reqwest::get(&format!("{off}/api/v1/version"))
+                .await
+                .expect("GET version"),
+        )
+        .await;
+        assert_eq!(body["teams_enabled"], false, "{body}");
+        for field in ["version", "commit", "built_at"] {
+            assert!(
+                body[field].is_string(),
+                "the build identity must keep its top-level fields: {body}"
+            );
+        }
+
+        let dir = TempDir::new();
+        let on = spawn_with(teams_memory(&dir)).await;
+        let body = body_json(
+            reqwest::get(&format!("{on}/api/v1/version"))
+                .await
+                .expect("GET version"),
+        )
+        .await;
+        assert_eq!(body["teams_enabled"], true, "{body}");
+    }
+
+    // ── the enable flow (STUDIO-652) ───────────────────────────────────────────────────────────
+
+    /// A daemon with no `teams.yaml` reports the off state **and creates nothing** — §2.1's
+    /// never-seed rule, now with a read endpoint pointed straight at it.
+    #[tokio::test]
+    async fn reading_an_absent_teams_config_reports_off_and_seeds_nothing() {
+        let dir = TempDir::new();
+        let path = dir.0.join("teams.yaml");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_config_path(path.to_string_lossy()),
+        ))
+        .await;
+
+        let body = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/config"))
+                .await
+                .expect("GET"),
+        )
+        .await;
+        assert_eq!(body["present"], false, "{body}");
+        assert_eq!(body["config"]["enabled"], false, "{body}");
+        assert_eq!(body["error"], "");
+        assert_eq!(
+            body["restart_required"], true,
+            "teams.yaml is boot-loaded, and the UI has to say so: {body}"
+        );
+        assert!(
+            !path.exists(),
+            "reading the enable flow must never create teams.yaml"
+        );
+    }
+
+    /// **The explicit enable, round-tripped.** A POST writes the file and the echoed view is read
+    /// back off disk — so what the editor shows next is what the daemon will boot.
+    #[tokio::test]
+    async fn posting_a_teams_config_writes_it_and_echoes_what_is_on_disk() {
+        let dir = TempDir::new();
+        let path = dir.0.join("teams.yaml");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_config_path(path.to_string_lossy()),
+        ))
+        .await;
+
+        let body = body_json(
+            post(
+                &format!("{url}/api/v1/teams/config"),
+                r#"{"config":{"enabled":true,"manager":{"mode":"labels+model"},"memory":{"backend":"none"},"roster":[{"name":"alice","profile":"swe","labels":["rust"]}]}}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["present"], true, "{body}");
+        assert_eq!(body["config"]["enabled"], true, "{body}");
+        assert_eq!(body["config"]["manager"]["mode"], "labels+model", "{body}");
+        assert_eq!(body["config"]["memory"]["backend"], "none", "{body}");
+        assert_eq!(body["config"]["roster"][0]["name"], "alice", "{body}");
+        assert!(path.exists(), "an explicit save creates teams.yaml");
+
+        // The daemon's own loader agrees with what the endpoint echoed.
+        let loaded = Teams::load(&path);
+        assert!(loaded.enabled);
+        assert_eq!(loaded.roster[0].name, "alice");
+    }
+
+    /// A rejected config is refused with the **daemon's own complaint, verbatim**, and leaves the
+    /// working file exactly as it was — `POST /api/v1/config`'s discipline, applied here.
+    #[tokio::test]
+    async fn an_invalid_teams_config_is_refused_and_never_overwrites() {
+        let dir = TempDir::new();
+        let path = dir.0.join("teams.yaml");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_config_path(path.to_string_lossy()),
+        ))
+        .await;
+        post(
+            &format!("{url}/api/v1/teams/config"),
+            r#"{"config":{"enabled":true,"roster":[{"name":"alice"}]}}"#,
+        )
+        .await;
+
+        let resp = post(
+            &format!("{url}/api/v1/teams/config"),
+            r#"{"config":{"enabled":true,"roster":[{"name":"Alice"}]}}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_teams_config", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("label-safe"),
+            "the daemon's own complaint must reach the operator verbatim: {body}"
+        );
+        assert_eq!(
+            Teams::load(&path).roster[0].name,
+            "alice",
+            "a rejected save must leave the working file untouched"
+        );
+    }
+
+    /// A present-but-broken `teams.yaml` reports the reason WITH the off state. Everywhere else in
+    /// the app that file reads as "Teams is off", which is indistinguishable from never having
+    /// written one — this is the one place that difference is visible.
+    #[tokio::test]
+    async fn a_broken_teams_config_reports_its_reason_with_the_off_state() {
+        let dir = TempDir::new();
+        let path = dir.0.join("teams.yaml");
+        std::fs::write(&path, "enabled: true\nroster: [\n").expect("write a broken file");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_config_path(path.to_string_lossy()),
+        ))
+        .await;
+
+        let body = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/config"))
+                .await
+                .expect("GET"),
+        )
+        .await;
+        assert_eq!(body["present"], true, "{body}");
+        assert_eq!(body["config"]["enabled"], false, "the daemon booted off");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("teams_"),
+            "the loader's reason must be reported: {body}"
+        );
+    }
+
+    /// A daemon with no on-disk runtime home has nowhere to keep a `teams.yaml`, and says so
+    /// rather than guessing a path and writing where the daemon will never read.
+    #[tokio::test]
+    async fn a_daemon_with_no_runtime_home_has_no_teams_config() {
+        let url = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
+        let resp = reqwest::get(&format!("{url}/api/v1/teams/config"))
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 409);
+        assert_eq!(err_code(resp).await, "teams_config_unavailable");
+
+        let resp = post(&format!("{url}/api/v1/teams/config"), r#"{"config":{}}"#).await;
+        assert_eq!(resp.status(), 409);
+        assert_eq!(err_code(resp).await, "teams_config_unavailable");
+    }
+
+    /// The config route answers a 405 ENVELOPE on anything but GET/HEAD/POST, rather than falling
+    /// through to the SPA fallback — this crate's method-agnostic registration rule.
+    #[tokio::test]
+    async fn the_teams_config_route_refuses_other_methods() {
+        let dir = TempDir::new();
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_teams_config_path(dir.0.join("teams.yaml").to_string_lossy()),
+        ))
+        .await;
+        let resp = reqwest::Client::new()
+            .delete(format!("{url}/api/v1/teams/config"))
+            .send()
+            .await
+            .expect("DELETE");
+        assert_eq!(resp.status(), 405);
+    }
+
+    /// **The browse the memory panel needs** (§5.2.3): an empty `query` lists what the identity
+    /// remembers, so a wrong fact can be seen before it can be invalidated.
+    #[tokio::test]
+    async fn recall_with_an_empty_query_lists_the_bank() {
+        let dir = TempDir::new();
+        let mem = teams_memory(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn_with(Arc::clone(&mem)).await;
+        for content in ["the mirror lock is per-repo", "goldens are recaptured only"] {
+            post(
+                &format!("{url}/api/v1/runs/7/retain"),
+                &format!(r#"{{"content":"{content}"}}"#),
+            )
+            .await;
+        }
+
+        let body = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/recall?identity=alice&query="))
+                .await
+                .expect("GET recall"),
+        )
+        .await;
+        assert_eq!(
+            body["facts"].as_array().map(Vec::len),
+            Some(2),
+            "an empty query lists the bank: {body}"
+        );
     }
 
     // ── the room's read side (STUDIO-650, T5) ──────────────────────────────────────────────────

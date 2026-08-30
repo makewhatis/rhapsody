@@ -219,7 +219,15 @@ where
     let mut server_task = None;
     let mut runtime_port_published = false;
     if let (eff_port, true) = resolve_server_port(flags.port, &flags.path) {
-        let provider = Arc::new(DaemonState::new(handle.clone()));
+        // The enable flow (STUDIO-652) reads and writes the SAME `teams.yaml` the boot load above
+        // resolved, so `GET/POST /api/v1/teams/config` and the daemon can never disagree about
+        // which file matters. `None` (no on-disk runtime home) leaves it empty, and the endpoint
+        // reports that rather than guessing a path.
+        let teams_config_path = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let provider =
+            Arc::new(DaemonState::new(handle.clone()).with_teams_config_path(teams_config_path));
         let logs = Arc::new(LogBufferSource::new(tel.logs.clone()));
         match rhapsody_httpapi::Server::bind(provider, Some(logs), &format!("127.0.0.1:{eff_port}"))
             .await

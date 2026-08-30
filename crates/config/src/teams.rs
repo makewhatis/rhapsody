@@ -20,8 +20,10 @@
 //! defaulted and validated here and consumed by NOTHING — the routing (T3a),
 //! triage (T3b) and memory (T4) slices are where they acquire behaviour.
 
+use crate::workflow::{create_temp, write_temp_and_rename};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 /// How the manager decides which identity takes a ticket (§2.2, §3.2, §3.5).
@@ -391,7 +393,12 @@ impl Teams {
     /// share a name; `manager.default_identity`, when set, names a roster
     /// entry. Runs regardless of `enabled` so a user editing the file sees the
     /// complaint before they flip the toggle, not after.
-    fn validate(&self) -> Result<(), TeamsError> {
+    ///
+    /// `pub` since STUDIO-652 so the Settings-page enable flow rejects a
+    /// candidate roster with **exactly** the daemon's own complaint, verbatim,
+    /// rather than with a second implementation of these rules that could
+    /// disagree with the one that decides whether the file loads at boot.
+    pub fn validate(&self) -> Result<(), TeamsError> {
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.roster.len());
         for entry in &self.roster {
             if !is_label_safe(&entry.name) {
@@ -416,6 +423,47 @@ impl Teams {
             )));
         }
         Ok(())
+    }
+
+    /// Writes `teams.yaml` — **the only code in the tree that creates it**
+    /// (STUDIO-652), and only ever when a caller explicitly asks.
+    ///
+    /// This does not weaken §2.1's never-seed rule; it is what that rule leaves
+    /// room for. "Absent ≡ off, and nothing creates it implicitly" is about
+    /// *reads*: [`Teams::load`] and [`Teams::try_load`] still never write, so
+    /// booting, reading, resolving and `teams show` all leave an absent file
+    /// absent. An operator deliberately enabling Teams is the explicit act the
+    /// rule names as the one way the file appears.
+    ///
+    /// Validation runs FIRST and a rejection writes nothing, so a bad edit can
+    /// never replace a working file — the discipline `POST /api/v1/config`
+    /// already applies to `WORKFLOW.md`. The write itself is the crate's
+    /// `~/.rhapsody` convention (temp file + chmod + rename), so no reader ever
+    /// observes half a config.
+    ///
+    /// It writes the CANONICAL serialization: every schema default made
+    /// explicit, in field order, with comments and hand-written key order in an
+    /// existing file not preserved. That is the same property `workflow::save`
+    /// has for `WORKFLOW.md`, and the caller is expected to say so before
+    /// overwriting a file a human wrote — the Settings enable flow does.
+    pub fn save(path: &Path, teams: &Teams) -> Result<(), TeamsError> {
+        teams.validate()?;
+        let yaml = serde_yaml_ng::to_string(teams).map_err(|e| TeamsError::Parse(e.to_string()))?;
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| TeamsError::Io(e.to_string()))?;
+        let (file, tmp_path) =
+            create_temp(dir, "teams").map_err(|e| TeamsError::Io(e.to_string()))?;
+        write_temp_and_rename(file, &tmp_path, yaml.as_bytes(), 0o600, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            TeamsError::Io(e.to_string())
+        })
     }
 }
 
@@ -446,6 +494,80 @@ mod tests {
             Teams::disabled()
         );
         assert!(!path.exists(), "try_load must not seed either");
+    }
+
+    /// **`save` is the explicit enable §2.1 leaves room for** (STUDIO-652): it
+    /// creates the file, and a `load` of what it wrote is the value that went
+    /// in. Round-tripping through YAML is the property that matters — the
+    /// Settings editor writes a `Teams` and the daemon boots the same one.
+    #[test]
+    fn save_creates_the_file_and_round_trips_through_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams.yaml");
+        let teams = Teams {
+            enabled: true,
+            manager: Manager {
+                mode: ManagerMode::LabelsModel,
+                default_identity: "alice".to_string(),
+                ..Manager::default()
+            },
+            memory: Memory {
+                backend: MemoryBackend::None,
+                ..Memory::default()
+            },
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                profile: "swe".to_string(),
+                labels: vec!["rust".to_string(), "config".to_string()],
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+
+        Teams::save(&path, &teams).expect("save");
+        assert!(path.exists(), "save must create teams.yaml");
+        assert_eq!(Teams::load(&path), teams, "save → load round-trips");
+    }
+
+    /// A rejected config writes NOTHING — not a new file, and not over a
+    /// working one. The same discipline `POST /api/v1/config` applies to
+    /// WORKFLOW.md: a bad edit can never corrupt a config that loads.
+    #[test]
+    fn save_validates_first_and_leaves_the_previous_file_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams.yaml");
+        let good = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+        Teams::save(&path, &good).expect("save the good one");
+
+        let bad = Teams {
+            roster: vec![Identity {
+                name: "Alice".to_string(), // not label-safe
+                ..Identity::default()
+            }],
+            ..good.clone()
+        };
+        let err = Teams::save(&path, &bad).expect_err("an invalid roster is rejected");
+        assert!(
+            matches!(err, TeamsError::Invalid(_)),
+            "expected a validation error, got {err}"
+        );
+        assert_eq!(
+            Teams::load(&path),
+            good,
+            "a rejected save must leave the working file exactly as it was"
+        );
+
+        // And onto a path that does not exist yet, a rejection creates nothing at all.
+        let fresh = dir.path().join("nested").join("teams.yaml");
+        assert!(Teams::save(&fresh, &bad).is_err());
+        assert!(!fresh.exists(), "a rejected save must create no file");
     }
 
     /// The off state is the schema's defaults with the toggle off, and it is

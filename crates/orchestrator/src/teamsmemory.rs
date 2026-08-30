@@ -97,6 +97,29 @@ pub struct RosterView {
     pub roster: Vec<RosterRow>,
 }
 
+/// `GET /api/v1/teams` — the ONE view the dashboard renders (STUDIO-652).
+///
+/// A superset of [`RosterView`] rather than a replacement for it: `teams_roster` is an agent-facing
+/// MCP tool whose payload is a contract, so the dashboard gets its own view instead of growing that
+/// one. What it adds over the roster is the two facts an operator needs to read the roster
+/// correctly — *how* tickets are assigned (`manager_mode`) and *whether* anything is remembered
+/// (`backend`) — which are otherwise invisible in the app.
+///
+/// `enabled` is always `true` here, because a Teams-off daemon answers this route
+/// `teams_disabled` and never reaches this struct. It is serialised anyway so a client reads one
+/// unambiguous shape rather than inferring the feature's state from an HTTP status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TeamsView {
+    pub enabled: bool,
+    /// `off` | `labels` | `labels+model` — the wire spelling `teams.yaml` uses.
+    pub manager_mode: String,
+    /// Who takes a ticket nothing matched; empty ⇒ run without an identity.
+    pub default_identity: String,
+    /// `none` | `local` | `hindsight`.
+    pub backend: String,
+    pub roster: Vec<RosterRow>,
+}
+
 /// `GET /api/v1/teams/recall`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RecallView {
@@ -456,6 +479,20 @@ impl TeamsMemory {
         })
     }
 
+    /// `GET /api/v1/teams` — the roster plus the two settings that make it legible
+    /// (STUDIO-652). Built ON TOP of [`roster`](TeamsMemory::roster), so the dashboard and the
+    /// `teams_roster` tool can never report different derived status.
+    pub fn overview(&self) -> Result<TeamsView, TeamsMemoryError> {
+        let roster = self.roster()?;
+        Ok(TeamsView {
+            enabled: self.teams.enabled,
+            manager_mode: manager_mode_name(&self.teams),
+            default_identity: self.teams.manager.default_identity.clone(),
+            backend: roster.backend,
+            roster: roster.roster,
+        })
+    }
+
     /// Recalls an identity's memory for a free-text `query` (§6.7's
     /// `teams_recall {identity, query}` — the memory-first path, no live turn).
     pub async fn recall(
@@ -490,6 +527,11 @@ impl TeamsMemory {
             labels: Vec::new(),
             title: query.to_string(),
             top_k: usize::try_from(self.teams.memory.recall_top_k).unwrap_or(0),
+            // An EMPTY query is not a search that matches nothing — it is "what does this
+            // teammate remember", the question the dashboard's memory listing asks before anyone
+            // can notice a wrong fact and invalidate it (§5.2.3, STUDIO-652). Still bounded by
+            // `recall_top_k`: browse widens what matches, never how much comes back.
+            browse: query.trim().is_empty(),
         };
         let recalled = self.backend.recall(identity, &q).await?;
         for (file, why) in &recalled.skipped {
@@ -596,6 +638,17 @@ impl TeamsMemory {
     }
 }
 
+/// The configured manager mode's name, for the overview view — the `teams.yaml` wire spelling,
+/// so what the app shows is what an operator would type into the file.
+fn manager_mode_name(teams: &Teams) -> String {
+    match teams.manager.mode {
+        rhapsody_config::teams::ManagerMode::Off => "off",
+        rhapsody_config::teams::ManagerMode::Labels => "labels",
+        rhapsody_config::teams::ManagerMode::LabelsModel => "labels+model",
+    }
+    .to_string()
+}
+
 /// The configured backend's name, for the roster view.
 fn backend_name(teams: &Teams) -> String {
     match teams.memory.backend {
@@ -682,6 +735,73 @@ mod tests {
             ticket: ticket.to_string(),
             workspace_dir: String::new(),
         }
+    }
+
+    /// **The dashboard's one view** (STUDIO-652): the roster plus the two settings that make it
+    /// legible. The derived status is the roster's own, not a second computation of it.
+    #[tokio::test]
+    async fn overview_reports_the_roster_plus_manager_mode_and_backend() {
+        let dir = TempDir::new();
+        let teams = Arc::new(Teams {
+            enabled: true,
+            manager: rhapsody_config::teams::Manager {
+                mode: rhapsody_config::teams::ManagerMode::LabelsModel,
+                default_identity: "alice".to_string(),
+                ..rhapsody_config::teams::Manager::default()
+            },
+            roster: vec![ident("alice"), ident("bob")],
+            ..Teams::disabled()
+        });
+        let mem = local(&dir, teams);
+        mem.bind_run(7, bound("alice", "MT-9"));
+        mem.bind_run(8, bound("alice", "MT-4"));
+
+        let view = mem.overview().expect("overview");
+        assert!(view.enabled);
+        assert_eq!(view.manager_mode, "labels+model");
+        assert_eq!(view.default_identity, "alice");
+        assert_eq!(view.backend, "local");
+        assert_eq!(view.roster.len(), 2);
+        assert_eq!(view.roster[0].name, "alice");
+        assert_eq!(view.roster[0].bank, "agent-alice");
+        assert_eq!(view.roster[0].live_runs, 2);
+        assert_eq!(view.roster[0].tickets, vec!["MT-4", "MT-9"], "sorted");
+        assert_eq!(view.roster[1].live_runs, 0, "bob is idle");
+        assert_eq!(
+            mem.roster().expect("roster").roster,
+            view.roster,
+            "the overview must not compute derived status a second way"
+        );
+    }
+
+    /// Teams off ⇒ the overview is `teams_disabled`, exactly like every other Teams surface.
+    #[tokio::test]
+    async fn overview_is_disabled_when_teams_is_off() {
+        let mem = TeamsMemory::new(Arc::new(Teams::disabled()), Arc::new(NoneBackend));
+        assert_eq!(mem.overview().expect_err("off"), TeamsMemoryError::Disabled);
+    }
+
+    /// **An empty query lists the bank** (STUDIO-652, §5.2.3): the browse the dashboard's memory
+    /// panel needs before anyone can notice a wrong fact. A non-empty query still searches.
+    #[tokio::test]
+    async fn an_empty_recall_query_browses_the_whole_bank() {
+        let dir = TempDir::new();
+        let mem = local(&dir, teams_on(vec![ident("alice")]));
+        mem.bind_run(7, bound("alice", "MT-9"));
+        for content in ["the mirror lock is per-repo", "goldens are recaptured only"] {
+            mem.retain_for_run(7, content, now()).await.expect("retain");
+        }
+
+        let browsed = mem.recall("alice", "   ").await.expect("recall");
+        assert_eq!(
+            browsed.facts.len(),
+            2,
+            "an empty query lists everything the bank holds: {browsed:?}"
+        );
+
+        let searched = mem.recall("alice", "goldens").await.expect("recall");
+        assert_eq!(searched.facts.len(), 1, "a real query still searches");
+        assert_eq!(searched.facts[0].content, "goldens are recaptured only");
     }
 
     /// **The anti-forgery property.** The tool takes `content` and nothing else:
