@@ -221,8 +221,11 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         workflow_path: String::new(),
         git_flow: r.git_flow,
         workspace_mode: r.workspace_mode,
-        // pr_label defaults to "symphony" so the post-run labeler is on by default but tunable.
-        pr_label: or_str(r.pr_label, "symphony"),
+        // pr_label defaults to "rhapsody" so the post-run labeler is on by default but tunable.
+        // Rhapsody-only divergence from Go's "symphony" default (AIE-301): the GitHub PR label now
+        // carries the Rust daemon's product name. Not part of the effective-config wire view, so no
+        // byte-parity golden is affected.
+        pr_label: or_str(r.pr_label, "rhapsody"),
     })
 }
 
@@ -849,11 +852,15 @@ mod tests {
     // live in `projects.rs` / `validate.rs`. These are the pure-Decode cases (the C5 ticket names
     // pr_label_test.go, review_test.go, and the validation half of dependency_mode_test.go).
 
-    // Mirrors Go `TestDecodePRLabelDefault`.
+    // Adapted from Go `TestDecodePRLabelDefault`: Rhapsody deliberately diverges from Go's
+    // "symphony" default so the GitHub PR label carries the Rust daemon's product name.
     #[test]
     fn decode_pr_label_default() {
         let c = decode_yaml("", "body");
-        assert_eq!(c.pr_label, "symphony", "pr_label default (AIE-301)");
+        assert_eq!(
+            c.pr_label, "rhapsody",
+            "pr_label default (Rhapsody divergence from AIE-301)"
+        );
     }
 
     // Mirrors Go `TestDecodeReviewSummonDefaults`.

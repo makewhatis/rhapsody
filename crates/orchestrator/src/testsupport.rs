@@ -295,6 +295,8 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         model: String::new(),
         stack_context: String::new(),
         capabilities_section: String::new(),
+        identity: String::new(),
+        teammate_section: String::new(),
         last_delivered_summon_at: epoch,
         thread_id: String::new(),
         session_id: String::new(),

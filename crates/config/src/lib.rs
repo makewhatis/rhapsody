@@ -14,10 +14,13 @@ pub mod capabilities;
 pub mod decode;
 pub mod effective_json;
 pub mod encode;
+pub mod memory;
 pub mod model;
+pub mod profiles;
 pub mod projects;
 pub mod prompt;
 pub mod resolve;
+pub mod teams;
 pub mod validate;
 pub mod workflow;
 

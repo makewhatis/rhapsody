@@ -100,6 +100,16 @@ pub struct ControlHandle {
     /// without racing the control task's reload (Go `CurrentRetentionDays` / `RetentionLoaded`).
     pub(crate) retention_days: std::sync::Arc<std::sync::atomic::AtomicI64>,
     pub(crate) retention_loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The SAME `Arc`-shared Teams memory runtime as
+    /// [`Orchestrator::teams_memory`](crate::orchestrator::Orchestrator::teams_memory), so the
+    /// daemon's `/api/v1/teams/*` handlers read the live run bindings and drive the backend
+    /// **without a control round-trip at all** (STUDIO-645, T4). `None` when the daemon has no
+    /// Teams runtime.
+    ///
+    /// Deliberately not routed through [`Self::events`]: §5.1 requires a retain never to block the
+    /// control task, and an event-channel round-trip would queue it behind the current tick — the
+    /// head-of-line class the T3a/T3b split already exists to avoid.
+    pub(crate) teams_memory: Option<std::sync::Arc<crate::teamsmemory::TeamsMemory>>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -121,7 +131,16 @@ impl crate::orchestrator::Orchestrator {
             workflow_path: self.workflow_path.clone(),
             retention_days: std::sync::Arc::clone(&self.retention_days),
             retention_loaded: std::sync::Arc::clone(&self.retention_loaded),
+            teams_memory: self.teams_memory.as_ref().map(std::sync::Arc::clone),
         }
+    }
+}
+
+impl ControlHandle {
+    /// The shared Teams memory runtime backing the `/api/v1/teams/*` handlers (STUDIO-645, T4).
+    /// `None` when the daemon has no Teams runtime, which the handlers render as `teams_disabled`.
+    pub fn teams_memory(&self) -> Option<&std::sync::Arc<crate::teamsmemory::TeamsMemory>> {
+        self.teams_memory.as_ref()
     }
 }
 

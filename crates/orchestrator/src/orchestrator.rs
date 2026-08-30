@@ -81,6 +81,24 @@ pub struct RunningEntry {
     /// labels, rendered through the capabilities registry. Empty when nothing resolves.
     pub capabilities_section: String,
 
+    /// The Rhapsody Teams identity this run was routed to (STUDIO-643, T3a; design record
+    /// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §3.1). Empty when Teams is off or when
+    /// nobody was routed — in which case the run is byte-identical to a Teams-off dispatch.
+    ///
+    /// **In memory only.** The `runs` table is frozen: this is never persisted as a column, and the
+    /// decision's per-run record is the `teams.route` / `teams.unrouted` *events* row instead
+    /// (§3.4). Its one live consumer is
+    /// [`LoadSnapshot::from_running`](crate::teams::LoadSnapshot::from_running), which counts live
+    /// runs per identity so the router's tie-break can prefer the least busy teammate.
+    pub identity: String,
+
+    /// The rendered teammate section prepended to the worker's first-turn prompt (STUDIO-643) — the
+    /// identity header plus the identity's resolved profile text. Empty when Teams is off, when
+    /// nobody was routed, or when the profile failed to resolve; the `if !x.is_empty()` guard in
+    /// `build_turn_prompt` then skips it and the prompt is byte-identical (§2.4 row 5), exactly as
+    /// `capabilities_section` behaves.
+    pub teammate_section: String,
+
     /// The `latest_summon_at` of the most recent mid-run summons already delivered to this run's
     /// mailbox (INF-448). The poll-side router delivers a summons only when it is strictly after BOTH
     /// `started_at` and this watermark, then advances it — so a stable summons is injected at most
@@ -151,6 +169,8 @@ impl RunningEntry {
             model: String::new(),
             stack_context: String::new(),
             capabilities_section: String::new(),
+            identity: String::new(),
+            teammate_section: String::new(),
             last_delivered_summon_at: zero_time(),
             thread_id: String::new(),
             session_id: String::new(),
@@ -266,6 +286,64 @@ pub struct Orchestrator {
     /// when the file fails to load — in which case capability rendering is a no-op, never a hard failure.
     /// [`dispatch_issue`](Orchestrator::dispatch_issue) renders the per-run capability section through it.
     pub capabilities_registry: Option<Vec<rhapsody_config::capabilities::CapabilityDef>>,
+
+    /// The Rhapsody Teams config loaded from `~/.rhapsody/teams.yaml` at daemon startup (STUDIO-639,
+    /// design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`). `None` when the daemon runs
+    /// without a durable on-disk home to anchor the file to (tests / storage disabled); otherwise the
+    /// loaded config, which is [`Teams::disabled`](rhapsody_config::teams::Teams::disabled) when the
+    /// file is absent (the shipped state, §2.1), malformed, or invalid.
+    ///
+    /// **Nothing reads this yet.** T1 carries the toggle and the roster inert; routing (T3a), triage
+    /// (T3b) and memory (T4) are the slices that consume it. Any future consumer must gate on
+    /// `.enabled` — `Some(..)` only means a file location existed, not that Teams is on.
+    pub teams: Option<rhapsody_config::teams::Teams>,
+
+    /// The Rhapsody Teams PROFILES directory (`<runtime home>/teams/profiles/`, STUDIO-642),
+    /// resolved at daemon startup beside [`teams`](Orchestrator::teams). `None` when the daemon runs
+    /// without a durable on-disk home — the same condition that leaves `teams` `None`, so in
+    /// production the two are set together.
+    ///
+    /// Read-only and never created: an absent directory simply means every profile resolves to its
+    /// built-in (§4). `dispatch_issue` resolves the routed identity's profile through it (T3a); a
+    /// failure logs and drops the section rather than failing the run.
+    pub teams_profiles_dir: Option<std::path::PathBuf>,
+
+    /// The Rhapsody Teams **local** memory bank the dispatch path recalls from (STUDIO-645, T4;
+    /// design record §5.2). `None` whenever there is nothing to recall: Teams off, no on-disk
+    /// runtime home, or `memory.backend` set to anything other than `local`.
+    ///
+    /// **The concrete [`LocalBank`](rhapsody_config::memory::LocalBank), deliberately never a
+    /// `dyn MemoryBackend`.** `dispatch_issue` runs inline on the single control task and is `fn`,
+    /// not `async fn`; the trait is async precisely because T8's `hindsight` backend does network
+    /// I/O. Holding the concrete local type here makes "zero network I/O on the dispatch path" a
+    /// property a reviewer can clear by reading one type name — a remote backend is not merely
+    /// forbidden here, it is unrepresentable. When T8 lands, its recall is prefetched off the
+    /// dispatch path and hands the SAME plain-data `Fact` slice to the same renderer.
+    pub teams_bank: Option<Arc<rhapsody_config::memory::LocalBank>>,
+
+    /// Ticket identifier → its state, as last seen by the poller **in memory** (STUDIO-645, T4).
+    /// Refreshed each tick from the candidate fetch, before dispatch, so a recall rendered during
+    /// that tick re-grounds against what the daemon already knows.
+    ///
+    /// This map is the WHOLE of §5.2's re-grounding, by design: §0.11.3 corrected the original
+    /// "free map lookup" pricing — a ticket now Done is never in the candidate fetch (active ∪
+    /// review only), so it simply is not here and the fact renders flagged `(state not
+    /// re-verified)`. The network fallback that would resolve it is deferred to an off-loop
+    /// improvement; a tracker call at dispatch is exactly the head-of-line stall the design review
+    /// forbade.
+    pub issue_states: HashMap<String, String>,
+
+    /// The **off-loop** Teams memory runtime (STUDIO-645, T4): the loaded config, the constructed
+    /// backend, and the live run → identity binding a `teams_retain` is stamped from. Shared by
+    /// `Arc` with the daemon's HTTP layer.
+    ///
+    /// This is the fourth sanctioned off-loop seam (see `crates/orchestrator/CLAUDE.md`), and it
+    /// exists because §5.1 requires a retain to be "best-effort, never fatal, **never blocking the
+    /// control task**". The control task's only interaction with it is two `HashMap` operations —
+    /// [`bind_run`](crate::teamsmemory::TeamsMemory::bind_run) at dispatch and
+    /// [`release_run`](crate::teamsmemory::TeamsMemory::release_run) at run exit — with no I/O and
+    /// no lock held across an `.await`. `None` when the daemon has no Teams runtime at all.
+    pub teams_memory: Option<Arc<crate::teamsmemory::TeamsMemory>>,
 
     /// Live workers, keyed by opaque issue id.
     pub running: HashMap<String, RunningEntry>,
@@ -393,6 +471,22 @@ pub struct Orchestrator {
     /// Whether a store was injected via [`set_store`](Orchestrator::set_store) (Go `storeInjected`),
     /// short-circuiting `Run`'s disk-open path so tests / callers own the store lifecycle.
     pub(crate) store_injected: bool,
+
+    // --- BO-59: dispatch credential-liveness preflight (Rhapsody-only; see `preflight.rs`). ---
+    /// The injectable credential-liveness probe seam. `None` disables the credential preflight →
+    /// dispatch is byte-identical to the pre-feature behavior (the default for tests and any build that
+    /// does not install one). Production installs a [`ClaudeCredentialProbe`](crate::preflight::ClaudeCredentialProbe)
+    /// via [`set_credential_probe`](Orchestrator::set_credential_probe).
+    pub(crate) cred_probe: Option<Arc<dyn crate::preflight::CredentialProbe>>,
+    /// The cached credential-probe verdict for the dispatch preflight. Mutated only by on_tick's
+    /// `credential_preflight` on the single control task, so it needs no lock. `None` until the first
+    /// probe.
+    pub(crate) probe_cache: Option<crate::preflight::ProbeCache>,
+    /// The per-probe timeout bound: a probe that does not answer within this is treated as "cannot
+    /// verify → skip dispatch" (fail closed), well under the poll interval so a hang never wedges the
+    /// tick. A field (not a const) so tests can shrink it; defaulted to
+    /// [`PROBE_TIMEOUT`](crate::preflight::PROBE_TIMEOUT).
+    pub(crate) probe_timeout: std::time::Duration,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -446,6 +540,11 @@ impl Orchestrator {
             spawn: None,
             eff: None,
             capabilities_registry: None,
+            teams: None,
+            teams_profiles_dir: None,
+            teams_bank: None,
+            issue_states: HashMap::new(),
+            teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),
@@ -473,6 +572,11 @@ impl Orchestrator {
             retention_loaded: Arc::new(AtomicBool::new(false)),
             warnings: Arc::new(WarningsState::default()),
             store_injected: false,
+            // BO-59: no credential probe by default → the preflight is a no-op and dispatch is
+            // byte-identical to the pre-feature behavior. The daemon installs the real probe at startup.
+            cred_probe: None,
+            probe_cache: None,
+            probe_timeout: crate::preflight::PROBE_TIMEOUT,
         }
     }
 

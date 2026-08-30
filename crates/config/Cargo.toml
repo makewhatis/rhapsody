@@ -7,6 +7,12 @@ repository.workspace = true
 
 [dependencies]
 rhapsody-core = { path = "../core" }
+# async-trait: `memory::MemoryBackend` is held as `Arc<dyn MemoryBackend>` by the daemon's off-loop
+# endpoints, and native `async fn` in traits is not dyn-compatible. The trait is async because T8's
+# `hindsight` backend does network I/O — which is exactly what makes it unusable on the dispatch
+# path (see `memory`'s module docs). Same version the httpapi/tracker/agent crates already record;
+# already in Cargo.lock, so no new external crate enters the tree.
+async-trait = "0.1"
 liquid = "0.26"
 # serde derive powers the raw front-matter model in `model.rs` (C3), deserialized by
 # serde_yaml_ng — the same `serde = { derive }` the core crate uses.
@@ -28,6 +34,9 @@ harness-fixtures = { path = "../harness-fixtures" }
 # tempfile: scratch dirs for the capabilities load_or_seed round-trip tests. Pinned to the
 # version already locked in the workspace (transitively via native-tls).
 tempfile = "3.27.0"
+# tokio: drives the handful of `#[tokio::test]`s that exercise the async `MemoryBackend` surface
+# (the sync `LocalBank` methods need no runtime). Already in Cargo.lock workspace-wide.
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

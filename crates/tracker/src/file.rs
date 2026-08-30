@@ -712,6 +712,89 @@ impl crate::Tracker for Tracker {
     async fn delete_comment(&self, _comment_id: &str) -> Result<(), TrackerError> {
         Ok(())
     }
+
+    /// Appends `label_name` to the issue's labels and rewrites the file atomically (STUDIO-644).
+    /// `team_id` is ignored — the file has no label registry to find-or-create in, so there is
+    /// nothing to resolve. Strictly additive and idempotent, exactly as the trait requires: an
+    /// issue that already carries the label (compared case-insensitively, matching the Linear
+    /// adapter's lowercasing) is a successful no-op that does not even rewrite the file. An
+    /// unknown id is an issue-not-found error.
+    async fn add_issue_label(
+        &self,
+        issue_id: &str,
+        _team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError> {
+        if issue_id.is_empty() || label_name.is_empty() {
+            return Err(load_err(format!(
+                "add label requires issueID and labelName (got {issue_id:?},{label_name:?})"
+            )));
+        }
+        let _guard = self.lock();
+        let mut doc = self.load_locked()?;
+        match doc.issues.iter().position(|j| j.id == issue_id) {
+            Some(i) => {
+                if doc.issues[i]
+                    .labels
+                    .iter()
+                    .any(|l| l.eq_ignore_ascii_case(label_name))
+                {
+                    return Ok(());
+                }
+                doc.issues[i].labels.push(label_name.to_string());
+                self.write_locked(&doc)
+            }
+            None => Err(issue_not_found_err(issue_id)),
+        }
+    }
+
+    /// Reloads the file and returns issues carrying ANY of `label_names` whose state is NOT
+    /// terminal, with `id`, `identifier` and (lowercased) `labels` populated — the per-identity
+    /// load read (STUDIO-644). An empty slice returns an empty result without reading the file
+    /// (mirrors the Linear adapter).
+    ///
+    /// "Open" is the file analogue of the Linear adapter's state-TYPE exclusion: a state the file's
+    /// optional `state_types` section maps to `completed` or `canceled` is terminal, and everything
+    /// else is open. A file with no such mapping — the common case, since the built-in default map
+    /// covers only `backlog`/`unstarted` — has no terminal states, so nothing is excluded. That is
+    /// deliberately the permissive direction: over-counting an identity's load can only make the
+    /// triage turn spread work wider, while under-counting would pile work on a busy teammate.
+    async fn fetch_open_issues_by_labels(
+        &self,
+        label_names: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        if label_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let want: HashSet<String> = label_names.iter().map(|l| normalize_state(l)).collect();
+        let _guard = self.lock();
+        let doc = self.load_locked()?;
+        let terminal: HashSet<String> = doc
+            .state_types
+            .iter()
+            .flatten()
+            .filter(|(kind, _)| kind.as_str() == "completed" || kind.as_str() == "canceled")
+            .map(|(_, name)| normalize_state(name))
+            .collect();
+        Ok(doc
+            .issues
+            .iter()
+            .filter(|j| !terminal.contains(&normalize_state(&j.state)))
+            .map(to_core_issue)
+            .filter(|iss| {
+                iss.labels
+                    .iter()
+                    .flatten()
+                    .any(|l| want.contains(l.as_str()))
+            })
+            .map(|iss| Issue {
+                id: iss.id,
+                identifier: iss.identifier,
+                labels: iss.labels,
+                ..Issue::default()
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -861,6 +944,106 @@ mod tests {
             .expect("no error");
         assert_eq!(got.len(), 1, "got {:?}, want [SMK-4]", ids(&got));
         assert_eq!(got[0].id, "SMK-4", "got {:?}, want [SMK-4]", ids(&got));
+    }
+
+    // STUDIO-644 (Teams T3b), design §0.11.1: the label write is ADDITIVE and idempotent. The
+    // human-conflict rule turns on it — the manager may only ever add where a label is absent, so a
+    // second write of the same label must change nothing and must not drop the labels already
+    // there.
+    #[tokio::test]
+    async fn add_issue_label_is_additive_and_idempotent() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        tr.add_issue_label("SMK-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect("add");
+        // Case-differing repeat: Linear treats label names case-insensitively, and so must this.
+        tr.add_issue_label("SMK-1", "team-1", "Rhapsody:@Alice")
+            .await
+            .expect("repeat add");
+
+        let got = tr.fetch_candidate_issues().await.expect("no error");
+        let smk1 = got.iter().find(|i| i.id == "SMK-1").expect("SMK-1");
+        assert_eq!(
+            smk1.labels,
+            Some(vec!["bug".to_string(), "rhapsody:@alice".to_string()]),
+            "the pre-existing label must survive and the identity label must be written once"
+        );
+    }
+
+    // STUDIO-644: a label write against an id the file does not know is an error, not a silent
+    // success — the triage task must be able to tell the assignment did not land.
+    #[tokio::test]
+    async fn add_issue_label_unknown_issue_errors() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        tr.add_issue_label("NOPE-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect_err("unknown issue must error");
+        tr.add_issue_label("", "team-1", "rhapsody:@alice")
+            .await
+            .expect_err("empty issue id must error");
+        tr.add_issue_label("SMK-1", "team-1", "")
+            .await
+            .expect_err("empty label must error");
+    }
+
+    // STUDIO-644, design §0.11.1: the per-identity load read returns open issues carrying the
+    // label, with id + identifier + lowercased labels. `SAMPLE` maps no completed/canceled state
+    // type, so nothing is terminal here — the terminal case is covered separately.
+    #[tokio::test]
+    async fn fetch_open_issues_by_labels_returns_labelled_issues() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        tr.add_issue_label("SMK-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect("add");
+
+        let got = tr
+            .fetch_open_issues_by_labels(&["rhapsody:@alice".to_string()])
+            .await
+            .expect("no error");
+        assert_eq!(ids(&got), vec!["SMK-1".to_string()]);
+        assert_eq!(got[0].identifier, "SMK-1");
+        assert_eq!(
+            got[0].labels,
+            Some(vec!["bug".to_string(), "rhapsody:@alice".to_string()])
+        );
+
+        assert!(
+            tr.fetch_open_issues_by_labels(&[])
+                .await
+                .expect("empty is Ok")
+                .is_empty(),
+            "an empty label list returns an empty result"
+        );
+    }
+
+    // STUDIO-644: a state the file maps to the `completed` type is terminal, so its ticket is not
+    // open load. Load counts work in flight, not work finished.
+    #[tokio::test]
+    async fn fetch_open_issues_by_labels_excludes_terminal_states() {
+        let src = TempSource::new(
+            r#"{
+  "state_types": { "backlog": "Backlog", "unstarted": "Todo", "completed": "Done" },
+  "issues": [
+    { "id": "SMK-1", "identifier": "SMK-1", "title": "Open", "state": "Todo", "labels": ["rhapsody:@alice"] },
+    { "id": "SMK-4", "identifier": "SMK-4", "title": "Finished", "state": "Done", "labels": ["rhapsody:@alice"] }
+  ]
+}"#,
+        );
+        let tr = new(Config {
+            source: src.path(),
+            active_states: vec!["Todo".to_string()],
+            ..Default::default()
+        });
+
+        let got = tr
+            .fetch_open_issues_by_labels(&["rhapsody:@alice".to_string()])
+            .await
+            .expect("no error");
+        assert_eq!(
+            ids(&got),
+            vec!["SMK-1".to_string()],
+            "a Done ticket is not open load"
+        );
     }
 
     // Mirrors Go `file.TestFetchIssuesByStatesEmptyReturnsNil`.

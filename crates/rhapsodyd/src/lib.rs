@@ -10,6 +10,8 @@
 //!   orchestrator + observability-server wiring, the startup banner, the prune scheduler, and graceful
 //!   shutdown/drain.
 //! * [`mcp`] — the `symphony mcp` subcommand (`mcp.go`): the local MCP facade over stdio (→ `crates/mcp`).
+//! * [`teams`] — the `rhapsodyd teams show|fork` subcommand (STUDIO-642, Rhapsody-only): prints and
+//!   forks resolved Teams profiles. No Go counterpart — Teams is a Rhapsody feature.
 //! * [`runlock`] — the advisory single-instance flock (`run.go`'s lock section).
 //! * [`state`] — the httpapi [`rhapsody_httpapi::StateProvider`] adapter over the orchestrator's
 //!   off-loop [`rhapsody_orchestrator::ControlHandle`] (Go passes `*Orchestrator` directly; Rust can't
@@ -26,6 +28,7 @@ pub mod prune;
 pub mod run;
 pub mod runlock;
 pub mod state;
+pub mod teams;
 
 #[cfg(test)]
 mod testutil;

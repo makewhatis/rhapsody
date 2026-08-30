@@ -49,6 +49,7 @@ pub mod message;
 pub mod obslog;
 pub mod orchestrator;
 pub mod persist;
+pub mod preflight;
 pub mod promote;
 pub mod reads;
 pub mod reconcile;
@@ -60,7 +61,10 @@ pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;
 pub mod stop;
+pub mod teams;
+pub mod teamsmemory;
 pub mod telemetry_attrs;
+pub mod triage;
 pub mod warnings;
 pub mod worker;
 pub mod workspace_gc;
@@ -82,6 +86,9 @@ pub use effective::{Effective, ResolvedProject, build_effective, build_effective
 pub use handoff::HandoffResult;
 pub use message::RunMessageResult;
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
+pub use preflight::{
+    ClaudeCredentialProbe, CredentialProbe, PROBE_TIMEOUT, ProbeOutcome, ProbeRequest,
+};
 pub use reads::{Identity, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
 pub use reload::ReloadError;
@@ -90,6 +97,10 @@ pub use snapshot::{
     ProjectStatus, RateLimit, RefreshResult, RetryRow, RunningRow, Snapshot, TokenCounts,
 };
 pub use stop::{ControlHandle, ResumeResult, StopError, StopResult};
+pub use triage::{
+    ClaudeTriageArbiter, MAX_TRIAGE_BACKOFF_MS, TRIAGE_INTERVAL, TriageArbiter, TriageDecision,
+    TriageDeps, TriageRequest, TriageTarget, run_triage_schedule, triage_enabled,
+};
 pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
 pub use workspace_gc::WorkspaceGcPlan;
 

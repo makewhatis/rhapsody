@@ -11,6 +11,9 @@ use axum::handler::Handler;
 use axum::routing::any;
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
+use rhapsody_orchestrator::teamsmemory::{
+    InvalidateView, RecallView, RetainView, RosterView, TeamsMemoryError,
+};
 use rhapsody_orchestrator::{
     HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot,
     StopResult,
@@ -27,6 +30,9 @@ use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
+use crate::handlers_teams::{
+    handle_run_retain, handle_teams_invalidate, handle_teams_recall, handle_teams_roster,
+};
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
 use crate::web::{WebDist, serve_web};
@@ -134,6 +140,47 @@ pub trait StateProvider: Send + Sync {
     /// `None` ⇒ no registry loaded yet, which the handler serves as an empty `[]`. Rhapsody-only (no
     /// Go v0.4.0 counterpart — this whole endpoint is a Rhapsody addition).
     fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>>;
+
+    /// The Teams roster with each identity's derived status (`GET /api/v1/teams/roster`,
+    /// STUDIO-645). Rhapsody-only, like [`capabilities_registry`](StateProvider::capabilities_registry)
+    /// — no Go v0.4.0 counterpart.
+    ///
+    /// The four `teams_*` methods default to [`TeamsMemoryError::Disabled`] so a provider that
+    /// predates Teams — the parity fake, and anything embedding this crate for the Go-shaped API —
+    /// behaves EXACTLY as a Teams-off daemon: `teams_disabled` on every route, nothing created,
+    /// nothing changed. Only a provider that actually has a Teams runtime overrides them.
+    async fn teams_roster(&self) -> Result<RosterView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// One identity's recalled memory for a free-text query (`GET /api/v1/teams/recall`).
+    async fn teams_recall(
+        &self,
+        _identity: &str,
+        _query: &str,
+    ) -> Result<RecallView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// Mark one record non-valid, with its reason (`POST /api/v1/teams/invalidate`, §5.3).
+    async fn teams_invalidate(
+        &self,
+        _identity: &str,
+        _fact_id: &str,
+        _reason: &str,
+    ) -> Result<InvalidateView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// Record what a live run learned, with the provenance stamped by the HOST from the run id —
+    /// never from the request body (`POST /api/v1/runs/{id}/retain`, §5.1).
+    async fn teams_retain(
+        &self,
+        _run_id: i64,
+        _content: &str,
+    ) -> Result<RetainView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -261,6 +308,13 @@ where
         // registry so the Settings UI can render the opt-in checkbox list. Method-agnostic like the
         // other read routes; the handler guards GET/HEAD.
         .route("/api/v1/capabilities", any(handle_capabilities))
+        // Rhapsody Teams memory (STUDIO-645, Rhapsody-only — no Go v0.4.0 counterpart): the roster
+        // with derived status, an identity's recalled memory, and the per-record invalidate that
+        // §5.2.3 wants "reachable at the moment someone notices". All static paths, so they never
+        // contend with anything already registered; a Teams-off daemon answers `teams_disabled`.
+        .route("/api/v1/teams/roster", any(handle_teams_roster))
+        .route("/api/v1/teams/recall", any(handle_teams_recall))
+        .route("/api/v1/teams/invalidate", any(handle_teams_invalidate))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.
@@ -284,6 +338,10 @@ where
         // Daemon-mediated review handoff (TRA-242): move a live run's ticket to the review state so it
         // leaves the active set and the run cleanly ends. POST-only; more-specific than runs/{id}.
         .route("/api/v1/runs/{id}/handoff", any(handle_run_handoff))
+        // Host-stamped memory retain for a live run (STUDIO-645): the body carries `content` and
+        // nothing else — the identity, ticket and commit come from the run this path names, which
+        // is what makes provenance unforgeable (§5.1). More-specific than runs/{id}.
+        .route("/api/v1/runs/{id}/retain", any(handle_run_retain))
         // Operator messages (H3): POST queues a "btw" for a live run's agent; GET lists the run's
         // messages with their delivery status. More-specific than runs/{id}, so they win the match.
         .route("/api/v1/runs/{id}/message", any(handle_run_message))

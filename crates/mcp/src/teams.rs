@@ -1,0 +1,480 @@
+//! teams — the Rhapsody Teams MCP tools (STUDIO-645, slice T4; design record
+//! `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.7, §6.7).
+//!
+//! **No Go v0.4.0 counterpart** — the Go facade has no analog, exactly as
+//! `symphony_handoff` has none. Four tools, each a thin proxy of a NEW additive
+//! daemon endpoint:
+//!
+//! | Tool | Reads/Writes | Endpoint |
+//! |---|---|---|
+//! | `teams_roster` | read | `GET /api/v1/teams/roster` |
+//! | `teams_recall {identity, query}` | read | `GET /api/v1/teams/recall` |
+//! | `teams_invalidate {identity, fact_id, reason}` | write | `POST /api/v1/teams/invalidate` |
+//! | `teams_retain {content}` | write | `POST /api/v1/runs/{id}/retain` |
+//!
+//! `teams_retain` is **this slice's addition to §6.7's table** — §6.7 listed
+//! `teams_roster` / `teams_recall` / `teams_invalidate` but not the retain half
+//! of §5.1, which has no other home: the design's retain is "authored by the
+//! agent at end of run", so the agent needs a tool to author it with.
+//!
+//! # Off ⇒ invisible, not merely inert (§6.7, §2.4 row 7)
+//!
+//! When Teams is off, [`Facade::new`] REMOVES all four routes, so `list_tools`
+//! is byte-identical to a daemon built before Teams existed. That is the
+//! `allow_handoff` mechanism, reused unchanged — the gate is the enabled-tool
+//! set, so a disabled tool is absent rather than surfacing a runtime
+//! permission-denied.
+//!
+//! # `teams_retain` cannot forge provenance
+//!
+//! The tool takes `content` and nothing else. The run id comes from
+//! `SYMPHONY_RUN_ID` — the env the daemon itself injected into this worker — and
+//! the daemon resolves that run to its identity, ticket and commit on the far
+//! side (§5.1). There is deliberately **no `identity` argument**: a tool that
+//! accepted one would let a run dispatched as `bob` write into `alice`'s bank,
+//! which is the forgery §0.11.4 rules out for the room's `from` and which
+//! applies with equal force here.
+
+use crate::client::FacadeError;
+use crate::server::{Facade, err_result, or_default, path_escape, text_result};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// `teams_recall` args. Both carry no `omitempty` analog: `identity` is required
+/// by the daemon and an empty `query` is a legitimate "everything you remember,
+/// bounded by `recall_top_k`".
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(crate) struct RecallArgs {
+    /// the teammate whose memory to read (a name from `teams_roster`).
+    identity: String,
+    /// what to look for — a ticket identifier, a subject, or a few keywords.
+    #[serde(default)]
+    query: String,
+}
+
+/// `teams_invalidate` args (§5.3). `reason` is REQUIRED, and deliberately so:
+/// the reason is the thing a correction is worth, and the Go
+/// `studiomemory.Invalidate` client's measured 400 came from omitting it.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(crate) struct InvalidateArgs {
+    /// the teammate whose bank holds the record.
+    identity: String,
+    /// the record id, as `teams_recall` reports it in each fact's `id`.
+    fact_id: String,
+    /// why this fact is no longer true. Stored with the record and reversible.
+    reason: String,
+}
+
+/// `teams_retain` args — `content` and nothing else, by design (module docs).
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(crate) struct RetainArgs {
+    /// what you learned, in your own words: observations and outcomes only.
+    content: String,
+}
+
+/// The `POST /api/v1/teams/invalidate` body.
+#[derive(Serialize)]
+struct InvalidateBody<'a> {
+    identity: &'a str,
+    fact_id: &'a str,
+    reason: &'a str,
+}
+
+/// The `POST /api/v1/runs/{id}/retain` body.
+#[derive(Serialize)]
+struct RetainBody<'a> {
+    content: &'a str,
+}
+
+#[tool_router(router = teams_router, vis = "pub(crate)")]
+impl Facade {
+    #[tool(
+        name = "teams_roster",
+        description = "Who is on this Rhapsody team: each identity's name, the profile it wears, its matching labels, its memory bank id, and the runs live as it right now. Proxies GET /api/v1/teams/roster. Only present when Teams is enabled."
+    )]
+    async fn teams_roster(&self) -> CallToolResult {
+        match self.client.get("/api/v1/teams/roster").await {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "teams_recall",
+        description = "Read a teammate's retained memory: past observations and outcomes matching your query, bounded by memory.recall_top_k. Each fact carries the ticket, run and commit it came from, so you can re-ground it yourself. Costs no model turn. Proxies GET /api/v1/teams/recall."
+    )]
+    async fn teams_recall(&self, Parameters(args): Parameters<RecallArgs>) -> CallToolResult {
+        if args.identity.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "identity is required (see teams_roster for the names)",
+            ));
+        }
+        let path = format!(
+            "/api/v1/teams/recall?identity={}&query={}",
+            query_escape(&args.identity),
+            query_escape(&args.query)
+        );
+        match self.client.get(&path).await {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "teams_invalidate",
+        description = "Mark one retained fact as no longer true, with the reason why. The record is NOT deleted — its content and your reason stay on disk and the change is reversible — but it stops being recalled into anyone's prompt. Use this the moment you find a remembered fact contradicted, rather than retaining a correction on top of it. Proxies POST /api/v1/teams/invalidate."
+    )]
+    async fn teams_invalidate(
+        &self,
+        Parameters(args): Parameters<InvalidateArgs>,
+    ) -> CallToolResult {
+        if args.identity.is_empty() || args.fact_id.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "identity and fact_id are required (see teams_recall for a fact's id)",
+            ));
+        }
+        if args.reason.trim().is_empty() {
+            return err_result(&FacadeError::new(
+                "empty_reason",
+                "reason is required: an invalidation with no reason cannot be judged later",
+            ));
+        }
+        let payload = match serde_json::to_vec(&InvalidateBody {
+            identity: &args.identity,
+            fact_id: &args.fact_id,
+            reason: &args.reason,
+        }) {
+            Ok(p) => p,
+            Err(e) => return err_result(&FacadeError::new("encode_error", e.to_string())),
+        };
+        match self
+            .client
+            .post_json("/api/v1/teams/invalidate", payload)
+            .await
+        {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "teams_retain",
+        description = "Record what THIS run learned, in your own words, into your teammate memory — observations and outcomes only, never a transcript and never a conclusion you did not verify. Rhapsody stamps the identity, ticket, run and commit itself from your run, so you supply only the prose. Best-effort: a failure never fails the run. Proxies POST /api/v1/runs/{id}/retain for SYMPHONY_RUN_ID."
+    )]
+    async fn teams_retain(&self, Parameters(args): Parameters<RetainArgs>) -> CallToolResult {
+        // There is no `run_id` argument: the run is the one the daemon injected
+        // into this worker's env, which is what makes the provenance the daemon
+        // stamps unforgeable (module docs, §5.1).
+        let id = or_default("", &self.opts.default_run_id);
+        if id.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "SYMPHONY_RUN_ID is not set: only a dispatched run can retain a memory",
+            ));
+        }
+        if args.content.trim().is_empty() {
+            return err_result(&FacadeError::new(
+                "empty_content",
+                "content is required: say what you learned",
+            ));
+        }
+        let payload = match serde_json::to_vec(&RetainBody {
+            content: &args.content,
+        }) {
+            Ok(p) => p,
+            Err(e) => return err_result(&FacadeError::new("encode_error", e.to_string())),
+        };
+        match self
+            .client
+            .post_json(
+                &format!("/api/v1/runs/{}/retain", path_escape(&id)),
+                payload,
+            )
+            .await
+        {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+}
+
+/// Query-escapes one component, the same rule [`crate::server`]'s `encode_query`
+/// applies. Kept here rather than exported because these two tools build their
+/// query strings directly (both parameters are always present, so the
+/// drop-empty/sort behaviour of `encode_query` would be wrong for `query=`).
+fn query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Driven through an in-memory MCP client over a tokio duplex (Go's
+    //! `connectInMemory`) against a small axum stub, exactly as `writes.rs`
+    //! drives the `mcp:`-gated write tools.
+    use super::*;
+    use crate::client::Client;
+    use crate::server::Options;
+    use crate::testutil::{spawn_router, test_config};
+    use axum::Router;
+    use axum::routing::any;
+    use rmcp::ServiceExt;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::service::RunningService;
+    use std::sync::{Arc, Mutex};
+
+    type SeenLog = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn teams_on() -> Options {
+        Options {
+            teams_enabled: true,
+            ..Options::default()
+        }
+    }
+
+    fn facade(opts: Options, port: u16) -> Facade {
+        Facade::new(&test_config(), Client::for_port(port as i64), opts)
+    }
+
+    async fn connect(facade: Facade) -> RunningService<rmcp::RoleClient, ()> {
+        let (client_t, server_t) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            if let Ok(server) = facade.serve(server_t).await {
+                let _ = server.waiting().await;
+            }
+        });
+        ().serve(client_t).await.expect("client connect")
+    }
+
+    async fn tool_names(facade: Facade) -> Vec<String> {
+        let client = connect(facade).await;
+        let mut names: Vec<String> = client
+            .list_all_tools()
+            .await
+            .expect("list tools")
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let _ = client.cancel().await;
+        names.sort();
+        names
+    }
+
+    /// A stub daemon that records every `(method, path-and-query)` it is asked
+    /// for and answers `{"ok":true}`.
+    async fn stub_daemon() -> (u16, SeenLog) {
+        let seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let router = Router::new().fallback(any(
+            move |method: axum::http::Method, uri: axum::http::Uri| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .expect("seen lock")
+                        .push((method.to_string(), uri.to_string()));
+                    (
+                        axum::http::StatusCode::OK,
+                        [("Content-Type", "application/json")],
+                        r#"{"ok":true}"#,
+                    )
+                }
+            },
+        ));
+        (spawn_router(router).await, seen)
+    }
+
+    async fn call_text(
+        client: &RunningService<rmcp::RoleClient, ()>,
+        name: &str,
+        args: serde_json::Value,
+    ) -> String {
+        let res = client
+            .call_tool(
+                CallToolRequestParams::new(name.to_string())
+                    .with_arguments(args.as_object().cloned().unwrap_or_default()),
+            )
+            .await
+            .expect("call tool");
+        res.content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .collect()
+    }
+
+    /// **§6.7 / §2.4 row 7: off ⇒ invisible.** With Teams disabled not one
+    /// `teams_*` tool is registered, so `list_tools` is byte-identical to a
+    /// daemon built before Teams existed. The gate is the enabled-tool set —
+    /// `allow_handoff`'s mechanism, reused unchanged.
+    #[tokio::test]
+    async fn teams_off_registers_no_teams_tools() {
+        let names = tool_names(facade(Options::default(), 0)).await;
+        assert!(
+            !names.iter().any(|n| n.starts_with("teams_")),
+            "teams off must register NO teams_* tool: {names:?}"
+        );
+    }
+
+    /// Turning Teams on ADDS exactly the four §0.11.7 tools and changes nothing
+    /// else — the precise statement of "byte-identical when off", checked from
+    /// both directions so a future tool cannot slip in unnoticed.
+    #[tokio::test]
+    async fn enabling_teams_only_adds_the_four_tools() {
+        let off = tool_names(facade(Options::default(), 0)).await;
+        let on = tool_names(facade(teams_on(), 0)).await;
+
+        let added: Vec<String> = on.iter().filter(|n| !off.contains(n)).cloned().collect();
+        let removed: Vec<String> = off.iter().filter(|n| !on.contains(n)).cloned().collect();
+        assert_eq!(
+            added,
+            vec![
+                "teams_invalidate",
+                "teams_recall",
+                "teams_retain",
+                "teams_roster"
+            ]
+        );
+        assert!(removed.is_empty(), "enabling teams removed {removed:?}");
+        // The pre-Teams surface is still all there.
+        for expected in ["symphony_state", "symphony_runs", "symphony_handoff"] {
+            assert!(on.contains(&expected.to_string()), "{on:?}");
+        }
+    }
+
+    /// `teams_retain` declares `content` and NOTHING else. The input schema is
+    /// the contract an agent reads, so this is where "the agent cannot forge
+    /// provenance" is checkable rather than merely intended (§5.1, §0.11.4).
+    #[tokio::test]
+    async fn retain_declares_only_content() {
+        let client = connect(facade(teams_on(), 0)).await;
+        let tools = client.list_all_tools().await.expect("list tools");
+        let retain = tools
+            .iter()
+            .find(|t| t.name == "teams_retain")
+            .expect("teams_retain is registered");
+        let props = retain
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("an object schema");
+        let mut keys: Vec<&String> = props.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["content"],
+            "teams_retain must expose no provenance argument"
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// The retain path end to end: the tool posts to the run named by
+    /// SYMPHONY_RUN_ID — never a run id the caller supplied.
+    #[tokio::test]
+    async fn retain_posts_to_the_run_from_the_env() {
+        let (port, seen) = stub_daemon().await;
+        let opts = Options {
+            default_run_id: "412".to_string(),
+            ..teams_on()
+        };
+        let client = connect(facade(opts, port)).await;
+
+        let out = call_text(
+            &client,
+            "teams_retain",
+            serde_json::json!({"content": "learned"}),
+        )
+        .await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![("POST".to_string(), "/api/v1/runs/412/retain".to_string())]
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// A coordinator session (no SYMPHONY_RUN_ID) cannot retain: there is no run
+    /// to attribute the record to, and the tool refuses rather than guessing.
+    #[tokio::test]
+    async fn retain_without_a_run_id_is_refused() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        let out = call_text(&client, "teams_retain", serde_json::json!({"content": "x"})).await;
+        assert!(out.contains("SYMPHONY_RUN_ID"), "out = {out}");
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "an unattributable retain must not reach the daemon"
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// An invalidation with no reason never leaves the facade: §5.3 stores the
+    /// reason, and the Go `studiomemory.Invalidate` client's measured 400 came
+    /// from omitting exactly this.
+    #[tokio::test]
+    async fn invalidate_without_a_reason_never_leaves_the_facade() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        let out = call_text(
+            &client,
+            "teams_invalidate",
+            serde_json::json!({"identity": "alice", "fact_id": "f1", "reason": "  "}),
+        )
+        .await;
+        assert!(out.contains("empty_reason"), "out = {out}");
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "a reasonless invalidate must not reach the daemon"
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// `teams_recall` escapes both parameters, so an identity or query carrying
+    /// reserved characters cannot alter the request it builds.
+    #[tokio::test]
+    async fn recall_escapes_both_parameters() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        call_text(
+            &client,
+            "teams_recall",
+            serde_json::json!({"identity": "alice", "query": "a&b c"}),
+        )
+        .await;
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![(
+                "GET".to_string(),
+                "/api/v1/teams/recall?identity=alice&query=a%26b+c".to_string()
+            )]
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// The roster proxies its endpoint verbatim.
+    #[tokio::test]
+    async fn roster_proxies_its_endpoint() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        let out = call_text(&client, "teams_roster", serde_json::json!({})).await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![("GET".to_string(), "/api/v1/teams/roster".to_string())]
+        );
+        let _ = client.cancel().await;
+    }
+}

@@ -19,6 +19,7 @@ mod client;
 mod discovery;
 mod server;
 mod status;
+mod teams;
 mod verdict;
 mod writes;
 
