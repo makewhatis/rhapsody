@@ -275,6 +275,12 @@ pub enum Event {
     },
 }
 
+/// How long [`ControlHandle::record_teams_post`] waits for the control task to report back on a
+/// post's best-effort mirrors before answering without them (STUDIO-653, T6). Comfortably inside
+/// the MCP client's own 15s timeout, so a busy tick degrades the `delivered` count rather than
+/// failing a post that already landed in the room log.
+const TEAMS_POST_MIRROR_WAIT: Duration = Duration::from_secs(5);
+
 /// The default `storage.retention_days` until a reload stores the effective value (Go `New`).
 pub(crate) const DEFAULT_RETENTION_DAYS: i64 = 30;
 
@@ -1075,6 +1081,14 @@ impl ControlHandle {
     /// through the `TeamsMemory` seam; if the loop is gone the mirrors are simply skipped. That is
     /// also why the reply is a count rather than a `Result`: there is no failure here that the
     /// caller could act on.
+    ///
+    /// **The wait is bounded** ([`TEAMS_POST_MIRROR_WAIT`]), unlike `send_run_message`'s, and for a
+    /// reason specific to this surface: `teams_post` is called by an AGENT through an MCP client
+    /// that gives up after 15s, so a tick busy on the network could otherwise turn a post that
+    /// already succeeded into a tool-level failure — and an agent that reads a failure retries,
+    /// putting the same message into every teammate's turn-1 prompt twice. On timeout the event is
+    /// still queued and the loop still performs both mirrors; only the REPORTED count degrades to
+    /// `0`, which already means "not delivered live" for every other reason too.
     pub async fn record_teams_post(
         &self,
         from_run_id: i64,
@@ -1090,9 +1104,23 @@ impl ControlHandle {
             return 0; // the loop is gone: the room log still has the post.
         }
         let mut lifetime = self.ctx.clone();
-        tokio::select! {
-            r = rx => r.unwrap_or(0),
-            _ = lifetime.cancelled() => 0,
+        let reply = async {
+            tokio::select! {
+                r = rx => r.unwrap_or(0),
+                _ = lifetime.cancelled() => 0,
+            }
+        };
+        match tokio::time::timeout(TEAMS_POST_MIRROR_WAIT, reply).await {
+            Ok(delivered) => delivered,
+            Err(_) => {
+                tracing::info!(
+                    run_id = from_run_id,
+                    "teams post: the control task did not answer within the bounded wait; the post \
+                     is in the room log and its mirrors are still queued, but this response cannot \
+                     say whether it was delivered live"
+                );
+                0
+            }
         }
     }
 

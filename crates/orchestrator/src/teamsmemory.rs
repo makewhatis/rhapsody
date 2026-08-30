@@ -155,7 +155,9 @@ pub struct PostView {
     /// How many LIVE runs the direct message also reached in their mailbox, wearing the teammate
     /// wrap. `0` for a room post, and `0` for a direct post whose recipient is not running or whose
     /// mailbox is full — both of which degrade to catch-up with nothing queued and nothing retried
-    /// (§0.5).
+    /// (§0.5). `0` is also what a busy control task answers within
+    /// `ControlHandle::record_teams_post`'s bounded wait: this field says what the host could
+    /// CONFIRM, never that the room log is missing anything.
     pub delivered: i64,
 }
 
