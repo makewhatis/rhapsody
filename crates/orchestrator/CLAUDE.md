@@ -106,7 +106,16 @@ the `Orchestrator` struct itself. Concretely:
   which is exactly why the design puts the feature's one model turn there (§0.11.2 — a model call on
   the dispatch path was the STUDIO-551 head-of-line class). Spawned at the composition root
   (`rhapsodyd/run.rs`) beside the prune scheduler, and only for `manager.mode: labels+model`. It is
-  NOT a state seam at all: unlike `teamsmemory.rs` it never touches orchestrator state.
+  NOT a state seam at all: unlike `teamsmemory.rs` it never touches orchestrator state. `quorum.rs`
+  is T7's review quorum and is triage's structural sibling: an off-loop task that holds no
+  `Orchestrator` and takes no lock the control task takes, fed `QuorumRequest`s — plain owned data —
+  over a channel whose sender rides on `ControlHandle` (so it is inside the `stop.rs` seam, not a
+  fifth one). The DECISION runs on the loop (`plan_quorum`, from the per-tick `record_quorum_state`
+  snapshot: no tracker read, no await); the WRITES run on the task. The send is deliberately gated on
+  the review-state move having succeeded, which is why the sender is on the handle rather than
+  reached through `Event` — the move happens off-loop, after the control round-trip returned.
+  `quorum.enabled` defaults false and spawns no task at all, so a default installation has no delta
+  to have.
 - **Cross-cutting constants**: `backoff.rs` (retry-cadence math), `telemetry_attrs.rs` (the
   bounded metric-label cardinality contract — project/model/outcome/reason only; never add an
   issue/run/session id here, that's a correctness bug, not a style nit).
@@ -146,8 +155,7 @@ the `Orchestrator` struct itself. Concretely:
   doc.
 - `handoff.rs` (`symphony_handoff` MCP tool → `POST /api/v1/runs/{id}/handoff`) is a capability
   beyond the frozen Go reference — don't treat its absence from the Go source as a porting gap, it's
-  intentional. But as of this writing **no README.md Divergences entry documents it**: root
-  CLAUDE.md requires every intentional deviation to get a Divergences entry, and grepping
-  `README.md` for TRA-242/handoff/review-handoff turns up nothing. Don't assume this is already
-  covered elsewhere — if you touch `handoff.rs`, add the missing entry (or confirm one now exists
-  and update this note).
+  intentional. Its README.md Divergences entry ("Daemon-mediated review handoff", TRA-242) was
+  finally written by STUDIO-659, which had to touch this file; keep it in step if the handoff's
+  behaviour changes. Note that the handoff is now also the review quorum's trigger (`quorum.rs`), so
+  a change to when it fires changes when reviews are requested.

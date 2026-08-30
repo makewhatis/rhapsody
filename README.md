@@ -216,7 +216,29 @@ midnight. This preserves the local-day semantics the client-side fold had; a UTC
 silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
 meaning, so the header's `cached = total − in − out` reconciliation still adds up.
 
-### Rhapsody Teams — an optional feature with no Go counterpart (STUDIO-639 … STUDIO-653)
+### Daemon-mediated review handoff — `POST /api/v1/runs/{id}/handoff` (TRA-242)
+
+Go has no analogue: an agent that finished its work moved its own ticket to the review state through
+its Linear-write MCP, so every dispatched agent needed Linear write credentials to end a run
+cleanly, and a run whose agent lacked them (or fumbled the state name) ran to `max_turns`.
+
+| Ending a run cleanly | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| who moves the ticket | the agent, via its own Linear-write MCP | the **daemon**, via its own tracker |
+| what the agent needs | Linear write access | nothing — one MCP tool call |
+| target state | whatever the agent typed | the owning project's configured `review_states[0]`, by NAME |
+
+The move is by NAME, not by Linear state TYPE: the type set is triage / backlog / unstarted /
+started / completed / canceled with **no "review"**, and the nearest ("started") resolves to an
+ACTIVE state, which would keep the ticket dispatchable and spin the turn loop to `max_turns`. The
+move alone is the clean end-of-run — the agent is **not** killed (it is the caller and finishes its
+turn) and no suppression state changes; the worker's next per-turn state refresh sees a non-active
+state and winds down. Empty `review_states` means the feature is off: the tool answers
+`handoff_not_configured` and the agent falls back to the documented Linear-MCP path, which is
+unchanged. The plan is resolved ON the control task and the tracker write runs off it, so a slow
+Linear cannot stall a tick.
+
+### Rhapsody Teams — an optional feature with no Go counterpart (STUDIO-639 … STUDIO-659)
 
 Teams gives a daemon named identities with shared profiles and per-identity memory. The frozen Go
 reference has none of it, so nothing here is a *difference* in ported behaviour — it is new surface,
@@ -297,6 +319,34 @@ it is separate work.
 One `teams.yaml` key governs how much of all this reaches a prompt: `prompt_budget_bytes`
 (default 16000) is a single total budget for the whole Teams turn-1 prepend. Overflow drops the
 oldest room posts first, then the least relevant recalled facts, and never the identity header.
+
+**The review quorum (STUDIO-659) is the one place Teams makes the daemon CREATE work**, and it is
+the only new cross-service capability the feature adds: an additive `Tracker::create_issue`. When a
+run dispatched as a roster identity hands off a ticket with an open linked pull request, the daemon
+creates one ordinary review ticket per reviewer — Todo, assigned to the API-key viewer (the claim
+rule; an unassigned ticket is never picked up), labelled `rhapsody:@<reviewer>`, with a
+host-written description naming the PR, the parent and the job: review independently, post findings
+on the PR as summon comments, approve or request changes explicitly, never merge. Reviewers are
+chosen least-loaded-first from the roster minus the author, and reviewer runs need no new dispatch
+machinery at all — separate tickets sidestep the one-live-run-per-issue invariant and give each
+reviewer their own worktree and prompt for free.
+
+| Surface | Off behaviour (`quorum.enabled: false`, the default) |
+| --- | --- |
+| the fan-out task | never spawned — there is no task to have a behaviour delta |
+| the per-tick candidate sweep | returns immediately; no load is tallied and no PR is read |
+| a handoff | byte-identical; the fan-out is unrepresentable, not merely skipped |
+| `create_issue` | never called by anything |
+
+It costs at least two extra agent runs per handoff, which is why it is opt-in **per installation on
+top of** Teams already being on. Every write is best-effort and off the control task: a tracker
+failure backs off (to one attempt per 15 minutes) and posts loudly to the room rather than retrying
+forever, and a partial fan-out (1 of 2 created) marks the parent anyway and names the shortfall in
+the room post — a duplicate review ticket wakes a real agent for no reason, while a stated gap does
+not. `rhapsody:quorum-requested` on the parent is the idempotency record, so a re-handoff after
+review fixes never fans out twice. The trigger is the **daemon-mediated handoff above**, the moment
+the daemon executes rather than infers; an agent that moves its own ticket through the Linear-MCP
+fallback is not observed.
 
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside

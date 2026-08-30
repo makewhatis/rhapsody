@@ -62,6 +62,13 @@ Read the sibling file's top-of-file doc comment for its exact Go source (`client
   GraphQL mock (`MockServer`) — the project has no `httptest`-equivalent dependency, so this reads
   raw HTTP/1.1 off a `TcpStream`. `start_with_viewer` auto-answers the `viewer {}` query so
   per-test handlers only need to cover the query under test.
+- **`create.rs`** is the only ISSUE-MINTING operation in the contract (STUDIO-659, Teams' review
+  quorum). It resolves the project (from the client's own `project_slug`, cached on `Client` like
+  the milestone id), the state name and every label name to ids — reusing `move_state`'s and
+  `labels`' existing resolvers rather than a parallel copy — and only then sends one `issueCreate`.
+  A label that will not resolve fails the whole create on purpose: the `rhapsody:@<name>` label IS
+  the assignment, so an unlabelled issue is routed to nobody while looking like success. It is not
+  idempotent and cannot be; the once-per-parent guard belongs to the caller.
 - The `file` tracker satisfies the pool-mode claim methods as inert no-ops (`assign_issue` no-op,
   `create_comment` returns `file_tracker_claim_unsupported`) — pool claiming is Linear-only by
   design; don't "implement" it there.
