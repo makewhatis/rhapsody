@@ -79,7 +79,7 @@ pub struct Issue {
     /// `latest_summon_at` is the newest timestamp of a comment whose body contains the
     /// configured summon token (e.g. "@symphony"), case-insensitive (`None` when none). It is
     /// the single re-engagement signal across the system: a summons newer than the START of
-    /// Symphony's last run on the ticket re-opens a PR-suppressed issue for dispatch
+    /// the daemon's last run on the ticket re-opens a PR-suppressed issue for dispatch
     /// (prSuppressed) and re-engages a review-state ticket (reviewReopenEligible) — so a
     /// summons posted mid-run still counts after that run ends (INF-448). Plain comments
     /// without the token do NOT set it.
@@ -99,7 +99,7 @@ pub struct Issue {
 
     /// `assignee_id` / `assignee_name` are the Linear user the issue is assigned to (both empty
     /// when unassigned). Populated by the tracker for log/observability visibility;
-    /// assignee-based candidate filtering itself is server-side — Symphony only fetches issues
+    /// assignee-based candidate filtering itself is server-side — the daemon only fetches issues
     /// assigned to the owner of its API key (the resolved `viewer`).
     pub assignee_id: String,
     pub assignee_name: String,

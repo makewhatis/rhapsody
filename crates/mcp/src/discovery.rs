@@ -16,7 +16,7 @@ use rhapsody_config::Config;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// The runtime file's name under the Symphony home directory (runtimeport.go's `FileName`).
+/// The runtime file's name under the daemon's home directory (runtimeport.go's `FileName`).
 const FILE_NAME: &str = "runtime.json";
 
 /// The daemon's published runtime state (runtimeport.go's `Info`). `port` is the actual bound
@@ -43,7 +43,7 @@ fn read_runtime_info_in(home: &Path) -> Option<RuntimeInfo> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// The Symphony home directory — `$HOME`, matching Go's `os.UserHomeDir()` on Unix (the daemon /
+/// The daemon's home directory — `$HOME`, matching Go's `os.UserHomeDir()` on Unix (the daemon /
 /// desktop app target). `None` when `$HOME` is unset/empty, so discovery falls back to config.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")

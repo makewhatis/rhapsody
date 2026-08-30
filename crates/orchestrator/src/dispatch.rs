@@ -296,8 +296,8 @@ impl Orchestrator {
     /// (symphony-29). The review-branch counterpart to [`eligible`] (which intentionally rejects
     /// non-active states); a review issue is handled ONLY here. Eligible iff it is neither running
     /// nor claimed, carries a `team_id` (required to promote it), carries a summons, AND that
-    /// summons is strictly newer than the START of Symphony's last run on it. No run / store
-    /// disabled / unparseable start ⇒ NOT eligible (Symphony never grabs a human-managed review
+    /// summons is strictly newer than the START of the daemon's last run on it. No run / store
+    /// disabled / unparseable start ⇒ NOT eligible (the daemon never grabs a human-managed review
     /// ticket it has never worked; the check converges). Mirrors Go `reviewReopenEligible`.
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
         if iss.id.is_empty() || iss.identifier.is_empty() || iss.team_id.is_empty() {
@@ -316,7 +316,7 @@ impl Orchestrator {
         }
     }
 
-    /// Returns the `started_at` of the most recent non-interrupted run Symphony recorded for
+    /// Returns the `started_at` of the most recent non-interrupted run the daemon recorded for
     /// `identifier`, parsed as RFC3339; `None` when there is no such run, the store is disabled, or
     /// no recent run has a parseable start time. It deliberately counts a still-running newest row
     /// (its start IS the boundary a mid-run summons must beat, INF-448); INTERRUPTED rows are skipped

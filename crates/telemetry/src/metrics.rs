@@ -1,4 +1,4 @@
-//! metrics — Symphony's OpenTelemetry instruments. Parity port of Go `telemetry.Metrics`.
+//! metrics — Rhapsody's OpenTelemetry instruments. Parity port of Go `telemetry.Metrics`.
 //!
 //! Bounded metric label keys (the cardinality contract): metric attributes are restricted to these
 //! low-cardinality dimensions ONLY. NEVER put issue/run/session identifiers on a metric — those are
@@ -17,7 +17,7 @@ pub const ATTR_OUTCOME: &str = "outcome";
 /// Metric attribute key: the bounded failure reason (`error` | `stalled`). Mirrors Go `AttrReason`.
 pub const ATTR_REASON: &str = "reason";
 
-/// Symphony's instruments. Build with [`Metrics::new`]; record via the semantic methods. All methods
+/// Rhapsody's instruments. Build with [`Metrics::new`]; record via the semantic methods. All methods
 /// are safe no-ops when built from a no-op meter. Mirrors Go `telemetry.Metrics`.
 pub struct Metrics {
     dispatched: Counter<u64>,

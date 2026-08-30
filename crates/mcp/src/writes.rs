@@ -4,7 +4,8 @@
 //! REMOVES any tool disabled in `cfg.mcp`, so a disabled write tool is not registered at all — the
 //! gate is the enabled-tool set, so a disabled tool is invisible to the agent (absent from
 //! `list_tools`, rejected on call) rather than a runtime "permission denied" (design: Tool surface
-//! §Write).
+//! §Write). STUDIO-603's `rhapsody_*` aliases are derived AFTER that removal, so a disabled write
+//! tool has no alias either and the gate cannot be walked around by spelling the tool the other way.
 //!
 //!   - `symphony_send_message`: ON by default (`cfg.mcp.allow_send_message`) — the INF-250 mailbox.
 //!   - `symphony_stop` / `symphony_resume`: OFF by default (`cfg.mcp.allow_stop` / `allow_resume`).
@@ -240,6 +241,91 @@ mod tests {
                 "{n:?} must be present when enabled: {names:?}"
             );
         }
+    }
+
+    // STUDIO-603: the brand aliases are derived AFTER gating, so a disabled write tool has no
+    // alias either — the opt-in gate cannot be walked around by spelling the tool the other way.
+    // This is the security-relevant half of the alias change.
+    #[tokio::test]
+    async fn brand_aliases_respect_the_write_gates() {
+        let pairs = [
+            ("symphony_send_message", "agent_send_message"),
+            ("symphony_stop", "rhapsody_stop"),
+            ("symphony_resume", "rhapsody_resume"),
+            ("symphony_handoff", "rhapsody_handoff"),
+        ];
+
+        // All off: NEITHER spelling of any write tool is registered.
+        let names = tool_names(Facade::new(
+            &cfg_with(false, false, false, false),
+            Client::for_port(0),
+            Options::default(),
+        ))
+        .await;
+        for (sym, alias) in pairs {
+            assert!(!names.contains(&sym.to_string()), "{sym} leaked: {names:?}");
+            assert!(
+                !names.contains(&alias.to_string()),
+                "{alias} leaked past the gate that removed {sym}: {names:?}"
+            );
+        }
+
+        // Defaults (send-message + handoff on, stop/resume off): the alias set tracks the gate
+        // exactly, tool by tool.
+        let names = tool_names(Facade::new(
+            &cfg_with(true, false, false, true),
+            Client::for_port(0),
+            Options::default(),
+        ))
+        .await;
+        for (sym, alias) in pairs {
+            assert_eq!(
+                names.contains(&sym.to_string()),
+                names.contains(&alias.to_string()),
+                "{alias} presence must track {sym}: {names:?}"
+            );
+        }
+        assert!(
+            names.contains(&"agent_send_message".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"rhapsody_handoff".to_string()), "{names:?}");
+        assert!(!names.contains(&"rhapsody_stop".to_string()), "{names:?}");
+        assert!(!names.contains(&"rhapsody_resume".to_string()), "{names:?}");
+
+        // All on: both spellings present for every write tool.
+        let names = tool_names(Facade::new(
+            &cfg_with(true, true, true, true),
+            Client::for_port(0),
+            Options::default(),
+        ))
+        .await;
+        for (sym, alias) in pairs {
+            assert!(names.contains(&sym.to_string()), "{sym} missing: {names:?}");
+            assert!(
+                names.contains(&alias.to_string()),
+                "{alias} missing: {names:?}"
+            );
+        }
+    }
+
+    // A disabled write tool is rejected on CALL under the alias too, not merely hidden from the
+    // listing (writes.go: "not registered at all").
+    #[tokio::test]
+    async fn disabled_write_alias_is_rejected_on_call() {
+        let facade = Facade::new(
+            &cfg_with(false, false, false, false),
+            Client::for_port(0),
+            Options::default(),
+        );
+        let client = connect(facade).await;
+        for name in ["symphony_stop", "rhapsody_stop"] {
+            assert!(
+                client.call_tool(call(name)).await.is_err(),
+                "{name} must be rejected when the stop gate is off"
+            );
+        }
+        let _ = client.cancel().await;
     }
 
     // symphony_send_message proxies POST /runs/{id}/message with the text body and defaults the run

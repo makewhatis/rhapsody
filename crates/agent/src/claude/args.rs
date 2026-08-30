@@ -57,7 +57,7 @@ pub struct Config {
     /// preserves the operator's servers because `--mcp-config` implies `--strict-mcp-config`.
     pub inject_mcp: bool,
     /// Absolute path to the running daemon binary, used as the injected server's `command`.
-    pub symphony_bin: String,
+    pub daemon_bin: String,
     /// Passed as `symphony mcp <workflow_path>` so the child resolves the SAME workflow (and thus
     /// the daemon's server port).
     pub workflow_path: String,
