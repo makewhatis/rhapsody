@@ -352,6 +352,30 @@ pub struct Orchestrator {
     /// forbade.
     pub issue_states: HashMap<String, String>,
 
+    /// Per-identity load, as last seen by the poller **in memory** (STUDIO-659, T7; §0.11.1's
+    /// load = open tickets carrying `rhapsody:@x`). Refreshed each tick from the candidate fetch by
+    /// [`record_quorum_state`](Orchestrator::record_quorum_state), and read by the review quorum's
+    /// reviewer selection so a handoff never costs a tracker round-trip on the control task.
+    ///
+    /// Empty and never written when the quorum is off, which is the whole of "zero behaviour change
+    /// with `quorum.enabled: false`" on the control-loop side.
+    pub(crate) quorum_load: HashMap<String, i64>,
+
+    /// Tracker issue id → what the last candidate sweep learned about it for quorum purposes: its
+    /// open linked PR and whether it already carries the `rhapsody:quorum-requested` marker
+    /// (STUDIO-659, T7). Refreshed and gated exactly like
+    /// [`quorum_load`](Orchestrator::quorum_load).
+    pub(crate) quorum_facts: HashMap<String, crate::quorum::QuorumFacts>,
+
+    /// The off-loop review-quorum task's inbox (STUDIO-659, T7). `None` whenever the quorum is off
+    /// or no task was spawned, in which case a handoff sends nothing — the fan-out is
+    /// unrepresentable rather than merely skipped.
+    ///
+    /// Cloned into every [`ControlHandle`](crate::stop::ControlHandle), which is what actually
+    /// sends: the request is built ON the loop (`plan_quorum`) but only dispatched AFTER the
+    /// off-loop review-state move succeeds, so a handoff whose Linear write failed never fans out.
+    pub(crate) quorum_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::quorum::QuorumRequest>>,
+
     /// The **off-loop** Teams memory runtime (STUDIO-645, T4): the loaded config, the constructed
     /// backend, and the live run → identity binding a `teams_retain` is stamped from. Shared by
     /// `Arc` with the daemon's HTTP layer.
@@ -565,6 +589,9 @@ impl Orchestrator {
             teams_room: None,
             teams_cursors: None,
             issue_states: HashMap::new(),
+            quorum_load: HashMap::new(),
+            quorum_facts: HashMap::new(),
+            quorum_tx: None,
             teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),

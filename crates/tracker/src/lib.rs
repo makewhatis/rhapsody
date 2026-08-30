@@ -73,6 +73,42 @@ impl From<linear::LinearError> for TrackerError {
     }
 }
 
+/// The fields one NEW issue is created with — the input to [`Tracker::create_issue`]
+/// (STUDIO-659, T7; design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.12).
+///
+/// A deliberately small, flat record rather than a `core::Issue`: [`Issue`] is a *normalized
+/// observation* ported field-for-field from Go and carries ~20 fields a creator has no business
+/// supplying (`identifier`, `linked_prs`, `latest_summon_at`, …). This is the write side's own
+/// contract, so it lives here with the trait rather than in `rhapsody-core`, which stays a mirror
+/// of the Go domain types.
+///
+/// Every field is by NAME where a name is what an operator writes (`state_name`, `labels`) and by
+/// ID where the tracker's own identity is what is meant (`team_id`, `assignee_id`); resolving a
+/// name to a tracker UUID is the adapter's job, exactly as it is for
+/// [`Tracker::move_issue_state`] and [`Tracker::add_issue_label`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewIssue {
+    /// The team the issue is created in. Required: a Linear issue belongs to a team, and the
+    /// state and label resolutions below are team-scoped. Callers pass the PARENT issue's
+    /// `team_id`, so a review ticket lands beside the work it reviews.
+    pub team_id: String,
+    pub title: String,
+    pub description: String,
+    /// The workflow state NAME to open the issue in (e.g. "Todo"), resolved team-scoped and
+    /// case-insensitively like [`Tracker::move_issue_state`]'s. Empty ⇒ the tracker's own default
+    /// state for the team.
+    pub state_name: String,
+    /// The tracker user id to assign. Empty ⇒ unassigned. The quorum passes the resolved viewer
+    /// because the default (assignee-mode) candidate query is keyed on `assignee == viewer`, so an
+    /// unassigned ticket is never picked up.
+    pub assignee_id: String,
+    /// Label NAMES to attach, find-or-created in `team_id` exactly as
+    /// [`Tracker::add_issue_label`] does. A label that cannot be resolved fails the whole create
+    /// rather than yielding a silently unlabelled issue — an unlabelled review ticket would be
+    /// routed to nobody.
+    pub labels: Vec<String>,
+}
+
 /// Tracker is the issue-tracker contract used by the orchestrator (upstream §11.1).
 /// Implementations must return normalized [`Issue`](rhapsody_core::Issue) values.
 ///
@@ -204,4 +240,24 @@ pub trait Tracker: Any + Send + Sync {
         &self,
         label_names: &[String],
     ) -> Result<Vec<Issue>, TrackerError>;
+
+    /// CreateIssue creates ONE new issue from `spec` and returns its human identifier (e.g.
+    /// `"STUDIO-700"`). Rhapsody Teams' review-quorum fan-out: a handoff by a teammate creates one
+    /// ordinary review ticket per reviewer, and ordinary tickets are the whole trick — they need no
+    /// new dispatch machinery, sidestep the one-live-run-per-issue invariant, and give §0.6's
+    /// reviewer context isolation for free (design record
+    /// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.12). STUDIO-659.
+    ///
+    /// **This is the contract's only ISSUE-CREATING surface**, and the only new cross-service
+    /// capability the quorum slice adds. Every other write here mutates an issue somebody else
+    /// created; this one mints work. Treat adding a second caller as a design decision.
+    ///
+    /// Adapters place the issue in whatever project scopes them (the Linear adapter uses its own
+    /// configured `project_slug`), so a created ticket is a candidate the daemon can later pick up.
+    /// The create is NOT idempotent — calling it twice makes two issues — so callers own the
+    /// once-per-parent guard; the quorum's is the `rhapsody:quorum-requested` marker label.
+    ///
+    /// An adapter with no notion of creating issues returns an error rather than a silent success:
+    /// a caller must be able to tell that the fan-out did not land.
+    async fn create_issue(&self, spec: &NewIssue) -> Result<String, TrackerError>;
 }

@@ -182,7 +182,7 @@ pub(super) async fn add_issue_label(
 /// a workspace-level label of the same name (an operator may well have created `rhapsody:@alice`
 /// there, and creating a second team-scoped copy would split the ledger this feature depends on).
 /// Only when neither exists is one created in the team.
-async fn resolve_or_create_label(
+pub(super) async fn resolve_or_create_label(
     c: &Client,
     team_id: &str,
     label_name: &str,

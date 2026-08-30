@@ -51,6 +51,7 @@ pub mod orchestrator;
 pub mod persist;
 pub mod preflight;
 pub mod promote;
+pub mod quorum;
 pub mod reads;
 pub mod reconcile;
 pub mod reconcile_run;
@@ -90,6 +91,10 @@ pub use message::RunMessageResult;
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
 pub use preflight::{
     ClaudeCredentialProbe, CredentialProbe, PROBE_TIMEOUT, ProbeOutcome, ProbeRequest,
+};
+pub use quorum::{
+    MAX_QUORUM_BACKOFF_MS, QUORUM_REQUESTED_LABEL, QuorumDeps, QuorumRequest, QuorumTarget,
+    run_quorum_task,
 };
 pub use reads::{Identity, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};

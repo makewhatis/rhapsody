@@ -139,7 +139,7 @@ pub(super) async fn move_issue_to_type(
 /// Linear's "In Progress" (a server-side eq filter would be case-sensitive and silently miss). The
 /// cache lock is dropped across the query (not single-flight, mirroring Go); a not-found result is
 /// never cached, so a later-created state resolves on a subsequent move.
-async fn resolve_state_id(
+pub(super) async fn resolve_state_id(
     c: &Client,
     team_id: &str,
     state_name: &str,

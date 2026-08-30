@@ -13,6 +13,7 @@ mod by_states;
 mod candidates;
 mod claim;
 mod client;
+mod create;
 mod decode;
 mod errors;
 mod labels;
@@ -27,7 +28,7 @@ pub use client::{Client, Config, new};
 pub use errors::{LinearError, LinearErrorKind};
 pub use normalize::RawIssue;
 
-use crate::TrackerError;
+use crate::{NewIssue, TrackerError};
 use async_trait::async_trait;
 use rhapsody_core::{Comment, Issue, Project, Viewer};
 
@@ -114,6 +115,9 @@ impl crate::Tracker for Client {
         label_names: &[String],
     ) -> Result<Vec<Issue>, TrackerError> {
         labels::fetch_open_issues_by_labels(self, label_names).await
+    }
+    async fn create_issue(&self, spec: &NewIssue) -> Result<String, TrackerError> {
+        create::create_issue(self, spec).await
     }
 }
 

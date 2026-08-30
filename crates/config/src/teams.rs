@@ -94,6 +94,21 @@ fn default_prompt_budget_bytes() -> i64 {
     DEFAULT_PROMPT_BUDGET_BYTES
 }
 
+/// `quorum.reviewers` — how many teammates a handoff fans review tickets out
+/// to. §0.12: "at least two" is both the floor of §0.6 and the default.
+pub const DEFAULT_QUORUM_REVIEWERS: i64 = 2;
+
+/// The smallest reviewer count honoured. A quorum of zero is not a quorum; it
+/// is the feature switched off, and `enabled: false` is how you say that. So a
+/// nonsensical `reviewers` (0, negative) clamps UP to one rather than silently
+/// turning an enabled quorum into a no-op — the same "a non-positive bound must
+/// not mean two different things" stance [`Memory::recall_top_k`] takes.
+pub const MIN_QUORUM_REVIEWERS: i64 = 1;
+
+fn default_quorum_reviewers() -> i64 {
+    DEFAULT_QUORUM_REVIEWERS
+}
+
 /// The `manager:` block (§2.2). Carried as config in T1; the routing function
 /// that reads `default_identity` is T3a and the model turn that reads `model` /
 /// `max_tokens` / `timeout_ms` is T3b's off-loop triage task (§0.11.2).
@@ -123,6 +138,49 @@ impl Default for Manager {
             max_tokens: DEFAULT_MAX_TOKENS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }
+    }
+}
+
+/// The `quorum:` block — Rhapsody Teams' **notified review** (§0.6, and the
+/// trigger/cap decision recorded as §0.12 on 2026-08-30).
+///
+/// When a teammate hands off a PR, the daemon fans review tickets out to the
+/// least-loaded other teammates so at least two pairs of eyes read the work
+/// independently. §0.6 calls this "the most expensive item in the revision" —
+/// it costs `reviewers` extra agent runs per handoff — which is why
+/// [`enabled`](Self::enabled) defaults to **false** and an absent `quorum:`
+/// section is the off state, exactly as an absent `teams.yaml` is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quorum {
+    /// The opt-in switch (§0.12's "cost control"). Default **false**: the
+    /// quorum is per-installation opt-in, never ambient.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How many teammates review one handoff, clamped to the roster minus the
+    /// author. Default 2; see [`Quorum::effective_reviewers`] for the floor.
+    #[serde(default = "default_quorum_reviewers")]
+    pub reviewers: i64,
+}
+
+impl Default for Quorum {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reviewers: DEFAULT_QUORUM_REVIEWERS,
+        }
+    }
+}
+
+impl Quorum {
+    /// [`Quorum::reviewers`] with the floor applied — the number the fan-out
+    /// actually asks for, before the roster clamps it further.
+    pub fn effective_reviewers(&self) -> usize {
+        usize::try_from(self.reviewers.max(MIN_QUORUM_REVIEWERS)).unwrap_or(
+            // Unreachable for any i64 >= 1 on a 64-bit target; a 32-bit target
+            // with an absurd `reviewers` degrades to the default rather than
+            // panicking, because a config value must never take the daemon down.
+            DEFAULT_QUORUM_REVIEWERS as usize,
+        )
     }
 }
 
@@ -196,6 +254,10 @@ pub struct Teams {
     pub manager: Manager,
     #[serde(default)]
     pub memory: Memory,
+    /// The `quorum:` block (STUDIO-659, T7; §0.6, §0.12). An ABSENT section is
+    /// [`Quorum::default`], i.e. disabled — the whole point of the opt-in.
+    #[serde(default)]
+    pub quorum: Quorum,
     #[serde(default)]
     pub roster: Vec<Identity>,
     /// **The one total byte budget** for the whole Teams turn-1 prepend
@@ -230,6 +292,7 @@ impl Default for Teams {
             enabled: false,
             manager: Manager::default(),
             memory: Memory::default(),
+            quorum: Quorum::default(),
             roster: Vec::new(),
             prompt_budget_bytes: DEFAULT_PROMPT_BUDGET_BYTES,
         }
@@ -534,6 +597,8 @@ mod tests {
             assert_eq!(t.memory.endpoint, "", "({text:?})");
             assert_eq!(t.memory.bank_prefix, "agent-", "({text:?})");
             assert_eq!(t.memory.recall_top_k, 8, "({text:?})");
+            assert!(!t.quorum.enabled, "quorum defaults OFF ({text:?})");
+            assert_eq!(t.quorum.reviewers, 2, "({text:?})");
             assert!(t.roster.is_empty(), "({text:?})");
             assert_eq!(t, Teams::disabled(), "({text:?})");
         }
@@ -814,6 +879,56 @@ mod tests {
         assert!(matches!(err, TeamsError::Invalid(_)), "got {err}");
     }
 
+    /// STUDIO-659 (T7), §0.12's "cost control": the quorum is opt-in per
+    /// installation. An absent `quorum:` section and a present-but-empty one
+    /// both mean OFF — the same "absence is the shipped state" rule the whole
+    /// file is built on. Teams itself being ON must not turn it on.
+    #[test]
+    fn quorum_is_absent_means_disabled() {
+        for text in [
+            "enabled: true\nroster:\n  - name: alice\n",
+            "enabled: true\nquorum:\nroster:\n  - name: alice\n",
+            "enabled: true\nquorum: {}\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert!(t.enabled, "({text:?})");
+            assert!(
+                !t.quorum.enabled,
+                "an absent/empty quorum section must be OFF ({text:?})"
+            );
+            assert_eq!(t.quorum, Quorum::default(), "({text:?})");
+            assert_eq!(t.quorum.reviewers, DEFAULT_QUORUM_REVIEWERS, "({text:?})");
+        }
+    }
+
+    /// §0.12's cap: `reviewers` defaults to 2 ("at least two" is the floor AND
+    /// the default) and is honoured when set.
+    #[test]
+    fn quorum_reviewers_defaults_to_two_and_is_settable() {
+        let t = Teams::parse("quorum:\n  enabled: true\n").expect("parses");
+        assert!(t.quorum.enabled);
+        assert_eq!(t.quorum.reviewers, 2);
+        assert_eq!(t.quorum.effective_reviewers(), 2);
+
+        let t = Teams::parse("quorum:\n  enabled: true\n  reviewers: 3\n").expect("parses");
+        assert_eq!(t.quorum.effective_reviewers(), 3);
+    }
+
+    /// The floor: a `reviewers` of 0 or below is a config mistake, and clamping
+    /// UP to one is the only reading that keeps `enabled: true` meaningful —
+    /// clamping down to zero would make an enabled quorum a silent no-op, which
+    /// is what `enabled: false` is already for.
+    #[test]
+    fn quorum_reviewers_clamps_up_to_one() {
+        for (yaml, want) in [
+            ("quorum:\n  enabled: true\n  reviewers: 0\n", 1usize),
+            ("quorum:\n  enabled: true\n  reviewers: -7\n", 1),
+        ] {
+            let t = Teams::parse(yaml).unwrap_or_else(|e| panic!("parse {yaml:?}: {e}"));
+            assert_eq!(t.quorum.effective_reviewers(), want, "({yaml:?})");
+        }
+    }
+
     /// Unknown keys are ignored rather than fatal, matching `CapabilityDef`'s
     /// tolerance for partial entries: a `teams.yaml` written by a NEWER
     /// Rhapsody must not disable the feature on an older one.
@@ -868,6 +983,10 @@ mod tests {
                 endpoint: String::new(),
                 bank_prefix: "team-".to_string(),
                 recall_top_k: 3,
+            },
+            quorum: Quorum {
+                enabled: true,
+                reviewers: 3,
             },
             roster: vec![Identity {
                 name: "alice".to_string(),

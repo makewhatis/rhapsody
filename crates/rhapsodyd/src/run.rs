@@ -197,6 +197,14 @@ where
     // re-sets the same ctx below.
     o.set_ctx(ctx.clone());
 
+    // --- Rhapsody Teams review quorum (STUDIO-659, slice T7; design record §0.6, §0.12) ---
+    //
+    // The channel a handoff hands its fan-out to. Created BEFORE `o.control()` so the sender is
+    // snapshotted onto the handle that actually performs the handoff, and created ONLY when the
+    // quorum is on: with `quorum.enabled: false` (the default) `o.quorum_tx` stays `None`, so a
+    // handoff cannot even represent a fan-out. §0.12's cost control, enforced by construction.
+    let quorum_rx = spawn_quorum(&teams_cfg).then(|| o.open_quorum_channel());
+
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
 
@@ -308,14 +316,19 @@ where
     // disabled spawn NOTHING, so those configurations have no task that could have a behaviour delta.
     // `install_probe` additionally holds it back in the hermetic daemon tests, which must never shell
     // out to a real `claude` — the same reason it gates the BO-59 credential probe above.
-    let triage_room = resolve_room_dir(resolved.as_ref(), &flags.db, flags.no_store)
+    // One room handle, shared by both off-loop Teams tasks (triage's decisions, STUDIO-650; the
+    // quorum's fan-out post, STUDIO-659). `LocalRoom` is a path plus a lock, so cloning the `Arc`
+    // is what keeps the room's single-writer discipline across the two tasks.
+    let teams_room = resolve_room_dir(resolved.as_ref(), &flags.db, flags.no_store)
         .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
+    let triage_room = teams_room.clone();
+    let quorum_room = teams_room;
     let triage_task = if spawn_triage(install_probe, &teams_cfg) {
         let triage_ctx = shutdown.wait();
         let triage_handle = handle.clone();
         let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
         let deps = rhapsody_orchestrator::TriageDeps {
-            teams: Arc::new(teams_cfg),
+            teams: Arc::new(teams_cfg.clone()),
             // Read lazily each cycle, exactly as the prune scheduler reads its store handle: the
             // handle is built before the first reload, so the tracker arrives later.
             target: move || {
@@ -341,6 +354,31 @@ where
         None
     };
 
+    // The quorum's own off-loop task, spawned beside triage and for the same reason: every tracker
+    // write it performs (two issue creates and a label) must happen off the control task, and a
+    // Linear that never answers must park this task and nothing else. It holds no `Orchestrator`,
+    // takes no lock the control task takes, and is cancelled by the same lifetime signal.
+    let quorum_task = quorum_rx.map(|rx| {
+        let quorum_ctx = shutdown.wait();
+        let quorum_handle = handle.clone();
+        let deps = rhapsody_orchestrator::QuorumDeps {
+            teams: Arc::new(teams_cfg),
+            // Read lazily per request, exactly as triage reads its tracker per cycle: the handle is
+            // built before the first reload, so the tracker arrives later.
+            target: move || {
+                quorum_handle
+                    .reads_tracker()
+                    .map(|tracker| rhapsody_orchestrator::QuorumTarget { tracker })
+            },
+            // The same room triage posts to, resolved the same way and for the same reason.
+            room: quorum_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+            max_backoff_ms: rhapsody_orchestrator::MAX_QUORUM_BACKOFF_MS,
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::run_quorum_task(quorum_ctx, deps, rx).await;
+        })
+    });
+
     // --- run the control loop until ctx is cancelled ---
     let run_err = o.run(ctx.clone()).await;
 
@@ -354,6 +392,11 @@ where
     // `manager.timeout_ms`, and a shutdown must never be held open by one — `kill_on_drop` reaps the
     // child when the runtime tears the task down.
     if let Some(t) = triage_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // The quorum task is cancelled by the same signal and checks it on both sides of its receive,
+    // so the wait is bounded by whatever tracker write is already in flight.
+    if let Some(t) = quorum_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // Drain the observability server (bounded, mirroring Go's 5s Shutdown ctx).
@@ -559,6 +602,24 @@ fn report_profile_issues(teams: Option<&rhapsody_config::teams::Teams>, teams_pa
 ///   `claude`. The BO-59 credential probe is held back by the same flag for the same reason.
 fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> bool {
     install_probe && rhapsody_orchestrator::triage_enabled(teams)
+}
+
+/// Whether the Rhapsody Teams review-quorum task should exist at all (STUDIO-659, T7; design
+/// record §0.12): Teams enabled, `quorum.enabled` true, and a roster to draw reviewers from.
+///
+/// **A roster of ONE still spawns the task, deliberately.** The obvious optimisation — require two
+/// teammates, since one cannot review its own work — would silently delete a behaviour §0.12 asks
+/// for by name: "zero ⇒ skip with a **loud room post**, never an error". That post is how an
+/// operator who enabled the quorum on a one-person team finds out nothing will ever be reviewed,
+/// and it lives in the task, so gating the task on `roster.len() > 1` would make it unreachable.
+/// An EMPTY roster is excluded (as it is for [`spawn_triage`]) because no run can wear an identity
+/// there, so no handoff could ever build a request to post about.
+///
+/// Unlike [`spawn_triage`] this is NOT gated on `install_probe`: the quorum shells out to nothing,
+/// so a hermetic daemon test can carry the task safely. It is gated on the config alone, which is
+/// what makes "`quorum.enabled: false` spawns no task" a property rather than a promise.
+fn spawn_quorum(teams: &rhapsody_config::teams::Teams) -> bool {
+    teams.enabled && teams.quorum.enabled && !teams.roster.is_empty()
 }
 
 /// The claude command, effective billing guard and tracker credential the Teams triage turn runs
@@ -1075,6 +1136,56 @@ mod tests {
         assert!(
             !std::path::Path::new(&dir.child("teams")).exists(),
             "installing the memory handles must not create the banks directory"
+        );
+    }
+
+    // STUDIO-659 (Teams T7), design §0.12 and the slice's first acceptance criterion: the review
+    // quorum is opt-in per installation, so the fan-out task exists ONLY for an enabled Teams with
+    // `quorum.enabled` and a roster of more than one. Every other configuration — which includes
+    // every installation shipping today — has no task at all rather than a task that returns early,
+    // which is what makes "zero behaviour change" a property rather than a promise.
+    #[test]
+    fn spawn_quorum_only_for_an_enabled_quorum_with_somebody_to_ask() {
+        use rhapsody_config::teams::{Identity, Quorum, Teams};
+
+        let team = |enabled: bool, quorum: bool, names: &[&str]| Teams {
+            enabled,
+            quorum: Quorum {
+                enabled: quorum,
+                reviewers: 2,
+            },
+            roster: names
+                .iter()
+                .map(|n| Identity {
+                    name: (*n).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Teams::disabled()
+        };
+
+        assert!(spawn_quorum(&team(true, true, &["alice", "bob"])));
+        assert!(
+            !spawn_quorum(&team(true, false, &["alice", "bob"])),
+            "the quorum defaults off and must spawn nothing until it is asked for"
+        );
+        assert!(
+            !spawn_quorum(&team(false, true, &["alice", "bob"])),
+            "Teams off must spawn no quorum task"
+        );
+        assert!(
+            spawn_quorum(&team(true, true, &["alice"])),
+            "a roster of ONE must still spawn the task: §0.12's loud \"nobody to ask\" room post \
+             lives there, and it is how an operator learns nothing will ever be reviewed"
+        );
+        assert!(
+            !spawn_quorum(&team(true, true, &[])),
+            "an EMPTY roster spawns nothing: no run can wear an identity, so no handoff could \
+             build a request to post about"
+        );
+        assert!(
+            !spawn_quorum(&Teams::disabled()),
+            "the shipped state must spawn no quorum task"
         );
     }
 
