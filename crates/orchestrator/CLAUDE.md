@@ -19,7 +19,7 @@ the `Orchestrator` struct itself. Concretely:
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
   they never lock anything and must never be called from another task.
-- Three exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+- Four exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -29,9 +29,15 @@ the `Orchestrator` struct itself. Concretely:
     `RwLock<WarningMaps>`) — mutated by spawned resolver tasks running off the control task, with a
     generation-counter guard so a slow/older pass can't clobber a newer reload's warnings (see
     "API-facing views" below).
+  - `teamsmemory.rs`'s `TeamsMemory` (`Orchestrator::teams_memory: Option<Arc<TeamsMemory>>`,
+    STUDIO-645) — the `/api/v1/teams/*` handlers drive it entirely on the HTTP task, with **no
+    control round-trip at all**, because the design requires a `teams_retain` never to block the
+    control task; an event-channel round-trip would queue it behind the current tick. The control
+    task's whole involvement is two `HashMap` writes (`bind_run` at dispatch, `release_run` at run
+    exit) with no I/O, and the `RwLock` is never held across an `.await`.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  three seams; if none fits, that's a real design decision — don't reach for a fourth ad hoc
+  four seams; if none fits, that's a real design decision — don't reach for a fifth ad hoc
   `Arc<Mutex<..>>` without updating this list.
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
@@ -77,14 +83,20 @@ the `Orchestrator` struct itself. Concretely:
   `internal/obslog`; `internal/ghsummons` above is a third): `liveness.rs` and `obslog.rs`. These
   exist because the Go packages have no dedicated Rust crate and the orchestrator is their sole
   consumer — don't extract them into new crates without checking nothing else needs them first.
-- **Rhapsody Teams** (STUDIO-639…644; no Go counterpart — design record
+- **Rhapsody Teams** (STUDIO-639…645; no Go counterpart — design record
   `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`): `teams.rs` is the T3a dispatch router — a pure,
-  sync, zero-I/O `route()` called from `dispatch_issue`. `triage.rs` is the T3b **off-loop** triage
+  sync, zero-I/O `route()` called from `dispatch_issue` — plus T4's memory recall, which renders into
+  the same turn-1 section. Recall reads **local files only**, and the orchestrator holds the CONCRETE
+  `rhapsody_config::memory::LocalBank` for it (`teams_bank`), never a `dyn MemoryBackend`: the trait
+  is async because T8's `hindsight` does HTTP, and `dispatch_issue` is `fn`, so a remote backend is
+  unrepresentable on that path rather than merely discouraged. Don't "tidy" `teams_bank` into the
+  trait object — that type choice IS the no-network-on-dispatch proof. `teamsmemory.rs` is the
+  off-loop half (see the fourth seam above). `triage.rs` is the T3b **off-loop** triage
   task: it holds no `Orchestrator`, sends no control event and takes no lock the control task takes,
   which is exactly why the design puts the feature's one model turn there (§0.11.2 — a model call on
   the dispatch path was the STUDIO-551 head-of-line class). Spawned at the composition root
   (`rhapsodyd/run.rs`) beside the prune scheduler, and only for `manager.mode: labels+model`. It is
-  NOT a fourth state seam: it never touches orchestrator state at all.
+  NOT a state seam at all: unlike `teamsmemory.rs` it never touches orchestrator state.
 - **Cross-cutting constants**: `backoff.rs` (retry-cadence math), `telemetry_attrs.rs` (the
   bounded metric-label cardinality contract — project/model/outcome/reason only; never add an
   issue/run/session id here, that's a correctness bug, not a style nit).

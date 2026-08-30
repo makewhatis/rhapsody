@@ -23,7 +23,12 @@ purpose — see root CLAUDE.md's "out of scope" cross-process contracts.
 4. **`otel.rs`** — maps `otel:` config + `OTEL_*` env into a `telemetry::Config` (enablement,
    protocol normalization, loopback-insecure heuristic).
 5. **`mcp.rs`** — the `rhapsodyd mcp` subcommand: a thin stdio MCP facade that talks to the
-   *running* daemon over loopback HTTP; never touches `~/.rhapsody` or the DB directly.
+   *running* daemon over loopback HTTP; never opens the DB. It reads exactly two files under
+   `~/.rhapsody`, both read-only, both because an MCP tool set is fixed at registration time and
+   there is nothing to ask the daemon yet: `runtime.json` (port discovery) and `teams.yaml`
+   (STUDIO-645 — whether the four `teams_*` tools exist at all). The teams read resolves its path
+   from the **resolved** config; a decoded-only config leaves `storage.path` empty and would
+   silently pin Teams off for every agent (see `resolve_teams_enabled`).
 6. **`runlock.rs`** — the single-instance advisory flock.
 7. **`prune.rs`** — the daily history + stale-worktree GC scheduler.
 8. **`state.rs`** / **`logsource.rs`** — adapters wiring `httpapi`'s `StateProvider`/`LogSource`
@@ -57,6 +62,10 @@ each other — the split is required by the trait-ownership constraint, not acci
   One difference between the two sidecars: `capabilities.yaml` is **seeded** on first read, while
   `teams.yaml` is **never** created by a read — an absent `teams.yaml` is Rhapsody Teams' off
   state and its shipped state, and a disabled feature must not create a file (design §2.1).
+  `bootcfg::resolve_banks_dir` (STUDIO-645) follows the same rule for `teams/banks/`, with one
+  addition: an explicit `memory.path` overrides the runtime home outright. Like the profiles
+  directory it only NAMES a path — the banks directory appears on the first `teams_retain` and at
+  no other time.
 - **Lock file naming (`runlock::with_lock_suffix`)**: appends the literal `.lock` suffix via
   `OsString::push`, not `set_extension` — `set_extension` would replace `.md` and collide two
   different workflow files' locks. `canonical_lock_path` also resolves through symlinks and the
