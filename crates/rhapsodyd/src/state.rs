@@ -20,7 +20,7 @@ use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
 use rhapsody_orchestrator::teamsmemory::{
-    InvalidateView, RecallView, RetainView, RosterView, TeamsMemory, TeamsMemoryError,
+    InvalidateView, RecallView, RetainView, RoomView, RosterView, TeamsMemory, TeamsMemoryError,
 };
 use rhapsody_orchestrator::{
     CancelWait, ControlHandle, HandoffResult, Identity, ReadsError, RefreshResult, ReloadError,
@@ -191,6 +191,12 @@ impl StateProvider for DaemonState {
     /// daemon with `enabled: false` gives.
     async fn teams_roster(&self) -> Result<RosterView, TeamsMemoryError> {
         self.teams_memory()?.roster()
+    }
+
+    /// The room's read side (STUDIO-650, T5) — the fifth Teams surface, and read-only in the
+    /// strongest sense: serving it advances no identity's cursor.
+    async fn teams_room(&self, limit: usize) -> Result<RoomView, TeamsMemoryError> {
+        self.teams_memory()?.room(limit)
     }
 
     async fn teams_recall(

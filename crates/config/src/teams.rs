@@ -754,6 +754,8 @@ mod tests {
                 bank: "b".to_string(),
                 max_concurrent: 2,
             }],
+            // STUDIO-650, T5: the one new key, round-tripped like the rest.
+            prompt_budget_bytes: 9000,
         };
         let yaml = serde_yaml_ng::to_string(&t).expect("serialize");
         assert_eq!(Teams::parse(&yaml).expect("reparse"), t);

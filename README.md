@@ -199,9 +199,9 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
-| Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/` |
+| Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/`, no `teams/room/` |
 
-Four **additive** Rhapsody-only endpoints back the memory tools; no existing payload changes shape
+Five **additive** Rhapsody-only endpoints back the Teams tools; no existing payload changes shape
 and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 
 | Endpoint | Serves |
@@ -210,16 +210,32 @@ and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 | `GET /api/v1/teams/recall?identity=&query=` | one identity's retained memory, bounded |
 | `POST /api/v1/teams/invalidate` | mark one record non-valid, with the reason; reversible |
 | `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host |
+| `GET /api/v1/teams/room?limit=` | the newest posts in the team room, bounded; advances no cursor |
 
-The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate` and `teams_retain`.
-`teams_retain` takes `content` and nothing else on purpose: the identity, ticket, run and commit are
-resolved by the daemon from the run id it injected into that worker, so a run dispatched as one
-identity cannot write into another's memory bank.
+The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_retain` and
+`teams_room_read`. `teams_retain` takes `content` and nothing else on purpose: the identity, ticket,
+run and commit are resolved by the daemon from the run id it injected into that worker, so a run
+dispatched as one identity cannot write into another's memory bank. `teams_room_read` takes only an
+optional `limit`, which can narrow the window but never widen it, and reading it never advances any
+teammate's catch-up watermark.
 
 Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
 because it works on a laptop with no cloud: append-only markdown records, one file per record, under
 `~/.rhapsody/teams/banks/<name>/`, in files a human can read and correct. The bank directory appears
 on the first retain and at no other time.
+
+**The team room** is an append-only log read at hydration, not a message bus: identities are durable
+state rather than processes, so nobody receives and everybody catches up. It is JSONL under
+`~/.rhapsody/teams/room/`, one message per line in day-partitioned files, written only by the daemon
+(one per machine, so there is no concurrent-append problem to solve). A message's id is `file:seq`
+and each teammate's watermark lives in its own bank directory, never in `rhapsody.db`. Appends are
+best-effort with no fsync — the room is advisory and Linear is the ledger — and a corrupt line is
+skipped loudly rather than being fatal. The room directory appears on the first post and at no other
+time; a teammate whose room is absent or quiet reads nothing and writes nothing.
+
+One `teams.yaml` key governs how much of all this reaches a prompt: `prompt_budget_bytes`
+(default 16000) is a single total budget for the whole Teams turn-1 prepend. Overflow drops the
+oldest room posts first, then the least relevant recalled facts, and never the identity header.
 
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside

@@ -459,15 +459,15 @@ impl Orchestrator {
             &self.issue_states,
             teams.effective_prompt_budget(),
         );
-        if let (Some(cursors), Some(cursor)) = (self.teams_cursors.as_ref(), cursor) {
-            if let Err(e) = cursors.save(identity, &cursor) {
-                tracing::warn!(
-                    identity = %identity,
-                    error = %e,
-                    "teams room: could not persist the catch-up watermark; the next run re-reads \
-                     a bounded window of the same messages"
-                );
-            }
+        if let (Some(cursors), Some(cursor)) = (self.teams_cursors.as_ref(), cursor)
+            && let Err(e) = cursors.save(identity, &cursor)
+        {
+            tracing::warn!(
+                identity = %identity,
+                error = %e,
+                "teams room: could not persist the catch-up watermark; the next run re-reads a \
+                 bounded window of the same messages"
+            );
         }
         section
     }
@@ -574,6 +574,7 @@ mod tests {
     // previously implicit and is still `MAX_SECTION_BYTES` here).
     use crate::teamscompose::{MEMORY_HEADER, NOT_RE_VERIFIED, memory_section};
     use rhapsody_config::memory::{Fact, LocalBank, MAX_SECTION_BYTES, Record as MemoryRecord};
+    use rhapsody_config::room::{Cursor, Cursors, LocalRoom, Message as RoomMessage};
     use rhapsody_config::teams::{Manager, Teams};
     use rhapsody_store::{Sqlite, Store, StorePath};
     use rhapsody_tracker::fake::Fake;
@@ -931,6 +932,29 @@ mod tests {
         bank
     }
 
+    /// Attaches a room + its cursor store, rooted in `dir`, the way the composition root does.
+    /// Creates nothing: both name paths only (STUDIO-650, T5).
+    fn attach_room(o: &mut Orchestrator, dir: &TempDir) -> (Arc<LocalRoom>, Arc<Cursors>) {
+        let room = Arc::new(LocalRoom::new(
+            dir.child(rhapsody_config::room::DEFAULT_ROOM_SUBDIR),
+        ));
+        let cursors = Arc::new(Cursors::new(
+            dir.child(rhapsody_config::memory::DEFAULT_BANKS_SUBDIR),
+            "agent-",
+        ));
+        o.teams_room = Some(Arc::clone(&room));
+        o.teams_cursors = Some(Arc::clone(&cursors));
+        (room, cursors)
+    }
+
+    fn posted(from: &str, secs: i64, body: &str) -> RoomMessage {
+        RoomMessage::room(
+            from,
+            DateTime::from_timestamp(1_756_000_000 + secs, 0).expect("timestamp"),
+            body,
+        )
+    }
+
     fn stamped(identity: &str, ticket: &str, run: &str, content: &str) -> MemoryRecord {
         MemoryRecord {
             identity: identity.to_string(),
@@ -1083,6 +1107,183 @@ mod tests {
             "dispatch created the bank root {}",
             bank.root().display()
         );
+    }
+
+    // ── the room, at dispatch (STUDIO-650, T5) ─────────────────────────────────────────────────
+
+    /// **The ticket's second acceptance bullet.** Teams on with the room absent or empty ⇒ the
+    /// prompt is byte-identical to T4's render, nothing is created on read, and no cursor is
+    /// written. This is what makes enabling the room free for a team that has not used it.
+    #[test]
+    fn an_absent_room_leaves_the_section_byte_identical_and_creates_nothing() {
+        let dir = TempDir::new();
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+
+        let (mut without, _s1) = orch_with_teams(teams.clone());
+        let bank = attach_bank(&mut without, &dir);
+        bank.retain(&stamped(
+            "alice",
+            "MT-1",
+            "7",
+            "the parser lives in decode.rs",
+        ))
+        .expect("retain");
+        without.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let baseline = without.running["1"].teammate_section.clone();
+        assert!(
+            baseline.contains("decode.rs"),
+            "the baseline must actually carry a memory section: {baseline}"
+        );
+
+        let (mut with, _s2) = orch_with_teams(teams);
+        with.teams_bank = Some(Arc::clone(&bank));
+        let (room, cursors) = attach_room(&mut with, &dir);
+        with.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+
+        assert_eq!(
+            with.running["1"].teammate_section, baseline,
+            "an absent room must not change one byte of the section"
+        );
+        assert!(
+            !room.root().exists(),
+            "dispatch created the room root {}",
+            room.root().display()
+        );
+        assert!(
+            !cursors
+                .dir("alice")
+                .expect("cursor dir")
+                .join(rhapsody_config::room::CURSOR_FILE)
+                .exists(),
+            "an empty catch-up must write no cursor"
+        );
+    }
+
+    /// **The ticket's third acceptance bullet, end to end.** Posts in the room are caught up into
+    /// the turn-1 section as quoted, provenance-prefixed data; the cursor advances; and the NEXT
+    /// run sees only what arrived since.
+    #[test]
+    fn posts_are_caught_up_once_and_the_cursor_advances() {
+        let dir = TempDir::new();
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+
+        let (mut o, _store) = orch_with_teams(teams.clone());
+        let (room, cursors) = attach_room(&mut o, &dir);
+        room.append(&posted("@manager", 0, "assigned MT-1 to alice"))
+            .expect("append");
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let first = o.running["1"].teammate_section.clone();
+        assert!(
+            first.contains("- @manager wrote on") && first.contains("\"assigned MT-1 to alice\""),
+            "{first}"
+        );
+        assert_eq!(
+            cursors.load("alice"),
+            Cursor {
+                file: cursor_file_of(&room),
+                seq: 1
+            },
+            "the catch-up earns a watermark"
+        );
+
+        // A second run with nothing new catches up on nothing at all.
+        let (mut quiet, _s2) = orch_with_teams(teams.clone());
+        quiet.teams_room = Some(Arc::clone(&room));
+        quiet.teams_cursors = Some(Arc::clone(&cursors));
+        quiet.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        assert!(
+            !quiet.running["1"]
+                .teammate_section
+                .contains("assigned MT-1"),
+            "a caught-up message must not be re-read: {}",
+            quiet.running["1"].teammate_section
+        );
+
+        // …and a third, after news arrives, sees ONLY the news.
+        room.append(&posted("@manager", 60, "bob picked up MT-2"))
+            .expect("append");
+        let (mut news, _s3) = orch_with_teams(teams);
+        news.teams_room = Some(Arc::clone(&room));
+        news.teams_cursors = Some(Arc::clone(&cursors));
+        news.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let third = news.running["1"].teammate_section.clone();
+        assert!(third.contains("bob picked up MT-2"), "{third}");
+        assert!(
+            !third.contains("assigned MT-1 to alice"),
+            "only the news: {third}"
+        );
+    }
+
+    /// §0.11.4's lost-cursor rule at the dispatch level: deleting a cursor re-reads at most the
+    /// bounded window, never the whole log.
+    #[test]
+    fn a_deleted_cursor_re_reads_at_most_the_bounded_window() {
+        let dir = TempDir::new();
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, _store) = orch_with_teams(teams);
+        let (room, cursors) = attach_room(&mut o, &dir);
+        for n in 0..(MAX_ROOM_WINDOW * 2) {
+            room.append(&posted("@manager", n as i64, &format!("post {n}")))
+                .expect("append");
+        }
+        // A cursor that was never written is exactly a deleted one.
+        assert_eq!(cursors.load("alice"), Cursor::default());
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert!(
+            !section.contains("\"post 0\""),
+            "the whole log must NOT be re-read: {section}"
+        );
+        assert!(
+            section.contains(&format!("\"post {}\"", MAX_ROOM_WINDOW * 2 - 1)),
+            "the newest post must be there: {section}"
+        );
+    }
+
+    /// The composer's total budget is honoured at dispatch, not merely in isolation: a tight
+    /// `prompt_budget_bytes` shrinks the prepend while the identity header survives whole.
+    #[test]
+    fn the_prompt_budget_binds_at_dispatch_and_keeps_the_header() {
+        let dir = TempDir::new();
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.prompt_budget_bytes = 600;
+        let (mut o, _store) = orch_with_teams(teams);
+        let (room, _cursors) = attach_room(&mut o, &dir);
+        for n in 0..30 {
+            room.append(&posted("@manager", n, &"chatter ".repeat(40)))
+                .expect("append");
+        }
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert!(
+            section.starts_with("## You are working as alice"),
+            "the identity header is never dropped: {section}"
+        );
+        assert!(
+            section.len() <= 600,
+            "budget overrun: {} bytes",
+            section.len()
+        );
+    }
+
+    /// The log file the room's single post landed in, so a test can name the cursor it expects
+    /// without hard-coding today's date.
+    fn cursor_file_of(room: &LocalRoom) -> String {
+        let mut stems: Vec<String> = std::fs::read_dir(room.root())
+            .expect("room dir")
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .strip_suffix(&format!(".{}", rhapsody_config::room::LOG_EXT))
+                    .map(str::to_string)
+            })
+            .collect();
+        stems.sort();
+        stems.pop().expect("at least one log file")
     }
 
     /// The whole memory section is capped, whatever the bank holds — every byte

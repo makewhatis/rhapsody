@@ -422,10 +422,10 @@ impl LocalRoom {
             // `strip_suffix`, NOT `trim_end_matches`: the latter strips EVERY
             // trailing repetition, so a stray `2026-08-29.jsonl.jsonl` would
             // report the stem `2026-08-29` and collide with the real day's file.
-            if let Some(stem) = name.strip_suffix(&suffix) {
-                if !stem.is_empty() {
-                    out.push(stem.to_string());
-                }
+            if let Some(stem) = name.strip_suffix(&suffix)
+                && !stem.is_empty()
+            {
+                out.push(stem.to_string());
             }
         }
         out.sort_unstable();
@@ -559,10 +559,10 @@ impl LocalRoom {
 
         // Advance the watermark to just past what is actually being handed over
         // — never past a message the caller never saw.
-        if let Some(last) = out.messages.last() {
-            if let Some(c) = Cursor::after(last) {
-                out.cursor = c;
-            }
+        if let Some(last) = out.messages.last()
+            && let Some(c) = Cursor::after(last)
+        {
+            out.cursor = c;
         }
         Ok(out)
     }

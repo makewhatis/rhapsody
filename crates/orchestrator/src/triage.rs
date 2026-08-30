@@ -384,7 +384,7 @@ where
             // A tracing line scrolls away; this is the durable record that a model turn fed
             // attacker-reachable ticket text tried to name somebody who does not exist.
             post(
-                &deps,
+                deps,
                 Message::room(
                     MANAGER_IDENTITY,
                     Utc::now(),
@@ -415,7 +415,7 @@ where
         // (30-day default), which would have silently deleted the misroute record any future
         // tuning depends on — so the room, not `events`, is where this lives.
         post(
-            &deps,
+            deps,
             Message::room(
                 MANAGER_IDENTITY,
                 Utc::now(),

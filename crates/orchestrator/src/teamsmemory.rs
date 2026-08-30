@@ -49,6 +49,7 @@ use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, Record};
+use rhapsody_config::room::{Cursor, Message, RoomError, RoomLog};
 use rhapsody_config::teams::Teams;
 use serde::Serialize;
 
@@ -117,6 +118,21 @@ pub struct RetainView {
     pub commit_sha: String,
 }
 
+/// `GET /api/v1/teams/room` (STUDIO-650, T5).
+///
+/// A **read-only peek** at the room, and deliberately not a catch-up: it advances no identity's
+/// cursor. Cursors belong to hydration, so a mid-run peek by one teammate must never eat another
+/// run's catch-up — the ticket's own words, and the reason this shares `LocalRoom::read_since` but
+/// never `Cursors::save`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RoomView {
+    /// Oldest first, bounded by the room's own window.
+    pub messages: Vec<Message>,
+    /// Log lines that could not be parsed — reported rather than hidden, so "skipped loudly" is
+    /// true of the API as well as of the log.
+    pub skipped: Vec<String>,
+}
+
 /// `POST /api/v1/teams/invalidate`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct InvalidateView {
@@ -163,6 +179,15 @@ impl std::fmt::Display for TeamsMemoryError {
 
 impl std::error::Error for TeamsMemoryError {}
 
+impl From<RoomError> for TeamsMemoryError {
+    fn from(e: RoomError) -> Self {
+        match e {
+            RoomError::Invalid(m) => TeamsMemoryError::Invalid(m),
+            RoomError::Io(m) => TeamsMemoryError::Backend(m),
+        }
+    }
+}
+
 impl From<MemoryError> for TeamsMemoryError {
     fn from(e: MemoryError) -> Self {
         match e {
@@ -187,6 +212,11 @@ pub struct TeamsMemory {
     /// at dispatch / run exit; read by the HTTP task. Never held across an
     /// `.await`.
     runs: RwLock<HashMap<i64, RunProvenance>>,
+    /// The room `teams_room_read` serves (STUDIO-650, T5). `None` when there is no on-disk runtime
+    /// home to anchor `~/.rhapsody/teams/room/` to, in which case the endpoint answers as an empty
+    /// room rather than an error: a room nobody has posted to and a room that cannot exist read
+    /// the same, and neither is a failure.
+    room: Option<Arc<dyn RoomLog>>,
 }
 
 impl TeamsMemory {
@@ -211,7 +241,47 @@ impl TeamsMemory {
             backend,
             bank_ids,
             runs: RwLock::new(HashMap::new()),
+            room: None,
         }
+    }
+
+    /// Attaches the room `teams_room_read` serves (STUDIO-650, T5). Creates nothing: a
+    /// [`LocalRoom`](rhapsody_config::room::LocalRoom) names paths only, and this endpoint only
+    /// ever reads.
+    pub fn with_room(mut self, room: Arc<dyn RoomLog>) -> Self {
+        self.room = Some(room);
+        self
+    }
+
+    /// `GET /api/v1/teams/room` — the newest posts in the room, bounded (STUDIO-650, T5).
+    ///
+    /// **Read-only in the strongest sense: it advances NO identity's cursor.** Catch-up belongs to
+    /// hydration, where the composer earns the watermark from what it actually rendered; a tool
+    /// read that advanced a cursor would let a mid-run peek eat another run's catch-up and silently
+    /// hide a hand-off from the teammate it was addressed to. That is why this reads from
+    /// [`Cursor::default`] every time and never touches `Cursors`.
+    ///
+    /// The reader is deliberately the empty string — a room-wide peek is not any identity, so it
+    /// sees room-audience posts and no direct ones (T6 is where teammate direct posts start to
+    /// exist at all).
+    pub fn room(&self, limit: usize) -> Result<RoomView, TeamsMemoryError> {
+        if !self.enabled() {
+            return Err(TeamsMemoryError::Disabled);
+        }
+        // No room configured reads as an empty one: a room nobody has posted to and a room that
+        // cannot exist are the same answer, and neither is a failure.
+        let Some(room) = self.room.as_ref() else {
+            return Ok(RoomView::default());
+        };
+        let got = room.read_since("", &Cursor::default(), limit)?;
+        Ok(RoomView {
+            messages: got.messages,
+            skipped: got
+                .skipped
+                .into_iter()
+                .map(|(line, why)| format!("{line}: {why}"))
+                .collect(),
+        })
     }
 
     /// The identity → bank-id map the backend was built with, so the composition

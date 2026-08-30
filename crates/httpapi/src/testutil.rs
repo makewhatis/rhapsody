@@ -311,6 +311,16 @@ impl StateProvider for FakeProvider {
         Ok(())
     }
 
+    async fn teams_room(
+        &self,
+        limit: usize,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::RoomView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?.room(limit)
+    }
+
     async fn teams_roster(
         &self,
     ) -> Result<
