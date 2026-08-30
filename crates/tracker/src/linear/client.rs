@@ -82,14 +82,16 @@ pub struct Client {
 }
 
 /// Builds a linear [`Client`] from its [`Config`], applying Go `New`'s defaults (30s timeout,
-/// `@symphony` summon token).
+/// `@symphony` summon token). The token is compiled with
+/// [`compile_summon_matcher`](rhapsody_core::compile_summon_matcher), so either brand spelling
+/// summons (STUDIO-603).
 pub fn new(config: Config) -> Client {
     let token = if config.summon_token.is_empty() {
         DEFAULT_SUMMON_TOKEN
     } else {
         config.summon_token.as_str()
     };
-    let summon_re = rhapsody_core::compile_summon_re(token).ok();
+    let summon_re = rhapsody_core::compile_summon_matcher(token).ok();
     let http = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()

@@ -33,7 +33,7 @@ use tokio::time::Instant;
 
 use crate::claude::{
     Config, TRACKER_ENV_VARS, append_me_env, billing_guard_enabled, billing_guard_ok, build_args,
-    classify, inject_symphony_mcp, scrub_env, scrubbed_env_vars, split_command,
+    classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars, split_command,
 };
 use crate::{
     AgentError, EVENT_OPERATOR_MESSAGE, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
@@ -87,14 +87,15 @@ impl crate::Runner for Runner {
         // sess.cfg is a value copy of the runner's cfg, so overriding its mcp_config affects only
         // this session.
         let mut cfg = self.cfg.clone();
-        // MCP injection (INF-473): MERGE a `symphony` server into this session's mcp_config so the
-        // dispatched agent can query run/daemon state. Best-effort — on any failure keep the
-        // operator's original config unchanged; injection never blocks a run.
+        // MCP injection (INF-473): MERGE this daemon's server into the session's mcp_config (under
+        // the `symphony` key — the agent's tool namespace, a live contract) so the dispatched agent
+        // can query run/daemon state. Best-effort — on any failure keep the operator's original
+        // config unchanged; injection never blocks a run.
         if cfg.inject_mcp {
-            match inject_symphony_mcp(
+            match inject_daemon_mcp(
                 workspace_path,
                 &cfg.mcp_config,
-                &cfg.symphony_bin,
+                &cfg.daemon_bin,
                 &cfg.workflow_path,
             ) {
                 Ok((path, kept_operator)) => {

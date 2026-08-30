@@ -351,8 +351,14 @@ impl Manager {
         (true, true)
     }
 
-    /// The EXTRA SYMPHONY_* env entries to layer on top of the inherited environment (mirrors Go's
-    /// `hookEnv`). SYMPHONY_PROJECT is always set (possibly empty) so hooks can rely on its presence.
+    /// The EXTRA env entries to layer on top of the inherited environment (mirrors Go's `hookEnv`).
+    /// `*_PROJECT` is always set (possibly empty) so hooks can rely on its presence.
+    ///
+    /// STUDIO-603: each variable is emitted under BOTH the `SYMPHONY_*` and the `RHAPSODY_*`
+    /// spelling, with identical values. This is purely additive — operator hooks in the wild read
+    /// `SYMPHONY_*` and keep working untouched, while a hook written today can read the name the
+    /// daemon actually ships under. Nothing is removed here; retiring the `SYMPHONY_*` spelling is a
+    /// later ticket, once the alias has shipped.
     pub(crate) fn hook_env(
         &self,
         repo_url: &str,
@@ -363,6 +369,9 @@ impl Manager {
             format!("SYMPHONY_REPO={repo_url}"),
             format!("SYMPHONY_PROJECT={project_slug}"),
             format!("SYMPHONY_ISSUE={identifier}"),
+            format!("RHAPSODY_REPO={repo_url}"),
+            format!("RHAPSODY_PROJECT={project_slug}"),
+            format!("RHAPSODY_ISSUE={identifier}"),
         ]
     }
 
@@ -1320,6 +1329,29 @@ mod tests {
         assert!(env.contains(&"SYMPHONY_REPO=git@github.com:x/y.git".to_string()));
         assert!(env.contains(&"SYMPHONY_ISSUE=MT-1".to_string()));
         assert!(env.contains(&"SYMPHONY_PROJECT=proj-x".to_string()));
+    }
+
+    // STUDIO-603: every hook variable is ALSO emitted under the RHAPSODY_* spelling, with the same
+    // value, and the SYMPHONY_* spelling is untouched (operator hooks in the wild read it).
+    #[test]
+    fn hook_env_emits_both_spellings() {
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let env = m.hook_env("git@github.com:x/y.git", "proj-x", "MT-1");
+        for (sym, rha) in [
+            (
+                "SYMPHONY_REPO=git@github.com:x/y.git",
+                "RHAPSODY_REPO=git@github.com:x/y.git",
+            ),
+            ("SYMPHONY_PROJECT=proj-x", "RHAPSODY_PROJECT=proj-x"),
+            ("SYMPHONY_ISSUE=MT-1", "RHAPSODY_ISSUE=MT-1"),
+        ] {
+            assert!(env.contains(&sym.to_string()), "{sym} missing: {env:?}");
+            assert!(env.contains(&rha.to_string()), "{rha} missing: {env:?}");
+        }
+        // An empty project_slug is still PRESENT under both spellings (hooks rely on presence).
+        let env = m.hook_env("", "", "MT-1");
+        assert!(env.contains(&"SYMPHONY_PROJECT=".to_string()), "{env:?}");
+        assert!(env.contains(&"RHAPSODY_PROJECT=".to_string()), "{env:?}");
     }
 
     // Mirror of TestEnsureFromRepo_ConcurrentDistinctIssuesSameRepo.

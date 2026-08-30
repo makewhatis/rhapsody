@@ -1,7 +1,7 @@
 //! `gtguard` — injects a Graphite-workflow guardrail into an agent's worktree (parity port of
 //! `internal/workspace/gtguard`).
 //!
-//! When a dispatch's effective `git_flow` is `"graphite"`, Symphony writes a Claude Code PreToolUse
+//! When a dispatch's effective `git_flow` is `"graphite"`, the daemon writes a Claude Code PreToolUse
 //! hook (`.claude/hooks/gt-guard.sh`) plus a `.claude/settings.local.json` that registers it for the
 //! Bash tool, BEFORE the agent spawns. The hook blocks raw mutating git commands (commit/push/
 //! bulk-add) and points the agent at the `gt …` equivalent — deterministic enforcement of the
@@ -9,7 +9,7 @@
 //!
 //! `settings.local.json` (not `settings.json`) is used deliberately: Claude Code merges it on top of
 //! any repo-committed `.claude/settings.json` (Local scope > Project scope), so a repo's own hooks
-//! are never clobbered. It is conventionally git-ignored; because Symphony writes it rather than
+//! are never clobbered. It is conventionally git-ignored; because the daemon writes it rather than
 //! Claude Code, the agent's explicit-path staging keeps it out of commits even when the repo does not
 //! ignore it.
 //!

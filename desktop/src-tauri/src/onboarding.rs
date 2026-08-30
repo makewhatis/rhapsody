@@ -28,7 +28,7 @@ const DEFAULT_PROMPT_BODY: &str = r#"You are an autonomous engineer working tick
 {{ issue.description }}
 
 Implement the change test-first, keep the build and tests green, open a draft PR, move the issue
-to review when done, and end your final message with a line: `HANDOFF: in-review` — Symphony
+to review when done, and end your final message with a line: `HANDOFF: in-review` — Rhapsody
 records the run as completed only when this declaration is present. Do not merge."#;
 
 /// The onboarding config front matter. The fields are declared in the SAME alphabetical order Go's
@@ -78,6 +78,11 @@ struct Tracker {
     api_key: &'static str,
     kind: &'static str,
     project_slug: String,
+    /// STUDIO-603: seeded explicitly as `@rhapsody` so a NEW user gets the name the daemon ships
+    /// under. `decode`'s resolved default is still `@symphony` — that default is pinned by the
+    /// `api/config.json` parity golden and cannot be flipped — but the daemon's summon matcher
+    /// accepts BOTH spellings, so an existing `@symphony` config keeps working either way.
+    summon_token: &'static str,
     terminal_states: Vec<&'static str>,
 }
 
@@ -97,6 +102,7 @@ pub fn render_initial_workflow(project_slug: &str) -> Result<Vec<u8>, Error> {
             kind: "linear",
             api_key: "$LINEAR_API_KEY",
             project_slug: slug.to_string(),
+            summon_token: "@rhapsody",
             active_states: vec!["Todo", "In Progress"],
             terminal_states: vec!["Done", "Cancelled", "Canceled", "Duplicate"],
         },
@@ -121,7 +127,10 @@ pub fn render_initial_workflow(project_slug: &str) -> Result<Vec<u8>, Error> {
             enabled: false,
             endpoint: DEFAULT_OTEL_ENDPOINT,
             protocol: "http",
-            service_name: "symphony",
+            // STUDIO-603: a fresh install reports itself as `rhapsody`. `decode`'s resolved default
+            // is still "symphony" (pinned by the api/config.json parity golden); seeding the value
+            // explicitly is what makes a NEW user's telemetry carry the shipping name.
+            service_name: "rhapsody",
             insecure: false,
         },
     };
@@ -199,8 +208,32 @@ mod tests {
         );
         assert_eq!(cfg["otel"]["endpoint"].as_str(), Some(""), "no default hub");
         assert_eq!(cfg["otel"]["protocol"].as_str(), Some("http"));
-        assert_eq!(cfg["otel"]["service_name"].as_str(), Some("symphony"));
+        assert_eq!(cfg["otel"]["service_name"].as_str(), Some("rhapsody"));
         assert_eq!(cfg["otel"]["insecure"].as_bool(), Some(false));
+    }
+
+    // STUDIO-603: a NEW user's seeded WORKFLOW.md ships the daemon's own name. The resolved
+    // `decode` defaults are still `@symphony` / "symphony" — pinned by the api/config.json parity
+    // golden — so seeding these two values EXPLICITLY is what makes a fresh install say rhapsody.
+    #[test]
+    fn render_initial_workflow_seeds_the_rhapsody_names() {
+        let cfg = front_yaml(&render_initial_workflow("my-project").expect("render"));
+        assert_eq!(
+            cfg["tracker"]["summon_token"].as_str(),
+            Some("@rhapsody"),
+            "a fresh install must summon as @rhapsody (the daemon still accepts @symphony too)"
+        );
+        assert_eq!(
+            cfg["otel"]["service_name"].as_str(),
+            Some("rhapsody"),
+            "a fresh install must report itself as rhapsody"
+        );
+        // The seeded prompt body names this daemon, not the Go original it was ported from.
+        let (_, body) = split_front_body(&render_initial_workflow("my-project").expect("render"));
+        assert!(
+            !body.contains("Symphony"),
+            "the seeded prompt body must not call this daemon Symphony:\n{body}"
+        );
     }
 
     // Mirrors TestRenderInitialWorkflowBodyDeclaresHandoff: the seeded prompt must instruct the agent to

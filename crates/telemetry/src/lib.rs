@@ -1,6 +1,6 @@
 //! rhapsody-telemetry — parity port of Go `internal/telemetry`.
 //!
-//! Wires optional OpenTelemetry export (traces/metrics/logs) for Symphony. When disabled it is a
+//! Wires optional OpenTelemetry export (traces/metrics/logs) for Rhapsody. When disabled it is a
 //! complete no-op that still logs to stderr and into the in-memory ring backing the desktop app's
 //! Logs tab — it NEVER returns an error that should stop the daemon. Mirrors `$REF/internal/telemetry/`.
 

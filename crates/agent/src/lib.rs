@@ -1,6 +1,6 @@
 //! rhapsody-agent — parity port of Go `internal/agent` (Symphony v0.4.0).
 //!
-//! Symphony's pluggable coding-agent abstraction and backends. It is backend-agnostic
+//! Rhapsody's pluggable coding-agent abstraction and backends. It is backend-agnostic
 //! (upstream §10): this crate ports `agent.go` (the `EventType`/`TurnStatus` value sets, `Usage`,
 //! `Event`, `TurnResult`, `Transcript`, and the [`Runner`]/[`Session`] traits), `errors.go` (the
 //! typed [`AgentError`] sentinels), `humanize.go` (the UI event humanizer — see [`humanize`]), and

@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use regex::Regex;
-use rhapsody_core::compile_summon_re;
+use rhapsody_core::compile_summon_matcher;
 
 /// Matches an ssh or https GitHub remote URL, capturing `owner` (group 1) and `repo` (group 2).
 /// Mirrors Go `ghsummons.repoRe` (`github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$`). Compiled once;
@@ -89,11 +89,12 @@ pub struct GH {
 impl GH {
     /// Creates a `GH` summon source for `token` (e.g. `"@symphony"`). Pass `None` for `run` to shell
     /// out to the real `gh` binary. Mirrors Go `ghsummons.NewGH` (nil run → `defaultRun`). The token
-    /// matcher reuses [`compile_summon_re`] so the GitHub path matches identically to the Linear
-    /// comment path; a token that (impossibly) fails to compile degrades to matching nothing.
+    /// matcher reuses [`compile_summon_matcher`] so the GitHub path matches identically to the
+    /// Linear comment path — including accepting either brand spelling (STUDIO-603); a token that
+    /// (impossibly) fails to compile degrades to matching nothing.
     pub fn new(token: &str, run: Option<RunFn>) -> GH {
         GH {
-            re: compile_summon_re(token).ok(),
+            re: compile_summon_matcher(token).ok(),
             run: run.unwrap_or_else(|| Box::new(default_run)),
         }
     }
@@ -299,6 +300,38 @@ mod tests {
             got.get(&9999).map(|h| h.at),
             Some(utc(2026, 6, 25, 17, 0, 0))
         );
+    }
+
+    // STUDIO-603: the GitHub PR-comment path accepts EITHER brand spelling, whichever is
+    // configured — proving `GH::new` wires `compile_summon_matcher`, so the two summon paths stay
+    // identical (the Linear path has the mirror of this test).
+    #[tokio::test]
+    async fn summons_since_detects_either_brand_token() {
+        let issues = r#"[[
+            {"body":"@symphony fix CI","created_at":"2026-06-25T16:00:00Z","issue_url":"https://api.github.com/repos/o/r/issues/1"},
+            {"body":"@rhapsody fix CI","created_at":"2026-06-25T17:00:00Z","issue_url":"https://api.github.com/repos/o/r/issues/2"}
+        ]]"#;
+        for configured in ["@symphony", "@rhapsody"] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let src = GH::new(
+                configured,
+                Some(run_by_endpoint(issues, "[[]]", calls.clone())),
+            );
+            let got = src
+                .summons_since("o", "r", utc(2026, 6, 25, 15, 0, 0))
+                .await
+                .expect("summons_since");
+            assert_eq!(
+                got.get(&1).map(|h| h.at),
+                Some(utc(2026, 6, 25, 16, 0, 0)),
+                "configured {configured:?} must detect the @symphony spelling"
+            );
+            assert_eq!(
+                got.get(&2).map(|h| h.at),
+                Some(utc(2026, 6, 25, 17, 0, 0)),
+                "configured {configured:?} must detect the @rhapsody spelling"
+            );
+        }
     }
 
     // Mirrors Go `TestSummonsSinceUsesUpdatedAt`: stamp at updated_at (edit time), fall back to
