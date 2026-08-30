@@ -434,7 +434,7 @@ impl Teams {
             // one.
             if crate::room::RESERVED_IDENTITIES.contains(&entry.name.as_str()) {
                 return Err(TeamsError::Invalid(format!(
-                    "roster name {:?} is reserved: the daemon stamps `{}` on the operator's own room posts and `manager` on the routing function's, so no teammate may wear either name — rename this entry",
+                    "roster name {:?} is reserved: `{}` and `manager` are the daemon's own voices in the team room, not teammates, so a roster entry wearing either would be indistinguishable from one in every catch-up line — rename this entry",
                     entry.name,
                     crate::room::OPERATOR_IDENTITY,
                 )));
