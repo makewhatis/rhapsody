@@ -1,4 +1,4 @@
-.PHONY: test lint fixtures app dmg _sign _notarize_app _dmg _notarize verify-icon print-version
+.PHONY: test lint fixtures hindsight-smoke app dmg _sign _notarize_app _dmg _notarize verify-icon print-version
 
 test:
 	cargo test --workspace
@@ -13,6 +13,25 @@ lint:
 # Recapture golden fixtures from the reference Go daemon (operator machine only; see harness/capture/)
 fixtures:
 	harness/capture/capture.sh
+
+# The LIVE hindsight memory smoke check (STUDIO-660, Teams T8; design record §5.3). Operator machine
+# only — it needs the tailnet, the deployed service and a credential — and deliberately NOT in CI:
+# it is `#[ignore]`d, so `make test` skips it.
+#
+# Drives the daemon's OWN client (`rhapsody_config::hindsight::HindsightBackend`) through
+# retain -> recall -> invalidate(with a reason) -> recall against a SCRATCH bank, printing what each
+# step saw. §5.3 makes exactly this an acceptance criterion: STUDIO-569 confirmed the correction
+# path from a probe script, and "confirmed from a probe script" is not "confirmed from Rhapsody's
+# client".
+#
+#   HINDSIGHT_API_KEY=…            required — every /v1/** path 401s without it
+#   HINDSIGHT_ENDPOINT=…           default https://hindsight.yak-saturation.ts.net
+#   HINDSIGHT_SMOKE_IDENTITY=…     default `smoke`, i.e. bank `agent-smoke`
+hindsight-smoke:
+	@test -n "$$HINDSIGHT_API_KEY" || { \
+		echo "HINDSIGHT_API_KEY is unset — the deployed service answers 401 without it."; \
+		echo "usage: HINDSIGHT_API_KEY=... make hindsight-smoke"; exit 2; }
+	cargo test -p rhapsody-config --test hindsight_smoke -- --ignored --nocapture
 
 # --- macOS desktop app (P7-D5, desktop/) — parity port of $REF/Makefile's app/dmg/sign targets ---
 # The Tauri app is its OWN cargo workspace (desktop/), so these targets `cd desktop`, mirroring the Go
