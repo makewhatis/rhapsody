@@ -46,9 +46,14 @@ editing a renderer/lib script — a full `cargo test` recompiles the whole `desk
 - **Required positional args use `"${1:?usage: ...}"`**, not a hand-rolled `[ $# -lt 1 ] && exit`.
   Match this idiom if you add a new script or argument.
 - **`render-cask.sh` and `render-latest-json.sh` are single sources of truth**, not scratch scripts:
-  the cask output must stay byte-identical to the committed `Casks/rhapsody.rb` in the
-  `makewhatis/homebrew-tap` repo, and `release.yml`'s auto-bump job re-runs `render-cask.sh` at
-  release time expecting the same shape. Edit the heredoc/jq body and its `_test.sh` together.
+  the cask output must stay byte-identical to the committed casks in the `makewhatis/homebrew-tap`
+  repo, and `release.yml`'s auto-bump jobs re-run `render-cask.sh` at release time expecting the same
+  shape. Edit the heredoc/jq body and its `_test.sh` together.
+- **`render-cask.sh` renders TWO channels** (STUDIO-648): `Casks/rhapsody.rb` by default and
+  `Casks/rhapsody@rc.rb` with a third `rc` argument. `render_cask_test.sh` pins each with a whole-output
+  golden, and the stable golden is a verbatim copy of the pre-rc-channel output — so a change to the
+  shared cask body fails BOTH goldens, which is the point. Never "fix" a golden to match a new render;
+  the stable cask is a published artifact and the tap must not drift.
 - **`notarize.sh` doubles as a sourceable library.** `source notarize.sh --lib-only` (used by
   `notarize_args_test.sh`) loads `resolve_asc_key`/`notary_auth_args`/`notarize_target_kind` without
   requiring a target arg or touching `xcrun`/the network — the `BASH_SOURCE[0]` != `$0` check near
