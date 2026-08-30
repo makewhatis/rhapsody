@@ -1,7 +1,7 @@
 # CLAUDE.md — crates/orchestrator
 
 Parity port of Go `internal/orchestrator` — one Go package split across 26 source files, all
-mutating a single `Orchestrator` struct. The Rust port mirrors that file split one-to-one (35
+mutating a single `Orchestrator` struct. The Rust port mirrors that file split one-to-one (36
 files under `src/`, one per Go source file plus a couple of Rust-only internal ports — see below);
 resist the urge to further decompose or merge modules; the file boundary IS the port boundary and
 every file's own top-of-file doc comment names its exact Go source. Read that comment first when
@@ -34,7 +34,12 @@ the `Orchestrator` struct itself. Concretely:
     control round-trip at all**, because the design requires a `teams_retain` never to block the
     control task; an event-channel round-trip would queue it behind the current tick. The control
     task's whole involvement is two `HashMap` writes (`bind_run` at dispatch, `release_run` at run
-    exit) with no I/O, and the `RwLock` is never held across an `.await`.
+    exit) with no I/O, and the `RwLock` is never held across an `.await`. STUDIO-653's `teams_post`
+    is the one Teams surface that uses **both** seams, in this order: the room append happens here,
+    off-loop, and only then does `ControlHandle::record_teams_post` round-trip `Event::TeamsPost`
+    for the two mirrors that genuinely need loop-owned state (`running`, `mailboxes`,
+    `RunningEntry::event_seq`). That round-trip is best-effort by construction — the post is
+    already in the log — so a gone loop costs nothing.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
   four seams; if none fits, that's a real design decision — don't reach for a fifth ad hoc
@@ -49,7 +54,7 @@ the `Orchestrator` struct itself. Concretely:
   try to hold a borrow of `self.eff` across an `.await` — follow the existing owned-locals pattern
   instead of fighting the borrow checker with `Arc<Mutex<..>>`.
 
-## Module groups (35 files)
+## Module groups (36 files)
 
 - **Core state**: `orchestrator.rs` (the `Orchestrator` struct + `RunningEntry`/`EventRecord`),
   `effective.rs` (`Config` → `Effective`/`ResolvedProject`, rebuilt+swapped on reload).
@@ -84,7 +89,7 @@ the `Orchestrator` struct itself. Concretely:
   `internal/obslog`; `internal/ghsummons` above is a third): `liveness.rs` and `obslog.rs`. These
   exist because the Go packages have no dedicated Rust crate and the orchestrator is their sole
   consumer — don't extract them into new crates without checking nothing else needs them first.
-- **Rhapsody Teams** (STUDIO-639…645; no Go counterpart — design record
+- **Rhapsody Teams** (STUDIO-639…653; no Go counterpart — design record
   `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`): `teams.rs` is the T3a dispatch router — a pure,
   sync, zero-I/O `route()` called from `dispatch_issue` — plus T4's memory recall, which renders into
   the same turn-1 section. Recall reads **local files only**, and the orchestrator holds the CONCRETE
@@ -92,8 +97,12 @@ the `Orchestrator` struct itself. Concretely:
   is async because T8's `hindsight` does HTTP, and `dispatch_issue` is `fn`, so a remote backend is
   unrepresentable on that path rather than merely discouraged. Don't "tidy" `teams_bank` into the
   trait object — that type choice IS the no-network-on-dispatch proof. `teamsmemory.rs` is the
-  off-loop half (see the fourth seam above). `triage.rs` is the T3b **off-loop** triage
-  task: it holds no `Orchestrator`, sends no control event and takes no lock the control task takes,
+  off-loop half (see the fourth seam above), and `teamspost.rs` is T6's write side — the teammate
+  wrap (deliberately NOT `message.rs`'s `operator_wrap`), the `teams.message` timeline row, and the
+  direct-to-live delivery, all of which reuse the INF-250 mailbox admission via
+  `Orchestrator::admit_to_mailbox` rather than a second delivery path. A room post has no dispatch
+  power at all (design §0.2) — that is pinned by a test, not just documented. `triage.rs` is the
+  T3b **off-loop** triage task: it holds no `Orchestrator`, sends no control event and takes no lock the control task takes,
   which is exactly why the design puts the feature's one model turn there (§0.11.2 — a model call on
   the dispatch path was the STUDIO-551 head-of-line class). Spawned at the composition root
   (`rhapsodyd/run.rs`) beside the prune scheduler, and only for `manager.mode: labels+model`. It is

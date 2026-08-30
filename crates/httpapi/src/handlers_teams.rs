@@ -14,12 +14,18 @@
 //! | `POST /api/v1/teams/invalidate` | `teams_invalidate {identity, fact_id, reason}` |
 //! | `POST /api/v1/runs/{id}/retain` | `teams_retain {content}` |
 //! | `GET /api/v1/teams/room` | `teams_room_read {limit?}` (STUDIO-650, T5) |
+//! | `POST /api/v1/runs/{id}/post` | `teams_post {body, to?, refs?}` (STUDIO-653, T6) |
 //!
 //! Retain is deliberately **run-scoped in its path**, following
 //! `/api/v1/runs/{id}/handoff`: the run id is what the host resolves the
 //! identity, ticket and commit from, and the body carries `content` and nothing
 //! else. There is no route by which an agent can supply its own provenance
 //! (§5.1).
+//!
+//! `POST /api/v1/runs/{id}/post` is the same shape for the same reason (§0.11.4:
+//! "`from` is stamped by the host … a run cannot supply it"). Its body carries
+//! `body`, an optional `to` and optional `refs`; **there is no `from` field**,
+//! and a body that invents one is ignored the way retain's is.
 
 use std::sync::Arc;
 
@@ -35,10 +41,11 @@ use crate::handlers_runaction::parse_run_id;
 use crate::responses::{write_error, write_json};
 use crate::server::StateProvider;
 
-/// Bounds a retained record on the wire. The bank truncates to its own
-/// `MAX_RETAIN_CONTENT_BYTES` as well; this rejects an obvious paste of a whole
-/// transcript at the door, with a message that says what a record is for
-/// (§5.1: a *constructed record, never a transcript*).
+/// Bounds a retained record — and, from T6, a room post — on the wire. Each has
+/// its own tighter truncation further in (the bank's
+/// `MAX_RETAIN_CONTENT_BYTES`, the room's `MAX_POST_BODY_BYTES`); this rejects
+/// an obvious paste of a whole transcript at the door, with a message that says
+/// what the surface is for (§5.1: a *constructed record, never a transcript*).
 const MAX_RETAIN_BODY: usize = 1 << 16;
 
 /// `GET /api/v1/teams/recall?identity=&query=`.
@@ -80,6 +87,21 @@ struct InvalidateReq {
     fact_id: String,
     #[serde(default)]
     reason: String,
+}
+
+/// `POST /api/v1/runs/{id}/post` body (STUDIO-653, T6). No `from` and no
+/// `identity`: unknown keys are ignored by serde, so a body that invents one
+/// changes nothing — the author is resolved from the run id in the PATH.
+#[derive(Debug, Default, Deserialize)]
+struct PostReq {
+    #[serde(default)]
+    body: String,
+    /// The recipient's name, or `*`/absent for the whole room.
+    #[serde(default)]
+    to: String,
+    /// Ticket ids, PR urls, commit SHAs — what proves it (§0.10).
+    #[serde(default)]
+    refs: Vec<String>,
 }
 
 /// `POST /api/v1/runs/{id}/retain` body — `content` and nothing else. Any other
@@ -228,6 +250,48 @@ pub(crate) async fn handle_run_retain(
     }
 }
 
+/// `POST /api/v1/runs/{id}/post` — post to the team room AS the run named in the
+/// path, with `from` stamped by the host (STUDIO-653, T6; §0.5, §0.11.4).
+///
+/// Shares [`MAX_RETAIN_BODY`] as its wire cap: both are "a short constructed
+/// message, not a transcript", and the room applies its own, tighter
+/// `MAX_POST_BODY_BYTES` truncation on the way to disk. This one rejects the
+/// obvious paste at the door so the caller learns rather than silently losing
+/// the tail.
+pub(crate) async fn handle_run_post(
+    method: Method,
+    Path(id): Path<String>,
+    State(provider): State<Arc<dyn StateProvider>>,
+    body: Bytes,
+) -> Response {
+    if let Some(resp) = require_post(&method, "use POST to post to the team room") {
+        return resp;
+    }
+    let run_id = match parse_run_id(&id) {
+        Ok(run_id) => run_id,
+        Err(resp) => return *resp,
+    };
+    if body.len() > MAX_RETAIN_BODY {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "content_too_long",
+            "a room post is a short message to the team, not a transcript",
+            None,
+        );
+    }
+    let req: PostReq = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None),
+    };
+    match provider
+        .teams_post(run_id, &req.body, &req.to, &req.refs)
+        .await
+    {
+        Ok(view) => write_json(StatusCode::OK, &view),
+        Err(e) => teams_error(&e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The Teams memory endpoints, driven end to end against a REAL
@@ -240,7 +304,7 @@ mod tests {
 
     use rhapsody_config::memory::{DEFAULT_BANKS_SUBDIR, LocalBank};
     use rhapsody_config::room::{
-        DEFAULT_ROOM_SUBDIR, LocalRoom, MAX_ROOM_WINDOW, Message as RoomMessage, RoomLog,
+        Cursor, DEFAULT_ROOM_SUBDIR, LocalRoom, MAX_ROOM_WINDOW, Message as RoomMessage, RoomLog,
     };
     use rhapsody_config::teams::{Identity, Teams};
     use rhapsody_orchestrator::teamsmemory::{RunProvenance, TeamsMemory};
@@ -468,6 +532,7 @@ mod tests {
                 r#"{"identity":"a","fact_id":"b","reason":"c"}"#,
             ),
             ("/api/v1/runs/7/retain", r#"{"content":"x"}"#),
+            ("/api/v1/runs/7/post", r#"{"body":"x"}"#),
         ] {
             let resp = post(&format!("{url}{path}"), body).await;
             assert_eq!(resp.status(), 409, "{path}");
@@ -516,7 +581,11 @@ mod tests {
             let resp = post(&format!("{url}{path}"), "{}").await;
             assert_eq!(resp.status(), 405, "{path}");
         }
-        for path in ["/api/v1/teams/invalidate", "/api/v1/runs/7/retain"] {
+        for path in [
+            "/api/v1/teams/invalidate",
+            "/api/v1/runs/7/retain",
+            "/api/v1/runs/7/post",
+        ] {
             let resp = reqwest::get(&format!("{url}{path}")).await.expect("GET");
             assert_eq!(resp.status(), 405, "{path}");
         }
@@ -688,5 +757,219 @@ mod tests {
         let url = spawn_with(teams_memory(&dir)).await;
         let resp = post(&format!("{url}/api/v1/teams/room"), "{}").await;
         assert_eq!(resp.status(), 405);
+    }
+
+    // ── the room's write side (STUDIO-653, T6) ──────────────────────────────────────────────────
+
+    /// A Teams runtime with a MULTI-name roster and a room, so a direct post has a real recipient
+    /// to be validated against. (`teams_memory` above is deliberately a one-identity roster; these
+    /// tests need more than one name and build their own rather than widening it.)
+    fn teams_memory_with_roster(
+        dir: &TempDir,
+        names: &[&str],
+    ) -> (Arc<TeamsMemory>, Arc<LocalRoom>) {
+        let teams = Teams {
+            enabled: true,
+            roster: names
+                .iter()
+                .map(|n| Identity {
+                    name: (*n).to_string(),
+                    profile: "swe".to_string(),
+                    ..Identity::default()
+                })
+                .collect(),
+            ..Teams::disabled()
+        };
+        let bank = LocalBank::new(dir.0.join(DEFAULT_BANKS_SUBDIR), "agent-");
+        let room = Arc::new(LocalRoom::new(dir.0.join(DEFAULT_ROOM_SUBDIR)));
+        let mem = Arc::new(
+            TeamsMemory::new(Arc::new(teams), Arc::new(bank))
+                .with_room(Arc::clone(&room) as Arc<dyn RoomLog>),
+        );
+        (mem, room)
+    }
+
+    /// Binds `run_id` to `identity`, the way the control task does at dispatch.
+    fn bind(mem: &TeamsMemory, run_id: i64, identity: &str) {
+        mem.bind_run(
+            run_id,
+            RunProvenance {
+                identity: identity.to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+    }
+
+    /// **The post is host-stamped, end to end through HTTP.** The body invents a `from` and an
+    /// `identity`; both are ignored, exactly the way `retain_recall_invalidate_round_trip` proves it
+    /// for a retained record's provenance (§0.11.4 — "a run cannot supply it"). The message lands in
+    /// the room log with the RUN's identity as its author.
+    #[tokio::test]
+    async fn a_post_is_stamped_from_the_run_never_from_the_body() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(Arc::clone(&mem)),
+        ))
+        .await;
+
+        let view = body_json(
+            post(
+                &format!("{url}/api/v1/runs/7/post"),
+                r#"{"body":"the mirror lock is per-repo","from":"bob","identity":"@manager","refs":["MT-9"]}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            view["from"], "alice",
+            "`from` is the RUN's identity, not the body's: {view}"
+        );
+        assert_eq!(view["to"], "*", "no `to` ⇒ the room: {view}");
+        assert_eq!(view["refs"][0], "MT-9");
+        assert!(
+            view["id"].as_str().unwrap_or_default().contains(':'),
+            "the response carries the log's file:seq id: {view}"
+        );
+
+        let caught = room
+            .read_since("bob", &Cursor::default(), 10)
+            .expect("read");
+        assert_eq!(caught.messages.len(), 1);
+        assert_eq!(
+            caught.messages[0].from, "alice",
+            "the LOG's author is the run's identity"
+        );
+    }
+
+    /// A direct post names its recipient, and only that recipient catches it up (§0.5's one log,
+    /// two audiences).
+    #[tokio::test]
+    async fn a_direct_post_is_addressed_and_only_its_recipient_reads_it() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_roster(&dir, &["alice", "bob", "carol"]);
+        bind(&mem, 7, "alice");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+
+        let view = body_json(
+            post(
+                &format!("{url}/api/v1/runs/7/post"),
+                r#"{"body":"bob, the lock moved","to":"bob"}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(view["to"], "bob");
+        // No control loop behind this fake provider, so nothing is delivered live; the post is in
+        // the log, which IS the fallback (§0.5).
+        assert_eq!(view["delivered"], 0);
+
+        let seen = |reader: &str| {
+            room.read_since(reader, &Cursor::default(), 10)
+                .expect("read")
+                .messages
+                .len()
+        };
+        assert_eq!(seen("bob"), 1);
+        assert_eq!(seen("carol"), 0, "`to: bob` must never render in carol's");
+    }
+
+    /// An unknown `to` is refused LOUDLY, naming the roster tool — never a silent room post. A
+    /// message its author believed was private must not quietly become public.
+    #[tokio::test]
+    async fn an_unknown_recipient_is_a_loud_bad_request() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+
+        let resp = post(
+            &format!("{url}/api/v1/runs/7/post"),
+            r#"{"body":"psst","to":"dave"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "bad_request");
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("dave") && msg.contains("teams_roster"),
+            "{msg}"
+        );
+        assert_eq!(
+            room.read_since("", &Cursor::default(), 10)
+                .expect("read")
+                .messages
+                .len(),
+            0,
+            "a refused post must not land in the room"
+        );
+    }
+
+    /// A post from a run the host has no binding for is `not_running`, not a message attributed to
+    /// a guess — the same answer retain gives, and the reason a run wearing no identity cannot post.
+    #[tokio::test]
+    async fn a_post_from_an_unbound_run_is_not_running() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+        let resp = post(&format!("{url}/api/v1/runs/99/post"), r#"{"body":"hi"}"#).await;
+        assert_eq!(resp.status(), 409);
+        assert_eq!(err_code(resp).await, "not_running");
+        assert_eq!(
+            room.read_since("", &Cursor::default(), 10)
+                .expect("read")
+                .messages
+                .len(),
+            0
+        );
+    }
+
+    /// An empty body is refused: a blank line in the room is noise in every teammate's turn-1
+    /// prompt, forever.
+    #[tokio::test]
+    async fn an_empty_post_is_rejected() {
+        let dir = TempDir::new();
+        let (mem, _room) = teams_memory_with_room(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+        let resp = post(&format!("{url}/api/v1/runs/7/post"), r#"{"body":"   "}"#).await;
+        assert_eq!(resp.status(), 400);
+        assert_eq!(err_code(resp).await, "bad_request");
     }
 }

@@ -105,6 +105,8 @@ impl Facade {
                 "teams_retain",
                 // STUDIO-650, T5: the room's read side, gated by exactly the same removal.
                 "teams_room_read",
+                // STUDIO-653, T6: the room's write side, likewise.
+                "teams_post",
             ] {
                 tool_router.remove_route(name);
             }

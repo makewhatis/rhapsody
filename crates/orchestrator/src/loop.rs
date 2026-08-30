@@ -263,6 +263,16 @@ pub enum Event {
         run_id: i64,
         reply: oneshot::Sender<HandoffPlan>,
     },
+    /// Mirror an ALREADY-APPENDED room post onto loop-owned state (STUDIO-653, T6; NEW beyond Go
+    /// v0.4.0): the poster's `teams.message` timeline row, and the teammate-wrapped delivery into
+    /// any live run wearing the addressed identity. The room append itself happened off-loop, on
+    /// the HTTP task, through the `TeamsMemory` seam — only these two mirrors need `running` /
+    /// `mailboxes` / `event_seq`, which the control task owns. Replies with how many live runs the
+    /// message reached. See [`crate::teamspost`].
+    TeamsPost {
+        post: crate::teamspost::TeamsPost,
+        reply: oneshot::Sender<i64>,
+    },
 }
 
 /// The default `storage.retention_days` until a reload stores the effective value (Go `New`).
@@ -483,6 +493,9 @@ impl Orchestrator {
             }
             Event::HandoffRun { run_id, reply } => {
                 let _ = reply.send(self.handle_handoff_run(run_id));
+            }
+            Event::TeamsPost { post, reply } => {
+                let _ = reply.send(self.handle_teams_post(&post));
             }
         }
     }
@@ -1049,6 +1062,37 @@ impl ControlHandle {
         tokio::select! {
             r = rx => r.unwrap_or(RunMessageResult { not_running: true, ..Default::default() }),
             _ = lifetime.cancelled() => RunMessageResult { not_running: true, ..Default::default() },
+        }
+    }
+
+    /// Mirrors an already-appended room post onto loop-owned state (STUDIO-653, T6): the poster's
+    /// `teams.message` timeline row, and the teammate-wrapped delivery into every live run wearing
+    /// the addressed identity. Returns how many runs the message reached live — `0` for a room
+    /// post, and `0` when the recipient is not running or its mailbox is full, both of which
+    /// degrade to §0.5's catch-up because the post is already in the log.
+    ///
+    /// **The post itself never depends on this round-trip.** The append happened first, off-loop,
+    /// through the `TeamsMemory` seam; if the loop is gone the mirrors are simply skipped. That is
+    /// also why the reply is a count rather than a `Result`: there is no failure here that the
+    /// caller could act on.
+    pub async fn record_teams_post(
+        &self,
+        from_run_id: i64,
+        view: &crate::teamsmemory::PostView,
+        body: &str,
+    ) -> i64 {
+        let (tx, rx) = oneshot::channel();
+        let ev = Event::TeamsPost {
+            post: crate::teamspost::TeamsPost::from_view(from_run_id, view, body),
+            reply: tx,
+        };
+        if self.events.send(ev).is_err() {
+            return 0; // the loop is gone: the room log still has the post.
+        }
+        let mut lifetime = self.ctx.clone();
+        tokio::select! {
+            r = rx => r.unwrap_or(0),
+            _ = lifetime.cancelled() => 0,
         }
     }
 

@@ -230,6 +230,32 @@ impl Message {
         }
     }
 
+    /// A post from `from` addressed by the WIRE form of `to` (STUDIO-653, T6) —
+    /// a teammate's name, or `*`/empty for the room, resolved through
+    /// [`Audience::from_wire`]. The caller validates the name against the
+    /// roster; this only builds the message.
+    ///
+    /// A direct post is appended to the SAME log a room post is:
+    /// [`Audience::Direct`] narrows who catches it up, it does not choose a
+    /// different store. So a direct message to a teammate who is not running
+    /// reaches them on their next waking, which is §0.5's degradation rather
+    /// than a queue.
+    pub fn addressed(
+        from: impl Into<String>,
+        to: &str,
+        at: DateTime<Utc>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: String::new(),
+            from: from.into(),
+            to: Audience::from_wire(to),
+            at,
+            body: body.into(),
+            refs: Vec::new(),
+        }
+    }
+
     /// Attaches the refs that prove it (§0.10, §5.1).
     pub fn with_refs<I: IntoIterator<Item = S>, S: Into<String>>(mut self, refs: I) -> Self {
         self.refs = refs.into_iter().map(Into::into).collect();
@@ -771,6 +797,28 @@ mod tests {
     fn post(r: &LocalRoom, from: &str, day: u32, hour: u32, body: &str) -> String {
         r.append(&Message::room(from, at(day, hour), body))
             .expect("append")
+    }
+
+    /// [`Message::addressed`] resolves the WIRE form of `to` (STUDIO-653, T6), so one constructor
+    /// serves both audiences and a lost recipient widens rather than hides: `*` and the empty
+    /// string are both the room, and any other name is a direct post only that name catches up.
+    #[test]
+    fn addressed_resolves_the_wire_form_of_to() {
+        let msg = Message::addressed("bob", "alice", at(1, 9), "the lock moved");
+        assert_eq!(msg.to, Audience::Direct("alice".to_string()));
+        assert!(msg.to.visible_to("alice"));
+        assert!(!msg.to.visible_to("carol"));
+        assert_eq!(msg.from, "bob", "`from` is whatever the HOST passed in");
+        assert!(
+            msg.id.is_empty(),
+            "the id is minted by the append, not here"
+        );
+
+        for room_form in ["", AUDIENCE_ROOM] {
+            let msg = Message::addressed("bob", room_form, at(1, 9), "news");
+            assert_eq!(msg.to, Audience::Room, "to={room_form:?}");
+            assert!(msg.to.visible_to("carol"));
+        }
     }
 
     /// §0.11.4 / the ticket's second acceptance bullet: **never create on read**.

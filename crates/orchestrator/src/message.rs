@@ -150,20 +150,46 @@ impl Orchestrator {
     /// router ([`deliver_mid_run_summons`](Orchestrator::deliver_mid_run_summons), INF-448) so there is
     /// exactly ONE admission path honoring [`OPERATOR_MAILBOX_CAP`]. Mirrors Go `deliverToMailbox`.
     pub(crate) fn deliver_to_mailbox(&self, re: &RunningEntry, body: &str) -> (i64, bool) {
+        self.admit_to_mailbox(re, &operator_wrap(body), Some(body))
+    }
+
+    /// The ONE mailbox admission: a non-blocking send of `wrapped` (a full — or absent, for
+    /// legacy/test-injected entries — mailbox rejects), then an optional best-effort persist of
+    /// `persist_as` as a `run_messages` row.
+    ///
+    /// `persist_as: Some(original)` is the operator path ([`deliver_to_mailbox`](Orchestrator::deliver_to_mailbox)),
+    /// where the store keeps the operator's own words while the mailbox carries the wrapper.
+    /// `None` is STUDIO-653's teammate path: a peer message's durable record is the room log, and a
+    /// `run_messages` row would file peer speech in the very table the run-detail view labels
+    /// operator messages — re-creating, in the timeline, exactly the authority confusion the
+    /// teammate wrap exists to prevent (§0.11.4).
+    ///
+    /// Split out of `deliver_to_mailbox` so the wrapper is the CALLER's choice while
+    /// [`OPERATOR_MAILBOX_CAP`] stays the single bound both paths honour. Mirrors Go
+    /// `deliverToMailbox`, whose operator-only behaviour is unchanged.
+    pub(crate) fn admit_to_mailbox(
+        &self,
+        re: &RunningEntry,
+        wrapped: &str,
+        persist_as: Option<&str>,
+    ) -> (i64, bool) {
         let sent = {
             let mailboxes = self
                 .mailboxes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match mailboxes.get(&re.issue.id) {
-                Some(mb) => mb.tx.try_send(operator_wrap(body)).is_ok(),
+                Some(mb) => mb.tx.try_send(wrapped.to_string()).is_ok(),
                 None => false, // nil mailbox (legacy/test-injected) → reject
             }
         };
         if !sent {
             return (0, false);
         }
-        (self.persist_run_message(re, body), true)
+        match persist_as {
+            Some(body) => (self.persist_run_message(re, body), true),
+            None => (0, true),
+        }
     }
 
     /// Returns the opaque issue id of the live run whose `run_id` matches, or `""` when none does

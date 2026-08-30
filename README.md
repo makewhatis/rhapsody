@@ -216,7 +216,7 @@ midnight. This preserves the local-day semantics the client-side fold had; a UTC
 silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
 meaning, so the header's `cached = total − in − out` reconciliation still adds up.
 
-### Rhapsody Teams — an optional feature with no Go counterpart (STUDIO-639 … STUDIO-645)
+### Rhapsody Teams — an optional feature with no Go counterpart (STUDIO-639 … STUDIO-653)
 
 Teams gives a daemon named identities with shared profiles and per-identity memory. The frozen Go
 reference has none of it, so nothing here is a *difference* in ported behaviour — it is new surface,
@@ -237,7 +237,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
 | Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/`, no `teams/room/` |
 
-Five **additive** Rhapsody-only endpoints back the Teams tools; no existing payload changes shape
+Six **additive** Rhapsody-only endpoints back the Teams tools; no existing payload changes shape
 and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 
 | Endpoint | Serves |
@@ -247,13 +247,18 @@ and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 | `POST /api/v1/teams/invalidate` | mark one record non-valid, with the reason; reversible |
 | `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host |
 | `GET /api/v1/teams/room?limit=` | the newest posts in the team room, bounded; advances no cursor |
+| `POST /api/v1/runs/{id}/post` | post to the team room as a live run, `from` stamped by the host |
 
-The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_retain` and
-`teams_room_read`. `teams_retain` takes `content` and nothing else on purpose: the identity, ticket,
-run and commit are resolved by the daemon from the run id it injected into that worker, so a run
-dispatched as one identity cannot write into another's memory bank. `teams_room_read` takes only an
-optional `limit`, which can narrow the window but never widen it, and reading it never advances any
-teammate's catch-up watermark.
+The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_retain`,
+`teams_room_read` and `teams_post`. `teams_retain` takes `content` and nothing else on purpose: the
+identity, ticket, run and commit are resolved by the daemon from the run id it injected into that
+worker, so a run dispatched as one identity cannot write into another's memory bank.
+`teams_room_read` takes only an optional `limit`, which can narrow the window but never widen it,
+and reading it never advances any teammate's catch-up watermark. `teams_post` follows retain's rule
+exactly: it takes `body`, an optional `to` and optional `refs`, and **no author argument at all** —
+the daemon resolves the run to the identity it dispatched it as, so a post cannot be forged and a
+run wearing no identity cannot post. An unknown `to` is refused loudly rather than silently
+downgraded to a room-wide post.
 
 Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
 because it works on a laptop with no cloud: append-only markdown records, one file per record, under
@@ -268,6 +273,26 @@ and each teammate's watermark lives in its own bank directory, never in `rhapsod
 best-effort with no fsync — the room is advisory and Linear is the ledger — and a corrupt line is
 skipped loudly rather than being fatal. The room directory appears on the first post and at no other
 time; a teammate whose room is absent or quiet reads nothing and writes nothing.
+
+A teammate posts through `teams_post`, and **the daemon remains the single writer** — the tool
+proxies an endpoint and never touches the log. A successful run-scoped post also writes one `events`
+row of kind `teams.message` (a data value in the existing `kind` column, exactly like `teams.route`
+— no schema change), so the post shows up in that run's own timeline; if the room append succeeds
+and the events write does not, the failure is logged and the post stands, because the room is the
+record and the timeline is a mirror. A message addressed to a teammate who is **running right now**
+is also delivered into that run's mailbox wearing a distinct **teammate wrap** — "TEAMMATE MESSAGE
+from alice (run 412) …" — never the operator wrap, so one agent's speech is never authoritative in
+another's context. A recipient who is not running, or whose bounded mailbox is full, degrades to
+catch-up: the post is already in the log, nothing is queued and nothing is retried. A live delivery
+is therefore also seen again in the recipient's next catch-up; that duplicate exposure of one
+bounded message is accepted deliberately, in preference to writing one identity's watermark from
+another identity's request. **A post never dispatches:** it starts no run, writes no label and
+touches no tracker, however it is addressed.
+
+One thing Teams deliberately does **not** fix: the pre-existing `agent_send_message` /
+`POST /api/v1/runs/{id}/message` surface lets any caller push text to any live run wearing the
+*operator* wrap. That is outside Teams' scope, `teams_post` does not route through it, and closing
+it is separate work.
 
 One `teams.yaml` key governs how much of all this reaches a prompt: `prompt_budget_bytes`
 (default 16000) is a single total budget for the whole Teams turn-1 prepend. Overflow drops the

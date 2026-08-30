@@ -20,7 +20,8 @@ use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
 use rhapsody_orchestrator::teamsmemory::{
-    InvalidateView, RecallView, RetainView, RoomView, RosterView, TeamsMemory, TeamsMemoryError,
+    InvalidateView, PostView, RecallView, RetainView, RoomView, RosterView, TeamsMemory,
+    TeamsMemoryError,
 };
 use rhapsody_orchestrator::{
     CancelWait, ControlHandle, HandoffResult, Identity, ReadsError, RefreshResult, ReloadError,
@@ -226,6 +227,31 @@ impl StateProvider for DaemonState {
         self.teams_memory()?
             .retain_for_run(run_id, content, Utc::now())
             .await
+    }
+
+    /// The room's write side (STUDIO-653, T6) — the ONE Teams surface that touches both seams, in
+    /// this order and deliberately so:
+    ///
+    /// 1. **Off-loop, on this HTTP task:** resolve the run to its identity, validate `to` against
+    ///    the roster, and append through the room's single writer. That append IS the post, and it
+    ///    is complete before the control task is involved at all.
+    /// 2. **On the loop, best-effort:** the poster's `teams.message` timeline row and the
+    ///    teammate-wrapped delivery into any live recipient, both of which need `running` /
+    ///    `mailboxes` / `event_seq`. A loop that is gone, a recipient that is not running and a
+    ///    full mailbox all report `delivered: 0` and degrade to §0.5's catch-up — nothing is
+    ///    queued, nothing is retried, and nothing is lost, because the post is already in the log.
+    async fn teams_post(
+        &self,
+        run_id: i64,
+        body: &str,
+        to: &str,
+        refs: &[String],
+    ) -> Result<PostView, TeamsMemoryError> {
+        let mut view = self
+            .teams_memory()?
+            .post_for_run(run_id, body, to, refs, Utc::now())?;
+        view.delivered = self.handle.record_teams_post(run_id, &view, body).await;
+        Ok(view)
     }
 }
 
