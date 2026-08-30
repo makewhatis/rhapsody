@@ -438,10 +438,7 @@ impl LocalRoom {
         match std::fs::read_to_string(path) {
             Ok(text) => Ok(text.lines().count() as u64),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(e) => Err(RoomError::Io(format!(
-                "read log {}: {e}",
-                path.display()
-            ))),
+            Err(e) => Err(RoomError::Io(format!("read log {}: {e}", path.display()))),
         }
     }
 
@@ -749,9 +746,7 @@ mod tests {
             "a read must not create the room directory"
         );
         assert_eq!(
-            std::fs::read_dir(dir.path())
-                .expect("tempdir")
-                .count(),
+            std::fs::read_dir(dir.path()).expect("tempdir").count(),
             0,
             "a read must create nothing at all"
         );
@@ -822,7 +817,10 @@ mod tests {
 
         let quiet = r.read_since("alice", &first.cursor, 0).expect("read");
         assert!(quiet.messages.is_empty(), "{:?}", quiet.messages);
-        assert_eq!(quiet.cursor, first.cursor, "an empty catch-up moves nothing");
+        assert_eq!(
+            quiet.cursor, first.cursor,
+            "an empty catch-up moves nothing"
+        );
 
         post(&r, "manager", 30, 1, "three");
         let second = r.read_since("alice", &first.cursor, 0).expect("read");
@@ -929,7 +927,9 @@ mod tests {
         let path = r.root().join("2026-08-29.jsonl");
         let mut text = std::fs::read_to_string(&path).expect("read");
         text.push_str("{ this is not json\n");
-        text.push_str("{\"from\":\"\",\"to\":\"*\",\"at\":\"2026-08-29T11:00:00Z\",\"body\":\"x\"}\n");
+        text.push_str(
+            "{\"from\":\"\",\"to\":\"*\",\"at\":\"2026-08-29T11:00:00Z\",\"body\":\"x\"}\n",
+        );
         text.push_str("{\"from\":\"m\",\"to\":\"*\",\"at\":\"not a time\",\"body\":\"y\"}\n");
         std::fs::write(&path, text).expect("write");
         post(&r, "manager", 29, 12, "good two");
@@ -962,7 +962,11 @@ mod tests {
         // …and the STORED body was capped too, so the log cannot grow without
         // bound from one caller pasting a transcript.
         let log = std::fs::read_to_string(r.root().join("2026-08-29.jsonl")).expect("read");
-        assert!(log.len() < MAX_POST_BODY_BYTES * 2, "log = {} bytes", log.len());
+        assert!(
+            log.len() < MAX_POST_BODY_BYTES * 2,
+            "log = {} bytes",
+            log.len()
+        );
     }
 
     /// An append with no `from` is refused: `from` is host-stamped (§0.11.4) and
