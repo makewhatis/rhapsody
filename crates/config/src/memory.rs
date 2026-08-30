@@ -377,10 +377,7 @@ impl LocalBank {
     /// roster set one, else `<bank_prefix><name>`. What `teams_roster` reports,
     /// so the view and the store cannot disagree.
     pub fn bank_id(&self, identity: &str) -> String {
-        match self.banks.get(identity) {
-            Some(bank) => bank.clone(),
-            None => format!("{}{identity}", self.bank_prefix),
-        }
+        bank_id_for(&self.bank_prefix, &self.banks, identity)
     }
 
     /// Appends one host-stamped record and returns its id.
@@ -588,6 +585,30 @@ impl MemoryBackend for LocalBank {
         reason: &str,
     ) -> Result<bool, MemoryError> {
         LocalBank::invalidate(self, identity, fact_id, reason)
+    }
+}
+
+/// The bank id `identity`'s records live under: the roster's `bank:` override
+/// when there is one, else `<bank_prefix><name>` (§2.2).
+///
+/// A free function rather than a method because **every backend must resolve a
+/// bank id the same way** — [`LocalBank::bank_id`] names a directory,
+/// [`HindsightBackend`](crate::hindsight::HindsightBackend) names a path segment
+/// in a URL, and [`Cursors`](crate::room::Cursors) names a sibling of the bank —
+/// and three copies of a two-line `match` is exactly how a roster override ends
+/// up honoured by the view and ignored by the store.
+///
+/// It does **not** validate `identity`: the callers do, because what an invalid
+/// identity would escape into differs (a directory, a URL path), and each of
+/// them refuses it before ever asking for a bank id.
+pub fn bank_id_for(
+    bank_prefix: &str,
+    overrides: &std::collections::HashMap<String, String>,
+    identity: &str,
+) -> String {
+    match overrides.get(identity) {
+        Some(bank) => bank.clone(),
+        None => format!("{bank_prefix}{identity}"),
     }
 }
 

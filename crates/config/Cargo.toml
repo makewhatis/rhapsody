@@ -14,6 +14,17 @@ rhapsody-core = { path = "../core" }
 # already in Cargo.lock, so no new external crate enters the tree.
 async-trait = "0.1"
 liquid = "0.26"
+# reqwest: the `hindsight` memory backend's HTTP transport (STUDIO-660, T8) — the shared cloud bank
+# behind the same `MemoryBackend` trait. Same version + same `default-features = false` +
+# `default-tls` shape the tracker / mcp / httpapi crates already record (the tailnet endpoint is
+# https, so a TLS backend is required); already in Cargo.lock, so no new external crate enters the
+# tree. Deliberately NOT reachable from the dispatch path — see `hindsight`'s module docs.
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "json"] }
+# tracing: `hindsight`'s ONE self-logged degradation — the best-effort `enable_observations: false`
+# bank write, which happens inside a `retain` whose own result must still be returned, so there is
+# no caller to hand the reason to. Every other diagnostic in this crate still travels to the caller
+# that owns the log. Already in Cargo.lock (orchestrator / tracker / store depend on it).
+tracing = "0.1"
 # serde derive powers the raw front-matter model in `model.rs` (C3), deserialized by
 # serde_yaml_ng — the same `serde = { derive }` the core crate uses.
 serde = { version = "1", features = ["derive"] }
@@ -36,7 +47,9 @@ harness-fixtures = { path = "../harness-fixtures" }
 tempfile = "3.27.0"
 # tokio: drives the handful of `#[tokio::test]`s that exercise the async `MemoryBackend` surface
 # (the sync `LocalBank` methods need no runtime). Already in Cargo.lock workspace-wide.
-tokio = { version = "1", features = ["macros", "rt"] }
+# `net` + `io-util` back the hand-rolled loopback hindsight stub the T8 tests answer from — the
+# same shape `rhapsody-tracker`'s `linear::testutil` mock server uses in place of Go's httptest.
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util"] }
 
 [lints]
 workspace = true

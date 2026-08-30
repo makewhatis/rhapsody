@@ -113,7 +113,12 @@ pub fn resolve(mut config: Config, workflow_dir: &str) -> Result<Resolved, Confi
 /// Go `resolveVar`: returns `$NAME`'s env value (empty when unset) iff `s` is exactly `$NAME` for a
 /// valid identifier; otherwise `s` verbatim. Full-string match, mirroring Go's regexp
 /// `^\$([A-Za-z_][A-Za-z0-9_]*)$` (hand-rolled to avoid a `regex` dependency).
-fn resolve_var(s: &str) -> String {
+///
+/// `pub` since STUDIO-660 so `teams.yaml`'s `memory.api_key` resolves a credential through the
+/// SAME indirection `tracker.api_key` does. `teams.yaml` is not part of the Go reference and never
+/// passes through [`resolve`], so it applies this itself at backend construction — reusing the
+/// function rather than growing a second, subtly different `$NAME` rule.
+pub fn resolve_var(s: &str) -> String {
     if let Some(name) = s.strip_prefix('$')
         && is_var_name(name)
     {

@@ -194,9 +194,28 @@ pub struct Memory {
     /// `local` backend: the bank directory. Empty ⇒ `~/.rhapsody/teams/banks/`.
     #[serde(default)]
     pub path: String,
-    /// `hindsight` backend: the MCP base URL.
+    /// `hindsight` backend: the service base URL (§2.2 spells the example with a
+    /// `/mcp/` suffix; the deployed contract is the REST surface under `/v1/`, and
+    /// [`HindsightBackend`](crate::hindsight::HindsightBackend) accepts either
+    /// spelling). Empty with `backend: hindsight` ⇒ the daemon warns and runs
+    /// memoryless.
     #[serde(default)]
     pub endpoint: String,
+    /// `hindsight` backend: the credential sent as the `Authorization` header.
+    ///
+    /// **Not in §2.2's sketch — it comes from the deployed service** (STUDIO-660):
+    /// hindsight 0.9.1 answers every `/v1/**` path with
+    /// `401 {"detail":"Authentication failed: Invalid API key"}` when the header is
+    /// absent or wrong, so a URL alone cannot reach a bank. Additive and defaulted
+    /// to empty, so `local`, `none` and Teams-off parse byte-identically.
+    ///
+    /// A bare `$NAME` is read from the environment instead of used literally — the
+    /// same indirection `tracker.api_key` uses in `WORKFLOW.md`
+    /// ([`crate::resolve::resolve_var`]) — so the secret need not sit in
+    /// `teams.yaml`. Empty ⇒ no `Authorization` header at all, which is what an
+    /// unauthenticated deployment wants.
+    #[serde(default)]
+    pub api_key: String,
     #[serde(default = "default_bank_prefix")]
     pub bank_prefix: String,
     #[serde(default = "default_recall_top_k")]
@@ -209,6 +228,7 @@ impl Default for Memory {
             backend: MemoryBackend::default(),
             path: String::new(),
             endpoint: String::new(),
+            api_key: String::new(),
             bank_prefix: default_bank_prefix(),
             recall_top_k: DEFAULT_RECALL_TOP_K,
         }
@@ -981,6 +1001,8 @@ mod tests {
                 backend: MemoryBackend::None,
                 path: "/tmp/banks".to_string(),
                 endpoint: String::new(),
+                // STUDIO-660, T8: the one new key, round-tripped like the rest.
+                api_key: "$HINDSIGHT_API_KEY".to_string(),
                 bank_prefix: "team-".to_string(),
                 recall_top_k: 3,
             },
