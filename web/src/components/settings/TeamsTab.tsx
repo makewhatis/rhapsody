@@ -3,6 +3,7 @@ import { Button, SectionCard, Select, TextInput, Toggle } from "@/components/ui"
 import { useSaveTeamsConfig, useTeamsConfigQuery } from "@/hooks/useTeams";
 import {
   draftErrors,
+  errText,
   MANAGER_MODES,
   MEMORY_BACKENDS,
   teamsYamlSnippet,
@@ -39,12 +40,13 @@ export function TeamsTab() {
   };
 
   if (cfg.isLoading) return <Note>Loading…</Note>;
-  // A daemon with no on-disk runtime home has nowhere to keep a teams.yaml. Say so, and offer the
-  // file's text anyway — the operator can still write it by hand once the daemon has a store.
+  // A daemon with no on-disk runtime home (--no-store, storage.path off/:memory:) has nowhere to
+  // keep a teams.yaml and answers 409 teams_config_unavailable. Report its reason verbatim rather
+  // than rendering an editor whose Save could not possibly land.
   if (cfg.isError) {
     return (
       <SectionCard title="Teams" desc="Named teammates with their own profiles, memory and a shared room.">
-        <Note tone="red">Could not read teams.yaml: {String(cfg.error)}</Note>
+        <Note tone="red">Could not read teams.yaml: {errText(cfg.error)}</Note>
       </SectionCard>
     );
   }
@@ -57,7 +59,7 @@ export function TeamsTab() {
         path={view?.path ?? ""}
         restartRequired={view?.restart_required ?? true}
         saving={save.isPending}
-        error={save.isError ? String(save.error) : ""}
+        error={save.isError ? errText(save.error) : ""}
         onCancel={() => setEditing(false)}
         onSave={() => {
           save.mutate(toConfig(draft, onDisk) as TeamsConfig, {
@@ -221,7 +223,10 @@ function TeamsEditor({
         ) : null}
       </SectionCard>
 
-      <SectionCard title="What Save will write" desc={path ? path : "~/.rhapsody/teams.yaml"}>
+      <SectionCard
+        title="What Save will configure"
+        desc={`${path || "~/.rhapsody/teams.yaml"} — the daemon writes this as a full file, with every schema default made explicit. Comments and key order in an existing file are not preserved.`}
+      >
         <pre
           className="mono"
           style={{

@@ -2,7 +2,7 @@ import * as React from "react";
 import { Button, Pill, SectionCard, StatusDot } from "@/components/ui";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { formatDateTime } from "@/lib/format";
-import { roomAuthorLine } from "@/lib/teams-model";
+import { errText, roomAuthorLine } from "@/lib/teams-model";
 import {
   useInvalidateFact,
   useTeamsOverview,
@@ -55,7 +55,7 @@ export function TeamsPanel({ pollMs, onOpenRun, onOpenSettings }: TeamsPanelProp
         }
       >
         {overview.isError ? (
-          <Note>Could not read the roster: {String(overview.error)}</Note>
+          <Note>Could not read the roster: {errText(overview.error)}</Note>
         ) : roster.length === 0 ? (
           <Note>
             {overview.isLoading ? "Loading the roster…" : "Teams is on, but the roster is empty."}
@@ -70,7 +70,7 @@ export function TeamsPanel({ pollMs, onOpenRun, onOpenSettings }: TeamsPanelProp
         desc="What the team recorded, newest last. Read-only — posting is the room's write side, and a post from here would have no run identity."
       >
         {room.isError ? (
-          <Note>Could not read the room: {String(room.error)}</Note>
+          <Note>Could not read the room: {errText(room.error)}</Note>
         ) : (room.data?.messages.length ?? 0) === 0 ? (
           <Note>{room.isLoading ? "Loading the room…" : "Nothing has been posted yet."}</Note>
         ) : (
@@ -269,7 +269,7 @@ function MemoryCard({ identity }: { identity: string }) {
       {identity === "" ? (
         <Note>Pick a teammate in the roster to see their memory.</Note>
       ) : recall.isError ? (
-        <Note>Could not read the bank: {String(recall.error)}</Note>
+        <Note>Could not read the bank: {errText(recall.error)}</Note>
       ) : facts.length === 0 ? (
         <Note>{recall.isLoading ? "Loading…" : `${identity} has not recorded anything yet.`}</Note>
       ) : (
@@ -362,7 +362,7 @@ function FactRow({ fact }: { fact: TeamsFact }) {
           Invalidate
         </Button>
       </div>
-      {invalidate.isError ? <Note tone="red">{String(invalidate.error)}</Note> : null}
+      {invalidate.isError ? <Note tone="red">{errText(invalidate.error)}</Note> : null}
       <ConfirmDialog
         open={confirming}
         title="Invalidate this memory?"

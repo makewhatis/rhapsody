@@ -40,6 +40,13 @@ export function roomAuthorLine(m: TeamsRoomMessage, formatAt: (at: string) => st
   return when ? `${who} wrote${audience} on ${when}` : `${who} wrote${audience}`;
 }
 
+// errText renders a thrown value for the operator. The API client throws the DAEMON's own message
+// verbatim, and `String(err)` would prefix it with "Error: " — turning the daemon's sentence into
+// something that reads like a client stack trace.
+export function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 // --- the enable flow's editor ---
 
 // RosterDraft is one editable roster row. `labels` is the raw comma-separated text the user typed,
@@ -146,16 +153,27 @@ export function draftErrors(draft: TeamsDraft): string[] {
 export function toConfig(draft: TeamsDraft, base?: TeamsConfig): Partial<TeamsConfig> {
   const roster = draft.roster
     .filter((r) => r.name.trim() !== "")
-    .map((r, i) => ({
-      ...(base?.roster?.[i] ?? {}),
-      name: r.name.trim(),
-      profile: r.profile.trim() || "swe",
-      labels: splitLabels(r.labels),
-    }));
+    .map((r) => {
+      const name = r.name.trim();
+      // Carry a teammate's unexposed keys (`bank`, `max_concurrent`) forward by NAME, never by row
+      // index: deleting or reordering a row would otherwise slide alice's bank override onto bob,
+      // silently pointing one teammate at another's memory. A renamed row correctly keeps nothing —
+      // a new name is a new identity, with a new bank.
+      const prior = base?.roster?.find((b) => b.name === name);
+      return { ...(prior ?? {}), name, profile: r.profile.trim() || "swe", labels: splitLabels(r.labels) };
+    });
+  const names = new Set(roster.map((r) => r.name));
+  // `manager.default_identity` is preserved like every other unexposed key — EXCEPT when the roster
+  // edit just removed the teammate it names. The daemon rejects that file ("default_identity is not
+  // a roster entry"), and since this editor does not surface the field, keeping it would leave the
+  // operator unable to save and unable to see why. Removing the teammate is the explicit act; the
+  // dangling pointer to them is the thing that has to go.
+  const priorDefault = base?.manager?.default_identity ?? "";
+  const default_identity = names.has(priorDefault) ? priorDefault : "";
   return {
     ...(base ?? {}),
     enabled: draft.enabled,
-    manager: { ...(base?.manager ?? {}), mode: draft.managerMode },
+    manager: { ...(base?.manager ?? {}), mode: draft.managerMode, default_identity },
     memory: { ...(base?.memory ?? {}), backend: draft.backend },
     roster,
   } as Partial<TeamsConfig>;

@@ -377,6 +377,12 @@ impl Teams {
     /// already applies to `WORKFLOW.md`. The write itself is the crate's
     /// `~/.rhapsody` convention (temp file + chmod + rename), so no reader ever
     /// observes half a config.
+    ///
+    /// It writes the CANONICAL serialization: every schema default made
+    /// explicit, in field order, with comments and hand-written key order in an
+    /// existing file not preserved. That is the same property `workflow::save`
+    /// has for `WORKFLOW.md`, and the caller is expected to say so before
+    /// overwriting a file a human wrote — the Settings enable flow does.
     pub fn save(path: &Path, teams: &Teams) -> Result<(), TeamsError> {
         teams.validate()?;
         let yaml = serde_yaml_ng::to_string(teams).map_err(|e| TeamsError::Parse(e.to_string()))?;

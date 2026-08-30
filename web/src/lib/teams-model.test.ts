@@ -153,6 +153,38 @@ describe("toDraft / toConfig", () => {
     expect(saved.prompt_budget_bytes).toBe(16000);
   });
 
+  // Carrying unexposed keys forward by ROW INDEX would slide alice's bank override onto bob the
+  // moment a row above him is deleted — one teammate silently pointed at another's memory.
+  it("carries a teammate's unexposed keys by name, not by row position", () => {
+    const twoUp: TeamsConfig = {
+      ...onDisk,
+      roster: [
+        { name: "alice", profile: "swe", labels: [], bank: "alice-bank", max_concurrent: 3 },
+        { name: "bob", profile: "reviewer", labels: [], bank: "", max_concurrent: 0 },
+      ],
+    };
+    const afterDeletingAlice = toConfig(
+      { ...toDraft(twoUp, true), roster: [{ name: "bob", profile: "reviewer", labels: "" }] },
+      twoUp,
+    );
+    expect(afterDeletingAlice.roster).toEqual([
+      { name: "bob", profile: "reviewer", labels: [], bank: "", max_concurrent: 0 },
+    ]);
+  });
+
+  // The daemon refuses a file whose `manager.default_identity` names nobody, and this editor does
+  // not surface that field — so preserving it after its teammate is deleted would leave the
+  // operator unable to save and unable to see why.
+  it("clears a default_identity the roster edit just removed, and keeps a live one", () => {
+    const withDefault: TeamsConfig = {
+      ...onDisk,
+      manager: { ...onDisk.manager, default_identity: "alice" },
+    };
+    expect(toConfig(toDraft(withDefault, true), withDefault).manager?.default_identity).toBe("alice");
+    const gone = toConfig({ ...toDraft(withDefault, true), roster: [{ name: "bob", profile: "swe", labels: "" }] }, withDefault);
+    expect(gone.manager?.default_identity).toBe("");
+  });
+
   it("drops unnamed rows and parses the label field", () => {
     const saved = toConfig({
       enabled: true,
