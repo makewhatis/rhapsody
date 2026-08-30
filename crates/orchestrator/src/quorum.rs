@@ -705,6 +705,20 @@ impl Orchestrator {
         if !self.quorum_enabled() || re.identity.is_empty() {
             return None;
         }
+        // A ticket with no team id cannot be reviewed: `create_issue` needs a team to create in and
+        // `add_issue_label` needs one to find-or-create the marker in, so EVERY write would fail —
+        // and, because the parent would then stay unmarked, fail again on the next handoff, and the
+        // next. Refusing here turns a permanent, recurring "REVIEW QUORUM FAILED" room post into
+        // one debug line. Triage drops team-less tickets for the same reason, before spending a
+        // model turn on them.
+        if re.issue.team_id.is_empty() {
+            tracing::debug!(
+                issue = %re.issue.identifier,
+                "teams quorum: the handed-off ticket has no team id, so no review ticket could be \
+                 created in it; nothing is requested"
+            );
+            return None;
+        }
         let teams = self.teams.as_ref()?;
         let facts = self.quorum_facts.get(&re.issue.id);
         // A ticket the poller has not seen since it acquired a PR simply has no URL yet, and a

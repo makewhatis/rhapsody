@@ -554,6 +554,36 @@ mod tests {
         let _ = task.await;
     }
 
+    // A ticket with no team id can never be reviewed — `create_issue` and `add_issue_label` both
+    // need one — so the quorum refuses up front rather than failing every write, leaving the parent
+    // unmarked, and failing again on every subsequent handoff. Triage drops team-less tickets for
+    // the same reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_with_no_team_id_requests_nothing() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_with_pr("ID-1", "MT-1", ""); // no team
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice", "bob", "carol"]),
+            parent,
+            "alice",
+            &snapshot,
+        );
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(
+            rx.try_recv().is_err(),
+            "no team id ⇒ no quorum, and no recurring failure post"
+        );
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
     // A handoff whose review-state move the tracker REFUSED is not a handoff, so it must not fan
     // review tickets out for work whose author is about to keep going.
     #[tokio::test(flavor = "multi_thread")]
