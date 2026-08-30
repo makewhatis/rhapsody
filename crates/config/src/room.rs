@@ -704,16 +704,36 @@ impl Cursors {
         })
     }
 
-    /// This identity's watermark. An absent, unreadable or unparseable cursor is
-    /// [`Cursor::default`] — "never read anything" — which is bounded by
-    /// [`MAX_ROOM_WINDOW`], never by the log's length. **Creates nothing.**
+    /// This identity's watermark, TOTAL: an absent, unreadable, or unparseable cursor is all
+    /// [`Cursor::default`] — "never read anything" — which is bounded by [`MAX_ROOM_WINDOW`], never
+    /// by the log's length. **Creates nothing.**
+    ///
+    /// Callers that need to REPORT why a present cursor could not be read use
+    /// [`Cursors::try_load`]; that is [`Teams::try_load`](crate::teams::Teams::try_load)'s split,
+    /// and the catch-up path uses it so an unreadable watermark is loud rather than showing up as
+    /// a teammate mysteriously re-reading the same posts every run.
     pub fn load(&self, identity: &str) -> Cursor {
-        let Ok(dir) = self.dir(identity) else {
-            return Cursor::default();
-        };
-        match std::fs::read_to_string(dir.join(CURSOR_FILE)) {
-            Ok(text) => Cursor::parse(&text),
-            Err(_) => Cursor::default(),
+        self.try_load(identity).unwrap_or_default()
+    }
+
+    /// [`Cursors::load`] with the reason preserved. An ABSENT cursor is `Ok(Cursor::default())`,
+    /// not an error: never having read the room is the starting state, not a failure. A present
+    /// cursor that cannot be read is `Err` — the caller logs it and falls back to the bounded
+    /// re-read, which is a degradation rather than a fault.
+    ///
+    /// An unparseable cursor is deliberately `Ok(Cursor::default())` rather than `Err`: garbage in
+    /// the file is indistinguishable from a partially-written one, and both mean the same thing to
+    /// a reader.
+    pub fn try_load(&self, identity: &str) -> Result<Cursor, RoomError> {
+        let dir = self.dir(identity)?;
+        let path = dir.join(CURSOR_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Cursor::parse(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cursor::default()),
+            Err(e) => Err(RoomError::Io(format!(
+                "read cursor {}: {e}",
+                path.display()
+            ))),
         }
     }
 
@@ -1058,6 +1078,29 @@ mod tests {
             .expect("read cursor"),
             "2026-08-29:3\n"
         );
+    }
+
+    /// An unreadable cursor is reported rather than swallowed, so a teammate re-reading the same
+    /// window every run is a log line and not a mystery. An ABSENT one is still not an error:
+    /// never having read the room is the starting state.
+    #[test]
+    fn an_unreadable_cursor_is_reported_but_an_absent_one_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = Cursors::new(dir.path().join(DEFAULT_BANKS_SUBDIR), "agent-");
+        assert_eq!(
+            c.try_load("alice").expect("absent is not an error"),
+            Cursor::default()
+        );
+
+        // A DIRECTORY where the cursor file should be is an unreadable cursor.
+        let bank = c.dir("alice").expect("bank dir");
+        std::fs::create_dir_all(bank.join(CURSOR_FILE)).expect("mkdir");
+        let err = c
+            .try_load("alice")
+            .expect_err("an unreadable cursor must be reported");
+        assert!(err.to_string().starts_with("room_io_error:"), "{err}");
+        // …and the total form still degrades to a bounded re-read rather than failing a dispatch.
+        assert_eq!(c.load("alice"), Cursor::default());
     }
 
     /// The cursor home and the memory bank home are resolved by SEPARATE code

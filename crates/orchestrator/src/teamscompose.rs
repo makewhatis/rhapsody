@@ -446,7 +446,20 @@ pub(crate) fn catch_up(
     identity: &str,
     limit: usize,
 ) -> CaughtUp {
-    let cursor = cursors.load(identity);
+    // An unreadable watermark degrades to a bounded re-read rather than failing the dispatch — but
+    // LOUDLY, because the symptom otherwise is a teammate mysteriously re-reading the same posts
+    // every run, which reads as the room being broken.
+    let cursor = match cursors.try_load(identity) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                identity = %identity,
+                error = %e,
+                "teams room: could not read the catch-up watermark; re-reading a bounded window"
+            );
+            Cursor::default()
+        }
+    };
     match room.read_since(identity, &cursor, limit) {
         Ok(got) => {
             // "A corrupt line is skipped LOUDLY, never fatal" — the same
