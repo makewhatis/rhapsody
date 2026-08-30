@@ -223,7 +223,7 @@ rc_from_stable="$(printf '%s\n' "$STABLE_GOLDEN" \
         -e "s/^  version \"$VERSION\"\$/  version \"$RC_VERSION\"/" \
         -e 's|^  depends_on macos: :catalina$|  conflicts_with cask: "rhapsody"\
   depends_on macos: :catalina|')"
-assert_eq "$rc" "$rc_from_stable"                                              'rc: differs from stable ONLY by the token and the conflicts_with stanza'
+assert_eq "$rc" "$rc_from_stable"                                              'rc: differs from stable ONLY by the token, the version and the conflicts_with stanza'
 
 # --- channel validation (STUDIO-648) ------------------------------------------
 # The rc channel TRACKS PRERELEASE TAGS: a final version must be refused, so the @rc cask can never
