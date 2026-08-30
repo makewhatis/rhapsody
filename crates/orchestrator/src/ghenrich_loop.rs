@@ -479,3 +479,71 @@ async fn github_summons_reopens_review_only_ticket() {
     );
     assert_eq!(entries[0].issue.identifier, "STUDIO-569");
 }
+
+// STUDIO-649: the summons that REOPENS a review-state ticket must reach the fresh run it triggers.
+// It is by construction OLDER than that run's start, so the mid-run router can never deliver it —
+// the reopen dispatch seeds the new run's operator mailbox with the same body instead. Drives the
+// same real GH-source → normalizer → reopen chain as the STUDIO-574 case above, so the body under
+// assertion is the one a reviewer actually typed on the PR.
+#[tokio::test]
+async fn github_summons_reopen_seeds_the_fresh_runs_mailbox() {
+    let (mut o, spawned, _eps) = studio574_orch(&["todo", "in progress"]);
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let run_id = {
+        let entries = spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            entries.len(),
+            1,
+            "the summoned review ticket must be promoted and dispatched"
+        );
+        o.running.get("iss-569").expect("running entry").run_id
+    };
+
+    let got = o
+        .mailbox_try_recv("iss-569")
+        .expect("the reopening summons must be seeded into the fresh run's mailbox");
+    assert!(
+        got.contains("OPERATOR MESSAGE"),
+        "seeded payload must go through the INF-250 operator wrapper, got {got:?}"
+    );
+    assert!(
+        got.contains("Reposting with the correct"),
+        "seeded payload must carry the summons COMMENT BODY, got {got:?}"
+    );
+
+    // Exactly one delivery, persisted with the reviewer's ORIGINAL (unwrapped) words.
+    assert!(
+        o.mailbox_try_recv("iss-569").is_none(),
+        "the reopening summons must be seeded exactly once"
+    );
+    let msgs = o
+        .store()
+        .list_run_messages(run_id)
+        .expect("list run messages");
+    assert_eq!(msgs.len(), 1, "expected exactly one persisted run_message");
+    assert!(
+        msgs[0].body.contains("Reposting with the correct")
+            && !msgs[0].body.contains("OPERATOR MESSAGE"),
+        "persisted body must be the ORIGINAL summons body, got {:?}",
+        msgs[0].body
+    );
+
+    // The watermark advanced to the seeded summons, so the mid-run router cannot re-deliver it.
+    assert_eq!(
+        o.running
+            .get("iss-569")
+            .expect("running entry")
+            .last_delivered_summon_at,
+        Utc.with_ymd_and_hms(2026, 8, 24, 21, 48, 32)
+            .single()
+            .expect("summon time"),
+        "the seeded summons must advance the per-run delivery watermark"
+    );
+}

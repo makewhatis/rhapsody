@@ -158,23 +158,46 @@ it uploads `Rhapsody.app.tar.gz` + `latest.json` next to the installer assets.
 
 ## Homebrew tap
 
-Rhapsody installs from a single-channel Homebrew cask served out of a public tap
+Rhapsody installs from a Homebrew cask served out of a public tap
 ([makewhatis/homebrew-tap](https://github.com/makewhatis/homebrew-tap)):
 
 ```sh
-brew install --cask makewhatis/tap/rhapsody
+brew install --cask makewhatis/tap/rhapsody       # stable: tracks real releases
+brew install --cask makewhatis/tap/rhapsody@rc    # rc: tracks prerelease tags (STUDIO-648)
 ```
 
-The cask (`Casks/rhapsody.rb` in the tap) points at the `Rhapsody.dmg` asset on this repo's GitHub
+The stable cask (`Casks/rhapsody.rb` in the tap) points at the `Rhapsody.dmg` asset on this repo's GitHub
 Release, carries `auto_updates true` (the P11 in-app updater owns upgrades; `brew upgrade` won't clobber
 it), and its `zap` stanza removes `~/.rhapsody` and the `is.makewhat.rhapsody` login-keychain item.
 
-`desktop/scripts/render-cask.sh <version> <sha256>` is the single source of truth for that cask body —
-it authored the committed cask and re-renders it on every release. `render_cask_test.sh` (run by the
-`desktop` job via `src-tauri/tests/packaging_gate.rs`) pins the output. This is a drastically simplified
-descendant of the Go reference's multi-channel `render-cask.sh`: one stable channel from GitHub Releases,
-no `@rc`/`@feature` casks, no internal dist host, no `conflicts_with`, and no `verified:` stanza (Homebrew
-rejects `verified:` as unnecessary when the url and homepage share the github.com domain).
+`desktop/scripts/render-cask.sh <version> <sha256> [channel]` is the single source of truth for both cask
+bodies — it authored the committed casks and re-renders them on every release. `render_cask_test.sh` (run
+by the `desktop` job via `src-tauri/tests/packaging_gate.rs`) pins each channel's output byte-for-byte.
+This is still a simplified descendant of the Go reference's multi-channel `render-cask.sh`: two channels
+served from GitHub Releases, no internal dist host, and no `verified:` stanza (Homebrew rejects
+`verified:` as unnecessary when the url and homepage share the github.com domain). The reference's third
+shape — per-feature-branch `rhapsody@<branch>` dogfood casks — is a **named follow-up**, not shipped: it
+needs per-branch signed builds and a retention/cleanup story.
+
+### The `@rc` channel
+
+`rhapsody@rc` is opt-in and tracks **prerelease** tags (`v0.3.4-rc.1`). Its cask body is the stable body
+plus the `rhapsody@rc` token and `conflicts_with cask: "rhapsody"` — both channels install the same
+`/Applications/Rhapsody.app`, so at most one may be installed at a time. The conflict is declared one-way
+(the stable cask is deliberately untouched by the rc channel), so brew blocks installing `@rc` over a
+stable install; swapping back means `brew uninstall --cask rhapsody@rc` first.
+
+Three isolation properties hold, and it's worth knowing *why* each one does:
+
+- **`brew upgrade --cask rhapsody` never sees an rc.** The two casks are separate files with separate
+  version stanzas, and the rc bump path writes only `Casks/rhapsody@rc.rb`. The renderer additionally
+  refuses to emit an `@rc` cask for a non-prerelease version, so `@rc` can never name a final release.
+- **The in-app auto-update channel stays stable-only, with no machinery.** tauri-plugin-updater polls
+  `releases/latest/download/latest.json`, and GitHub never points `releases/latest` at a release flagged
+  `prerelease`. That holds by construction — so instead of building anything, `homebrew-bump-rc` just
+  *asserts* the flag and fails loudly if a prerelease tag was published as a full release.
+- **An rc install auto-updates to the next FINAL release**, because tauri compares semver and
+  `0.3.4-rc.1 < 0.3.4`. That is the intended exit ramp off the channel — there is no "downgrade" step.
 
 ### Release-time auto-bump
 
@@ -182,6 +205,15 @@ rejects `verified:` as unnecessary when the url and homepage share the github.co
 new version + the `Rhapsody.dmg` checksum from the release's `SHA256SUMS` asset and opens a bump PR
 against the tap. It is **gated on the `HOMEBREW_TAP_TOKEN` secret** and cleanly skips (green, with a
 `::warning::`) until that secret exists — the release itself never goes red for a missing token.
+
+Its sibling `homebrew-bump-rc` does the same for `Casks/rhapsody@rc.rb`, reusing the same secret and the
+same straight-push-to-tap-`main`. It runs on the **`workflow_dispatch`** path only — the flow that
+actually builds an rc (`gh workflow run release.yml -f tag=v0.3.4-rc.1`) — and skips with a `::notice::`
+when the dispatched tag is not a semver prerelease. It is deliberately *not* a `release: prereleased`
+trigger: that event fires when a Release is published, i.e. before `build` has uploaded the `SHA256SUMS`
+asset the bump reads its checksum from. release-please never cuts a prerelease itself, so no rc tag is
+missed. The tap needs **no manual seed commit** for the rc cask — the first prerelease run creates
+`Casks/rhapsody@rc.rb` and pushes it.
 
 **Operator setup (one time, before the next release):** create a fine-grained PAT with **Contents:
 read+write AND Pull requests: write** on `makewhatis/homebrew-tap`, then:

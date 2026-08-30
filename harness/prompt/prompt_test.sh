@@ -13,9 +13,21 @@
 #     the one that does not depend on Linear being reachable.
 #   * That directory is a second read-only exception to the "stay in the workspace" rule, with a
 #     one-file write carve-out for the run's own record.
+#   * The invariant is the DEPENDENCY DIRECTION, not the absence of a token (STUDIO-600). 599 pinned
+#     `save_document` as absent, which also banned the only container suited to a 16-57KB record and
+#     left the ticket half of the dual-write as a document-sized comment paste. So the ticket copy now
+#     scales with the record — always a summary plus the `~/.rhapsody/docs/` path, full text inline
+#     below a named character threshold and a linked Linear document above it — and what is pinned is
+#     that the file is written first and unconditionally, and that `save_document` is the HISTORY
+#     container and never the deliverable.
 #   * A run that cannot read a required input STOPS and hands off; it never reconstructs the input.
 #   * None of this weakens the absolute rule that specs, plans and design docs never land in the repo —
 #     the directory sits outside the repo precisely so that rule can stand.
+#   * A statement of FACT about the repo can rot into a falsehood while every word around it stays
+#     true. STUDIO-602: the prompt told every run the daemon binary was `symphonyd` — once as a fact
+#     and once as a non-negotiable — long after the tree had renamed it. A run that took the
+#     non-negotiable literally would defend a binary that does not exist, or flag the real one as a
+#     violation. Such statements are checked against the tree, never against a literal in this file.
 #
 # No dependencies beyond bash + git. Run from anywhere: `harness/prompt/prompt_test.sh`.
 set -euo pipefail
@@ -78,17 +90,64 @@ present_i "the routing is described as a dual-write (filesystem + ticket)" \
 # NOT a bare `save_comment` grep: that token already appears in the ground rules' write budget and in
 # Phase 6 step 2 regardless of this change, so it would stay green with the ticket half of the
 # dual-write deleted. Same for a bare `dual-write`, which the Phase-2 intro also says. Pin the
-# instruction and the property that makes it affordable — that it costs no second Linear write.
-present_i "the record's ticket copy is posted to Linear for history" \
-          'Post the same text to the Linear ticket'
-present_i "the ticket copy costs no extra Linear write" \
+# instruction, plus the property that keeps the SMALL-record case affordable. That property is now
+# branch-specific, not universal — a large record deliberately pays a second Linear write for its
+# document — so the check names the branch it pins rather than overstating its subject.
+present_i "the ticket always gets a copy of the record, for history" \
+          'Give the ticket a copy, sized to the record'
+present_i "an inlined ticket copy costs no extra Linear write" \
           'costs no extra write'
 
-# The deliverable must no longer DEPEND on a Linear write or on a pull request existing. Both of the
-# superseded routes are pinned as absent: publishing the document as a Linear document, and carrying
-# its full text in the PR body. Reinstating either turns this red.
-absent "the deliverable no longer depends on publishing a Linear document" \
-       'save_document'
+# --- the deliverable never DEPENDS on a Linear write (STUDIO-600) ---------------------------------
+# The real 599 invariant: the record FILE is written first and unconditionally, so a fully headless
+# run still produces the deliverable. Pin the dependency direction in all three places it is stated —
+# the file write itself, what it does not wait on, and what the ticket copy is demoted to.
+present "the record file is written first and never skipped" \
+        'Write the file. Always, first, and never skipped'
+present_i "the record file does not depend on Linear, gh, or a pull request" \
+          'does not depend on Linear, on `gh`, or on there being a pull request'
+present_i "the ticket copy is history, and the file write never waits on it" \
+          'nothing in step 1 waits on it'
+
+# The summary comment ALWAYS carries the path, at every record size — that is what keeps a large
+# record findable from the ticket without pasting it there. Checked in both places that say it:
+# Phase 2 states the rule, Phase 6 is where the comment is actually written.
+present "Phase 2: the summary comment always carries a summary plus the record's docs path" \
+        'always carries a summary of the record plus its'
+present_i "the summary comment is never a document-sized paste" \
+          'never a [0-9]+KB paste'
+present "Phase 6: the summary comment cites the record's ~/.rhapsody/docs/ path" \
+        '`~/\.rhapsody/docs/\{\{ *issue\.identifier *\}\}-<slug>\.md` path'
+
+# A NAMED threshold, not a judgement call. The number itself is deliberately not frozen — retuning it
+# is a legitimate edit; leaving the choice to the run's judgement is the regression.
+present "a numeric threshold is named for inlining the full text" \
+        'Under [0-9][0-9,]+ characters'
+present "a numeric threshold is named for the linked-document route" \
+        '[0-9][0-9,]+ characters or more'
+
+# `save_document` is allowed BACK, but only as the history container for a large record. Neither check
+# below is a bare `save_document` grep: that token now also appears in the ground rules' write budget,
+# independently of this route, so deleting the route would leave a bare grep green (the same hole 599's
+# own self-review found in its `save_comment` check). Pin the instruction, then the qualification —
+# because a route reinstated as the DELIVERABLE is the thing 599 was right to prevent.
+present "a large record's full text is published as a Linear document" \
+        'mcp__claude_ai_Linear__save_document`, parented to the ticket'
+present "save_document is the history container and never the deliverable" \
+        '`save_document` is the HISTORY container and never the deliverable'
+
+# A large record takes TWO Linear writes, which fail independently. Dropping the summary comment
+# because the DOCUMENT write failed would strand the path citation and leave the worst case strictly
+# worse than the single-write route this replaced, so the comment is unconditional.
+present_i "a failed save_document still posts the summary comment carrying the path" \
+          'still post the summary comment'
+# Phase 6 is where the comment is actually written, so it is the copy a run has in front of it when a
+# write fails. It must DEFER to the rule above, not restate a summary of it that can go stale — which
+# is exactly what happened once on this branch.
+present_i "Phase 6 defers to Phase 2's denial rule instead of restating it" \
+          "apply Phase 2's denial rule"
+
+# The PR body stays dead as a home for the document (unchanged from STUDIO-599).
 absent "the deliverable no longer lives in the pull request body" \
        '(full|whole|entire) (text|document).*in the pull request body|document.{0,20}under a .## Design document'
 
@@ -124,6 +183,93 @@ if [ -n "$tracked" ]; then
 else
   ok "the repo tracks no docs/ or rfcs/ process-document tree"
 fi
+
+# --- the sidecar binary name the prompt states matches the one the tree builds (STUDIO-602) ---------
+# Derived from the tree on every run, never written as a literal here: a literal would have to be
+# edited by the same rename that moved the tree, which is exactly the edit that got missed. The
+# contract is `BINARY_NAME` in the desktop supervisor — the constant the app resolves the sidecar by —
+# and it is cross-checked against the crate that actually builds a binary of that name.
+resolve_rs="$root/desktop/src-tauri/src/supervisor/resolve.rs"
+
+# first_line <text> — the first line of a captured blob. Used instead of `| head -1` throughout this
+# section: the script runs under `set -euo pipefail`, where a `head` that closes the pipe early can
+# SIGPIPE its producer, and where a failing producer (a source file that moved) aborts the whole
+# script at the assignment — silently, before the check below can report WHY. Capture, then slice.
+first_line() { printf '%s' "${1%%$'\n'*}"; }
+
+# The name the desktop app resolves the sidecar by.
+binary_name="$(first_line "$(sed -n 's/.*BINARY_NAME[^=]*= *"\([^"]*\)".*/\1/p' "$resolve_rs" 2>/dev/null || true)")"
+
+# crate_bin_names <manifest> <has-src-main> — every binary the crate can build, one per line.
+# NOT "the `[[bin]]` override, else the package name": with `autobins` (default on 2018+ editions) an
+# explicit `[[bin]]` does not replace the `src/main.rs` target, cargo builds BOTH. Treating an added
+# helper binary as having renamed the sidecar would turn this red on a change that broke nothing, and
+# a guard that cries wolf gets deleted — which would undo the whole point of this section. So it is a
+# membership test over the full set: every `[[bin]]` name, plus the package name when `src/main.rs`
+# exists and no `[[bin]]` has claimed that path (cargo's own suppression rule).
+crate_bin_names() {
+  awk -v has_main="$2" '
+    function val(  ) { return match($0, /"[^"]*"/) ? substr($0, RSTART + 1, RLENGTH - 2) : "" }
+    /^[[:space:]]*\[/ { tbl=$1 }
+    tbl=="[package]" && /^[[:space:]]*name[[:space:]]*=/ { if (pkg == "") pkg = val() }
+    tbl=="[[bin]]"   && /^[[:space:]]*name[[:space:]]*=/ { v = val(); if (v != "") names[++n] = v }
+    tbl=="[[bin]]"   && /^[[:space:]]*path[[:space:]]*=/ { if (val() ~ /(^|\/)src\/main\.rs$/) main_claimed = 1 }
+    END {
+      for (i = 1; i <= n; i++) print names[i]
+      if (pkg != "" && has_main == "1" && !main_claimed) print pkg
+    }
+  ' "$1"
+}
+
+# Exactly one crate must build `$binary_name`, or the sidecar the desktop app looks for is not built
+# (none), or two crates disagree about who owns the name (more than one).
+producers=""
+if [ -n "$binary_name" ]; then
+  for manifest in "$root"/crates/*/Cargo.toml; do
+    [ -f "$manifest" ] || continue
+    crate_dir="$(dirname "$manifest")"
+    has_main=0; [ -f "$crate_dir/src/main.rs" ] && has_main=1
+    # Captured, then compared line by line — deliberately not `| grep -Fxq`, which exits on the first
+    # match and can SIGPIPE the awk feeding it; under `pipefail` that reads back as "no match".
+    while IFS= read -r bin_nm; do
+      if [ "$bin_nm" = "$binary_name" ]; then
+        producers="$producers $(basename "$crate_dir")"
+        break
+      fi
+    done <<<"$(crate_bin_names "$manifest" "$has_main" 2>/dev/null || true)"
+  done
+fi
+
+if [ -z "$binary_name" ]; then
+  bad "the daemon binary name can be derived from $resolve_rs (no BINARY_NAME found — did it move?)"
+elif [ "$(printf '%s' "$producers" | wc -w | tr -d ' ')" != "1" ]; then
+  bad "exactly one crate builds the '$binary_name' sidecar (found:${producers:-" none"})"
+else
+  ok "the '$binary_name' sidecar is built by crates/$(printf '%s' "$producers" | tr -d ' ')"
+fi
+
+# stated_binary <description> <sed-extract-expression> — pull the binary name the prompt states at one
+# position and require it to equal the derived one. An empty extract fails too: the phrasing that
+# carries the claim was reworded away, and a reworded claim is unchecked until this test is updated
+# alongside it.
+stated_binary() {
+  local desc="$1" extract="$2" stated
+  stated="$(first_line "$(sed -n "$extract" "$prompt" 2>/dev/null || true)")"
+  if [ -z "$stated" ]; then
+    bad "$desc (the prompt no longer states it in the expected phrasing)"
+  elif [ "$stated" != "$binary_name" ]; then
+    bad "$desc (prompt says '$stated', the tree builds '$binary_name')"
+  else
+    ok "$desc ('$stated')"
+  fi
+}
+
+# Both places the prompt makes the claim. Checked separately: the first is a statement of fact in the
+# repo tour, the second is a NON-NEGOTIABLE a run is told to defend, and either can rot alone.
+stated_binary "the repo tour names the bin crate the tree actually builds" \
+              's/.*plus the `\([^`]*\)` bin crate.*/\1/p'
+stated_binary "the non-negotiable names the binary the tree actually builds" \
+              's/.*the binary stays `\([^`]*\)`.*/\1/p'
 
 if [ "$fail" -ne 0 ]; then
   echo "prompt_test: FAILED"
