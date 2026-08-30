@@ -470,6 +470,40 @@ mod tests {
         let _ = task.await;
     }
 
+    // §0.12's "zero ⇒ skip with a loud room post": a roster of one still SENDS a request, carrying
+    // no reviewers. The plan half and the task half have to agree on this — the task is where the
+    // loud post lives, so a plan that returned `None` here (or a spawn gate that refused a
+    // one-person roster) would delete the only signal an operator gets that nothing will ever be
+    // reviewed. The post itself is asserted in `quorum::tests::a_roster_of_one_writes_nothing…`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_roster_of_one_still_sends_a_request_so_the_room_can_be_told() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice"]),
+            parent,
+            "alice",
+            &snapshot,
+        );
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        let req = rx.try_recv().expect("a request is still sent");
+        assert!(
+            req.reviewers.is_empty(),
+            "nobody to ask, but the request carries the parent + PR the room post names"
+        );
+        assert_eq!(req.parent_identifier, "MT-1");
+        assert_eq!(req.pr_url, "https://github.com/o/r/pull/7");
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
     // A run that was NOT dispatched as a roster identity is an ordinary Rhapsody run: there is no
     // author to exclude and no team to ask, so nothing fires.
     #[tokio::test(flavor = "multi_thread")]

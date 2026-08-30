@@ -1240,6 +1240,55 @@ mod tests {
         );
     }
 
+    // ── the shipped prompt prose ────────────────────────────────────────────────────────────────
+
+    // The reviewer's description is agent-facing prose assembled from a backslash-continued Rust
+    // literal, and prose has no compiler: STUDIO-599 shipped a prompt whose source indentation
+    // leaked into the rendered text, invisible to every other kind of test. So this asserts on the
+    // RENDERED whitespace — no line may start with the literal's own indentation — as well as on
+    // the four things the description exists to say.
+    #[test]
+    fn the_reviewer_description_renders_without_leaking_source_indentation() {
+        let req = request(&["bob"]);
+        let body = review_description(&req, "bob");
+
+        for (n, line) in body.lines().enumerate() {
+            assert!(
+                !line.starts_with("  ") || line.trim_start().starts_with('-'),
+                "line {n} leaks source indentation: {line:?}\n---\n{body}"
+            );
+            assert_eq!(
+                line.trim_end(),
+                line,
+                "line {n} has trailing whitespace: {line:?}"
+            );
+        }
+        // The substance, in the order §0.12 lists it: the PR, the parent, the author, and the job.
+        assert!(body.contains(&req.pr_url), "{body}");
+        assert!(body.contains(&req.parent_identifier), "{body}");
+        assert!(body.contains(&req.parent_title), "{body}");
+        assert!(body.contains(&req.author), "{body}");
+        assert!(body.contains("independently"), "{body}");
+        assert!(
+            body.contains(&format!("starting with `{}`", req.summon_token)),
+            "findings must name the CONFIGURED summon token, not a hard-coded one: {body}"
+        );
+        assert!(body.contains("Approve or request changes"), "{body}");
+        assert!(body.contains("Never merge"), "{body}");
+        // The reviewer is named, so the run knows which identity it is wearing.
+        assert!(body.contains("You are **bob**"), "{body}");
+    }
+
+    // The title is the host template §0.12 names, and it leads with the parent's identifier so a
+    // reviewer scanning a backlog can see what is under review without opening anything.
+    #[test]
+    fn the_review_title_names_the_parent() {
+        assert_eq!(
+            review_title("MT-1", "do the thing"),
+            "Review: MT-1 do the thing"
+        );
+    }
+
     // ── the per-tick candidate snapshot ─────────────────────────────────────────────────────────
 
     fn orch_with(teams: Teams) -> Orchestrator {

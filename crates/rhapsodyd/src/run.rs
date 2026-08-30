@@ -597,20 +597,21 @@ fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> b
 }
 
 /// Whether the Rhapsody Teams review-quorum task should exist at all (STUDIO-659, T7; design
-/// record §0.12): Teams enabled, `quorum.enabled` true, and a roster with **more than one**
-/// teammate to draw reviewers from.
+/// record §0.12): Teams enabled, `quorum.enabled` true, and a roster to draw reviewers from.
 ///
-/// The `> 1` is not an optimisation, it is the honest reading of the feature: a roster of one has
-/// nobody to review the one member's work, so there is no fan-out to make and nothing for the task
-/// to do but log. (A roster that shrinks to one AFTER boot still produces the loud room post
-/// §0.12 asks for — that path lives in the task, which is reached whenever a roster of two or more
-/// existed at startup.)
+/// **A roster of ONE still spawns the task, deliberately.** The obvious optimisation — require two
+/// teammates, since one cannot review its own work — would silently delete a behaviour §0.12 asks
+/// for by name: "zero ⇒ skip with a **loud room post**, never an error". That post is how an
+/// operator who enabled the quorum on a one-person team finds out nothing will ever be reviewed,
+/// and it lives in the task, so gating the task on `roster.len() > 1` would make it unreachable.
+/// An EMPTY roster is excluded (as it is for [`spawn_triage`]) because no run can wear an identity
+/// there, so no handoff could ever build a request to post about.
 ///
 /// Unlike [`spawn_triage`] this is NOT gated on `install_probe`: the quorum shells out to nothing,
 /// so a hermetic daemon test can carry the task safely. It is gated on the config alone, which is
 /// what makes "`quorum.enabled: false` spawns no task" a property rather than a promise.
 fn spawn_quorum(teams: &rhapsody_config::teams::Teams) -> bool {
-    teams.enabled && teams.quorum.enabled && teams.roster.len() > 1
+    teams.enabled && teams.quorum.enabled && !teams.roster.is_empty()
 }
 
 /// The claude command, effective billing guard and tracker credential the Teams triage turn runs
@@ -1165,12 +1166,14 @@ mod tests {
             "Teams off must spawn no quorum task"
         );
         assert!(
-            !spawn_quorum(&team(true, true, &["alice"])),
-            "a roster of one has nobody to review its own work"
+            spawn_quorum(&team(true, true, &["alice"])),
+            "a roster of ONE must still spawn the task: §0.12's loud \"nobody to ask\" room post \
+             lives there, and it is how an operator learns nothing will ever be reviewed"
         );
         assert!(
             !spawn_quorum(&team(true, true, &[])),
-            "an empty roster likewise"
+            "an EMPTY roster spawns nothing: no run can wear an identity, so no handoff could \
+             build a request to post about"
         );
         assert!(
             !spawn_quorum(&Teams::disabled()),
