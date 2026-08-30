@@ -385,3 +385,136 @@ jobs:
             exit 1
           fi
           echo "Pushed the rhapsody ${version} cask bump to makewhatis/homebrew-tap main."
+
+  # STUDIO-648: the opt-in @rc channel. After a PRERELEASE tag has been built, signed, notarized and
+  # uploaded by `build`, publish `Casks/rhapsody@rc.rb` to the same tap so
+  # `brew install makewhatis/tap/rhapsody@rc` tracks prereleases. Same renderer, same tap, same token,
+  # same straight-push-to-main as `homebrew-bump` — only the channel and the target file differ.
+  #
+  # WHY THIS FIRES ON workflow_dispatch AND NOT ON A `release: prereleased` TRIGGER
+  # The bump has to read the dmg's checksum out of the Release's SHA256SUMS asset, which only exists
+  # once `build` has uploaded it. `release: prereleased` fires when a Release is *published* as a
+  # prerelease — i.e. BEFORE anything is built for it — so that trigger would race the assets it needs
+  # (and would add a whole second event path to this workflow, under the release-please concurrency
+  # group, for no gain). The dispatch path already creates the assets: it is exactly the flow that
+  # produces an rc today (`gh workflow run release.yml -f tag=v0.3.4-rc.1`), and hanging the bump off
+  # `needs: build` gives it the same assets-exist ordering guarantee `homebrew-bump` has. release-please
+  # never cuts a prerelease itself (release-please-config.json is a plain `simple` package with no
+  # prerelease config), so the dispatch path is the ONLY way an rc tag gets built — nothing is missed.
+  #
+  # CHANNEL ISOLATION
+  #   - The stable cask is never touched here: this job writes exactly one file, `Casks/rhapsody@rc.rb`,
+  #     and asserts that before it pushes. `homebrew-bump` above is untouched by STUDIO-648, so
+  #     `brew upgrade --cask rhapsody` still only ever sees a real release.
+  #   - The in-app auto-update channel needs NO machinery to stay stable-only: tauri-plugin-updater polls
+  #     `releases/latest/download/latest.json`, and GitHub never points `releases/latest` at a release
+  #     flagged `prerelease`. That holds by construction — so rather than build anything, we simply
+  #     ASSERT the flag below, because a semver-prerelease tag published as a FULL release would quietly
+  #     move every stable app's update check onto the rc.
+  #   - An rc install's exit ramp is that same updater: tauri compares semver, and `0.3.4-rc.1 < 0.3.4`,
+  #     so an rc auto-updates to the next FINAL release. That is the intended way off the channel.
+  #
+  # BOOTSTRAP: the tap needs no manual seed commit. `Casks/rhapsody@rc.rb` does not exist there yet; the
+  # first prerelease run creates it (the idempotency guard below stages the file *before* diffing, so a
+  # brand-new file registers as a change rather than looking like a no-op) and pushes it to tap main.
+  homebrew-bump-rc:
+    name: Bump Homebrew @rc cask
+    needs: [release-please, build]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      # Check out the dispatched tag so render-cask.sh matches the prerelease that was just built.
+      # Pure shell + git + gh, so no rust toolchain / cargo on PATH.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+      - name: Push the Homebrew @rc cask bump to tap main
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # GITHUB_TOKEN reads THIS repo's Release (SHA256SUMS + the prerelease flag); the tap push
+          # uses the PAT. No new secret beyond the one homebrew-bump already needs.
+          RELEASE_READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+
+          # Channel gate: only a semver PRERELEASE tag feeds @rc. A dispatch dry-run against a
+          # draft/stable tag (the RD2 flow) leaves the rc cask entirely alone.
+          case "$version" in
+            *-*) ;;
+            *)
+              echo "::notice::${TAG} is not a prerelease tag — leaving Casks/rhapsody@rc.rb alone. The stable cask is bumped by the homebrew-bump job on a real release."
+              exit 0
+              ;;
+          esac
+
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set — skipping the Homebrew @rc cask bump for ${TAG}. Set a fine-grained PAT (Contents: read+write on makewhatis/homebrew-tap) as the HOMEBREW_TAP_TOKEN secret to enable auto-bump (see desktop/README.md 'Homebrew tap')."
+            exit 0
+          fi
+
+          # Assert the isolation invariant rather than assume it (see the job comment): a prerelease tag
+          # whose Release is NOT flagged `prerelease` would become `releases/latest`, pointing the stable
+          # in-app updater — and every stable user — at an rc.
+          is_prerelease="$(GH_TOKEN="$RELEASE_READ_TOKEN" gh release view "$TAG" --repo "$REPO" --json isPrerelease --jq .isPrerelease)"
+          if [ "$is_prerelease" != "true" ]; then
+            echo "::error::${TAG} is a semver prerelease tag but its GitHub Release is not marked as a prerelease (isPrerelease=${is_prerelease}) — refusing to publish the @rc cask. Publishing it would let releases/latest point at ${TAG}, moving the stable in-app update channel onto an rc. Fix with 'gh release edit ${TAG} --prerelease' and re-run."
+            exit 1
+          fi
+
+          echo "Bumping the Homebrew @rc cask to ${version} (direct push to tap main)"
+
+          tmp="$(mktemp -d)"
+          # Pull the checksum from the SHA256SUMS asset the `build` job attached to this Release.
+          GH_TOKEN="$RELEASE_READ_TOKEN" gh release download "$TAG" \
+            --repo "$REPO" --pattern SHA256SUMS --dir "$tmp"
+          sha256="$(awk '$2 == "Rhapsody.dmg" { print $1 }' "$tmp/SHA256SUMS")"
+          if [ -z "$sha256" ]; then
+            echo "::error::Rhapsody.dmg not found in the ${TAG} SHA256SUMS asset"
+            exit 1
+          fi
+          echo "Rhapsody.dmg sha256=${sha256}"
+
+          # Clone the tap on its default branch (main) with the PAT and render the rc cask from the
+          # single-source-of-truth renderer — the same script that authored the stable cask.
+          tap="$tmp/homebrew-tap"
+          cask="Casks/rhapsody@rc.rb"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/makewhatis/homebrew-tap.git" "$tap"
+          mkdir -p "$tap/Casks"
+          desktop/scripts/render-cask.sh "$version" "$sha256" rc > "$tap/$cask"
+
+          # Stage BEFORE diffing: on the bootstrap run the cask is untracked, and `git diff` (worktree
+          # vs index) would report no change for it and wrongly skip the very first publish. Staging
+          # first makes `diff --cached` see an addition, while a re-run with identical content still
+          # stages nothing and stays a clean no-op.
+          git -C "$tap" add -- "$cask"
+          if git -C "$tap" diff --cached --quiet; then
+            echo "@rc cask already at ${version} — nothing to bump."
+            exit 0
+          fi
+
+          # The stable cask must be untouched by this path. We only ever write $cask, so this can only
+          # fire if the renderer or this script grew a second output — fail loud rather than push it.
+          staged="$(git -C "$tap" diff --cached --name-only)"
+          if [ "$staged" != "$cask" ]; then
+            echo "::error::the @rc bump would change files other than ${cask} (staged: ${staged}) — refusing to push. This path must never touch the stable cask."
+            exit 1
+          fi
+
+          git -C "$tap" config user.name "github-actions[bot]"
+          git -C "$tap" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$tap" commit -m "rhapsody@rc ${version}"
+
+          # Rebase onto the latest main in case it advanced since the clone, then push STRAIGHT to the
+          # tap's (unprotected) main — same mechanism TRA-270 settled on for the stable cask.
+          git -C "$tap" pull --rebase origin main
+
+          # Fail the step LOUDLY on a rejected push — never silently drop the bump.
+          if ! git -C "$tap" push origin HEAD:main; then
+            echo "::error::Failed to push the rhapsody@rc ${version} cask bump to makewhatis/homebrew-tap main — the bump was NOT published. See the push output above (non-fast-forward, or main is now protected)."
+            exit 1
+          fi
+          echo "Pushed the rhapsody@rc ${version} cask bump to makewhatis/homebrew-tap main."
