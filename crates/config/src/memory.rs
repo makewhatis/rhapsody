@@ -164,6 +164,23 @@ pub struct Query {
     pub title: String,
     /// `memory.recall_top_k`. Zero or negative ⇒ [`FALLBACK_TOP_K`].
     pub top_k: usize,
+    /// **Browse:** every valid record matches, still ordered and still bounded
+    /// by `top_k` (STUDIO-652).
+    ///
+    /// It exists because "show me what this teammate remembers" is not a search
+    /// and has no query to score against: with all three match fields empty
+    /// every record scores 0, and a zero score is a drop — so the obvious
+    /// spelling of that question returns an empty bank that looks broken. This
+    /// flag makes the answer "everything, bounded" instead of "nothing", which
+    /// is what §5.2.3 needs before a wrong fact can be *noticed* and
+    /// invalidated.
+    ///
+    /// **The dispatch path never sets it** — `teamscompose::recall_query`
+    /// passes `browse: false` explicitly — so turn-1 recall keeps scoring
+    /// exactly as before and no prompt gains a byte. Only the off-loop
+    /// `teams_recall` browse surface turns it on, and only when the free-text
+    /// query is empty.
+    pub browse: bool,
 }
 
 impl Query {
@@ -676,7 +693,9 @@ fn parse_record(id: &str, text: &str) -> Result<Fact, MemoryError> {
 /// cost.
 fn score_fact(f: &Fact, q: &Query) -> i64 {
     let hay = format!("{} {}", f.ticket, f.content).to_ascii_lowercase();
-    let mut score = 0i64;
+    // A browse floors every valid record at 1 so nothing is dropped for scoring zero; the
+    // match terms below still rank, so a browse WITH terms reads as "everything, best first".
+    let mut score = i64::from(q.browse);
     if !q.ticket.is_empty() {
         let ticket = q.ticket.to_ascii_lowercase();
         if f.ticket.to_ascii_lowercase() == ticket {
@@ -849,6 +868,97 @@ mod tests {
         assert_eq!(
             bounded.facts[0].content, "observation 4",
             "newest first among equal scores"
+        );
+    }
+
+    /// **A browse is "everything, bounded" — not "nothing"** (STUDIO-652).
+    ///
+    /// With no ticket, no labels and no title there is nothing to score against, so every
+    /// record scores 0 and the zero-score drop empties the result. That is the correct answer
+    /// to a *search* and the wrong answer to "what does this teammate remember", which is the
+    /// question the dashboard's memory listing asks. `browse` floors the score at 1, and the
+    /// existing `top_k` + newest-first ordering still bound what comes back.
+    #[test]
+    fn a_browse_recalls_the_whole_bank_bounded_and_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = bank(dir.path());
+        for n in 0..5 {
+            let mut r = record(
+                "alice",
+                &format!("OTHER-{n}"),
+                &n.to_string(),
+                &format!("observation {n}"),
+            );
+            r.at = at(n);
+            b.retain(&r).expect("retain");
+        }
+
+        // The same empty query WITHOUT browse is still empty — the dispatch path's behaviour
+        // is untouched, which is the whole reason this is a flag and not a rule.
+        let searched = b
+            .recall(
+                "alice",
+                &Query {
+                    top_k: 8,
+                    ..Query::default()
+                },
+            )
+            .expect("recall");
+        assert!(
+            searched.facts.is_empty(),
+            "an empty SEARCH still matches nothing: {searched:?}"
+        );
+
+        let browsed = b
+            .recall(
+                "alice",
+                &Query {
+                    top_k: 8,
+                    browse: true,
+                    ..Query::default()
+                },
+            )
+            .expect("recall");
+        assert_eq!(browsed.facts.len(), 5, "a browse returns the whole bank");
+
+        let bounded = b
+            .recall(
+                "alice",
+                &Query {
+                    top_k: 2,
+                    browse: true,
+                    ..Query::default()
+                },
+            )
+            .expect("recall");
+        assert_eq!(bounded.facts.len(), 2, "top_k still bounds a browse");
+        assert_eq!(
+            bounded.facts[0].content, "observation 4",
+            "newest first among equal scores"
+        );
+    }
+
+    /// A browse shows only VALID records, so invalidating a fact from the dashboard makes it
+    /// leave the listing — the round-trip §5.2.3 asks the button to close.
+    #[test]
+    fn a_browse_hides_an_invalidated_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = bank(dir.path());
+        let id = b
+            .retain(&record("alice", "OTHER-1", "1", "never was true"))
+            .expect("retain");
+        let browse = Query {
+            top_k: 8,
+            browse: true,
+            ..Query::default()
+        };
+        assert_eq!(b.recall("alice", &browse).expect("recall").facts.len(), 1);
+
+        b.invalidate("alice", &id, "measured otherwise")
+            .expect("invalidate");
+        assert!(
+            b.recall("alice", &browse).expect("recall").facts.is_empty(),
+            "an invalidated record leaves the browse listing"
         );
     }
 
