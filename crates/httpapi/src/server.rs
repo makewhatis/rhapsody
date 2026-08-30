@@ -13,6 +13,7 @@ use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, RetainView, RoomView, RosterView, TeamsMemoryError,
+    TeamsView,
 };
 use rhapsody_orchestrator::{
     HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot,
@@ -31,8 +32,8 @@ use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
 use crate::handlers_teams::{
-    handle_run_post, handle_run_retain, handle_teams_invalidate, handle_teams_recall,
-    handle_teams_room, handle_teams_roster,
+    handle_run_post, handle_run_retain, handle_teams, handle_teams_config, handle_teams_invalidate,
+    handle_teams_recall, handle_teams_room, handle_teams_roster,
 };
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
@@ -141,6 +142,35 @@ pub trait StateProvider: Send + Sync {
     /// `None` ⇒ no registry loaded yet, which the handler serves as an empty `[]`. Rhapsody-only (no
     /// Go v0.4.0 counterpart — this whole endpoint is a Rhapsody addition).
     fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>>;
+
+    /// Whether Rhapsody Teams is on — **the one cheap gate a client checks before it fetches any
+    /// `/api/v1/teams*` route at all** (STUDIO-652), served as a field on `GET /api/v1/version`.
+    ///
+    /// It lives there rather than on `/api/v1/state` because `/state` is byte-pinned to the Go
+    /// daemon's `api/state.json` golden and can carry no Rhapsody-only key; `/version` is already
+    /// the additive Rhapsody-only endpoint the dashboard fetches exactly once at mount, so the gate
+    /// costs no request of its own. A Teams-off dashboard therefore makes ZERO requests against
+    /// `/api/v1/teams*` — not even one 409 per load.
+    fn teams_enabled(&self) -> bool {
+        false
+    }
+
+    /// Where this daemon reads `teams.yaml` (`GET`/`POST /api/v1/teams/config`, STUDIO-652). Empty
+    /// ⇒ there is no on-disk runtime home to anchor one to (`--no-store`, an in-memory or disabled
+    /// store), so the enable flow has nothing to offer and says so rather than guessing a path.
+    ///
+    /// Deliberately NOT gated on Teams being enabled: the whole point of the enable flow is that it
+    /// works while the feature is off, which is the only state from which anyone would use it.
+    fn teams_config_path(&self) -> &str {
+        ""
+    }
+
+    /// The one dashboard view: the roster, the manager mode and the memory backend
+    /// (`GET /api/v1/teams`, STUDIO-652). Teams off ⇒ [`TeamsMemoryError::Disabled`], like every
+    /// other Teams route.
+    async fn teams_overview(&self) -> Result<TeamsView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
 
     /// The Teams roster with each identity's derived status (`GET /api/v1/teams/roster`,
     /// STUDIO-645). Rhapsody-only, like [`capabilities_registry`](StateProvider::capabilities_registry)
@@ -335,6 +365,15 @@ where
         // with derived status, an identity's recalled memory, and the per-record invalidate that
         // §5.2.3 wants "reachable at the moment someone notices". All static paths, so they never
         // contend with anything already registered; a Teams-off daemon answers `teams_disabled`.
+        // The ONE view the dashboard renders (STUDIO-652) — roster + manager mode + backend. A
+        // static path, and more specific than nothing else: `/api/v1/teams/*` below are all
+        // literal segments, so axum's matchit keeps them apart from this bare `/api/v1/teams`.
+        .route("/api/v1/teams", any(handle_teams))
+        // The enable flow's read/write of `teams.yaml` (STUDIO-652). The ONLY Teams route that is
+        // NOT gated on Teams being enabled: it is how a disabled daemon gets enabled, and it
+        // follows `POST /api/v1/config`'s discipline exactly — validate first, atomically rewrite
+        // only when valid, leave the on-disk file untouched on a rejection.
+        .route("/api/v1/teams/config", any(handle_teams_config))
         .route("/api/v1/teams/roster", any(handle_teams_roster))
         .route("/api/v1/teams/recall", any(handle_teams_recall))
         .route("/api/v1/teams/invalidate", any(handle_teams_invalidate))

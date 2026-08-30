@@ -69,6 +69,9 @@ pub(crate) struct FakeProvider {
     /// The Teams memory runtime the `/api/v1/teams/*` handlers drive (STUDIO-645). Unset ⇒ the
     /// trait's default `teams_disabled`, which is exactly what a Teams-off daemon answers.
     teams_memory: Option<Arc<rhapsody_orchestrator::teamsmemory::TeamsMemory>>,
+    /// The `teams.yaml` path `/api/v1/teams/config` reads and writes (STUDIO-652). Empty ⇒ the
+    /// no-runtime-home answer a `--no-store` daemon gives.
+    teams_config_path: String,
 }
 
 impl FakeProvider {
@@ -104,6 +107,7 @@ impl FakeProvider {
             workflow_path: String::new(),
             capabilities_registry: None,
             teams_memory: None,
+            teams_config_path: String::new(),
         }
     }
 
@@ -226,6 +230,13 @@ impl FakeProvider {
         self.teams_memory = Some(mem);
         self
     }
+
+    /// Set the `teams.yaml` path `GET`/`POST /api/v1/teams/config` reads and writes (STUDIO-652).
+    /// Unset ⇒ the no-runtime-home path, which is what a `--no-store` daemon serves.
+    pub(crate) fn with_teams_config_path(mut self, path: impl Into<String>) -> Self {
+        self.teams_config_path = path.into();
+        self
+    }
 }
 
 #[async_trait]
@@ -328,6 +339,23 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
         self.teams()?.roster()
+    }
+
+    async fn teams_overview(
+        &self,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::TeamsView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?.overview()
+    }
+
+    fn teams_enabled(&self) -> bool {
+        self.teams_memory.as_ref().is_some_and(|m| m.enabled())
+    }
+
+    fn teams_config_path(&self) -> &str {
+        &self.teams_config_path
     }
 
     async fn teams_recall(

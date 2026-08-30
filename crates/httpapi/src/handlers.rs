@@ -64,15 +64,26 @@ pub(crate) async fn handle_state(
     }
 }
 
-/// `GET /api/v1/version` — this daemon's build identity (`version`/`commit`/`built_at`). Rhapsody-only
-/// (STUDIO-380); no Go counterpart. State-free like `/healthz`, so it answers even while the
-/// orchestrator is wedged — which is exactly when an operator wants to know what is running. See
-/// [`crate::build_info`] for why this is its own route rather than a field on `/state`.
-pub(crate) async fn handle_version(method: Method) -> Response {
+/// `GET /api/v1/version` — this daemon's build identity (`version`/`commit`/`built_at`), plus
+/// `teams_enabled` (STUDIO-652). Rhapsody-only (STUDIO-380); no Go counterpart. See
+/// [`crate::build_info`] for why this is its own route rather than a field on `/state`, and why the
+/// Teams gate rides here rather than costing a request of its own.
+///
+/// The build half stays state-free, so this still answers while the orchestrator is wedged — which
+/// is exactly when an operator wants to know what is running. Reading `teams_enabled` off the
+/// provider does not change that: it is a field read on the shared Teams config, not a control-loop
+/// round-trip, and a provider without a Teams runtime answers `false`.
+pub(crate) async fn handle_version(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
     if let Some(resp) = require_get(&method) {
         return resp;
     }
-    write_json(StatusCode::OK, &build_info::current())
+    write_json(
+        StatusCode::OK,
+        &build_info::response(provider.teams_enabled()),
+    )
 }
 
 /// `POST /api/v1/refresh` — request a coalesced poll+reconcile tick and return 202. The provider's

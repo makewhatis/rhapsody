@@ -274,6 +274,10 @@ export interface DaemonVersion {
   version: string; // nearest release tag + distance, e.g. "v0.3.1" or "v0.3.1-8-g581e281"
   commit: string; // full git SHA, or "unknown"
   built_at: string; // RFC3339 UTC, or "unknown"
+  // Whether Rhapsody Teams is on (STUDIO-652). THE gate: the app reads it from this one mount-time
+  // request and, when it is false, never touches /api/v1/teams* at all — no chip, no panel, no
+  // fetches. Optional because a daemon older than STUDIO-652 omits it, which reads as off.
+  teams_enabled?: boolean;
 }
 
 // fetchVersion reads the daemon's build identity. Unlike the shell's appVersion() this works in a
@@ -832,4 +836,215 @@ export interface CapabilityDefDTO {
 // checklist without hardcoding options. Serves [] when no registry is loaded yet.
 export async function fetchCapabilitiesRegistry(): Promise<CapabilityDefDTO[]> {
   return getJSON<CapabilityDefDTO[]>("/api/v1/capabilities");
+}
+
+// --- Rhapsody Teams (STUDIO-652; Rhapsody-only, no Go v0.4.0 mirror) ---
+//
+// Every route below is additive and answers `teams_disabled` (409) on a daemon with Teams off, so
+// nothing here may be fetched speculatively. The gate is `DaemonVersion.teams_enabled`, read once
+// at shell mount from the request the app already makes — see `useTeamsEnabled`.
+
+// TeamsRosterRow is one identity as the daemon reports it: the configured record plus the status
+// derived from the runs live as that identity RIGHT NOW.
+export interface TeamsRosterRow {
+  name: string;
+  profile: string;
+  labels: string[];
+  /** The memory bank id the store actually uses (`<bank_prefix><name>` unless overridden). */
+  bank: string;
+  /** 0 ⇒ unlimited. */
+  max_concurrent: number;
+  live_runs: number;
+  /** Which tickets those runs are working, sorted by the daemon for a stable response. */
+  tickets: string[];
+}
+
+// TeamsOverview is GET /api/v1/teams: the roster plus the two settings that make it legible —
+// how tickets are assigned (`manager_mode`) and whether anything is remembered (`backend`).
+export interface TeamsOverview {
+  enabled: boolean;
+  /** "off" | "labels" | "labels+model" — the teams.yaml wire spelling. */
+  manager_mode: string;
+  /** Who takes a ticket nothing matched; "" ⇒ run without an identity. */
+  default_identity: string;
+  /** "none" | "local" | "hindsight". */
+  backend: string;
+  roster: TeamsRosterRow[];
+}
+
+// TeamsRoomMessage is one post in the team room. `from` is HOST-stamped (design §0.11.4): a run
+// cannot supply it. `body` is untrusted content and is rendered quoted, never as instructions.
+export interface TeamsRoomMessage {
+  /** `file:seq` — stable across reads. */
+  id: string;
+  from: string;
+  /** "*" for a room-wide post, else the addressed identity. */
+  to: string;
+  at: string; // RFC3339
+  body: string;
+  /** Ticket ids, PR urls, commit SHAs — what proves it. */
+  refs: string[];
+}
+
+export interface TeamsRoomResponse {
+  /** Oldest first, bounded by the room's own window. */
+  messages: TeamsRoomMessage[];
+  /** Log lines that could not be parsed — reported rather than hidden. */
+  skipped: string[];
+}
+
+// TeamsFact is one record in an identity's memory bank. Untrusted content, same as a room post.
+export interface TeamsFact {
+  id: string;
+  identity: string;
+  document_id: string;
+  ticket: string;
+  commit_sha: string;
+  pr: string;
+  run_id: string;
+  at: string;
+  /** "valid" | "invalidated"; recall only ever returns valid records. */
+  state: string;
+  reason: string;
+  content: string;
+}
+
+export interface TeamsRecallResponse {
+  identity: string;
+  facts: TeamsFact[];
+  /** Bank files that could not be read — reported rather than hidden. */
+  skipped: string[];
+}
+
+export interface TeamsInvalidateResponse {
+  identity: string;
+  fact_id: string;
+  /** false ⇒ the record was already invalidated (a no-op, not a failure). */
+  invalidated: boolean;
+  reason: string;
+}
+
+// --- teams.yaml, for the enable flow ---
+
+export interface TeamsIdentityConfig {
+  name: string;
+  profile: string;
+  labels: string[];
+  bank: string;
+  max_concurrent: number;
+}
+
+export interface TeamsManagerConfig {
+  mode: string;
+  default_identity: string;
+  model: string;
+  max_tokens: number;
+  timeout_ms: number;
+}
+
+export interface TeamsMemoryConfig {
+  backend: string;
+  path: string;
+  endpoint: string;
+  bank_prefix: string;
+  recall_top_k: number;
+}
+
+// TeamsConfig mirrors `~/.rhapsody/teams.yaml` field for field (design §2.2). The daemon applies
+// every schema default on read, so a partial POST is legal — an omitted key means "the default",
+// not "empty".
+export interface TeamsConfig {
+  enabled: boolean;
+  manager: TeamsManagerConfig;
+  memory: TeamsMemoryConfig;
+  roster: TeamsIdentityConfig[];
+  prompt_budget_bytes: number;
+}
+
+// TeamsConfigView is GET/POST /api/v1/teams/config. `present: false` is the SHIPPED state: an
+// absent teams.yaml means Teams is off, and nothing — including reading this — ever creates it.
+export interface TeamsConfigView {
+  path: string;
+  present: boolean;
+  /** Why a PRESENT file did not load, verbatim from the daemon's loader; "" when it did. */
+  error: string;
+  config: TeamsConfig;
+  /** teams.yaml is boot-loaded (no watcher), so a save takes effect on the next daemon start. */
+  restart_required: boolean;
+}
+
+export async function fetchTeamsOverview(): Promise<TeamsOverview> {
+  const t = await getJSON<TeamsOverview>("/api/v1/teams");
+  t.roster ??= [];
+  return t;
+}
+
+// fetchTeamsRoom reads the newest posts in the room. `limit` can only NARROW — the daemon clamps
+// it to the room's own ceiling — and reading advances no identity's cursor, so the panel can poll
+// without ever eating a teammate's catch-up.
+export async function fetchTeamsRoom(limit?: number): Promise<TeamsRoomResponse> {
+  const q = limit && limit > 0 ? `?limit=${limit}` : "";
+  const r = await getJSON<TeamsRoomResponse>(`/api/v1/teams/room${q}`);
+  r.messages ??= [];
+  r.skipped ??= [];
+  return r;
+}
+
+// fetchTeamsRecall lists what an identity remembers. An EMPTY query is a browse — "everything,
+// bounded by recall_top_k" — which is what the memory panel wants: a wrong fact has to be visible
+// before it can be invalidated (design §5.2.3).
+export async function fetchTeamsRecall(identity: string, query = ""): Promise<TeamsRecallResponse> {
+  const params = new URLSearchParams({ identity, query });
+  const r = await getJSON<TeamsRecallResponse>(`/api/v1/teams/recall?${params}`);
+  r.facts ??= [];
+  r.skipped ??= [];
+  return r;
+}
+
+// postJSON POSTs `body` and surfaces the daemon's error envelope verbatim — the Teams write paths
+// (invalidate, save teams.yaml) both want the daemon's own complaint on screen rather than a
+// paraphrase, because the daemon's answer is the one that decides what happens.
+async function postJSON<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let message = res.statusText;
+    try {
+      const parsed = (await res.json()) as ApiError;
+      if (parsed?.error) message = parsed.error.message;
+    } catch {
+      /* non-JSON body */
+    }
+    throw new Error(message);
+  }
+  return (await res.json()) as T;
+}
+
+// postTeamsInvalidate marks one record non-valid WITH its reason (design §5.3). Nothing is
+// deleted and the reason is stored, so the correction is readable by whoever finds it later; the
+// daemon rejects a reasonless invalidate, which is why the UI requires one too.
+export async function postTeamsInvalidate(
+  identity: string,
+  factID: string,
+  reason: string,
+): Promise<TeamsInvalidateResponse> {
+  return postJSON<TeamsInvalidateResponse>("/api/v1/teams/invalidate", {
+    identity,
+    fact_id: factID,
+    reason,
+  });
+}
+
+export async function fetchTeamsConfig(): Promise<TeamsConfigView> {
+  return getJSON<TeamsConfigView>("/api/v1/teams/config");
+}
+
+// saveTeamsConfig writes teams.yaml — the ONE explicit act that creates it. The daemon validates
+// with the same `Teams::validate` it uses at boot and writes nothing on a rejection, so a failure
+// here means the on-disk file is exactly as it was.
+export async function saveTeamsConfig(config: TeamsConfig): Promise<TeamsConfigView> {
+  return postJSON<TeamsConfigView>("/api/v1/teams/config", { config });
 }

@@ -2,6 +2,7 @@ import * as React from "react";
 import { StatusDot } from "@/components/ui";
 import { Play, Square, RotateCcw, Settings } from "@/components/ui/icons";
 import type { ConductorModel } from "@/lib/daemon-status";
+import type { TeamsChip } from "@/lib/teams-model";
 
 export interface ToolbarProps {
   /** The derived conductor-status model (see `conductorStatus`) — dot + label + mono detail. */
@@ -24,6 +25,16 @@ export interface ToolbarProps {
   onOpenLinear: () => void;
   /** Jump to the Tools settings tab (the "Tools" shortcut). */
   onOpenTools: () => void;
+  /**
+   * The Teams status chip (STUDIO-652), or null/undefined when Rhapsody Teams is off — which is
+   * the SHIPPED state, and why this is optional: absent ⇒ the bar renders exactly as it did before
+   * Teams existed, with no chip and no reserved space.
+   */
+  teams?: TeamsChip | null;
+  /** The Teams panel is the active route — lights the chip rust. */
+  teamsActive?: boolean;
+  /** Open the Teams panel. Only ever called from the chip, which only renders when `teams` is set. */
+  onOpenTeams?: () => void;
 }
 
 // Toolbar — the single 46px "Podium" toolbar rendered as the first row on every route (P10-D2). It
@@ -49,6 +60,9 @@ export function Toolbar({
   onToggleSettings,
   onOpenLinear,
   onOpenTools,
+  teams,
+  teamsActive = false,
+  onOpenTeams,
 }: ToolbarProps) {
   // Transport gating (design spec): while the daemon runs, Play is disabled and Stop/Restart are
   // live; while it is stopped, Play is live and Stop/Restart are disabled. Everything is disabled
@@ -88,6 +102,8 @@ export function Toolbar({
 
       <div style={{ flex: 1 }} />
 
+      {teams && onOpenTeams ? <TeamsChipButton chip={teams} active={teamsActive} onClick={onOpenTeams} /> : null}
+
       <SubtleButton label="Open Linear" onClick={onOpenLinear}>
         Linear <span style={{ color: "var(--faint)", fontSize: 11 }}>↗</span>
       </SubtleButton>
@@ -113,6 +129,45 @@ export function Toolbar({
 
       <GearButton active={settingsActive} onClick={onToggleSettings} updateAvailable={updateAvailable} />
     </div>
+  );
+}
+
+// TeamsChipButton — the "Teams: N teammates, M live" status chip (STUDIO-652). It sits with the
+// toolbar's other shortcuts and opens the Teams panel. A live dot pulses whenever anything is
+// running as a teammate, so the strip answers "is the team working right now" at a glance.
+//
+// It renders ONLY when the daemon reports Teams enabled. That is the whole inertness contract at
+// the UI layer: no chip, no reserved gap, no layout change of any kind on a Teams-off daemon.
+function TeamsChipButton({ chip, active, onClick }: { chip: TeamsChip; active: boolean; onClick: () => void }) {
+  const [hover, setHover] = React.useState(false);
+  const live = chip.live > 0;
+  return (
+    <button
+      type="button"
+      aria-label={chip.label}
+      aria-pressed={active}
+      title="Open the Teams panel"
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 7,
+        fontSize: 12,
+        color: active ? "var(--rust-text)" : hover ? "var(--ink)" : "var(--btn-label)",
+        padding: "5px 11px",
+        borderRadius: 7,
+        border: `1px solid ${active || hover ? "rgba(255,255,255,.14)" : "var(--hair-control)"}`,
+        background: active ? "var(--tint-active-nav)" : hover ? "rgba(255,255,255,.06)" : "rgba(255,255,255,.03)",
+        cursor: "pointer",
+        transition: "color .12s, background .12s, border-color .12s",
+        whiteSpace: "nowrap",
+      }}
+    >
+      <StatusDot color={live ? "var(--emerald)" : "var(--tx-faint)"} size={6} pulse={live} />
+      {chip.label}
+    </button>
   );
 }
 
