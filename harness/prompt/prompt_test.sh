@@ -23,6 +23,11 @@
 #   * A run that cannot read a required input STOPS and hands off; it never reconstructs the input.
 #   * None of this weakens the absolute rule that specs, plans and design docs never land in the repo —
 #     the directory sits outside the repo precisely so that rule can stand.
+#   * A statement of FACT about the repo can rot into a falsehood while every word around it stays
+#     true. STUDIO-602: the prompt told every run the daemon binary was `symphonyd` — once as a fact
+#     and once as a non-negotiable — long after the tree had renamed it. A run that took the
+#     non-negotiable literally would defend a binary that does not exist, or flag the real one as a
+#     violation. Such statements are checked against the tree, never against a literal in this file.
 #
 # No dependencies beyond bash + git. Run from anywhere: `harness/prompt/prompt_test.sh`.
 set -euo pipefail
@@ -178,6 +183,93 @@ if [ -n "$tracked" ]; then
 else
   ok "the repo tracks no docs/ or rfcs/ process-document tree"
 fi
+
+# --- the sidecar binary name the prompt states matches the one the tree builds (STUDIO-602) ---------
+# Derived from the tree on every run, never written as a literal here: a literal would have to be
+# edited by the same rename that moved the tree, which is exactly the edit that got missed. The
+# contract is `BINARY_NAME` in the desktop supervisor — the constant the app resolves the sidecar by —
+# and it is cross-checked against the crate that actually builds a binary of that name.
+resolve_rs="$root/desktop/src-tauri/src/supervisor/resolve.rs"
+
+# first_line <text> — the first line of a captured blob. Used instead of `| head -1` throughout this
+# section: the script runs under `set -euo pipefail`, where a `head` that closes the pipe early can
+# SIGPIPE its producer, and where a failing producer (a source file that moved) aborts the whole
+# script at the assignment — silently, before the check below can report WHY. Capture, then slice.
+first_line() { printf '%s' "${1%%$'\n'*}"; }
+
+# The name the desktop app resolves the sidecar by.
+binary_name="$(first_line "$(sed -n 's/.*BINARY_NAME[^=]*= *"\([^"]*\)".*/\1/p' "$resolve_rs" 2>/dev/null || true)")"
+
+# crate_bin_names <manifest> <has-src-main> — every binary the crate can build, one per line.
+# NOT "the `[[bin]]` override, else the package name": with `autobins` (default on 2018+ editions) an
+# explicit `[[bin]]` does not replace the `src/main.rs` target, cargo builds BOTH. Treating an added
+# helper binary as having renamed the sidecar would turn this red on a change that broke nothing, and
+# a guard that cries wolf gets deleted — which would undo the whole point of this section. So it is a
+# membership test over the full set: every `[[bin]]` name, plus the package name when `src/main.rs`
+# exists and no `[[bin]]` has claimed that path (cargo's own suppression rule).
+crate_bin_names() {
+  awk -v has_main="$2" '
+    function val(  ) { return match($0, /"[^"]*"/) ? substr($0, RSTART + 1, RLENGTH - 2) : "" }
+    /^[[:space:]]*\[/ { tbl=$1 }
+    tbl=="[package]" && /^[[:space:]]*name[[:space:]]*=/ { if (pkg == "") pkg = val() }
+    tbl=="[[bin]]"   && /^[[:space:]]*name[[:space:]]*=/ { v = val(); if (v != "") names[++n] = v }
+    tbl=="[[bin]]"   && /^[[:space:]]*path[[:space:]]*=/ { if (val() ~ /(^|\/)src\/main\.rs$/) main_claimed = 1 }
+    END {
+      for (i = 1; i <= n; i++) print names[i]
+      if (pkg != "" && has_main == "1" && !main_claimed) print pkg
+    }
+  ' "$1"
+}
+
+# Exactly one crate must build `$binary_name`, or the sidecar the desktop app looks for is not built
+# (none), or two crates disagree about who owns the name (more than one).
+producers=""
+if [ -n "$binary_name" ]; then
+  for manifest in "$root"/crates/*/Cargo.toml; do
+    [ -f "$manifest" ] || continue
+    crate_dir="$(dirname "$manifest")"
+    has_main=0; [ -f "$crate_dir/src/main.rs" ] && has_main=1
+    # Captured, then compared line by line — deliberately not `| grep -Fxq`, which exits on the first
+    # match and can SIGPIPE the awk feeding it; under `pipefail` that reads back as "no match".
+    while IFS= read -r bin_nm; do
+      if [ "$bin_nm" = "$binary_name" ]; then
+        producers="$producers $(basename "$crate_dir")"
+        break
+      fi
+    done <<<"$(crate_bin_names "$manifest" "$has_main" 2>/dev/null || true)"
+  done
+fi
+
+if [ -z "$binary_name" ]; then
+  bad "the daemon binary name can be derived from $resolve_rs (no BINARY_NAME found — did it move?)"
+elif [ "$(printf '%s' "$producers" | wc -w | tr -d ' ')" != "1" ]; then
+  bad "exactly one crate builds the '$binary_name' sidecar (found:${producers:-" none"})"
+else
+  ok "the '$binary_name' sidecar is built by crates/$(printf '%s' "$producers" | tr -d ' ')"
+fi
+
+# stated_binary <description> <sed-extract-expression> — pull the binary name the prompt states at one
+# position and require it to equal the derived one. An empty extract fails too: the phrasing that
+# carries the claim was reworded away, and a reworded claim is unchecked until this test is updated
+# alongside it.
+stated_binary() {
+  local desc="$1" extract="$2" stated
+  stated="$(first_line "$(sed -n "$extract" "$prompt" 2>/dev/null || true)")"
+  if [ -z "$stated" ]; then
+    bad "$desc (the prompt no longer states it in the expected phrasing)"
+  elif [ "$stated" != "$binary_name" ]; then
+    bad "$desc (prompt says '$stated', the tree builds '$binary_name')"
+  else
+    ok "$desc ('$stated')"
+  fi
+}
+
+# Both places the prompt makes the claim. Checked separately: the first is a statement of fact in the
+# repo tour, the second is a NON-NEGOTIABLE a run is told to defend, and either can rot alone.
+stated_binary "the repo tour names the bin crate the tree actually builds" \
+              's/.*plus the `\([^`]*\)` bin crate.*/\1/p'
+stated_binary "the non-negotiable names the binary the tree actually builds" \
+              's/.*the binary stays `\([^`]*\)`.*/\1/p'
 
 if [ "$fail" -ne 0 ]; then
   echo "prompt_test: FAILED"
