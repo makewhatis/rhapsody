@@ -323,9 +323,9 @@ on, the app shows the roster with each teammate's live runs (linking to that run
 view), a read-only tail of the room, and each identity's memory with a per-record
 invalidate-with-reason button. Room posts and recalled facts are rendered as quoted,
 provenance-prefixed data — they are untrusted content that reaches every teammate's prompt, so the
-app never renders them as bare prose. Posting to the room from the UI is deliberately absent: a post
-from the app has no run identity, so it could only be a *human* post, and that provenance question
-belongs with the room's write side.
+app never renders them as bare prose. The panel has **no compose box**: teammates post through
+`teams_post` (STUDIO-653), but a post from the *app* has no run identity, so it could only be a
+*human* post, and that provenance question is still open.
 
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside

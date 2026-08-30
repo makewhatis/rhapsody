@@ -20,9 +20,9 @@ import type { TeamsFact, TeamsRosterRow } from "@/lib/api";
 // would answer `teams_disabled`. On a Teams-off daemon this component never mounts and the app
 // makes no request against /api/v1/teams* at all.
 //
-// Nothing here writes except the invalidate button. Posting to the room is deliberately absent — a
-// post from the UI has no run identity, so the host could only stamp it as a *human* post, and that
-// provenance question belongs with the room's write side (design §0.11.4, deferred with T6).
+// Nothing here writes except the invalidate button. Teammates post through `teams_post` (T6), but
+// this panel gets no compose box: a post from the UI has no run identity, so the host could only
+// stamp it as a *human* post, and that provenance question (design §0.11.4) is still open.
 export interface TeamsPanelProps {
   /** Poll cadence, matched to the daemon's own poll interval when known. */
   pollMs?: number;
@@ -67,12 +67,12 @@ export function TeamsPanel({ pollMs, onOpenRun, onOpenSettings }: TeamsPanelProp
 
       <SectionCard
         title="The room"
-        desc="What the team recorded, newest last. Read-only — posting is the room's write side, and a post from here would have no run identity."
+        desc="What the team recorded, newest last. Read-only here — teammates post with `teams_post`, but a post from this panel would have no run identity."
       >
         {room.isError ? (
           <Note>Could not read the room: {errText(room.error)}</Note>
         ) : (room.data?.messages.length ?? 0) === 0 ? (
-          <Note>{room.isLoading ? "Loading the room…" : "Nothing has been posted yet."}</Note>
+          <Note>{room.isLoading ? "Loading the room…" : "Nothing has been posted yet — teammates post to the room with `teams_post`."}</Note>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {room.data?.messages.map((m) => (
