@@ -62,9 +62,8 @@ the `Orchestrator` struct itself. Concretely:
   attempt, off-loop task), `agentupdate.rs` (folds a worker event into `RunningEntry` + totals),
   `message.rs` (operator→live-run mailbox delivery, mid-run summons routing, and STUDIO-649's
   reopen seed — the Rhapsody-only half that hands a reopening summons to the run it triggered),
-  `handoff.rs`
-  (daemon-mediated review handoff, TRA-242 — an addition beyond Go Symphony, see the pitfall note
-  below), `stop.rs` (Stop/Resume).
+  `handoff.rs` (daemon-mediated review handoff, TRA-242 — an addition beyond Go Symphony, see the
+  pitfall note below), `stop.rs` (Stop/Resume).
 - **Reconciliation**: `reconcile.rs` (pure decision: refreshed state → `ReconcileAction`) vs.
   `reconcile_run.rs` (the apply side: grouping, per-project refresh, stall detection, workspace
   cleanup). Keep that split when editing — decision logic stays testable without a tracker.
