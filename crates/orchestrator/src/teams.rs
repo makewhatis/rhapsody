@@ -42,6 +42,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
+use rhapsody_config::memory::Fact;
 use rhapsody_config::room::MAX_ROOM_WINDOW;
 use rhapsody_config::teams::{Identity, ManagerMode, Teams};
 use rhapsody_core::Issue;
@@ -428,8 +429,11 @@ impl Orchestrator {
     /// Two guards carry the whole of "off costs nothing", and each is one
     /// `Option` (§2.4 rows 5–8):
     ///
-    /// * `teams_bank` is `None` with `memory.backend: none`, `hindsight` (T8) or
-    ///   no on-disk runtime home — no bank is read and no directory is created.
+    /// * `teams_bank` is `None` with `memory.backend: none`, `hindsight` or no
+    ///   on-disk runtime home — no bank is read and no directory is created.
+    ///   With `hindsight` the facts come instead from `teams_prefetch`, which is
+    ///   a **non-blocking** read of what the off-loop prefetch task already
+    ///   fetched (T8, STUDIO-660) — never a recall performed here.
     /// * `teams_room` / `teams_cursors` are `None` with Teams off or no on-disk
     ///   runtime home — no log is read and no cursor is written.
     ///
@@ -446,7 +450,12 @@ impl Orchestrator {
     fn composed(&self, header: String, teams: &Teams, identity: &str, iss: &Issue) -> String {
         let facts = match self.teams_bank.as_ref() {
             Some(bank) => recall_facts(bank, teams, identity, iss),
-            None => Vec::new(),
+            // No local bank. With `memory.backend: hindsight` the facts were
+            // recalled ahead of time by `teamsprefetch`'s own task; this reads
+            // them out of a shared map and never touches the network. Every
+            // other configuration answers `None` here and renders no section,
+            // exactly as it did before T8.
+            None => self.prefetched_facts(identity, iss),
         };
         let caught = match (self.teams_room.as_ref(), self.teams_cursors.as_ref()) {
             (Some(room), Some(cursors)) => catch_up(room, cursors, identity, MAX_ROOM_WINDOW),
@@ -470,6 +479,44 @@ impl Orchestrator {
             );
         }
         section
+    }
+
+    /// The prefetched facts for this dispatch, or none — **the T8 dispatch-path
+    /// read** (STUDIO-660).
+    ///
+    /// This is the whole of `hindsight`'s presence on the control task, and it is
+    /// three things a reviewer can check at a glance: it is `fn`, it takes no
+    /// backend, and its one call is
+    /// [`PrefetchCache::try_get`](crate::teamsprefetch::PrefetchCache::try_get),
+    /// which gives up rather than waits. There is no `.await` reachable from
+    /// `dispatch_issue` through here, and there is no type in scope that could
+    /// introduce one.
+    ///
+    /// A miss, a stale entry, or a lock the prefetch task happened to hold all
+    /// return the same empty vector, and an empty vector renders no memory
+    /// section — byte-for-byte what `memory.backend: none` produces. The run
+    /// proceeds either way; it is never retried inline and never waited on.
+    fn prefetched_facts(&self, identity: &str, iss: &Issue) -> Vec<Fact> {
+        let Some(cache) = self.teams_prefetch.as_ref() else {
+            return Vec::new();
+        };
+        match cache.try_get(identity, &iss.identifier, (self.now)()) {
+            Some(facts) => facts,
+            None => {
+                // At debug, not warn: a cold cache is the NORMAL state for the
+                // first dispatch after a daemon start, and one line per dispatch
+                // at warn would train an operator to ignore the level that also
+                // carries "the bank is down" (which `teamsprefetch` logs, once
+                // per cycle, where it belongs).
+                tracing::debug!(
+                    identity = %identity,
+                    ticket = %iss.identifier,
+                    "teams memory: no prefetched facts for this dispatch; rendering no memory \
+                     section (cold, stale, or the prefetch task holds the cache)"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Binds a just-dispatched run to the provenance a later `teams_retain` is
@@ -1038,6 +1085,192 @@ mod tests {
         assert!(
             section.contains(&format!("MT-42 ({NOT_RE_VERIFIED})")),
             "a ticket the map cannot see is FLAGGED, not dropped: {section:?}"
+        );
+    }
+
+    // ---- T8: the prefetched remote bank on the dispatch path (§5, §5.4) ----
+
+    /// Attaches the prefetch cache the composition root installs for
+    /// `memory.backend: hindsight`, seeded with `facts` for `(identity, ticket)`.
+    /// Deliberately leaves `teams_bank` `None`, which is what `hindsight` means.
+    fn attach_prefetch(
+        o: &mut Orchestrator,
+        identity: &str,
+        ticket: &str,
+        facts: Vec<Fact>,
+    ) -> Arc<crate::teamsprefetch::PrefetchCache> {
+        let cache = Arc::new(crate::teamsprefetch::PrefetchCache::new());
+        cache.replace(
+            vec![(
+                crate::teamsprefetch::PrefetchKey::new(identity, ticket),
+                facts,
+            )],
+            (o.now)(),
+        );
+        o.teams_prefetch = Some(Arc::clone(&cache));
+        cache
+    }
+
+    /// A fact shaped the way `HindsightBackend::recall` maps one — plain data,
+    /// with no hint of where it came from.
+    fn remote_fact(ticket: &str, content: &str) -> Fact {
+        Fact {
+            id: "fact-1".to_string(),
+            identity: "alice".to_string(),
+            document_id: "run-7".to_string(),
+            ticket: ticket.to_string(),
+            run_id: "7".to_string(),
+            at: "2026-08-29T17:45:00Z".to_string(),
+            state: rhapsody_config::memory::STATE_VALID.to_string(),
+            content: content.to_string(),
+            ..Fact::default()
+        }
+    }
+
+    /// **The payoff of T4's stated design test.** A prefetched fact renders
+    /// through the SAME composer, into the same slot, in the same order — the
+    /// renderer never learns which backend produced it.
+    #[test]
+    fn a_prefetched_fact_renders_through_the_same_composer() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, _store) = orch_with_teams(teams);
+        attach_prefetch(
+            &mut o,
+            "alice",
+            "MT-1",
+            vec![remote_fact(
+                "MT-9",
+                "The capabilities registry no-ops an unknown label.",
+            )],
+        );
+        assert!(o.teams_bank.is_none(), "hindsight holds no LocalBank");
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert!(
+            section.starts_with("## You are working as alice"),
+            "the identity header still leads: {section:?}"
+        );
+        assert!(section.contains(MEMORY_HEADER), "{section:?}");
+        assert!(
+            section.contains("The capabilities registry no-ops an unknown label."),
+            "{section:?}"
+        );
+        assert!(
+            section.find("## You are working as alice") < section.find(MEMORY_HEADER),
+            "memory still renders AFTER the identity header (§0.11.6): {section:?}"
+        );
+    }
+
+    /// **Re-grounding is unchanged** (§5.2 as corrected by §0.11.3): a prefetched
+    /// fact re-grounds against the in-memory candidate map at render, with the
+    /// same flags a local fact gets. The composer must not know or care which
+    /// backend produced the facts.
+    #[test]
+    fn a_prefetched_fact_re_grounds_exactly_like_a_local_one() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, _store) = orch_with_teams(teams);
+        attach_prefetch(
+            &mut o,
+            "alice",
+            "MT-1",
+            vec![
+                remote_fact("MT-9", "MT-9 rust work was subtle."),
+                remote_fact("MT-42", "MT-42 rust work is finished."),
+            ],
+        );
+        o.record_issue_states([issue("9", "MT-9", "In Progress")].iter());
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert!(
+            section.contains("MT-9 (ticket now: In Progress)"),
+            "{section:?}"
+        );
+        assert!(
+            section.contains(&format!("MT-42 ({NOT_RE_VERIFIED})")),
+            "a ticket the map cannot see is still FLAGGED, not dropped: {section:?}"
+        );
+    }
+
+    /// **The cold-cache acceptance criterion.** A miss dispatches with no memory
+    /// section and the run proceeds — and the section is byte-identical to the
+    /// one the same dispatch produces with no memory configured at all.
+    #[test]
+    fn a_cold_cache_dispatches_with_no_memory_section() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+
+        let (mut cold, _s1) = orch_with_teams(teams.clone());
+        // A cache that holds facts for a DIFFERENT ticket: present, fresh, and
+        // still a miss — a hit is per (identity, ticket).
+        attach_prefetch(
+            &mut cold,
+            "alice",
+            "MT-999",
+            vec![remote_fact("MT-9", "not for this ticket")],
+        );
+        cold.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let with_cold_cache = cold.running["1"].teammate_section.clone();
+
+        let (mut none, _s2) = orch_with_teams(teams);
+        none.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let with_no_memory = none.running["1"].teammate_section.clone();
+
+        assert_eq!(
+            with_cold_cache, with_no_memory,
+            "a cold cache degrades to exactly what `backend: none` gives"
+        );
+        assert!(
+            !with_cold_cache.contains(MEMORY_HEADER),
+            "and renders no memory section at all: {with_cold_cache:?}"
+        );
+        assert_eq!(
+            cold.running["1"].identity, "alice",
+            "the run still dispatched, to the same teammate"
+        );
+    }
+
+    /// A stale entry is a miss too: a fact set past the TTL has had time to be
+    /// invalidated, and rendering it would undo the correction someone made.
+    #[test]
+    fn a_stale_entry_dispatches_with_no_memory_section() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, _store) = orch_with_teams(teams);
+        let cache = Arc::new(crate::teamsprefetch::PrefetchCache::new());
+        let then = (o.now)()
+            - chrono::Duration::from_std(crate::teamsprefetch::PREFETCH_TTL).expect("ttl")
+            - chrono::Duration::seconds(1);
+        cache.replace(
+            vec![(
+                crate::teamsprefetch::PrefetchKey::new("alice", "MT-1"),
+                vec![remote_fact("MT-9", "old news")],
+            )],
+            then,
+        );
+        o.teams_prefetch = Some(cache);
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let section = o.running["1"].teammate_section.clone();
+        assert!(!section.contains(MEMORY_HEADER), "{section:?}");
+        assert!(
+            section.contains("## You are working as alice"),
+            "{section:?}"
+        );
+    }
+
+    /// The other backends are untouched: with no cache installed — which is
+    /// `local`, `none` and Teams off — the dispatch path reaches exactly the code
+    /// it reached before T8.
+    #[test]
+    fn no_cache_installed_is_the_pre_t8_path() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, _store) = orch_with_teams(teams);
+        assert!(o.teams_prefetch.is_none());
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        assert!(
+            !o.running["1"].teammate_section.contains(MEMORY_HEADER),
+            "{:?}",
+            o.running["1"].teammate_section
         );
     }
 
