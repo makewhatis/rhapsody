@@ -63,6 +63,7 @@ pub mod snapshot_json;
 pub mod stop;
 pub mod teams;
 pub mod telemetry_attrs;
+pub mod triage;
 pub mod warnings;
 pub mod worker;
 pub mod workspace_gc;
@@ -95,6 +96,10 @@ pub use snapshot::{
     ProjectStatus, RateLimit, RefreshResult, RetryRow, RunningRow, Snapshot, TokenCounts,
 };
 pub use stop::{ControlHandle, ResumeResult, StopError, StopResult};
+pub use triage::{
+    ClaudeTriageArbiter, MAX_TRIAGE_BACKOFF_MS, TRIAGE_INTERVAL, TriageArbiter, TriageDecision,
+    TriageDeps, TriageRequest, TriageTarget, run_triage_schedule, triage_enabled,
+};
 pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
 pub use workspace_gc::WorkspaceGcPlan;
 

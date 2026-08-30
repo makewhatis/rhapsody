@@ -144,7 +144,8 @@ pub(crate) fn scrub_child_env(
 }
 
 /// The current process environment as `KEY=VALUE` strings (mirrors the runner's `base_env` capture).
-fn process_env() -> Vec<String> {
+/// Shared with [`crate::triage`], whose model turn scrubs the same environment for the same reason.
+pub(crate) fn process_env() -> Vec<String> {
     std::env::vars_os()
         .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
         .collect()

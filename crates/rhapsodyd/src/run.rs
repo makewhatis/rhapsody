@@ -146,8 +146,9 @@ where
     // on-disk store home (--no-store / off / :memory:) leaves the field `None`. STUDIO-643 makes
     // `dispatch_issue` its first consumer (routing); the profiles directory is resolved alongside so
     // a routed identity's profile can be rendered into the turn-1 prompt.
+    let mut teams_cfg = rhapsody_config::teams::Teams::disabled();
     if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
-        o.teams = Some(match rhapsody_config::teams::Teams::try_load(&teams_path) {
+        teams_cfg = match rhapsody_config::teams::Teams::try_load(&teams_path) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
@@ -157,7 +158,8 @@ where
                 );
                 rhapsody_config::teams::Teams::disabled()
             }
-        });
+        };
+        o.teams = Some(teams_cfg.clone());
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
@@ -269,6 +271,45 @@ where
         crate::prune::run_prune_schedule(prune_ctx, sf, rf, pw, rl).await;
     });
 
+    // --- Rhapsody Teams triage (STUDIO-644, slice T3b; design record
+    // ~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md, §0.11.2) ---
+    //
+    // The one model turn the Teams design accepts runs HERE — an off-loop background task beside the
+    // prune scheduler, on its own cadence, never on the control task. §0.11.2 moved it here after the
+    // adversarial review found a model call inside `dispatch_issue` to be the STUDIO-551 head-of-line
+    // class: up to `manager.timeout_ms` of stall per unrouted pick, per tick, with no breaker.
+    //
+    // `spawn_triage` is the whole gate: `manager.mode: labels`, `mode: off`, an empty roster or Teams
+    // disabled spawn NOTHING, so those configurations have no task that could have a behaviour delta.
+    // `install_probe` additionally holds it back in the hermetic daemon tests, which must never shell
+    // out to a real `claude` — the same reason it gates the BO-59 credential probe above.
+    let triage_task = if spawn_triage(install_probe, &teams_cfg) {
+        let triage_ctx = shutdown.wait();
+        let triage_handle = handle.clone();
+        let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
+        let deps = rhapsody_orchestrator::TriageDeps {
+            teams: Arc::new(teams_cfg),
+            // Read lazily each cycle, exactly as the prune scheduler reads its store handle: the
+            // handle is built before the first reload, so the tracker arrives later.
+            target: move || {
+                triage_handle
+                    .reads_tracker()
+                    .map(|tracker| rhapsody_orchestrator::TriageTarget { tracker })
+            },
+            arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
+            agent_command: command,
+            billing_guard,
+            tracker_api_key,
+            interval: rhapsody_orchestrator::TRIAGE_INTERVAL,
+            max_backoff_ms: rhapsody_orchestrator::MAX_TRIAGE_BACKOFF_MS,
+        };
+        Some(tokio::spawn(async move {
+            rhapsody_orchestrator::run_triage_schedule(triage_ctx, deps).await;
+        }))
+    } else {
+        None
+    };
+
     // --- run the control loop until ctx is cancelled ---
     let run_err = o.run(ctx.clone()).await;
 
@@ -277,6 +318,13 @@ where
     shutdown.cancel();
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
+    // The triage task is cancelled by the same signal, and checks it between model turns as well as
+    // between cycles. The wait is still BOUNDED: a turn already in flight can take up to
+    // `manager.timeout_ms`, and a shutdown must never be held open by one — `kill_on_drop` reaps the
+    // child when the runtime tears the task down.
+    if let Some(t) = triage_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
     // Drain the observability server (bounded, mirroring Go's 5s Shutdown ctx).
     if let Some(t) = server_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
@@ -464,6 +512,41 @@ fn report_profile_issues(teams: Option<&rhapsody_config::teams::Teams>, teams_pa
             profiles = %drifted.join("; "),
             "teams profiles are pinned behind their built-in; run `rhapsodyd teams show <name>` to see the resolved prompt (reported, never merged)"
         );
+    }
+}
+
+/// Whether this boot spawns the Teams triage task (STUDIO-644) — the composition-root gate, named
+/// so it is testable at exactly the predicate `run` calls.
+///
+/// Two conditions, and both are "spawn NOTHING", not "spawn something inert":
+///
+/// * [`triage_enabled`](rhapsody_orchestrator::triage_enabled) — the design's own gate (§0.11.2):
+///   Teams enabled, `manager.mode: labels+model`, and a non-empty roster. `mode: labels`, `mode:
+///   off` and Teams-off therefore have zero behaviour delta by construction; there is no task to
+///   have one.
+/// * `install_probe` — false in the hermetic daemon tests, which must never shell out to a real
+///   `claude`. The BO-59 credential probe is held back by the same flag for the same reason.
+fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> bool {
+    install_probe && rhapsody_orchestrator::triage_enabled(teams)
+}
+
+/// The claude command, effective billing guard and tracker credential the Teams triage turn runs
+/// under (STUDIO-644). Read from the boot-resolved config, alongside `teams.yaml` itself: this
+/// slice does not hot-reload Teams config, so its model-turn inputs are boot-scoped too. A daemon
+/// with no readable workflow falls back to the same defaults the runner would apply — an empty
+/// command means the runner's own `claude` default, and an absent `billing_guard` is on.
+fn triage_agent_env(cfg: Option<&Config>) -> (String, bool, String) {
+    match cfg {
+        Some(c) => (
+            c.claude.command.clone(),
+            rhapsody_agent::claude::billing_guard_enabled(c.claude.billing_guard),
+            c.tracker.api_key.clone(),
+        ),
+        None => (
+            String::new(),
+            rhapsody_agent::claude::billing_guard_enabled(None),
+            String::new(),
+        ),
     }
 }
 
@@ -796,6 +879,80 @@ mod tests {
         assert!(
             !dir.child("teams.yaml").exists(),
             "teams.yaml must NEVER be seeded: an absent file is Teams' off state and shipped state"
+        );
+    }
+
+    // STUDIO-644 (Teams T3b), design §0.11.2 and the slice's first acceptance criterion: the triage
+    // task — the ONLY thing in the daemon that can call a model outside a dispatched run — spawns
+    // for `labels+model` and for nothing else. This is the exact predicate `run` gates the spawn on,
+    // so `mode: labels` / `mode: off` / Teams-off provably have no task at all, rather than a task
+    // that returns early.
+    #[test]
+    fn spawn_triage_only_for_labels_plus_model_in_production() {
+        use rhapsody_config::teams::{Identity, ManagerMode, Teams};
+
+        let with_mode = |mode: ManagerMode, enabled: bool| Teams {
+            enabled,
+            manager: rhapsody_config::teams::Manager {
+                mode,
+                ..Default::default()
+            },
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Default::default()
+            }],
+            ..Teams::disabled()
+        };
+
+        assert!(spawn_triage(
+            true,
+            &with_mode(ManagerMode::LabelsModel, true)
+        ));
+        assert!(
+            !spawn_triage(true, &with_mode(ManagerMode::Labels, true)),
+            "`mode: labels` must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(true, &with_mode(ManagerMode::Off, true)),
+            "`mode: off` must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(true, &with_mode(ManagerMode::LabelsModel, false)),
+            "Teams off must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(true, &Teams::disabled()),
+            "the shipped state must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(false, &with_mode(ManagerMode::LabelsModel, true)),
+            "the hermetic daemon tests must never spawn a task that shells out to claude"
+        );
+    }
+
+    // STUDIO-644: a `labels+model` teams.yaml boots and stops cleanly. The triage wiring sits beside
+    // the prune scheduler in the boot path, so a mistake there would show up as a hang or a non-zero
+    // exit rather than as a failing unit test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_starts_cleanly_with_a_labels_plus_model_teams_yaml() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nmanager:\n  mode: labels+model\nroster:\n  - name: alice\n    labels: [rust]\n",
+        )
+        .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "daemon should exit 0 on cancel; stderr={}",
+            buf.contents()
         );
     }
 

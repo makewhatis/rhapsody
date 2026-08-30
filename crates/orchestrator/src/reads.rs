@@ -101,6 +101,17 @@ impl ControlHandle {
     pub async fn connected_viewer(&self) -> (Identity, Option<TrackerError>) {
         connected_viewer_from(&self.reads).await
     }
+
+    /// The account-level tracker captured by the most recent config load, or `None` before the
+    /// first one (STUDIO-644). It reads the SAME shared reads cell as the surfaces above, so a
+    /// hot-reload is reflected without the caller round-tripping the control channel.
+    ///
+    /// It exists for the off-loop Teams triage task, which is spawned at the composition root
+    /// BEFORE the daemon's first reload and needs a tracker each cycle rather than once. Cloning
+    /// the handle out releases the lock immediately — it is never held across the caller's `await`.
+    pub fn reads_tracker(&self) -> Option<Arc<dyn Tracker>> {
+        reads_snapshot(&self.reads).0
+    }
 }
 
 /// Snapshots the current tracker handle + key from a shared reads cell (Go `readsTarget`). Clones the
