@@ -12,11 +12,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use chrono::Utc;
 use rhapsody_agent::LogEntry;
 use rhapsody_config::workflow::Definition;
 use rhapsody_core::Project;
 use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
+};
+use rhapsody_orchestrator::teamsmemory::{
+    InvalidateView, RecallView, RetainView, RosterView, TeamsMemory, TeamsMemoryError,
 };
 use rhapsody_orchestrator::{
     CancelWait, ControlHandle, HandoffResult, Identity, ReadsError, RefreshResult, ReloadError,
@@ -176,6 +180,53 @@ impl StateProvider for DaemonState {
         // task (BO-12). Until then the endpoint honestly serves `[]` rather than re-reading + seeding
         // the file from an HTTP read handler; wiring here becomes a one-line delegate to the handle.
         None
+    }
+
+    /// The four Rhapsody Teams memory surfaces (STUDIO-645, T4). Each delegates straight to the
+    /// `Arc`-shared [`TeamsMemory`] the control handle carries, so the request is served **entirely
+    /// on this HTTP task**: no control-channel round-trip, and therefore no way for a `teams_retain`
+    /// to sit behind whatever the current tick is doing (§5.1 — "never blocking the control task").
+    ///
+    /// `None` — a daemon with no Teams runtime at all — is `teams_disabled`, the same answer a
+    /// daemon with `enabled: false` gives.
+    async fn teams_roster(&self) -> Result<RosterView, TeamsMemoryError> {
+        self.teams_memory()?.roster()
+    }
+
+    async fn teams_recall(
+        &self,
+        identity: &str,
+        query: &str,
+    ) -> Result<RecallView, TeamsMemoryError> {
+        self.teams_memory()?.recall(identity, query).await
+    }
+
+    async fn teams_invalidate(
+        &self,
+        identity: &str,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<InvalidateView, TeamsMemoryError> {
+        self.teams_memory()?
+            .invalidate(identity, fact_id, reason)
+            .await
+    }
+
+    async fn teams_retain(
+        &self,
+        run_id: i64,
+        content: &str,
+    ) -> Result<RetainView, TeamsMemoryError> {
+        self.teams_memory()?
+            .retain_for_run(run_id, content, Utc::now())
+            .await
+    }
+}
+
+impl DaemonState {
+    /// The shared Teams memory runtime, or [`TeamsMemoryError::Disabled`] when the daemon has none.
+    fn teams_memory(&self) -> Result<&Arc<TeamsMemory>, TeamsMemoryError> {
+        self.handle.teams_memory().ok_or(TeamsMemoryError::Disabled)
     }
 }
 

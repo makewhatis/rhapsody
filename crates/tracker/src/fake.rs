@@ -53,6 +53,14 @@ pub struct AssignCall {
     pub assignee_id: String,
 }
 
+/// One [`Tracker::add_issue_label`] invocation (STUDIO-644).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddLabelCall {
+    pub issue_id: String,
+    pub team_id: String,
+    pub label_name: String,
+}
+
 /// A programmable [`Tracker::fetch_issue_states_by_ids`] override (lets tests vary results per
 /// call, e.g. active-then-inactive). Takes precedence over `by_id`/`by_id_err` when set.
 type StatesByIdsFn = Box<dyn Fn(&[String]) -> Result<Vec<Issue>, TrackerError> + Send + Sync>;
@@ -122,6 +130,19 @@ pub struct Fake {
     pub assignee_err: Option<TrackerError>,
     pub delete_comment_err: Option<TrackerError>,
 
+    /// The programmable `fetch_open_issues_by_labels` result — the per-identity load read
+    /// (STUDIO-644). Returned verbatim (no filtering), so a test states the load it wants;
+    /// `open_by_labels_err`, when set, is returned instead. `add_issue_label` APPENDS to this so a
+    /// label the fake just wrote is visible to the next load read.
+    pub open_by_labels: Vec<Issue>,
+    pub open_by_labels_err: Option<TrackerError>,
+    /// When set, returned by `add_issue_label` (the call is still recorded).
+    pub add_label_err: Option<TrackerError>,
+    /// When set, `add_issue_label` AWAITS this gate (until it carries `true`) before it returns —
+    /// the async stand-in for a slow Linear write, so a test can park the triage task inside its
+    /// one label write and observe that dispatch is unaffected.
+    pub add_label_gate: Option<tokio::sync::watch::Receiver<bool>>,
+
     /// When it has an entry for an issue, forces `fetch_issue_assignee` to return that value
     /// regardless of `assign_issue` — used to simulate a concurrent daemon that won the assign
     /// race (lose-on-read-back).
@@ -143,6 +164,11 @@ struct Inner {
     create_comment_calls: Vec<CommentCall>,
     assign_calls: Vec<AssignCall>,
     delete_comment_calls: Vec<String>,
+    add_label_calls: Vec<AddLabelCall>,
+    open_by_labels_calls: usize,
+    /// Issues `add_issue_label` has written a label onto, keyed by issue id, so the load read sees
+    /// the fake's own writes (STUDIO-644).
+    labelled: HashMap<String, Issue>,
     list_comments_calls: usize,
     assignee_calls: usize,
     candidate_calls: usize,
@@ -228,6 +254,14 @@ impl Fake {
     /// Every `delete_comment` id, in order.
     pub fn delete_comment_calls(&self) -> Vec<String> {
         self.lock().delete_comment_calls.clone()
+    }
+    /// Every `add_issue_label` invocation, in order (STUDIO-644).
+    pub fn add_label_calls(&self) -> Vec<AddLabelCall> {
+        self.lock().add_label_calls.clone()
+    }
+    /// Number of `fetch_open_issues_by_labels` calls (STUDIO-644).
+    pub fn open_by_labels_calls(&self) -> usize {
+        self.lock().open_by_labels_calls
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -442,6 +476,94 @@ impl Tracker for Fake {
             }
         }
         Ok(())
+    }
+
+    /// Records the label write and applies it to the in-memory issues (STUDIO-644). Strictly
+    /// additive and idempotent, exactly as the trait requires — the fake would otherwise let a
+    /// caller that violates the contract pass its tests. `add_label_err`, when set, is returned
+    /// after the call is recorded; `add_label_gate`, when set, parks the call first.
+    async fn add_issue_label(
+        &self,
+        issue_id: &str,
+        team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError> {
+        self.lock().add_label_calls.push(AddLabelCall {
+            issue_id: issue_id.to_string(),
+            team_id: team_id.to_string(),
+            label_name: label_name.to_string(),
+        });
+        if let Some(gate) = &self.add_label_gate {
+            let mut gate = gate.clone();
+            // The `borrow()` guard is dropped before each `await`; a dropped sender (`Err`) opens
+            // the gate rather than parking forever, so a test that forgets to release cannot wedge.
+            while !*gate.borrow() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        if let Some(e) = &self.add_label_err {
+            return Err(e.clone());
+        }
+        let mut inner = self.lock();
+        for iss in inner.labelled.values_mut() {
+            if iss.id != issue_id {
+                continue;
+            }
+            let labels = iss.labels.get_or_insert_with(Vec::new);
+            if !labels.iter().any(|l| l.eq_ignore_ascii_case(label_name)) {
+                labels.push(label_name.to_string());
+            }
+            return Ok(());
+        }
+        inner.labelled.insert(
+            issue_id.to_string(),
+            Issue {
+                id: issue_id.to_string(),
+                identifier: issue_id.to_string(),
+                team_id: team_id.to_string(),
+                labels: Some(vec![label_name.to_string()]),
+                ..Issue::default()
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns the programmed `open_by_labels` plus every issue `add_issue_label` has labelled,
+    /// filtered to those carrying one of `label_names` (STUDIO-644). An empty slice returns an
+    /// empty result WITHOUT recording a call, mirroring the real adapters' no-API-call contract.
+    async fn fetch_open_issues_by_labels(
+        &self,
+        label_names: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        if label_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut inner = self.lock();
+        inner.open_by_labels_calls += 1;
+        if let Some(e) = &self.open_by_labels_err {
+            return Err(e.clone());
+        }
+        let carries = |iss: &Issue| {
+            iss.labels
+                .iter()
+                .flatten()
+                .any(|l| label_names.iter().any(|w| w.eq_ignore_ascii_case(l)))
+        };
+        let mut out: Vec<Issue> = self
+            .open_by_labels
+            .iter()
+            .filter(|iss| carries(iss))
+            .cloned()
+            .collect();
+        let seen: Vec<String> = out.iter().map(|i| i.id.clone()).collect();
+        for iss in inner.labelled.values() {
+            if carries(iss) && !seen.contains(&iss.id) {
+                out.push(iss.clone());
+            }
+        }
+        Ok(out)
     }
 }
 

@@ -30,8 +30,9 @@ use rhapsody_telemetry as telemetry;
 use rhapsody_tracker as tracker;
 
 use crate::bootcfg::{
-    assignee_label, banner_color_enabled, open_store, resolve_banner_data,
-    resolve_capabilities_path, resolve_server_port, workflow_dir,
+    assignee_label, banner_color_enabled, open_store, resolve_banks_dir, resolve_banner_data,
+    resolve_capabilities_path, resolve_profiles_dir, resolve_server_port, resolve_teams_path,
+    workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -44,8 +45,16 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// Returns the process exit code (Go's `run` `int`): `0` on a clean shutdown, `1` on a fatal boot /
 /// run error, `2` on a flag-parse error. `stderr` is any `MakeWriter` (the binary passes
 /// `std::io::stderr`; tests pass a capture buffer); `is_terminal` reports whether that stream is a
-/// TTY (for the banner's ANSI-color decision). Mirrors Go `run`.
-pub async fn run<W>(ctx: CancelWait, args: &[String], stderr: W, is_terminal: bool) -> i32
+/// TTY (for the banner's ANSI-color decision). `install_probe` installs the production dispatch
+/// credential-liveness probe (BO-59) — `true` for the real binary, `false` for the hermetic daemon
+/// tests, which must not shell out to a real `claude`. Mirrors Go `run`.
+pub async fn run<W>(
+    ctx: CancelWait,
+    args: &[String],
+    stderr: W,
+    is_terminal: bool,
+    install_probe: bool,
+) -> i32
 where
     W: for<'a> MakeWriter<'a> + Clone + Send + Sync + 'static,
 {
@@ -54,6 +63,15 @@ where
     // `rhapsodyd <workflow>` behaves identically. Mirrors Go `run`'s `args[0] == "mcp"` branch.
     if args.first().map(String::as_str) == Some("mcp") {
         return crate::mcp::run_mcp(ctx, &args[1..], stderr).await;
+    }
+
+    // `rhapsodyd teams <show|fork> <name>` inspects and forks Rhapsody Teams profiles instead of
+    // running the daemon (STUDIO-642; design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`,
+    // §4). Dispatched here for the same reason `mcp` is: the daemon's run-lock and flag parsing stay
+    // untouched, and `rhapsodyd <workflow>` behaves identically. Rhapsody-only — Go v0.4.0 has no
+    // Teams feature and therefore no counterpart verb.
+    if args.first().map(String::as_str) == Some("teams") {
+        return crate::teams::run_teams(&args[1..], std::io::stdout(), stderr.make_writer());
     }
 
     let flags = match parse_flags(args) {
@@ -120,6 +138,53 @@ where
             ),
         }
     }
+    // Load the Rhapsody Teams config (~/.rhapsody/teams.yaml, colocated with the durable store) and
+    // inject it before Run (STUDIO-639; design record ~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md).
+    // Best-effort, and NEVER seeded: an absent file is the off state and the shipped state (§2.1), so
+    // unlike the capabilities registry above this never creates the file it reads. A malformed or
+    // invalid file yields `Teams::disabled()` plus ONE loud log line — never a startup failure. No
+    // on-disk store home (--no-store / off / :memory:) leaves the field `None`. STUDIO-643 makes
+    // `dispatch_issue` its first consumer (routing); the profiles directory is resolved alongside so
+    // a routed identity's profile can be rendered into the turn-1 prompt.
+    let mut teams_cfg = rhapsody_config::teams::Teams::disabled();
+    if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
+        teams_cfg = match rhapsody_config::teams::Teams::try_load(&teams_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    path = %teams_path.display(),
+                    "teams config load failed; teams disabled"
+                );
+                rhapsody_config::teams::Teams::disabled()
+            }
+        };
+        o.teams = Some(teams_cfg.clone());
+        o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
+        report_profile_issues(o.teams.as_ref(), &teams_path);
+        report_inert_manager(o.teams.as_ref());
+        // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
+        // types, and the difference is the design:
+        //
+        // * `teams_bank` is the CONCRETE `LocalBank` the dispatch path recalls from. It is `Some`
+        //   only for `backend: local`, so a remote backend cannot end up on the control task —
+        //   `dispatch_issue` is `fn` and could not await one anyway (§5.2's hard rule).
+        // * `teams_memory` is the `dyn MemoryBackend` the OFF-LOOP `/api/v1/teams/*` handlers drive.
+        //
+        // Neither creates anything: the banks directory appears on the first `retain` (§2.1).
+        install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags);
+    }
+    // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
+    // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
+    // dispatched children get, so a dead agent credential (e.g. an expired Claude OAuth login) skips
+    // dispatch WITHOUT claiming — an infrastructure fault fails fast instead of claim→dispatch→die every
+    // ~5 min. Gated off for the hermetic daemon tests, which must not shell out to a real `claude`.
+    if install_probe {
+        o.set_credential_probe(std::sync::Arc::new(
+            rhapsody_orchestrator::ClaudeCredentialProbe,
+        ));
+    }
+
     // Install the lifetime ctx BEFORE snapshotting the off-loop handle, so the handle's stop/resume/
     // message reply-waits are bounded by the real ctx (not the never-cancelling default). `Run`
     // re-sets the same ctx below.
@@ -216,6 +281,45 @@ where
         crate::prune::run_prune_schedule(prune_ctx, sf, rf, pw, rl).await;
     });
 
+    // --- Rhapsody Teams triage (STUDIO-644, slice T3b; design record
+    // ~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md, §0.11.2) ---
+    //
+    // The one model turn the Teams design accepts runs HERE — an off-loop background task beside the
+    // prune scheduler, on its own cadence, never on the control task. §0.11.2 moved it here after the
+    // adversarial review found a model call inside `dispatch_issue` to be the STUDIO-551 head-of-line
+    // class: up to `manager.timeout_ms` of stall per unrouted pick, per tick, with no breaker.
+    //
+    // `spawn_triage` is the whole gate: `manager.mode: labels`, `mode: off`, an empty roster or Teams
+    // disabled spawn NOTHING, so those configurations have no task that could have a behaviour delta.
+    // `install_probe` additionally holds it back in the hermetic daemon tests, which must never shell
+    // out to a real `claude` — the same reason it gates the BO-59 credential probe above.
+    let triage_task = if spawn_triage(install_probe, &teams_cfg) {
+        let triage_ctx = shutdown.wait();
+        let triage_handle = handle.clone();
+        let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
+        let deps = rhapsody_orchestrator::TriageDeps {
+            teams: Arc::new(teams_cfg),
+            // Read lazily each cycle, exactly as the prune scheduler reads its store handle: the
+            // handle is built before the first reload, so the tracker arrives later.
+            target: move || {
+                triage_handle
+                    .reads_tracker()
+                    .map(|tracker| rhapsody_orchestrator::TriageTarget { tracker })
+            },
+            arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
+            agent_command: command,
+            billing_guard,
+            tracker_api_key,
+            interval: rhapsody_orchestrator::TRIAGE_INTERVAL,
+            max_backoff_ms: rhapsody_orchestrator::MAX_TRIAGE_BACKOFF_MS,
+        };
+        Some(tokio::spawn(async move {
+            rhapsody_orchestrator::run_triage_schedule(triage_ctx, deps).await;
+        }))
+    } else {
+        None
+    };
+
     // --- run the control loop until ctx is cancelled ---
     let run_err = o.run(ctx.clone()).await;
 
@@ -224,6 +328,13 @@ where
     shutdown.cancel();
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
+    // The triage task is cancelled by the same signal, and checks it between model turns as well as
+    // between cycles. The wait is still BOUNDED: a turn already in flight can take up to
+    // `manager.timeout_ms`, and a shutdown must never be held open by one — `kill_on_drop` reaps the
+    // child when the runtime tears the task down.
+    if let Some(t) = triage_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
     // Drain the observability server (bounded, mirroring Go's 5s Shutdown ctx).
     if let Some(t) = server_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
@@ -370,6 +481,161 @@ fn resolve_boot_otel(path: &Path) -> telemetry::Config {
 
 /// Loads + decodes + resolves the workflow config for the store-open path (`None` on any failure, so
 /// the store falls back to Noop and Run's reload reports the error).
+/// Reports what an operator needs to know about the roster's profiles at boot, in ONE warning line
+/// per category (STUDIO-642; design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §4):
+///
+///   * a roster entry naming a profile that does not resolve — the "broken agent discovered at
+///     dispatch time" §4 exists to prevent, reported here per T1's disable-loudly semantics;
+///   * a PINNED profile whose built-in has moved on. §4 is explicit that drift is **reported, never
+///     merged**: nothing here rewrites a user's file, and nothing silently upgrades a pin.
+///
+/// Read-only and never seeding: the profiles directory sits beside `teams.yaml`, and an absent one
+/// simply means every profile resolves to its built-in.
+fn report_profile_issues(teams: Option<&rhapsody_config::teams::Teams>, teams_path: &Path) {
+    let Some(teams) = teams.filter(|t| !t.roster.is_empty()) else {
+        return;
+    };
+    let Some(dir) = teams_path
+        .parent()
+        .map(|d| d.join("teams").join("profiles"))
+    else {
+        return;
+    };
+    let (mut broken, mut drifted) = (Vec::new(), Vec::new());
+    for issue in rhapsody_config::profiles::check_roster(teams, &dir) {
+        match issue {
+            i @ rhapsody_config::profiles::RosterIssue::Unresolvable { .. } => {
+                broken.push(i.to_string())
+            }
+            i @ rhapsody_config::profiles::RosterIssue::Drift { .. } => drifted.push(i.to_string()),
+        }
+    }
+    if !broken.is_empty() {
+        tracing::warn!(
+            profiles = %broken.join("; "),
+            dir = %dir.display(),
+            "teams roster names profiles that do not resolve; those identities have no prompt"
+        );
+    }
+    if !drifted.is_empty() {
+        tracing::warn!(
+            profiles = %drifted.join("; "),
+            "teams profiles are pinned behind their built-in; run `rhapsodyd teams show <name>` to see the resolved prompt (reported, never merged)"
+        );
+    }
+}
+
+/// Whether this boot spawns the Teams triage task (STUDIO-644) — the composition-root gate, named
+/// so it is testable at exactly the predicate `run` calls.
+///
+/// Two conditions, and both are "spawn NOTHING", not "spawn something inert":
+///
+/// * [`triage_enabled`](rhapsody_orchestrator::triage_enabled) — the design's own gate (§0.11.2):
+///   Teams enabled, `manager.mode: labels+model`, and a non-empty roster. `mode: labels`, `mode:
+///   off` and Teams-off therefore have zero behaviour delta by construction; there is no task to
+///   have one.
+/// * `install_probe` — false in the hermetic daemon tests, which must never shell out to a real
+///   `claude`. The BO-59 credential probe is held back by the same flag for the same reason.
+fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> bool {
+    install_probe && rhapsody_orchestrator::triage_enabled(teams)
+}
+
+/// The claude command, effective billing guard and tracker credential the Teams triage turn runs
+/// under (STUDIO-644). Read from the boot-resolved config, alongside `teams.yaml` itself: this
+/// slice does not hot-reload Teams config, so its model-turn inputs are boot-scoped too. A daemon
+/// with no readable workflow falls back to the same defaults the runner would apply — an empty
+/// command means the runner's own `claude` default, and an absent `billing_guard` is on.
+fn triage_agent_env(cfg: Option<&Config>) -> (String, bool, String) {
+    match cfg {
+        Some(c) => (
+            c.claude.command.clone(),
+            rhapsody_agent::claude::billing_guard_enabled(c.claude.billing_guard),
+            c.tracker.api_key.clone(),
+        ),
+        None => (
+            String::new(),
+            rhapsody_agent::claude::billing_guard_enabled(None),
+            String::new(),
+        ),
+    }
+}
+
+/// §3.5's named startup warning: `enabled: true` with `manager.mode: off` and NO
+/// `default_identity` is "behaviour identical to `enabled: false`" — nothing routes and nothing is
+/// prepended. That is a real combination to reach by half-editing a file, and the design says it is
+/// "worth a startup warning rather than a silent no-op" (STUDIO-643; design record
+/// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §3.5).
+///
+/// `mode: off` WITH a `default_identity` is the opposite — single-identity Teams, "probably the right
+/// first thing to try" — so it is deliberately not warned about.
+/// Builds and installs the Teams memory handles (STUDIO-645, T4). A no-op when Teams is off — no
+/// backend is constructed, no path is resolved, nothing is created (§2.4 row 8: "there is no code
+/// path").
+fn install_teams_memory(
+    o: &mut rhapsody_orchestrator::Orchestrator,
+    teams_cfg: &rhapsody_config::teams::Teams,
+    resolved: Option<&rhapsody_config::Config>,
+    flags: &Flags,
+) {
+    use rhapsody_config::memory::{LocalBank, MemoryBackend, NoneBackend};
+    use rhapsody_config::teams::MemoryBackend as BackendKind;
+
+    if !teams_cfg.enabled {
+        return;
+    }
+    let banks = resolve_banks_dir(resolved, &teams_cfg.memory.path, &flags.db, flags.no_store);
+    let bank = match (teams_cfg.memory.backend, banks) {
+        (BackendKind::Local, Some(dir)) => Some(Arc::new(
+            LocalBank::new(dir, teams_cfg.memory.bank_prefix.clone()).with_bank_overrides(
+                teams_cfg
+                    .roster
+                    .iter()
+                    .map(|i| (i.name.clone(), i.bank.clone())),
+            ),
+        )),
+        (BackendKind::Local, None) => {
+            tracing::warn!(
+                "teams memory: backend is `local` but there is no on-disk runtime home to anchor \
+                 banks to (storage off / in-memory); memory is disabled for this daemon"
+            );
+            None
+        }
+        (BackendKind::Hindsight, _) => {
+            tracing::warn!(
+                "teams memory: backend `hindsight` is not implemented yet (slice T8, blocked on \
+                 STUDIO-629's tailnet exposure); running with no memory. Set `memory.backend: \
+                 local` for on-disk banks."
+            );
+            None
+        }
+        (BackendKind::None, _) => None,
+    };
+    // The dispatch path only ever sees a LOCAL bank; `none` and `hindsight` leave it `None`, and
+    // the turn-1 prompt is then byte-identical to T3a's.
+    o.teams_bank = bank.as_ref().map(Arc::clone);
+    let backend: Arc<dyn MemoryBackend> = match &bank {
+        Some(b) => Arc::clone(b) as Arc<dyn MemoryBackend>,
+        None => Arc::new(NoneBackend),
+    };
+    o.teams_memory = Some(Arc::new(
+        rhapsody_orchestrator::teamsmemory::TeamsMemory::new(Arc::new(teams_cfg.clone()), backend),
+    ));
+}
+
+fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    if teams.enabled
+        && teams.manager.mode == rhapsody_config::teams::ManagerMode::Off
+        && teams.manager.default_identity.is_empty()
+    {
+        tracing::warn!(
+            "teams is enabled but manager.mode is `off` with no manager.default_identity: nothing \
+             will route and no teammate section will be prepended, which is exactly the behaviour \
+             of `enabled: false`. Set manager.default_identity to run every ticket as one teammate."
+        );
+    }
+}
+
 fn load_resolved(path: &Path) -> Option<Config> {
     let def = workflow::load(path).ok()?;
     let cfg = decode(&def).ok()?;
@@ -489,7 +755,7 @@ mod tests {
         let ctx = signal.wait();
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let buf = buf.clone();
-        let handle = tokio::spawn(async move { run(ctx, &argv, buf, false).await });
+        let handle = tokio::spawn(async move { run(ctx, &argv, buf, false, false).await });
         tokio::time::sleep(Duration::from_millis(250)).await;
         signal.cancel();
         tokio::time::timeout(Duration::from_secs(5), handle)
@@ -502,7 +768,7 @@ mod tests {
     async fn run_now(args: &[&str], buf: &SharedBuf) -> i32 {
         let signal = CancelSignal::new();
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        run(signal.wait(), &argv, buf.clone(), false).await
+        run(signal.wait(), &argv, buf.clone(), false, false).await
     }
 
     // Mirrors Go `TestRunStartsDaemonAndStopsCleanly` (storage forced off to stay hermetic — the
@@ -644,6 +910,259 @@ mod tests {
         assert!(
             !dir.child("ws").join("symphony.db").exists(),
             "storage.path: off must not create a symphony.db file"
+        );
+    }
+
+    // STUDIO-639 (Teams T1), design §2.1: a `teams.yaml` that is NOT there stays not there. This is
+    // the deliberate divergence from the `capabilities.yaml` precedent — `load_or_seed` writes its
+    // file on first read, and a disabled feature must not. The test boots the real daemon against an
+    // on-disk store so BOTH sidecar paths resolve into the same temp dir, then asserts the asymmetry
+    // directly: capabilities.yaml appears (proving the path resolution really reached this dir and the
+    // test is not vacuous), teams.yaml does not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_seeds_capabilities_but_never_seeds_teams_yaml() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "daemon should exit 0 on cancel; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            dir.child("capabilities.yaml").exists(),
+            "the capabilities registry IS seeded beside the store — if this fails the sidecar path \
+             never resolved here and the teams.yaml assertion below proves nothing"
+        );
+        assert!(
+            !dir.child("teams.yaml").exists(),
+            "teams.yaml must NEVER be seeded: an absent file is Teams' off state and shipped state"
+        );
+        // STUDIO-645 (T4): and no bank directory either. The banks dir appears on the first
+        // `retain` and at no other time, so a Teams-off daemon leaves the same filesystem behind it
+        // found — the same claim the teams.yaml assertion above makes, for memory.
+        assert!(
+            !std::path::Path::new(&dir.child("teams")).exists(),
+            "a Teams-off boot must create no teams/ directory (banks or profiles)"
+        );
+    }
+
+    // STUDIO-645 (Teams T4), §5.4 + §2.4 row 8: which memory handles a boot installs is decided by
+    // the toggle and `memory.backend` alone. This is the exact function `run` calls, so "off costs
+    // nothing" is checked at the composition root rather than inferred from it.
+    //
+    // `teams_bank` is the CONCRETE local bank the DISPATCH path recalls from; it must be `Some` for
+    // `local` and `None` for everything else, because that is what makes "no network on the dispatch
+    // path" true by construction rather than by care.
+    #[test]
+    fn teams_memory_handles_are_installed_only_for_an_enabled_local_backend() {
+        use rhapsody_config::teams::{MemoryBackend as BackendKind, Teams};
+
+        let with = |enabled: bool, backend: BackendKind| {
+            let mut t = Teams {
+                enabled,
+                ..Teams::disabled()
+            };
+            t.memory.backend = backend;
+            t
+        };
+        let dir = TempDir::new();
+        let flags = Flags {
+            port: -1,
+            db: dir.child("rhapsody.db").to_string_lossy().into_owned(),
+            no_store: false,
+            no_color: false,
+            path: PathBuf::from("WORKFLOW.md"),
+        };
+        let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
+
+        let install = |teams: &Teams| {
+            let mut o = rhapsody_orchestrator::Orchestrator::new(String::new());
+            install_teams_memory(&mut o, teams, cfg.as_ref(), &flags);
+            (o.teams_bank.is_some(), o.teams_memory.is_some())
+        };
+
+        assert_eq!(
+            install(&with(false, BackendKind::Local)),
+            (false, false),
+            "Teams OFF installs nothing at all — not even the off-loop runtime"
+        );
+        assert_eq!(
+            install(&with(true, BackendKind::Local)),
+            (true, true),
+            "`local` installs both the dispatch-path bank and the off-loop runtime"
+        );
+        assert_eq!(
+            install(&with(true, BackendKind::None)),
+            (false, true),
+            "`none` still serves the off-loop tools (as no-ops) but puts NO bank on the dispatch path"
+        );
+        assert_eq!(
+            install(&with(true, BackendKind::Hindsight)),
+            (false, true),
+            "`hindsight` is T8: it must never reach the dispatch path, where it could not be awaited"
+        );
+
+        // Installing handles creates nothing: the banks dir waits for the first retain.
+        assert!(
+            !std::path::Path::new(&dir.child("teams")).exists(),
+            "installing the memory handles must not create the banks directory"
+        );
+    }
+
+    // STUDIO-644 (Teams T3b), design §0.11.2 and the slice's first acceptance criterion: the triage
+    // task — the ONLY thing in the daemon that can call a model outside a dispatched run — spawns
+    // for `labels+model` and for nothing else. This is the exact predicate `run` gates the spawn on,
+    // so `mode: labels` / `mode: off` / Teams-off provably have no task at all, rather than a task
+    // that returns early.
+    #[test]
+    fn spawn_triage_only_for_labels_plus_model_in_production() {
+        use rhapsody_config::teams::{Identity, ManagerMode, Teams};
+
+        let with_mode = |mode: ManagerMode, enabled: bool| Teams {
+            enabled,
+            manager: rhapsody_config::teams::Manager {
+                mode,
+                ..Default::default()
+            },
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Default::default()
+            }],
+            ..Teams::disabled()
+        };
+
+        assert!(spawn_triage(
+            true,
+            &with_mode(ManagerMode::LabelsModel, true)
+        ));
+        assert!(
+            !spawn_triage(true, &with_mode(ManagerMode::Labels, true)),
+            "`mode: labels` must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(true, &with_mode(ManagerMode::Off, true)),
+            "`mode: off` must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(true, &with_mode(ManagerMode::LabelsModel, false)),
+            "Teams off must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(true, &Teams::disabled()),
+            "the shipped state must spawn no triage task"
+        );
+        assert!(
+            !spawn_triage(false, &with_mode(ManagerMode::LabelsModel, true)),
+            "the hermetic daemon tests must never spawn a task that shells out to claude"
+        );
+    }
+
+    // STUDIO-644: a `labels+model` teams.yaml boots and stops cleanly. The triage wiring sits beside
+    // the prune scheduler in the boot path, so a mistake there would show up as a hang or a non-zero
+    // exit rather than as a failing unit test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_starts_cleanly_with_a_labels_plus_model_teams_yaml() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nmanager:\n  mode: labels+model\nroster:\n  - name: alice\n    labels: [rust]\n",
+        )
+        .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "daemon should exit 0 on cancel; stderr={}",
+            buf.contents()
+        );
+    }
+
+    // STUDIO-642 (Teams T2), design §4: `rhapsodyd teams …` is dispatched at the very top of `run`,
+    // beside `mcp`, so it never reaches flag parsing or the run-lock. An unknown verb is the cheapest
+    // proof the branch was taken: it exits non-zero with the `symphony teams:` marker rather than
+    // treating "teams" as a workflow path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_dispatches_to_teams() {
+        let buf = SharedBuf::new();
+        let code = run_now(&["teams", "no-such-verb"], &buf).await;
+        assert_ne!(code, 0, "expected non-zero exit for an unknown teams verb");
+        assert!(
+            buf.contents().contains("symphony teams:"),
+            "stderr = {:?}, want the teams dispatch marker",
+            buf.contents()
+        );
+    }
+
+    // STUDIO-642, design §4's never-create-on-read rule: booting the daemon with a roster that names
+    // profiles resolves them (which is what produces the drift / unknown-profile warnings) and must
+    // still leave `teams/profiles/` absent. Only `rhapsodyd teams fork` ever creates it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_never_creates_the_profiles_dir() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n  - name: bob\n    profile: nosuch\n",
+        )
+        .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "a roster naming an unknown profile must not fail the boot; stderr={}",
+            buf.contents()
+        );
+        assert!(
+            !dir.child("teams").exists(),
+            "resolving the roster's profiles must never create {}",
+            dir.child("teams").display()
+        );
+    }
+
+    // STUDIO-639 (Teams T1), design §2.1: a malformed teams.yaml disables Teams LOUDLY and the daemon
+    // still starts and stops cleanly — a broken optional config file is never a startup failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_starts_cleanly_with_a_malformed_teams_yaml() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        // `roster` as a scalar where a sequence belongs: YAML that cannot become a `Teams`.
+        std::fs::write(dir.child("teams.yaml"), "enabled: true\nroster: \"nope\"\n")
+            .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "a malformed teams.yaml must not fail the boot; stderr={}",
+            buf.contents()
+        );
+        // And the daemon did not "repair" the file by overwriting it — it is left exactly as written,
+        // for the operator to fix.
+        assert_eq!(
+            std::fs::read_to_string(dir.child("teams.yaml")).expect("read back"),
+            "enabled: true\nroster: \"nope\"\n"
         );
     }
 

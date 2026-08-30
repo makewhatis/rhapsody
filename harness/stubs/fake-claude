@@ -11,7 +11,14 @@
 #
 # Protocol contract (read the runner source, not this comment, if they ever diverge):
 #   * The runner invokes us with `-p --output-format stream-json --input-format stream-json
-#     --verbose ...`. We ignore all argv (the flags carry no information we need).
+#     --verbose ...`. We ignore all argv (the flags carry no information we need) EXCEPT to
+#     tell a real turn dispatch apart from a plain print-mode call (see below).
+#   * BO-59's credential-liveness preflight invokes the configured claude command in bare
+#     print mode: `-p '<prompt>'`, with the prompt as `-p`'s own argument and none of the
+#     turn flags above. Real `claude -p '<prompt>'` in this mode just prints a plain-text
+#     reply and exits — no JSONL, no held-open stdin. We mimic that: `-p` followed by a
+#     non-flag argument short-circuits straight to a plain "OK" on stdout, exit 0, before
+#     any of the turn-execution logic below runs.
 #   * The runner writes the initial prompt as a {"type":"user",...} JSONL line on stdin and
 #     HOLDS STDIN OPEN as an operator-message mailbox until it sees the terminal result, then
 #     closes it (INF-250). We must drain stdin continuously so the runner's stdin-writer
@@ -34,6 +41,20 @@
 #                         (run outcome `failed`, reason `stalled`). Never emits a result.
 #
 set -u
+
+# Bare print-mode probe (BO-59 credential-liveness check): `-p '<prompt>'` with the prompt
+# as `-p`'s own argument, never `--output-format`. Answer directly and exit before touching
+# any of the turn-execution/JSONL machinery below — a probe never sends stdin and never
+# expects a stream-json reply.
+if [ "${1:-}" = "-p" ] && [ "${2:-}" != "" ]; then
+	case "$2" in
+	--*) ;; # a genuine turn call never has a flag as -p's value; fall through
+	*)
+		printf 'OK\n'
+		exit 0
+		;;
+	esac
+fi
 
 readonly SESSION_ID="fake-claude-session"
 

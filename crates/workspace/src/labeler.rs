@@ -25,7 +25,7 @@ use crate::Manager;
 /// PR-label color used only when the labeler auto-creates the label.
 const PR_LABEL_COLOR: &str = "8B5CF6";
 /// PR-label description used only when the labeler auto-creates the label.
-const PR_LABEL_DESCRIPTION: &str = "Authored by the Symphony agent";
+const PR_LABEL_DESCRIPTION: &str = "Authored by the Rhapsody agent";
 /// Bounds each `gh` subprocess so a hung network call can never wedge run teardown.
 const GH_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Caps the whole labeling pass (git enumeration + every gh call); set to match AfterRun's 60s hook
