@@ -384,7 +384,7 @@ fn flatten(body: &str) -> String {
 
 /// Builds the recall [`Query`] for a dispatch: the ticket being worked, its
 /// labels and its title, bounded by `memory.recall_top_k`.
-fn recall_query(teams: &Teams, iss: &Issue) -> Query {
+pub(crate) fn recall_query(teams: &Teams, iss: &Issue) -> Query {
     Query {
         ticket: iss.identifier.clone(),
         labels: iss.labels.clone().unwrap_or_default(),

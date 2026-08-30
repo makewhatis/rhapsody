@@ -66,6 +66,7 @@ pub mod teams;
 mod teamscompose;
 pub mod teamsmemory;
 pub mod teamspost;
+pub mod teamsprefetch;
 pub mod telemetry_attrs;
 pub mod triage;
 pub mod warnings;
@@ -104,6 +105,10 @@ pub use snapshot::{
     ProjectStatus, RateLimit, RefreshResult, RetryRow, RunningRow, Snapshot, TokenCounts,
 };
 pub use stop::{ControlHandle, ResumeResult, StopError, StopResult};
+pub use teamsprefetch::{
+    MAX_PREFETCH_BACKOFF_MS, PREFETCH_INTERVAL, PrefetchCache, PrefetchDeps, PrefetchKey,
+    PrefetchTarget, prefetch_enabled, run_prefetch_schedule,
+};
 pub use triage::{
     ClaudeTriageArbiter, MAX_TRIAGE_BACKOFF_MS, TRIAGE_INTERVAL, TriageArbiter, TriageDecision,
     TriageDeps, TriageRequest, TriageTarget, run_triage_schedule, triage_enabled,

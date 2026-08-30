@@ -321,6 +321,22 @@ pub struct Orchestrator {
     /// dispatch path and hands the SAME plain-data `Fact` slice to the same renderer.
     pub teams_bank: Option<Arc<rhapsody_config::memory::LocalBank>>,
 
+    /// The Rhapsody Teams **prefetched** memory the dispatch path reads when the bank is remote
+    /// (STUDIO-660, T8; design record §5, §5.4). `Some` only for `memory.backend: hindsight` with
+    /// a roster; `None` for `local`, `none`, and Teams off — so those configurations reach exactly
+    /// the code they reached before this field existed.
+    ///
+    /// It is [`teams_bank`](Orchestrator::teams_bank)'s counterpart, not its replacement, and the
+    /// two are mutually exclusive by construction at the composition root: `local` gets a bank and
+    /// no cache, `hindsight` gets a cache and no bank. The rule that forces the split is the same
+    /// one `teams_bank`'s doc states — the control task may not await — and the cache is how a
+    /// remote bank obeys it. All of its network I/O happened earlier, on
+    /// [`crate::teamsprefetch`]'s own task; what dispatch does here is
+    /// [`PrefetchCache::try_get`](crate::teamsprefetch::PrefetchCache::try_get), a **non-blocking**
+    /// map read that cannot wait, cannot fail and does no I/O. A miss, a stale entry or a
+    /// contended lock all render no memory section, which is byte-for-byte `backend: none`.
+    pub teams_prefetch: Option<Arc<crate::teamsprefetch::PrefetchCache>>,
+
     /// The Rhapsody Teams **room** the dispatch path catches up from (STUDIO-650, T5; design
     /// record §0.5, §0.11.4). `None` whenever there is no room to read: Teams off, or no on-disk
     /// runtime home to anchor `~/.rhapsody/teams/room/` to.
@@ -586,6 +602,7 @@ impl Orchestrator {
             teams: None,
             teams_profiles_dir: None,
             teams_bank: None,
+            teams_prefetch: None,
             teams_room: None,
             teams_cursors: None,
             issue_states: HashMap::new(),
