@@ -67,6 +67,10 @@ const DEFAULT_TIMEOUT_MS: i64 = 5000;
 const DEFAULT_BANK_PREFIX: &str = "agent-";
 /// `memory.recall_top_k` — how many facts a recall returns.
 const DEFAULT_RECALL_TOP_K: i64 = 8;
+/// `prompt_budget_bytes` — the ONE total byte budget the Teams composer spends
+/// across the whole teammate prepend (§0.11.6). See [`Teams::prompt_budget_bytes`]
+/// for why the default is this size and not smaller.
+pub const DEFAULT_PROMPT_BUDGET_BYTES: i64 = 16000;
 
 fn default_max_tokens() -> i64 {
     DEFAULT_MAX_TOKENS
@@ -82,6 +86,10 @@ fn default_bank_prefix() -> String {
 
 fn default_recall_top_k() -> i64 {
     DEFAULT_RECALL_TOP_K
+}
+
+fn default_prompt_budget_bytes() -> i64 {
+    DEFAULT_PROMPT_BUDGET_BYTES
 }
 
 /// The `manager:` block (§2.2). Carried as config in T1; the routing function
@@ -177,7 +185,7 @@ pub struct Identity {
 /// [`Teams::default`] is [`Teams::disabled`]: the schema's own defaults with
 /// `enabled: false`, which is exactly what an absent file means (§2.1) and what
 /// an empty-but-present file parses to.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Teams {
     /// The one toggle the whole feature lives behind (§2). Default false.
     #[serde(default)]
@@ -188,6 +196,53 @@ pub struct Teams {
     pub memory: Memory,
     #[serde(default)]
     pub roster: Vec<Identity>,
+    /// **The one total byte budget** for the whole Teams turn-1 prepend
+    /// (STUDIO-650, T5; §0.11.6). Optional, and the only new key this slice
+    /// adds.
+    ///
+    /// §0.11.6 gives the turn-1 prompt a single budget owner because by T5 it
+    /// has four independent growing tenants — capabilities, the identity
+    /// header + profile prose, room catch-up and memory recall — each with a
+    /// local bound and no aggregate. The composer spends this budget in the
+    /// fixed order capabilities → teammate header → room catch-up → memory
+    /// recall, and on overflow drops **oldest room items first, then recall
+    /// items, never the identity header**.
+    ///
+    /// The default is deliberately generous rather than tight: it must be large
+    /// enough that a room-empty prompt is **byte-identical to T4's**, so
+    /// enabling the room changes nothing for a team that has not used it. Zero
+    /// or negative ⇒ [`DEFAULT_PROMPT_BUDGET_BYTES`], for
+    /// [`Memory::recall_top_k`]'s reason: a non-positive bound must not silently
+    /// mean "unbounded" in one place and "nothing" in another.
+    #[serde(default = "default_prompt_budget_bytes")]
+    pub prompt_budget_bytes: i64,
+}
+
+/// Hand-written rather than derived, for the reason [`Manager`] and [`Memory`]
+/// are: `prompt_budget_bytes` has a non-zero schema default, and a derived
+/// `Default` would make `Teams::disabled()` disagree with what parsing an empty
+/// file yields. `disabled_matches_an_empty_file` pins the two together.
+impl Default for Teams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            manager: Manager::default(),
+            memory: Memory::default(),
+            roster: Vec::new(),
+            prompt_budget_bytes: DEFAULT_PROMPT_BUDGET_BYTES,
+        }
+    }
+}
+
+impl Teams {
+    /// [`Teams::prompt_budget_bytes`] with the non-positive fallback applied —
+    /// the number the composer actually spends.
+    pub fn effective_prompt_budget(&self) -> usize {
+        usize::try_from(self.prompt_budget_bytes)
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_PROMPT_BUDGET_BYTES as usize)
+    }
 }
 
 /// Why a `teams.yaml` was rejected. The daemon boot turns any of these into ONE
@@ -699,6 +754,8 @@ mod tests {
                 bank: "b".to_string(),
                 max_concurrent: 2,
             }],
+            // STUDIO-650, T5: the one new key, round-tripped like the rest.
+            prompt_budget_bytes: 9000,
         };
         let yaml = serde_yaml_ng::to_string(&t).expect("serialize");
         assert_eq!(Teams::parse(&yaml).expect("reparse"), t);

@@ -2,7 +2,7 @@
 //! `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.7, §6.7).
 //!
 //! **No Go v0.4.0 counterpart** — the Go facade has no analog, exactly as
-//! `symphony_handoff` has none. Four tools, each a thin proxy of a NEW additive
+//! `symphony_handoff` has none. Five tools, each a thin proxy of a NEW additive
 //! daemon endpoint:
 //!
 //! | Tool | Reads/Writes | Endpoint |
@@ -11,6 +11,7 @@
 //! | `teams_recall {identity, query}` | read | `GET /api/v1/teams/recall` |
 //! | `teams_invalidate {identity, fact_id, reason}` | write | `POST /api/v1/teams/invalidate` |
 //! | `teams_retain {content}` | write | `POST /api/v1/runs/{id}/retain` |
+//! | `teams_room_read {limit?}` | read | `GET /api/v1/teams/room` (STUDIO-650, T5) |
 //!
 //! `teams_retain` is **this slice's addition to §6.7's table** — §6.7 listed
 //! `teams_roster` / `teams_recall` / `teams_invalidate` but not the retain half
@@ -19,11 +20,20 @@
 //!
 //! # Off ⇒ invisible, not merely inert (§6.7, §2.4 row 7)
 //!
-//! When Teams is off, [`Facade::new`] REMOVES all four routes, so `list_tools`
+//! When Teams is off, [`Facade::new`] REMOVES all five routes, so `list_tools`
 //! is byte-identical to a daemon built before Teams existed. That is the
 //! `allow_handoff` mechanism, reused unchanged — the gate is the enabled-tool
 //! set, so a disabled tool is absent rather than surfacing a runtime
 //! permission-denied.
+//!
+//! # `teams_room_read` never advances a cursor (STUDIO-650, T5)
+//!
+//! The room's watermarks belong to **hydration**: the composer earns one from what it actually
+//! rendered into a turn-1 prompt. A tool read that advanced a cursor would let a mid-run peek eat
+//! another run's catch-up and silently hide a hand-off from the teammate it was addressed to — so
+//! this tool reads the newest bounded window every time and moves nothing. That is also why it
+//! takes no `identity`: a peek is not any identity, so it sees room-audience posts and no direct
+//! ones. §6.7's table gains it with a T5 home (§0.11.7); `teams_post`, the write half, is T6's.
 //!
 //! # `teams_retain` cannot forge provenance
 //!
@@ -66,6 +76,15 @@ pub(crate) struct InvalidateArgs {
     fact_id: String,
     /// why this fact is no longer true. Stored with the record and reversible.
     reason: String,
+}
+
+/// `teams_room_read` args. `limit` is optional and can only ever NARROW: the daemon clamps it to
+/// the room's own ceiling, so no caller can widen the window §0.5 calls non-negotiable.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(crate) struct RoomReadArgs {
+    /// how many of the newest posts to return; omit for the default window.
+    #[serde(default)]
+    limit: u32,
 }
 
 /// `teams_retain` args — `content` and nothing else, by design (module docs).
@@ -157,6 +176,18 @@ impl Facade {
             .post_json("/api/v1/teams/invalidate", payload)
             .await
         {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "teams_room_read",
+        description = "Read the newest posts in the team room: the manager's routing decisions and teammates' hand-offs, oldest first, bounded. This is the same log your turn-1 prompt caught you up on, so use it to look FURTHER back or to re-check something mid-run. Read-only — it never advances your catch-up watermark, so nothing you read here is hidden from your next run. Proxies GET /api/v1/teams/room."
+    )]
+    async fn teams_room_read(&self, Parameters(args): Parameters<RoomReadArgs>) -> CallToolResult {
+        let path = format!("/api/v1/teams/room?limit={}", args.limit);
+        match self.client.get(&path).await {
             Ok(body) => text_result(&body),
             Err(e) => err_result(&e),
         }
@@ -329,11 +360,14 @@ mod tests {
         );
     }
 
-    /// Turning Teams on ADDS exactly the four §0.11.7 tools and changes nothing
+    /// Turning Teams on ADDS exactly the §0.11.7 + §6.7 tools and changes nothing
     /// else — the precise statement of "byte-identical when off", checked from
     /// both directions so a future tool cannot slip in unnoticed.
+    ///
+    /// STUDIO-650 (T5) extended this list with `teams_room_read`; the assertion
+    /// is unchanged in kind, only in the set it names.
     #[tokio::test]
-    async fn enabling_teams_only_adds_the_four_tools() {
+    async fn enabling_teams_only_adds_the_teams_tools() {
         let off = tool_names(facade(Options::default(), 0)).await;
         let on = tool_names(facade(teams_on(), 0)).await;
 
@@ -345,6 +379,7 @@ mod tests {
                 "teams_invalidate",
                 "teams_recall",
                 "teams_retain",
+                "teams_room_read",
                 "teams_roster"
             ]
         );
@@ -461,6 +496,50 @@ mod tests {
                 "/api/v1/teams/recall?identity=alice&query=a%26b+c".to_string()
             )]
         );
+        let _ = client.cancel().await;
+    }
+
+    /// `teams_room_read` proxies its endpoint and passes the limit straight through — the daemon
+    /// owns the clamp, so the tool cannot widen the window and cannot disagree with the ceiling.
+    #[tokio::test]
+    async fn room_read_proxies_its_endpoint_with_the_limit() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+
+        let out = call_text(&client, "teams_room_read", serde_json::json!({"limit": 5})).await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        // An omitted limit is `0`, which the daemon reads as "the default window" — the same
+        // non-positive-means-fallback rule `recall_top_k` follows.
+        call_text(&client, "teams_room_read", serde_json::json!({})).await;
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![
+                ("GET".to_string(), "/api/v1/teams/room?limit=5".to_string()),
+                ("GET".to_string(), "/api/v1/teams/room?limit=0".to_string()),
+            ]
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// `teams_room_read` declares `limit` and NOTHING else. In particular no `identity`: a peek is
+    /// not any identity, and a tool that accepted one would be a read-as-somebody-else surface of
+    /// exactly the kind §0.11.4 rules out for `from`.
+    #[tokio::test]
+    async fn room_read_declares_only_limit() {
+        let client = connect(facade(teams_on(), 0)).await;
+        let tools = client.list_all_tools().await.expect("list tools");
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "teams_room_read")
+            .expect("teams_room_read is registered");
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("an object schema");
+        let mut keys: Vec<&String> = props.keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["limit"]);
         let _ = client.cancel().await;
     }
 

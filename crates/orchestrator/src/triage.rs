@@ -45,15 +45,28 @@
 //!
 //! # Not in this slice
 //!
-//! Memory digests in the prompt join when T4 lands; the room post that §0.11.2 pairs with the label
-//! arrives with T6. Until then the durable record of a triage decision is **the label itself**,
-//! visible in Linear, plus a tracing line. `manager.mode: labels` spawns no task at all.
+//! Memory digests in the prompt join when T4 lands. `manager.mode: labels` spawns no task at all.
+//!
+//! # The durable record (STUDIO-650, T5)
+//!
+//! Both of this module's T5 deferrals are now closed: a triage decision, and a model output that
+//! fails roster validation, each leave a **manager post in the room log** (§0.11.1, §0.11.2,
+//! §0.11.5 requirement 2). The label in Linear is still the assignment; the room post is the
+//! reasoning behind it, which `events` could not be — those rows are pruned with their run
+//! (30-day default), silently deleting exactly the misroute record any future tuning depends on
+//! (§0.11.7).
+//!
+//! Both posts are **best-effort and never fatal to triage**: they run off the control task on
+//! triage's own task, and a room that cannot be written costs the team a paragraph of history and
+//! costs the ticket nothing (§0.11.4 — the room is advisory, Linear is the ledger).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
+use rhapsody_config::room::{Message, RoomLog};
 use rhapsody_config::teams::{ManagerMode, Teams};
 use rhapsody_core::Issue;
 use rhapsody_tracker::Tracker;
@@ -174,6 +187,16 @@ pub struct TriageDeps<TF> {
     pub interval: Duration,
     /// The back-off ceiling; [`MAX_TRIAGE_BACKOFF_MS`] in production.
     pub max_backoff_ms: i64,
+    /// The room log every triage decision is posted to (STUDIO-650, T5; §0.11.1's "the decision's
+    /// durable record is a manager post in the room log", §0.11.2's room post paired with the
+    /// label). `None` when there is no room to write to — Teams without an on-disk runtime home —
+    /// in which case triage behaves exactly as it did in T3b.
+    ///
+    /// A `dyn RoomLog` rather than a concrete `LocalRoom` **because this is the off-loop side**:
+    /// nothing here runs on the control task, so the no-network-on-dispatch argument that forces
+    /// `Orchestrator::teams_room` to be concrete does not apply, and the seam is what lets a test
+    /// substitute a failing room to prove triage survives one.
+    pub room: Option<Arc<dyn RoomLog>>,
 }
 
 /// What one cycle did — the input to the back-off decision, and the assertion surface for the
@@ -357,6 +380,24 @@ where
                 chosen = %decision.identity,
                 "teams triage returned an identity that is NOT on the roster; writing nothing"
             );
+            // §0.11.5 requirement 2 in full: "deterministic fallback plus a **loud room post**".
+            // A tracing line scrolls away; this is the durable record that a model turn fed
+            // attacker-reachable ticket text tried to name somebody who does not exist.
+            post(
+                deps,
+                Message::room(
+                    MANAGER_IDENTITY,
+                    Utc::now(),
+                    format!(
+                        "REJECTED a triage decision for {}: the turn chose {:?}, which is NOT on \
+                         the roster. Nothing was written and the ticket stays unlabeled, so \
+                         dispatch routes it deterministically. Model output naming an unknown \
+                         identity is a trust boundary, not a typo.",
+                        iss.identifier, decision.identity
+                    ),
+                )
+                .with_refs([iss.identifier.clone()]),
+            );
             continue;
         };
         let label = format!("{IDENTITY_LABEL_PREFIX}{identity}");
@@ -369,8 +410,23 @@ where
             );
             return CycleOutcome::TrackerFailure;
         }
-        // The durable record of this decision in T3b is the label itself, plus this line; the room
-        // post §0.11.2 pairs with it arrives in T6.
+        // §0.11.1: "the decision's durable record is a manager post in the room log". The
+        // `teams.route` events row is the per-run TIMELINE copy and is pruned with its run
+        // (30-day default), which would have silently deleted the misroute record any future
+        // tuning depends on — so the room, not `events`, is where this lives.
+        post(
+            deps,
+            Message::room(
+                MANAGER_IDENTITY,
+                Utc::now(),
+                format!(
+                    "Assigned {} to {identity}. Reason: {}",
+                    iss.identifier,
+                    reason_or_unstated(&decision.reason)
+                ),
+            )
+            .with_refs([iss.identifier.clone()]),
+        );
         tracing::info!(
             issue = %iss.identifier,
             identity = %identity,
@@ -386,6 +442,39 @@ where
         CycleOutcome::Idle
     } else {
         CycleOutcome::Labelled(labelled)
+    }
+}
+
+/// The `from` every triage post is host-stamped with (§0.11.4: "`from` is stamped by the host; a
+/// run cannot supply it").
+///
+/// Deliberately NOT a roster name. The manager is a function, not an identity (§3.1), so it can
+/// never collide with a teammate: `is_label_safe` forbids the `@`, which means no `teams.yaml`
+/// roster entry can ever be called this and no teammate can be impersonated by it.
+pub(crate) const MANAGER_IDENTITY: &str = "@manager";
+
+/// What a decision with no stated reason renders as, so a post never reads as a truncated sentence.
+fn reason_or_unstated(reason: &str) -> &str {
+    let r = reason.trim();
+    if r.is_empty() { "not stated" } else { r }
+}
+
+/// Appends one manager post to the room, **best-effort and never fatal to triage**.
+///
+/// This runs off the control task (triage's own task), and the room is advisory while Linear is the
+/// ledger (§0.11.4) — so a room that cannot be written costs the team a paragraph of history and
+/// costs the ticket nothing. The label write has already happened or has already been refused; this
+/// can neither undo nor block it, which is why it returns nothing to check.
+fn post<TF>(deps: &TriageDeps<TF>, msg: Message) {
+    let Some(room) = deps.room.as_ref() else {
+        return;
+    };
+    if let Err(e) = room.append(&msg) {
+        tracing::warn!(
+            err = %e,
+            "teams triage could not post its decision to the room; the label and the Linear \
+             history are unaffected"
+        );
     }
 }
 
@@ -662,7 +751,8 @@ fn snippet(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testsupport::issue;
+    use crate::testsupport::{TempDir, issue};
+    use rhapsody_config::room::{Cursor, LocalRoom};
     use rhapsody_config::teams::{Identity, Manager};
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex;
@@ -737,6 +827,15 @@ mod tests {
             })
         }
 
+        /// An answer carrying a specific reason, so a test can pin that the reason reaches the
+        /// room post rather than being dropped on the way (STUDIO-650, T5).
+        fn reasoned(identity: &str, reason: &str) -> Result<TriageDecision, String> {
+            Ok(TriageDecision {
+                identity: identity.to_string(),
+                reason: reason.to_string(),
+            })
+        }
+
         fn prompts(&self) -> Vec<String> {
             self.prompts.lock().expect("prompts").clone()
         }
@@ -791,6 +890,20 @@ mod tests {
             tracker_api_key: String::new(),
             interval: Duration::from_millis(5),
             max_backoff_ms: 20,
+            room: None,
+        }
+    }
+
+    /// The same deps, with a room to post into (STUDIO-650, T5).
+    fn deps_with_room(
+        teams: Teams,
+        tr: Arc<Fake>,
+        arbiter: Arc<dyn TriageArbiter>,
+        room: Arc<dyn RoomLog>,
+    ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
+        TriageDeps {
+            room: Some(room),
+            ..deps(teams, tr, arbiter)
         }
     }
 
@@ -1046,6 +1159,137 @@ mod tests {
             1,
             "load is ONE read for the whole roster, not one per identity"
         );
+    }
+
+    // ── the durable room record (STUDIO-650, T5) ────────────────────────────────────────────────
+
+    /// §0.11.1 / §0.11.2: a triage decision leaves a durable manager post in the room, carrying the
+    /// reason and the ticket it names. This is the record `events` could not be — those rows are
+    /// pruned with their run — and it closes this module's first T5 deferral comment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_leaves_a_durable_room_post() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rust"])];
+        let d = deps_with_room(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::new(tr),
+            FakeArbiter::answering(vec![FakeArbiter::reasoned(
+                "alice",
+                "rust and config overlap",
+            )]),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(1)
+        );
+        let got = room
+            .read_since("alice", &Cursor::default(), 0)
+            .expect("catch up");
+        assert_eq!(got.messages.len(), 1, "{:?}", got.messages);
+        let m = &got.messages[0];
+        assert_eq!(m.from, MANAGER_IDENTITY, "`from` is host-stamped");
+        assert_eq!(m.to, rhapsody_config::room::Audience::Room);
+        assert_eq!(m.refs, vec!["i1".to_string()]);
+        assert!(m.body.contains("Assigned i1 to alice"), "{}", m.body);
+        assert!(m.body.contains("rust and config overlap"), "{}", m.body);
+    }
+
+    /// §0.11.5 requirement 2 in full: an off-roster identity is written NOWHERE **and** leaves a
+    /// loud room post. The label is still not written — the post is the record of the refusal, not
+    /// a softening of it. Closes this module's second T5 deferral comment.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_identity_leaves_a_loud_room_post_and_still_writes_no_label() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rust"])];
+        let tr = Arc::new(tr);
+        let d = deps_with_room(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            FakeArbiter::answering(vec![FakeArbiter::ok("mallory")]),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        triage_cycle(&CancelWait::default(), &d).await;
+        assert!(
+            tr.add_label_calls().is_empty(),
+            "an off-roster identity is written NOWHERE"
+        );
+        let got = room
+            .read_since("alice", &Cursor::default(), 0)
+            .expect("catch up");
+        assert_eq!(got.messages.len(), 1, "{:?}", got.messages);
+        let body = &got.messages[0].body;
+        assert!(body.contains("REJECTED"), "{body}");
+        assert!(body.contains("mallory"), "{body}");
+        assert!(body.contains("NOT on the roster"), "{body}");
+    }
+
+    /// The room is advisory and Linear is the ledger (§0.11.4): a room that cannot be written costs
+    /// the team a paragraph of history and costs the ticket nothing. Triage still labels, and still
+    /// reports success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn triage_never_fails_on_a_room_error() {
+        struct BrokenRoom;
+        impl RoomLog for BrokenRoom {
+            fn append(&self, _msg: &Message) -> Result<String, rhapsody_config::room::RoomError> {
+                Err(rhapsody_config::room::RoomError::Io(
+                    "disk on fire".to_string(),
+                ))
+            }
+            fn read_since(
+                &self,
+                _reader: &str,
+                _cursor: &Cursor,
+                _limit: usize,
+            ) -> Result<rhapsody_config::room::CaughtUp, rhapsody_config::room::RoomError>
+            {
+                Err(rhapsody_config::room::RoomError::Io(
+                    "disk on fire".to_string(),
+                ))
+            }
+        }
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rust"])];
+        let tr = Arc::new(tr);
+        let d = deps_with_room(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice")]),
+            Arc::new(BrokenRoom) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(1),
+            "a room failure must not fail triage"
+        );
+        assert_eq!(tr.add_label_calls().len(), 1, "the label still lands");
+    }
+
+    /// Triage with no room at all behaves exactly as T3b did — the `None` handle is the whole gate,
+    /// so a daemon with no on-disk runtime home has no new behaviour and no new failure mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_room_is_t3b_behaviour_unchanged() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rust"])];
+        let tr = Arc::new(tr);
+        let d = deps(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice")]),
+        );
+        assert!(d.room.is_none());
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d).await,
+            CycleOutcome::Labelled(1)
+        );
+        assert_eq!(tr.add_label_calls().len(), 1);
     }
 
     // Nothing to triage costs nothing: no load read, and above all no model turn.
@@ -1351,6 +1595,7 @@ mod tests {
             tracker_api_key: String::new(),
             interval: Duration::from_millis(5),
             max_backoff_ms: 20,
+            room: None,
         };
         assert_eq!(
             triage_cycle(&CancelWait::default(), &d).await,

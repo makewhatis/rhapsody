@@ -20,6 +20,7 @@ pub mod profiles;
 pub mod projects;
 pub mod prompt;
 pub mod resolve;
+pub mod room;
 pub mod teams;
 pub mod validate;
 pub mod workflow;

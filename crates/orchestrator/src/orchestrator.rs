@@ -321,6 +321,25 @@ pub struct Orchestrator {
     /// dispatch path and hands the SAME plain-data `Fact` slice to the same renderer.
     pub teams_bank: Option<Arc<rhapsody_config::memory::LocalBank>>,
 
+    /// The Rhapsody Teams **room** the dispatch path catches up from (STUDIO-650, T5; design
+    /// record §0.5, §0.11.4). `None` whenever there is no room to read: Teams off, or no on-disk
+    /// runtime home to anchor `~/.rhapsody/teams/room/` to.
+    ///
+    /// **The concrete [`LocalRoom`](rhapsody_config::room::LocalRoom)**, for
+    /// [`teams_bank`](Orchestrator::teams_bank)'s reason and one more: `RoomLog` is already sync,
+    /// so it could not `.await` even as a trait object, and holding the local type additionally
+    /// says which backend this is. A relay backend (§0.10's deferred Nostr leg) is unrepresentable
+    /// here, which is how "zero network I/O on the dispatch path" stays checkable from a type name.
+    pub teams_room: Option<Arc<rhapsody_config::room::LocalRoom>>,
+
+    /// Where each identity's room watermark lives (STUDIO-650, T5; §0.11.4: the identity's own
+    /// state, `<banks>/<bank-id>/cursor`, never the parity store). `None` on exactly the same
+    /// conditions as [`teams_room`](Orchestrator::teams_room), and set with it.
+    ///
+    /// Read at turn-1 composition and written back ONLY after a catch-up that actually returned
+    /// messages — so a room that is absent or quiet writes nothing and creates nothing.
+    pub teams_cursors: Option<Arc<rhapsody_config::room::Cursors>>,
+
     /// Ticket identifier → its state, as last seen by the poller **in memory** (STUDIO-645, T4).
     /// Refreshed each tick from the candidate fetch, before dispatch, so a recall rendered during
     /// that tick re-grounds against what the daemon already knows.
@@ -543,6 +562,8 @@ impl Orchestrator {
             teams: None,
             teams_profiles_dir: None,
             teams_bank: None,
+            teams_room: None,
+            teams_cursors: None,
             issue_states: HashMap::new(),
             teams_memory: None,
             running: HashMap::new(),

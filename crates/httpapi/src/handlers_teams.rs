@@ -13,6 +13,7 @@
 //! | `GET /api/v1/teams/recall` | `teams_recall {identity, query}` |
 //! | `POST /api/v1/teams/invalidate` | `teams_invalidate {identity, fact_id, reason}` |
 //! | `POST /api/v1/runs/{id}/retain` | `teams_retain {content}` |
+//! | `GET /api/v1/teams/room` | `teams_room_read {limit?}` (STUDIO-650, T5) |
 //!
 //! Retain is deliberately **run-scoped in its path**, following
 //! `/api/v1/runs/{id}/handoff`: the run id is what the host resolves the
@@ -47,6 +48,27 @@ pub(crate) struct RecallParams {
     identity: String,
     #[serde(default)]
     query: String,
+}
+
+/// `GET /api/v1/teams/room?limit=` (STUDIO-650, T5).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RoomParams {
+    /// How many of the newest posts to return. Absent, empty, `0` or unparseable ⇒ the room's own
+    /// default window; any value is clamped to its ceiling, so this parameter can widen nothing
+    /// (§0.5's "bounded read window, non-negotiable").
+    ///
+    /// Carried as a `String` and parsed here rather than typed `usize`, because a typed field would
+    /// make `?limit=abc` fail axum's own extractor and answer with ITS error body instead of this
+    /// crate's `{error, message}` envelope — a wire-shape inconsistency no other read route has. A
+    /// garbage limit is a request for the default window, not a 400.
+    #[serde(default)]
+    limit: String,
+}
+
+impl RoomParams {
+    fn limit(&self) -> usize {
+        self.limit.trim().parse().unwrap_or(0)
+    }
 }
 
 /// `POST /api/v1/teams/invalidate` body.
@@ -132,6 +154,24 @@ pub(crate) async fn handle_teams_recall(
     }
 }
 
+/// `GET /api/v1/teams/room` — the newest posts in the team room (§0.5, §0.11.4).
+///
+/// **Read-only, and it advances no cursor.** Cursors belong to hydration; a mid-run peek that ate a
+/// catch-up would silently hide a hand-off from the teammate it was addressed to.
+pub(crate) async fn handle_teams_room(
+    method: Method,
+    Query(params): Query<RoomParams>,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    match provider.teams_room(params.limit()).await {
+        Ok(view) => write_json(StatusCode::OK, &view),
+        Err(e) => teams_error(&e),
+    }
+}
+
 /// `POST /api/v1/teams/invalidate` — §5.3's per-record correction, with the
 /// reason stored and nothing deleted.
 pub(crate) async fn handle_teams_invalidate(
@@ -199,6 +239,9 @@ mod tests {
     use std::sync::Arc;
 
     use rhapsody_config::memory::{DEFAULT_BANKS_SUBDIR, LocalBank};
+    use rhapsody_config::room::{
+        DEFAULT_ROOM_SUBDIR, LocalRoom, MAX_ROOM_WINDOW, Message as RoomMessage, RoomLog,
+    };
     use rhapsody_config::teams::{Identity, Teams};
     use rhapsody_orchestrator::teamsmemory::{RunProvenance, TeamsMemory};
     use serde_json::Value;
@@ -240,6 +283,18 @@ mod tests {
         };
         let bank = LocalBank::new(dir.0.join(DEFAULT_BANKS_SUBDIR), "agent-");
         Arc::new(TeamsMemory::new(Arc::new(teams), Arc::new(bank)))
+    }
+
+    /// The same runtime with a room attached (STUDIO-650, T5), returned alongside so a test can
+    /// post into it.
+    fn teams_memory_with_room(dir: &TempDir) -> (Arc<TeamsMemory>, Arc<LocalRoom>) {
+        let room = Arc::new(LocalRoom::new(dir.0.join(DEFAULT_ROOM_SUBDIR)));
+        let mem = Arc::new(
+            Arc::try_unwrap(teams_memory(dir))
+                .map(|m| m.with_room(Arc::clone(&room) as Arc<dyn RoomLog>))
+                .unwrap_or_else(|_| unreachable!("sole owner")),
+        );
+        (mem, room)
     }
 
     async fn spawn(provider: Arc<FakeProvider>) -> String {
@@ -465,5 +520,173 @@ mod tests {
             let resp = reqwest::get(&format!("{url}{path}")).await.expect("GET");
             assert_eq!(resp.status(), 405, "{path}");
         }
+    }
+
+    // ── the room's read side (STUDIO-650, T5) ──────────────────────────────────────────────────
+
+    /// The endpoint serves the room's newest posts, oldest first, with the host-stamped `from` and
+    /// the stable `file:seq` id intact.
+    #[tokio::test]
+    async fn room_serves_the_newest_posts() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        room.append(
+            &RoomMessage::room("@manager", chrono::Utc::now(), "assigned MT-1 to alice")
+                .with_refs(["MT-1"]),
+        )
+        .expect("append");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+
+        let body = body_json(
+            reqwest::get(format!("{url}/api/v1/teams/room"))
+                .await
+                .expect("GET"),
+        )
+        .await;
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1, "{body}");
+        assert_eq!(messages[0]["from"], "@manager");
+        assert_eq!(messages[0]["to"], "*");
+        assert_eq!(messages[0]["body"], "assigned MT-1 to alice");
+        assert!(
+            messages[0]["id"].as_str().unwrap_or_default().contains(':'),
+            "the id is file:seq: {body}"
+        );
+    }
+
+    /// **The tool must not eat a run's catch-up.** Serving this endpoint advances NO cursor, so a
+    /// mid-run peek cannot hide a hand-off from the teammate it was addressed to. Checked by
+    /// reading twice and getting the same answer, and by there being no cursor file at all.
+    #[tokio::test]
+    async fn room_reads_advance_no_cursor() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        room.append(&RoomMessage::room("@manager", chrono::Utc::now(), "news"))
+            .expect("append");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+
+        for _ in 0..2 {
+            let body = body_json(
+                reqwest::get(format!("{url}/api/v1/teams/room"))
+                    .await
+                    .expect("GET"),
+            )
+            .await;
+            assert_eq!(
+                body["messages"].as_array().map(Vec::len),
+                Some(1),
+                "a repeated read must return the same messages: {body}"
+            );
+        }
+        assert!(
+            !dir.0.join(DEFAULT_BANKS_SUBDIR).exists(),
+            "a tool read must write no cursor anywhere"
+        );
+    }
+
+    /// `limit` can only NARROW: it is clamped to the room's ceiling, so no caller can widen the
+    /// window §0.5 calls non-negotiable, and `0` means the default rather than "nothing".
+    #[tokio::test]
+    async fn room_limit_narrows_and_never_widens() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        for n in 0..(MAX_ROOM_WINDOW + 10) {
+            room.append(&RoomMessage::room(
+                "@manager",
+                chrono::Utc::now(),
+                format!("m{n}"),
+            ))
+            .expect("append");
+        }
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+
+        let count = |q: &str| {
+            let url = format!("{url}/api/v1/teams/room{q}");
+            async move {
+                body_json(reqwest::get(url).await.expect("GET")).await["messages"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default()
+            }
+        };
+        assert_eq!(count("?limit=3").await, 3);
+        assert!(count("?limit=0").await > 0, "0 is the default, not nothing");
+        assert_eq!(
+            count("?limit=100000").await,
+            MAX_ROOM_WINDOW,
+            "the ceiling cannot be widened from the wire"
+        );
+    }
+
+    /// An unparseable `limit` is a request for the DEFAULT window, not a 400 — so the route keeps
+    /// answering in this crate's envelope rather than falling through to axum's own extractor
+    /// error body, which no other read route here does.
+    #[tokio::test]
+    async fn room_tolerates_a_garbage_limit() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        room.append(&RoomMessage::room("@manager", chrono::Utc::now(), "news"))
+            .expect("append");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(mem),
+        ))
+        .await;
+
+        for q in ["?limit=abc", "?limit=", "?limit=-3"] {
+            let resp = reqwest::get(format!("{url}/api/v1/teams/room{q}"))
+                .await
+                .expect("GET");
+            assert_eq!(resp.status(), 200, "{q} should serve the default window");
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["messages"].as_array().map(Vec::len),
+                Some(1),
+                "{q}: {body}"
+            );
+        }
+    }
+
+    /// A daemon with Teams enabled but no room configured answers as an EMPTY room, not an error:
+    /// a room nobody has posted to and a room that cannot exist read the same.
+    #[tokio::test]
+    async fn no_room_configured_reads_as_an_empty_room() {
+        let dir = TempDir::new();
+        let url = spawn_with(teams_memory(&dir)).await;
+        let resp = reqwest::get(format!("{url}/api/v1/teams/room"))
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["messages"].as_array().map(Vec::len), Some(0), "{body}");
+    }
+
+    /// Teams off ⇒ `teams_disabled`, exactly like every other `teams_*` route.
+    #[tokio::test]
+    async fn room_is_teams_disabled_without_a_runtime() {
+        let url = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
+        let resp = reqwest::get(format!("{url}/api/v1/teams/room"))
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 409);
+        assert_eq!(err_code(resp).await, "teams_disabled");
+    }
+
+    /// The route is GET-only, like every other read route, and answers a 405 ENVELOPE rather than
+    /// falling through to the SPA fallback (this crate's method-agnostic registration rule).
+    #[tokio::test]
+    async fn room_refuses_a_post() {
+        let dir = TempDir::new();
+        let url = spawn_with(teams_memory(&dir)).await;
+        let resp = post(&format!("{url}/api/v1/teams/room"), "{}").await;
+        assert_eq!(resp.status(), 405);
     }
 }

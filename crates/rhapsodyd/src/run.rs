@@ -31,8 +31,8 @@ use rhapsody_tracker as tracker;
 
 use crate::bootcfg::{
     assignee_label, banner_color_enabled, open_store, resolve_banks_dir, resolve_banner_data,
-    resolve_capabilities_path, resolve_profiles_dir, resolve_server_port, resolve_teams_path,
-    workflow_dir,
+    resolve_capabilities_path, resolve_profiles_dir, resolve_room_dir, resolve_server_port,
+    resolve_teams_path, workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -172,6 +172,13 @@ where
         // * `teams_memory` is the `dyn MemoryBackend` the OFF-LOOP `/api/v1/teams/*` handlers drive.
         //
         // Neither creates anything: the banks directory appears on the first `retain` (§2.1).
+        //
+        // Rhapsody Teams room (STUDIO-650, T5) is installed alongside on the same terms and with
+        // the same split: `teams_room` + `teams_cursors` are the CONCRETE local types the dispatch
+        // path catches up from, and the shared `TeamsMemory` gets a `dyn RoomLog` for the off-loop
+        // `GET /api/v1/teams/room`. Nothing is created: the room directory appears on the first
+        // append (which in this slice means the first triage post) and a cursor file only after a
+        // catch-up that actually rendered messages.
         install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags);
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
@@ -293,6 +300,8 @@ where
     // disabled spawn NOTHING, so those configurations have no task that could have a behaviour delta.
     // `install_probe` additionally holds it back in the hermetic daemon tests, which must never shell
     // out to a real `claude` — the same reason it gates the BO-59 credential probe above.
+    let triage_room = resolve_room_dir(resolved.as_ref(), &flags.db, flags.no_store)
+        .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
     let triage_task = if spawn_triage(install_probe, &teams_cfg) {
         let triage_ctx = shutdown.wait();
         let triage_handle = handle.clone();
@@ -312,6 +321,10 @@ where
             tracker_api_key,
             interval: rhapsody_orchestrator::TRIAGE_INTERVAL,
             max_backoff_ms: rhapsody_orchestrator::MAX_TRIAGE_BACKOFF_MS,
+            // The room triage posts its decisions to (STUDIO-650, T5). Resolved here rather than
+            // taken from `o` because the orchestrator has already moved into the control task by
+            // this point; both resolve the same directory through `resolve_room_dir`.
+            room: triage_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
         };
         Some(tokio::spawn(async move {
             rhapsody_orchestrator::run_triage_schedule(triage_ctx, deps).await;
@@ -617,9 +630,50 @@ fn install_teams_memory(
         Some(b) => Arc::clone(b) as Arc<dyn MemoryBackend>,
         None => Arc::new(NoneBackend),
     };
-    o.teams_memory = Some(Arc::new(
-        rhapsody_orchestrator::teamsmemory::TeamsMemory::new(Arc::new(teams_cfg.clone()), backend),
-    ));
+    // The room (STUDIO-650, T5). Independent of `memory.backend`: a roster running with
+    // `backend: none` still has a room, because the room is the team's shared log rather than any
+    // one identity's memory. Only the absence of an on-disk runtime home turns it off.
+    let room = resolve_room_dir(resolved, &flags.db, flags.no_store)
+        .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
+    // A backstop rather than a live branch: this function is only reached from inside
+    // `resolve_teams_path(..).is_some()`, which already required the same runtime home, so today
+    // `room` is always `Some` here. It stays because the two resolutions are independent and a
+    // future call site need not carry that guarantee.
+    if room.is_none() {
+        tracing::warn!(
+            "teams room: there is no on-disk runtime home to anchor ~/.rhapsody/teams/room/ to \
+             (storage off / in-memory); the room is disabled for this daemon"
+        );
+    }
+    // Cursors live in the identity's own state (§0.11.4), resolved by the SAME rule the banks use
+    // so a teammate's watermark lands beside its records — including the roster's `bank:`
+    // overrides. Resolved even when `memory.backend` is not `local`, because a cursor is the room's
+    // state, not memory's.
+    let cursors = resolve_banks_dir(resolved, &teams_cfg.memory.path, &flags.db, flags.no_store)
+        .map(|dir| {
+            Arc::new(
+                rhapsody_config::room::Cursors::new(dir, teams_cfg.memory.bank_prefix.clone())
+                    .with_bank_overrides(
+                        teams_cfg
+                            .roster
+                            .iter()
+                            .map(|i| (i.name.clone(), i.bank.clone())),
+                    ),
+            )
+        });
+    // Both handles or neither: a room with no cursor home would re-read the same bounded window on
+    // every run forever, which reads to an operator as the room being broken rather than as the
+    // watermark being unwritable.
+    if let (Some(room), Some(cursors)) = (room.as_ref(), cursors.as_ref()) {
+        o.teams_room = Some(Arc::clone(room));
+        o.teams_cursors = Some(Arc::clone(cursors));
+    }
+    let mut mem =
+        rhapsody_orchestrator::teamsmemory::TeamsMemory::new(Arc::new(teams_cfg.clone()), backend);
+    if let Some(room) = room {
+        mem = mem.with_room(room as Arc<dyn rhapsody_config::room::RoomLog>);
+    }
+    o.teams_memory = Some(Arc::new(mem));
 }
 
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {

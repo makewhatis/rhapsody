@@ -12,7 +12,7 @@ use axum::routing::any;
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::teamsmemory::{
-    InvalidateView, RecallView, RetainView, RosterView, TeamsMemoryError,
+    InvalidateView, RecallView, RetainView, RoomView, RosterView, TeamsMemoryError,
 };
 use rhapsody_orchestrator::{
     HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot,
@@ -31,7 +31,8 @@ use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
 use crate::handlers_teams::{
-    handle_run_retain, handle_teams_invalidate, handle_teams_recall, handle_teams_roster,
+    handle_run_retain, handle_teams_invalidate, handle_teams_recall, handle_teams_room,
+    handle_teams_roster,
 };
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
@@ -159,6 +160,12 @@ pub trait StateProvider: Send + Sync {
         _identity: &str,
         _query: &str,
     ) -> Result<RecallView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// The newest posts in the team room (`GET /api/v1/teams/room`, STUDIO-650 T5). Read-only:
+    /// serving it advances no identity's cursor.
+    async fn teams_room(&self, _limit: usize) -> Result<RoomView, TeamsMemoryError> {
         Err(TeamsMemoryError::Disabled)
     }
 
@@ -315,6 +322,9 @@ where
         .route("/api/v1/teams/roster", any(handle_teams_roster))
         .route("/api/v1/teams/recall", any(handle_teams_recall))
         .route("/api/v1/teams/invalidate", any(handle_teams_invalidate))
+        // The team room's read side (STUDIO-650, T5): a bounded, read-only peek that advances no
+        // identity's cursor.
+        .route("/api/v1/teams/room", any(handle_teams_room))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.

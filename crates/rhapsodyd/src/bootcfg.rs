@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use chrono::Duration;
 use rhapsody_config::memory::DEFAULT_BANKS_SUBDIR;
+use rhapsody_config::room::DEFAULT_ROOM_SUBDIR;
 use rhapsody_config::{Config, decode, go_duration_string, resolve, resolve_projects, workflow};
 use rhapsody_core::Viewer;
 use rhapsody_store::{Noop, Sqlite, Store, StorePath, parse_store_path};
@@ -158,6 +159,26 @@ pub fn resolve_banks_dir(
         return Some(PathBuf::from(memory_path));
     }
     resolve_runtime_home_file(cfg, db_override, no_store, DEFAULT_BANKS_SUBDIR)
+}
+
+/// Resolves the Rhapsody Teams ROOM directory (STUDIO-650, T5; design record §0.11.4:
+/// `~/.rhapsody/teams/room/`).
+///
+/// Deliberately **not** parameterised on `memory.path`, unlike [`resolve_banks_dir`]: banks are
+/// per-identity memory and an operator may legitimately point them at another disk, but the room is
+/// one shared log for the whole roster and `teams.yaml` has no key for it. It therefore always sits
+/// in the runtime home beside `teams.yaml`, `teams/profiles/` and `teams/banks/`. `None` (a
+/// disabled / in-memory store, or a failed config load) means there is no durable home to anchor a
+/// room to, so the room stays off rather than writing somewhere arbitrary.
+///
+/// Naming the directory does not create it: the room appears on the first append and at no other
+/// time (§2.1's rule, carried into the room).
+pub fn resolve_room_dir(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, DEFAULT_ROOM_SUBDIR)
 }
 
 /// The shared path decision behind [`resolve_capabilities_path`] and [`resolve_teams_path`]: `file`

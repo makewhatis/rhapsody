@@ -103,6 +103,8 @@ impl Facade {
                 "teams_recall",
                 "teams_invalidate",
                 "teams_retain",
+                // STUDIO-650, T5: the room's read side, gated by exactly the same removal.
+                "teams_room_read",
             ] {
                 tool_router.remove_route(name);
             }
