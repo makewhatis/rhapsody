@@ -36,12 +36,40 @@ pub(crate) struct VersionJson {
     pub built_at: &'static str,
 }
 
-/// This binary's build identity, as served. Constant for the life of the process.
+/// This binary's build identity. Constant for the life of the process.
 pub(crate) fn current() -> VersionJson {
     VersionJson {
         version: VERSION,
         commit: COMMIT,
         built_at: BUILT_AT,
+    }
+}
+
+/// The full `GET /api/v1/version` body: the build identity, flattened, plus the one **runtime**
+/// bit a client must know before it may fetch anything else (STUDIO-652).
+///
+/// Why a feature flag rides on the version route: a Teams-off dashboard must issue **zero**
+/// requests against `/api/v1/teams*` — asking a Teams endpoint whether Teams is on is exactly the
+/// poll-to-learn-it-is-off the acceptance forbids. The alternative home, `/api/v1/state`, is
+/// byte-pinned to the Go daemon's `api/state.json` golden and can carry no Rhapsody-only key at
+/// all. `/version` is already additive, already Rhapsody-only, and already fetched exactly once at
+/// shell mount for the build stamp — so the gate rides along for no extra round-trip.
+///
+/// Flattened rather than nested so the three build fields keep their existing top-level names: a
+/// client reading `version`/`commit`/`built_at` today sees no change.
+#[derive(Serialize)]
+pub(crate) struct VersionResponse {
+    #[serde(flatten)]
+    pub build: VersionJson,
+    /// Rhapsody Teams is configured and on (`~/.rhapsody/teams.yaml` with `enabled: true`).
+    pub teams_enabled: bool,
+}
+
+/// The served `GET /api/v1/version` body.
+pub(crate) fn response(teams_enabled: bool) -> VersionResponse {
+    VersionResponse {
+        build: current(),
+        teams_enabled,
     }
 }
 
