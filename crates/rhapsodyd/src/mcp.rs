@@ -3,16 +3,20 @@
 //!
 //! It resolves the SAME WORKFLOW.md the daemon uses (positional arg / `SYMPHONY_WORKFLOW` / default)
 //! to learn the loopback base URL (`server.port`, or the live `runtime.json` port) and which write
-//! tools are enabled, then serves until the peer disconnects or `ctx` is cancelled. It never touches
-//! `~/.rhapsody` or the DB — all state comes from the daemon's loopback HTTP API (INF-473). stdout is
-//! the MCP transport; errors go to stderr.
+//! tools are enabled, then serves until the peer disconnects or `ctx` is cancelled. All run/issue
+//! state comes from the daemon's loopback HTTP API (INF-473) — it never opens the DB. stdout is the
+//! MCP transport; errors go to stderr.
+//!
+//! It reads exactly two files under `~/.rhapsody`, both read-only and both because a tool set has to
+//! be decided before there is anything to ask the daemon: `runtime.json` for port discovery, and —
+//! since STUDIO-645 — `teams.yaml`, to decide whether the four `teams_*` tools are registered at all.
 
 use std::io::Write;
 use std::path::Path;
 
 use tracing_subscriber::fmt::MakeWriter;
 
-use rhapsody_config::{decode, workflow};
+use rhapsody_config::{decode, resolve, workflow};
 use rhapsody_mcp::{Client, Facade, Options, resolve_daemon_port};
 use rhapsody_orchestrator::CancelWait;
 
@@ -63,14 +67,44 @@ fn mcp_server_from_args(
     // published it (reflecting a dynamic/ephemeral --port), else `server.port` from WORKFLOW.md. The
     // discovery is the mcp crate's `resolve_daemon_port` — the port of mcp.go's `daemonPort` (INF-473).
     let client = Client::for_port(resolve_daemon_port(&cfg));
+    let teams_enabled = resolve_teams_enabled(&cfg, &path);
     let opts = Options {
         // "me" defaults: PR3's runner env injection sets these on dispatched workers so
         // symphony_run / symphony_ticket / symphony_run_status default to the worker's own run.
         default_run_id: getenv("SYMPHONY_RUN_ID"),
         default_issue: getenv("SYMPHONY_ISSUE"),
         now: None,
+        teams_enabled,
     };
     Ok(Facade::new(&cfg, client, opts))
+}
+
+/// Whether Rhapsody Teams is enabled for this facade process (STUDIO-645, T4).
+///
+/// The facade is a SEPARATE PROCESS from the daemon, so it resolves and loads `teams.yaml` itself —
+/// by the same bootcfg path rule the daemon uses ([`crate::bootcfg::resolve_teams_path`]), so the
+/// two can never disagree about where the file is. Read-only and never seeded: an absent file is the
+/// off state and stays absent (§2.1). Teams off ⇒ `Facade::new` removes every `teams_*` route and
+/// `list_tools` is byte-identical to a build that predates Teams (§6.7).
+///
+/// Deciding this here is unavoidable: an MCP tool set is fixed at registration time, and there is no
+/// endpoint the facade could ask before it has registered anything.
+///
+/// **The config must be RESOLVED first.** `storage.path` is defaulted and tilde-expanded by
+/// `rhapsody_config::resolve`, not by `decode`, and `resolve_teams_path` derives the runtime home
+/// from it — so handing this a decoded-only config would leave `storage.path` empty, resolve to
+/// `None`, and silently pin Teams off for every agent. That is the worst failure shape available: a
+/// feature that never appears rather than one that fails loudly. A resolve failure is NOT fatal: it
+/// simply means Teams stays off, exactly as an absent file does.
+fn resolve_teams_enabled(cfg: &rhapsody_config::Config, workflow_path: &str) -> bool {
+    resolve(
+        cfg.clone(),
+        &crate::bootcfg::workflow_dir(Path::new(workflow_path)),
+    )
+    .ok()
+    .and_then(|r| crate::bootcfg::resolve_teams_path(Some(&r), "", false))
+    .map(|p| rhapsody_config::teams::Teams::load(&p).enabled)
+    .unwrap_or(false)
 }
 
 /// Resolves the MCP workflow path, mirroring the daemon's resolution: a positional arg wins, else
@@ -125,18 +159,31 @@ mod tests {
     // tool set (always-on reads + the `mcp:`-gated writes, threading SYMPHONY_RUN_ID/ISSUE) is the
     // mcp crate's `Facade::new` behavior, covered exhaustively by that crate's facade tests
     // (`read_tools_always_registered` + the `mcp:` gating tests); this asserts the F1 wiring feeds it.
-    #[test]
-    fn mcp_server_from_args_builds_facade_on_valid_workflow() {
-        let dir = TempDir::new();
+    /// A hermetic workflow: every runtime path (`workspace.root`, `logging.dir`, `storage.path`)
+    /// is pinned INSIDE `dir`.
+    ///
+    /// `storage.path` matters more here than it looks: the Teams gating below derives the runtime
+    /// home from it, so a workflow that omits it would resolve to the operator's real
+    /// `~/.rhapsody` and make the test's answer depend on whatever `teams.yaml` that machine
+    /// happens to have. The load is read-only and never seeds, so it could not corrupt anything —
+    /// but it would make the test lie on one machine and pass on another.
+    fn hermetic_workflow(dir: &TempDir) -> std::path::PathBuf {
         let wf = dir.child("WORKFLOW.md");
         std::fs::write(
             &wf,
             format!(
-                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nserver:\n  port: 8799\nworkspace:\n  root: {}\n---\nDo {{{{ issue.identifier }}}}.\n",
-                dir.path.display()
+                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nserver:\n  port: 8799\nworkspace:\n  root: {root}\nlogging:\n  dir: {root}\nstorage:\n  path: {root}/rhapsody.db\n---\nDo {{{{ issue.identifier }}}}.\n",
+                root = dir.path.display()
             ),
         )
         .expect("write WORKFLOW.md");
+        wf
+    }
+
+    #[test]
+    fn mcp_server_from_args_builds_facade_on_valid_workflow() {
+        let dir = TempDir::new();
+        let wf = hermetic_workflow(&dir);
         let getenv = |k: &str| match k {
             "SYMPHONY_RUN_ID" => "7".to_string(),
             "SYMPHONY_ISSUE" => "INF-1".to_string(),
@@ -146,6 +193,78 @@ mod tests {
         assert!(
             mcp_server_from_args(&args, getenv).is_ok(),
             "mcp_server_from_args should build the facade for a valid workflow"
+        );
+    }
+
+    /// **§6.7 / §2.4 row 7 at the composition root.** The facade turns its four `teams_*` tools on
+    /// from `teams.yaml` — resolved by the SAME bootcfg rule the daemon uses — and an absent file is
+    /// the off state, read without creating anything.
+    #[test]
+    fn teams_gating_follows_the_daemons_teams_yaml() {
+        let dir = TempDir::new();
+        let wf = hermetic_workflow(&dir);
+        let cfg = decode(&workflow::load(&wf).expect("load")).expect("decode");
+        let teams_yaml = std::path::Path::new(&dir.path).join("teams.yaml");
+
+        // Absent ⇒ off, and reading it creates nothing (§2.1).
+        assert!(!teams_yaml.exists());
+        assert!(
+            !resolve_teams_enabled(&cfg, &wf.to_string_lossy()),
+            "an absent teams.yaml must leave Teams off"
+        );
+        assert!(
+            !teams_yaml.exists(),
+            "resolving the toggle must never seed teams.yaml"
+        );
+
+        // Present but off ⇒ still off.
+        std::fs::write(&teams_yaml, "enabled: false\n").expect("write teams.yaml");
+        assert!(!resolve_teams_enabled(&cfg, &wf.to_string_lossy()));
+
+        // Enabled ⇒ on.
+        std::fs::write(
+            &teams_yaml,
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        assert!(
+            resolve_teams_enabled(&cfg, &wf.to_string_lossy()),
+            "an enabled teams.yaml beside the store must turn Teams on"
+        );
+
+        // A malformed file is the off state plus a complaint, never a crash — `Teams::load` is
+        // total, and the facade must still serve its pre-Teams tool set.
+        std::fs::write(&teams_yaml, "enabled: true\nroster: [[[\n").expect("write teams.yaml");
+        assert!(
+            !resolve_teams_enabled(&cfg, &wf.to_string_lossy()),
+            "a malformed teams.yaml must fall back to off, not panic"
+        );
+    }
+
+    /// The gating reads the RESOLVED `storage.path`. A workflow that leaves `storage.path` off
+    /// resolves to the runtime-home default rather than to nothing — the bug this guards against is
+    /// passing a decoded-only config, which would leave the path empty and pin Teams off forever.
+    #[test]
+    fn teams_gating_uses_the_resolved_storage_path() {
+        let dir = TempDir::new();
+        let wf = dir.child("WORKFLOW.md");
+        std::fs::write(
+            &wf,
+            format!(
+                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nworkspace:\n  root: {root}\nstorage:\n  path: {root}/nested/rhapsody.db\n---\nDo it.\n",
+                root = dir.path.display()
+            ),
+        )
+        .expect("write WORKFLOW.md");
+        let cfg = decode(&workflow::load(&wf).expect("load")).expect("decode");
+        // Unresolved, `storage.path` is whatever the front matter said; the point is that the
+        // helper resolves and lands beside the DB, not beside the workflow.
+        let nested = std::path::Path::new(&dir.path).join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested");
+        std::fs::write(nested.join("teams.yaml"), "enabled: true\n").expect("write teams.yaml");
+        assert!(
+            resolve_teams_enabled(&cfg, &wf.to_string_lossy()),
+            "teams.yaml must be read from the resolved store directory"
         );
     }
 

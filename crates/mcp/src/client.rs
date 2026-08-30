@@ -177,6 +177,18 @@ impl Client {
         self.do_request(reqwest::Method::GET, path, None).await
     }
 
+    /// POSTs an already-encoded JSON `payload` to `path`, returning the raw 2xx body. The generic
+    /// form behind the Rhapsody Teams write tools (STUDIO-645), whose bodies vary per tool; the
+    /// Go-parity `post_message` / `post_action` keep their own named helpers.
+    pub(crate) async fn post_json(
+        &self,
+        path: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, FacadeError> {
+        self.do_request(reqwest::Method::POST, path, Some(payload))
+            .await
+    }
+
     /// Fetches and decodes `GET /api/v1/state` (client.go's `getState`).
     pub(crate) async fn get_state(&self) -> Result<StateResp, FacadeError> {
         let raw = self.get("/api/v1/state").await?;
