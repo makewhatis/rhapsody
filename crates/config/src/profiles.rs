@@ -14,7 +14,8 @@
 //! # The upgrade strategy: layered defaults with explicit fork (§4)
 //!
 //! Built-in profiles ship compiled into the binary and are **versioned**
-//! ([`builtin_profiles`]: `swe@1`, `reviewer@1`, `sre@1`). A user's file is an
+//! ([`builtin_profiles`]: `swe`, `reviewer`, `sre`, each shipping v1 and — since
+//! T4 taught every role to retain (§5.1) — v2). A user's file is an
 //! **overlay** on one of them:
 //!
 //! * `extends: swe` — track the newest built-in. Fields the user never set
@@ -171,6 +172,43 @@ const BUILTINS: &[BuiltinProfile] = &[
         capabilities: &["systematic-debugging", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/sre.v1.md"),
+    },
+    // v2 (STUDIO-645, T4): every role gains the "retain what the next run will
+    // need" section — the prose half of §5.1's split, where Rhapsody supplies
+    // the evidence and the agent supplies the words. Shipped as ADDED files, as
+    // §4 requires: `swe@1` still resolves byte-for-byte for anyone who pinned
+    // it, and `extends: swe` picks these up on upgrade for free.
+    BuiltinProfile {
+        name: "swe",
+        version: 2,
+        model: "",
+        effort: "",
+        capabilities: &[
+            "design-first",
+            "test-coverage",
+            "code-review",
+            "adversarial-verify",
+        ],
+        tools: &[],
+        body: include_str!("profiles/builtin/swe.v2.md"),
+    },
+    BuiltinProfile {
+        name: "reviewer",
+        version: 2,
+        model: "",
+        effort: "",
+        capabilities: &["code-review", "security-review", "simplify"],
+        tools: &[],
+        body: include_str!("profiles/builtin/reviewer.v2.md"),
+    },
+    BuiltinProfile {
+        name: "sre",
+        version: 2,
+        model: "",
+        effort: "",
+        capabilities: &["systematic-debugging", "adversarial-verify"],
+        tools: &[],
+        body: include_str!("profiles/builtin/sre.v2.md"),
     },
 ];
 
@@ -703,16 +741,42 @@ mod tests {
 
     // ---- built-ins ----
 
-    /// The shipped set is exactly §4's `swe@1`, `reviewer@1`, `sre@1`, each with
-    /// a real prompt body. Pinned here because the names are a user-facing
-    /// contract (`extends: swe`) and the versions are the thing pins name.
+    /// The shipped set is §4's three roles, each with a real prompt body.
+    /// Pinned here because the names are a user-facing contract
+    /// (`extends: swe`) and the versions are the thing pins name.
+    ///
+    /// T4 bumped every role to v2 (the "retain what the next run will need"
+    /// section, §5.1). **v1 is still listed, unedited**: §4's upgrade story is
+    /// that a bump is an ADDED file, so anyone who wrote `extends: swe@1` keeps
+    /// exactly the bytes they pinned.
     #[test]
-    fn builtins_are_swe_reviewer_sre_at_v1() {
+    fn builtins_ship_v1_and_v2_of_swe_reviewer_sre() {
         let got: Vec<(&str, u32)> = builtin_profiles()
             .iter()
             .map(|b| (b.name, b.version))
             .collect();
-        assert_eq!(got, vec![("swe", 1), ("reviewer", 1), ("sre", 1)]);
+        assert_eq!(
+            got,
+            vec![
+                ("swe", 1),
+                ("reviewer", 1),
+                ("sre", 1),
+                ("swe", 2),
+                ("reviewer", 2),
+                ("sre", 2)
+            ]
+        );
+        // Every v2 teaches the retain half of §5.1, and every v1 predates it.
+        for b in builtin_profiles() {
+            let teaches_retain = b.body.contains("teams_retain");
+            assert_eq!(
+                teaches_retain,
+                b.version >= 2,
+                "{}@{} must teach `teams_retain` iff it is v2 or newer",
+                b.name,
+                b.version
+            );
+        }
         for b in builtin_profiles() {
             assert!(
                 b.body.trim().len() > 400,
@@ -738,14 +802,22 @@ mod tests {
         let profiles = dir.path().join("teams").join("profiles");
         assert!(!profiles.exists());
 
+        // `extends`-less resolution takes the NEWEST built-in of that name, so
+        // this asserts against the newest rather than a fixed index — the whole
+        // point of §4's versioning is that the newest moves.
+        let newest_swe = builtin_profiles()
+            .iter()
+            .filter(|b| b.name == "swe")
+            .max_by_key(|b| b.version)
+            .expect("a swe built-in ships");
         let r = resolve(&profiles, "swe").expect("swe resolves from the built-in");
         assert_eq!(r.name, "swe");
-        assert_eq!(r.prompt, builtin_profiles()[0].body.trim());
+        assert_eq!(r.prompt, newest_swe.body.trim());
         assert_eq!(
             r.provenance.base,
             Some(BaseRef {
                 name: "swe".to_string(),
-                version: 1,
+                version: newest_swe.version,
                 pinned: false
             })
         );
@@ -1243,7 +1315,6 @@ mod tests {
             }],
             ..Teams::disabled()
         };
-        // The real registry ships only swe@1, so drift needs the synthetic one.
         let issue = RosterIssue::Drift {
             identity: "alice".to_string(),
             profile: "swe".to_string(),
@@ -1257,7 +1328,15 @@ mod tests {
             issue.to_string(),
             "alice's profile \"swe\" overlays swe@1; the built-in is now swe@2"
         );
-        // Against the SHIPPED registry there is no v2, so nothing is reported.
-        assert!(check_roster(&teams, p).is_empty());
+        // The SHIPPED registry now ships swe@2 too (T4's retain section), so
+        // this pin is real drift and the boot-time roster check reports it —
+        // exactly the operator warning §4 designed the pin to earn.
+        assert_eq!(
+            check_roster(&teams, p)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["alice's profile \"swe\" overlays swe@1; the built-in is now swe@2"]
+        );
     }
 }
