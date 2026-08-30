@@ -318,6 +318,7 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         workspace_mode: eff.workspace_mode.clone(),
         stack_context: String::new(),
         capabilities_section: String::new(),
+        teammate_section: String::new(),
         pr_label: eff.pr_label.clone(),
         // The review state a declared HANDOFF parks the ticket in (TRA-240). review_states is a
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
@@ -532,6 +533,15 @@ impl Orchestrator {
             self.schedule_tick(poll);
             return;
         }
+        // BO-59: agent credential-liveness preflight. A dead backend credential (e.g. an expired Claude
+        // OAuth login) skips ALL dispatch WITHOUT claiming anything, so an infrastructure fault fails
+        // fast instead of claim→dispatch→die every ~5 min. Runs BEFORE candidate fetch (nothing is
+        // claimed); cached per TTL; logs the transition + rate-limits the steady-state repeat itself, so
+        // this call site stays quiet rather than error-logging every 30s forever.
+        if !self.credential_preflight().await {
+            self.schedule_tick(poll);
+            return;
+        }
         // symphony.poll wraps this tick's candidate fetch + dispatch decisions (a short control-loop
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
@@ -557,6 +567,10 @@ impl Orchestrator {
             // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448,
             // O6 `message.rs`).
             self.deliver_mid_run_summons_tagged(&tagged);
+            // Teams memory re-grounding (STUDIO-645, T4): snapshot what the poller just observed
+            // so a recall rendered during THIS tick's dispatch can attach a ticket's current state
+            // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
+            self.record_issue_states(tagged.iter().map(|t| &t.iss));
             let (picked, reopen) = self.select_dispatch_multi_with_reopens(tagged);
             // Pool-mode picks (INF-477) win the single-claimant claim BEFORE dispatch; assignee-mode
             // picks dispatch immediately. Build owned routes before the `&mut self` dispatch.
@@ -616,6 +630,7 @@ impl Orchestrator {
         }
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
+        self.record_issue_states(issues.iter());
         let (active, reopen) = self.select_dispatch_with_reopens(issues);
         if self
             .eff
@@ -883,8 +898,9 @@ impl Orchestrator {
     /// links are P6; full agent-subprocess kill on cancel is validated e2e in O8).
     // The signature mirrors Go's flat `spawnWorker(wctx, iss, attempt, projectSlug, stackContext,
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
-    // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit. Bundling
-    // these into a struct would diverge from the Go parity shape for no behavioral gain.
+    // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
+    // STUDIO-643 threads `teammate_section` identically. Bundling these into a struct would diverge
+    // from the Go parity shape for no behavioral gain.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_worker(
         &self,
@@ -894,6 +910,7 @@ impl Orchestrator {
         project_slug: String,
         stack_context: String,
         capabilities_section: String,
+        teammate_section: String,
         started_at: DateTime<Utc>,
     ) {
         let Some(eff) = self.eff.as_ref() else {
@@ -902,6 +919,7 @@ impl Orchestrator {
         let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug));
         deps.stack_context = stack_context;
         deps.capabilities_section = capabilities_section;
+        deps.teammate_section = teammate_section;
         // Take this run's operator-message mailbox receiver (INF-250, O6): the worker drains it onto the
         // agent's held-open stdin. `None` for legacy / test-injected entries with no mailbox.
         let mut mailbox = self

@@ -104,6 +104,12 @@ pub struct WorkerDeps {
     /// Rendered capability-instruction text, prepended to the FIRST-turn prompt
     /// only, same as `stack_context`.
     pub capabilities_section: String,
+    /// The Rhapsody Teams identity header + resolved profile text, prepended to the FIRST-turn
+    /// prompt only, same as `capabilities_section` (STUDIO-643; design record
+    /// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §2.4 row 5). Empty whenever Teams is off,
+    /// nobody was routed, or the profile failed to resolve — and empty means the guard in
+    /// [`build_turn_prompt`] skips it, leaving the prompt byte-identical.
+    pub teammate_section: String,
     /// The GitHub label name the post-run labeler adds to every PR in this run's stack (AIE-301).
     pub pr_label: String,
     /// The review state a declared HANDOFF parks the ticket in (a review-state name; `None` ⇒ the
@@ -207,12 +213,19 @@ pub(crate) fn resolve_prompt_template(
 }
 
 /// Renders the full template on the first turn and returns fixed continuation guidance on later turns
-/// (upstream §7.1, §12.3). Non-empty `capabilities_section` (BO-12) and `stack_context` (INF-318) are
-/// prepended (as plain text, capabilities first) to the FIRST-turn prompt only. Mirrors Go
-/// `buildTurnPrompt`.
+/// (upstream §7.1, §12.3). Non-empty `capabilities_section` (BO-12), `teammate_section` (STUDIO-643)
+/// and `stack_context` (INF-318) are prepended (as plain text, in that order) to the FIRST-turn
+/// prompt only. Mirrors Go `buildTurnPrompt`.
+///
+/// The teammate section sits immediately after capabilities because §0.11.6 fixes that relative
+/// order (capabilities → teammate header → room catch-up → memory recall); the later two tenants and
+/// the composer that owns the total byte budget are T5's. **Every section is guarded by
+/// `if !x.is_empty()`**, so a daemon with Teams off produces a byte-identical prompt to one built
+/// before Teams existed — that guard IS the inertness proof (§2.4 row 5).
 pub(crate) fn build_turn_prompt(
     tmpl: &str,
     capabilities_section: &str,
+    teammate_section: &str,
     stack_context: &str,
     iss: &Issue,
     attempt: Option<i32>,
@@ -223,6 +236,10 @@ pub(crate) fn build_turn_prompt(
         let mut out = String::new();
         if !capabilities_section.is_empty() {
             out.push_str(capabilities_section);
+            out.push_str("\n\n");
+        }
+        if !teammate_section.is_empty() {
+            out.push_str(teammate_section);
             out.push_str("\n\n");
         }
         if !stack_context.is_empty() {
@@ -416,6 +433,7 @@ impl WorkerDeps {
             let p = match build_turn_prompt(
                 prompt_tmpl,
                 &self.capabilities_section,
+                &self.teammate_section,
                 &self.stack_context,
                 &issue,
                 attempt,
@@ -557,6 +575,7 @@ mod tests {
             workspace_mode: String::new(),
             stack_context: String::new(),
             capabilities_section: String::new(),
+            teammate_section: String::new(),
             pr_label: String::new(),
             review_handoff_state: None,
         }
@@ -599,10 +618,10 @@ mod tests {
     #[test]
     fn build_turn_prompt_first_vs_continuation() {
         let iss = issue("", "MT-1", "Todo");
-        let first = build_turn_prompt("Work {{ issue.identifier }}", "", "", &iss, None, 1)
+        let first = build_turn_prompt("Work {{ issue.identifier }}", "", "", "", &iss, None, 1)
             .expect("render");
         assert_eq!(first, "Work MT-1");
-        let cont = build_turn_prompt("Work {{ issue.identifier }}", "", "", &iss, None, 2)
+        let cont = build_turn_prompt("Work {{ issue.identifier }}", "", "", "", &iss, None, 2)
             .expect("render");
         assert_eq!(cont, CONTINUATION_GUIDANCE);
     }
@@ -613,10 +632,10 @@ mod tests {
     fn build_turn_prompt_stack_context() {
         let iss = issue("", "MT-2", "Todo");
         let stack = "STACK ON: feat/mt-1 (PR #7) — create your branch stacked on this predecessor.";
-        let first = build_turn_prompt("Work {{ issue.identifier }}", "", stack, &iss, None, 1)
+        let first = build_turn_prompt("Work {{ issue.identifier }}", "", "", stack, &iss, None, 1)
             .expect("render");
         assert_eq!(first, format!("{stack}\n\nWork MT-2"));
-        let cont = build_turn_prompt("Work {{ issue.identifier }}", "", stack, &iss, None, 2)
+        let cont = build_turn_prompt("Work {{ issue.identifier }}", "", "", stack, &iss, None, 2)
             .expect("render");
         assert_eq!(cont, CONTINUATION_GUIDANCE);
     }
@@ -626,10 +645,10 @@ mod tests {
     fn build_turn_prompt_capabilities_section() {
         let iss = issue("", "MT-3", "Todo");
         let caps = "## Required practices for this ticket\n\nReview your own diff.";
-        let first = build_turn_prompt("Work {{ issue.identifier }}", caps, "", &iss, None, 1)
+        let first = build_turn_prompt("Work {{ issue.identifier }}", caps, "", "", &iss, None, 1)
             .expect("render");
         assert_eq!(first, format!("{caps}\n\nWork MT-3"));
-        let cont = build_turn_prompt("Work {{ issue.identifier }}", caps, "", &iss, None, 2)
+        let cont = build_turn_prompt("Work {{ issue.identifier }}", caps, "", "", &iss, None, 2)
             .expect("render");
         assert_eq!(cont, CONTINUATION_GUIDANCE);
     }
@@ -640,8 +659,16 @@ mod tests {
         let iss = issue("", "MT-4", "Todo");
         let caps = "## Required practices for this ticket\n\nReview your own diff.";
         let stack = "STACK ON: feat/mt-1 (PR #7) — create your branch stacked on this predecessor.";
-        let first = build_turn_prompt("Work {{ issue.identifier }}", caps, stack, &iss, None, 1)
-            .expect("render");
+        let first = build_turn_prompt(
+            "Work {{ issue.identifier }}",
+            caps,
+            "",
+            stack,
+            &iss,
+            None,
+            1,
+        )
+        .expect("render");
         assert_eq!(first, format!("{caps}\n\n{stack}\n\nWork MT-4"));
     }
 

@@ -166,4 +166,42 @@ pub trait Tracker: Any + Send + Sync {
     /// DeleteComment removes a comment by ID, used to clean up a daemon's own claim comment
     /// (whether it won or lost the election) so stale claims don't accumulate. INF-477.
     async fn delete_comment(&self, comment_id: &str) -> Result<(), TrackerError>;
+
+    /// AddIssueLabel ADDS `label_name` to an issue, find-or-creating the label in `team_id` first
+    /// (Linear's add takes a label id, not a name). Rhapsody Teams' assignment write: the
+    /// `rhapsody:@<identity>` label IS the assignment (design record
+    /// `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.1), so this is the ONE mutation the
+    /// off-loop triage task performs. STUDIO-644.
+    ///
+    /// **Strictly additive, and that is a contract, not an implementation detail.** It must never
+    /// remove or replace a label the issue already carries — §0.11.1's human-conflict rule turns on
+    /// it ("the manager never edits or removes an existing `rhapsody:@` label"). Adding a label can
+    /// also never remove an issue from candidacy (required-labels is a subset check), which is why
+    /// the label, not the assignee field, is the assignment.
+    ///
+    /// Idempotent: an issue that already carries the label is a successful no-op.
+    ///
+    /// `team_id` is required because a Linear label is team-scoped and must be resolved (or
+    /// created) before it can be added — the same reason [`Tracker::move_issue_state`] takes one to
+    /// resolve a state name. Callers pass the issue's own `team_id`.
+    async fn add_issue_label(
+        &self,
+        issue_id: &str,
+        team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError>;
+
+    /// FetchOpenIssuesByLabels returns OPEN (non-terminal) issues in the configured project that
+    /// carry ANY of `label_names`, each with its `id`, `identifier` and `labels` populated —
+    /// §0.11.1's "one new, additive tracker read (fetch id+labels by label across states)".
+    ///
+    /// It backs Rhapsody Teams' per-identity load count: load is the number of open tickets
+    /// carrying `rhapsody:@<name>`, and one call over the whole roster's labels answers it for
+    /// every identity at once (the caller tallies client-side). An empty slice returns an empty
+    /// result with no API call, mirroring [`Tracker::fetch_issues_by_states`]. Read-only.
+    /// STUDIO-644.
+    async fn fetch_open_issues_by_labels(
+        &self,
+        label_names: &[String],
+    ) -> Result<Vec<Issue>, TrackerError>;
 }

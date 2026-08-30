@@ -32,6 +32,15 @@ pub struct Options {
     /// Overridable clock for tests; `None` ⇒ `Utc::now()` at call time (Go `Options.now`, nil ⇒
     /// `time.Now`).
     pub now: Option<DateTime<Utc>>,
+    /// Whether Rhapsody Teams is enabled (STUDIO-645, T4). Resolved by the `rhapsodyd mcp`
+    /// subcommand, which loads `~/.rhapsody/teams.yaml` by the SAME bootcfg path rule the daemon
+    /// uses — the facade is a separate process and has no other way to know.
+    ///
+    /// `false` (the default, and what an absent `teams.yaml` means) REMOVES all four `teams_*`
+    /// routes in [`Facade::new`], so `list_tools` is byte-identical to a build that predates Teams
+    /// (§6.7, §2.4 row 7). This lives on `Options` rather than `Config` deliberately: Teams is not
+    /// a `WORKFLOW.md` key, and adding one would put a new field in a parity-checked view.
+    pub teams_enabled: bool,
 }
 
 impl Options {
@@ -78,6 +87,20 @@ impl Facade {
         // mirror of the send-message gate, not the stop/resume opt-in gate.
         if !cfg.mcp.allow_handoff {
             tool_router.remove_route("symphony_handoff");
+        }
+        // Rhapsody Teams (STUDIO-645, T4): the same removal mechanism, gated on the toggle rather
+        // than on an `mcp:` key. Teams off ⇒ not one `teams_*` tool is registered, so the feature
+        // is invisible rather than merely inert and `list_tools` is byte-identical (§6.7).
+        tool_router.merge(Self::teams_router());
+        if !opts.teams_enabled {
+            for name in [
+                "teams_roster",
+                "teams_recall",
+                "teams_invalidate",
+                "teams_retain",
+            ] {
+                tool_router.remove_route(name);
+            }
         }
         Self {
             client,

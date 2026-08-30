@@ -265,6 +265,68 @@ query IssueAssignee($id: String!) {
   issue(id: $id) { assignee { id } }
 }"#;
 
+// ─── Rhapsody Teams label surface (STUDIO-644; no Go v0.4.0 counterpart) ───────────────────────
+//
+// These four documents back the two additive `Tracker` methods the off-loop triage task needs
+// (design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.1): find-or-create a
+// `rhapsody:@<identity>` label and ADD it to a ticket, and count open tickets per identity by
+// label. They are Rhapsody-only, so — unlike the ported documents above — they have no Go original
+// to be byte-identical to; they follow the same formatting so the file reads as one contract.
+
+/// `queryLabelsByName` — every issue label with an exact name, plus its owning team (`null` for a
+/// workspace-level label). Deliberately NOT team-filtered server-side: a `rhapsody:@alice` label an
+/// operator created at workspace level would be invisible to a team-scoped filter, and the adapter
+/// would then create a duplicate team label rather than reuse theirs. The caller prefers the
+/// team-scoped match, then the workspace-level one. STUDIO-644.
+pub const QUERY_LABELS_BY_NAME: &str = r#"
+query LabelsByName($name: String!, $first: Int!) {
+  issueLabels(first: $first, filter: { name: { eq: $name } }) {
+    nodes { id name team { id } }
+  }
+}"#;
+
+/// `mutationIssueLabelCreate` — creates a team-scoped issue label, the "create" half of
+/// find-or-create. STUDIO-644.
+pub const MUTATION_ISSUE_LABEL_CREATE: &str = r#"
+mutation CreateIssueLabel($teamId: String!, $name: String!) {
+  issueLabelCreate(input: { teamId: $teamId, name: $name }) {
+    success
+    issueLabel { id }
+  }
+}"#;
+
+/// `mutationIssueAddLabel` — ADDS one label to an issue.
+///
+/// `issueAddLabel` is chosen over `issueUpdate(labelIds:)` for a design reason, not a stylistic
+/// one: `issueUpdate` REPLACES the whole label set, so a lost-update race with a human editing
+/// labels could silently drop theirs. `issueAddLabel` is additive server-side, which is what
+/// §0.11.1's "never edits or removes an existing label" requires. STUDIO-644.
+pub const MUTATION_ISSUE_ADD_LABEL: &str = r#"
+mutation AddIssueLabel($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) { success }
+}"#;
+
+/// `queryOpenIssuesByLabels` — open (non-terminal) issues in the project carrying ANY of the named
+/// labels, with just the fields the per-identity load count needs (id, identifier, labels).
+/// "Open" is expressed by Linear state TYPE (`completed`/`canceled` excluded), which is config-free
+/// — state names vary per workspace, types do not, the same reasoning `queryBacklogCandidates`
+/// uses. Paginated. STUDIO-644.
+pub const QUERY_OPEN_ISSUES_BY_LABELS: &str = r#"
+query OpenIssuesByLabels($projectSlug: String!, $names: [String!], $first: Int!, $after: String) {
+  issues(
+    first: $first
+    after: $after
+    filter: { project: { slugId: { eq: $projectSlug } }, labels: { name: { in: $names } }, state: { type: { nin: ["completed", "canceled"] } } }
+  ) {
+    nodes {
+      id
+      identifier
+      labels { nodes { name } }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

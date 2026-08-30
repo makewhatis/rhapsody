@@ -42,12 +42,19 @@ async-trait = "0.1"
 # retry timers, and off-loop warning resolvers use `rt` (`tokio::spawn` / `JoinHandle`); the runtime
 # itself is provided by the `rhapsodyd` binary. Anticipated by the P5 plan's dep set; already in
 # Cargo.lock (agent/workspace/tracker depend on it).
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+# `process`: BO-59's dispatch credential probe spawns `claude -p 'reply with exactly: OK'` as an async
+# child (kill-on-drop so a timed-out probe is reaped). Already built for the `agent` crate's runner.
+tokio = { version = "1", features = ["sync", "time", "rt", "process"] }
 # serde_json powers the O4 `snapshot_json` view — the `/api/v1/state` wire render (`render(&Snapshot)
 # -> serde_json::Value`, mirroring Go httpapi `toStateJSON`). Following the config crate's
 # `effective_json` convention, the domain crate owns its wire view + parity gate and P6 reuses it
 # rather than reimplementing the serialization. `serde` is in the P5 plan's anticipated dep set;
 # `serde_json` (its JSON codec) is already in Cargo.lock via config/store — no new crate enters the tree.
+# serde (derive): the Rhapsody-only Teams memory views (`teamsmemory`) serialize straight to the
+# additive `/api/v1/teams/*` bodies. The parity-checked `/api/v1/state` render deliberately stays
+# hand-built in `snapshot_json` — this derive is only ever used by surfaces with no Go counterpart.
+# Already in Cargo.lock via config/store/core; no new external crate enters the tree.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]

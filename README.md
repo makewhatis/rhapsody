@@ -179,3 +179,48 @@ midnight as `since` (the dashboard does), and omitting it falls back to the daem
 midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would
 silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
 meaning, so the header's `cached = total − in − out` reconciliation still adds up.
+
+### Rhapsody Teams — an optional feature with no Go counterpart (STUDIO-639 … STUDIO-645)
+
+Teams gives a daemon named identities with shared profiles and per-identity memory. The frozen Go
+reference has none of it, so nothing here is a *difference* in ported behaviour — it is new surface,
+and it is listed for the same reason `GET /api/v1/version` is: it adds `/api/v1` routes and MCP
+tools that a reader comparing the two daemons will not find upstream.
+
+**The whole feature is off by default and off is the shipped state.** `~/.rhapsody/teams.yaml` is
+absent on a fresh install, absence means `enabled: false`, and nothing ever creates it — unlike
+`capabilities.yaml`, which is seeded on first read. With Teams off:
+
+| Surface | Off behaviour |
+| --- | --- |
+| `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
+| `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
+| `rhapsody.db` | no column, no table, no new row *kind* |
+| Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
+| Dispatch | `route()` is not called; the same issues dispatch in the same order |
+| MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
+| Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/` |
+
+Four **additive** Rhapsody-only endpoints back the memory tools; no existing payload changes shape
+and no golden moves. Each answers `409 teams_disabled` when Teams is off:
+
+| Endpoint | Serves |
+| --- | --- |
+| `GET /api/v1/teams/roster` | the roster, each identity's profile, and its live runs |
+| `GET /api/v1/teams/recall?identity=&query=` | one identity's retained memory, bounded |
+| `POST /api/v1/teams/invalidate` | mark one record non-valid, with the reason; reversible |
+| `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host |
+
+The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate` and `teams_retain`.
+`teams_retain` takes `content` and nothing else on purpose: the identity, ticket, run and commit are
+resolved by the daemon from the run id it injected into that worker, so a run dispatched as one
+identity cannot write into another's memory bank.
+
+Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
+because it works on a laptop with no cloud: append-only markdown records, one file per record, under
+`~/.rhapsody/teams/banks/<name>/`, in files a human can read and correct. The bank directory appears
+on the first retain and at no other time.
+
+**Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
+prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside
+this repo.

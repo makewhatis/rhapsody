@@ -15,6 +15,7 @@ mod claim;
 mod client;
 mod decode;
 mod errors;
+mod labels;
 mod move_state;
 mod normalize;
 mod projects;
@@ -99,6 +100,20 @@ impl crate::Tracker for Client {
     }
     async fn delete_comment(&self, comment_id: &str) -> Result<(), TrackerError> {
         claim::delete_comment(self, comment_id).await
+    }
+    async fn add_issue_label(
+        &self,
+        issue_id: &str,
+        team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError> {
+        labels::add_issue_label(self, issue_id, team_id, label_name).await
+    }
+    async fn fetch_open_issues_by_labels(
+        &self,
+        label_names: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        labels::fetch_open_issues_by_labels(self, label_names).await
     }
 }
 
