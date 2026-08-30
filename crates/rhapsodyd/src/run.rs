@@ -147,6 +147,10 @@ where
     // `dispatch_issue` its first consumer (routing); the profiles directory is resolved alongside so
     // a routed identity's profile can be rendered into the turn-1 prompt.
     let mut teams_cfg = rhapsody_config::teams::Teams::disabled();
+    // The off-loop memory prefetch wiring (STUDIO-660, T8): `Some` only for
+    // `memory.backend: hindsight` with a usable endpoint. Carried out of the Teams block so the
+    // task can be spawned beside triage and the quorum, where every other Teams task lives.
+    let mut teams_prefetch: Option<PrefetchWiring> = None;
     if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
         teams_cfg = match rhapsody_config::teams::Teams::try_load(&teams_path) {
             Ok(t) => t,
@@ -179,7 +183,12 @@ where
         // `GET /api/v1/teams/room`. Nothing is created: the room directory appears on the first
         // append (which in this slice means the first triage post) and a cursor file only after a
         // catch-up that actually rendered messages.
-        install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags);
+        // STUDIO-660, T8 adds a THIRD handle for `backend: hindsight` only, and it is the same
+        // split one more time: `teams_prefetch` is a bounded map of plain-data `Fact`s that the
+        // dispatch path reads non-blockingly, and the remote client that fills it lives on the
+        // off-loop prefetch task spawned below. `teams_bank` stays `None` for hindsight, so the
+        // control task still cannot reach a network backend by any path.
+        teams_prefetch = install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags);
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
     // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
@@ -362,7 +371,9 @@ where
         let quorum_ctx = shutdown.wait();
         let quorum_handle = handle.clone();
         let deps = rhapsody_orchestrator::QuorumDeps {
-            teams: Arc::new(teams_cfg),
+            // Cloned rather than moved: the prefetch task below is the third reader of the same
+            // boot-loaded config (Teams config is not hot-reloaded in this slice).
+            teams: Arc::new(teams_cfg.clone()),
             // Read lazily per request, exactly as triage reads its tracker per cycle: the handle is
             // built before the first reload, so the tracker arrives later.
             target: move || {
@@ -376,6 +387,39 @@ where
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::run_quorum_task(quorum_ctx, deps, rx).await;
+        })
+    });
+
+    // --- Rhapsody Teams memory prefetch (STUDIO-660, slice T8; design record §5, §5.4) ---
+    //
+    // The third off-loop Teams task, beside triage and the quorum, and spawned for exactly the same
+    // reason: `memory.backend: hindsight` puts the bank on the far side of a tailnet, and
+    // `dispatch_issue` runs inline on the single control task. So the recall happens HERE, ahead of
+    // time, and dispatch does nothing but a non-blocking read of what this task already fetched.
+    //
+    // `install_teams_memory` returning `Some` IS the gate: any other backend, an empty or malformed
+    // endpoint, Teams off, or an empty roster all yield `None`, and then no task exists to have a
+    // behaviour delta.
+    let prefetch_task = teams_prefetch.map(|w| {
+        let prefetch_ctx = shutdown.wait();
+        let prefetch_handle = handle.clone();
+        let deps = rhapsody_orchestrator::PrefetchDeps {
+            teams: Arc::new(teams_cfg),
+            // Read lazily each cycle, exactly as triage reads its tracker: the handle is built
+            // before the first reload, so the tracker arrives later.
+            target: move || {
+                prefetch_handle
+                    .reads_tracker()
+                    .map(|tracker| rhapsody_orchestrator::PrefetchTarget { tracker })
+            },
+            backend: w.backend,
+            cache: w.cache,
+            interval: rhapsody_orchestrator::PREFETCH_INTERVAL,
+            max_backoff_ms: rhapsody_orchestrator::MAX_PREFETCH_BACKOFF_MS,
+            now: Box::new(chrono::Utc::now),
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::run_prefetch_schedule(prefetch_ctx, deps).await;
         })
     });
 
@@ -397,6 +441,12 @@ where
     // The quorum task is cancelled by the same signal and checks it on both sides of its receive,
     // so the wait is bounded by whatever tracker write is already in flight.
     if let Some(t) = quorum_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // The prefetch task is cancelled by the same signal and checks it on both sides of its sleep as
+    // well as between candidates, so the wait is bounded by one remote recall — itself capped by
+    // `rhapsody_config::hindsight::REQUEST_TIMEOUT`.
+    if let Some(t) = prefetch_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // Drain the observability server (bounded, mirroring Go's 5s Shutdown ctx).
@@ -653,18 +703,73 @@ fn triage_agent_env(cfg: Option<&Config>) -> (String, bool, String) {
 /// Builds and installs the Teams memory handles (STUDIO-645, T4). A no-op when Teams is off — no
 /// backend is constructed, no path is resolved, nothing is created (§2.4 row 8: "there is no code
 /// path").
+/// What the off-loop memory prefetch task needs, built by [`install_teams_memory`] and spawned by
+/// [`run`] beside triage and the quorum (STUDIO-660, T8).
+///
+/// It exists so the ONE remote client the daemon builds is shared by both consumers — the off-loop
+/// `/api/v1/teams/*` handlers (through `TeamsMemory`) and the prefetch task — rather than each
+/// dialling its own connection pool at the same bank.
+struct PrefetchWiring {
+    backend: Arc<dyn rhapsody_config::memory::MemoryBackend>,
+    cache: Arc<rhapsody_orchestrator::PrefetchCache>,
+}
+
 fn install_teams_memory(
     o: &mut rhapsody_orchestrator::Orchestrator,
     teams_cfg: &rhapsody_config::teams::Teams,
     resolved: Option<&rhapsody_config::Config>,
     flags: &Flags,
-) {
+) -> Option<PrefetchWiring> {
+    use rhapsody_config::hindsight::HindsightBackend;
     use rhapsody_config::memory::{LocalBank, MemoryBackend, NoneBackend};
     use rhapsody_config::teams::MemoryBackend as BackendKind;
 
     if !teams_cfg.enabled {
-        return;
+        return None;
     }
+    // `backend: hindsight` — the shared cloud bank (§5.4). Built here and handed to BOTH the
+    // off-loop `TeamsMemory` surface and the prefetch task; `teams_bank` is deliberately left
+    // `None` below, so nothing on the control task can reach it.
+    //
+    // An empty endpoint is the one configuration that still runs memoryless, because there is
+    // nothing to dial. Anything else that fails to build (a malformed URL) does the same, loudly:
+    // a broken memory endpoint must not be a startup failure.
+    let remote = match teams_cfg.memory.backend {
+        BackendKind::Hindsight if teams_cfg.memory.endpoint.trim().is_empty() => {
+            tracing::warn!(
+                "teams memory: backend is `hindsight` but `memory.endpoint` is empty, so there is \
+                 no bank to dial; running with no memory. Set `memory.endpoint` to the service \
+                 base URL (and `memory.api_key`, which the deployed service requires), or \
+                 `memory.backend: local` for on-disk banks."
+            );
+            None
+        }
+        BackendKind::Hindsight => {
+            match HindsightBackend::new(
+                &teams_cfg.memory.endpoint,
+                teams_cfg.memory.bank_prefix.clone(),
+                &teams_cfg.memory.api_key,
+            ) {
+                Ok(h) => Some(Arc::new(
+                    h.with_bank_overrides(
+                        teams_cfg
+                            .roster
+                            .iter()
+                            .map(|i| (i.name.clone(), i.bank.clone())),
+                    ),
+                )),
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        "teams memory: backend `hindsight` could not be built from \
+                         `memory.endpoint`; running with no memory"
+                    );
+                    None
+                }
+            }
+        }
+        BackendKind::Local | BackendKind::None => None,
+    };
     let banks = resolve_banks_dir(resolved, &teams_cfg.memory.path, &flags.db, flags.no_store);
     let bank = match (teams_cfg.memory.backend, banks) {
         (BackendKind::Local, Some(dir)) => Some(Arc::new(
@@ -682,23 +787,34 @@ fn install_teams_memory(
             );
             None
         }
-        (BackendKind::Hindsight, _) => {
-            tracing::warn!(
-                "teams memory: backend `hindsight` is not implemented yet (slice T8, blocked on \
-                 STUDIO-629's tailnet exposure); running with no memory. Set `memory.backend: \
-                 local` for on-disk banks."
-            );
-            None
-        }
+        // `hindsight` never takes a LOCAL bank, whether or not the remote one was built: its
+        // records live in the cloud. `resolve_banks_dir` is still consulted below for the room's
+        // cursors, which are the room's state rather than memory's.
+        (BackendKind::Hindsight, _) => None,
         (BackendKind::None, _) => None,
     };
     // The dispatch path only ever sees a LOCAL bank; `none` and `hindsight` leave it `None`, and
-    // the turn-1 prompt is then byte-identical to T3a's.
+    // the turn-1 prompt is then byte-identical to T3a's. For `hindsight` the facts arrive instead
+    // through `teams_prefetch`, filled off-loop and read non-blockingly (STUDIO-660).
     o.teams_bank = bank.as_ref().map(Arc::clone);
-    let backend: Arc<dyn MemoryBackend> = match &bank {
-        Some(b) => Arc::clone(b) as Arc<dyn MemoryBackend>,
-        None => Arc::new(NoneBackend),
+    let backend: Arc<dyn MemoryBackend> = match (&bank, &remote) {
+        (Some(b), _) => Arc::clone(b) as Arc<dyn MemoryBackend>,
+        (None, Some(h)) => Arc::clone(h) as Arc<dyn MemoryBackend>,
+        (None, None) => Arc::new(NoneBackend),
     };
+    // The prefetch cache, installed on the orchestrator ONLY when there is a remote bank to fill it
+    // and a roster to route to — the same gate the task's spawn uses, so the field and the task can
+    // never disagree about whether prefetching is on.
+    let wiring = remote
+        .filter(|_| rhapsody_orchestrator::prefetch_enabled(teams_cfg))
+        .map(|h| {
+            let cache = Arc::new(rhapsody_orchestrator::PrefetchCache::new());
+            o.teams_prefetch = Some(Arc::clone(&cache));
+            PrefetchWiring {
+                backend: h as Arc<dyn MemoryBackend>,
+                cache,
+            }
+        });
     // The room (STUDIO-650, T5). Independent of `memory.backend`: a roster running with
     // `backend: none` still has a room, because the room is the team's shared log rather than any
     // one identity's memory. Only the absence of an on-disk runtime home turns it off.
@@ -718,6 +834,12 @@ fn install_teams_memory(
     // so a teammate's watermark lands beside its records — including the roster's `bank:`
     // overrides. Resolved even when `memory.backend` is not `local`, because a cursor is the room's
     // state, not memory's.
+    //
+    // That includes `hindsight` (STUDIO-660): a remote memory bank does NOT move the room or its
+    // cursors to the cloud, and it does not make the local banks directory dead. `resolve_banks_dir`
+    // still anchors cursors under ~/.rhapsody/teams/banks/ regardless of backend, and any local bank
+    // contents a `local` deployment left behind stay exactly where they are — migrating them is its
+    // own (unwritten) ticket, never a side effect of flipping one config line.
     let cursors = resolve_banks_dir(resolved, &teams_cfg.memory.path, &flags.db, flags.no_store)
         .map(|dir| {
             Arc::new(
@@ -743,6 +865,7 @@ fn install_teams_memory(
         mem = mem.with_room(room as Arc<dyn rhapsody_config::room::RoomLog>);
     }
     o.teams_memory = Some(Arc::new(mem));
+    wiring
 }
 
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
@@ -1076,6 +1199,71 @@ mod tests {
         );
     }
 
+    // STUDIO-660 (Teams T8): a `memory.backend: hindsight` teams.yaml boots cleanly and dials
+    // NOTHING while it does. The endpoint here is a closed loopback port, so any request at all
+    // during boot would be a connection refused the run would have to survive — and the prefetch
+    // task deliberately waits out its first interval before a cycle, so there is none to survive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_starts_cleanly_with_a_hindsight_teams_yaml_without_dialling() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nmemory:\n  backend: hindsight\n  endpoint: http://127.0.0.1:9/mcp/\n               api_key: $RHAPSODY_NO_SUCH_VAR\nroster:\n  - name: alice\n    labels: [rust]\n",
+        )
+        .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "daemon should exit 0 on cancel; stderr={}",
+            buf.contents()
+        );
+        // And no local bank was created on the way: `hindsight` records live in the cloud, and the
+        // banks directory still appears only on a `local` retain.
+        assert!(
+            !std::path::Path::new(&dir.child("teams"))
+                .join("banks")
+                .exists(),
+            "a hindsight boot must create no local banks directory"
+        );
+    }
+
+    // The other half of the endpoint contract: `backend: hindsight` with NO endpoint keeps the
+    // pre-T8 warn-and-memoryless behaviour, and says which key is missing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hindsight_backend_with_no_endpoint_warns_and_runs_memoryless() {
+        let dir = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        let db = dir.child("rhapsody.db");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nmemory:\n  backend: hindsight\nroster:\n  - name: alice\n",
+        )
+        .expect("write teams.yaml");
+        let buf = SharedBuf::new();
+        assert_eq!(
+            run_briefly(
+                &["--db", &db.to_string_lossy(), &wf.to_string_lossy()],
+                &buf
+            )
+            .await,
+            0,
+            "stderr={}",
+            buf.contents()
+        );
+        let logged = buf.contents();
+        assert!(
+            logged.contains("memory.endpoint") && logged.contains("no memory"),
+            "the warning must name the missing key: {logged}"
+        );
+    }
+
     // STUDIO-645 (Teams T4), §5.4 + §2.4 row 8: which memory handles a boot installs is decided by
     // the toggle and `memory.backend` alone. This is the exact function `run` calls, so "off costs
     // nothing" is checked at the composition root rather than inferred from it.
@@ -1105,31 +1293,73 @@ mod tests {
         };
         let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
 
+        // (dispatch-path local bank, off-loop runtime, dispatch-path prefetch cache).
         let install = |teams: &Teams| {
             let mut o = rhapsody_orchestrator::Orchestrator::new(String::new());
-            install_teams_memory(&mut o, teams, cfg.as_ref(), &flags);
-            (o.teams_bank.is_some(), o.teams_memory.is_some())
+            let wiring = install_teams_memory(&mut o, teams, cfg.as_ref(), &flags);
+            assert_eq!(
+                wiring.is_some(),
+                o.teams_prefetch.is_some(),
+                "the returned wiring and the installed cache must agree: one gates the task's \
+                 spawn and the other gates the dispatch-path read, and a disagreement would mean \
+                 a cache nobody fills or a task nobody reads"
+            );
+            (
+                o.teams_bank.is_some(),
+                o.teams_memory.is_some(),
+                o.teams_prefetch.is_some(),
+            )
         };
 
         assert_eq!(
             install(&with(false, BackendKind::Local)),
-            (false, false),
+            (false, false, false),
             "Teams OFF installs nothing at all — not even the off-loop runtime"
         );
         assert_eq!(
             install(&with(true, BackendKind::Local)),
-            (true, true),
-            "`local` installs both the dispatch-path bank and the off-loop runtime"
+            (true, true, false),
+            "`local` installs both the dispatch-path bank and the off-loop runtime, and no cache"
         );
         assert_eq!(
             install(&with(true, BackendKind::None)),
-            (false, true),
+            (false, true, false),
             "`none` still serves the off-loop tools (as no-ops) but puts NO bank on the dispatch path"
         );
+
+        // STUDIO-660 (T8). `hindsight` NEVER takes the dispatch-path bank slot, whatever else it
+        // does — that is what makes "no network on the dispatch path" true by construction. What it
+        // installs instead depends on whether there is a bank to dial at all.
         assert_eq!(
             install(&with(true, BackendKind::Hindsight)),
-            (false, true),
-            "`hindsight` is T8: it must never reach the dispatch path, where it could not be awaited"
+            (false, true, false),
+            "`hindsight` with no endpoint runs memoryless, exactly as it did before T8"
+        );
+        let mut reachable = with(true, BackendKind::Hindsight);
+        reachable.memory.endpoint = "https://hindsight.example.ts.net".to_string();
+        reachable.roster = vec![rhapsody_config::teams::Identity {
+            name: "alice".to_string(),
+            ..rhapsody_config::teams::Identity::default()
+        }];
+        assert_eq!(
+            install(&reachable),
+            (false, true, true),
+            "`hindsight` with an endpoint drives the off-loop tools remotely and feeds dispatch \
+             through the prefetch cache — still with NO bank on the dispatch path"
+        );
+        let mut no_roster = reachable.clone();
+        no_roster.roster.clear();
+        assert_eq!(
+            install(&no_roster),
+            (false, true, false),
+            "an empty roster routes nothing, so there is nothing to prefetch for"
+        );
+        let mut malformed = reachable.clone();
+        malformed.memory.endpoint = "not a url".to_string();
+        assert_eq!(
+            install(&malformed),
+            (false, true, false),
+            "a malformed endpoint degrades to memoryless; it is never a startup failure"
         );
 
         // Installing handles creates nothing: the banks dir waits for the first retain.
