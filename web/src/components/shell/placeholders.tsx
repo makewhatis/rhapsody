@@ -1,10 +1,13 @@
-export type SettingsTabId = "general" | "projects" | "tools" | "logs" | "updates";
+export type SettingsTabId = "general" | "projects" | "teams" | "tools" | "logs" | "updates";
 
 // The shell shows one of two top-level views: the Runs dashboard (default) or Settings. There is
 // no longer a visible tab strip — Runs is the whole main area and the titlebar's gear button
 // toggles Settings (INF-… top-bar simplification). Kept as a named union so the state + tray
 // navigation stay typed.
-export type TopTabId = "runs" | "settings";
+// "teams" is added by STUDIO-652 and is reachable ONLY while the daemon reports Teams enabled —
+// the toolbar chip that navigates to it does not render otherwise, so a Teams-off app has exactly
+// the two views it had before.
+export type TopTabId = "runs" | "settings" | "teams";
 
 // The single top-level panel that holds whichever view (Runs or Settings) is active.
 export const TOP_PANEL_ID = "shell-top-panel";

@@ -15,7 +15,15 @@ import { RunDetail } from "./RunDetail";
 // The HTTP queries poll the daemon over /api regardless of host: in a plain browser the daemon
 // serves this UI from its own origin; under the Wails app the AssetServer reverse-proxies /api to
 // the sidecar (desktop apiProxyMiddleware), so the relative fetches reach the daemon either way.
-export function RunsView() {
+// Run-detail selection is normally RunsView's own state. The shell may lift it (STUDIO-652) so the
+// Teams panel can open a teammate's live run: pass both props to control it, or neither to keep the
+// self-contained behaviour every existing caller relies on.
+export interface RunsViewProps {
+  openRunId?: number | null;
+  onOpenRun?: (runID: number | null) => void;
+}
+
+export function RunsView({ openRunId: controlledRunId, onOpenRun }: RunsViewProps = {}) {
   const { data: state } = useStateQuery();
   const pollMs = state?.poll_interval_ms;
   // The Jobs list reads the ISSUE-level listing and the header reads the daemon's day totals — two
@@ -31,7 +39,9 @@ export function RunsView() {
   const maxTurns = config?.global?.agent.max_turns;
   const nowMs = useNow(1000);
   const summary = useDaySummary(nowMs, { refetchInterval: pollMs ?? 2000 });
-  const [openRunId, setOpenRunId] = React.useState<number | null>(null);
+  const [ownRunId, setOwnRunId] = React.useState<number | null>(null);
+  const openRunId = controlledRunId !== undefined ? controlledRunId : ownRunId;
+  const setOpenRunId: (id: number | null) => void = onOpenRun ?? setOwnRunId;
 
   if (openRunId != null) {
     // Run detail renders full-bleed too (mock 1d): the header, the edge-to-edge meta strip, and the

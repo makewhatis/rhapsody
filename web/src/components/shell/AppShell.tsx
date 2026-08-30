@@ -8,9 +8,11 @@ import { ToastProvider, useToast } from "./Toast";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useStateQuery } from "@/hooks/useStateQuery";
 import { useUpdater } from "@/hooks/useUpdater";
+import { useTeamsEnabled, useTeamsOverview, useVersionQuery } from "@/hooks/useTeams";
+import { TeamsPanel } from "@/components/teams/TeamsPanel";
+import { teamsChip } from "@/lib/teams-model";
 import { conductorStatus, viewForStatus } from "@/lib/daemon-status";
 import { appVersion, hasBridge, onNavigate, onShuttingDown, openExternal, type VersionDTO } from "@/lib/bindings";
-import { type DaemonVersion, fetchVersion } from "@/lib/api";
 import { stamp } from "@/lib/version-stamp";
 import { StatusDot } from "@/components/ui";
 
@@ -72,6 +74,16 @@ function ShellBody() {
   // The single in-app update model (P11-U3): the toolbar gear dot and the Settings "Updates" surface
   // share this one instance so a check/download in the panel and the gear badge never disagree.
   const updater = useUpdater();
+  // Rhapsody Teams (STUDIO-652). THE gate is `teams_enabled` on GET /api/v1/version — the one
+  // request the shell already makes at mount for the build stamp. While it is false the overview
+  // query below is disabled, so a Teams-off app issues ZERO requests against /api/v1/teams*, shows
+  // no chip, and is byte-for-byte the app it was before this ticket.
+  const teamsEnabled = useTeamsEnabled();
+  const teams = useTeamsOverview(teamsEnabled, data?.poll_interval_ms);
+  const teamsChipModel = teamsChip(teams.data);
+  // Run-detail selection is lifted out of RunsView so the Teams panel can open a teammate's live
+  // run in the SAME detail view the Jobs list uses — one run detail, reached two ways.
+  const [openRunId, setOpenRunId] = React.useState<number | null>(null);
 
   // The macOS tray's "Open Dashboard" / "Settings…" items emit tray:navigate; switch the
   // active route to match (a no-op in a plain browser, where the Wails runtime is absent).
@@ -156,6 +168,9 @@ function ShellBody() {
             setTopTab("settings");
             setSettingsTab("tools");
           }}
+          teams={teamsChipModel}
+          teamsActive={topTab === "teams"}
+          onOpenTeams={() => setTopTab(topTab === "teams" ? "runs" : "teams")}
         />
       )}
       {/* Always reserve the vertical scrollbar's width so the centered content (max-width 1180,
@@ -182,7 +197,7 @@ function ShellBody() {
           <div
             id={TOP_PANEL_ID}
             role="tabpanel"
-            aria-label={topTab === "runs" ? "Runs" : "Settings"}
+            aria-label={topTab === "runs" ? "Runs" : topTab === "teams" ? "Teams" : "Settings"}
             tabIndex={0}
             style={topTab === "runs" ? { outline: "none" } : { outline: "none", ...CONTENT_PAD }}
           >
@@ -196,7 +211,19 @@ function ShellBody() {
               )
             ) : null}
             {topTab === "runs" ? (
-              <RunsView />
+              <RunsView openRunId={openRunId} onOpenRun={setOpenRunId} />
+            ) : topTab === "teams" ? (
+              <TeamsPanel
+                pollMs={data?.poll_interval_ms}
+                onOpenRun={(runID) => {
+                  setOpenRunId(runID);
+                  setTopTab("runs");
+                }}
+                onOpenSettings={() => {
+                  setTopTab("settings");
+                  setSettingsTab("teams");
+                }}
+              />
             ) : (
               <Settings tab={settingsTab} onTab={setSettingsTab} onBack={() => setTopTab("runs")} updater={updater} />
             )}
@@ -286,15 +313,14 @@ function ShutdownOverlay() {
 // the shell stamp it also renders in a plain browser.
 function VersionFooter() {
   const [app, setApp] = React.useState<VersionDTO | null>(null);
-  const [daemon, setDaemon] = React.useState<DaemonVersion | null>(null);
   React.useEffect(() => {
     void appVersion().then(setApp);
-    // A daemon that is down or too old to serve this route simply leaves the stamp off; the footer
-    // is diagnostic furniture and must never surface an error or white-screen the shell.
-    void fetchVersion()
-      .then(setDaemon)
-      .catch(() => {});
   }, []);
+  // The daemon stamp comes from the SHARED version query (STUDIO-652) rather than a second fetch of
+  // its own, so the footer and the Teams gate cost exactly one request between them. A daemon that
+  // is down or too old to serve the route simply leaves the stamp off; the footer is diagnostic
+  // furniture and must never surface an error or white-screen the shell.
+  const daemon = useVersionQuery().data ?? null;
   if (!app && !daemon) return null;
 
   const appLabel = app ? stamp(app.version, app.commit) : "";
