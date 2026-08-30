@@ -5,6 +5,7 @@ import { formatDateTime } from "@/lib/format";
 import { errText, roomAuthorLine } from "@/lib/teams-model";
 import {
   useInvalidateFact,
+  usePostToRoom,
   useTeamsOverview,
   useTeamsRecall,
   useTeamsRoom,
@@ -20,9 +21,11 @@ import type { TeamsFact, TeamsRosterRow } from "@/lib/api";
 // would answer `teams_disabled`. On a Teams-off daemon this component never mounts and the app
 // makes no request against /api/v1/teams* at all.
 //
-// Nothing here writes except the invalidate button. Teammates post through `teams_post` (T6), but
-// this panel gets no compose box: a post from the UI has no run identity, so the host could only
-// stamp it as a *human* post, and that provenance question (design §0.11.4) is still open.
+// Two things here write: the invalidate button, and — since STUDIO-661 — the room's compose box.
+// A post from this panel has no run to resolve an identity through, so the daemon stamps the
+// reserved name `operator` on it (design §0.5, §0.11.4); the request carries no author field at
+// all. It is an async standup note, not an instruction: a live agent is told things through the
+// operator-message mailbox, while the room reaches whoever wakes up next, quoted and attributed.
 export interface TeamsPanelProps {
   /** Poll cadence, matched to the daemon's own poll interval when known. */
   pollMs?: number;
@@ -67,12 +70,12 @@ export function TeamsPanel({ pollMs, onOpenRun, onOpenSettings }: TeamsPanelProp
 
       <SectionCard
         title="The room"
-        desc="What the team recorded, newest last. Read-only here — teammates post with `teams_post`, but a post from this panel would have no run identity."
+        desc="What the team recorded, newest last. Anything you post here goes in as `operator` and reaches each teammate on their next waking — it is an async note to the team, not an instruction to a running agent."
       >
         {room.isError ? (
           <Note>Could not read the room: {errText(room.error)}</Note>
         ) : (room.data?.messages.length ?? 0) === 0 ? (
-          <Note>{room.isLoading ? "Loading the room…" : "Nothing has been posted yet — teammates post to the room with `teams_post`."}</Note>
+          <Note>{room.isLoading ? "Loading the room…" : "Nothing has been posted yet — teammates post with `teams_post`, and you can post below."}</Note>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {room.data?.messages.map((m) => (
@@ -83,6 +86,7 @@ export function TeamsPanel({ pollMs, onOpenRun, onOpenSettings }: TeamsPanelProp
         {(room.data?.skipped.length ?? 0) > 0 ? (
           <Note>{room.data?.skipped.length} log line(s) could not be parsed and were skipped.</Note>
         ) : null}
+        <RoomCompose />
       </SectionCard>
 
       <MemoryCard identity={identity} />
@@ -251,6 +255,101 @@ function RoomPost({ authorLine, body, refs }: { authorLine: string; body: string
       ) : null}
     </blockquote>
   );
+}
+
+// RoomCompose — the operator's own line into the room (STUDIO-661), the compose box STUDIO-652
+// deferred while the authorship question was open. It is now answered: the daemon stamps
+// `operator`, and this form carries no author field to argue with.
+//
+// Room-wide only, so there is no recipient picker: a live agent already has the operator-message
+// mailbox, and an async direct note to a sleeping teammate is an unproven need. The refs field is
+// the same "what proves it" pointer a teammate attaches (design §0.10) — comma-separated ticket
+// ids, PR urls or SHAs — so a post the team reads later can be re-grounded against what it names.
+function RoomCompose() {
+  const [body, setBody] = React.useState("");
+  const [refs, setRefs] = React.useState("");
+  const post = usePostToRoom();
+  const trimmed = body.trim();
+
+  return (
+    <form
+      style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 12 }}
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (trimmed === "" || post.isPending) return;
+        post.mutate(
+          { body: trimmed, refs: parseRefs(refs) },
+          {
+            // Cleared only on success: a failed post keeps what was typed, so the daemon's
+            // complaint can be read and the same text retried rather than retyped.
+            onSuccess: () => {
+              setBody("");
+              setRefs("");
+            },
+          },
+        );
+      }}
+    >
+      <textarea
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        placeholder="Post to the team room…"
+        aria-label="Post to the team room"
+        rows={2}
+        style={{
+          fontSize: 12.5,
+          padding: "7px 9px",
+          borderRadius: "var(--r-ctrl)",
+          border: "1px solid var(--hair-control)",
+          background: "var(--bg-input, rgba(255,255,255,.03))",
+          color: "var(--tx)",
+          resize: "vertical",
+          fontFamily: "inherit",
+          lineHeight: 1.5,
+        }}
+      />
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <input
+          type="text"
+          value={refs}
+          onChange={(e) => setRefs(e.target.value)}
+          placeholder="Refs (optional): STUDIO-661, a PR url, a SHA"
+          aria-label="Refs for this post"
+          style={{
+            flex: 1,
+            minWidth: 200,
+            fontSize: 12,
+            padding: "6px 9px",
+            borderRadius: "var(--r-ctrl)",
+            border: "1px solid var(--hair-control)",
+            background: "var(--bg-input, rgba(255,255,255,.03))",
+            color: "var(--tx)",
+          }}
+        />
+        <Button
+          type="submit"
+          size="sm"
+          // Disabled without a body: the daemon refuses an empty post anyway, and the disabled
+          // state says why up front rather than after a round-trip.
+          disabled={trimmed === "" || post.isPending}
+          title={trimmed === "" ? "Write something to post" : "Post to the team room as operator"}
+        >
+          {post.isPending ? "Posting…" : "Post as operator"}
+        </Button>
+      </div>
+      {post.isError ? <Note tone="red">Could not post: {errText(post.error)}</Note> : null}
+    </form>
+  );
+}
+
+// parseRefs splits the comma-separated refs field into the array the daemon takes. Empty entries
+// are dropped rather than posted as blank refs — a ref that names nothing cannot re-ground
+// anything, and it would render as an empty pill in every teammate's catch-up.
+function parseRefs(text: string): string[] {
+  return text
+    .split(",")
+    .map((r) => r.trim())
+    .filter((r) => r !== "");
 }
 
 // MemoryCard — what one teammate remembers, with the invalidate button design §5.2.3 named and

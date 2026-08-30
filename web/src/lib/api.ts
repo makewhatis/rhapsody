@@ -886,6 +886,22 @@ export interface TeamsRoomMessage {
   refs: string[];
 }
 
+// TeamsRoomPost is the daemon's echo of a post it just appended: what was written, and who it was
+// written as. `from` is always "operator" here — the daemon stamps it, and there is no request
+// field that can change that (design §0.11.4).
+export interface TeamsRoomPost {
+  /** `file:seq` — the same id a later room read serves for this message. */
+  id: string;
+  /** Always "operator": the reserved name the daemon stamps on a human post. */
+  from: string;
+  /** Always "*": v1 is room-wide only. */
+  to: string;
+  at: string; // RFC3339, rendered exactly as the log stored it
+  refs: string[];
+  /** Always 0 for a room post — the room is a log, not a delivery bus. */
+  delivered: number;
+}
+
 export interface TeamsRoomResponse {
   /** Oldest first, bounded by the room's own window. */
   messages: TeamsRoomMessage[];
@@ -1036,6 +1052,14 @@ export async function postTeamsInvalidate(
     fact_id: factID,
     reason,
   });
+}
+
+// postTeamsRoom is the operator's OWN post to the team room (STUDIO-661) — the human door the
+// panel's compose box goes through. The body carries the prose and optional refs and NOTHING else:
+// there is no `from` (the daemon stamps `operator`) and no `to` (v1 is room-wide only; a live
+// instruction to a running agent is the operator-message mailbox, not the room).
+export async function postTeamsRoom(body: string, refs: string[] = []): Promise<TeamsRoomPost> {
+  return postJSON<TeamsRoomPost>("/api/v1/teams/room", { body, refs });
 }
 
 export async function fetchTeamsConfig(): Promise<TeamsConfigView> {
