@@ -13,6 +13,13 @@
 #     the one that does not depend on Linear being reachable.
 #   * That directory is a second read-only exception to the "stay in the workspace" rule, with a
 #     one-file write carve-out for the run's own record.
+#   * The invariant is the DEPENDENCY DIRECTION, not the absence of a token (STUDIO-600). 599 pinned
+#     `save_document` as absent, which also banned the only container suited to a 16-57KB record and
+#     left the ticket half of the dual-write as a document-sized comment paste. So the ticket copy now
+#     scales with the record — always a summary plus the `~/.rhapsody/docs/` path, full text inline
+#     below a named character threshold and a linked Linear document above it — and what is pinned is
+#     that the file is written first and unconditionally, and that `save_document` is the HISTORY
+#     container and never the deliverable.
 #   * A run that cannot read a required input STOPS and hands off; it never reconstructs the input.
 #   * None of this weakens the absolute rule that specs, plans and design docs never land in the repo —
 #     the directory sits outside the repo precisely so that rule can stand.
@@ -83,17 +90,64 @@ present_i "the routing is described as a dual-write (filesystem + ticket)" \
 # NOT a bare `save_comment` grep: that token already appears in the ground rules' write budget and in
 # Phase 6 step 2 regardless of this change, so it would stay green with the ticket half of the
 # dual-write deleted. Same for a bare `dual-write`, which the Phase-2 intro also says. Pin the
-# instruction and the property that makes it affordable — that it costs no second Linear write.
-present_i "the record's ticket copy is posted to Linear for history" \
-          'Post the same text to the Linear ticket'
-present_i "the ticket copy costs no extra Linear write" \
+# instruction, plus the property that keeps the SMALL-record case affordable. That property is now
+# branch-specific, not universal — a large record deliberately pays a second Linear write for its
+# document — so the check names the branch it pins rather than overstating its subject.
+present_i "the ticket always gets a copy of the record, for history" \
+          'Give the ticket a copy, sized to the record'
+present_i "an inlined ticket copy costs no extra Linear write" \
           'costs no extra write'
 
-# The deliverable must no longer DEPEND on a Linear write or on a pull request existing. Both of the
-# superseded routes are pinned as absent: publishing the document as a Linear document, and carrying
-# its full text in the PR body. Reinstating either turns this red.
-absent "the deliverable no longer depends on publishing a Linear document" \
-       'save_document'
+# --- the deliverable never DEPENDS on a Linear write (STUDIO-600) ---------------------------------
+# The real 599 invariant: the record FILE is written first and unconditionally, so a fully headless
+# run still produces the deliverable. Pin the dependency direction in all three places it is stated —
+# the file write itself, what it does not wait on, and what the ticket copy is demoted to.
+present "the record file is written first and never skipped" \
+        'Write the file. Always, first, and never skipped'
+present_i "the record file does not depend on Linear, gh, or a pull request" \
+          'does not depend on Linear, on `gh`, or on there being a pull request'
+present_i "the ticket copy is history, and the file write never waits on it" \
+          'nothing in step 1 waits on it'
+
+# The summary comment ALWAYS carries the path, at every record size — that is what keeps a large
+# record findable from the ticket without pasting it there. Checked in both places that say it:
+# Phase 2 states the rule, Phase 6 is where the comment is actually written.
+present "Phase 2: the summary comment always carries a summary plus the record's docs path" \
+        'always carries a summary of the record plus its'
+present_i "the summary comment is never a document-sized paste" \
+          'never a [0-9]+KB paste'
+present "Phase 6: the summary comment cites the record's ~/.rhapsody/docs/ path" \
+        '`~/\.rhapsody/docs/\{\{ *issue\.identifier *\}\}-<slug>\.md` path'
+
+# A NAMED threshold, not a judgement call. The number itself is deliberately not frozen — retuning it
+# is a legitimate edit; leaving the choice to the run's judgement is the regression.
+present "a numeric threshold is named for inlining the full text" \
+        'Under [0-9][0-9,]+ characters'
+present "a numeric threshold is named for the linked-document route" \
+        '[0-9][0-9,]+ characters or more'
+
+# `save_document` is allowed BACK, but only as the history container for a large record. Neither check
+# below is a bare `save_document` grep: that token now also appears in the ground rules' write budget,
+# independently of this route, so deleting the route would leave a bare grep green (the same hole 599's
+# own self-review found in its `save_comment` check). Pin the instruction, then the qualification —
+# because a route reinstated as the DELIVERABLE is the thing 599 was right to prevent.
+present "a large record's full text is published as a Linear document" \
+        'mcp__claude_ai_Linear__save_document`, parented to the ticket'
+present "save_document is the history container and never the deliverable" \
+        '`save_document` is the HISTORY container and never the deliverable'
+
+# A large record takes TWO Linear writes, which fail independently. Dropping the summary comment
+# because the DOCUMENT write failed would strand the path citation and leave the worst case strictly
+# worse than the single-write route this replaced, so the comment is unconditional.
+present_i "a failed save_document still posts the summary comment carrying the path" \
+          'still post the summary comment'
+# Phase 6 is where the comment is actually written, so it is the copy a run has in front of it when a
+# write fails. It must DEFER to the rule above, not restate a summary of it that can go stale — which
+# is exactly what happened once on this branch.
+present_i "Phase 6 defers to Phase 2's denial rule instead of restating it" \
+          "apply Phase 2's denial rule"
+
+# The PR body stays dead as a home for the document (unchanged from STUDIO-599).
 absent "the deliverable no longer lives in the pull request body" \
        '(full|whole|entire) (text|document).*in the pull request body|document.{0,20}under a .## Design document'
 

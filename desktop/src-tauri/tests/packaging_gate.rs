@@ -207,11 +207,13 @@ fn notarize_args_lib_contract() {
     );
 }
 
-// The Homebrew cask renderer (`render-cask.sh`, TRA-241): the single-stable-channel cask text (version
-// + sha256 substitution, the literal `#{version}` interpolation brew evaluates at install time, the
-// zap stanza, and the deliberate simplifications vs the Go reference — no verified:/dist host/@channels)
-// stays pinned by the ported pure-shell test. No network / Ruby / brew is touched. `render-cask.sh`
-// authors the committed cask AND feeds release.yml's release-time auto-bump job.
+// The Homebrew cask renderer (`render-cask.sh`, TRA-241 + STUDIO-648): both channels' cask text — the
+// `rhapsody` stable body and the `rhapsody@rc` prerelease body, each pinned byte-for-byte by a golden —
+// plus version + sha256 substitution, the literal `#{version}` interpolation brew evaluates at install
+// time, the zap stanza, and the deliberate simplifications vs the Go reference (no verified:, no
+// internal dist host, no per-feature-branch channel). Stays pinned by the ported pure-shell test; no
+// network / Ruby / brew is touched. `render-cask.sh` authors the committed casks AND feeds both of
+// release.yml's release-time auto-bump jobs.
 #[test]
 fn render_cask_lib_contract() {
     let script = desktop_dir().join("scripts/render_cask_test.sh");

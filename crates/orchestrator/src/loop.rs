@@ -805,7 +805,16 @@ impl Orchestrator {
         }
         tracing::info!(issue_id = %iss.id, issue_identifier = %iss.identifier, from_state = %iss.state, promote_state = %promote_state, "review-reopen: summoned ticket promoted and dispatched");
         iss.state = promote_state;
+        // STUDIO-649: the summons that triggered this reopen predates the run about to start, so the
+        // mid-run router can never deliver it. Capture it before the issue moves into dispatch, then
+        // seed the fresh run's operator mailbox with it (see `message::seed_reopen_summons`).
+        let reopen_summons = iss
+            .latest_summon_at
+            .map(|at| (iss.id.clone(), at, iss.latest_summon_body.clone()));
         self.dispatch_issue(iss, None, route, String::new());
+        if let Some((id, at, body)) = reopen_summons {
+            self.seed_reopen_summons(&id, at, &body);
+        }
     }
 
     /// Removes workspaces for issues already in terminal states at startup (§8.6). Per-project when
