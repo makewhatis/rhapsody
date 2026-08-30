@@ -413,6 +413,20 @@ impl StateProvider for FakeProvider {
             .post_for_run(run_id, body, to, refs, fixed_instant())
     }
 
+    /// The room's human door (STUDIO-661). Nothing here needs the control task at all — there is
+    /// no run, so no timeline row and no delivery — which is why the fake provider can exercise
+    /// the whole operation rather than only its room half.
+    async fn teams_room_post(
+        &self,
+        body: &str,
+        refs: &[String],
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::PostView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?.post_as_operator(body, refs, fixed_instant())
+    }
+
     fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>> {
         self.capabilities_registry.clone()
     }

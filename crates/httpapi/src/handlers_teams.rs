@@ -14,6 +14,7 @@
 //! | `POST /api/v1/teams/invalidate` | `teams_invalidate {identity, fact_id, reason}` |
 //! | `POST /api/v1/runs/{id}/retain` | `teams_retain {content}` |
 //! | `GET /api/v1/teams/room` | `teams_room_read {limit?}` (STUDIO-650, T5) |
+//! | `POST /api/v1/teams/room` | the OPERATOR's own post — no MCP tool (STUDIO-661) |
 //! | `POST /api/v1/runs/{id}/post` | `teams_post {body, to?, refs?}` (STUDIO-653, T6) |
 //! | `GET /api/v1/teams` | the dashboard's one view (STUDIO-652) |
 //! | `GET`/`POST /api/v1/teams/config` | the dashboard's enable flow (STUDIO-652) |
@@ -35,6 +36,12 @@
 //! "`from` is stamped by the host … a run cannot supply it"). Its body carries
 //! `body`, an optional `to` and optional `refs`; **there is no `from` field**,
 //! and a body that invents one is ignored the way retain's is.
+//!
+//! `POST /api/v1/teams/room` (STUDIO-661) is the one write here that is NOT run-scoped, because a
+//! human post has no run: the daemon stamps the reserved `operator` name on it. Same
+//! no-`from`-field rule, one route rather than two because there is no run id to put in the path —
+//! and deliberately no MCP tool, since agents already have `teams_post` and this door exists for
+//! the dashboard and `curl`.
 
 use std::sync::Arc;
 
@@ -186,19 +193,75 @@ pub(crate) async fn handle_teams_recall(
     }
 }
 
-/// `GET /api/v1/teams/room` — the newest posts in the team room (§0.5, §0.11.4).
+/// `GET`/`POST /api/v1/teams/room`, dispatched by method (the shape [`handle_teams_config`] uses).
 ///
-/// **Read-only, and it advances no cursor.** Cursors belong to hydration; a mid-run peek that ate a
-/// catch-up would silently hide a hand-off from the teammate it was addressed to.
+/// * **GET** — the newest posts in the team room (§0.5, §0.11.4). **Read-only, and it advances no
+///   cursor.** Cursors belong to hydration; a mid-run peek that ate a catch-up would silently hide
+///   a hand-off from the teammate it was addressed to.
+/// * **POST** — the room's HUMAN door (STUDIO-661): the operator's own post, `from` stamped by the
+///   daemon. See [`operator_room_post`].
 pub(crate) async fn handle_teams_room(
     method: Method,
     Query(params): Query<RoomParams>,
     State(provider): State<Arc<dyn StateProvider>>,
+    body: Bytes,
 ) -> Response {
-    if let Some(resp) = require_get(&method) {
-        return resp;
+    match method {
+        Method::GET | Method::HEAD => match provider.teams_room(params.limit()).await {
+            Ok(view) => write_json(StatusCode::OK, &view),
+            Err(e) => teams_error(&e),
+        },
+        Method::POST => operator_room_post(provider.as_ref(), &body).await,
+        _ => write_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "use GET to read the team room or POST to post to it",
+            Some("GET, HEAD, POST"),
+        ),
     }
-    match provider.teams_room(params.limit()).await {
+}
+
+/// `POST /api/v1/teams/room` body (STUDIO-661) — `body` and optional `refs`, and **nothing else**.
+///
+/// There is deliberately no `from`: the operator has no run to resolve an identity through, so the
+/// daemon stamps the reserved name itself, and a body that invents a `from` (or an `identity`) is
+/// ignored by serde exactly as `teams_retain`'s and `teams_post`'s are.
+///
+/// There is deliberately no `to` either — v1 is **room-wide only**. Direct-to-a-live-run from the
+/// operator already exists as the operator-message mailbox (`POST /api/v1/runs/{id}/message`),
+/// which is the authoritative live channel; an async direct note to a *sleeping* teammate is an
+/// unproven need and a follow-up if it is ever wanted. The log already carries the `to` field, so
+/// that day costs one additive key here.
+#[derive(Debug, Default, Deserialize)]
+struct OperatorPostReq {
+    #[serde(default)]
+    body: String,
+    /// Ticket ids, PR urls, commit SHAs — what proves it (§0.10).
+    #[serde(default)]
+    refs: Vec<String>,
+}
+
+/// The operator's own room post. Shares [`MAX_RETAIN_BODY`] as its wire cap for the same reason
+/// [`handle_run_post`] does — the room applies its own tighter truncation on the way to disk, and
+/// rejecting the obvious paste at the door tells the caller rather than silently losing the tail.
+///
+/// An empty body is `bad_request` (the daemon's own message, from the same check a teammate's post
+/// runs through), and a Teams-off daemon answers `teams_disabled` like every other Teams route.
+/// Posting starts no run, writes no label and touches no tracker (§0.2).
+async fn operator_room_post(provider: &dyn StateProvider, body: &Bytes) -> Response {
+    if body.len() > MAX_RETAIN_BODY {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "content_too_long",
+            "a room post is a short message to the team, not a transcript",
+            None,
+        );
+    }
+    let req: OperatorPostReq = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(err) => return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None),
+    };
+    match provider.teams_room_post(&req.body, &req.refs).await {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -690,6 +753,8 @@ mod tests {
             ),
             ("/api/v1/runs/7/retain", r#"{"content":"x"}"#),
             ("/api/v1/runs/7/post", r#"{"body":"x"}"#),
+            // The human door is gated exactly like the agent-facing ones (STUDIO-661).
+            ("/api/v1/teams/room", r#"{"body":"x"}"#),
         ] {
             let resp = post(&format!("{url}{path}"), body).await;
             assert_eq!(resp.status(), 409, "{path}");
@@ -746,6 +811,20 @@ mod tests {
             let resp = reqwest::get(&format!("{url}{path}")).await.expect("GET");
             assert_eq!(resp.status(), 405, "{path}");
         }
+        // `/api/v1/teams/room` answers BOTH verbs since STUDIO-661, so its 405 is anything else.
+        let resp = reqwest::Client::new()
+            .delete(format!("{url}/api/v1/teams/room"))
+            .send()
+            .await
+            .expect("DELETE");
+        assert_eq!(resp.status(), 405);
+        assert_eq!(
+            resp.headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "GET, HEAD, POST"
+        );
     }
 
     // ── the dashboard surface (STUDIO-652) ─────────────────────────────────────────────────────
@@ -1188,14 +1267,29 @@ mod tests {
         assert_eq!(err_code(resp).await, "teams_disabled");
     }
 
-    /// The route is GET-only, like every other read route, and answers a 405 ENVELOPE rather than
-    /// falling through to the SPA fallback (this crate's method-agnostic registration rule).
+    /// The route was GET-only until STUDIO-661 opened the human door on it, so a POST is no longer
+    /// a 405 — it is the operator's own post, and the pinned behaviour here is that it reaches the
+    /// handler rather than the method guard. Everything ELSE is still a 405 ENVELOPE rather than a
+    /// fall-through to the SPA fallback (this crate's method-agnostic registration rule), which
+    /// `wrong_methods_are_405_not_the_spa_fallback` pins with its `Allow` header.
     #[tokio::test]
-    async fn room_refuses_a_post() {
+    async fn room_accepts_a_post_and_still_refuses_other_methods() {
         let dir = TempDir::new();
-        let url = spawn_with(teams_memory(&dir)).await;
-        let resp = post(&format!("{url}/api/v1/teams/room"), "{}").await;
-        assert_eq!(resp.status(), 405);
+        let (mem, _room) = teams_memory_with_room(&dir);
+        let url = spawn_with(mem).await;
+
+        let resp = post(&format!("{url}/api/v1/teams/room"), r#"{"body":"hi"}"#).await;
+        assert_eq!(resp.status(), 200, "POST is the human door now");
+
+        for method in [reqwest::Method::PUT, reqwest::Method::PATCH] {
+            let resp = reqwest::Client::new()
+                .request(method.clone(), format!("{url}/api/v1/teams/room"))
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(resp.status(), 405, "{method}");
+            assert_eq!(err_code(resp).await, "method_not_allowed", "{method}");
+        }
     }
 
     // ── the room's write side (STUDIO-653, T6) ──────────────────────────────────────────────────
@@ -1410,5 +1504,123 @@ mod tests {
         let resp = post(&format!("{url}/api/v1/runs/7/post"), r#"{"body":"   "}"#).await;
         assert_eq!(resp.status(), 400);
         assert_eq!(err_code(resp).await, "bad_request");
+    }
+
+    // ── the room's human door (STUDIO-661) ─────────────────────────────────────────────────────
+
+    /// **The operator posts, and the daemon stamps who.** The body carries `body` and `refs` and
+    /// nothing else; the post lands in the log as `from: "operator"` and reads straight back
+    /// through the room's own GET — the same log, the same window, the same rendering.
+    #[tokio::test]
+    async fn an_operator_post_lands_in_the_room_stamped_operator() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        let url = spawn_with(mem).await;
+
+        let resp = post(
+            &format!("{url}/api/v1/teams/room"),
+            r#"{"body":"prefer the retry queue for STUDIO-6xx, see the design doc","refs":["STUDIO-661"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let view = body_json(resp).await;
+        assert_eq!(view["from"], "operator");
+        assert_eq!(view["to"], "*", "v1 is room-wide only");
+        assert_eq!(view["refs"][0], "STUDIO-661");
+        assert_eq!(view["delivered"], 0, "the room is a log, not a bus");
+
+        // In the log, once, and readable by anyone catching up.
+        let caught = room
+            .read_since("alice", &Cursor::default(), 10)
+            .expect("read");
+        assert_eq!(caught.messages.len(), 1);
+        assert_eq!(caught.messages[0].from, "operator");
+        assert_eq!(
+            caught.messages[0].body,
+            "prefer the retry queue for STUDIO-6xx, see the design doc"
+        );
+
+        // And through the endpoint's own read side, agreeing byte for byte with what was echoed.
+        let served = body_json(
+            reqwest::get(format!("{url}/api/v1/teams/room"))
+                .await
+                .expect("GET"),
+        )
+        .await;
+        assert_eq!(served["messages"][0]["from"], "operator");
+        assert_eq!(served["messages"][0]["id"], view["id"]);
+        assert_eq!(served["messages"][0]["at"], view["at"]);
+    }
+
+    /// **A body-supplied `from` is ignored** — the T4/T6 forgery-test pattern applied to the human
+    /// door. There is no field an operator (or anything else reaching loopback) can add to make a
+    /// post look like a teammate's: the daemon stamps the name, full stop.
+    #[tokio::test]
+    async fn a_body_supplied_from_is_ignored() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        let url = spawn_with(mem).await;
+
+        let resp = post(
+            &format!("{url}/api/v1/teams/room"),
+            r#"{"from":"alice","identity":"alice","to":"bob","body":"not from alice"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let view = body_json(resp).await;
+        assert_eq!(view["from"], "operator", "`from` is host-stamped");
+        assert_eq!(
+            view["to"], "*",
+            "and `to` is not a field on this door at all"
+        );
+
+        let caught = room
+            .read_since("bob", &Cursor::default(), 10)
+            .expect("read");
+        assert_eq!(
+            caught.messages.len(),
+            1,
+            "it is a ROOM post, so bob sees it"
+        );
+        assert_eq!(caught.messages[0].from, "operator");
+    }
+
+    /// An empty body is refused: a blank line in the room is noise in every teammate's turn-1
+    /// prompt, forever — the same rule a teammate's post runs through.
+    #[tokio::test]
+    async fn an_empty_operator_post_is_rejected() {
+        let dir = TempDir::new();
+        let (mem, room) = teams_memory_with_room(&dir);
+        let url = spawn_with(mem).await;
+        for body in [r#"{"body":"   "}"#, "{}"] {
+            let resp = post(&format!("{url}/api/v1/teams/room"), body).await;
+            assert_eq!(resp.status(), 400, "{body}");
+            assert_eq!(err_code(resp).await, "bad_request", "{body}");
+        }
+        assert_eq!(
+            room.read_since("", &Cursor::default(), 10)
+                .expect("read")
+                .messages
+                .len(),
+            0,
+            "a refused post writes nothing"
+        );
+    }
+
+    /// A transcript pasted into the compose box is refused at the door rather than silently
+    /// truncated on the way to disk, exactly like a teammate's oversized post.
+    #[tokio::test]
+    async fn an_oversized_operator_post_is_rejected() {
+        let dir = TempDir::new();
+        let (mem, _room) = teams_memory_with_room(&dir);
+        let url = spawn_with(mem).await;
+        let huge = "x".repeat(super::MAX_RETAIN_BODY + 1);
+        let resp = post(
+            &format!("{url}/api/v1/teams/room"),
+            &format!(r#"{{"body":"{huge}"}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        assert_eq!(err_code(resp).await, "content_too_long");
     }
 }

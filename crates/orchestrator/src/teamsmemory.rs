@@ -50,7 +50,9 @@ use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, Record};
-use rhapsody_config::room::{AUDIENCE_ROOM, Cursor, Message, RoomError, RoomLog};
+use rhapsody_config::room::{
+    AUDIENCE_ROOM, Cursor, Message, OPERATOR_IDENTITY, RoomError, RoomLog,
+};
 use rhapsody_config::teams::Teams;
 use serde::Serialize;
 
@@ -407,6 +409,64 @@ impl TeamsMemory {
         })
     }
 
+    /// `POST /api/v1/teams/room` — the room's HUMAN door (STUDIO-661; §0.5, §0.11.4).
+    ///
+    /// The operator has no run, so there is no identity to resolve: the daemon stamps
+    /// [`OPERATOR_IDENTITY`] as `from`, and the request carries no `from` field at all — exactly
+    /// like `teams_retain` and `teams_post` carry none. That is what makes the name unforgeable
+    /// here, and it is why [`RESERVED_IDENTITIES`](rhapsody_config::room::RESERVED_IDENTITIES)
+    /// keeps a roster entry from wearing it.
+    ///
+    /// **Room-wide only in v1.** There is deliberately no `to`: direct-to-a-live-run from the
+    /// operator already exists as the operator-message mailbox
+    /// (`POST /api/v1/runs/{id}/message`), which is the *authoritative* channel, and an async
+    /// direct note to a sleeping teammate is an unproven need. If it is ever wanted, it is an
+    /// additive `to` on this same body — the log already carries the field.
+    ///
+    /// **No timeline row, and no mirrors.** §0.10's resolution writes a `teams.message` events row
+    /// as the *run's* timeline record; an operator post is not run-scoped, `events.run_id` is
+    /// `NOT NULL REFERENCES runs(id)`, and inventing a run to hang it on would be a lie in the
+    /// ledger. §0.5 named this case precisely — "a post not tied to a run … goes to a file log" —
+    /// so the file log is the whole of it. Nothing is delivered either: §0.2's room never
+    /// dispatches, and a live teammate catches this up on its next turn like everyone else.
+    pub fn post_as_operator(
+        &self,
+        body: &str,
+        refs: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<PostView, TeamsMemoryError> {
+        if !self.enabled() {
+            return Err(TeamsMemoryError::Disabled);
+        }
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(TeamsMemoryError::Invalid(
+                "body is required: say what you want the team to know".to_string(),
+            ));
+        }
+        // Same call `post_for_run` makes: a write that cannot be recorded must say so rather than
+        // report success over a message that went nowhere.
+        let Some(room) = self.room.as_ref() else {
+            return Err(TeamsMemoryError::Backend(
+                "the team room has no on-disk home on this daemon, so there is nowhere to post"
+                    .to_string(),
+            ));
+        };
+        let msg = Message::room(OPERATOR_IDENTITY, now, body).with_refs(refs.iter().cloned());
+        let id = room.append(&msg)?;
+        Ok(PostView {
+            id,
+            from: OPERATOR_IDENTITY.to_string(),
+            to: msg.to.as_wire().to_string(),
+            // The log's own rendering, so this view and a later room read agree byte for byte.
+            at: msg.at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            refs: msg.refs,
+            // Nothing was delivered anywhere: an operator post is room-wide, and the room is a log
+            // rather than a bus (§0.5).
+            delivered: 0,
+        })
+    }
+
     /// The identity → bank-id map the backend was built with, so the composition
     /// root can hand the SAME resolution to `LocalBank::with_bank_overrides`.
     pub fn bank_ids(&self) -> &HashMap<String, String> {
@@ -725,6 +785,14 @@ mod tests {
         TeamsMemory::new(teams, Arc::new(bank))
     }
 
+    /// The same memory, with a real [`LocalRoom`](rhapsody_config::room::LocalRoom) attached —
+    /// what the composition root builds, and what the room's read and write sides both need.
+    fn with_room(dir: &TempDir, teams: Arc<Teams>) -> TeamsMemory {
+        local(dir, teams).with_room(Arc::new(rhapsody_config::room::LocalRoom::new(
+            dir.child("room"),
+        )))
+    }
+
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_756_000_000, 0).expect("timestamp")
     }
@@ -1039,6 +1107,96 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(mem.roster().expect("roster").backend, "none");
+    }
+
+    /// The room's HUMAN door (STUDIO-661): an operator post lands in the log with `from:
+    /// "operator"` — the reserved name the daemon stamps because there is no run to resolve an
+    /// identity through — and it reads back through the same room view every other post does.
+    #[tokio::test]
+    async fn an_operator_post_is_stamped_operator_and_reads_back_room_wide() {
+        let dir = TempDir::new();
+        let mem = with_room(&dir, teams_on(vec![ident("alice")]));
+
+        let view = mem
+            .post_as_operator(
+                "  prefer the retry queue for STUDIO-6xx  ",
+                &["STUDIO-661".to_string()],
+                now(),
+            )
+            .expect("operator post");
+        assert_eq!(view.from, OPERATOR_IDENTITY);
+        assert_eq!(view.to, AUDIENCE_ROOM, "v1 is room-wide only");
+        assert_eq!(view.refs, vec!["STUDIO-661".to_string()]);
+        assert_eq!(view.delivered, 0, "the room is a log, not a bus");
+        assert!(!view.id.is_empty(), "the log stamps a file:seq id");
+
+        let read = mem.room(0).expect("room reads back");
+        assert_eq!(read.messages.len(), 1, "{read:?}");
+        let m = &read.messages[0];
+        assert_eq!(m.from, OPERATOR_IDENTITY);
+        assert_eq!(m.to.as_wire(), AUDIENCE_ROOM);
+        assert_eq!(
+            m.body, "prefer the retry queue for STUDIO-6xx",
+            "the body is trimmed, exactly as a teammate's is"
+        );
+        assert_eq!(m.id, view.id, "the echoed id is the log's own");
+        assert_eq!(
+            m.at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            view.at,
+            "the echoed timestamp renders exactly as the log stored it"
+        );
+    }
+
+    /// An empty body is a `bad_request`, not an empty line in the log: the acceptance criterion,
+    /// and the same rule `post_for_run` applies.
+    #[tokio::test]
+    async fn an_empty_operator_post_is_refused() {
+        let dir = TempDir::new();
+        let mem = with_room(&dir, teams_on(vec![ident("alice")]));
+        for body in ["", "   \n\t "] {
+            assert!(
+                matches!(
+                    mem.post_as_operator(body, &[], now()),
+                    Err(TeamsMemoryError::Invalid(_))
+                ),
+                "an empty body must be refused: {body:?}"
+            );
+        }
+        assert!(
+            mem.room(0).expect("room").messages.is_empty(),
+            "a refused post writes nothing"
+        );
+    }
+
+    /// Teams off ⇒ `teams_disabled`, like every other Teams entry point — and nothing is created
+    /// on disk, because the refusal happens before the room is ever touched (§2.4).
+    #[tokio::test]
+    async fn an_operator_post_is_disabled_when_teams_is_off() {
+        let dir = TempDir::new();
+        let room_dir = dir.child("room");
+        let mem = local(&dir, Arc::new(Teams::disabled()))
+            .with_room(Arc::new(rhapsody_config::room::LocalRoom::new(&room_dir)));
+        assert_eq!(
+            mem.post_as_operator("hello", &[], now()),
+            Err(TeamsMemoryError::Disabled)
+        );
+        assert!(
+            !std::path::Path::new(&room_dir).exists(),
+            "a disabled daemon creates no room directory"
+        );
+    }
+
+    /// A daemon with no on-disk room says so rather than reporting success over a message that
+    /// went nowhere. The READ side answers an empty room in the same situation, deliberately: a
+    /// room nobody posted to reads the same, but a write that cannot land is not a success.
+    #[tokio::test]
+    async fn an_operator_post_with_no_room_is_a_backend_error() {
+        let dir = TempDir::new();
+        let mem = local(&dir, teams_on(vec![ident("alice")]));
+        assert!(matches!(
+            mem.post_as_operator("hello", &[], now()),
+            Err(TeamsMemoryError::Backend(_))
+        ));
     }
 
     /// An empty or whitespace-only body is refused rather than stored: a record

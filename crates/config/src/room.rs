@@ -100,6 +100,35 @@ pub const CURSOR_FILE: &str = "cursor";
 /// [`Audience::Direct`] recipient.
 pub const AUDIENCE_ROOM: &str = "*";
 
+/// The `from` the daemon stamps on a post the **operator** made — through
+/// `POST /api/v1/teams/room` or the dashboard's compose box (STUDIO-661).
+///
+/// A human post has no run to resolve an identity through (§0.5: "a post not
+/// tied to a run … goes to a file log"), so the daemon stamps this reserved name
+/// instead. The request carries no `from` field at all, exactly like
+/// `teams_retain` and `teams_post` carry none — §0.11.4's "`from` is stamped by
+/// the host" holds for the human door too.
+///
+/// Unlike the manager's `@manager`, this one IS label-safe, so a roster entry
+/// could otherwise take it and speak with the operator's voice. That is why it
+/// is reserved in [`RESERVED_IDENTITIES`] rather than left to a sigil.
+pub const OPERATOR_IDENTITY: &str = "operator";
+
+/// Names no roster identity may take, because the daemon stamps them itself
+/// (STUDIO-661).
+///
+/// * `operator` — [`OPERATOR_IDENTITY`], the human's own voice in the room.
+/// * `manager` — the routing function's voice. Triage stamps `@manager` today,
+///   which `is_label_safe` already puts out of a roster's reach; `manager` is
+///   reserved beside it so the *unsigil'd* spelling cannot be taken either. A
+///   teammate literally named `manager` would render as one in every catch-up
+///   line ("manager wrote on …") whatever the daemon spells internally, and
+///   label-safe is not the same thing as identity-legal.
+///
+/// Existing configs are unaffected unless they already commit the sin, in which
+/// case failing validation loudly is the correct outcome.
+pub const RESERVED_IDENTITIES: [&str; 2] = [OPERATOR_IDENTITY, "manager"];
+
 /// The most a single post may store, in bytes. §0.5's room "carries decisions
 /// and hand-offs, not chatter"; this is the backstop that keeps a caller from
 /// appending a transcript anyway. Content past the cap is truncated, never

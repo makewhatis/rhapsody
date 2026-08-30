@@ -409,10 +409,12 @@ impl Teams {
     /// Syntactic validation only — profiles are T2, so `profile` is not
     /// resolved here and an unknown one is not an error yet.
     ///
-    /// Checked: every roster `name` is label-safe (§0.11.1); no two entries
-    /// share a name; `manager.default_identity`, when set, names a roster
-    /// entry. Runs regardless of `enabled` so a user editing the file sees the
-    /// complaint before they flip the toggle, not after.
+    /// Checked: every roster `name` is label-safe (§0.11.1); no name is one of
+    /// the daemon's own [reserved speakers](crate::room::RESERVED_IDENTITIES)
+    /// (STUDIO-661); no two entries share a name; `manager.default_identity`,
+    /// when set, names a roster entry. Runs regardless of `enabled` so a user
+    /// editing the file sees the complaint before they flip the toggle, not
+    /// after.
     ///
     /// `pub` since STUDIO-652 so the Settings-page enable flow rejects a
     /// candidate roster with **exactly** the daemon's own complaint, verbatim,
@@ -425,6 +427,16 @@ impl Teams {
                 return Err(TeamsError::Invalid(format!(
                     "roster name {:?} is not label-safe (must match ^[a-z][a-z0-9-]*$; it becomes a `rhapsody:@<name>` label)",
                     entry.name
+                )));
+            }
+            // Reserved before duplicate-checking, so a roster with two entries
+            // named `operator` is told the real problem rather than the second
+            // one.
+            if crate::room::RESERVED_IDENTITIES.contains(&entry.name.as_str()) {
+                return Err(TeamsError::Invalid(format!(
+                    "roster name {:?} is reserved: `{}` and `manager` are the daemon's own voices in the team room, not teammates, so a roster entry wearing either would be indistinguishable from one in every catch-up line — rename this entry",
+                    entry.name,
+                    crate::room::OPERATOR_IDENTITY,
                 )));
             }
             if !seen.insert(entry.name.as_str()) {
@@ -789,6 +801,47 @@ mod tests {
             err.to_string().contains("alice"),
             "error names the offender: {err}"
         );
+    }
+
+    /// `operator` and `manager` are the daemon's OWN voices in the room
+    /// (STUDIO-661), so a roster may not claim either. Both spellings are
+    /// label-safe, which is exactly the problem: without this rule a teammate
+    /// named `operator` would render as the human in every teammate's catch-up
+    /// line, and there is no way to tell the two apart after the fact.
+    #[test]
+    fn reserved_speaker_names_are_rejected() {
+        for name in crate::room::RESERVED_IDENTITIES {
+            let text = format!("roster:\n  - name: {name}\n");
+            let err = Teams::parse(&text)
+                .unwrap_or_else(|e| panic!("parse {name:?}: {e}"))
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(err, TeamsError::Invalid(_)),
+                "{name:?}: want an invalid error, got {err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(name), "the message names the offender: {msg}");
+            assert!(
+                msg.contains("reserved"),
+                "the message names the reservation: {msg}"
+            );
+        }
+    }
+
+    /// The reservation is exact, not a prefix or a substring match: a real
+    /// teammate called `operators` or `manager-bot` is an ordinary name and
+    /// stays legal. Widening this rule would break rosters for no reason —
+    /// only the two names the daemon itself stamps are unavailable.
+    #[test]
+    fn names_that_merely_resemble_a_reserved_one_are_still_legal() {
+        for name in ["operators", "manager-bot", "op", "co-operator", "manag"] {
+            let text = format!("roster:\n  - name: {name}\n");
+            Teams::parse(&text)
+                .unwrap_or_else(|e| panic!("parse {name:?}: {e}"))
+                .validate()
+                .unwrap_or_else(|e| panic!("roster name {name:?} must stay legal: {e}"));
+        }
     }
 
     /// The charset a name is pinned to, because it is interpolated into a

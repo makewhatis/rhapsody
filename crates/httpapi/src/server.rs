@@ -234,6 +234,22 @@ pub trait StateProvider: Send + Sync {
     ) -> Result<PostView, TeamsMemoryError> {
         Err(TeamsMemoryError::Disabled)
     }
+
+    /// Post to the team room as the OPERATOR (`POST /api/v1/teams/room`, STUDIO-661; §0.5,
+    /// §0.11.4). The human door: there is no run, so there is no path in the body either —
+    /// the daemon stamps the reserved `operator` name, and a body key that invents a `from` is
+    /// ignored exactly as `teams_retain`'s and `teams_post`'s are.
+    ///
+    /// **Room-wide only in v1**, hence no `to`: direct-to-a-live-run from the operator is already
+    /// the operator-message mailbox, and an async direct note to a sleeping teammate is an unproven
+    /// need. The day it is wanted it is an additive `to` on this same body.
+    async fn teams_room_post(
+        &self,
+        _body: &str,
+        _refs: &[String],
+    ) -> Result<PostView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -377,8 +393,9 @@ where
         .route("/api/v1/teams/roster", any(handle_teams_roster))
         .route("/api/v1/teams/recall", any(handle_teams_recall))
         .route("/api/v1/teams/invalidate", any(handle_teams_invalidate))
-        // The team room's read side (STUDIO-650, T5): a bounded, read-only peek that advances no
-        // identity's cursor.
+        // The team room, dispatched by method (the shape `/api/v1/teams/config` uses): GET is
+        // T5's bounded, read-only peek that advances no identity's cursor; POST is STUDIO-661's
+        // human door, an operator post the daemon stamps `operator` on.
         .route("/api/v1/teams/room", any(handle_teams_room))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit

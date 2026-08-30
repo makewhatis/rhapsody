@@ -6,12 +6,14 @@ import {
   fetchTeamsRoom,
   fetchVersion,
   postTeamsInvalidate,
+  postTeamsRoom,
   saveTeamsConfig,
   type DaemonVersion,
   type TeamsConfig,
   type TeamsConfigView,
   type TeamsOverview,
   type TeamsRecallResponse,
+  type TeamsRoomPost,
   type TeamsRoomResponse,
 } from "@/lib/api";
 
@@ -65,6 +67,20 @@ export function useTeamsRoom(enabled: boolean, limit?: number, pollMs?: number) 
     refetchInterval: pollMs ?? 5000,
     refetchOnWindowFocus: false,
     enabled,
+  });
+}
+
+// usePostToRoom is the operator's own voice in the room (STUDIO-661). On success it invalidates
+// the room query so the new post appears in the tail immediately, with no reload — the same
+// round-trip shape `useInvalidateFact` uses, for the same reason: the write and what the operator
+// sees next must not need a refresh to agree.
+export function usePostToRoom() {
+  const qc = useQueryClient();
+  return useMutation<TeamsRoomPost, Error, { body: string; refs: string[] }>({
+    mutationFn: (v) => postTeamsRoom(v.body, v.refs),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: TEAMS_ROOM_QUERY_KEY });
+    },
   });
 }
 

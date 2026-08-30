@@ -563,6 +563,71 @@ mod tests {
         );
     }
 
+    /// **The operator's own post is under §0.2 like everyone else's** (STUDIO-661): it starts no
+    /// run, writes no label, touches no tracker — and, unlike a teammate's, writes no `events` row
+    /// at all, because there is no run to hang one on (`events.run_id` is
+    /// `NOT NULL REFERENCES runs(id)`; §0.5 sends a post not tied to a run to the file log and
+    /// nowhere else). The live teammate is not delivered to either: an operator note is async
+    /// standup, and the mailbox remains the channel for a live instruction.
+    #[tokio::test]
+    async fn an_operator_post_starts_nothing_and_writes_no_events_row() {
+        let Harness {
+            mut o,
+            store,
+            room,
+            mem,
+            tracker,
+            ..
+        } = post_harness(&["alice", "bob"]);
+        let alice_run = dispatch_as(&mut o, "ID-A", "MT-1", "alice");
+        let running_before: Vec<String> = {
+            let mut v: Vec<String> = o.running.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        let writes_before = tracker_writes(&tracker);
+
+        let view = mem
+            .post_as_operator(
+                "prefer the retry queue for STUDIO-6xx, see the design doc",
+                &["STUDIO-661".to_string()],
+                Utc::now(),
+            )
+            .expect("operator post");
+        assert_eq!(view.from, "operator", "`from` is host-stamped");
+        o.stop_event_writer(); // drain the batched writer before reading rows back
+
+        let running_after: Vec<String> = {
+            let mut v: Vec<String> = o.running.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            running_before, running_after,
+            "an operator post must start NO run — §0.2 is permanent, not deferred"
+        );
+        assert_eq!(
+            writes_before,
+            tracker_writes(&tracker),
+            "an operator post must touch NO tracker: no label, no state move, no comment, no assignee"
+        );
+        let rows = events_of(store.as_ref(), alice_run);
+        assert!(
+            rows.iter().all(|(k, _)| k != EVENT_MESSAGE),
+            "a non-run-scoped post writes no `teams.message` row on anyone's run: {rows:?}"
+        );
+        assert!(
+            store.list_run_messages(alice_run).expect("list").is_empty(),
+            "nothing is delivered into a live teammate's mailbox: the room is a log, not a bus"
+        );
+        // It is in the log, and that is the whole of it — alice reads it on her next waking.
+        let caught = room
+            .read_since("alice", &Cursor::default(), 10)
+            .expect("read");
+        assert_eq!(caught.messages.len(), 1, "the post is only ever a log line");
+        assert_eq!(caught.messages[0].from, "operator");
+    }
+
     /// **A teammate delivery must not steal the next operator message's `delivered_turn`.**
     /// `persist_run_message_delivered` marks the OLDEST still-"sent" row when the runner reports a
     /// stdin write, so row order has to match mailbox order. Queue a teammate message ahead of an

@@ -246,7 +246,7 @@ state and winds down. Empty `review_states` means the feature is off: the tool a
 unchanged. The plan is resolved ON the control task and the tracker write runs off it, so a slow
 Linear cannot stall a tick.
 
-### Rhapsody Teams — an optional feature with no Go counterpart (STUDIO-639 … STUDIO-659)
+### Rhapsody Teams — an optional feature with no Go counterpart (STUDIO-639 … STUDIO-661)
 
 Teams gives a daemon named identities with shared profiles and per-identity memory. The frozen Go
 reference has none of it, so nothing here is a *difference* in ported behaviour — it is new surface,
@@ -267,7 +267,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
 | Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/`, no `teams/room/` |
 
-Seven **additive** Rhapsody-only endpoints back the Teams tools and the dashboard; no existing
+Eight **additive** Rhapsody-only endpoints back the Teams tools and the dashboard; no existing
 payload changes shape and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 
 | Endpoint | Serves |
@@ -277,6 +277,7 @@ payload changes shape and no golden moves. Each answers `409 teams_disabled` whe
 | `POST /api/v1/teams/invalidate` | mark one record non-valid, with the reason; reversible |
 | `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host |
 | `GET /api/v1/teams/room?limit=` | the newest posts in the team room, bounded; advances no cursor |
+| `POST /api/v1/teams/room` | the OPERATOR's own post to the room, `from` stamped `operator` (STUDIO-661) |
 | `POST /api/v1/runs/{id}/post` | post to the team room as a live run, `from` stamped by the host |
 | `GET /api/v1/teams` | the dashboard's one view: the roster with derived status, the manager mode and the memory backend (STUDIO-652) |
 
@@ -290,6 +291,18 @@ exactly: it takes `body`, an optional `to` and optional `refs`, and **no author 
 the daemon resolves the run to the identity it dispatched it as, so a post cannot be forged and a
 run wearing no identity cannot post. An unknown `to` is refused loudly rather than silently
 downgraded to a room-wide post.
+
+**The operator posts too**, through `POST /api/v1/teams/room` or the dashboard's compose box: a body
+and optional refs, no author field, and the daemon stamps the reserved name `operator` on it — there
+is no run to resolve an identity through, which is the case design §0.5 sent to the file log in the
+first place. It is room-wide only in v1 (a live agent is already reachable directly), it writes no
+`events` row because it is not run-scoped, and it starts no run, exactly like a teammate's.
+`operator` and `manager` are therefore reserved: a `teams.yaml` roster naming either fails
+validation, because both spellings are label-safe and a teammate wearing one would be
+indistinguishable from the daemon's own voice in every catch-up line. **Note where authority lives:**
+the room is *async data*, quoted and attributed in a teammate's next prompt and weighed against what
+the repository actually says; the operator-*message* mailbox (`POST /api/v1/runs/{id}/message`) is
+the *live instruction* channel to a running agent, and this door deliberately does not duplicate it.
 
 Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
 because it works on a laptop with no cloud: append-only markdown records, one file per record, under
@@ -373,9 +386,9 @@ on, the app shows the roster with each teammate's live runs (linking to that run
 view), a read-only tail of the room, and each identity's memory with a per-record
 invalidate-with-reason button. Room posts and recalled facts are rendered as quoted,
 provenance-prefixed data — they are untrusted content that reaches every teammate's prompt, so the
-app never renders them as bare prose. The panel has **no compose box**: teammates post through
-`teams_post` (STUDIO-653), but a post from the *app* has no run identity, so it could only be a
-*human* post, and that provenance question is still open.
+app never renders them as bare prose. Since STUDIO-661 the room also has a **compose box**: the
+operator types a line, the daemon posts it as `operator`, and it appears in the tail immediately and
+in every teammate's next catch-up.
 
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside

@@ -15,6 +15,7 @@ const h = vi.hoisted(() => ({
   fetchTeamsRoom: vi.fn(),
   fetchTeamsRecall: vi.fn(),
   postTeamsInvalidate: vi.fn(),
+  postTeamsRoom: vi.fn(),
   fetchState: vi.fn(),
 }));
 
@@ -26,6 +27,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchTeamsRoom: h.fetchTeamsRoom,
     fetchTeamsRecall: h.fetchTeamsRecall,
     postTeamsInvalidate: h.postTeamsInvalidate,
+    postTeamsRoom: h.postTeamsRoom,
     fetchState: h.fetchState,
   };
 });
@@ -138,10 +140,89 @@ describe("TeamsPanel room", () => {
     expect(screen.getByText(/@manager wrote on /)).toBeTruthy();
   });
 
-  it("offers no way to post — writes are the room's other half", async () => {
+});
+
+// STUDIO-661 — the human door. The compose box STUDIO-652 deferred, now that a human post's author
+// is decided: the daemon stamps `operator`, and this form carries no author field to argue with.
+describe("TeamsPanel compose box", () => {
+  it("posts the operator's line and shows it in the tail without a reload", async () => {
     renderPanel();
     await screen.findByText("assigned MT-9 to alice");
-    expect(screen.queryByRole("button", { name: /post/i })).toBeNull();
+    h.postTeamsRoom.mockResolvedValue({
+      id: "2026-08-30:1",
+      from: "operator",
+      to: "*",
+      at: "2026-08-30T11:00:00Z",
+      refs: ["STUDIO-661"],
+      delivered: 0,
+    });
+    // What the room reads back after the post — the refetch the mutation triggers sees it.
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: [
+        ...room.messages,
+        {
+          id: "2026-08-30:1",
+          from: "operator",
+          to: "*",
+          at: "2026-08-30T11:00:00Z",
+          body: "prefer the retry queue for STUDIO-6xx",
+          refs: ["STUDIO-661"],
+        },
+      ],
+      skipped: [],
+    } satisfies TeamsRoomResponse);
+
+    fireEvent.change(screen.getByLabelText("Post to the team room"), {
+      target: { value: "  prefer the retry queue for STUDIO-6xx  " },
+    });
+    fireEvent.change(screen.getByLabelText("Refs for this post"), {
+      target: { value: "STUDIO-661, " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Post as operator" }));
+
+    // The trimmed body and the parsed refs — an empty ref is dropped, never posted blank.
+    await waitFor(() =>
+      expect(h.postTeamsRoom).toHaveBeenCalledWith("prefer the retry queue for STUDIO-6xx", [
+        "STUDIO-661",
+      ]),
+    );
+    // The new post appears in the tail, attributed to the operator, with no reload.
+    const posted = await screen.findByText("prefer the retry queue for STUDIO-6xx");
+    expect(posted.closest("blockquote")).toBeTruthy();
+    expect(screen.getByText(/operator wrote on /)).toBeTruthy();
+    // A successful post clears the form.
+    await waitFor(() =>
+      expect((screen.getByLabelText("Post to the team room") as HTMLTextAreaElement).value).toBe(""),
+    );
+  });
+
+  it("keeps the send button disabled until there is something to say", async () => {
+    renderPanel();
+    await screen.findByText("assigned MT-9 to alice");
+    const button = screen.getByRole("button", { name: "Post as operator" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    // Whitespace is not something to say — the daemon refuses it, and so does the button.
+    fireEvent.change(screen.getByLabelText("Post to the team room"), { target: { value: "   " } });
+    expect(button.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Post to the team room"), { target: { value: "hi" } });
+    expect(button.disabled).toBe(false);
+  });
+
+  it("surfaces the daemon's own complaint and keeps what was typed", async () => {
+    renderPanel();
+    await screen.findByText("assigned MT-9 to alice");
+    h.postTeamsRoom.mockRejectedValue(new Error("the team room has no on-disk home on this daemon"));
+
+    fireEvent.change(screen.getByLabelText("Post to the team room"), {
+      target: { value: "does not land" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Post as operator" }));
+
+    expect(await screen.findByText(/the team room has no on-disk home on this daemon/)).toBeTruthy();
+    // A failed post keeps the text, so it can be retried rather than retyped.
+    expect((screen.getByLabelText("Post to the team room") as HTMLTextAreaElement).value).toBe(
+      "does not land",
+    );
   });
 });
 
