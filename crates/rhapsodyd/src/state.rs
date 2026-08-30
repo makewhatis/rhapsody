@@ -289,6 +289,19 @@ impl StateProvider for DaemonState {
         view.delivered = self.handle.record_teams_post(run_id, &view, body).await;
         Ok(view)
     }
+
+    /// The room's HUMAN door (STUDIO-661) — and, unlike [`teams_post`](Self::teams_post), it
+    /// touches ONE seam rather than two. There is no run to resolve, so there is no timeline row
+    /// to write and nobody to deliver to: the append on this HTTP task is the entire operation,
+    /// and the control task is never involved at all.
+    async fn teams_room_post(
+        &self,
+        body: &str,
+        refs: &[String],
+    ) -> Result<PostView, TeamsMemoryError> {
+        self.teams_memory()?
+            .post_as_operator(body, refs, Utc::now())
+    }
 }
 
 impl DaemonState {
