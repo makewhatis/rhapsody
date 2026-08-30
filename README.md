@@ -81,7 +81,7 @@ prompt changes behavior. Deprecation and removal is a later ticket.
 | --- | --- | --- |
 | Agent "me" identity env | `SYMPHONY_ISSUE` / `SYMPHONY_RUN_ID` | **both**, plus `RHAPSODY_ISSUE` / `RHAPSODY_RUN_ID` |
 | Lifecycle-hook env | `SYMPHONY_REPO` / `_PROJECT` / `_ISSUE` | **both**, plus the `RHAPSODY_*` trio |
-| Agent-facing MCP tools | 11 × `symphony_*` | **both**, plus 11 × `rhapsody_*` aliases of the same handlers |
+| Agent-facing MCP tools | 11 × `symphony_*` | **both**, plus 11 aliases of the same handlers: `rhapsody_*`, except `symphony_send_message`, whose alias is the semantic `agent_send_message` |
 | Summon token matching | the one configured token | the configured token; either brand token accepts **both** |
 
 The MCP aliases are derived from the router AFTER the `cfg.mcp` gating removals, so a disabled write

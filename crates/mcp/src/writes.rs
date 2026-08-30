@@ -243,13 +243,13 @@ mod tests {
         }
     }
 
-    // STUDIO-603: the `rhapsody_*` aliases are derived AFTER gating, so a disabled write tool has no
+    // STUDIO-603: the brand aliases are derived AFTER gating, so a disabled write tool has no
     // alias either — the opt-in gate cannot be walked around by spelling the tool the other way.
     // This is the security-relevant half of the alias change.
     #[tokio::test]
     async fn brand_aliases_respect_the_write_gates() {
         let pairs = [
-            ("symphony_send_message", "rhapsody_send_message"),
+            ("symphony_send_message", "agent_send_message"),
             ("symphony_stop", "rhapsody_stop"),
             ("symphony_resume", "rhapsody_resume"),
             ("symphony_handoff", "rhapsody_handoff"),
@@ -262,11 +262,11 @@ mod tests {
             Options::default(),
         ))
         .await;
-        for (sym, rha) in pairs {
+        for (sym, alias) in pairs {
             assert!(!names.contains(&sym.to_string()), "{sym} leaked: {names:?}");
             assert!(
-                !names.contains(&rha.to_string()),
-                "{rha} leaked past the gate that removed {sym}: {names:?}"
+                !names.contains(&alias.to_string()),
+                "{alias} leaked past the gate that removed {sym}: {names:?}"
             );
         }
 
@@ -278,15 +278,15 @@ mod tests {
             Options::default(),
         ))
         .await;
-        for (sym, rha) in pairs {
+        for (sym, alias) in pairs {
             assert_eq!(
                 names.contains(&sym.to_string()),
-                names.contains(&rha.to_string()),
-                "{rha} presence must track {sym}: {names:?}"
+                names.contains(&alias.to_string()),
+                "{alias} presence must track {sym}: {names:?}"
             );
         }
         assert!(
-            names.contains(&"rhapsody_send_message".to_string()),
+            names.contains(&"agent_send_message".to_string()),
             "{names:?}"
         );
         assert!(names.contains(&"rhapsody_handoff".to_string()), "{names:?}");
@@ -300,9 +300,12 @@ mod tests {
             Options::default(),
         ))
         .await;
-        for (sym, rha) in pairs {
+        for (sym, alias) in pairs {
             assert!(names.contains(&sym.to_string()), "{sym} missing: {names:?}");
-            assert!(names.contains(&rha.to_string()), "{rha} missing: {names:?}");
+            assert!(
+                names.contains(&alias.to_string()),
+                "{alias} missing: {names:?}"
+            );
         }
     }
 

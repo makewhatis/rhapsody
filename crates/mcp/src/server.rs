@@ -8,8 +8,10 @@
 //! `daemon_unreachable`. The opt-in write tools (`symphony_send_message` / `_stop` / `_resume`) are
 //! registered by a later phase (M2); this phase is read-only.
 //!
-//! STUDIO-603: every registered tool is ALSO listed under a `rhapsody_*` alias of the same handler
-//! ([`register_brand_aliases`]) — additively, so both spellings work and nothing is removed.
+//! STUDIO-603: every registered tool is ALSO listed under a second name for the same handler
+//! ([`register_brand_aliases`]) — `rhapsody_*`, except `symphony_send_message`, whose alias is the
+//! semantic `agent_send_message` ([`ALIAS_OVERRIDES`]). Additively: both spellings work and nothing
+//! is removed.
 
 use crate::client::{Client, FacadeError};
 use chrono::{DateTime, Utc};
@@ -399,10 +401,30 @@ fn hex_upper(nibble: u8) -> char {
 pub const TOOL_PREFIX_SYMPHONY: &str = "symphony_";
 
 /// The tool-name prefix Rhapsody ships under, registered ADDITIVELY alongside
-/// [`TOOL_PREFIX_SYMPHONY`] so a prompt can name either spelling (STUDIO-603).
+/// [`TOOL_PREFIX_SYMPHONY`] so a prompt can name either spelling (STUDIO-603). Carried by every
+/// alias except the [`ALIAS_OVERRIDES`] entries.
 pub const TOOL_PREFIX_RHAPSODY: &str = "rhapsody_";
 
-/// Registers a `rhapsody_*` alias for every `symphony_*` tool currently in `router`.
+/// Alias names that are NOT the plain brand-prefix swap, keyed by the tool being aliased.
+///
+/// `symphony_send_message` delivers a message to an AGENT's run, so its new spelling says what the
+/// tool does rather than which brand owns it — and `agent_send_message` is the name the Rhapsody
+/// Teams design record (STUDIO-572) uses throughout, so the prefix-swapped spelling of this one
+/// tool is deliberately a name the daemon never registers. Every other tool takes the prefix swap.
+const ALIAS_OVERRIDES: &[(&str, &str)] = &[("symphony_send_message", "agent_send_message")];
+
+/// The alias name for a `symphony_*` tool: its [`ALIAS_OVERRIDES`] entry when it has one, otherwise
+/// `symphony_` swapped for `rhapsody_`. `None` for a name that is not `symphony_*` at all.
+fn alias_name_for(name: &str) -> Option<String> {
+    let suffix = name.strip_prefix(TOOL_PREFIX_SYMPHONY)?;
+    let over = ALIAS_OVERRIDES
+        .iter()
+        .find_map(|(from, to)| (*from == name).then_some(*to));
+    Some(over.map_or_else(|| format!("{TOOL_PREFIX_RHAPSODY}{suffix}"), str::to_string))
+}
+
+/// Registers an alias of every `symphony_*` tool currently in `router` under its
+/// [`alias_name_for`] spelling — `rhapsody_*` for all but the [`ALIAS_OVERRIDES`] entries.
 ///
 /// The alias CLONES the route, so it shares the original's handler `Arc` and input schema outright
 /// — one implementation, two names, and the alias cannot drift from the tool it aliases. Only the
@@ -411,7 +433,8 @@ pub const TOOL_PREFIX_RHAPSODY: &str = "rhapsody_";
 ///
 /// Call this LAST, after any gating: aliases are derived from what actually survived, so a disabled
 /// write tool gets no alias and its gate cannot be walked around by spelling the tool the other way.
-/// A pre-existing `rhapsody_*` route (there is none today) is left untouched rather than clobbered.
+/// A pre-existing route under the alias name (there is none today) is left untouched rather than
+/// clobbered.
 ///
 /// The gate is honored for BOTH ways rmcp can close one. `Facade::new` gates by `remove_route`, so a
 /// gated tool is simply absent from the map here. `has_route` additionally excludes a route closed
@@ -423,11 +446,10 @@ fn register_brand_aliases(router: &mut ToolRouter<Facade>) {
         .map
         .iter()
         .filter_map(|(name, route)| {
-            let suffix = name.strip_prefix(TOOL_PREFIX_SYMPHONY)?;
+            let alias_name = alias_name_for(name)?;
             if !router.has_route(name) {
                 return None;
             }
-            let alias_name = format!("{TOOL_PREFIX_RHAPSODY}{suffix}");
             if router.map.contains_key(alias_name.as_str()) {
                 return None;
             }
@@ -576,8 +598,8 @@ mod tests {
         let _ = client.cancel().await;
     }
 
-    // STUDIO-603: every registered `symphony_*` tool is ALSO listed under its `rhapsody_*` alias,
-    // and nothing is removed — the two name sets are exactly parallel.
+    // STUDIO-603: every registered `symphony_*` tool is ALSO listed under its alias name, and
+    // nothing is removed — the two name sets are exactly parallel.
     #[tokio::test]
     async fn brand_aliases_mirror_every_tool() {
         let facade = Facade::new(&test_config(), Client::for_port(0), Options::default());
@@ -593,23 +615,42 @@ mod tests {
             !symphony.is_empty(),
             "no symphony_* tools registered at all: {names:?}"
         );
+        let mut aliases: Vec<String> = Vec::new();
         for n in &symphony {
-            let alias = n.replacen(TOOL_PREFIX_SYMPHONY, TOOL_PREFIX_RHAPSODY, 1);
+            let alias = alias_name_for(n).expect("a symphony_* tool has an alias name");
             assert!(
                 names.contains(&alias),
                 "{n} has no {alias} alias: {names:?}"
             );
+            aliases.push(alias);
         }
-        // Exactly parallel: no orphan alias without an original.
-        let rhapsody: Vec<&String> = names
+        // Exactly parallel: no orphan alias without an original. Aliases are the `rhapsody_*` set
+        // plus the overridden names, and nothing else.
+        let branded: Vec<&String> = names
             .iter()
-            .filter(|n| n.starts_with(TOOL_PREFIX_RHAPSODY))
+            .filter(|n| {
+                n.starts_with(TOOL_PREFIX_RHAPSODY)
+                    || ALIAS_OVERRIDES.iter().any(|(_, to)| *to == n.as_str())
+            })
             .collect();
         assert_eq!(
             symphony.len(),
-            rhapsody.len(),
+            branded.len(),
             "alias set must mirror the original set exactly: {names:?}"
         );
+        // The overridden name is the ONLY spelling of its alias: the prefix-swap name it replaced
+        // is not registered anywhere.
+        assert!(
+            aliases.contains(&"agent_send_message".to_string()),
+            "send-message aliases to the semantic name: {names:?}"
+        );
+        for (from, _) in ALIAS_OVERRIDES {
+            let swapped = from.replacen(TOOL_PREFIX_SYMPHONY, TOOL_PREFIX_RHAPSODY, 1);
+            assert!(
+                !names.contains(&swapped),
+                "{swapped} must not be registered — {from} aliases to its override: {names:?}"
+            );
+        }
         let _ = client.cancel().await;
     }
 
