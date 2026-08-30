@@ -50,6 +50,7 @@ mod handlers_logs;
 mod handlers_message;
 mod handlers_projects;
 mod handlers_runaction;
+mod handlers_teams;
 mod history;
 mod logs;
 mod responses;

@@ -331,6 +331,7 @@ impl Orchestrator {
     /// `outcome` metric label, which is dropped telemetry).
     pub(crate) fn terminate(&mut self, id: &str) -> Option<RunningEntry> {
         let re = self.running.remove(id)?;
+        self.release_teams_run(&re);
         re.cancel.cancel();
         let dur = ((self.now)() - re.started_at)
             .num_nanoseconds()

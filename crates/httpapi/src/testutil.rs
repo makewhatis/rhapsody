@@ -66,6 +66,9 @@ pub(crate) struct FakeProvider {
     /// The canned agent-capabilities registry `GET /api/v1/capabilities` serves. `None` ⇒ the
     /// handler's empty-registry (`[]`) path.
     capabilities_registry: Option<Vec<rhapsody_config::capabilities::CapabilityDef>>,
+    /// The Teams memory runtime the `/api/v1/teams/*` handlers drive (STUDIO-645). Unset ⇒ the
+    /// trait's default `teams_disabled`, which is exactly what a Teams-off daemon answers.
+    teams_memory: Option<Arc<rhapsody_orchestrator::teamsmemory::TeamsMemory>>,
 }
 
 impl FakeProvider {
@@ -100,6 +103,7 @@ impl FakeProvider {
             },
             workflow_path: String::new(),
             capabilities_registry: None,
+            teams_memory: None,
         }
     }
 
@@ -212,6 +216,16 @@ impl FakeProvider {
         self.capabilities_registry = Some(registry);
         self
     }
+
+    /// Give the provider a REAL Teams memory runtime, so the `/api/v1/teams/*` handler tests drive
+    /// the actual backend over a temp bank rather than a canned result (STUDIO-645).
+    pub(crate) fn with_teams_memory(
+        mut self,
+        mem: Arc<rhapsody_orchestrator::teamsmemory::TeamsMemory>,
+    ) -> Self {
+        self.teams_memory = Some(mem);
+        self
+    }
 }
 
 #[async_trait]
@@ -297,6 +311,51 @@ impl StateProvider for FakeProvider {
         Ok(())
     }
 
+    async fn teams_roster(
+        &self,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::RosterView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?.roster()
+    }
+
+    async fn teams_recall(
+        &self,
+        identity: &str,
+        query: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::RecallView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?.recall(identity, query).await
+    }
+
+    async fn teams_invalidate(
+        &self,
+        identity: &str,
+        fact_id: &str,
+        reason: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::InvalidateView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?.invalidate(identity, fact_id, reason).await
+    }
+
+    async fn teams_retain(
+        &self,
+        run_id: i64,
+        content: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::RetainView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?
+            .retain_for_run(run_id, content, fixed_instant())
+            .await
+    }
+
     fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>> {
         self.capabilities_registry.clone()
     }
@@ -305,6 +364,20 @@ impl StateProvider for FakeProvider {
 /// Bind a loopback listener on an ephemeral port, serve `router` on a background task, and return the
 /// base URL. Mirrors Go's `httptest.NewServer(NewHandler(...))`; the listener is bound before serving
 /// so a request issued immediately never races startup.
+impl FakeProvider {
+    /// The injected Teams runtime, or the Teams-off answer.
+    fn teams(
+        &self,
+    ) -> Result<
+        &Arc<rhapsody_orchestrator::teamsmemory::TeamsMemory>,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams_memory
+            .as_ref()
+            .ok_or(rhapsody_orchestrator::teamsmemory::TeamsMemoryError::Disabled)
+    }
+}
+
 pub(crate) async fn spawn_router(router: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

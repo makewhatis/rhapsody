@@ -30,7 +30,7 @@ use rhapsody_telemetry as telemetry;
 use rhapsody_tracker as tracker;
 
 use crate::bootcfg::{
-    assignee_label, banner_color_enabled, open_store, resolve_banner_data,
+    assignee_label, banner_color_enabled, open_store, resolve_banks_dir, resolve_banner_data,
     resolve_capabilities_path, resolve_profiles_dir, resolve_server_port, resolve_teams_path,
     workflow_dir,
 };
@@ -163,6 +163,16 @@ where
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
+        // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
+        // types, and the difference is the design:
+        //
+        // * `teams_bank` is the CONCRETE `LocalBank` the dispatch path recalls from. It is `Some`
+        //   only for `backend: local`, so a remote backend cannot end up on the control task —
+        //   `dispatch_issue` is `fn` and could not await one anyway (§5.2's hard rule).
+        // * `teams_memory` is the `dyn MemoryBackend` the OFF-LOOP `/api/v1/teams/*` handlers drive.
+        //
+        // Neither creates anything: the banks directory appears on the first `retain` (§2.1).
+        install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags);
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
     // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
@@ -558,6 +568,60 @@ fn triage_agent_env(cfg: Option<&Config>) -> (String, bool, String) {
 ///
 /// `mode: off` WITH a `default_identity` is the opposite — single-identity Teams, "probably the right
 /// first thing to try" — so it is deliberately not warned about.
+/// Builds and installs the Teams memory handles (STUDIO-645, T4). A no-op when Teams is off — no
+/// backend is constructed, no path is resolved, nothing is created (§2.4 row 8: "there is no code
+/// path").
+fn install_teams_memory(
+    o: &mut rhapsody_orchestrator::Orchestrator,
+    teams_cfg: &rhapsody_config::teams::Teams,
+    resolved: Option<&rhapsody_config::Config>,
+    flags: &Flags,
+) {
+    use rhapsody_config::memory::{LocalBank, MemoryBackend, NoneBackend};
+    use rhapsody_config::teams::MemoryBackend as BackendKind;
+
+    if !teams_cfg.enabled {
+        return;
+    }
+    let banks = resolve_banks_dir(resolved, &teams_cfg.memory.path, &flags.db, flags.no_store);
+    let bank = match (teams_cfg.memory.backend, banks) {
+        (BackendKind::Local, Some(dir)) => Some(Arc::new(
+            LocalBank::new(dir, teams_cfg.memory.bank_prefix.clone()).with_bank_overrides(
+                teams_cfg
+                    .roster
+                    .iter()
+                    .map(|i| (i.name.clone(), i.bank.clone())),
+            ),
+        )),
+        (BackendKind::Local, None) => {
+            tracing::warn!(
+                "teams memory: backend is `local` but there is no on-disk runtime home to anchor \
+                 banks to (storage off / in-memory); memory is disabled for this daemon"
+            );
+            None
+        }
+        (BackendKind::Hindsight, _) => {
+            tracing::warn!(
+                "teams memory: backend `hindsight` is not implemented yet (slice T8, blocked on \
+                 STUDIO-629's tailnet exposure); running with no memory. Set `memory.backend: \
+                 local` for on-disk banks."
+            );
+            None
+        }
+        (BackendKind::None, _) => None,
+    };
+    // The dispatch path only ever sees a LOCAL bank; `none` and `hindsight` leave it `None`, and
+    // the turn-1 prompt is then byte-identical to T3a's.
+    o.teams_bank = bank.as_ref().map(Arc::clone);
+    let backend: Arc<dyn MemoryBackend> = match &bank {
+        Some(b) => Arc::clone(b) as Arc<dyn MemoryBackend>,
+        None => Arc::new(NoneBackend),
+    };
+    o.teams_memory = Some(Arc::new(
+        rhapsody_orchestrator::teamsmemory::TeamsMemory::new(Arc::new(teams_cfg.clone()), backend),
+    ));
+}
+
 fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
     let Some(teams) = teams else { return };
     if teams.enabled
@@ -879,6 +943,76 @@ mod tests {
         assert!(
             !dir.child("teams.yaml").exists(),
             "teams.yaml must NEVER be seeded: an absent file is Teams' off state and shipped state"
+        );
+        // STUDIO-645 (T4): and no bank directory either. The banks dir appears on the first
+        // `retain` and at no other time, so a Teams-off daemon leaves the same filesystem behind it
+        // found — the same claim the teams.yaml assertion above makes, for memory.
+        assert!(
+            !std::path::Path::new(&dir.child("teams")).exists(),
+            "a Teams-off boot must create no teams/ directory (banks or profiles)"
+        );
+    }
+
+    // STUDIO-645 (Teams T4), §5.4 + §2.4 row 8: which memory handles a boot installs is decided by
+    // the toggle and `memory.backend` alone. This is the exact function `run` calls, so "off costs
+    // nothing" is checked at the composition root rather than inferred from it.
+    //
+    // `teams_bank` is the CONCRETE local bank the DISPATCH path recalls from; it must be `Some` for
+    // `local` and `None` for everything else, because that is what makes "no network on the dispatch
+    // path" true by construction rather than by care.
+    #[test]
+    fn teams_memory_handles_are_installed_only_for_an_enabled_local_backend() {
+        use rhapsody_config::teams::{MemoryBackend as BackendKind, Teams};
+
+        let with = |enabled: bool, backend: BackendKind| {
+            let mut t = Teams {
+                enabled,
+                ..Teams::disabled()
+            };
+            t.memory.backend = backend;
+            t
+        };
+        let dir = TempDir::new();
+        let flags = Flags {
+            port: -1,
+            db: dir.child("rhapsody.db").to_string_lossy().into_owned(),
+            no_store: false,
+            no_color: false,
+            path: PathBuf::from("WORKFLOW.md"),
+        };
+        let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
+
+        let install = |teams: &Teams| {
+            let mut o = rhapsody_orchestrator::Orchestrator::new(String::new());
+            install_teams_memory(&mut o, teams, cfg.as_ref(), &flags);
+            (o.teams_bank.is_some(), o.teams_memory.is_some())
+        };
+
+        assert_eq!(
+            install(&with(false, BackendKind::Local)),
+            (false, false),
+            "Teams OFF installs nothing at all — not even the off-loop runtime"
+        );
+        assert_eq!(
+            install(&with(true, BackendKind::Local)),
+            (true, true),
+            "`local` installs both the dispatch-path bank and the off-loop runtime"
+        );
+        assert_eq!(
+            install(&with(true, BackendKind::None)),
+            (false, true),
+            "`none` still serves the off-loop tools (as no-ops) but puts NO bank on the dispatch path"
+        );
+        assert_eq!(
+            install(&with(true, BackendKind::Hindsight)),
+            (false, true),
+            "`hindsight` is T8: it must never reach the dispatch path, where it could not be awaited"
+        );
+
+        // Installing handles creates nothing: the banks dir waits for the first retain.
+        assert!(
+            !std::path::Path::new(&dir.child("teams")).exists(),
+            "installing the memory handles must not create the banks directory"
         );
     }
 

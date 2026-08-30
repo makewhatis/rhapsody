@@ -308,6 +308,43 @@ pub struct Orchestrator {
     /// failure logs and drops the section rather than failing the run.
     pub teams_profiles_dir: Option<std::path::PathBuf>,
 
+    /// The Rhapsody Teams **local** memory bank the dispatch path recalls from (STUDIO-645, T4;
+    /// design record §5.2). `None` whenever there is nothing to recall: Teams off, no on-disk
+    /// runtime home, or `memory.backend` set to anything other than `local`.
+    ///
+    /// **The concrete [`LocalBank`](rhapsody_config::memory::LocalBank), deliberately never a
+    /// `dyn MemoryBackend`.** `dispatch_issue` runs inline on the single control task and is `fn`,
+    /// not `async fn`; the trait is async precisely because T8's `hindsight` backend does network
+    /// I/O. Holding the concrete local type here makes "zero network I/O on the dispatch path" a
+    /// property a reviewer can clear by reading one type name — a remote backend is not merely
+    /// forbidden here, it is unrepresentable. When T8 lands, its recall is prefetched off the
+    /// dispatch path and hands the SAME plain-data `Fact` slice to the same renderer.
+    pub teams_bank: Option<Arc<rhapsody_config::memory::LocalBank>>,
+
+    /// Ticket identifier → its state, as last seen by the poller **in memory** (STUDIO-645, T4).
+    /// Refreshed each tick from the candidate fetch, before dispatch, so a recall rendered during
+    /// that tick re-grounds against what the daemon already knows.
+    ///
+    /// This map is the WHOLE of §5.2's re-grounding, by design: §0.11.3 corrected the original
+    /// "free map lookup" pricing — a ticket now Done is never in the candidate fetch (active ∪
+    /// review only), so it simply is not here and the fact renders flagged `(state not
+    /// re-verified)`. The network fallback that would resolve it is deferred to an off-loop
+    /// improvement; a tracker call at dispatch is exactly the head-of-line stall the design review
+    /// forbade.
+    pub issue_states: HashMap<String, String>,
+
+    /// The **off-loop** Teams memory runtime (STUDIO-645, T4): the loaded config, the constructed
+    /// backend, and the live run → identity binding a `teams_retain` is stamped from. Shared by
+    /// `Arc` with the daemon's HTTP layer.
+    ///
+    /// This is the fourth sanctioned off-loop seam (see `crates/orchestrator/CLAUDE.md`), and it
+    /// exists because §5.1 requires a retain to be "best-effort, never fatal, **never blocking the
+    /// control task**". The control task's only interaction with it is two `HashMap` operations —
+    /// [`bind_run`](crate::teamsmemory::TeamsMemory::bind_run) at dispatch and
+    /// [`release_run`](crate::teamsmemory::TeamsMemory::release_run) at run exit — with no I/O and
+    /// no lock held across an `.await`. `None` when the daemon has no Teams runtime at all.
+    pub teams_memory: Option<Arc<crate::teamsmemory::TeamsMemory>>,
+
     /// Live workers, keyed by opaque issue id.
     pub running: HashMap<String, RunningEntry>,
     /// Issue ids currently claimed (dispatched or in a claim election), a set.
@@ -505,6 +542,9 @@ impl Orchestrator {
             capabilities_registry: None,
             teams: None,
             teams_profiles_dir: None,
+            teams_bank: None,
+            issue_states: HashMap::new(),
+            teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),
