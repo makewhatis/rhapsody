@@ -61,6 +61,14 @@ pub struct AddLabelCall {
     pub label_name: String,
 }
 
+/// One [`Tracker::create_issue`] invocation, recorded verbatim (STUDIO-659). Tests assert on the
+/// whole spec — the state, the assignee and the labels are each an acceptance criterion of the
+/// review-quorum fan-out, so recording only the title would hide the interesting half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIssueCall {
+    pub spec: crate::NewIssue,
+}
+
 /// A programmable [`Tracker::fetch_issue_states_by_ids`] override (lets tests vary results per
 /// call, e.g. active-then-inactive). Takes precedence over `by_id`/`by_id_err` when set.
 type StatesByIdsFn = Box<dyn Fn(&[String]) -> Result<Vec<Issue>, TrackerError> + Send + Sync>;
@@ -138,6 +146,12 @@ pub struct Fake {
     pub open_by_labels_err: Option<TrackerError>,
     /// When set, returned by `add_issue_label` (the call is still recorded).
     pub add_label_err: Option<TrackerError>,
+    /// When set, returned by `create_issue` (the call is still recorded). STUDIO-659.
+    pub create_issue_err: Option<TrackerError>,
+    /// When set, `create_issue` fails for exactly the first N calls and succeeds thereafter — the
+    /// PARTIAL fan-out case (1 of 2 reviewers created), which the quorum must report rather than
+    /// retry forever. Takes precedence over nothing: `create_issue_err` still fails every call.
+    pub create_issue_fail_first: usize,
     /// When set, `add_issue_label` AWAITS this gate (until it carries `true`) before it returns —
     /// the async stand-in for a slow Linear write, so a test can park the triage task inside its
     /// one label write and observe that dispatch is unaffected.
@@ -165,6 +179,7 @@ struct Inner {
     assign_calls: Vec<AssignCall>,
     delete_comment_calls: Vec<String>,
     add_label_calls: Vec<AddLabelCall>,
+    create_issue_calls: Vec<CreateIssueCall>,
     open_by_labels_calls: usize,
     /// Issues `add_issue_label` has written a label onto, keyed by issue id, so the load read sees
     /// the fake's own writes (STUDIO-644).
@@ -262,6 +277,10 @@ impl Fake {
     /// Number of `fetch_open_issues_by_labels` calls (STUDIO-644).
     pub fn open_by_labels_calls(&self) -> usize {
         self.lock().open_by_labels_calls
+    }
+    /// Every `create_issue` invocation, in order (STUDIO-659).
+    pub fn create_issue_calls(&self) -> Vec<CreateIssueCall> {
+        self.lock().create_issue_calls.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -564,6 +583,29 @@ impl Tracker for Fake {
             }
         }
         Ok(out)
+    }
+
+    /// Records the spec and mints an identifier (STUDIO-659). `create_issue_err` fails every call;
+    /// `create_issue_fail_first` fails the first N and then succeeds — the partial-fan-out case.
+    /// The identifier is `FAKE-<n>` numbered from the call count, so a test can assert on exactly
+    /// which reviewers got a ticket.
+    async fn create_issue(&self, spec: &crate::NewIssue) -> Result<String, TrackerError> {
+        let seq = {
+            let mut inner = self.lock();
+            inner
+                .create_issue_calls
+                .push(CreateIssueCall { spec: spec.clone() });
+            inner.create_issue_calls.len()
+        };
+        if let Some(e) = &self.create_issue_err {
+            return Err(e.clone());
+        }
+        if seq <= self.create_issue_fail_first {
+            return Err(TrackerError::Other(format!(
+                "fake_create_issue_failed: call {seq}"
+            )));
+        }
+        Ok(format!("FAKE-{seq}"))
     }
 }
 

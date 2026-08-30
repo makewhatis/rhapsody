@@ -79,6 +79,12 @@ pub struct Client {
     /// in the sibling `move_state` module. Only the name-based resolution is cached; the type-based
     /// one (`MoveIssueToType`) is not (cheap, rare).
     pub(in crate::linear) state_id_cache: tokio::sync::Mutex<HashMap<String, String>>,
+    /// The configured project's resolved UUID (STUDIO-659), empty until first resolved. Needed
+    /// only by `issueCreate`, which takes a project ID and has no create-by-slug form. Same
+    /// single-flight shape and rationale as [`milestone_id`](Self::milestone_id): the lock is held
+    /// across the lookup so a fan-out's several creates issue one project query between them.
+    /// Written by `resolve_project_id` in the sibling `create` module.
+    pub(in crate::linear) project_id: tokio::sync::Mutex<String>,
 }
 
 /// Builds a linear [`Client`] from its [`Config`], applying Go `New`'s defaults (30s timeout,
@@ -104,6 +110,7 @@ pub fn new(config: Config) -> Client {
         viewer: tokio::sync::Mutex::new(None),
         milestone_id: tokio::sync::Mutex::new(String::new()),
         state_id_cache: tokio::sync::Mutex::new(HashMap::new()),
+        project_id: tokio::sync::Mutex::new(String::new()),
     }
 }
 

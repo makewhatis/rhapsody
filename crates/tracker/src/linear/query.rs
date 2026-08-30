@@ -327,6 +327,32 @@ query OpenIssuesByLabels($projectSlug: String!, $names: [String!], $first: Int!,
   }
 }"#;
 
+/// `queryProjectBySlug` — the configured project's UUID, resolved from the `slugId` every other
+/// query already filters on. `issueCreate` takes a project ID (there is no create-by-slug form),
+/// so this is the one lookup the create path needs that no existing query supplies. Cached for the
+/// client's lifetime like the milestone id. STUDIO-659.
+pub const QUERY_PROJECT_BY_SLUG: &str = r#"
+query ProjectBySlug($projectSlug: String!, $first: Int!) {
+  projects(first: $first, filter: { slugId: { eq: $projectSlug } }) {
+    nodes { id }
+  }
+}"#;
+
+/// `mutationIssueCreate` — creates ONE issue and returns its human identifier, the review-quorum
+/// fan-out's write (design §0.12). STUDIO-659.
+///
+/// Every optional input is threaded as a nullable GraphQL variable rather than assembled into the
+/// document, so the query text is a constant: Linear treats an explicit `null` in an `issueCreate`
+/// input the same as an omitted key, which lets "no assignee" / "no state" / "no labels" reuse one
+/// document instead of forking it four ways.
+pub const MUTATION_ISSUE_CREATE: &str = r#"
+mutation CreateIssue($teamId: String!, $projectId: String, $title: String!, $description: String, $stateId: String, $assigneeId: String, $labelIds: [String!]) {
+  issueCreate(input: { teamId: $teamId, projectId: $projectId, title: $title, description: $description, stateId: $stateId, assigneeId: $assigneeId, labelIds: $labelIds }) {
+    success
+    issue { id identifier }
+  }
+}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

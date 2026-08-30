@@ -795,6 +795,70 @@ impl crate::Tracker for Tracker {
             })
             .collect())
     }
+
+    /// Appends a new issue to the file and rewrites it atomically (STUDIO-659) — the review-quorum
+    /// fan-out's write, so the file tracker's smoke-test loop can exercise the quorum end to end
+    /// without Linear.
+    ///
+    /// The file has no id server, so the identifier is minted here: `<team_id or "FILE">-<n>` where
+    /// `n` is one past the highest numeric suffix already in the file. It is unique within the file
+    /// and stable across reloads, which is all any caller needs — `id` and `identifier` are the
+    /// same string, as they already are for every issue `SAMPLE`-style fixtures declare.
+    ///
+    /// `state_name` is written verbatim (the file has no workflow-state registry to resolve
+    /// against), and labels are written verbatim for the same reason `add_issue_label` ignores
+    /// `team_id`: there is nothing to find-or-create in.
+    async fn create_issue(&self, spec: &crate::NewIssue) -> Result<String, TrackerError> {
+        if spec.team_id.is_empty() || spec.title.is_empty() {
+            return Err(load_err(format!(
+                "create issue requires teamID and title (got {:?},{:?})",
+                spec.team_id, spec.title
+            )));
+        }
+        let _guard = self.lock();
+        let mut doc = self.load_locked()?;
+        let identifier = mint_identifier(&doc, &spec.team_id);
+        doc.issues.push(IssueJson {
+            id: identifier.clone(),
+            identifier: identifier.clone(),
+            title: spec.title.clone(),
+            description: (!spec.description.is_empty()).then(|| spec.description.clone()),
+            priority: None,
+            state: spec.state_name.clone(),
+            branch_name: None,
+            url: None,
+            team_id: spec.team_id.clone(),
+            labels: spec.labels.clone(),
+            blocked_by: Vec::new(),
+            created_at: None,
+            updated_at: None,
+            linked_pr: false,
+            latest_pr_activity_at: None,
+            latest_summon_at: None,
+            latest_summon_body: String::new(),
+            milestone_id: String::new(),
+            milestone_name: String::new(),
+            assignee_id: spec.assignee_id.clone(),
+            assignee_name: String::new(),
+        });
+        self.write_locked(&doc)?;
+        Ok(identifier)
+    }
+}
+
+/// Mints an identifier for a created issue: `<prefix>-<n>`, where the prefix is the issue's team
+/// and `n` is one past the largest numeric suffix any existing identifier carries (0 ⇒ 1). Scanning
+/// the whole file rather than counting rows means a deleted issue's number is never reused, which
+/// keeps identifiers stable references in a file an operator also hand-edits.
+fn mint_identifier(doc: &Doc, team_id: &str) -> String {
+    let highest = doc
+        .issues
+        .iter()
+        .filter_map(|j| j.identifier.rsplit_once('-'))
+        .filter_map(|(_, n)| n.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("{team_id}-{}", highest + 1)
 }
 
 #[cfg(test)]
@@ -968,6 +1032,79 @@ mod tests {
             Some(vec!["bug".to_string(), "rhapsody:@alice".to_string()]),
             "the pre-existing label must survive and the identity label must be written once"
         );
+    }
+
+    // STUDIO-659, design §0.12: a created review ticket lands in the file with everything the
+    // dispatcher needs — an unused identifier, the requested state, the assignee, the labels — and
+    // is immediately a candidate, so the file tracker can drive the whole quorum without Linear.
+    #[tokio::test]
+    async fn create_issue_appends_a_dispatchable_ticket() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        let identifier = tr
+            .create_issue(&crate::NewIssue {
+                team_id: "team-1".into(),
+                title: "Review: SMK-1 Todo ticket".into(),
+                description: "review https://github.com/o/r/pull/7".into(),
+                state_name: "Todo".into(),
+                assignee_id: "u-smoke".into(),
+                labels: vec!["rhapsody:@bob".into()],
+            })
+            .await
+            .expect("create");
+        assert_eq!(
+            identifier, "team-1-5",
+            "one past the highest numeric suffix in SAMPLE (SMK-4)"
+        );
+
+        let got = tr.fetch_candidate_issues().await.expect("no error");
+        let made = got
+            .iter()
+            .find(|i| i.identifier == identifier)
+            .expect("the created ticket is a candidate");
+        assert_eq!(made.title, "Review: SMK-1 Todo ticket");
+        assert_eq!(made.state, "Todo");
+        assert_eq!(made.team_id, "team-1");
+        assert_eq!(made.assignee_id, "u-smoke");
+        assert_eq!(made.labels, Some(vec!["rhapsody:@bob".to_string()]));
+        assert_eq!(
+            made.description.as_deref(),
+            Some("review https://github.com/o/r/pull/7")
+        );
+    }
+
+    // Two creates make two DISTINCT issues — the create is deliberately not idempotent, and the
+    // once-per-parent guard is the caller's (the quorum's marker label).
+    #[tokio::test]
+    async fn create_issue_is_not_idempotent_and_never_reuses_an_identifier() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        let spec = crate::NewIssue {
+            team_id: "T".into(),
+            title: "same title".into(),
+            state_name: "Todo".into(),
+            ..crate::NewIssue::default()
+        };
+        let first = tr.create_issue(&spec).await.expect("first");
+        let second = tr.create_issue(&spec).await.expect("second");
+        assert_ne!(first, second, "each create mints a fresh identifier");
+        assert_eq!((first.as_str(), second.as_str()), ("T-5", "T-6"));
+    }
+
+    // STUDIO-659: the required arguments are checked before the file is touched.
+    #[tokio::test]
+    async fn create_issue_requires_a_team_and_a_title() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        tr.create_issue(&crate::NewIssue {
+            title: "t".into(),
+            ..crate::NewIssue::default()
+        })
+        .await
+        .expect_err("no team must error");
+        tr.create_issue(&crate::NewIssue {
+            team_id: "T".into(),
+            ..crate::NewIssue::default()
+        })
+        .await
+        .expect_err("no title must error");
     }
 
     // STUDIO-644: a label write against an id the file does not know is an error, not a silent
