@@ -178,6 +178,11 @@ impl From<MemoryError> for TeamsMemoryError {
 pub struct TeamsMemory {
     teams: Arc<Teams>,
     backend: Arc<dyn MemoryBackend>,
+    /// How the backend resolves an identity to its bank id, so the roster view
+    /// reports what the STORE actually uses rather than re-deriving it and
+    /// risking disagreement (an identity with a roster `bank:` override would
+    /// otherwise be reported one way and written another).
+    bank_ids: HashMap<String, String>,
     /// run id → what the host knows about that run. Written by the control task
     /// at dispatch / run exit; read by the HTTP task. Never held across an
     /// `.await`.
@@ -189,11 +194,30 @@ impl TeamsMemory {
     /// Creates nothing: with `backend: none` (or Teams off) the backend is a
     /// no-op and the filesystem is never touched.
     pub fn new(teams: Arc<Teams>, backend: Arc<dyn MemoryBackend>) -> Self {
+        let bank_ids = teams
+            .roster
+            .iter()
+            .map(|i| {
+                let bank = if i.bank.is_empty() {
+                    format!("{}{}", teams.memory.bank_prefix, i.name)
+                } else {
+                    i.bank.clone()
+                };
+                (i.name.clone(), bank)
+            })
+            .collect();
         Self {
             teams,
             backend,
+            bank_ids,
             runs: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The identity → bank-id map the backend was built with, so the composition
+    /// root can hand the SAME resolution to `LocalBank::with_bank_overrides`.
+    pub fn bank_ids(&self) -> &HashMap<String, String> {
+        &self.bank_ids
     }
 
     /// Whether Teams is on. Every entry point below refuses when it is not, and
@@ -249,11 +273,7 @@ impl TeamsMemory {
                     name: i.name.clone(),
                     profile: i.profile.clone(),
                     labels: i.labels.clone(),
-                    bank: if i.bank.is_empty() {
-                        format!("{}{}", self.teams.memory.bank_prefix, i.name)
-                    } else {
-                        i.bank.clone()
-                    },
+                    bank: self.bank_ids.get(&i.name).cloned().unwrap_or_default(),
                     max_concurrent: i.max_concurrent,
                     live_runs: tickets.len() as i64,
                     tickets,

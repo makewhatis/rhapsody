@@ -585,10 +585,14 @@ fn install_teams_memory(
     }
     let banks = resolve_banks_dir(resolved, &teams_cfg.memory.path, &flags.db, flags.no_store);
     let bank = match (teams_cfg.memory.backend, banks) {
-        (BackendKind::Local, Some(dir)) => Some(Arc::new(LocalBank::new(
-            dir,
-            teams_cfg.memory.bank_prefix.clone(),
-        ))),
+        (BackendKind::Local, Some(dir)) => Some(Arc::new(
+            LocalBank::new(dir, teams_cfg.memory.bank_prefix.clone()).with_bank_overrides(
+                teams_cfg
+                    .roster
+                    .iter()
+                    .map(|i| (i.name.clone(), i.bank.clone())),
+            ),
+        )),
         (BackendKind::Local, None) => {
             tracing::warn!(
                 "teams memory: backend is `local` but there is no on-disk runtime home to anchor \

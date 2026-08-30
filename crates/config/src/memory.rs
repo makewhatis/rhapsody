@@ -290,6 +290,10 @@ struct FrontMatter {
 pub struct LocalBank {
     root: PathBuf,
     bank_prefix: String,
+    /// Per-identity bank-id overrides, from the roster's `bank:` field. Empty
+    /// for the common case, where every identity derives its bank from
+    /// `bank_prefix`.
+    banks: std::collections::HashMap<String, String>,
 }
 
 impl LocalBank {
@@ -299,7 +303,31 @@ impl LocalBank {
         Self {
             root: root.into(),
             bank_prefix: bank_prefix.into(),
+            banks: std::collections::HashMap::new(),
         }
+    }
+
+    /// Honours the roster's per-identity `bank:` overrides (§2.2: "Memory bank
+    /// id; empty ⇒ `<memory.bank_prefix><name>`").
+    ///
+    /// Without this the override would be a field the roster VIEW reports and
+    /// the store ignores — `teams_roster` would name `custom` while records
+    /// landed in `agent-alice`. An override that is not label-safe is dropped
+    /// rather than joined: it becomes a directory name, so it can no more carry
+    /// a separator than an identity can.
+    pub fn with_bank_overrides<I, K, V>(mut self, overrides: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        for (identity, bank) in overrides {
+            let (identity, bank) = (identity.into(), bank.into());
+            if !bank.is_empty() && crate::teams::is_label_safe(&bank) {
+                self.banks.insert(identity, bank);
+            }
+        }
+        self
     }
 
     /// The bank root every identity's directory sits under.
@@ -320,7 +348,22 @@ impl LocalBank {
                 "identity {identity:?} is not label-safe (must match ^[a-z][a-z0-9-]*$)"
             )));
         }
-        Ok(self.root.join(format!("{}{identity}", self.bank_prefix)))
+        // The roster's `bank:` override wins; every entry in the map was already
+        // charset-checked by `with_bank_overrides`.
+        Ok(match self.banks.get(identity) {
+            Some(bank) => self.root.join(bank),
+            None => self.root.join(format!("{}{identity}", self.bank_prefix)),
+        })
+    }
+
+    /// The bank id `identity`'s records live under — the override when the
+    /// roster set one, else `<bank_prefix><name>`. What `teams_roster` reports,
+    /// so the view and the store cannot disagree.
+    pub fn bank_id(&self, identity: &str) -> String {
+        match self.banks.get(identity) {
+            Some(bank) => bank.clone(),
+            None => format!("{}{identity}", self.bank_prefix),
+        }
     }
 
     /// Appends one host-stamped record and returns its id.
@@ -376,6 +419,7 @@ impl LocalBank {
                 return Err(MemoryError::Io(format!("read bank {}: {e}", dir.display())));
             }
         };
+        let suffix = format!(".{RECORD_EXT}");
         let mut names: Vec<String> = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -386,7 +430,7 @@ impl LocalBank {
                 }
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(&format!(".{RECORD_EXT}")) {
+            if !name.ends_with(&suffix) {
                 continue;
             }
             names.push(name);
@@ -406,7 +450,11 @@ impl LocalBank {
                     continue;
                 }
             };
-            let id = name.trim_end_matches(&format!(".{RECORD_EXT}")).to_string();
+            // `strip_suffix`, NOT `trim_end_matches`: the latter strips EVERY
+            // trailing repetition, so a hand-dropped `notes.md.md` would report
+            // the id `notes` — and an invalidate naming that id would then miss
+            // the file it came from, or hit a different one.
+            let id = name.strip_suffix(&suffix).unwrap_or(&name).to_string();
             let fact = match parse_record(&id, &text) {
                 Ok(f) => f,
                 Err(e) => {
@@ -557,13 +605,19 @@ fn sanitize_id(s: &str) -> String {
 /// stem. `fact_id` arrives from an MCP tool argument, so a separator or a `..`
 /// must be refused rather than joined.
 fn record_path(dir: &Path, fact_id: &str) -> Result<PathBuf, MemoryError> {
+    // `.` is allowed because it is REACHABLE: a bank is a directory of files a
+    // human may add to, and `recall` reports the filename-minus-one-extension as
+    // the id — so a hand-written `notes.md.md` is reported as `notes.md`, and an
+    // id this function refused would be one no caller could ever act on. What
+    // must not get through is anything that could leave the bank directory.
     let ok = !fact_id.is_empty()
+        && !fact_id.contains("..")
         && fact_id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if !ok {
         return Err(MemoryError::Invalid(format!(
-            "fact_id {fact_id:?} is not a record id (expected [A-Za-z0-9_-]+)"
+            "fact_id {fact_id:?} is not a record id (expected [A-Za-z0-9_-.]+ with no \"..\")"
         )));
     }
     Ok(dir.join(format!("{fact_id}.{RECORD_EXT}")))
@@ -964,7 +1018,15 @@ mod tests {
         }
         b.retain(&record("alice", "STUDIO-1", "1", "x"))
             .expect("retain");
-        for bad in ["../../etc/passwd", "a/b", ""] {
+        for bad in [
+            "../../etc/passwd",
+            "a/b",
+            "",
+            "..",
+            "a..b",
+            "x/../y",
+            "a\\b",
+        ] {
             match b.invalidate("alice", bad, "why") {
                 Err(MemoryError::Invalid(_)) => {}
                 other => panic!("fact_id {bad:?} must be refused, got {other:?}"),
@@ -1064,6 +1126,108 @@ mod tests {
                 .expect("recall")
                 .facts
                 .is_empty()
+        );
+    }
+
+    /// The roster's `bank:` override selects the directory records actually
+    /// live in — otherwise it would be a field the roster VIEW reports and the
+    /// store ignores, and `teams_roster` would name one bank while records
+    /// landed in another.
+    #[test]
+    fn a_roster_bank_override_selects_the_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = LocalBank::new(dir.path().join(DEFAULT_BANKS_SUBDIR), "agent-")
+            .with_bank_overrides([("alice", "shared-rust"), ("bob", "")]);
+
+        assert_eq!(b.bank_id("alice"), "shared-rust");
+        assert_eq!(
+            b.bank_id("bob"),
+            "agent-bob",
+            "an empty override is no override"
+        );
+        assert!(
+            b.bank_dir("alice")
+                .expect("bank dir")
+                .ends_with("shared-rust"),
+            "{:?}",
+            b.bank_dir("alice")
+        );
+
+        b.retain(&record("alice", "STUDIO-1", "1", "into the shared bank"))
+            .expect("retain");
+        assert!(
+            dir.path()
+                .join(DEFAULT_BANKS_SUBDIR)
+                .join("shared-rust")
+                .exists(),
+            "the override directory is what retain creates"
+        );
+        assert_eq!(
+            b.recall("alice", &ticket_query("STUDIO-1"))
+                .expect("recall")
+                .facts
+                .len(),
+            1,
+            "and what recall reads back"
+        );
+    }
+
+    /// An override that is not label-safe is DROPPED, not joined: it becomes a
+    /// directory name under the bank root, so it can no more carry a separator
+    /// or a `..` than an identity can.
+    #[test]
+    fn an_unsafe_bank_override_is_dropped_not_joined() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = LocalBank::new(dir.path().join(DEFAULT_BANKS_SUBDIR), "agent-")
+            .with_bank_overrides([("alice", "../../escape"), ("bob", "Not/Safe")]);
+        assert_eq!(b.bank_id("alice"), "agent-alice");
+        assert_eq!(b.bank_id("bob"), "agent-bob");
+        assert!(
+            b.bank_dir("alice")
+                .expect("bank dir")
+                .ends_with("agent-alice"),
+            "an unsafe override must fall back, never escape the root"
+        );
+    }
+
+    /// A record id is the filename with ONE `.md` stripped. `trim_end_matches`
+    /// would strip every trailing repetition, so a hand-dropped `notes.md.md`
+    /// would report the id `notes` — and an invalidate naming that id would then
+    /// miss the file it came from, or hit a different one.
+    #[test]
+    fn a_record_id_strips_exactly_one_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = bank(dir.path());
+        b.retain(&record("alice", "STUDIO-1", "1", "real record"))
+            .expect("retain");
+        let bank_dir = b.bank_dir("alice").expect("bank dir");
+        // A human dropped a note in the bank whose stem itself ends in `.md`.
+        std::fs::write(
+            bank_dir.join("20260829T120000Z-notes.md.md"),
+            "---
+identity: alice
+ticket: STUDIO-1
+state: valid
+---
+
+STUDIO-1 hand-written
+",
+        )
+        .expect("write");
+
+        let got = b
+            .recall("alice", &ticket_query("STUDIO-1"))
+            .expect("recall");
+        let ids: Vec<&str> = got.facts.iter().map(|f| f.id.as_str()).collect();
+        assert!(
+            ids.contains(&"20260829T120000Z-notes.md"),
+            "the id keeps the inner .md: {ids:?}"
+        );
+        // And that id round-trips: invalidating it finds the file it came from.
+        assert!(
+            b.invalidate("alice", "20260829T120000Z-notes.md", "superseded")
+                .expect("invalidate"),
+            "a reported id must address the record it was reported for"
         );
     }
 
