@@ -64,6 +64,7 @@ pub mod stop;
 pub mod teams;
 mod teamscompose;
 pub mod teamsmemory;
+pub mod teamspost;
 pub mod telemetry_attrs;
 pub mod triage;
 pub mod warnings;

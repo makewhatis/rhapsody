@@ -366,6 +366,25 @@ impl StateProvider for FakeProvider {
             .await
     }
 
+    /// The room's write side (STUDIO-653, T6). The ROOM half only: the timeline row and the
+    /// direct-to-live delivery need the control task's `running` / `mailboxes`, which no fake
+    /// provider has — those are exercised in `rhapsody-orchestrator`'s `teamspost` tests against a
+    /// real orchestrator. What this proves is what the HTTP boundary owns: the host-stamped `from`,
+    /// roster validation, and the wire envelope.
+    async fn teams_post(
+        &self,
+        run_id: i64,
+        body: &str,
+        to: &str,
+        refs: &[String],
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::PostView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?
+            .post_for_run(run_id, body, to, refs, fixed_instant())
+    }
+
     fn capabilities_registry(&self) -> Option<Vec<rhapsody_config::capabilities::CapabilityDef>> {
         self.capabilities_registry.clone()
     }

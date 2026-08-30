@@ -2,7 +2,7 @@
 //! `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.7, §6.7).
 //!
 //! **No Go v0.4.0 counterpart** — the Go facade has no analog, exactly as
-//! `symphony_handoff` has none. Five tools, each a thin proxy of a NEW additive
+//! `symphony_handoff` has none. Six tools, each a thin proxy of a NEW additive
 //! daemon endpoint:
 //!
 //! | Tool | Reads/Writes | Endpoint |
@@ -12,6 +12,7 @@
 //! | `teams_invalidate {identity, fact_id, reason}` | write | `POST /api/v1/teams/invalidate` |
 //! | `teams_retain {content}` | write | `POST /api/v1/runs/{id}/retain` |
 //! | `teams_room_read {limit?}` | read | `GET /api/v1/teams/room` (STUDIO-650, T5) |
+//! | `teams_post {body, to?, refs?}` | write | `POST /api/v1/runs/{id}/post` (STUDIO-653, T6) |
 //!
 //! `teams_retain` is **this slice's addition to §6.7's table** — §6.7 listed
 //! `teams_roster` / `teams_recall` / `teams_invalidate` but not the retain half
@@ -20,7 +21,7 @@
 //!
 //! # Off ⇒ invisible, not merely inert (§6.7, §2.4 row 7)
 //!
-//! When Teams is off, [`Facade::new`] REMOVES all five routes, so `list_tools`
+//! When Teams is off, [`Facade::new`] REMOVES all six routes, so `list_tools`
 //! is byte-identical to a daemon built before Teams existed. That is the
 //! `allow_handoff` mechanism, reused unchanged — the gate is the enabled-tool
 //! set, so a disabled tool is absent rather than surfacing a runtime
@@ -33,7 +34,21 @@
 //! another run's catch-up and silently hide a hand-off from the teammate it was addressed to — so
 //! this tool reads the newest bounded window every time and moves nothing. That is also why it
 //! takes no `identity`: a peek is not any identity, so it sees room-audience posts and no direct
-//! ones. §6.7's table gains it with a T5 home (§0.11.7); `teams_post`, the write half, is T6's.
+//! ones. §6.7's table gains it with a T5 home (§0.11.7).
+//!
+//! # `teams_post` cannot forge its author either (STUDIO-653, T6)
+//!
+//! **There is no `from` argument, and there is no way to add one** (§0.11.4: "`from` is stamped by
+//! the host … a run cannot supply it"). The run id comes from `SYMPHONY_RUN_ID` exactly as
+//! `teams_retain`'s does, the daemon resolves that run to the identity it was dispatched as, and a
+//! run wearing no identity cannot post at all. `to` names a teammate — validated against the roster
+//! on the far side, where an unknown name is a loud `bad_request` rather than a silent downgrade to
+//! a room post, because a message its author believed was private must never quietly become public.
+//!
+//! The tool is a **proxy and nothing more**: it never opens the room log. The daemon stays the
+//! single writer (§0.11.4), which is what makes the concurrent-append problem dissolve rather than
+//! needing a lock. And a post has no dispatch power whatever (§0.2) — it starts no run, writes no
+//! label and touches no tracker, however it is addressed.
 //!
 //! # `teams_retain` cannot forge provenance
 //!
@@ -87,6 +102,23 @@ pub(crate) struct RoomReadArgs {
     limit: u32,
 }
 
+/// `teams_post` args (STUDIO-653, T6). Note what is NOT here: no `from`, no
+/// `identity`, no `run_id`. The author is resolved by the daemon from
+/// `SYMPHONY_RUN_ID`, and `retain_declares_only_content`'s sibling test pins
+/// this schema so a provenance argument cannot be added by accident.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(crate) struct PostArgs {
+    /// what you want the team to know, in your own words.
+    body: String,
+    /// a teammate's name (from `teams_roster`) to address it to; omit, or use
+    /// `*`, for the whole room.
+    #[serde(default)]
+    to: String,
+    /// ticket ids, PR urls or commit SHAs that back it up.
+    #[serde(default)]
+    refs: Vec<String>,
+}
+
 /// `teams_retain` args — `content` and nothing else, by design (module docs).
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct RetainArgs {
@@ -106,6 +138,16 @@ struct InvalidateBody<'a> {
 #[derive(Serialize)]
 struct RetainBody<'a> {
     content: &'a str,
+}
+
+/// The `POST /api/v1/runs/{id}/post` body. Carries exactly the three declared
+/// arguments — the run id travels in the PATH, which is what makes `from`
+/// unforgeable.
+#[derive(Serialize)]
+struct PostBody<'a> {
+    body: &'a str,
+    to: &'a str,
+    refs: &'a [String],
 }
 
 #[tool_router(router = teams_router, vis = "pub(crate)")]
@@ -226,6 +268,44 @@ impl Facade {
                 &format!("/api/v1/runs/{}/retain", path_escape(&id)),
                 payload,
             )
+            .await
+        {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "teams_post",
+        description = "Say something to your team: ask a question, hand off a decision, or flag what you found. Omit `to` (or use `*`) to post to the whole room; set `to` to a teammate's name from teams_roster to address them directly. Rhapsody stamps WHO you are from your run — you cannot post as anyone else. A teammate who is running right now also gets it in-turn, clearly marked as coming from you rather than from the operator; one who is not running reads it when they next start. Posting never starts a run, never assigns a ticket and never changes anything in Linear — the room is for talking, not for dispatching work. Proxies POST /api/v1/runs/{id}/post for SYMPHONY_RUN_ID."
+    )]
+    async fn teams_post(&self, Parameters(args): Parameters<PostArgs>) -> CallToolResult {
+        // As with `teams_retain`: no `run_id` argument, so the identity the daemon stamps is the
+        // one it dispatched this worker with (module docs, §0.11.4).
+        let id = or_default("", &self.opts.default_run_id);
+        if id.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "SYMPHONY_RUN_ID is not set: only a dispatched run can post to the team room",
+            ));
+        }
+        if args.body.trim().is_empty() {
+            return err_result(&FacadeError::new(
+                "empty_body",
+                "body is required: say what you want the team to know",
+            ));
+        }
+        let payload = match serde_json::to_vec(&PostBody {
+            body: &args.body,
+            to: &args.to,
+            refs: &args.refs,
+        }) {
+            Ok(p) => p,
+            Err(e) => return err_result(&FacadeError::new("encode_error", e.to_string())),
+        };
+        match self
+            .client
+            .post_json(&format!("/api/v1/runs/{}/post", path_escape(&id)), payload)
             .await
         {
             Ok(body) => text_result(&body),
@@ -364,8 +444,9 @@ mod tests {
     /// else — the precise statement of "byte-identical when off", checked from
     /// both directions so a future tool cannot slip in unnoticed.
     ///
-    /// STUDIO-650 (T5) extended this list with `teams_room_read`; the assertion
-    /// is unchanged in kind, only in the set it names.
+    /// STUDIO-650 (T5) extended this list with `teams_room_read` and STUDIO-653
+    /// (T6) with `teams_post`; the assertion is unchanged in kind, only in the
+    /// set it names.
     #[tokio::test]
     async fn enabling_teams_only_adds_the_teams_tools() {
         let off = tool_names(facade(Options::default(), 0)).await;
@@ -377,6 +458,7 @@ mod tests {
             added,
             vec![
                 "teams_invalidate",
+                "teams_post",
                 "teams_recall",
                 "teams_retain",
                 "teams_room_read",
@@ -540,6 +622,93 @@ mod tests {
         let mut keys: Vec<&String> = props.keys().collect();
         keys.sort();
         assert_eq!(keys, vec!["limit"]);
+        let _ = client.cancel().await;
+    }
+
+    // ── the room's write side (STUDIO-653, T6) ────────────────────────────
+
+    /// `teams_post` declares `body`, `to` and `refs` — and, crucially, NOTHING else. No `from`, no
+    /// `identity`, no `run_id`. The input schema is the contract an agent reads, so this is where
+    /// §0.11.4's "a run cannot supply it" is checkable rather than merely intended.
+    #[tokio::test]
+    async fn post_declares_no_provenance_argument() {
+        let client = connect(facade(teams_on(), 0)).await;
+        let tools = client.list_all_tools().await.expect("list tools");
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "teams_post")
+            .expect("teams_post is registered");
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("an object schema");
+        let mut keys: Vec<&String> = props.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["body", "refs", "to"],
+            "teams_post must expose no provenance argument"
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// The post path end to end: the tool posts to the run named by SYMPHONY_RUN_ID — never a run
+    /// id, and never an author, the caller supplied.
+    #[tokio::test]
+    async fn post_goes_to_the_run_from_the_env() {
+        let (port, seen) = stub_daemon().await;
+        let opts = Options {
+            default_run_id: "412".to_string(),
+            ..teams_on()
+        };
+        let client = connect(facade(opts, port)).await;
+
+        let out = call_text(
+            &client,
+            "teams_post",
+            serde_json::json!({"body": "the mirror lock is per-repo", "to": "alice"}),
+        )
+        .await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![("POST".to_string(), "/api/v1/runs/412/post".to_string())]
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// A coordinator session (no SYMPHONY_RUN_ID) cannot post: there is no run to resolve an author
+    /// from, and the tool refuses rather than guessing — the same rule `teams_retain` follows.
+    #[tokio::test]
+    async fn post_without_a_run_id_is_refused() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+        let out = call_text(&client, "teams_post", serde_json::json!({"body": "hi"})).await;
+        assert!(out.contains("SYMPHONY_RUN_ID"), "out = {out}");
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "an unattributable post must not reach the daemon"
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// An empty body never leaves the facade: a blank line in the room is noise in every teammate's
+    /// turn-1 prompt, forever.
+    #[tokio::test]
+    async fn an_empty_post_never_leaves_the_facade() {
+        let (port, seen) = stub_daemon().await;
+        let opts = Options {
+            default_run_id: "412".to_string(),
+            ..teams_on()
+        };
+        let client = connect(facade(opts, port)).await;
+        let out = call_text(&client, "teams_post", serde_json::json!({"body": "  \n "})).await;
+        assert!(out.contains("empty_body"), "out = {out}");
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "an empty post must not reach the daemon"
+        );
         let _ = client.cancel().await;
     }
 

@@ -12,7 +12,7 @@ use axum::routing::any;
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::teamsmemory::{
-    InvalidateView, RecallView, RetainView, RoomView, RosterView, TeamsMemoryError,
+    InvalidateView, PostView, RecallView, RetainView, RoomView, RosterView, TeamsMemoryError,
 };
 use rhapsody_orchestrator::{
     HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot,
@@ -31,8 +31,8 @@ use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
 use crate::handlers_teams::{
-    handle_run_retain, handle_teams_invalidate, handle_teams_recall, handle_teams_room,
-    handle_teams_roster,
+    handle_run_post, handle_run_retain, handle_teams_invalidate, handle_teams_recall,
+    handle_teams_room, handle_teams_roster,
 };
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
@@ -186,6 +186,22 @@ pub trait StateProvider: Send + Sync {
         _run_id: i64,
         _content: &str,
     ) -> Result<RetainView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// Post a message to the team room as a live run (`POST /api/v1/runs/{id}/post`, STUDIO-653 T6;
+    /// §0.5, §0.11.4). Like retain, run-scoped in its PATH: the host resolves the run to the
+    /// identity it was dispatched as and stamps that as `from`, so there is no route by which an
+    /// agent can name itself. `to` empty or `*` is the room; any other value must name a roster
+    /// member. The room append is the post; the timeline row and any direct-to-live delivery are
+    /// best-effort mirrors reported in the view.
+    async fn teams_post(
+        &self,
+        _run_id: i64,
+        _body: &str,
+        _to: &str,
+        _refs: &[String],
+    ) -> Result<PostView, TeamsMemoryError> {
         Err(TeamsMemoryError::Disabled)
     }
 }
@@ -352,6 +368,10 @@ where
         // nothing else — the identity, ticket and commit come from the run this path names, which
         // is what makes provenance unforgeable (§5.1). More-specific than runs/{id}.
         .route("/api/v1/runs/{id}/retain", any(handle_run_retain))
+        // The room's write side (STUDIO-653, T6): run-scoped in its path for the same reason
+        // retain is — the run id in the PATH is what `from` is stamped from, and the body carries
+        // no provenance key at all.
+        .route("/api/v1/runs/{id}/post", any(handle_run_post))
         // Operator messages (H3): POST queues a "btw" for a live run's agent; GET lists the run's
         // messages with their delivery status. More-specific than runs/{id}, so they win the match.
         .route("/api/v1/runs/{id}/message", any(handle_run_message))

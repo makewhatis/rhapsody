@@ -11,6 +11,7 @@
 //! * `teams_recall` — read an identity's bank.
 //! * `teams_invalidate` — mark one record non-valid, with the reason.
 //! * `teams_roster` — who exists, and what each of them is doing right now.
+//! * `teams_post` — append a host-stamped message to the room (STUDIO-653, T6).
 //!
 //! # Why this is a fourth shared cell, and what keeps it honest
 //!
@@ -47,9 +48,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, Record};
-use rhapsody_config::room::{Cursor, Message, RoomError, RoomLog};
+use rhapsody_config::room::{AUDIENCE_ROOM, Cursor, Message, RoomError, RoomLog};
 use rhapsody_config::teams::Teams;
 use serde::Serialize;
 
@@ -131,6 +132,33 @@ pub struct RoomView {
     /// Log lines that could not be parsed — reported rather than hidden, so "skipped loudly" is
     /// true of the API as well as of the log.
     pub skipped: Vec<String>,
+}
+
+/// `POST /api/v1/runs/{id}/post` (STUDIO-653, T6) — the host-stamped message echoed back, so the
+/// agent can see exactly what was written on its behalf and to whom.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PostView {
+    /// The room log's `file:seq` id for the appended line (§0.11.4).
+    pub id: String,
+    /// **Host-stamped**: the identity the posting run is wearing, never anything the body carried
+    /// (§0.11.4 — "a run cannot supply it").
+    pub from: String,
+    /// The wire audience: a teammate's name, or [`AUDIENCE_ROOM`] for the room.
+    pub to: String,
+    /// The host clock at append time, rendered EXACTLY as the log line renders it (RFC 3339,
+    /// second precision, `Z`). A `DateTime<Utc>` here would echo sub-second precision the log
+    /// never stored, so this response and a later `GET /api/v1/teams/room` would disagree about
+    /// the timestamp of the same message.
+    pub at: String,
+    /// The refs the poster attached (§0.10 — what proves it).
+    pub refs: Vec<String>,
+    /// How many LIVE runs the direct message also reached in their mailbox, wearing the teammate
+    /// wrap. `0` for a room post, and `0` for a direct post whose recipient is not running or whose
+    /// mailbox is full — both of which degrade to catch-up with nothing queued and nothing retried
+    /// (§0.5). `0` is also what a busy control task answers within
+    /// `ControlHandle::record_teams_post`'s bounded wait: this field says what the host could
+    /// CONFIRM, never that the room log is missing anything.
+    pub delivered: i64,
 }
 
 /// `POST /api/v1/teams/invalidate`.
@@ -281,6 +309,78 @@ impl TeamsMemory {
                 .into_iter()
                 .map(|(line, why)| format!("{line}: {why}"))
                 .collect(),
+        })
+    }
+
+    /// `POST /api/v1/runs/{id}/post` — the room's WRITE side (STUDIO-653, T6; §0.5, §0.10,
+    /// §0.11.4).
+    ///
+    /// **Everything unforgeable about a post is decided here.** The agent supplies `body`, an
+    /// optional `to` and optional `refs`; the host resolves `run_id` → the identity that run was
+    /// dispatched as and stamps it as `from`, stamps `at` from its own clock, and appends through
+    /// [`LocalRoom::append`](rhapsody_config::room::LocalRoom::append) — the single writer, which
+    /// also owns the body cap. There is no argument, and no body key, by which a run can name
+    /// itself something else, and a run wearing no identity is never bound and so cannot post at
+    /// all.
+    ///
+    /// `to` absent or [`AUDIENCE_ROOM`] is the room. Any other value must name a roster member:
+    /// an unknown name is [`TeamsMemoryError::Invalid`] pointing at `teams_roster`, **never** a
+    /// silent downgrade to a room post — a message the author believed was private must not
+    /// quietly become public.
+    ///
+    /// This does the ROOM half only. The best-effort mirrors — the `teams.message` timeline row
+    /// and the teammate-wrapped delivery into a live recipient's mailbox — need loop-owned state
+    /// and live in [`crate::teamspost`], applied by the caller after this returns.
+    pub fn post_for_run(
+        &self,
+        run_id: i64,
+        body: &str,
+        to: &str,
+        refs: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<PostView, TeamsMemoryError> {
+        if !self.enabled() {
+            return Err(TeamsMemoryError::Disabled);
+        }
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(TeamsMemoryError::Invalid(
+                "body is required: say what you want the team to know".to_string(),
+            ));
+        }
+        // The binding is the whole authorisation: no entry (or an entry with no identity, which
+        // `bind_run` refuses to store) ⇒ there is nobody to attribute the post to, and guessing is
+        // exactly the forgery §0.11.4 rules out.
+        let Some(prov) = self.read_runs().get(&run_id).cloned() else {
+            return Err(TeamsMemoryError::NotRunning);
+        };
+        let to = to.trim();
+        if !(to.is_empty() || to == AUDIENCE_ROOM)
+            && !self.teams.roster.iter().any(|i| i.name == to)
+        {
+            return Err(TeamsMemoryError::Invalid(format!(
+                "no teammate named `{to}` is on this roster: call teams_roster for the names, or                  omit `to` to post to the whole room"
+            )));
+        }
+        // A post needs somewhere to land. Unlike a READ — where no room configured is an empty
+        // room, because a room nobody posted to reads the same — a write that cannot be recorded
+        // must say so rather than report success over a message that went nowhere.
+        let Some(room) = self.room.as_ref() else {
+            return Err(TeamsMemoryError::Backend(
+                "the team room has no on-disk home on this daemon, so there is nowhere to post"
+                    .to_string(),
+            ));
+        };
+        let msg = Message::addressed(&prov.identity, to, now, body).with_refs(refs.iter().cloned());
+        let id = room.append(&msg)?;
+        Ok(PostView {
+            id,
+            from: prov.identity,
+            to: msg.to.as_wire().to_string(),
+            // The log's own rendering, so this view and a later room read agree byte for byte.
+            at: msg.at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            refs: msg.refs,
+            delivered: 0,
         })
     }
 

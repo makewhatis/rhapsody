@@ -150,20 +150,47 @@ impl Orchestrator {
     /// router ([`deliver_mid_run_summons`](Orchestrator::deliver_mid_run_summons), INF-448) so there is
     /// exactly ONE admission path honoring [`OPERATOR_MAILBOX_CAP`]. Mirrors Go `deliverToMailbox`.
     pub(crate) fn deliver_to_mailbox(&self, re: &RunningEntry, body: &str) -> (i64, bool) {
+        self.admit_to_mailbox(re, &operator_wrap(body), body)
+    }
+
+    /// The ONE mailbox admission: a non-blocking send of `wrapped` (a full — or absent, for
+    /// legacy/test-injected entries — mailbox rejects), then a best-effort persist of `persist_as`
+    /// as a `run_messages` row.
+    ///
+    /// The two arguments are separate because the operator path stores the operator's OWN words
+    /// while the mailbox carries the wrapper; STUDIO-653's teammate path passes the wrapped text
+    /// for both, because `run_messages` has no author column and a bare body there would read back
+    /// as the operator's.
+    ///
+    /// **Every admission persists a row, and that is load-bearing rather than incidental:**
+    /// [`persist_run_message_delivered`](Orchestrator::persist_run_message_delivered) marks the
+    /// OLDEST still-"sent" row when the runner reports a stdin write, so the row order must match
+    /// the mailbox order. An admission that skipped its row would make the next operator message's
+    /// `delivered_turn` the turn some OTHER message was written.
+    ///
+    /// Split out of `deliver_to_mailbox` so the wrapper is the CALLER's choice while
+    /// [`OPERATOR_MAILBOX_CAP`] stays the single bound both paths honour. Mirrors Go
+    /// `deliverToMailbox`, whose operator-only behaviour is unchanged.
+    pub(crate) fn admit_to_mailbox(
+        &self,
+        re: &RunningEntry,
+        wrapped: &str,
+        persist_as: &str,
+    ) -> (i64, bool) {
         let sent = {
             let mailboxes = self
                 .mailboxes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match mailboxes.get(&re.issue.id) {
-                Some(mb) => mb.tx.try_send(operator_wrap(body)).is_ok(),
+                Some(mb) => mb.tx.try_send(wrapped.to_string()).is_ok(),
                 None => false, // nil mailbox (legacy/test-injected) → reject
             }
         };
         if !sent {
             return (0, false);
         }
-        (self.persist_run_message(re, body), true)
+        (self.persist_run_message(re, persist_as), true)
     }
 
     /// Returns the opaque issue id of the live run whose `run_id` matches, or `""` when none does
