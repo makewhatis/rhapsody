@@ -40,7 +40,7 @@ pub fn encode(c: &Config) -> Result<Definition, ConfigError> {
     let value: Value =
         serde_yaml_ng::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
     // `pruned` is a map, or empty when everything pruned away (Go's `front, _ := pruned.(map)` +
-    // nil-guard). `pr_label` defaults to "symphony" (non-empty) so the map is never actually empty.
+    // nil-guard). `pr_label` defaults to "rhapsody" (non-empty) so the map is never actually empty.
     let config = match prune_empty(value) {
         Some(Value::Mapping(m)) => m,
         _ => Mapping::new(),
@@ -163,7 +163,7 @@ fn raw_from_config(c: &Config) -> Raw {
     r.prompt_file = c.prompt_file.clone();
     r.git_flow = c.git_flow.clone();
     r.workspace_mode = c.workspace_mode.clone();
-    r.pr_label = c.pr_label.clone(); // defaulted "symphony" is non-empty, survives pruning (AIE-301)
+    r.pr_label = c.pr_label.clone(); // defaulted "rhapsody" is non-empty, survives pruning (AIE-301)
     r.tracker.project_slug = c.tracker.project_slug.clone();
 
     if collapsible_to_single(c) {
