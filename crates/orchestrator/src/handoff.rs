@@ -317,6 +317,291 @@ mod tests {
         i
     }
 
+    // ── the Rhapsody Teams review quorum (STUDIO-659, T7; design record §0.6, §0.12) ────────────
+    //
+    // The handoff IS the quorum's trigger, so these tests live here: they drive the real
+    // `handoff_run` and assert on what came out of the channel it feeds.
+
+    /// A quorum-enabled Teams over `roster`.
+    fn quorum_teams(roster: &[&str]) -> rhapsody_config::teams::Teams {
+        rhapsody_config::teams::Teams {
+            enabled: true,
+            quorum: rhapsody_config::teams::Quorum {
+                enabled: true,
+                reviewers: 2,
+            },
+            roster: roster
+                .iter()
+                .map(|n| rhapsody_config::teams::Identity {
+                    name: (*n).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..rhapsody_config::teams::Teams::disabled()
+        }
+    }
+
+    /// A ticket with one open linked PR, so the poller's snapshot has a URL to hand the fan-out.
+    fn issue_with_pr(id: &str, ident: &str, team: &str) -> Issue {
+        let mut i = issue_team(id, ident, "In Progress", team);
+        i.title = "do the thing".to_string();
+        i.linked_pr = true;
+        i.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 7,
+            merged: false,
+        }]);
+        i
+    }
+
+    /// Dispatches `iss` AS `identity` with the quorum on, opens the quorum channel, records the
+    /// poller snapshot, and returns the loop task + handle + receiver. `snapshot` is what the
+    /// candidate sweep saw this tick (the load and the PR/marker facts come from it).
+    fn quorum_harness(
+        tr: Arc<Fake>,
+        teams: rhapsody_config::teams::Teams,
+        iss: Issue,
+        identity: &str,
+        snapshot: &[Issue],
+    ) -> (
+        tokio::task::JoinHandle<Orchestrator>,
+        ControlHandle,
+        tokio::sync::mpsc::UnboundedReceiver<crate::quorum::QuorumRequest>,
+        i64,
+        CancelSignal,
+    ) {
+        let (mut o, env) = handoff_orch(tr, &["In Review"]);
+        o.teams = Some(teams);
+        let rx = o.open_quorum_channel();
+        o.record_quorum_state(snapshot.iter());
+        let id = iss.id.clone();
+        o.dispatch_issue(iss, None, None, String::new());
+        // `dispatch_issue` stamps the identity only when routing produced one; these tests state it
+        // directly so the trigger, not the router, is what is under test.
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = identity.to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+        (task, handle, rx, run_id, env.signal)
+    }
+
+    // The acceptance path end to end: an identity-worn handoff with a PR yields exactly `reviewers`
+    // review requests, author excluded, least-loaded first — and the handoff itself is unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_identity_handoff_with_a_pr_requests_a_quorum() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+        // A known load state: carol holds one open ticket, dave three, bob none. Roster order is
+        // bob, carol, dave — so "least-loaded first" and "roster order" disagree past the first pick.
+        let mut carol_work = issue("w1", "MT-9", "Todo");
+        carol_work.labels = Some(vec!["rhapsody:@carol".into()]);
+        let mut dave_work = issue("w2", "MT-10", "Todo");
+        dave_work.labels = Some(vec!["rhapsody:@dave".into()]);
+        let mut dave_work2 = issue("w3", "MT-11", "Todo");
+        dave_work2.labels = Some(vec!["rhapsody:@dave".into()]);
+        let snapshot = vec![parent.clone(), carol_work, dave_work, dave_work2];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice", "bob", "carol", "dave"]),
+            parent,
+            "alice",
+            &snapshot,
+        );
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert_eq!(res.moved_to, "In Review", "the handoff itself is unchanged");
+
+        let req = rx.try_recv().expect("a quorum request was sent");
+        assert_eq!(req.parent_issue_id, "ID-1");
+        assert_eq!(req.parent_team_id, "TEAM-1");
+        assert_eq!(req.parent_identifier, "MT-1");
+        assert_eq!(req.parent_title, "do the thing");
+        assert_eq!(req.pr_url, "https://github.com/o/r/pull/7");
+        assert_eq!(req.author, "alice");
+        assert_eq!(
+            req.reviewers,
+            vec!["bob".to_string(), "carol".to_string()],
+            "author excluded, least-loaded first, capped at reviewers"
+        );
+        assert_eq!(
+            req.state_name, "Todo",
+            "the run's project's FIRST configured active state, in the config's own casing (the \
+             by-name create resolves it exactly as the by-name move does) — never a hard-coded \
+             literal, which would create review tickets this daemon cannot dispatch"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one request per handoff");
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    // §0.12's "once per ticket": a re-handoff after review fixes fans out NOTHING, decided from the
+    // marker label the first fan-out wrote onto the parent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parent_already_marked_requests_nothing() {
+        let tr = Arc::new(Fake::new());
+        let mut parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+        parent.labels = Some(vec![crate::quorum::QUORUM_REQUESTED_LABEL.to_string()]);
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice", "bob", "carol"]),
+            parent,
+            "alice",
+            &snapshot,
+        );
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert_eq!(res.moved_to, "In Review", "the handoff still succeeds");
+        assert!(
+            rx.try_recv().is_err(),
+            "a re-handoff of a marked parent fans out nothing"
+        );
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    // A run that was NOT dispatched as a roster identity is an ordinary Rhapsody run: there is no
+    // author to exclude and no team to ask, so nothing fires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_identity_handoff_requests_nothing() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice", "bob", "carol"]),
+            parent,
+            "", // no identity
+            &snapshot,
+        );
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(rx.try_recv().is_err(), "no identity ⇒ no quorum");
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    // A handoff with no linked PR has nothing for a reviewer to read, so it fires nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_with_no_pr_requests_nothing() {
+        let tr = Arc::new(Fake::new());
+        let mut parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        parent.title = "do the thing".into();
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice", "bob", "carol"]),
+            parent,
+            "alice",
+            &snapshot,
+        );
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(rx.try_recv().is_err(), "no PR ⇒ no quorum");
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    // A handoff whose review-state move the tracker REFUSED is not a handoff, so it must not fan
+    // review tickets out for work whose author is about to keep going.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_move_requests_nothing() {
+        let mut fake = Fake::new();
+        fake.move_err = Some(TrackerError::Other("linear_move_rejected: nope".into()));
+        let tr = Arc::new(fake);
+        let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice", "bob", "carol"]),
+            parent,
+            "alice",
+            &snapshot,
+        );
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(!res.move_err.is_empty(), "the move failed: {res:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a handoff that did not land fans out nothing"
+        );
+
+        signal.cancel();
+        let _ = task.await;
+    }
+
+    // The acceptance criterion for the default installation: quorum OFF (and Teams off) means the
+    // handoff is byte-identical to what it was before this slice — no channel, no request, and the
+    // candidate snapshot is not even recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_quorum_being_off_changes_nothing_about_a_handoff() {
+        for teams in [
+            None,
+            Some(rhapsody_config::teams::Teams::disabled()),
+            // Teams ON, quorum absent — the shipped shape of an existing Teams installation.
+            Some(rhapsody_config::teams::Teams {
+                enabled: true,
+                roster: vec![rhapsody_config::teams::Identity {
+                    name: "alice".into(),
+                    ..Default::default()
+                }],
+                ..rhapsody_config::teams::Teams::disabled()
+            }),
+        ] {
+            let tr = Arc::new(Fake::new());
+            let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+            o.teams = teams.clone();
+            let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+            o.record_quorum_state(std::iter::once(&parent));
+            assert!(!o.quorum_enabled(), "the quorum must be off for {teams:?}");
+            o.dispatch_issue(parent, None, None, String::new());
+            if let Some(re) = o.running.get_mut("ID-1") {
+                re.identity = "alice".to_string();
+            }
+            let run_id = o.running["ID-1"].run_id;
+            let (task, handle) = start(o, &env.signal);
+
+            let res = handle
+                .handoff_run(CancelWait::default(), run_id)
+                .await
+                .expect("handoff_run");
+            assert_eq!(res.moved_to, "In Review");
+            assert!(
+                tr.create_issue_calls().is_empty(),
+                "no tracker create with the quorum off"
+            );
+            assert!(tr.add_label_calls().is_empty(), "and no label write either");
+
+            env.signal.cancel();
+            let o = task.await.expect("loop task");
+            assert!(
+                o.quorum_facts.is_empty() && o.quorum_load.is_empty(),
+                "the candidate sweep is a hard no-op with the quorum off"
+            );
+        }
+    }
+
     // The happy path: a live run's ticket is moved to the configured review state by NAME, the agent
     // is NOT killed, and the result carries the identifier + moved-to state.
     #[tokio::test(flavor = "multi_thread")]

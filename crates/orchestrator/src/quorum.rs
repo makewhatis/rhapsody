@@ -792,3 +792,621 @@ impl Orchestrator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testsupport::{TempDir, issue};
+    use rhapsody_config::room::{Cursor, LocalRoom, RoomError};
+    use rhapsody_config::teams::{Identity, Quorum};
+    use rhapsody_core::LinkedPRRef;
+    use rhapsody_tracker::TrackerError;
+    use rhapsody_tracker::fake::Fake;
+
+    fn ident(name: &str) -> Identity {
+        Identity {
+            name: name.to_string(),
+            profile: "swe".to_string(),
+            labels: Vec::new(),
+            bank: String::new(),
+            max_concurrent: 0,
+        }
+    }
+
+    /// Teams ON with the quorum ON — the only configuration the fan-out runs under.
+    fn teams_quorum(names: &[&str], reviewers: i64) -> Teams {
+        Teams {
+            enabled: true,
+            quorum: Quorum {
+                enabled: true,
+                reviewers,
+            },
+            roster: names.iter().map(|n| ident(n)).collect(),
+            ..Teams::disabled()
+        }
+    }
+
+    fn request(reviewers: &[&str]) -> QuorumRequest {
+        QuorumRequest {
+            parent_issue_id: "iss-1".into(),
+            parent_team_id: "team-1".into(),
+            parent_identifier: "MT-1".into(),
+            parent_title: "do the thing".into(),
+            pr_url: "https://github.com/o/r/pull/7".into(),
+            author: "alice".into(),
+            reviewers: reviewers.iter().map(|r| (*r).to_string()).collect(),
+            state_name: "Todo".into(),
+            summon_token: "@symphony".into(),
+        }
+    }
+
+    fn deps(teams: Teams, tr: Arc<Fake>) -> QuorumDeps<impl Fn() -> Option<QuorumTarget>> {
+        QuorumDeps {
+            teams: Arc::new(teams),
+            target: move || {
+                Some(QuorumTarget {
+                    tracker: Arc::clone(&tr) as Arc<dyn Tracker>,
+                })
+            },
+            room: None,
+            max_backoff_ms: 20,
+        }
+    }
+
+    fn deps_with_room(
+        teams: Teams,
+        tr: Arc<Fake>,
+        room: Arc<dyn RoomLog>,
+    ) -> QuorumDeps<impl Fn() -> Option<QuorumTarget>> {
+        QuorumDeps {
+            room: Some(room),
+            ..deps(teams, tr)
+        }
+    }
+
+    /// A tracker with a viewer to assign to — the fan-out refuses to create anything without one.
+    fn tracker_with_viewer() -> Fake {
+        let mut tr = Fake::new();
+        tr.viewer = rhapsody_core::Viewer {
+            id: "viewer-1".into(),
+            ..Default::default()
+        };
+        tr
+    }
+
+    /// Every message in the room, oldest first.
+    fn room_posts(room: &LocalRoom) -> Vec<rhapsody_config::room::Message> {
+        room.read_since("reader", &Cursor::default(), 0)
+            .expect("catch up")
+            .messages
+    }
+
+    // ── reviewer selection (pure) ───────────────────────────────────────────────────────────────
+
+    // The acceptance criterion, pinned with a KNOWN load state: the author is excluded, the roster
+    // is ordered least-loaded first, and exactly `reviewers` are taken. Roster order here is
+    // deliberately the OPPOSITE of load order, so a test that merely returned the roster would fail.
+    #[test]
+    fn reviewers_are_least_loaded_first_and_never_the_author() {
+        let teams = teams_quorum(&["alice", "bob", "carol", "dave"], 2);
+        let load = HashMap::from([
+            ("alice".to_string(), 0), // the author: excluded regardless of load
+            ("bob".to_string(), 5),
+            ("carol".to_string(), 1),
+            ("dave".to_string(), 3),
+        ]);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &load),
+            vec!["carol".to_string(), "dave".to_string()],
+            "least-loaded first, author excluded, capped at reviewers"
+        );
+    }
+
+    // An identity with no open tickets counts as zero rather than being skipped — the idlest
+    // teammate is the best reviewer, and `HashMap::get` returning `None` must not read as "unknown".
+    #[test]
+    fn an_absent_load_entry_counts_as_idle() {
+        let teams = teams_quorum(&["alice", "bob", "carol"], 1);
+        let load = HashMap::from([("bob".to_string(), 4)]);
+        assert_eq!(select_reviewers(&teams, "alice", &load), vec!["carol"]);
+    }
+
+    // Ties break on ROSTER ORDER, exactly as `teams::route`'s label-overlap fallback does, so the
+    // choice is deterministic across runs and a fresh team does not fan out at random.
+    #[test]
+    fn a_tie_breaks_on_roster_order() {
+        let teams = teams_quorum(&["alice", "bob", "carol", "dave"], 2);
+        let load = HashMap::new();
+        assert_eq!(
+            select_reviewers(&teams, "alice", &load),
+            vec!["bob".to_string(), "carol".to_string()]
+        );
+    }
+
+    // Too few candidates degrades to however many exist — never an error, never a wait (§0.12).
+    #[test]
+    fn a_short_roster_degrades_to_as_many_as_exist() {
+        let teams = teams_quorum(&["alice", "bob"], 2);
+        assert_eq!(
+            select_reviewers(&teams, "alice", &HashMap::new()),
+            vec!["bob"]
+        );
+
+        let solo = teams_quorum(&["alice"], 2);
+        assert!(
+            select_reviewers(&solo, "alice", &HashMap::new()).is_empty(),
+            "a roster of one has nobody to ask"
+        );
+    }
+
+    // ── the PR read ─────────────────────────────────────────────────────────────────────────────
+
+    // A merged PR needs no review, so the URL is the first UNMERGED ref; an issue with none has no
+    // URL at all, which is what makes "a handoff with no PR fires nothing" decidable in memory.
+    #[test]
+    fn open_pr_url_picks_the_first_unmerged_ref() {
+        let pr = |number: i64, merged: bool| LinkedPRRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            number,
+            merged,
+        };
+        let mut iss = issue("i1", "MT-1", "In Progress");
+        assert_eq!(open_pr_url(&iss), "", "no refs ⇒ no url");
+
+        iss.linked_prs = Some(vec![pr(1, true)]);
+        assert_eq!(open_pr_url(&iss), "", "a merged PR needs no review");
+
+        iss.linked_prs = Some(vec![pr(1, true), pr(7, false)]);
+        assert_eq!(open_pr_url(&iss), "https://github.com/o/r/pull/7");
+    }
+
+    // ── the fan-out ─────────────────────────────────────────────────────────────────────────────
+
+    // The headline acceptance: exactly `reviewers` review tickets, each Todo, viewer-assigned and
+    // labelled `rhapsody:@<reviewer>`; the parent marked; ONE manager post naming the PR and the
+    // reviewers.
+    #[tokio::test]
+    async fn a_fan_out_creates_a_ticket_per_reviewer_marks_the_parent_and_tells_the_room() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let tr = Arc::new(tracker_with_viewer());
+        let d = deps_with_room(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob", "carol"])).await,
+            FanOutcome::Fanned {
+                created: 2,
+                wanted: 2
+            }
+        );
+
+        let calls = tr.create_issue_calls();
+        assert_eq!(calls.len(), 2, "one review ticket per reviewer: {calls:?}");
+        for (call, reviewer) in calls.iter().zip(["bob", "carol"]) {
+            let s = &call.spec;
+            assert_eq!(s.team_id, "team-1", "created beside the work it reviews");
+            assert_eq!(s.state_name, "Todo");
+            assert_eq!(
+                s.assignee_id, "viewer-1",
+                "unassigned tickets are never picked up"
+            );
+            assert_eq!(s.labels, vec![format!("rhapsody:@{reviewer}")]);
+            assert_eq!(s.title, "Review: MT-1 do the thing");
+            assert!(
+                s.description.contains("https://github.com/o/r/pull/7"),
+                "the description names the PR: {}",
+                s.description
+            );
+            assert!(
+                s.description.contains("MT-1"),
+                "and the parent: {}",
+                s.description
+            );
+            assert!(
+                s.description.contains("@symphony"),
+                "and the summon token findings must carry: {}",
+                s.description
+            );
+            assert!(
+                s.description.contains("Never merge"),
+                "and the one instruction that must always hold: {}",
+                s.description
+            );
+        }
+
+        let labels = tr.add_label_calls();
+        assert_eq!(labels.len(), 1, "the parent is marked once: {labels:?}");
+        assert_eq!(labels[0].issue_id, "iss-1");
+        assert_eq!(labels[0].label_name, QUORUM_REQUESTED_LABEL);
+
+        let posts = room_posts(&room);
+        assert_eq!(posts.len(), 1, "exactly one manager post: {posts:?}");
+        let m = &posts[0];
+        assert_eq!(m.from, MANAGER_IDENTITY, "`from` is host-stamped");
+        assert_eq!(m.to, rhapsody_config::room::Audience::Room);
+        assert!(
+            m.body
+                .contains("Requested review of https://github.com/o/r/pull/7"),
+            "{}",
+            m.body
+        );
+        assert!(m.body.contains("bob, carol"), "{}", m.body);
+        assert!(
+            m.refs.contains(&"MT-1".to_string()),
+            "the post refs the parent: {:?}",
+            m.refs
+        );
+    }
+
+    // §0.12: "zero ⇒ skip with a loud room post". A one-person team is a valid configuration; it
+    // just cannot hold a quorum, and nothing is written to the tracker at all.
+    #[tokio::test]
+    async fn a_roster_of_one_writes_nothing_and_posts_loudly() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let tr = Arc::new(tracker_with_viewer());
+        let d = deps_with_room(
+            teams_quorum(&["alice"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(fan_out(&d, &request(&[])).await, FanOutcome::NoReviewers);
+        assert!(tr.create_issue_calls().is_empty(), "nothing is created");
+        assert!(tr.add_label_calls().is_empty(), "and nothing is marked");
+
+        let posts = room_posts(&room);
+        assert_eq!(posts.len(), 1);
+        assert!(
+            posts[0].body.contains("NO REVIEW QUORUM"),
+            "{}",
+            posts[0].body
+        );
+        assert!(posts[0].body.contains("MT-1"), "{}", posts[0].body);
+    }
+
+    // Scope 7's stated tradeoff: 1 of 2 created still marks the parent and REPORTS the shortfall,
+    // rather than leaving the parent unmarked so a later handoff re-creates the ticket that already
+    // succeeded. A duplicate review ticket wakes a real agent for no reason; a stated gap does not.
+    #[tokio::test]
+    async fn a_partial_fan_out_marks_the_parent_and_names_the_shortfall() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut fake = tracker_with_viewer();
+        fake.create_issue_fail_first = 1; // bob's create fails, carol's succeeds
+        let tr = Arc::new(fake);
+        let d = deps_with_room(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob", "carol"])).await,
+            FanOutcome::Fanned {
+                created: 1,
+                wanted: 2
+            }
+        );
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            2,
+            "one create failing does not abort the other"
+        );
+        assert_eq!(
+            tr.add_label_calls().len(),
+            1,
+            "the parent is marked anyway, so this is never retried"
+        );
+
+        let body = &room_posts(&room)[0].body;
+        assert!(body.contains("SHORTFALL"), "{body}");
+        assert!(body.contains("bob"), "the failed reviewer is named: {body}");
+        assert!(body.contains("1 of 2"), "{body}");
+    }
+
+    // Every create failing is a TrackerFailure: the parent is NOT marked (so a later handoff may
+    // still try), the room is told loudly, and the caller backs off.
+    #[tokio::test]
+    async fn a_total_failure_leaves_the_parent_unmarked_and_posts_loudly() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut fake = tracker_with_viewer();
+        fake.create_issue_err = Some(TrackerError::Other("linear_api_status: 503".into()));
+        let tr = Arc::new(fake);
+        let d = deps_with_room(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob", "carol"])).await,
+            FanOutcome::TrackerFailure
+        );
+        assert!(
+            tr.add_label_calls().is_empty(),
+            "nothing was requested, so nothing is marked"
+        );
+        let body = &room_posts(&room)[0].body;
+        assert!(body.contains("REVIEW QUORUM FAILED"), "{body}");
+        assert!(body.contains("NOT marked"), "{body}");
+    }
+
+    // Without a viewer to assign to, creating the tickets would be worse than creating none: an
+    // unassigned ticket is never picked up, so the fan-out would look like it worked.
+    #[tokio::test]
+    async fn no_resolvable_viewer_creates_nothing() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut fake = Fake::new();
+        fake.viewer_err = Some(TrackerError::Other("linear_api_request: boom".into()));
+        let tr = Arc::new(fake);
+        let d = deps_with_room(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob", "carol"])).await,
+            FanOutcome::TrackerFailure
+        );
+        assert!(tr.create_issue_calls().is_empty());
+        assert!(room_posts(&room)[0].body.contains("REVIEW QUORUM FAILED"));
+    }
+
+    // The room is advisory and Linear is the ledger (§0.11.4): a room that cannot be written costs
+    // the team a paragraph of history and costs the fan-out nothing.
+    #[tokio::test]
+    async fn a_failing_room_does_not_cost_the_fan_out() {
+        struct BrokenRoom;
+        impl RoomLog for BrokenRoom {
+            fn append(&self, _msg: &Message) -> Result<String, RoomError> {
+                Err(RoomError::Io("disk on fire".into()))
+            }
+            fn read_since(
+                &self,
+                _reader: &str,
+                _cursor: &Cursor,
+                _limit: usize,
+            ) -> Result<rhapsody_config::room::CaughtUp, RoomError> {
+                Err(RoomError::Io("disk on fire".into()))
+            }
+        }
+        let tr = Arc::new(tracker_with_viewer());
+        let d = deps_with_room(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::new(BrokenRoom) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob", "carol"])).await,
+            FanOutcome::Fanned {
+                created: 2,
+                wanted: 2
+            }
+        );
+        assert_eq!(tr.create_issue_calls().len(), 2);
+        assert_eq!(tr.add_label_calls().len(), 1);
+    }
+
+    // A marker write that fails does not undo a fan-out that succeeded — but it IS said out loud,
+    // because it means a restarted daemon could fan out a second time.
+    #[tokio::test]
+    async fn a_failed_marker_still_reports_the_created_tickets() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut fake = tracker_with_viewer();
+        fake.add_label_err = Some(TrackerError::Other("linear_move_rejected: nope".into()));
+        let tr = Arc::new(fake);
+        let d = deps_with_room(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob", "carol"])).await,
+            FanOutcome::Fanned {
+                created: 2,
+                wanted: 2
+            }
+        );
+        let body = &room_posts(&room)[0].body;
+        assert!(body.contains("WARNING"), "{body}");
+        assert!(body.contains(QUORUM_REQUESTED_LABEL), "{body}");
+    }
+
+    // No tracker yet (the daemon has not loaded a config) is a failure the caller backs off on, not
+    // a silent success.
+    #[tokio::test]
+    async fn no_tracker_is_a_backed_off_failure() {
+        let d: QuorumDeps<fn() -> Option<QuorumTarget>> = QuorumDeps {
+            teams: Arc::new(teams_quorum(&["alice", "bob"], 2)),
+            target: || None,
+            room: None,
+            max_backoff_ms: 20,
+        };
+        assert_eq!(
+            fan_out(&d, &request(&["bob"])).await,
+            FanOutcome::TrackerFailure
+        );
+    }
+
+    // ── the per-tick candidate snapshot ─────────────────────────────────────────────────────────
+
+    fn orch_with(teams: Teams) -> Orchestrator {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.teams = Some(teams);
+        o
+    }
+
+    fn with_labels(id: &str, labels: &[&str]) -> Issue {
+        let mut iss = issue(id, id, "Todo");
+        iss.labels = Some(labels.iter().map(|s| (*s).to_string()).collect());
+        iss
+    }
+
+    // The sweep tallies §0.11.1's load per identity and reads each ticket's PR + marker, so a
+    // handoff arriving between ticks costs no tracker read at all.
+    #[test]
+    fn the_candidate_sweep_records_load_and_facts() {
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 2));
+        let mut parent = with_labels("iss-1", &["rhapsody:@alice"]);
+        parent.linked_prs = Some(vec![LinkedPRRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 7,
+            merged: false,
+        }]);
+        let marked = with_labels("iss-2", &["rhapsody:@bob", QUORUM_REQUESTED_LABEL]);
+        let other = with_labels("iss-3", &["rhapsody:@bob"]);
+        // A label naming nobody on the roster is not load: §0.11.1 makes a present label
+        // authoritative for ROUTING, but a departed teammate is not somebody to hand a review to.
+        let stray = with_labels("iss-4", &["rhapsody:@mallory"]);
+
+        o.record_quorum_state([parent, marked, other, stray].iter());
+
+        assert_eq!(o.quorum_load.get("alice"), Some(&1));
+        assert_eq!(o.quorum_load.get("bob"), Some(&2));
+        assert_eq!(o.quorum_load.get("mallory"), None, "off-roster is not load");
+        assert_eq!(
+            o.quorum_facts["iss-1"].pr_url,
+            "https://github.com/o/r/pull/7"
+        );
+        assert!(!o.quorum_facts["iss-1"].already_requested);
+        assert!(o.quorum_facts["iss-2"].already_requested);
+        assert!(!o.quorum_facts["iss-3"].already_requested);
+    }
+
+    // Replaces rather than merges: a ticket that has left the candidate set stops asserting a PR
+    // link or a marker that was true a week ago.
+    #[test]
+    fn the_candidate_sweep_replaces_rather_than_merges() {
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 2));
+        o.record_quorum_state([with_labels("iss-1", &["rhapsody:@alice"])].iter());
+        assert!(o.quorum_facts.contains_key("iss-1"));
+
+        o.record_quorum_state([with_labels("iss-2", &["rhapsody:@bob"])].iter());
+        assert!(
+            !o.quorum_facts.contains_key("iss-1"),
+            "a departed ticket must not linger"
+        );
+        assert_eq!(o.quorum_load.get("alice"), None);
+        assert_eq!(o.quorum_load.get("bob"), Some(&1));
+    }
+
+    // The acceptance criterion, at the sweep: with the quorum off — or with Teams off entirely —
+    // the per-tick pass is a hard no-op, not a pass whose result is merely unread.
+    #[test]
+    fn the_candidate_sweep_is_a_hard_no_op_when_the_quorum_is_off() {
+        let mut teams_on_quorum_off = teams_quorum(&["alice", "bob"], 2);
+        teams_on_quorum_off.quorum.enabled = false;
+        let mut teams_off = teams_quorum(&["alice", "bob"], 2);
+        teams_off.enabled = false;
+
+        for teams in [Some(teams_on_quorum_off), Some(teams_off), None] {
+            let mut o = Orchestrator::new("WORKFLOW.md");
+            o.teams = teams.clone();
+            assert!(!o.quorum_enabled(), "{teams:?}");
+            o.record_quorum_state([with_labels("iss-1", &["rhapsody:@alice"])].iter());
+            assert!(o.quorum_load.is_empty(), "{teams:?}");
+            assert!(o.quorum_facts.is_empty(), "{teams:?}");
+        }
+    }
+
+    // ── the task ────────────────────────────────────────────────────────────────────────────────
+
+    // §0.12's "once per ticket", in-process half: a second handoff of the SAME parent fans out
+    // nothing, even before a poll could refresh the marker label onto the candidate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_handoff_of_the_same_parent_fans_out_nothing() {
+        let tr = Arc::new(tracker_with_viewer());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let d = deps(teams_quorum(&["alice", "bob", "carol"], 2), Arc::clone(&tr));
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        tx.send(request(&["bob", "carol"])).expect("first handoff");
+        tx.send(request(&["bob", "carol"])).expect("second handoff");
+        // Drop the sender so the task drains and returns rather than being killed mid-write.
+        drop(tx);
+        task.await.expect("task joins");
+
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            2,
+            "the repeat handoff must create nothing: {:?}",
+            tr.create_issue_calls()
+        );
+        assert_eq!(tr.add_label_calls().len(), 1);
+        signal.cancel();
+    }
+
+    // Cancellation returns promptly rather than waiting out a queued request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_task_stops_on_cancel() {
+        let tr = Arc::new(tracker_with_viewer());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<QuorumRequest>();
+        let signal = crate::control_loop::CancelSignal::new();
+        let d = deps(teams_quorum(&["alice", "bob"], 2), tr);
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+        signal.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the task stops promptly on cancel")
+            .expect("task joins");
+    }
+
+    // A dropped sender ends the task: no handoff can arrive once the control handle is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_task_ends_when_every_sender_is_dropped() {
+        let tr = Arc::new(tracker_with_viewer());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<QuorumRequest>();
+        let signal = crate::control_loop::CancelSignal::new();
+        let d = deps(teams_quorum(&["alice", "bob"], 2), tr);
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the task ends")
+            .expect("task joins");
+        signal.cancel();
+    }
+
+    // A tracker that refuses everything must not turn into a hot retry loop: a failed fan-out
+    // delays the NEXT one, and the failed one is never retried at all — a re-handoff is the only
+    // thing entitled to ask again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_fan_out_backs_off_and_is_never_retried() {
+        let mut fake = tracker_with_viewer();
+        fake.create_issue_err = Some(TrackerError::Other("linear_api_status: 503".into()));
+        let tr = Arc::new(fake);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let d = deps(teams_quorum(&["alice", "bob", "carol"], 2), Arc::clone(&tr));
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        for n in 1..=3 {
+            let mut req = request(&["bob"]);
+            req.parent_issue_id = format!("iss-{n}");
+            tx.send(req).expect("send");
+        }
+        drop(tx);
+        task.await.expect("task joins");
+
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            3,
+            "one attempt per REQUEST, never a retry of a failed one"
+        );
+        signal.cancel();
+    }
+}

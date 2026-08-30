@@ -1130,6 +1130,54 @@ mod tests {
         );
     }
 
+    // STUDIO-659 (Teams T7), design §0.12 and the slice's first acceptance criterion: the review
+    // quorum is opt-in per installation, so the fan-out task exists ONLY for an enabled Teams with
+    // `quorum.enabled` and a roster of more than one. Every other configuration — which includes
+    // every installation shipping today — has no task at all rather than a task that returns early,
+    // which is what makes "zero behaviour change" a property rather than a promise.
+    #[test]
+    fn spawn_quorum_only_for_an_enabled_quorum_with_somebody_to_ask() {
+        use rhapsody_config::teams::{Identity, Quorum, Teams};
+
+        let team = |enabled: bool, quorum: bool, names: &[&str]| Teams {
+            enabled,
+            quorum: Quorum {
+                enabled: quorum,
+                reviewers: 2,
+            },
+            roster: names
+                .iter()
+                .map(|n| Identity {
+                    name: (*n).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Teams::disabled()
+        };
+
+        assert!(spawn_quorum(&team(true, true, &["alice", "bob"])));
+        assert!(
+            !spawn_quorum(&team(true, false, &["alice", "bob"])),
+            "the quorum defaults off and must spawn nothing until it is asked for"
+        );
+        assert!(
+            !spawn_quorum(&team(false, true, &["alice", "bob"])),
+            "Teams off must spawn no quorum task"
+        );
+        assert!(
+            !spawn_quorum(&team(true, true, &["alice"])),
+            "a roster of one has nobody to review its own work"
+        );
+        assert!(
+            !spawn_quorum(&team(true, true, &[])),
+            "an empty roster likewise"
+        );
+        assert!(
+            !spawn_quorum(&Teams::disabled()),
+            "the shipped state must spawn no quorum task"
+        );
+    }
+
     // STUDIO-644 (Teams T3b), design §0.11.2 and the slice's first acceptance criterion: the triage
     // task — the ONLY thing in the daemon that can call a model outside a dispatched run — spawns
     // for `labels+model` and for nothing else. This is the exact predicate `run` gates the spawn on,
