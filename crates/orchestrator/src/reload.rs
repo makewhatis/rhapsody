@@ -113,6 +113,7 @@ impl Orchestrator {
         let states = crate::dispatch::DispatchStates {
             active: eff.active_states.clone(),
             terminal: eff.terminal_states.clone(),
+            review: eff.review_states.clone(),
         };
         let inputs = project_warn_inputs(&eff);
         let checker = self.prompt_file_checker_for(&eff);

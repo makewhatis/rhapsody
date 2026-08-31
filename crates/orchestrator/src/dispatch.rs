@@ -114,6 +114,12 @@ pub(crate) fn dispatchable_state(
 pub struct DispatchStates {
     pub active: HashSet<String>,
     pub terminal: HashSet<String>,
+    /// The configured REVIEW states. Not part of [`dispatchable_state`] — the selection gate
+    /// handles review-state issues on its own reopen branch — but the reconcile sweep
+    /// (STUDIO-672) needs them to scope itself to exactly "parked in review" rather than to every
+    /// state that merely fails to be dispatchable, which would sweep Done, Canceled and Backlog
+    /// tickets too.
+    pub review: HashSet<String>,
 }
 
 impl DispatchStates {
@@ -121,6 +127,14 @@ impl DispatchStates {
     /// issue, normalizing the state the way every other reader of `Issue::state` does.
     pub fn admits(&self, iss: &Issue) -> bool {
         dispatchable_state(&normalize_state(&iss.state), &self.active, &self.terminal)
+    }
+
+    /// Whether `iss` is parked in a configured REVIEW state — non-dispatchable, but alive: work
+    /// awaiting a human, or a record deliberately left open. The complement of [`Self::admits`]
+    /// within the candidate fetch, which is exactly active ∪ review.
+    pub fn is_in_review(&self, iss: &Issue) -> bool {
+        let st = normalize_state(&iss.state);
+        self.review.contains(&st) && !self.active.contains(&st)
     }
 
     /// Whether any active state is configured at all. `false` means this snapshot admits NOTHING,

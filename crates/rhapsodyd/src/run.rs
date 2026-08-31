@@ -388,6 +388,15 @@ where
             // taken from `o` because the orchestrator has already moved into the control task by
             // this point; both resolve the same directory through `resolve_room_dir`.
             room: triage_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+            // The evidence the one-time review-label reconcile judges by (STUDIO-672): the
+            // `teams.route` events row every routed dispatch already writes. Teams itself only
+            // exists where there IS an on-disk runtime home (`resolve_teams_path` gates the config
+            // load above on exactly that), so the store this reads is a real one wherever this task
+            // is spawned at all — and a store that answers with an error answers "cannot tell",
+            // never "nobody", so an unreadable history costs nobody a label she earned.
+            history: Some(Arc::new(rhapsody_orchestrator::StoreIdentityHistory::new(
+                handle.store(),
+            ))),
         };
         Some(tokio::spawn(async move {
             rhapsody_orchestrator::run_triage_schedule(triage_ctx, deps).await;
