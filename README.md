@@ -263,7 +263,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
 | `rhapsody.db` | no column, no table, no new row *kind* |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
-| Dispatch | `route()` is not called; the same issues dispatch in the same order |
+| Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
 | Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/`, no `teams/room/` |
 
@@ -337,6 +337,26 @@ One thing Teams deliberately does **not** fix: the pre-existing `agent_send_mess
 `POST /api/v1/runs/{id}/message` surface lets any caller push text to any live run wearing the
 *operator* wrap. That is outside Teams' scope, `teams_post` does not route through it, and closing
 it is separate work.
+
+**With Teams on, work goes to the team (STUDIO-669).** A ticket carrying no `rhapsody:@<identity>`
+label, matching no teammate's topic labels and caught by no `manager.default_identity` is **held at
+selection** rather than dispatched anonymously, and its arrival wakes the triage manager immediately
+instead of leaving it to the next scheduled sweep. The manager assigns it — from its model turn
+under `manager.mode: labels+model`, or deterministically (`default_identity`, else the least-loaded
+teammate) whenever no model can answer: `manager.mode: labels`, a model outage, a triage back-off, or
+an answer naming somebody who is not on the roster. Either way the room gets a `manager` post saying
+who took the ticket and why, marked `(deterministic)` when it was not the model's call, and the
+`rhapsody:@` label lands in Linear as the durable assignment. Work is never withheld: if even the
+label write fails, the assignment is held in memory, the run dispatches wearing it anyway, and the
+label reconciles on a later cycle.
+
+**`rhapsody:solo` is the one deliberate way around the team.** A ticket wearing it dispatches
+immediately as a plain identity-less run — for daemon-debugging work, or anything you want vanilla.
+Triage never reads it, never labels it and never posts about it; routing leaves it unrouted and
+records `reason=solo`, so a deliberate opt-out stays countable and is never confused with a misroute.
+Skipping the team is the thing that requires a label; it is never the accident that happens by
+default. With Teams **off**, or `manager.mode: off`, nothing is ever held and dispatch is exactly
+what it always was.
 
 One `teams.yaml` key governs how much of all this reaches a prompt: `prompt_budget_bytes`
 (default 16000) is a single total budget for the whole Teams turn-1 prepend. Overflow drops the

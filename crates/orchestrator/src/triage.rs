@@ -391,22 +391,18 @@ where
         "teams triage task started (off-loop; dispatch is never blocked on it)"
     );
     let mut failures: i64 = 0;
+    // The next time the model may be asked. Held as a DEADLINE rather than re-derived from a sleep
+    // each pass, because the two wake-ups below must not be able to postpone each other: a kick
+    // that restarted the back-off timer would let a steady trickle of new tickets starve the
+    // model's recovery probe indefinitely, leaving a healthy model permanently unasked.
+    let mut next_cycle = tokio::time::Instant::now() + deps.interval;
     loop {
-        // Back off AT LEAST the normal cadence: retrying a down API sooner than we would poll a
-        // healthy one would be the hot loop the review forbade.
-        let delay = if failures > 0 {
-            deps.interval.max(Duration::from_millis(
-                failure_backoff_ms(failures, deps.max_backoff_ms).max(0) as u64,
-            ))
-        } else {
-            deps.interval
-        };
         // WHY this cycle woke decides what it may do. The arrival kick (STUDIO-669, §A.3.2) and
-        // the timer are both wake-ups, and treating them identically would break one of the two
+        // the deadline are both wake-ups, and treating them identically would break one of the two
         // bounds this loop has to hold at once.
         let kicked = tokio::select! {
             _ = ctx.cancelled() => return,
-            _ = tokio::time::sleep(delay) => false,
+            _ = tokio::time::sleep_until(next_cycle) => false,
             _ = deps.handle.kicked() => true,
         };
         if ctx.is_cancelled() {
@@ -414,17 +410,17 @@ where
         }
         // A kick that arrives DURING the back-off is a liveness cycle, not a retry (§A.3.3's
         // "triage in back-off" case). It assigns deterministically — the held ticket must not wait
-        // out a 15-minute back-off for a model that is down — and it leaves the back-off counter
-        // exactly where it was, so the model's recovery probe still happens on the back-off
-        // schedule rather than once per kick. That is what keeps "never a hot retry loop against a
-        // down API" true while the control task is kicking every couple of seconds.
+        // out a 15-minute back-off for a model that is down — and it leaves both the back-off
+        // counter and the deadline exactly where they were, so the model's recovery probe still
+        // happens on the back-off schedule rather than once per kick, and cannot be postponed by
+        // one. That is what keeps "never a hot retry loop against a down API" true while the
+        // control task is kicking every couple of seconds.
         //
         // The kicks are self-limiting besides: the gate only kicks for a HELD ticket, and a cycle
         // resolves every ticket it touches into either a label or a pending assignment, neither of
         // which is held. A kick storm is therefore not reachable from a failing dependency, only
         // from a backlog — which drains [`MAX_PER_CYCLE`] at a time.
-        let backing_off = failures > 0;
-        if kicked && backing_off {
+        if kicked && failures > 0 {
             triage_cycle(&ctx, &deps, false).await;
             continue;
         }
@@ -439,6 +435,16 @@ where
         } else {
             failures = 0;
         }
+        // Back off AT LEAST the normal cadence: retrying a down API sooner than we would poll a
+        // healthy one would be the hot loop the review forbade.
+        let delay = if failures > 0 {
+            deps.interval.max(Duration::from_millis(
+                failure_backoff_ms(failures, deps.max_backoff_ms).max(0) as u64,
+            ))
+        } else {
+            deps.interval
+        };
+        next_cycle = tokio::time::Instant::now() + delay;
     }
 }
 
@@ -532,6 +538,10 @@ where
     // Is there a model to ask at all? `mode: labels` has no model turn by definition (§A.3.3), and
     // the caller has already said whether the back-off is running.
     let mut model = ask_model && deps.teams.manager.mode == ManagerMode::LabelsModel;
+    // Why the model is unavailable for the REST of this cycle once it has been dropped, so the
+    // tickets behind a mid-cycle failure report the failure that actually happened rather than a
+    // back-off that has not started yet.
+    let mut model_down: Option<NoModel> = None;
     let mut labelled = 0usize;
     let mut model_failed = false;
     let mut write_failed = false;
@@ -570,11 +580,13 @@ where
         // was not the model's — that reason reaches the room post verbatim (§A.3.3: "the history is
         // honest about which brain chose").
         let mut no_model: Option<NoModel> = (!model).then(|| {
-            if deps.teams.manager.mode == ManagerMode::LabelsModel {
-                NoModel::BackOff
-            } else {
-                NoModel::ModeLabels
-            }
+            model_down.clone().unwrap_or({
+                if deps.teams.manager.mode == ManagerMode::LabelsModel {
+                    NoModel::BackOff
+                } else {
+                    NoModel::ModeLabels
+                }
+            })
         });
         let mut chosen: Option<(String, String)> = None;
         if model {
@@ -631,7 +643,8 @@ where
                     // failing, and the deterministic path needs nothing from it.
                     model = false;
                     model_failed = true;
-                    no_model = Some(NoModel::TurnFailed(e));
+                    model_down = Some(NoModel::TurnFailed(e));
+                    no_model = model_down.clone();
                 }
             }
         }
@@ -647,11 +660,13 @@ where
             (None, None) => continue,
         };
 
+        let mut wrote = true;
         if let Err(e) = write_label(tracker.as_ref(), iss, &identity).await {
             // §A.3.4's liveness valve, and the design's order of goods in one branch: an
             // identity-worn run beats a stalled ticket beats an identity-less run. The decision
             // stands, the router reads it from memory, and the label reconciles on a later cycle.
             write_failed = true;
+            wrote = false;
             let held = deps.handle.record_pending(&iss.id, &identity);
             if held {
                 tracing::warn!(
@@ -689,7 +704,10 @@ where
                         iss.identifier
                     )
                 } else {
-                    format!("Assigned {} to {identity}. Reason: {reason}", iss.identifier)
+                    format!(
+                        "Assigned {} to {identity}. Reason: {reason}",
+                        iss.identifier
+                    )
                 },
             )
             .with_refs([iss.identifier.clone()]),
@@ -704,7 +722,12 @@ where
         // Count the ticket we just assigned, so the next candidate in THIS cycle sees the load it
         // created. Without it a cycle would hand every ticket to whoever started out idlest.
         *load.entry(identity).or_default() += 1;
-        labelled += 1;
+        // Counted only when the LABEL landed. A pending assignment is a decision, not a label, and
+        // the cycle reports `TrackerFailure` for it either way — but `Labelled(n)` should never be
+        // able to mean "n decided, some of them unwritten".
+        if wrote {
+            labelled += 1;
+        }
     }
     if write_failed {
         CycleOutcome::TrackerFailure
@@ -2156,5 +2179,364 @@ mod tests {
         park_tx.send_replace(true);
         signal.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), triage).await;
+    }
+
+    // ── §A.3.3 the deterministic fallback, §A.3.4 the liveness valve, §A.3.6 rhapsody:solo ───────
+
+    /// `mode: labels` has no model turn at all, so §A.3.3 is the ONLY thing that can assign — and
+    /// it must, because the selection gate is holding the ticket until it does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mode_labels_assigns_deterministically_without_ever_asking_a_model() {
+        let mut teams = teams_model(vec![ident("alice", &["rust"]), ident("bob", &["web"])]);
+        teams.manager.mode = ManagerMode::Labels;
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["docs"])];
+        // alice is busy, bob is idle: least-loaded wins.
+        tr.open_by_labels = vec![labelled("old", &["rhapsody:@alice"])];
+        let tr = Arc::new(tr);
+        let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let d = deps_with_room(
+            teams,
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Labelled(1)
+        );
+        assert!(
+            arbiter.prompts().is_empty(),
+            "`mode: labels` must never reach a model, task or no task"
+        );
+        assert_eq!(tr.add_label_calls()[0].label_name, "rhapsody:@bob");
+        let body = &room
+            .read_since("bob", &Cursor::default(), 0)
+            .expect("catch up")
+            .messages[0]
+            .body;
+        assert!(body.contains("(deterministic)"), "{body}");
+        assert!(
+            body.contains("least-loaded teammate (0 open tickets)"),
+            "{body}"
+        );
+        assert!(body.contains("manager.mode is `labels`"), "{body}");
+    }
+
+    /// A liveness cycle woken by an arrival kick while the back-off runs (`ask_model: false`) still
+    /// assigns — that is §A.3.3's "triage in back-off" case, and it is why a held ticket never
+    /// waits out a 15-minute back-off for a model that is down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_back_off_cycle_assigns_deterministically_without_a_turn() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["docs"])];
+        let tr = Arc::new(tr);
+        let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let d = deps_with_room(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, false).await,
+            CycleOutcome::Labelled(1)
+        );
+        assert!(
+            arbiter.prompts().is_empty(),
+            "the down model is not asked again"
+        );
+        assert_eq!(tr.add_label_calls()[0].label_name, "rhapsody:@alice");
+        let body = &room
+            .read_since("alice", &Cursor::default(), 0)
+            .expect("catch up")
+            .messages[0]
+            .body;
+        assert!(body.contains("in back-off"), "{body}");
+    }
+
+    /// The tickets BEHIND a mid-cycle model failure report the failure that actually happened, not
+    /// a back-off that has not started yet. The room is the durable record of a misroute, so a
+    /// reason that describes the wrong cause is worse than terse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tickets_behind_a_failed_turn_name_that_failure_in_the_room() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["docs"]), labelled("i2", &["docs"])];
+        let tr = Arc::new(tr);
+        let arbiter = FakeArbiter::answering(vec![Err("model exploded".to_string())]);
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let d = deps_with_room(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::ModelFailure
+        );
+        assert_eq!(tr.add_label_calls().len(), 2, "both tickets still flow");
+        let msgs = room
+            .read_since("alice", &Cursor::default(), 0)
+            .expect("catch up")
+            .messages;
+        assert_eq!(msgs.len(), 2);
+        for m in &msgs {
+            assert!(m.body.contains("(deterministic)"), "{}", m.body);
+            assert!(
+                m.body.contains("model exploded"),
+                "the second ticket must name the real cause too: {}",
+                m.body
+            );
+        }
+    }
+
+    /// `default_identity` outranks least-loaded, and says so in the room.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_deterministic_fallback_prefers_the_default_identity() {
+        let mut teams = teams_model(vec![ident("alice", &["rust"]), ident("bob", &["web"])]);
+        teams.manager.mode = ManagerMode::Labels;
+        teams.manager.default_identity = "bob".to_string();
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["docs"])];
+        // bob is the busier of the two: `default_identity` still wins.
+        tr.open_by_labels = vec![labelled("old", &["rhapsody:@bob"])];
+        let tr = Arc::new(tr);
+        let d = deps(
+            teams,
+            Arc::clone(&tr),
+            FakeArbiter::answering(Vec::new()) as Arc<dyn TriageArbiter>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Labelled(1)
+        );
+        assert_eq!(tr.add_label_calls()[0].label_name, "rhapsody:@bob");
+    }
+
+    /// The author-of-nothing edge cases, in one table. Every one of them has an answer, and the
+    /// answer is stable: an empty load map, a roster nobody has ever been assigned from, and a
+    /// failed load read all resolve to the first least-loaded member in ROSTER order — never to map
+    /// iteration order, which would differ between ticks and between daemons.
+    #[test]
+    fn deterministic_assignment_always_answers_and_is_stable() {
+        let teams = teams_model(vec![ident("alice", &["rust"]), ident("bob", &["web"])]);
+        let empty = HashMap::new();
+        for _ in 0..8 {
+            assert_eq!(
+                deterministic_assignment(&teams, &empty).map(|(n, _)| n),
+                Some("alice".to_string()),
+                "nobody has anything ⇒ roster order, every time"
+            );
+        }
+
+        let loaded: HashMap<String, i64> = [("alice".to_string(), 3)].into_iter().collect();
+        let (name, how) = deterministic_assignment(&teams, &loaded).expect("an answer");
+        assert_eq!(name, "bob", "an identity absent from the tally is at zero");
+        assert_eq!(how, "least-loaded teammate (0 open tickets)");
+
+        // The floor: an empty roster has no answer, and one is never invented (§0.11.5).
+        assert_eq!(
+            deterministic_assignment(&teams_model(Vec::new()), &empty),
+            None
+        );
+    }
+
+    /// §A.3.6: triage never touches a solo ticket. Not the label, and not the model turn either —
+    /// opting out of the team also opts out of being read by it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn triage_never_touches_a_solo_ticket() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rhapsody:solo", "docs"])];
+        let tr = Arc::new(tr);
+        let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
+        let d = deps(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Idle
+        );
+        assert!(tr.add_label_calls().is_empty(), "no label");
+        assert!(
+            arbiter.prompts().is_empty(),
+            "and the ticket text never reaches a model"
+        );
+        assert_eq!(
+            tr.open_by_labels_calls(),
+            0,
+            "and no load read was worth doing"
+        );
+    }
+
+    /// **§A.3.4's acceptance, end to end: a failing-then-healing tracker.** The first write is
+    /// refused, so the decision is held in memory and the run dispatches wearing it; a later cycle
+    /// reconciles the label onto the ticket and the pending entry is retired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_label_write_becomes_a_pending_assignment_and_reconciles_later() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["docs"])];
+        tr.add_label_fail_first = 1;
+        let tr = Arc::new(tr);
+        let handle = Arc::new(TriageHandle::new());
+        let d = deps_with_handle(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"); 2]) as Arc<dyn TriageArbiter>,
+            Arc::clone(&handle),
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::TrackerFailure,
+            "the schedule still backs off"
+        );
+        assert_eq!(
+            handle.pending_identity("i1").as_deref(),
+            Some("alice"),
+            "the decision survives the refused write in memory (§A.3.4)"
+        );
+
+        // The tracker heals. The next cycle RECONCILES rather than deciding again — a second
+        // decision could hand a live run's ticket to somebody else mid-flight.
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Labelled(1)
+        );
+        let calls = tr.add_label_calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|c| c.label_name == "rhapsody:@alice"));
+        assert_eq!(handle.pending_len(), 0, "and the pending entry is retired");
+    }
+
+    /// A label that arrived by ANY route retires the pending entry — including one a human typed
+    /// while the write was failing, which §0.11.1 makes authoritative over anything triage decided.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_label_that_appears_by_any_route_retires_the_pending_entry() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rhapsody:@bob"])];
+        let tr = Arc::new(tr);
+        let handle = Arc::new(TriageHandle::new());
+        handle.record_pending("i1", "alice");
+        let d = deps_with_handle(
+            teams_model(vec![ident("alice", &["rust"]), ident("bob", &["web"])]),
+            Arc::clone(&tr),
+            FakeArbiter::answering(Vec::new()) as Arc<dyn TriageArbiter>,
+            Arc::clone(&handle),
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Idle
+        );
+        assert_eq!(
+            handle.pending_len(),
+            0,
+            "the label is the assignment; the map defers to it"
+        );
+    }
+
+    /// The valve is bounded: past [`MAX_PENDING_ASSIGNMENTS`] it stops taking entries and reports
+    /// itself saturated, which is what stops the selection gate holding work nothing can release.
+    #[test]
+    fn the_pending_map_is_bounded_and_reports_saturation() {
+        let handle = TriageHandle::new();
+        for n in 0..MAX_PENDING_ASSIGNMENTS {
+            assert!(handle.record_pending(&format!("i{n}"), "alice"));
+        }
+        assert!(handle.pending_saturated());
+        assert!(
+            !handle.record_pending("one-too-many", "alice"),
+            "a full valve refuses rather than growing without bound"
+        );
+        // An entry already held is still updatable, so a reconcile can never be locked out.
+        assert!(handle.record_pending("i0", "bob"));
+        handle.clear_pending("i0");
+        assert!(!handle.pending_saturated());
+    }
+
+    /// A kick storm during a back-off must not POSTPONE the model's recovery probe.
+    ///
+    /// The back-off is held as a deadline rather than as a fresh sleep per pass precisely for this:
+    /// if a kicked liveness cycle restarted the timer, a steady trickle of new tickets — one every
+    /// couple of seconds on the live daemon — would keep a healthy model permanently unasked, and
+    /// triage would silently degrade to deterministic-forever. Here the model fails once and then
+    /// answers; kicks arrive continuously throughout, and the probe still lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kick_storm_cannot_postpone_the_model_recovery_probe() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["docs"])];
+        let tr = Arc::new(tr);
+        let handle = Arc::new(TriageHandle::new());
+        let mut answers = vec![Err("model down".to_string())];
+        answers.extend((0..64).map(|_| FakeArbiter::ok("alice")));
+        let arbiter = FakeArbiter::answering(answers);
+        let d = deps_with_handle(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+            Arc::clone(&handle),
+        );
+        let signal = crate::control_loop::CancelSignal::new();
+        let ctx = signal.wait();
+        let task = tokio::spawn(async move { run_triage_schedule(ctx, d).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while arbiter.prompts().len() < 2 && std::time::Instant::now() < deadline {
+            handle.kick();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            arbiter.prompts().len() >= 2,
+            "the recovery probe must fire on the back-off's own schedule, whatever the kick rate"
+        );
+        signal.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// The arrival kick, from the schedule's side: a kick delivered while the task sleeps out its
+    /// (long) interval wakes it, so the latency a held ticket sees is one cycle rather than one
+    /// TRIAGE_INTERVAL. This is the §A.1 race, closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kick_wakes_the_schedule_ahead_of_its_interval() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["docs"])];
+        let tr = Arc::new(tr);
+        let handle = Arc::new(TriageHandle::new());
+        let d = TriageDeps {
+            // An interval no test would ever wait out: only the kick can produce a cycle.
+            interval: Duration::from_secs(3600),
+            ..deps_with_handle(
+                teams_model(vec![ident("alice", &["rust"])]),
+                Arc::clone(&tr),
+                FakeArbiter::answering(vec![FakeArbiter::ok("alice")]) as Arc<dyn TriageArbiter>,
+                Arc::clone(&handle),
+            )
+        };
+        let signal = crate::control_loop::CancelSignal::new();
+        let ctx = signal.wait();
+        let task = tokio::spawn(async move { run_triage_schedule(ctx, d).await });
+
+        handle.kick();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while tr.add_label_calls().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            tr.add_label_calls().len(),
+            1,
+            "the kick must produce a cycle without waiting out the interval"
+        );
+        signal.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 }

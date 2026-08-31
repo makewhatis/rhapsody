@@ -968,14 +968,20 @@ mod tests {
     #[test]
     fn assigned_solo_and_matched_candidates_are_never_held() {
         for (name, labels) in [
-            ("an identity label is the assignment", &["rhapsody:@alice"][..]),
+            (
+                "an identity label is the assignment",
+                &["rhapsody:@alice"][..],
+            ),
             ("a roster topic label matches", &["rust"][..]),
             ("rhapsody:solo is the opt-out", &["rhapsody:solo"][..]),
         ] {
             let (o, handle) = orch_with_teams_gate(&["rust"]);
             let picked = o.select_dispatch(vec![teams_issue("1", "MT-1", labels)]);
             assert_eq!(picked.len(), 1, "{name}");
-            assert!(!futures_lite_ready(handle.kicked()), "{name}: nothing to kick for");
+            assert!(
+                !futures_lite_ready(handle.kicked()),
+                "{name}: nothing to kick for"
+            );
         }
     }
 
@@ -988,7 +994,8 @@ mod tests {
             t.manager.default_identity = "alice".to_string();
         }
         assert_eq!(
-            o.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])]).len(),
+            o.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])])
+                .len(),
             1,
             "the default catches it, so nothing is pending"
         );
@@ -1000,7 +1007,10 @@ mod tests {
     fn a_pending_assignment_releases_the_hold() {
         let (o, handle) = orch_with_teams_gate(&["rust"]);
         let iss = teams_issue("1", "MT-1", &["docs"]);
-        assert!(o.select_dispatch(vec![iss.clone()]).is_empty(), "held first");
+        assert!(
+            o.select_dispatch(vec![iss.clone()]).is_empty(),
+            "held first"
+        );
 
         handle.record_pending("1", "alice");
         assert_eq!(
@@ -1018,14 +1028,16 @@ mod tests {
         let (mut o, _) = orch_with_teams_gate(&["rust"]);
         o.teams_triage = None;
         assert_eq!(
-            o.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])]).len(),
+            o.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])])
+                .len(),
             1
         );
 
         let mut off = orch_for_select(10, HashMap::new(), None);
         off.teams = None;
         assert_eq!(
-            off.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])]).len(),
+            off.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])])
+                .len(),
             1,
             "Teams off dispatches exactly as it always did"
         );
@@ -1118,13 +1130,8 @@ mod tests {
     /// `notified()` resolves immediately exactly when a permit is waiting — and it keeps these
     /// tests synchronous, like every other test in this module.
     fn futures_lite_ready(fut: impl std::future::Future<Output = ()>) -> bool {
-        use std::task::{Context, Poll, Wake, Waker};
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = Box::pin(fut);
         matches!(fut.as_mut().poll(&mut cx), Poll::Ready(()))
     }

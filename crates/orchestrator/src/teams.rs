@@ -2201,4 +2201,107 @@ mod tests {
             "the resolved profile prose must be included: {section:?}"
         );
     }
+
+    // ── rhapsody:solo and the pending-assignment valve (STUDIO-669, §A.3.4 / §A.3.6) ─────────────
+
+    /// §A.3.6: `rhapsody:solo` is the one deliberate way around the team, and it is ABSOLUTE — it
+    /// outranks the topic-label fallback and `default_identity`'s never-refuse floor alike, because
+    /// "run this one vanilla" is the operator's own explicit instruction.
+    #[test]
+    fn solo_dispatches_identity_less_whatever_else_the_ticket_says() {
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.manager.default_identity = "alice".to_string();
+        for labels in [
+            &["rhapsody:solo"][..],
+            &["rhapsody:solo", "rust"][..],
+            &["RHAPSODY:SOLO"][..],
+        ] {
+            let iss = Issue {
+                labels: Some(labels.iter().map(|s| (*s).to_string()).collect()),
+                ..issue("1", "MT-1", "Todo")
+            };
+            let got = route(&teams, &iss, &LoadSnapshot::default());
+            assert_eq!(got.identity, None, "{labels:?}");
+            assert_eq!(got.reason, RouteReason::Solo, "{labels:?}");
+        }
+    }
+
+    /// A solo ticket dispatches — nothing is withheld — and its opt-out is recorded distinctly, so
+    /// a deliberate solo run is never confused with a misroute in the events timeline.
+    #[test]
+    fn dispatch_records_solo_distinctly_from_a_misroute() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, store) = orch_with_teams(teams);
+        o.dispatch_issue(
+            with_labels(&["rhapsody:solo", "rust"]),
+            None,
+            None,
+            String::new(),
+        );
+        let run_id = o.running["1"].run_id;
+        assert_eq!(o.running["1"].identity, "", "identity-less by request");
+        assert_eq!(
+            o.running["1"].teammate_section, "",
+            "and no teammate section"
+        );
+        flush_events(&mut o);
+        assert_eq!(
+            events_of(store.as_ref(), run_id),
+            vec![("teams.unrouted".to_string(), "reason=solo".to_string())]
+        );
+    }
+
+    /// §A.3.4: with the label write refused, the run still wears the identity triage chose. The
+    /// design's order of goods, in one assertion — an identity-worn run beats a stalled ticket.
+    #[test]
+    fn a_pending_assignment_routes_a_run_that_has_no_label() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, store) = orch_with_teams(teams);
+        let handle = Arc::new(crate::triage::TriageHandle::new());
+        handle.record_pending("1", "alice");
+        o.teams_triage = Some(handle);
+
+        o.dispatch_issue(with_labels(&["docs"]), None, None, String::new());
+        let run_id = o.running["1"].run_id;
+        assert_eq!(o.running["1"].identity, "alice");
+        flush_events(&mut o);
+        assert_eq!(
+            events_of(store.as_ref(), run_id),
+            vec![(
+                "teams.route".to_string(),
+                "identity=alice reason=pending_assignment".to_string()
+            )]
+        );
+    }
+
+    /// A REAL label outranks the pending map: §0.11.1 makes a present label authoritative whoever
+    /// wrote it, including a human who overrode the manager while the write was failing.
+    #[test]
+    fn a_real_label_outranks_a_pending_assignment() {
+        let teams = teams_with(vec![
+            ident("alice", &["rust"], 0),
+            ident("bob", &["web"], 0),
+        ]);
+        let (mut o, _) = orch_with_teams(teams);
+        let handle = Arc::new(crate::triage::TriageHandle::new());
+        handle.record_pending("1", "alice");
+        o.teams_triage = Some(handle);
+
+        o.dispatch_issue(with_labels(&["rhapsody:@bob"]), None, None, String::new());
+        assert_eq!(o.running["1"].identity, "bob");
+    }
+
+    /// A pending entry naming somebody who is not on the roster is not trusted (§0.11.5) — the run
+    /// falls through to whatever routing would have said without it.
+    #[test]
+    fn a_pending_assignment_off_the_roster_is_not_trusted() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, _) = orch_with_teams(teams);
+        let handle = Arc::new(crate::triage::TriageHandle::new());
+        handle.record_pending("1", "mallory");
+        o.teams_triage = Some(handle);
+
+        o.dispatch_issue(with_labels(&["docs"]), None, None, String::new());
+        assert_eq!(o.running["1"].identity, "");
+    }
 }
