@@ -110,6 +110,14 @@ impl crate::Tracker for Client {
     ) -> Result<(), TrackerError> {
         labels::add_issue_label(self, issue_id, team_id, label_name).await
     }
+    async fn remove_issue_label(
+        &self,
+        issue_id: &str,
+        team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError> {
+        labels::remove_issue_label(self, issue_id, team_id, label_name).await
+    }
     async fn fetch_open_issues_by_labels(
         &self,
         label_names: &[String],

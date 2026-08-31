@@ -32,7 +32,7 @@ use rhapsody_tracker as tracker;
 use crate::bootcfg::{
     assignee_label, banner_color_enabled, open_store, resolve_banks_dir, resolve_banner_data,
     resolve_capabilities_path, resolve_profiles_dir, resolve_room_dir, resolve_server_port,
-    resolve_teams_path, workflow_dir,
+    resolve_teams_path, resolve_teams_reconcile_path, workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -120,7 +120,10 @@ where
     // (the Rust orchestrator defers disk store-open to the daemon). A best-effort load failure leaves
     // the config `None`, so open_store falls back to Noop and Run's own reload reports the error.
     let resolved = load_resolved(&flags.path);
-    let store = open_store(resolved.as_ref(), &flags.db, flags.no_store);
+    // `durable_store` is false for every fallback — storage off, --no-store, :memory:, AND a
+    // failed open. Only the one reader that would ACT on an absence uses it (the Teams
+    // identity-label reconcile, STUDIO-672); everything else is guard-free by design.
+    let (store, durable_store) = open_store(resolved.as_ref(), &flags.db, flags.no_store);
     o.set_store(store);
     // Load the agent-capabilities registry (~/.rhapsody/capabilities.yaml, colocated with the durable
     // store), seeding defaults on first run, and inject it before Run (BO-12). Best-effort: a load
@@ -167,6 +170,7 @@ where
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
+        report_starved_manager(o.teams.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
         //
@@ -363,10 +367,15 @@ where
             // `project.slugId == ""` — a query Linear answers with zero rows and no error. The task
             // ran every cycle and found nothing to do, silently, while the selection gate held the
             // very tickets it was meant to release.
+            //
+            // The state sets ride along from the SAME reload (STUDIO-672): triage considers
+            // exactly the tickets the selection gate would hold, which means filtering by the
+            // gate's own dispatchable-state predicate rather than by labels alone. Without them
+            // triage assigned identities to In-Review tickets — parked design records and work
+            // already under human review — that the gate could never have held.
             target: move || {
-                triage_handle
-                    .reads_project_trackers()
-                    .map(|trackers| rhapsody_orchestrator::TriageTarget { trackers })
+                let (trackers, states) = triage_handle.reads_triage_target()?;
+                Some(rhapsody_orchestrator::TriageTarget { trackers, states })
             },
             arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
             agent_command: command,
@@ -380,6 +389,32 @@ where
             // taken from `o` because the orchestrator has already moved into the control task by
             // this point; both resolve the same directory through `resolve_room_dir`.
             room: triage_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+            // The evidence the one-time review-label reconcile judges by (STUDIO-672): the
+            // `teams.route` events row every routed dispatch already writes.
+            //
+            // Armed ONLY for the durable on-disk store. A `Noop` answers every read `Ok(empty)` and
+            // never `Err` — so a store that failed to open would tell this sweep that nobody has
+            // ever worn any identity, and it would strip every roster label in the workspace,
+            // including the earned ones. Teams needs an on-disk runtime home to exist at all, so a
+            // non-durable store here means the open FAILED, and a failed open must disable the
+            // sweep rather than answer its question with silence.
+            history: durable_store.then(|| {
+                Arc::new(rhapsody_orchestrator::StoreIdentityHistory::new(
+                    handle.store(),
+                    // `resolve()` defaults this to 30; the fallback is unreachable here because a
+                    // config that failed to load leaves `resolve_teams_path` `None` and Teams off.
+                    resolved
+                        .as_ref()
+                        .and_then(|c| c.storage.retention_days)
+                        .unwrap_or(30),
+                )) as Arc<dyn rhapsody_orchestrator::IdentityHistory>
+            }),
+            // Where a completed sweep is recorded, so "one-time" outlives this process.
+            reconcile_marker: resolve_teams_reconcile_path(
+                resolved.as_ref(),
+                &flags.db,
+                flags.no_store,
+            ),
         };
         Some(tokio::spawn(async move {
             rhapsody_orchestrator::run_triage_schedule(triage_ctx, deps).await;
@@ -924,6 +959,26 @@ fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
              of `enabled: false`. Set manager.default_identity to run every ticket as one teammate."
         );
     }
+}
+
+/// Warns when a model-consulting manager is given a timeout too small for the turn it bounds
+/// (STUDIO-673). Reported at boot, never clamped: the operator's explicit value still wins and
+/// triage keeps working, deterministically — this line is what stops that being discoverable only
+/// by reading a day of the room's failure reasons.
+fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    let Some(ms) = teams.starved_manager_timeout_ms() else {
+        return;
+    };
+    let floor = rhapsody_config::teams::MIN_MODEL_TIMEOUT_MS;
+    tracing::warn!(
+        timeout_ms = ms,
+        floor_ms = floor,
+        "manager.mode consults a model but manager.timeout_ms is {ms}ms, below the {floor}ms a \
+         triage turn needs: a turn spawns a subprocess and waits on a model, so every turn will \
+         time out and every ticket will be assigned by the deterministic fallback. The value is \
+         honoured as written — raise manager.timeout_ms in teams.yaml to use the model at all."
+    );
 }
 
 fn load_resolved(path: &Path) -> Option<Config> {

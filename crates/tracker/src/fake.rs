@@ -61,6 +61,16 @@ pub struct AddLabelCall {
     pub label_name: String,
 }
 
+/// One [`Tracker::remove_issue_label`] invocation (STUDIO-672). Shares [`AddLabelCall`]'s shape
+/// because the two mutations take the same three arguments; a separate type keeps a test's
+/// assertion about a REMOVAL from silently passing against a recorded add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveLabelCall {
+    pub issue_id: String,
+    pub team_id: String,
+    pub label_name: String,
+}
+
 /// One [`Tracker::create_issue`] invocation, recorded verbatim (STUDIO-659). Tests assert on the
 /// whole spec — the state, the assignee and the labels are each an acceptance criterion of the
 /// review-quorum fan-out, so recording only the title would hide the interesting half.
@@ -151,6 +161,8 @@ pub struct Fake {
     /// refused write in memory and reconciles onto the ticket on a later cycle. Mirrors
     /// `create_issue_fail_first`; `add_label_err` still fails every call.
     pub add_label_fail_first: usize,
+    /// When set, returned by `remove_issue_label` (the call is still recorded). STUDIO-672.
+    pub remove_label_err: Option<TrackerError>,
     /// When set, returned by `create_issue` (the call is still recorded). STUDIO-659.
     pub create_issue_err: Option<TrackerError>,
     /// When set, `create_issue` fails for exactly the first N calls and succeeds thereafter — the
@@ -184,6 +196,7 @@ struct Inner {
     assign_calls: Vec<AssignCall>,
     delete_comment_calls: Vec<String>,
     add_label_calls: Vec<AddLabelCall>,
+    remove_label_calls: Vec<RemoveLabelCall>,
     create_issue_calls: Vec<CreateIssueCall>,
     open_by_labels_calls: usize,
     /// Issues `add_issue_label` has written a label onto, keyed by issue id, so the load read sees
@@ -278,6 +291,10 @@ impl Fake {
     /// Every `add_issue_label` invocation, in order (STUDIO-644).
     pub fn add_label_calls(&self) -> Vec<AddLabelCall> {
         self.lock().add_label_calls.clone()
+    }
+    /// Every `remove_issue_label` invocation, in order (STUDIO-672).
+    pub fn remove_label_calls(&self) -> Vec<RemoveLabelCall> {
+        self.lock().remove_label_calls.clone()
     }
     /// Number of `fetch_open_issues_by_labels` calls (STUDIO-644).
     pub fn open_by_labels_calls(&self) -> usize {
@@ -557,6 +574,39 @@ impl Tracker for Fake {
                 ..Issue::default()
             },
         );
+        Ok(())
+    }
+
+    /// Records the label removal and applies it to `labelled` — the store `add_issue_label` writes
+    /// into and the load read serves from — so a label the fake removes stops counting against its
+    /// identity (STUDIO-672). Idempotent and case-insensitive, exactly as the trait requires.
+    /// `remove_label_err`, when set, is returned after the call is recorded.
+    ///
+    /// The programmed `candidates` are NOT rewritten: they are a plain `pub` input field a test
+    /// owns, not recorded state, so a test that wants the next fetch to reflect a removal states
+    /// that itself. Assertions about a removal belong on [`Fake::remove_label_calls`].
+    async fn remove_issue_label(
+        &self,
+        issue_id: &str,
+        team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError> {
+        self.lock().remove_label_calls.push(RemoveLabelCall {
+            issue_id: issue_id.to_string(),
+            team_id: team_id.to_string(),
+            label_name: label_name.to_string(),
+        });
+        if let Some(e) = &self.remove_label_err {
+            return Err(e.clone());
+        }
+        let mut inner = self.lock();
+        for iss in inner.labelled.values_mut() {
+            if iss.id == issue_id
+                && let Some(labels) = iss.labels.as_mut()
+            {
+                labels.retain(|l| !l.eq_ignore_ascii_case(label_name));
+            }
+        }
         Ok(())
     }
 

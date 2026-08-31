@@ -20,6 +20,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use rhapsody_core::{Project, Viewer};
 use rhapsody_tracker::{Tracker, TrackerError};
 
+use crate::dispatch::DispatchStates;
 use crate::orchestrator::Orchestrator;
 use crate::stop::ControlHandle;
 
@@ -56,6 +57,10 @@ pub struct ReadsTarget {
     /// wedge STUDIO-671 reported. Anything that must see the daemon's WORK — as opposed to the
     /// account — reads these instead, the same clients the poll loop fans out over.
     pub project_trackers: Vec<Arc<dyn Tracker>>,
+    /// The reload's dispatchable-state sets (STUDIO-672), for the off-loop readers that must ask
+    /// "would the selection gate hold this ticket?" without holding the `Effective` that answers
+    /// it. Published beside `project_trackers`, from the same reload, for the same reason.
+    pub states: DispatchStates,
 }
 
 /// The resolved "connected as" account for the Settings identity endpoint (INF-224). `masked_token`
@@ -80,19 +85,37 @@ impl Orchestrator {
         w.api_key = api_key.into();
     }
 
-    /// Records every ENABLED project's slug-bound tracker for the off-loop readers that need the
-    /// daemon's WORK rather than its account (STUDIO-671). Called from the reload path beside
-    /// [`Orchestrator::set_reads_target`], on every (re)load, so a hot-reload that adds, removes or
-    /// pauses a project is reflected without a restart.
+    /// Publishes BOTH halves of the off-loop triage snapshot under **one** write acquisition —
+    /// every enabled project's tracker and this reload's dispatchable-state sets (STUDIO-672).
     ///
-    /// Additive rather than folded into `set_reads_target` because that one mirrors Go
-    /// `setReadsTarget`, whose two fields back the account-level Settings surfaces; the Go daemon
-    /// has no reader of this list at all. The two writes are separate, and that is harmless: no
-    /// reader correlates the account tracker with the project list, so a cycle that lands between
-    /// them sees one of the two a moment stale and nothing inconsistent.
-    pub fn set_reads_projects(&self, trackers: Vec<Arc<dyn Tracker>>) {
+    /// The tracker list is every ENABLED project's slug-bound client, for the off-loop readers that
+    /// need the daemon's WORK rather than its account (STUDIO-671). Called from the reload path on
+    /// every (re)load, so a hot-reload that adds, removes or pauses a project — or changes
+    /// `active_states` — reaches triage without a restart.
+    ///
+    /// Triage needs the states because "who should take this ticket?" is only ever asked of work
+    /// somebody is about to do. The selection gate holds exactly the DISPATCHABLE candidates, and
+    /// triage exists to release that hold — so the two must filter by the identical predicate
+    /// ([`dispatchable_state`](crate::dispatch::dispatchable_state)), which means triage needs the
+    /// gate's identical sets rather than a restatement of them.
+    ///
+    /// Separate writes are what [`Self::reads_triage_target`]'s single read was defending against
+    /// only half of: a reader can hold the lock between two writes just as easily as it can take it
+    /// twice, so publishing the pair in two acquisitions leaves the identical straddle window open
+    /// from the other side. Written together, the pair a reader sees is always one reload's.
+    ///
+    /// The account-level tracker ([`Self::set_reads_target`], the Go-parity write) stays separate
+    /// and that is safe: `reads_triage_target` reads it only as a "has a config ever loaded"
+    /// sentinel and never correlates it with either field, so a reader between the two writes sees
+    /// the previous reload's pair — stale together, never mixed.
+    pub fn set_reads_triage_snapshot(
+        &self,
+        trackers: Vec<Arc<dyn Tracker>>,
+        states: DispatchStates,
+    ) {
         let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
         w.project_trackers = trackers;
+        w.states = states;
     }
 
     /// Lists the workspace's Linear projects for the add-agent picker (INF-224), reusing the
@@ -155,6 +178,26 @@ impl ControlHandle {
         let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
         r.tracker.as_ref()?;
         Some(r.project_trackers.clone())
+    }
+
+    /// Everything the off-loop Teams triage task needs from the last reload, under **ONE** lock
+    /// (STUDIO-672): every enabled project's tracker, and the dispatchable-state sets triage must
+    /// filter by. `None` before the first config load, exactly as
+    /// [`Self::reads_project_trackers`] reports it.
+    ///
+    /// **The single acquisition is the point, not a micro-optimisation.** Two separate reads can
+    /// straddle a reload and hand the caller trackers with a default (empty) state snapshot. Triage
+    /// filters candidates by those states and — worse — runs its ONE-TIME reconcile against them,
+    /// so a cycle that landed in that window would sweep nothing, report a completed sweep, and
+    /// retire a cleanup that never happened. Reading both under one lock closes half of that
+    /// window; [`Self::set_reads_triage_snapshot`] writing both under one lock closes the other
+    /// half. Neither alone is sufficient, which is why the reload path uses that publisher.
+    ///
+    /// Cloning the values out releases the lock immediately — it is never held across an `await`.
+    pub fn reads_triage_target(&self) -> Option<(Vec<Arc<dyn Tracker>>, DispatchStates)> {
+        let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
+        r.tracker.as_ref()?;
+        Some((r.project_trackers.clone(), r.states.clone()))
     }
 }
 

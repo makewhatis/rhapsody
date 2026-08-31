@@ -81,6 +81,71 @@ pub struct EligibilityGate<'a> {
     pub canceled: &'a HashSet<String>,
 }
 
+/// The STATE half of dispatch eligibility: is `st` (already normalized) a state the daemon
+/// dispatches work FROM at all?
+///
+/// It is the exact test [`eligibility`] has always run — an ACTIVE state that is not also terminal
+/// — lifted out of it verbatim so there can be **one** source of truth for "dispatchable"
+/// (STUDIO-672). Lifting it changes nothing about eligibility; what it buys is a second caller.
+/// [`DispatchStates::admits`] wraps it for the off-loop Teams triage task, which must consider
+/// exactly the tickets the selection gate would hold and nothing else. Before this, triage filtered
+/// on labels alone and happily assigned identities to **review-state** tickets the gate could never
+/// hold — parked design records and work already under human review — which surprised the operator
+/// in Linear, inflated the least-loaded assigner's load counts, and pre-decided the owner of a
+/// reopen nobody had asked for.
+///
+/// Pure and allocation-free, so sharing it costs the dispatch path nothing.
+pub(crate) fn dispatchable_state(
+    st: &str,
+    active: &HashSet<String>,
+    terminal: &HashSet<String>,
+) -> bool {
+    active.contains(st) && !terminal.contains(st)
+}
+
+/// The resolved state sets an off-loop reader needs to answer [`dispatchable_state`] for itself
+/// (STUDIO-672).
+///
+/// [`EligibilityGate`] cannot serve that reader: it is a borrow into the live `Effective`, which
+/// belongs to the control task and is swapped on every reload. This is the same two sets, OWNED, so
+/// the triage task can be handed a snapshot each cycle through the `reads` seam exactly as it is
+/// already handed that reload's project trackers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DispatchStates {
+    pub active: HashSet<String>,
+    pub terminal: HashSet<String>,
+    /// The configured REVIEW states. Not part of [`dispatchable_state`] — the selection gate
+    /// handles review-state issues on its own reopen branch — but the reconcile sweep
+    /// (STUDIO-672) needs them to scope itself to exactly "parked in review" rather than to every
+    /// state that merely fails to be dispatchable, which would sweep Done, Canceled and Backlog
+    /// tickets too.
+    pub review: HashSet<String>,
+}
+
+impl DispatchStates {
+    /// Whether `iss` is in a state the daemon would dispatch from — [`dispatchable_state`] over an
+    /// issue, normalizing the state the way every other reader of `Issue::state` does.
+    pub fn admits(&self, iss: &Issue) -> bool {
+        dispatchable_state(&normalize_state(&iss.state), &self.active, &self.terminal)
+    }
+
+    /// Whether `iss` is parked in a configured REVIEW state — non-dispatchable, but alive: work
+    /// awaiting a human, or a record deliberately left open. The complement of [`Self::admits`]
+    /// within the candidate fetch, which is exactly active ∪ review.
+    pub fn is_in_review(&self, iss: &Issue) -> bool {
+        let st = normalize_state(&iss.state);
+        self.review.contains(&st) && !self.active.contains(&st)
+    }
+
+    /// Whether any active state is configured at all. `false` means this snapshot admits NOTHING,
+    /// which is a legitimate pre-first-reload state and an illegitimate post-reload one — the
+    /// triage task logs the difference rather than sweeping silently past it (the STUDIO-671 class
+    /// of wedge: a filter that quietly matches nothing looks exactly like a quiet daemon).
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+}
+
 /// The verdict of the dispatch-eligibility predicate plus, when the issue was rejected SOLELY
 /// because of non-terminal blockers, the offending blockers in declaration order. `blocked_by` is
 /// non-empty only when `ok` is false AND non-terminal blockers were the operative reason — so the
@@ -130,7 +195,7 @@ pub(crate) fn eligibility(
         return EligibilityResult::default();
     }
     let st = normalize_state(&iss.state);
-    if !gate.active.contains(&st) || gate.terminal.contains(&st) {
+    if !dispatchable_state(&st, gate.active, gate.terminal) {
         return EligibilityResult::default();
     }
     if running.contains(&iss.id) || claimed.contains(&iss.id) {

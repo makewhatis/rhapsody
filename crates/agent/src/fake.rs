@@ -46,6 +46,11 @@ struct Recorded {
     /// The transcript passed to the most recent `start_session` (Go's `LastTranscript`). Held so
     /// tests can observe whether the worker wired transcript capture; the writers are opaque.
     last_transcript: Option<Transcript>,
+    /// The run id the most recent session was given via [`Session::set_run_id`], or `None` when the
+    /// caller never set one. Recorded so a test can assert the worker threads the store run row's
+    /// id onto the session — the env the agent's `teams_post`/`teams_retain` resolve from
+    /// (STUDIO-675).
+    last_run_id: Option<i64>,
 }
 
 impl Fake {
@@ -72,6 +77,12 @@ impl Fake {
     /// Whether the most recent `start_session` received a transcript (Go's `LastTranscript != nil`).
     pub fn last_transcript_present(&self) -> bool {
         self.lock().last_transcript.is_some()
+    }
+
+    /// The run id the most recent session was given via [`Session::set_run_id`]; `None` when the
+    /// caller never called it (STUDIO-675).
+    pub fn last_run_id(&self) -> Option<i64> {
+        self.lock().last_run_id
     }
 
     fn lock(&self) -> MutexGuard<'_, Recorded> {
@@ -129,6 +140,13 @@ impl Session for FakeSession {
 
     fn thread_id(&self) -> String {
         self.thread_id.clone()
+    }
+
+    fn set_run_id(&self, id: i64) {
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_run_id = Some(id);
     }
 
     async fn run_turn(

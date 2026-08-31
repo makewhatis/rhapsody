@@ -310,7 +310,8 @@ impl Orchestrator {
 /// (and shared agent/workspace); when `None` it falls back to the top-level effective fields (legacy
 /// single-project + the test-injected effective path). `max_turns` / transcripts / `pr_label` stay
 /// top-level. Mirrors Go `workerDepsFor` (dropping the telemetry fields — Tracer/Metrics/Model/
-/// DispatchSpanContext/RunID — per the P6 deferral; see `worker.rs`).
+/// DispatchSpanContext — per the P6 deferral; see `worker.rs`). `run_id` is per-dispatch, not
+/// per-project, so [`Orchestrator::spawn_worker`] stamps it (STUDIO-675).
 fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps {
     // Local raw logging is enabled only when a log dir is configured (Go passes `o.eff.transcripts`,
     // which is nil when logging is off).
@@ -336,6 +337,8 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         capabilities_section: String::new(),
         teammate_section: String::new(),
         pr_label: eff.pr_label.clone(),
+        // Per-dispatch, like `stack_context` above: `spawn_worker` stamps the dispatched run's id.
+        run_id: 0,
         // The review state a declared HANDOFF parks the ticket in (TRA-240). review_states is a
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
@@ -933,8 +936,9 @@ impl Orchestrator {
     // The signature mirrors Go's flat `spawnWorker(wctx, iss, attempt, projectSlug, stackContext,
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
-    // STUDIO-643 threads `teammate_section` identically. Bundling these into a struct would diverge
-    // from the Go parity shape for no behavioral gain.
+    // STUDIO-643 threads `teammate_section` identically, and STUDIO-675 threads `run_id` — which Go
+    // carries on `WorkerDeps` proper. Bundling these into a struct would diverge from the Go parity
+    // shape for no behavioral gain.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_worker(
         &self,
@@ -945,6 +949,7 @@ impl Orchestrator {
         stack_context: String,
         capabilities_section: String,
         teammate_section: String,
+        run_id: i64,
         started_at: DateTime<Utc>,
     ) {
         let Some(eff) = self.eff.as_ref() else {
@@ -954,6 +959,9 @@ impl Orchestrator {
         deps.stack_context = stack_context;
         deps.capabilities_section = capabilities_section;
         deps.teammate_section = teammate_section;
+        // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
+        // its `teams_post` / `teams_retain` can resolve WHICH run is speaking (STUDIO-675).
+        deps.run_id = run_id;
         // Take this run's operator-message mailbox receiver (INF-250, O6): the worker drains it onto the
         // agent's held-open stdin. `None` for legacy / test-injected entries with no mailbox.
         let mut mailbox = self

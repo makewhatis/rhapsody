@@ -155,6 +155,20 @@ pub trait Store {
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError>;
     fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError>;
     fn search_events(&self, q: EventQuery) -> Result<Vec<EventHit>, StoreError>;
+    /// The `started_at` of the OLDEST run this store still holds, or `Ok(None)` when it holds no
+    /// runs at all. RFC3339, compared as a string exactly like [`RunFilter::since`].
+    ///
+    /// This is the store's **evidence horizon** (STUDIO-672): the earliest instant it can answer a
+    /// question about. Before it, "there is no record of X" and "the record of X is gone" are
+    /// indistinguishable — [`Store::prune`] deletes ended runs wholesale, and a replaced or
+    /// freshly-created database has no rows at any age. A caller that would ACT on an absence (the
+    /// Teams identity-label reconcile removes a label when no run wore it) must bound itself to
+    /// after this instant; `None` means the store can vouch for nothing and the caller must not act
+    /// at all.
+    ///
+    /// Additive to the Go `store.Store` port: Rhapsody Teams has no Go counterpart, so neither does
+    /// the question. It reads the existing `runs` table and adds no column, index or migration.
+    fn earliest_run_start(&self) -> Result<Option<String>, StoreError>;
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
 
     // --- operator messages (INF-250) ---
