@@ -111,7 +111,7 @@ pub use teamsprefetch::{
 };
 pub use triage::{
     ClaudeTriageArbiter, MAX_TRIAGE_BACKOFF_MS, TRIAGE_INTERVAL, TriageArbiter, TriageDecision,
-    TriageDeps, TriageRequest, TriageTarget, run_triage_schedule, triage_enabled,
+    TriageDeps, TriageHandle, TriageRequest, TriageTarget, run_triage_schedule, triage_enabled,
 };
 pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
 pub use workspace_gc::WorkspaceGcPlan;

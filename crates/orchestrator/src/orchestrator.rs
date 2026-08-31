@@ -337,6 +337,16 @@ pub struct Orchestrator {
     /// contended lock all render no memory section, which is byte-for-byte `backend: none`.
     pub teams_prefetch: Option<Arc<crate::teamsprefetch::PrefetchCache>>,
 
+    /// The seam between this task and the off-loop **triage** task (STUDIO-669; design record
+    /// `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.2, §A.3.4): the selection gate kicks a
+    /// triage cycle through it, and the router reads its pending-assignment map when a label write
+    /// has failed.
+    ///
+    /// **`Some` exactly when a triage task was spawned**, which is what makes §A.3.1's hold safe:
+    /// [`teams_awaiting_assignment`](Orchestrator::teams_awaiting_assignment) answers `false`
+    /// without a handle, so no boot can hold work for a manager that does not exist.
+    pub teams_triage: Option<Arc<crate::triage::TriageHandle>>,
+
     /// The Rhapsody Teams **room** the dispatch path catches up from (STUDIO-650, T5; design
     /// record §0.5, §0.11.4). `None` whenever there is no room to read: Teams off, or no on-disk
     /// runtime home to anchor `~/.rhapsody/teams/room/` to.
@@ -603,6 +613,7 @@ impl Orchestrator {
             teams_profiles_dir: None,
             teams_bank: None,
             teams_prefetch: None,
+            teams_triage: None,
             teams_room: None,
             teams_cursors: None,
             issue_states: HashMap::new(),

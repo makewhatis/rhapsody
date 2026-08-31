@@ -76,9 +76,21 @@ use crate::control_loop::CancelWait;
 use crate::preflight::{process_env, scrub_child_env};
 use crate::teams::IDENTITY_LABEL_PREFIX;
 
-/// The triage pass's own cadence — deliberately **not** the control loop's tick (§0.11.2). One
-/// minute is slower than the 30s poll interval on purpose: triage is ahead-of-dispatch work whose
-/// latency nobody waits on, and every cycle that finds candidates spends model turns.
+/// The triage pass's own cadence — deliberately **not** the control loop's tick (§0.11.2).
+///
+/// **This interval is no longer load-bearing for correctness, and the comment that said otherwise
+/// was the STUDIO-667 bug** (`~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.1). It used to read
+/// "a minute is slower than the 30s poll interval on purpose: triage is ahead-of-dispatch work",
+/// which quietly assumed triage would win a race it always lost: the live daemon polls every **two
+/// seconds**, so on an idle daemon dispatch beat triage every single time and a freshly-filed,
+/// unlabelled ticket dispatched identity-less within seconds.
+///
+/// What makes triage timely now is [`TriageHandle::kick`] — the selection gate wakes this task the
+/// moment it holds a candidate, so the latency a newly-arrived ticket actually sees is one triage
+/// cycle, not up to one interval. What this constant governs is the **steady-state sweep**: the
+/// unhurried re-check that picks up tickets no gate held (a label removed by hand, a
+/// [`TriageHandle`] pending assignment waiting to reconcile, a backlog past [`MAX_PER_CYCLE`]).
+/// A minute is right for that work precisely because nobody is waiting on it.
 pub const TRIAGE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The ceiling on the failure back-off. A model or tracker outage settles at one attempt per 15
@@ -115,6 +127,112 @@ fn turn_timeout(timeout_ms: i64) -> Duration {
     } else {
         FALLBACK_TIMEOUT_MS
     })
+}
+
+/// The most pending assignments the liveness valve will hold at once.
+///
+/// The map only ever grows on a **failed** label write, so in a healthy daemon it is empty and in a
+/// sick one it is bounded by how many tickets one outage can touch. The cap exists so that a Linear
+/// that rejects every write for a week cannot turn an in-memory routing aid into an unbounded leak;
+/// past it the valve simply stops taking new entries and says so, and those tickets fall back to
+/// the pre-STUDIO-669 behaviour of dispatching identity-less rather than stalling.
+const MAX_PENDING_ASSIGNMENTS: usize = 256;
+
+/// The two-way seam between the **control task** and the **triage task** (STUDIO-669; design record
+/// `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.2 and §A.3.4).
+///
+/// It is deliberately the ONLY thing the two share, and neither direction can block the other:
+///
+/// * **The kick** (§A.3.2, control → triage). When the selection gate holds a candidate for want of
+///   an assignment it calls [`kick`](TriageHandle::kick), a `Notify` permit that costs the control
+///   task nothing and wakes the triage task out of its sleep. Without it the ticket would wait out
+///   [`TRIAGE_INTERVAL`], which is what made §A.1's race lose.
+/// * **The pending map** (§A.3.4, triage → control). When triage has decided who takes a ticket but
+///   the LABEL WRITE fails, the decision is recorded here and the router reads it in place of the
+///   absent label. The design's order of goods is explicit: an identity-worn run beats a stalled
+///   ticket beats an identity-less run — so a Linear that will not accept the write costs the team
+///   its durable record, never the run's identity and never the work.
+///
+/// **Its presence is also the gate's own precondition.** The handle exists exactly when a triage
+/// task was spawned to resolve holds, so `None` (Teams off, `manager.mode: off`, an empty roster, a
+/// hermetic test daemon) means the gate holds nothing at all. Work is never held for a manager that
+/// does not exist — that is a structural guarantee rather than a rule someone has to remember.
+#[derive(Debug, Default)]
+pub struct TriageHandle {
+    /// Wakes the triage task's sleep. `Notify` and not a channel because the signal is level-ish,
+    /// not a queue: ten held tickets in one tick want ONE cycle, not ten.
+    kick: tokio::sync::Notify,
+    /// Issue id → the identity triage assigned but could not label. `std::sync::Mutex` and not
+    /// `tokio`'s because every critical section is a map lookup with no `await` inside it, and the
+    /// control task must be able to read it from a synchronous `fn`.
+    pending: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl TriageHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Locks the pending map, treating a poisoned lock as readable.
+    ///
+    /// A panic in one of these two-line critical sections cannot leave the map logically
+    /// inconsistent, and this is a routing AID: refusing to read it because some other thread
+    /// panicked would turn a cosmetic fault into identity-less dispatch, which is the outcome the
+    /// whole valve exists to avoid. `unwrap()` is also simply not available here (non-test code).
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Asks the triage task to run a cycle NOW (§A.3.2). Cheap, non-blocking, and idempotent
+    /// within a tick: a second call before the task wakes coalesces into the same single cycle.
+    pub(crate) fn kick(&self) {
+        self.kick.notify_one();
+    }
+
+    /// Resolves when someone has kicked. A permit stored while the task was mid-cycle resolves
+    /// this immediately, so a kick raced against a cycle is never lost.
+    pub(crate) async fn kicked(&self) {
+        self.kick.notified().await;
+    }
+
+    /// The identity triage assigned to `issue_id` but could not write (§A.3.4), if any.
+    pub(crate) fn pending_identity(&self, issue_id: &str) -> Option<String> {
+        self.map().get(issue_id).cloned()
+    }
+
+    /// Records an assignment whose label write failed. Returns whether it was taken — `false` once
+    /// [`MAX_PENDING_ASSIGNMENTS`] entries are held, which the caller logs.
+    pub(crate) fn record_pending(&self, issue_id: &str, identity: &str) -> bool {
+        let mut map = self.map();
+        if !map.contains_key(issue_id) && map.len() >= MAX_PENDING_ASSIGNMENTS {
+            return false;
+        }
+        map.insert(issue_id.to_string(), identity.to_string());
+        true
+    }
+
+    /// Drops a pending entry — because the label reconciled, or because the ticket turned out to
+    /// carry an identity label already (whoever wrote it).
+    pub(crate) fn clear_pending(&self, issue_id: &str) {
+        self.map().remove(issue_id);
+    }
+
+    /// How many assignments are waiting to reconcile. Test/observability surface only.
+    pub(crate) fn pending_len(&self) -> usize {
+        self.map().len()
+    }
+
+    /// Whether the valve is saturated — [`MAX_PENDING_ASSIGNMENTS`] decisions are already waiting
+    /// to reconcile, so the next one cannot be held.
+    ///
+    /// The selection gate reads this and **stops holding work** while it is true. That looks like
+    /// giving up, and it is: a daemon whose label writes have failed 256 times running is in a
+    /// state where the design's order of goods says an identity-less run beats a stalled ticket.
+    /// Without it, a ticket whose assignment could be neither written nor held would be held by the
+    /// gate forever, kicking a cycle every tick that could never release it.
+    pub(crate) fn pending_saturated(&self) -> bool {
+        self.map().len() >= MAX_PENDING_ASSIGNMENTS
+    }
 }
 
 /// What the model is asked, and the bounds it is asked under (§2.2's `manager.model` /
@@ -187,6 +305,11 @@ pub struct TriageDeps<TF> {
     pub interval: Duration,
     /// The back-off ceiling; [`MAX_TRIAGE_BACKOFF_MS`] in production.
     pub max_backoff_ms: i64,
+    /// The seam shared with the control task (STUDIO-669): the arrival kick this task sleeps on,
+    /// and the pending-assignment map it writes when a label write fails. The SAME `Arc` the
+    /// orchestrator holds as `teams_triage` — if the two ever diverged, the gate would hold
+    /// tickets this task could not release.
+    pub handle: Arc<TriageHandle>,
     /// The room log every triage decision is posted to (STUDIO-650, T5; §0.11.1's "the decision's
     /// durable record is a manager post in the room log", §0.11.2's room post paired with the
     /// label). `None` when there is no room to write to — Teams without an on-disk runtime home —
@@ -224,15 +347,26 @@ impl CycleOutcome {
     }
 }
 
-/// Whether the triage task should exist at all (§0.11.2, and the ticket's first acceptance
-/// bullet): **only** with Teams enabled, `manager.mode: labels+model`, and a roster to choose from.
+/// Whether the triage task should exist at all: Teams enabled, a `manager.mode` that routes, and a
+/// roster to choose from.
 ///
-/// `mode: labels` and `mode: off` spawn nothing — not a task that returns early, nothing — so those
-/// configurations have zero behaviour delta and cannot call the model even by accident. An empty
-/// roster is included here rather than left to the cycle because a triage turn with nobody to pick
-/// has no possible valid answer.
+/// **`mode: labels` now spawns the task too (STUDIO-669, §A.3.3), and that is a deliberate change.**
+/// T3b restricted this to `labels+model` because triage WAS the model turn: with no model there was
+/// nothing for the task to do. §A.3.3 gives it a second job that needs no model at all — the
+/// deterministic assignment that makes "work always flows, and always to the team" true rather than
+/// aspirational. Under `labels` the task never reaches an arbiter (see [`triage_cycle`]'s
+/// `model_available`), so the "cannot call the model even by accident" property is unchanged: it is
+/// now enforced by the mode test at the decision, not by the absence of a task.
+///
+/// `mode: off` still spawns nothing. §3.5 promises it is "behaviour identical to `enabled: false`",
+/// and the selection gate keys off the same condition — [`route`](crate::teams::route) never
+/// answers `Unrouted` under `mode: off` — so nothing is ever held there and nothing would be
+/// waiting for this task to resolve.
+///
+/// An empty roster is excluded because an assignment with nobody to pick has no possible answer,
+/// deterministic or otherwise.
 pub fn triage_enabled(teams: &Teams) -> bool {
-    teams.enabled && teams.manager.mode == ManagerMode::LabelsModel && !teams.roster.is_empty()
+    teams.enabled && teams.manager.mode != ManagerMode::Off && !teams.roster.is_empty()
 }
 
 /// Runs the triage pass on its own cadence until `ctx` is cancelled (§0.11.2).
@@ -267,19 +401,40 @@ where
         } else {
             deps.interval
         };
-        tokio::select! {
+        // WHY this cycle woke decides what it may do. The arrival kick (STUDIO-669, §A.3.2) and
+        // the timer are both wake-ups, and treating them identically would break one of the two
+        // bounds this loop has to hold at once.
+        let kicked = tokio::select! {
             _ = ctx.cancelled() => return,
-            _ = tokio::time::sleep(delay) => {}
-        }
+            _ = tokio::time::sleep(delay) => false,
+            _ = deps.handle.kicked() => true,
+        };
         if ctx.is_cancelled() {
             return;
         }
-        let outcome = triage_cycle(&ctx, &deps).await;
+        // A kick that arrives DURING the back-off is a liveness cycle, not a retry (§A.3.3's
+        // "triage in back-off" case). It assigns deterministically — the held ticket must not wait
+        // out a 15-minute back-off for a model that is down — and it leaves the back-off counter
+        // exactly where it was, so the model's recovery probe still happens on the back-off
+        // schedule rather than once per kick. That is what keeps "never a hot retry loop against a
+        // down API" true while the control task is kicking every couple of seconds.
+        //
+        // The kicks are self-limiting besides: the gate only kicks for a HELD ticket, and a cycle
+        // resolves every ticket it touches into either a label or a pending assignment, neither of
+        // which is held. A kick storm is therefore not reachable from a failing dependency, only
+        // from a backlog — which drains [`MAX_PER_CYCLE`] at a time.
+        let backing_off = failures > 0;
+        if kicked && backing_off {
+            triage_cycle(&ctx, &deps, false).await;
+            continue;
+        }
+        let outcome = triage_cycle(&ctx, &deps, true).await;
         if outcome.is_failure() {
             failures += 1;
             tracing::warn!(
                 consecutive_failures = failures,
-                "teams triage cycle failed; backing off (tickets stay unlabeled and still dispatch)"
+                "teams triage cycle failed; backing off (held tickets are still assigned \
+                 deterministically on the next kick)"
             );
         } else {
             failures = 0;
@@ -287,13 +442,29 @@ where
     }
 }
 
-/// One triage pass: fetch candidates, drop the ones already assigned, count load, and run the
-/// bounded turn for each remaining ticket **serially**.
+/// One triage pass: reconcile what failed to write last time, then decide who takes every held
+/// ticket — from the model when there is one to ask, deterministically when there is not.
 ///
-/// A failure stops the cycle rather than moving to the next ticket: whatever failed (the model, the
-/// tracker) is almost certainly still failing, and burning the rest of the backlog against it is
-/// the hot loop. The already-labelled tickets keep their labels; the rest are picked up next cycle.
-pub(crate) async fn triage_cycle<TF>(ctx: &CancelWait, deps: &TriageDeps<TF>) -> CycleOutcome
+/// `ask_model` is the caller's answer to "may the model be asked at all this cycle?" — false on a
+/// liveness cycle woken by an arrival kick while the back-off is running. Combined with
+/// `manager.mode` it selects the brain (§A.3.3); the ANSWER is the same shape either way, and so is
+/// everything downstream of it.
+///
+/// Two ordering rules earn their keep here:
+///
+/// * **A pending assignment is reconciled, never re-decided.** The decision was already made and is
+///   already routing runs; asking a second brain would change a live run's identity mid-flight.
+/// * **A failure no longer stops the cycle.** T3b stopped at the first one, because whatever failed
+///   was still failing and burning the backlog against it was the hot loop. Under §A.3.3 the model
+///   is simply dropped for the rest of the cycle (no further turns are spent), and a failed label
+///   write still leaves a pending assignment that routes — so continuing is progress rather than
+///   waste. The cycle is capped at [`MAX_PER_CYCLE`] either way, and the outcome still backs the
+///   schedule off.
+pub(crate) async fn triage_cycle<TF>(
+    ctx: &CancelWait,
+    deps: &TriageDeps<TF>,
+    ask_model: bool,
+) -> CycleOutcome
 where
     TF: Fn() -> Option<TriageTarget>,
 {
@@ -308,6 +479,15 @@ where
             return CycleOutcome::TrackerFailure;
         }
     };
+    // A label that arrived by any route — this task's own earlier reconcile, another daemon, a
+    // human — retires the pending entry that stood in for it. Doing it over the whole fetch and not
+    // just the candidates is what keeps the map from holding an entry for a ticket that is no
+    // longer anybody's problem.
+    for iss in &issues {
+        if has_any_identity_label(iss) {
+            deps.handle.clear_pending(&iss.id);
+        }
+    }
     let candidates = unlabelled_candidates(&issues);
     if candidates.is_empty() {
         return CycleOutcome::Idle;
@@ -316,7 +496,8 @@ where
     // BEFORE the cap rather than inside the loop — otherwise a run of team-less tickets could eat a
     // whole cycle's budget and starve the tickets behind them, cycle after cycle. One aggregated
     // line per cycle, not one per ticket: the condition persists, so per-ticket lines would repeat
-    // forever in `/api/v1/logs`.
+    // forever in `/api/v1/logs`. The selection gate declines to hold these for the same reason, so
+    // they dispatch identity-less rather than waiting on a label that can never be written.
     let (actionable, team_less): (Vec<&Issue>, Vec<&Issue>) =
         candidates.into_iter().partition(|i| !i.team_id.is_empty());
     if !team_less.is_empty() {
@@ -332,9 +513,11 @@ where
         return CycleOutcome::Idle;
     }
 
-    // Load is ADVISORY input to the turn, so a failed load read degrades to "everybody looks idle"
-    // rather than failing the cycle — a triage decision without load counts is still much better
-    // than no decision.
+    // Load is the input to BOTH brains now (§0.11.1's definition — open tickets carrying
+    // `rhapsody:@x` in non-terminal states — is what §A.3.3's "least-loaded roster member" means).
+    // A failed load read still degrades to "everybody looks idle" rather than failing the cycle: a
+    // decision without load counts is much better than no decision, and under §A.3.3 "no decision"
+    // now means a held ticket rather than an unlabelled one.
     let mut load = match tracker
         .fetch_open_issues_by_labels(&roster_labels(&deps.teams))
         .await
@@ -346,91 +529,176 @@ where
         }
     };
 
+    // Is there a model to ask at all? `mode: labels` has no model turn by definition (§A.3.3), and
+    // the caller has already said whether the back-off is running.
+    let mut model = ask_model && deps.teams.manager.mode == ManagerMode::LabelsModel;
     let mut labelled = 0usize;
+    let mut model_failed = false;
+    let mut write_failed = false;
     for iss in actionable.into_iter().take(MAX_PER_CYCLE) {
         // A shutdown must not have to wait out a whole cycle of bounded model turns.
         if ctx.is_cancelled() {
             break;
         }
-        let req = TriageRequest {
-            command: deps.agent_command.clone(),
-            billing_guard: deps.billing_guard,
-            tracker_api_key: deps.tracker_api_key.clone(),
-            model: deps.teams.manager.model.clone(),
-            timeout: turn_timeout(deps.teams.manager.timeout_ms),
-            prompt: build_prompt(&deps.teams, iss, &load),
+        // Already decided, only unwritten (§A.3.4): retry the write, decide nothing.
+        if let Some(identity) = deps.handle.pending_identity(&iss.id) {
+            match write_label(tracker.as_ref(), iss, &identity).await {
+                Ok(()) => {
+                    deps.handle.clear_pending(&iss.id);
+                    tracing::info!(
+                        issue = %iss.identifier,
+                        %identity,
+                        "teams triage reconciled a pending identity label"
+                    );
+                    labelled += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        issue = %iss.identifier,
+                        %identity,
+                        err = %e,
+                        "teams triage could not reconcile a pending identity label; the run still \
+                         wears the assignment and the label is retried next cycle"
+                    );
+                    write_failed = true;
+                }
+            }
+            continue;
+        }
+
+        // The decision. Exactly one of the two brains answers, and `no_model` records WHY when it
+        // was not the model's — that reason reaches the room post verbatim (§A.3.3: "the history is
+        // honest about which brain chose").
+        let mut no_model: Option<NoModel> = (!model).then(|| {
+            if deps.teams.manager.mode == ManagerMode::LabelsModel {
+                NoModel::BackOff
+            } else {
+                NoModel::ModeLabels
+            }
+        });
+        let mut chosen: Option<(String, String)> = None;
+        if model {
+            let req = TriageRequest {
+                command: deps.agent_command.clone(),
+                billing_guard: deps.billing_guard,
+                tracker_api_key: deps.tracker_api_key.clone(),
+                model: deps.teams.manager.model.clone(),
+                timeout: turn_timeout(deps.teams.manager.timeout_ms),
+                prompt: build_prompt(&deps.teams, iss, &load),
+            };
+            match deps.arbiter.arbitrate(&req).await {
+                // §0.11.5 requirement 2: an identity the roster does not contain is never written.
+                // The turn is fed attacker-controllable ticket text, so this is a security
+                // boundary, not a typo check — hence the loud room post, and hence the fact that
+                // the rejected name is not what gets assigned below.
+                Ok(d) => match validate_identity(&deps.teams, &d.identity) {
+                    Some(identity) => {
+                        chosen = Some((identity, reason_or_unstated(&d.reason).to_string()))
+                    }
+                    None => {
+                        tracing::error!(
+                            issue = %iss.identifier,
+                            chosen = %d.identity,
+                            "teams triage returned an identity that is NOT on the roster; writing \
+                             nothing it named"
+                        );
+                        post(
+                            deps,
+                            Message::room(
+                                MANAGER_IDENTITY,
+                                Utc::now(),
+                                format!(
+                                    "REJECTED a triage decision for {}: the turn chose {:?}, which \
+                                     is NOT on the roster. Nothing it named was written; the \
+                                     ticket is assigned deterministically instead. Model output \
+                                     naming an unknown identity is a trust boundary, not a typo.",
+                                    iss.identifier, d.identity
+                                ),
+                            )
+                            .with_refs([iss.identifier.clone()]),
+                        );
+                        no_model = Some(NoModel::OffRoster(d.identity));
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        issue = %iss.identifier,
+                        err = %e,
+                        "teams triage turn failed; this ticket and the rest of the cycle are \
+                         assigned deterministically"
+                    );
+                    // Not asked again this cycle: whatever failed is almost certainly still
+                    // failing, and the deterministic path needs nothing from it.
+                    model = false;
+                    model_failed = true;
+                    no_model = Some(NoModel::TurnFailed(e));
+                }
+            }
+        }
+        // §A.3.3, the never-refuse floor: `default_identity` if set, else the least-loaded roster
+        // member. `None` is only reachable for an empty roster, which `triage_enabled` excludes.
+        let (identity, reason, deterministic) = match (chosen, no_model) {
+            (Some((identity, reason)), _) => (identity, reason, false),
+            (None, Some(why)) => match deterministic_assignment(&deps.teams, &load) {
+                Some((identity, how)) => (identity, format!("{how}; {}", why.as_str()), true),
+                None => continue,
+            },
+            // Unreachable: `chosen` is `None` only on a path that set `no_model`.
+            (None, None) => continue,
         };
-        let decision = match deps.arbiter.arbitrate(&req).await {
-            Ok(d) => d,
-            Err(e) => {
+
+        if let Err(e) = write_label(tracker.as_ref(), iss, &identity).await {
+            // §A.3.4's liveness valve, and the design's order of goods in one branch: an
+            // identity-worn run beats a stalled ticket beats an identity-less run. The decision
+            // stands, the router reads it from memory, and the label reconciles on a later cycle.
+            write_failed = true;
+            let held = deps.handle.record_pending(&iss.id, &identity);
+            if held {
                 tracing::warn!(
                     issue = %iss.identifier,
+                    %identity,
                     err = %e,
-                    "teams triage turn failed; the ticket stays unlabeled and dispatch routes it deterministically"
+                    "teams triage could not write the identity label; holding the assignment in \
+                     memory so the run still wears it, and reconciling the label later"
                 );
-                return CycleOutcome::ModelFailure;
+            } else {
+                tracing::error!(
+                    issue = %iss.identifier,
+                    %identity,
+                    err = %e,
+                    pending = deps.handle.pending_len(),
+                    "teams triage could not write the identity label AND the pending-assignment \
+                     map is full; this ticket dispatches identity-less"
+                );
+                continue;
             }
-        };
-        // §0.11.5 requirement 2: an identity the roster does not contain is never written. The turn
-        // is fed attacker-controllable ticket text, so this is a security boundary, not a typo
-        // check — hence the loud log and the hard stop for this ticket.
-        let Some(identity) = validate_identity(&deps.teams, &decision.identity) else {
-            tracing::error!(
-                issue = %iss.identifier,
-                chosen = %decision.identity,
-                "teams triage returned an identity that is NOT on the roster; writing nothing"
-            );
-            // §0.11.5 requirement 2 in full: "deterministic fallback plus a **loud room post**".
-            // A tracing line scrolls away; this is the durable record that a model turn fed
-            // attacker-reachable ticket text tried to name somebody who does not exist.
-            post(
-                deps,
-                Message::room(
-                    MANAGER_IDENTITY,
-                    Utc::now(),
-                    format!(
-                        "REJECTED a triage decision for {}: the turn chose {:?}, which is NOT on \
-                         the roster. Nothing was written and the ticket stays unlabeled, so \
-                         dispatch routes it deterministically. Model output naming an unknown \
-                         identity is a trust boundary, not a typo.",
-                        iss.identifier, decision.identity
-                    ),
-                )
-                .with_refs([iss.identifier.clone()]),
-            );
-            continue;
-        };
-        let label = format!("{IDENTITY_LABEL_PREFIX}{identity}");
-        if let Err(e) = tracker.add_issue_label(&iss.id, &iss.team_id, &label).await {
-            tracing::warn!(
-                issue = %iss.identifier,
-                %label,
-                err = %e,
-                "teams triage could not write the identity label; the ticket stays unlabeled"
-            );
-            return CycleOutcome::TrackerFailure;
         }
         // §0.11.1: "the decision's durable record is a manager post in the room log". The
         // `teams.route` events row is the per-run TIMELINE copy and is pruned with its run
         // (30-day default), which would have silently deleted the misroute record any future
-        // tuning depends on — so the room, not `events`, is where this lives.
+        // tuning depends on — so the room, not `events`, is where this lives. §A.3.3 adds the
+        // "(deterministic)" note: both brains post under `manager`, and the post says which one.
         post(
             deps,
             Message::room(
                 MANAGER_IDENTITY,
                 Utc::now(),
-                format!(
-                    "Assigned {} to {identity}. Reason: {}",
-                    iss.identifier,
-                    reason_or_unstated(&decision.reason)
-                ),
+                if deterministic {
+                    format!(
+                        "Assigned {} to {identity} (deterministic). Reason: {reason}.",
+                        iss.identifier
+                    )
+                } else {
+                    format!("Assigned {} to {identity}. Reason: {reason}", iss.identifier)
+                },
             )
             .with_refs([iss.identifier.clone()]),
         );
         tracing::info!(
             issue = %iss.identifier,
             identity = %identity,
-            reason = %decision.reason,
+            deterministic,
+            reason = %reason,
             "teams triage assigned a ticket"
         );
         // Count the ticket we just assigned, so the next candidate in THIS cycle sees the load it
@@ -438,11 +706,95 @@ where
         *load.entry(identity).or_default() += 1;
         labelled += 1;
     }
-    if labelled == 0 {
+    if write_failed {
+        CycleOutcome::TrackerFailure
+    } else if model_failed {
+        CycleOutcome::ModelFailure
+    } else if labelled == 0 {
         CycleOutcome::Idle
     } else {
         CycleOutcome::Labelled(labelled)
     }
+}
+
+/// Why a decision was NOT the model's — rendered verbatim into the room post so an operator reading
+/// the history can tell a `mode: labels` install from a model outage from a rejected answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoModel {
+    /// `manager.mode: labels`: there is no model turn in this configuration at all.
+    ModeLabels,
+    /// The triage back-off is running after an earlier model failure.
+    BackOff,
+    /// The turn failed or timed out; the message is the operator-facing reason.
+    TurnFailed(String),
+    /// The turn answered with a name the roster does not contain (§0.11.5 requirement 2).
+    OffRoster(String),
+}
+
+impl NoModel {
+    fn as_str(&self) -> String {
+        match self {
+            NoModel::ModeLabels => {
+                "no model turn exists in this configuration (manager.mode is `labels`)".to_string()
+            }
+            NoModel::BackOff => {
+                "the model was not asked because triage is in back-off after an earlier failure"
+                    .to_string()
+            }
+            NoModel::TurnFailed(e) => format!("the model turn failed ({e})"),
+            NoModel::OffRoster(name) => {
+                format!("the model named {name:?}, who is not on the roster")
+            }
+        }
+    }
+}
+
+/// §A.3.3's deterministic assignment: `manager.default_identity` when it names a roster member,
+/// otherwise the **least-loaded** roster member, ties broken by roster order.
+///
+/// Returns the identity and a short description of how it was picked, for the room post.
+///
+/// Load is §0.11.1's: open tickets carrying `rhapsody:@x` in non-terminal states, already tallied
+/// by the caller. An identity that appears in no count is at zero and is therefore *preferred* —
+/// which covers the author-of-nothing cases in one rule rather than as an exception: a brand-new
+/// roster where nobody has anything, a teammate added this morning, and a load read that failed and
+/// left every count absent all resolve to "the first least-loaded member in roster order". Roster
+/// order is the operator's own, written down in `teams.yaml`, so the answer is stable across ticks
+/// and across daemons rather than dependent on map iteration order.
+///
+/// `None` only for an empty roster, which [`triage_enabled`] already excludes — but it is returned
+/// rather than assumed away, because inventing an identity is exactly what §0.11.5 forbids.
+pub(crate) fn deterministic_assignment(
+    teams: &Teams,
+    load: &HashMap<String, i64>,
+) -> Option<(String, String)> {
+    let default = &teams.manager.default_identity;
+    if !default.is_empty()
+        && let Some(i) = teams.roster.iter().find(|i| &i.name == default)
+    {
+        return Some((i.name.clone(), "manager.default_identity".to_string()));
+    }
+    let (name, open) = teams
+        .roster
+        .iter()
+        .enumerate()
+        .min_by_key(|(order, i)| (load.get(&i.name).copied().unwrap_or(0), *order))
+        .map(|(_, i)| (i.name.clone(), load.get(&i.name).copied().unwrap_or(0)))?;
+    Some((name, format!("least-loaded teammate ({open} open tickets)")))
+}
+
+/// The one additive write a triage decision makes: `rhapsody:@<identity>` on the ticket.
+///
+/// Never edits and never removes (§0.11.1's human-conflict rule) — it cannot, because
+/// [`Tracker::add_issue_label`] is additive and a ticket that already carries an identity label is
+/// not a candidate.
+async fn write_label(
+    tracker: &dyn Tracker,
+    iss: &Issue,
+    identity: &str,
+) -> Result<(), rhapsody_tracker::TrackerError> {
+    let label = format!("{IDENTITY_LABEL_PREFIX}{identity}");
+    tracker.add_issue_label(&iss.id, &iss.team_id, &label).await
 }
 
 /// The `from` every triage post is host-stamped with (§0.11.4: "`from` is stamped by the host; a
@@ -478,21 +830,29 @@ fn post<TF>(deps: &TriageDeps<TF>, msg: Message) {
     }
 }
 
-/// The candidates a triage pass may act on: those carrying **no** `rhapsody:@` label at all.
+/// Whether `iss` already carries SOME `rhapsody:@` label.
 ///
 /// The prefix test is deliberately broader than "names a roster member" — §0.11.1 makes a present
 /// label authoritative *whoever wrote it*, so a `rhapsody:@someone-who-left` label a human typed
 /// still takes the ticket out of triage. The manager cannot fight a human for the field because it
 /// never looks at an occupied one.
+pub(crate) fn has_any_identity_label(iss: &Issue) -> bool {
+    iss.labels
+        .iter()
+        .flatten()
+        .any(|l| l.starts_with(IDENTITY_LABEL_PREFIX))
+}
+
+/// The candidates a triage pass may act on: no `rhapsody:@` label, and not opted out.
+///
+/// [`SOLO_LABEL`](crate::teams::SOLO_LABEL) is excluded here and not merely routed around later
+/// (§A.3.6: "triage never touches a solo ticket"). Excluding it at the candidate step is what makes
+/// that true of the model turn as well as of the write — a solo ticket's text never reaches an
+/// arbiter, so opting out of the team also opts out of being read by it.
 pub(crate) fn unlabelled_candidates(issues: &[Issue]) -> Vec<&Issue> {
     issues
         .iter()
-        .filter(|iss| {
-            !iss.labels
-                .iter()
-                .flatten()
-                .any(|l| l.starts_with(IDENTITY_LABEL_PREFIX))
-        })
+        .filter(|iss| !has_any_identity_label(iss) && !crate::teams::is_solo(iss))
         .collect()
 }
 
@@ -890,7 +1250,22 @@ mod tests {
             tracker_api_key: String::new(),
             interval: Duration::from_millis(5),
             max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
             room: None,
+        }
+    }
+
+    /// The same deps over a caller-supplied seam, for the tests that need to observe the kick or
+    /// the pending-assignment map from the outside.
+    fn deps_with_handle(
+        teams: Teams,
+        tr: Arc<Fake>,
+        arbiter: Arc<dyn TriageArbiter>,
+        handle: Arc<TriageHandle>,
+    ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
+        TriageDeps {
+            handle,
+            ..deps(teams, tr, arbiter)
         }
     }
 
@@ -902,6 +1277,7 @@ mod tests {
         room: Arc<dyn RoomLog>,
     ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
         TriageDeps {
+            handle: Arc::new(TriageHandle::new()),
             room: Some(room),
             ..deps(teams, tr, arbiter)
         }
@@ -912,7 +1288,7 @@ mod tests {
     // The gate the composition root calls. Only `enabled + labels+model + a roster` is triage; every
     // other configuration is zero behaviour delta because no task exists to have any.
     #[test]
-    fn triage_enabled_only_for_labels_plus_model_with_a_roster() {
+    fn triage_enabled_for_every_routing_mode_with_a_roster() {
         let roster = vec![ident("alice", &["rust"])];
         assert!(triage_enabled(&teams_model(roster.clone())));
 
@@ -920,11 +1296,21 @@ mod tests {
         off.enabled = false;
         assert!(!triage_enabled(&off), "Teams off ⇒ no triage task");
 
-        for mode in [ManagerMode::Labels, ManagerMode::Off] {
-            let mut t = teams_model(roster.clone());
-            t.manager.mode = mode;
-            assert!(!triage_enabled(&t), "{mode:?} ⇒ no triage task");
-        }
+        // STUDIO-669, §A.3.3: `mode: labels` now spawns the task. It has no model turn to run, but
+        // it does have the deterministic assignment that makes the selection gate's hold safe —
+        // and holding work with nobody to release it is the one thing the gate must never do.
+        let mut labels = teams_model(roster.clone());
+        labels.manager.mode = ManagerMode::Labels;
+        assert!(
+            triage_enabled(&labels),
+            "`labels` assigns deterministically ⇒ the task exists"
+        );
+
+        // `mode: off` still spawns nothing: §3.5 makes it indistinguishable from Teams-off, and
+        // `route` never answers `Unrouted` there, so nothing is ever held waiting for it.
+        let mut mode_off = teams_model(roster.clone());
+        mode_off.manager.mode = ManagerMode::Off;
+        assert!(!triage_enabled(&mode_off), "`off` ⇒ no triage task");
 
         let mut empty = teams_model(Vec::new());
         empty.roster.clear();
@@ -939,10 +1325,15 @@ mod tests {
 
     // Defence in depth: even hand-built, the schedule refuses to run for a configuration the gate
     // rejects — so no back door reaches the model turn.
+    //
+    // STUDIO-669 changed which configuration this is: `mode: labels` used to be the example here
+    // (no model ⇒ no work) and now spawns a task that assigns deterministically (§A.3.3), so the
+    // test pins `mode: off` instead — the mode §3.5 promises is indistinguishable from Teams-off,
+    // and therefore the one that must still park nothing and poll nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn schedule_returns_immediately_when_not_enabled() {
         let mut t = teams_model(vec![ident("alice", &["rust"])]);
-        t.manager.mode = ManagerMode::Labels;
+        t.manager.mode = ManagerMode::Off;
         let mut tr = Fake::new();
         tr.candidates = vec![labelled("i1", &["rust"])];
         let tr = Arc::new(tr);
@@ -1146,7 +1537,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(1)
         );
         let calls = tr.add_label_calls();
@@ -1183,7 +1574,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(1)
         );
         let got = room
@@ -1198,11 +1589,15 @@ mod tests {
         assert!(m.body.contains("rust and config overlap"), "{}", m.body);
     }
 
-    /// §0.11.5 requirement 2 in full: an off-roster identity is written NOWHERE **and** leaves a
-    /// loud room post. The label is still not written — the post is the record of the refusal, not
-    /// a softening of it. Closes this module's second T5 deferral comment.
+    /// §0.11.5 requirement 2 in full: the identity the model named is written NOWHERE **and**
+    /// leaves a loud room post. Closes this module's second T5 deferral comment.
+    ///
+    /// STUDIO-669 (§A.3.3) adds the second post: the ticket is then assigned deterministically, and
+    /// that post carries the "(deterministic)" note and the reason, so the room says which brain
+    /// chose and why the model's answer was not used. The refusal is unchanged — it is the reason
+    /// for the fallback, not softened by it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_unknown_identity_leaves_a_loud_room_post_and_still_writes_no_label() {
+    async fn an_unknown_identity_leaves_a_loud_room_post_and_never_writes_the_name_it_chose() {
         let dir = TempDir::new();
         let room = Arc::new(LocalRoom::new(dir.child("room")));
         let mut tr = Fake::new();
@@ -1215,19 +1610,27 @@ mod tests {
             Arc::clone(&room) as Arc<dyn RoomLog>,
         );
 
-        triage_cycle(&CancelWait::default(), &d).await;
-        assert!(
-            tr.add_label_calls().is_empty(),
+        triage_cycle(&CancelWait::default(), &d, true).await;
+        let calls = tr.add_label_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].label_name, "rhapsody:@alice",
             "an off-roster identity is written NOWHERE"
         );
         let got = room
             .read_since("alice", &Cursor::default(), 0)
             .expect("catch up");
-        assert_eq!(got.messages.len(), 1, "{:?}", got.messages);
-        let body = &got.messages[0].body;
-        assert!(body.contains("REJECTED"), "{body}");
-        assert!(body.contains("mallory"), "{body}");
-        assert!(body.contains("NOT on the roster"), "{body}");
+        assert_eq!(got.messages.len(), 2, "{:?}", got.messages);
+        let rejection = &got.messages[0].body;
+        assert!(rejection.contains("REJECTED"), "{rejection}");
+        assert!(rejection.contains("mallory"), "{rejection}");
+        assert!(rejection.contains("NOT on the roster"), "{rejection}");
+        let assignment = &got.messages[1].body;
+        assert!(assignment.contains("(deterministic)"), "{assignment}");
+        assert!(
+            assignment.contains("not on the roster"),
+            "the post must say WHY the model's answer was not used: {assignment}"
+        );
     }
 
     /// The room is advisory and Linear is the ledger (§0.11.4): a room that cannot be written costs
@@ -1265,7 +1668,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(1),
             "a room failure must not fail triage"
         );
@@ -1286,7 +1689,7 @@ mod tests {
         );
         assert!(d.room.is_none());
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(1)
         );
         assert_eq!(tr.add_label_calls().len(), 1);
@@ -1306,7 +1709,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Idle
         );
         assert!(
@@ -1317,10 +1720,17 @@ mod tests {
         assert_eq!(tr.open_by_labels_calls(), 0, "and no load read");
     }
 
-    // §0.11.5 requirement 2: an off-roster answer is written NOWHERE. The ticket stays unlabeled and
-    // T3a's deterministic fallback routes it.
+    // §0.11.5 requirement 2: an off-roster answer is never written — **the name it chose** is never
+    // written, that is.
+    //
+    // STUDIO-669 (§A.3.3) changes what happens next. T3b left the ticket unlabeled and let T3a's
+    // dispatch-time fallback route it; under the M1 invariant an unlabeled ticket is HELD, so
+    // "write nothing at all" would have stalled it forever and turned every held tick's arrival
+    // kick into a hot loop. The rejected name is still written nowhere; the ticket is assigned
+    // deterministically instead, which is what §0.11.5 asked for in the first place ("deterministic
+    // fallback plus a loud room post").
     #[tokio::test(flavor = "multi_thread")]
-    async fn cycle_writes_nothing_for_an_off_roster_identity() {
+    async fn cycle_never_writes_an_off_roster_identity_and_assigns_deterministically() {
         let mut tr = Fake::new();
         tr.candidates = vec![labelled("i1", &["rust"])];
         let tr = Arc::new(tr);
@@ -1332,19 +1742,27 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
-            CycleOutcome::Idle
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Labelled(1)
         );
-        assert!(
-            tr.add_label_calls().is_empty(),
-            "an unvalidated identity must never be written"
+        let calls = tr.add_label_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].label_name, "rhapsody:@alice",
+            "the model's name must never be written; the roster's own is"
         );
     }
 
-    // Serial, and it stops at the first model failure rather than burning the backlog against an
-    // API that is evidently down.
+    // Serial, and it stops asking the MODEL at the first failure rather than burning the backlog
+    // against an API that is evidently down.
+    //
+    // STUDIO-669 (§A.3.3) retires the second half of T3b's rule. The cycle used to stop outright,
+    // leaving the remaining tickets unlabeled for T3a to route at dispatch; under the M1 invariant
+    // those tickets are held instead, so stopping would stall them. What the "stop" now protects is
+    // exactly what it was ever for — the model is not asked again this cycle — while the tickets
+    // behind the failure are assigned deterministically and flow.
     #[tokio::test(flavor = "multi_thread")]
-    async fn cycle_is_serial_and_stops_at_the_first_model_failure() {
+    async fn cycle_stops_asking_the_model_at_the_first_failure_and_still_assigns() {
         let mut tr = Fake::new();
         tr.candidates = vec![
             labelled("i1", &["rust"]),
@@ -1364,18 +1782,19 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
-            CycleOutcome::ModelFailure
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::ModelFailure,
+            "the schedule still backs off"
         );
         assert_eq!(
             arbiter.prompts().len(),
             2,
-            "the third ticket is not attempted"
+            "the model is not asked a third time"
         );
         assert_eq!(
             tr.add_label_calls().len(),
-            1,
-            "only the first ticket landed"
+            3,
+            "but every ticket is assigned: one by the model, two deterministically"
         );
         assert_eq!(
             arbiter.max_in_flight.load(Ordering::SeqCst),
@@ -1400,7 +1819,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(2)
         );
         let prompts = arbiter.prompts();
@@ -1430,7 +1849,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::TrackerFailure
         );
         assert!(arbiter.prompts().is_empty());
@@ -1453,7 +1872,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(1)
         );
         assert!(arbiter.prompts()[0].contains("open tickets: 0"));
@@ -1476,7 +1895,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(1)
         );
         assert_eq!(
@@ -1507,7 +1926,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(MAX_PER_CYCLE)
         );
     }
@@ -1545,7 +1964,7 @@ mod tests {
         );
 
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(2),
             "both actionable tickets must be triaged despite {MAX_PER_CYCLE} team-less ones ahead of them"
         );
@@ -1576,7 +1995,7 @@ mod tests {
         let ctx = signal.wait();
         signal.cancel();
 
-        assert_eq!(triage_cycle(&ctx, &d).await, CycleOutcome::Idle);
+        assert_eq!(triage_cycle(&ctx, &d, true).await, CycleOutcome::Idle);
         assert!(
             arbiter.prompts().is_empty(),
             "a cancelled ctx must spend no model turn"
@@ -1595,10 +2014,11 @@ mod tests {
             tracker_api_key: String::new(),
             interval: Duration::from_millis(5),
             max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
             room: None,
         };
         assert_eq!(
-            triage_cycle(&CancelWait::default(), &d).await,
+            triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Idle
         );
     }
@@ -1639,6 +2059,11 @@ mod tests {
     // The back-off bound: a permanently failing model must not produce a cycle per cadence. With a
     // 5ms cadence and a 20ms ceiling, an un-backed-off loop would run tens of cycles in the window
     // below; a backed-off one runs a handful.
+    //
+    // STUDIO-669 (§A.3.3) retires this test's "and nothing is written". The bound being pinned is
+    // about how often the MODEL is asked, and that is unchanged; what changed is that a ticket the
+    // model could not decide is now assigned deterministically instead of being left unlabeled, so
+    // the writes are the point rather than a violation.
     #[tokio::test(flavor = "multi_thread")]
     async fn schedule_backs_off_a_failing_model() {
         let mut tr = Fake::new();
@@ -1665,7 +2090,16 @@ mod tests {
             attempts <= 20,
             "a failing model must be backed off, not retried hot: {attempts} attempts in 300ms"
         );
-        assert!(tr.add_label_calls().is_empty(), "and nothing is written");
+        assert!(
+            !tr.add_label_calls().is_empty(),
+            "a model that never answers must not stop the work: §A.3.3 assigns deterministically"
+        );
+        assert!(
+            tr.add_label_calls()
+                .iter()
+                .all(|c| c.label_name == "rhapsody:@alice"),
+            "and always to the team"
+        );
     }
 
     // ── the acceptance criterion: a hung model never touches dispatch ───────────────────────────

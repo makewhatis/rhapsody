@@ -64,6 +64,26 @@ use crate::teamscompose::{Prepend, catch_up, compose, recall_facts};
 /// the test pinning the split (`rhapsody_namespace_splits_between_routing_and_capabilities`).
 pub(crate) const IDENTITY_LABEL_PREFIX: &str = "rhapsody:@";
 
+/// The one deliberate way to go **around** the team: a ticket wearing
+/// `rhapsody:solo` dispatches as a plain identity-less run (STUDIO-669; design
+/// record `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.6).
+///
+/// It is the opt-OUT, and that direction is the whole point of the M1 invariant:
+/// with Teams enabled every dispatched run wears a roster identity **unless**
+/// this label says otherwise. Skipping the team is the thing that now requires a
+/// label; it is never the accident that happens by default.
+///
+/// Three consumers agree on it and none of them may disagree:
+/// [`route`] returns [`RouteReason::Solo`] with no identity, the selection gate
+/// ([`Orchestrator::teams_awaiting_assignment`]) never holds it, and triage
+/// never triages it ([`crate::triage::unlabelled_candidates`]).
+///
+/// It lives in the same shared `rhapsody:` namespace the doc above describes:
+/// `dispatch_issue` strips the prefix and looks `solo` up in the BO-11
+/// capabilities registry, where an unknown name is a documented silent no-op —
+/// exactly as for `@`.
+pub(crate) const SOLO_LABEL: &str = "rhapsody:solo";
+
 /// The `events` row kind for a routed run (§3.4). A **data** value in the
 /// existing `kind` column — no schema change, no new column, no golden move.
 pub(crate) const EVENT_ROUTE: &str = "teams.route";
@@ -95,7 +115,23 @@ pub(crate) enum RouteReason {
     /// **byte-identically to Teams-off** and a `teams.unrouted` event is
     /// recorded. Never a refusal — a Teams feature that can withhold work is a
     /// second queue (§3.4).
+    ///
+    /// Since STUDIO-669 this reason is also the SELECTION GATE's predicate: it
+    /// names exactly the state §A.3.1 holds — no `rhapsody:@` label, no roster
+    /// topic-label overlap, and no `default_identity` catch — so the gate asks
+    /// the router the question instead of re-deriving the answer beside it.
     Unrouted,
+    /// A pending assignment (§A.3.4) stood in for a label whose write failed:
+    /// triage decided, Linear refused the write, and the run wears the identity
+    /// anyway while the label reconciles on a later cycle. Recorded distinctly
+    /// so "this run's assignment is not yet in Linear" is visible after the
+    /// fact rather than inferred.
+    Pending,
+    /// The ticket carries [`SOLO_LABEL`]: the operator asked for a plain
+    /// identity-less run (STUDIO-669, §A.3.6). The run dispatches exactly as it
+    /// does with Teams off; the `teams.unrouted` row is the only trace, so a
+    /// deliberate opt-out stays countable and is never confused with a misroute.
+    Solo,
 }
 
 impl RouteReason {
@@ -108,6 +144,8 @@ impl RouteReason {
             RouteReason::Default => "default_identity",
             RouteReason::Off => "off",
             RouteReason::Unrouted => "no_match",
+            RouteReason::Solo => "solo",
+            RouteReason::Pending => "pending_assignment",
         }
     }
 }
@@ -170,6 +208,8 @@ impl LoadSnapshot {
 /// Decision order, cheapest first — and every step is a comparison over data
 /// already in hand:
 ///
+/// 0. **[`SOLO_LABEL`]** (STUDIO-669, §A.3.6): the ticket opted out of the team
+///    entirely, so nothing routes and the run is identity-less.
 /// 1. **`manager.mode: off`** (§3.5): no routing is ever performed.
 ///    `default_identity` takes every ticket (single-identity Teams); without one,
 ///    nothing routes.
@@ -195,6 +235,13 @@ pub(crate) fn route(teams: &Teams, iss: &Issue, load: &LoadSnapshot) -> Routed {
     // route against a disabled roster.
     if !teams.enabled || teams.roster.is_empty() {
         return Routed::none(RouteReason::Off);
+    }
+    // The opt-out, checked FIRST and therefore absolute (§A.3.6). It outranks
+    // `mode: off`'s `default_identity` and every tier below, because "run this
+    // one vanilla" is the operator's own explicit instruction and nothing the
+    // roster says should be able to overrule it.
+    if is_solo(iss) {
+        return Routed::none(RouteReason::Solo);
     }
     if teams.manager.mode == ManagerMode::Off {
         return match default_identity(teams) {
@@ -248,6 +295,17 @@ fn tier0(teams: &Teams, iss: &Issue) -> Option<String> {
         .iter()
         .find(|i| has_identity_label(iss, &i.name))
         .map(|i| i.name.clone())
+}
+
+/// Whether `iss` carries [`SOLO_LABEL`] — the per-ticket opt-out (§A.3.6).
+///
+/// Case-insensitive because labels reach the daemon however the tracker spells
+/// them, and an operator who typed `Rhapsody:Solo` in Linear meant the opt-out.
+pub(crate) fn is_solo(iss: &Issue) -> bool {
+    iss.labels
+        .iter()
+        .flatten()
+        .any(|l| l.eq_ignore_ascii_case(SOLO_LABEL))
 }
 
 /// Whether `iss` carries the `rhapsody:@<name>` label for exactly `name`.
@@ -348,7 +406,11 @@ impl Orchestrator {
     /// the behavioural delta that promise rules out.
     pub(crate) fn route_teams(&self, iss: &Issue) -> Option<TeamsDispatch> {
         let teams = self.teams.as_ref().filter(|t| t.enabled)?;
-        let routed = route(teams, iss, &LoadSnapshot::from_running(&self.running));
+        let routed = self.apply_pending_assignment(
+            teams,
+            iss,
+            route(teams, iss, &LoadSnapshot::from_running(&self.running)),
+        );
         let Some(identity) = routed.identity else {
             if routed.reason == RouteReason::Off {
                 return None;
@@ -367,6 +429,87 @@ impl Orchestrator {
             identity,
             section,
         })
+    }
+
+    /// The liveness valve (STUDIO-669, §A.3.4): substitutes a **pending assignment** for a label
+    /// whose write failed, so a Linear that refused the write costs the team its durable record
+    /// rather than the run's identity.
+    ///
+    /// It sits HERE rather than inside [`route`] on purpose. T3a's acceptance — routing is pure,
+    /// sync and zero-model-turn — survives this ticket intact, and it survives because `route`
+    /// still takes exactly `(teams, issue, load)` and still answers from them alone. The pending
+    /// map is orchestrator state, so consulting it is the orchestrator's job, one layer out.
+    ///
+    /// Precedence is the design's, not a convenience: a **real** `rhapsody:@` label wins outright
+    /// ([`RouteReason::Label`]), because §0.11.1 makes a present label authoritative whoever wrote
+    /// it — including a human who overrode the manager while the write was failing. Below that the
+    /// pending entry stands in as Tier 0 would have, and it is re-validated against the roster
+    /// (§0.11.5: no identity is trusted twice without being checked once).
+    fn apply_pending_assignment(&self, teams: &Teams, iss: &Issue, routed: Routed) -> Routed {
+        if routed.reason == RouteReason::Label {
+            return routed;
+        }
+        let Some(handle) = self.teams_triage.as_ref() else {
+            return routed;
+        };
+        let Some(name) = handle.pending_identity(&iss.id) else {
+            return routed;
+        };
+        match teams.roster.iter().find(|i| i.name == name) {
+            Some(i) => Routed::to(i.name.clone(), RouteReason::Pending),
+            None => routed,
+        }
+    }
+
+    /// Whether this candidate must be **held this tick** for want of a team assignment
+    /// (STUDIO-669; design record `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.1).
+    ///
+    /// The invariant it enforces: *with Teams enabled, every dispatched run wears a roster
+    /// identity, unless the ticket carries [`SOLO_LABEL`]*. Skipping the team is the thing that
+    /// requires a label; it is never the default. §A.1 measured what the absence of this gate cost
+    /// — a ticket filed at 15:05:16Z dispatched unrouted at 15:06:33Z with the roster idle.
+    ///
+    /// **The predicate is the router's own answer**, deliberately: [`RouteReason::Unrouted`] is
+    /// returned by exactly the state §A.3.1 describes — no `rhapsody:@` label, no roster
+    /// topic-label overlap, and no `default_identity` catch — so the gate cannot drift out of
+    /// agreement with the thing that will route the ticket once triage has spoken. `Solo` and `Off`
+    /// are different reasons and are therefore never held.
+    ///
+    /// Four preconditions come before that question, and each closes a way to hold work forever:
+    ///
+    /// * **No triage task, no hold.** The handle is `Some` only when a triage task was spawned to
+    ///   resolve holds, so Teams-off, `manager.mode: off`, an empty roster and the hermetic test
+    ///   daemon all hold nothing — the ticket dispatches exactly as it does today.
+    /// * **A pending assignment releases the hold** (§A.3.4). The run wears the identity from the
+    ///   map; waiting for the label to reconcile would be the stalled ticket the design ranks
+    ///   below it. A **saturated** map releases every hold for the same reason one layer up: an
+    ///   assignment that can be neither written nor held is one nothing could ever resolve, so the
+    ///   ticket dispatches identity-less rather than waiting on a manager that has run out of room.
+    /// * **A ticket with no team id is never held**, because the identity label cannot be written
+    ///   for it (triage drops those candidates for the same reason) — holding one would be a hold
+    ///   nothing could ever release.
+    /// * **Teams must be enabled**, checked here rather than left to `route`, so the whole gate
+    ///   costs a `None` test on the overwhelmingly common Teams-off path.
+    ///
+    /// Cheap by construction: no I/O, no lock the control task does not already hold, and the work
+    /// is one roster scan over data already in hand — the same shape as every other skip condition
+    /// in [`select_dispatch_with_reopens`](Orchestrator::select_dispatch_with_reopens), so loop
+    /// cadence is untouched.
+    pub(crate) fn teams_awaiting_assignment(&self, iss: &Issue) -> bool {
+        let Some(handle) = self.teams_triage.as_ref() else {
+            return false;
+        };
+        let Some(teams) = self.teams.as_ref().filter(|t| t.enabled) else {
+            return false;
+        };
+        if iss.team_id.is_empty()
+            || handle.pending_identity(&iss.id).is_some()
+            || handle.pending_saturated()
+        {
+            return false;
+        }
+        route(teams, iss, &LoadSnapshot::from_running(&self.running)).reason
+            == RouteReason::Unrouted
     }
 
     /// Renders the routed identity's turn-1 section, resolving its profile
