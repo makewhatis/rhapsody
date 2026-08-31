@@ -239,6 +239,10 @@ function TeamsEditor({
           <Select
             value={draft.defaultIdentity}
             width={320}
+            // `placeholder="none"` rather than the generic "Select…": a value orphaned by renaming
+            // its teammate matches no option, and `toConfig` clears it on save. Showing "none" makes
+            // the control agree with the preview and with what is actually written.
+            placeholder="none"
             options={[
               { value: "", label: "none", mono: false },
               ...rosterNames.map((n) => ({ value: n, label: n })),

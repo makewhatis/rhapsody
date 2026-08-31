@@ -391,6 +391,14 @@ describe("teamsYamlSnippet", () => {
     expect(yaml).toContain("    max_concurrent: 2");
   });
 
+  // The card is titled "What Save will configure", so it previews the FILE, not the daemon's
+  // effective reading of it. A hand-written `reviewers: 0` is written back as 0 (the daemon floors
+  // it on read); previewing 1 would have shown bytes the save does not send.
+  it("previews the reviewer count that will be written, not the floored one", () => {
+    const yaml = teamsYamlSnippet({ ...emptyDraft(), quorumEnabled: true, quorumReviewers: 0 });
+    expect(yaml).toContain("  reviewers: 0");
+  });
+
   // The preview is a rendered surface like any other, so it obeys the same rule the form does.
   it("masks a stored literal api_key rather than previewing it", () => {
     const yaml = teamsYamlSnippet({

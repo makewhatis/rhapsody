@@ -364,7 +364,10 @@ export function teamsYamlSnippet(draft: TeamsDraft): string {
   if (draft.managerTimeoutMs !== DEFAULT_TIMEOUT_MS) lines.push(`  timeout_ms: ${draft.managerTimeoutMs}`);
 
   if (draft.quorumEnabled) {
-    lines.push("", "quorum:", "  enabled: true", `  reviewers: ${Math.max(draft.quorumReviewers, MIN_QUORUM_REVIEWERS)}`);
+    // The RAW value, not `effectiveReviewers`: this card previews the FILE, and the daemon applies
+    // its own floor on read. `quorumNote` beside the toggle is where the effective count is stated,
+    // so the two surfaces stay honest about different things rather than both being half-right.
+    lines.push("", "quorum:", "  enabled: true", `  reviewers: ${draft.quorumReviewers}`);
   }
 
   lines.push("", "memory:", `  backend: ${draft.backend}`);
