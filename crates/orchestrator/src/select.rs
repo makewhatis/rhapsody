@@ -1043,6 +1043,27 @@ mod tests {
         );
     }
 
+    /// A ticket whose `rhapsody:@` label names nobody on the roster — the `someone-who-left` case
+    /// §0.11.1 names — routes to no identity, but triage will never touch it either, because ANY
+    /// identity label makes the field occupied. Holding it would be a hold nothing could release,
+    /// and every tick's kick would be a cycle that could not act. It dispatches, exactly as it did
+    /// before the gate existed.
+    #[test]
+    fn a_label_naming_nobody_on_the_roster_is_not_held() {
+        let (o, handle) = orch_with_teams_gate(&["rust"]);
+        let picked = o.select_dispatch(vec![teams_issue("1", "MT-1", &["rhapsody:@who-left"])]);
+        assert_eq!(
+            picked.len(),
+            1,
+            "a hold nothing could release is never taken"
+        );
+        assert_eq!(picked[0].id, "1");
+        assert!(
+            !futures_lite_ready(handle.kicked()),
+            "and triage is not woken for it"
+        );
+    }
+
     /// A ticket with no team id can never be labelled, so holding it would be a hold nothing could
     /// release. Triage drops these candidates for the same reason.
     #[test]

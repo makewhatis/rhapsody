@@ -508,6 +508,18 @@ impl Orchestrator {
         {
             return false;
         }
+        // A ticket triage would not touch must never be held, or the hold is one nothing can
+        // release. The exact case §0.11.1 names: a `rhapsody:@someone-who-left` label a human
+        // typed. Routing finds no roster member for it and would answer `Unrouted`, but triage
+        // treats ANY `rhapsody:@` label as an occupied field and never looks at one — so without
+        // this the ticket would be held forever, kicking a cycle every tick that could not act on
+        // it. A present label is authoritative whoever wrote it; if it names nobody real, that is
+        // the human's to fix, and meanwhile the run dispatches exactly as it did before this
+        // ticket. The predicate is deliberately triage's OWN candidate rule, imported rather than
+        // restated, so the two cannot drift.
+        if crate::triage::has_any_identity_label(iss) {
+            return false;
+        }
         route(teams, iss, &LoadSnapshot::from_running(&self.running)).reason
             == RouteReason::Unrouted
     }

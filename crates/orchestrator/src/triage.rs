@@ -695,10 +695,8 @@ where
         // "(deterministic)" note: both brains post under `manager`, and the post says which one.
         post(
             deps,
-            Message::room(
-                MANAGER_IDENTITY,
-                Utc::now(),
-                if deterministic {
+            Message::room(MANAGER_IDENTITY, Utc::now(), {
+                let mut body = if deterministic {
                     format!(
                         "Assigned {} to {identity} (deterministic). Reason: {reason}.",
                         iss.identifier
@@ -708,8 +706,18 @@ where
                         "Assigned {} to {identity}. Reason: {reason}",
                         iss.identifier
                     )
-                },
-            )
+                };
+                // The room is the durable record, so it must not claim an assignment Linear
+                // does not yet carry. Saying so is the point of §A.3.4 rather than an apology
+                // for it: the run genuinely IS wearing this identity.
+                if !wrote {
+                    body.push_str(
+                        " (the label write failed; the run wears the assignment from memory \
+                             and the label reconciles on a later cycle)",
+                    );
+                }
+                body
+            })
             .with_refs([iss.identifier.clone()]),
         );
         tracing::info!(
@@ -2388,12 +2396,16 @@ mod tests {
         tr.add_label_fail_first = 1;
         let tr = Arc::new(tr);
         let handle = Arc::new(TriageHandle::new());
-        let d = deps_with_handle(
-            teams_model(vec![ident("alice", &["rust"])]),
-            Arc::clone(&tr),
-            FakeArbiter::answering(vec![FakeArbiter::ok("alice"); 2]) as Arc<dyn TriageArbiter>,
-            Arc::clone(&handle),
-        );
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let d = TriageDeps {
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            ..deps_with_handle(
+                teams_model(vec![ident("alice", &["rust"])]),
+                Arc::clone(&tr),
+                FakeArbiter::answering(vec![FakeArbiter::ok("alice"); 2]) as Arc<dyn TriageArbiter>,
+                Arc::clone(&handle),
+            )
+        };
 
         assert_eq!(
             triage_cycle(&CancelWait::default(), &d, true).await,
@@ -2404,6 +2416,15 @@ mod tests {
             handle.pending_identity("i1").as_deref(),
             Some("alice"),
             "the decision survives the refused write in memory (§A.3.4)"
+        );
+        let body = &room
+            .read_since("alice", &Cursor::default(), 0)
+            .expect("catch up")
+            .messages[0]
+            .body;
+        assert!(
+            body.contains("the label write failed"),
+            "the room must not claim an assignment Linear does not carry yet: {body}"
         );
 
         // The tracker heals. The next cycle RECONCILES rather than deciding again — a second
