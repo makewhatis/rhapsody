@@ -580,6 +580,51 @@ mod tests {
         let _ = task.await;
     }
 
+    // STUDIO-674, the legacy single-project shape: `project_repo` is only populated by the
+    // resolved-project dispatch path, so a config with no `projects:` block leaves it empty and
+    // carries the repo top-level. Without this fallback the head-branch lookup would resolve
+    // nothing on exactly the installations most likely to be running one tracker and one repo.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_single_project_run_falls_back_to_the_top_level_repo() {
+        let tr = Arc::new(Fake::new());
+        let mut parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        parent.title = "do the thing".into();
+        let snapshot = [parent.clone()];
+
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.repo = "https://github.com/o/legacy.git".to_string();
+        }
+        o.teams = Some(quorum_teams(&["alice", "bob", "carol"]));
+        let mut rx = o.open_quorum_channel();
+        o.record_quorum_state(snapshot.iter());
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = "alice".to_string();
+            // Left EMPTY on purpose: that is the legacy path this test exists for.
+            assert!(re.project_repo.is_empty());
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        let req = rx.try_recv().expect("a quorum request was sent");
+        assert_eq!(
+            (req.pr_owner.as_str(), req.pr_repo.as_str()),
+            ("o", "legacy"),
+            "parsed from the top-level repo when the run carries no project repo"
+        );
+        assert_eq!(req.pr_head_branch, "symphony/MT-1");
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
     // The other three gates still refuse BEFORE the attachment question is reached, so an
     // attachment-less ticket that fails one of them still costs no request at all: STUDIO-674
     // widened exactly one gate and left the rest where they were.

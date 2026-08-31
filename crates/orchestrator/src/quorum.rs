@@ -888,8 +888,19 @@ impl Orchestrator {
             );
             return None;
         }
-        let (pr_owner, pr_repo) =
-            crate::ghsummons::parse_repo(&re.project_repo).unwrap_or_default();
+        // The remote the run pushed its branch to, with [`Orchestrator::bind_teams_run`]'s fallback
+        // and for its reason: a legacy single-project config never populates `project_repo` (only
+        // the resolved-project dispatch path sets it) and carries the repo top-level instead.
+        // Without the fallback the head-branch lookup would silently resolve nothing there.
+        let repo_url = if re.project_repo.is_empty() {
+            self.eff
+                .as_ref()
+                .map(|eff| eff.cfg.repo.clone())
+                .unwrap_or_default()
+        } else {
+            re.project_repo.clone()
+        };
+        let (pr_owner, pr_repo) = crate::ghsummons::parse_repo(&repo_url).unwrap_or_default();
         Some(QuorumRequest {
             parent_issue_id: re.issue.id.clone(),
             parent_team_id: re.issue.team_id.clone(),
