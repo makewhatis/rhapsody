@@ -278,7 +278,7 @@ function TeamsEditor({
           <Field
             label="Triage timeout"
             inline
-            hint="Exceeded ⇒ the deterministic answer stands. Triage never blocks dispatch."
+            hint="Exceeded ⇒ the deterministic answer stands. Triage never blocks dispatch. A turn spawns a subprocess and waits on a model, so below 15000ms the daemon warns the manager is starved."
           >
             <Stepper
               value={draft.managerTimeoutMs}

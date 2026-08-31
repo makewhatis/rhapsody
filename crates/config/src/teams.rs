@@ -649,10 +649,14 @@ mod tests {
     #[test]
     fn the_shipped_manager_timeout_clears_the_model_floor() {
         assert_eq!(DEFAULT_TIMEOUT_MS, 60000);
-        assert!(
-            DEFAULT_TIMEOUT_MS >= MIN_MODEL_TIMEOUT_MS,
-            "the shipped default must not be a value the daemon itself warns about"
-        );
+        // A const block, so a future edit that drops the default back under the
+        // floor fails to COMPILE rather than to run.
+        const {
+            assert!(
+                DEFAULT_TIMEOUT_MS >= MIN_MODEL_TIMEOUT_MS,
+                "the shipped default must not be a value the daemon itself warns about"
+            )
+        };
         let t = Teams {
             enabled: true,
             manager: Manager {
@@ -686,7 +690,8 @@ mod tests {
             "the shipped-5000 case this ticket exists for"
         );
         assert_eq!(
-            teams(ManagerMode::LabelsModel, true, MIN_MODEL_TIMEOUT_MS).starved_manager_timeout_ms(),
+            teams(ManagerMode::LabelsModel, true, MIN_MODEL_TIMEOUT_MS)
+                .starved_manager_timeout_ms(),
             None,
             "the floor itself is not starved"
         );
