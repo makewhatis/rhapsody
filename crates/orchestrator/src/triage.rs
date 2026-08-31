@@ -114,11 +114,13 @@ const BYTES_PER_TOKEN: usize = 4;
 /// prompt the model can answer rather than an empty string.
 const MIN_PROMPT_BYTES: usize = 2048;
 
-/// The turn timeout used when `manager.timeout_ms` is absent or non-positive. It is §2.2's own
-/// default, restated here rather than imported because the point is the FALLBACK, not the schema:
-/// `timeout_ms: 0` would otherwise make `tokio::time::timeout` fire before the process could
-/// answer, silently turning `labels+model` into "triage never works" with only a warning per cycle.
-const FALLBACK_TIMEOUT_MS: u64 = 5000;
+/// The turn timeout used when `manager.timeout_ms` is absent or non-positive. It is the schema's
+/// own default, restated here rather than imported because the point is the FALLBACK, not the
+/// schema: `timeout_ms: 0` would otherwise make `tokio::time::timeout` fire before the process
+/// could answer, silently turning `labels+model` into "triage never works" with only a warning per
+/// cycle. Raised with that default from 5000 to 60000 (STUDIO-673) — a substituted value too small
+/// for a real turn is the same wedge by another route, so the two move in lockstep.
+const FALLBACK_TIMEOUT_MS: u64 = 60000;
 
 /// `manager.timeout_ms` as a [`Duration`], with the non-positive fallback above applied.
 fn turn_timeout(timeout_ms: i64) -> Duration {
@@ -1261,18 +1263,33 @@ impl TriageArbiter for ClaudeTriageArbiter {
 
         let out = tokio::time::timeout(req.timeout, cmd.output())
             .await
-            .map_err(|_| {
-                format!(
-                    "triage turn exceeded manager.timeout_ms ({}ms)",
-                    req.timeout.as_millis()
-                )
-            })?
+            .map_err(|_| report_timeout(req.timeout, &req.model))?
             .map_err(|e| format!("could not launch claude for the triage turn: {e}"))?;
         if !out.status.success() {
             return Err(turn_failure_reason(out.status.code(), &out.stderr));
         }
         parse_decision(&String::from_utf8_lossy(&out.stdout))
     }
+}
+
+/// The reason a timed-out turn reports — and, because a timeout is the one turn failure an operator
+/// can fix from `teams.yaml`, a WARN naming the setting and the value it was given (STUDIO-673).
+///
+/// The room post carries the returned reason for the ticket it decided; the log line is what makes
+/// the PATTERN visible while that is happening. A budget too small for a real turn starves every
+/// decision at once, and each individual room post reads like an ordinary fallback — which is
+/// exactly how a shipped 5000ms default went a day unnoticed on v0.3.4-rc.8. The string itself is
+/// unchanged, so the room's wording is what it always was.
+fn report_timeout(timeout: Duration, model: &str) -> String {
+    let ms = timeout.as_millis();
+    tracing::warn!(
+        timeout_ms = %ms,
+        %model,
+        "teams triage turn exceeded manager.timeout_ms and was killed; this cycle is assigned by \
+         the deterministic fallback instead. A turn spawns a subprocess and waits on a model, so if \
+         this repeats the manager is being starved — raise manager.timeout_ms in teams.yaml."
+    );
+    format!("triage turn exceeded manager.timeout_ms ({ms}ms)")
 }
 
 /// A concise operator-facing reason for a failed turn: the exit status plus a trimmed stderr tail
@@ -2196,6 +2213,33 @@ mod tests {
         assert_eq!(
             triage_cycle(&CancelWait::default(), &d, true).await,
             CycleOutcome::Labelled(MAX_PER_CYCLE)
+        );
+    }
+
+    // STUDIO-673: a timeout is the ONE turn failure an operator can fix from teams.yaml, and a
+    // budget too small for a real turn starves every decision at once while reading, per ticket, as
+    // an ordinary fallback. So the kill names the setting and its configured value at WARN — the
+    // level `/api/v1/logs` is watched at — and the reason the room post carries is unchanged.
+    #[test]
+    fn a_timed_out_turn_warns_at_warn_with_the_configured_budget() {
+        let (reason, events) = crate::testsupport::capture_events(|| {
+            report_timeout(Duration::from_millis(5000), "claude-opus-5")
+        });
+
+        assert_eq!(reason, "triage turn exceeded manager.timeout_ms (5000ms)");
+        let warn = events
+            .iter()
+            .find(|e| e.message.contains("manager.timeout_ms"))
+            .expect("the timeout is reported");
+        assert_eq!(warn.level, "WARN");
+        assert_eq!(
+            warn.fields.get("timeout_ms").map(String::as_str),
+            Some("5000"),
+            "the operator cannot act on a starvation warning that hides the number to raise"
+        );
+        assert_eq!(
+            warn.fields.get("model").map(String::as_str),
+            Some("claude-opus-5")
         );
     }
 
