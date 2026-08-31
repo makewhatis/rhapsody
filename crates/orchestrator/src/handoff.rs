@@ -378,9 +378,12 @@ mod tests {
         let id = iss.id.clone();
         o.dispatch_issue(iss, None, None, String::new());
         // `dispatch_issue` stamps the identity only when routing produced one; these tests state it
-        // directly so the trigger, not the router, is what is under test.
+        // directly so the trigger, not the router, is what is under test. `project_repo` is the
+        // remote the run's worktree pushed to, which is where STUDIO-674's head-branch PR lookup is
+        // aimed; the resolved-project wiring that normally fills it is not under test here.
         if let Some(re) = o.running.get_mut(&id) {
             re.identity = identity.to_string();
+            re.project_repo = "git@github.com:o/r.git".to_string();
         }
         let run_id = o.running[&id].run_id;
         let (task, handle) = start(o, &env.signal);
@@ -529,9 +532,13 @@ mod tests {
         let _ = task.await;
     }
 
-    // A handoff with no linked PR has nothing for a reviewer to read, so it fires nothing.
+    // STUDIO-674: a handoff whose ticket carries no Linear GitHub attachment is no longer dropped
+    // on the control loop. This installation's Linear holds `attachments: []` on EVERY issue, so
+    // the old gate made the quorum structurally dead — it refused every ticket, forever. The loop
+    // now hands the off-loop task what it needs to ask GitHub itself (the run's repo and the
+    // `symphony/<identifier>` branch its worktree pushed) and stays network-free doing it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_handoff_with_no_pr_requests_nothing() {
+    async fn a_handoff_with_no_attachment_hands_the_branch_to_the_off_loop_task() {
         let tr = Arc::new(Fake::new());
         let mut parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
         parent.title = "do the thing".into();
@@ -548,10 +555,69 @@ mod tests {
             .handoff_run(CancelWait::default(), run_id)
             .await
             .expect("handoff_run");
-        assert!(rx.try_recv().is_err(), "no PR ⇒ no quorum");
+
+        let req = rx.try_recv().expect("a quorum request was sent");
+        assert_eq!(
+            req.pr_url, "",
+            "the control task resolved nothing — that is the off-loop task's job"
+        );
+        assert_eq!(
+            (req.pr_owner.as_str(), req.pr_repo.as_str()),
+            ("o", "r"),
+            "parsed from the run's own project repo"
+        );
+        assert_eq!(
+            req.pr_head_branch, "symphony/MT-1",
+            "the frozen `symphony/<key>` branch contract the worktree was created on"
+        );
+        assert_eq!(
+            req.reviewers,
+            vec!["bob".to_string(), "carol".to_string()],
+            "every other gate is unchanged"
+        );
 
         signal.cancel();
         let _ = task.await;
+    }
+
+    // The other three gates still refuse BEFORE the attachment question is reached, so an
+    // attachment-less ticket that fails one of them still costs no request at all: STUDIO-674
+    // widened exactly one gate and left the rest where they were.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_other_gates_still_refuse_an_attachment_less_ticket() {
+        for (why, teams, identity, mark) in [
+            (
+                "no identity ⇒ no quorum",
+                quorum_teams(&["alice", "bob", "carol"]),
+                "",
+                false,
+            ),
+            (
+                "already requested ⇒ no quorum",
+                quorum_teams(&["alice", "bob", "carol"]),
+                "alice",
+                true,
+            ),
+        ] {
+            let tr = Arc::new(Fake::new());
+            let mut parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+            parent.title = "do the thing".into();
+            if mark {
+                parent.labels = Some(vec![crate::quorum::QUORUM_REQUESTED_LABEL.to_string()]);
+            }
+            let snapshot = vec![parent.clone()];
+            let (task, handle, mut rx, run_id, signal) =
+                quorum_harness(Arc::clone(&tr), teams, parent, identity, &snapshot);
+
+            handle
+                .handoff_run(CancelWait::default(), run_id)
+                .await
+                .expect("handoff_run");
+            assert!(rx.try_recv().is_err(), "{why}");
+
+            signal.cancel();
+            let _ = task.await;
+        }
     }
 
     // A ticket with no team id can never be reviewed — `create_issue` and `add_issue_label` both

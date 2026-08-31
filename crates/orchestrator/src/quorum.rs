@@ -33,6 +33,26 @@
 //! wakes on a handoff rather than on a timer, which is why it is a channel consumer rather than a
 //! schedule.
 //!
+//! # The PR is resolved from GitHub when Linear does not know it (STUDIO-674)
+//!
+//! §0.12's trigger is "a teammate's handoff **with a linked PR**", and the only thing that ever
+//! knew about that PR was a Linear GitHub **attachment** on the poller's candidate snapshot. On an
+//! installation whose Linear↔GitHub integration never materializes, every issue holds
+//! `attachments: []` — including long-shipped ones with merged PRs — so that gate refused every
+//! ticket and the quorum was structurally dead rather than merely quiet.
+//!
+//! So the attachment is a fast path, not the source of truth. When it is present it wins outright
+//! and costs no network call. When it is absent the request is built anyway, carrying the run's
+//! repo and the `symphony/<identifier>` branch its worktree pushed, and **the off-loop task** asks
+//! GitHub for the open PR on that branch ([`crate::ghsummons::OpenPrSource`]) — dropping the
+//! request there, having written nothing, if GitHub has none either.
+//!
+//! The split is the point: [`Orchestrator::plan_quorum`] still touches no network, because
+//! resolution needs only config it already holds (the branch name is a frozen contract and the repo
+//! is the one the run was dispatched against). A ticket that never gets a PR therefore costs one
+//! `gh` call per handoff and no writes, and its parent is deliberately left unmarked so a PR opened
+//! afterwards is still reviewable on the next handoff.
+//!
 //! # Off costs exactly nothing
 //!
 //! `quorum.enabled` defaults **false** (§0.12's cost control: §0.6 calls notified review the most
@@ -66,6 +86,7 @@
 //!   moment the daemon already observes, because it executes the handoff", and
 //!   `symphony_handoff` is that moment.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -76,9 +97,11 @@ use rhapsody_config::room::{Message, RoomLog};
 use rhapsody_config::teams::Teams;
 use rhapsody_core::Issue;
 use rhapsody_tracker::{NewIssue, Tracker};
+use rhapsody_workspace::sanitize_key;
 
 use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
+use crate::ghsummons::OpenPrSource;
 use crate::orchestrator::Orchestrator;
 use crate::teams::IDENTITY_LABEL_PREFIX;
 use crate::triage::MANAGER_IDENTITY;
@@ -97,6 +120,10 @@ pub const QUORUM_REQUESTED_LABEL: &str = "rhapsody:quorum-requested";
 /// The ceiling on the failure back-off, [`crate::triage::MAX_TRIAGE_BACKOFF_MS`]'s value and its
 /// reason: a tracker outage settles at one attempt per 15 minutes rather than a hot retry loop.
 pub const MAX_QUORUM_BACKOFF_MS: i64 = 15 * 60 * 1000;
+
+/// Bounds the open-PR lookup (STUDIO-674), [`crate::ghenrich`]'s `GH_SUMMONS_TIMEOUT` and its
+/// reason: a network-stalled `gh` must not park the fan-out indefinitely.
+const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the per-tick candidate sweep learned about ONE ticket, so the handoff moment can decide
 /// without asking the tracker anything (§0.12: the check reads "the candidate's already-fetched
@@ -127,9 +154,24 @@ pub struct QuorumRequest {
     pub parent_team_id: String,
     pub parent_identifier: String,
     pub parent_title: String,
-    /// The pull request under review. Never empty — a handoff with no linked PR builds no request
-    /// at all, because there would be nothing for a reviewer to read.
+    /// The pull request under review, as read off the ticket's Linear GitHub attachment.
+    ///
+    /// **May be empty** (STUDIO-674). An installation whose Linear↔GitHub integration never
+    /// materializes holds `attachments: []` on every issue, so the poller's candidate snapshot has
+    /// no URL to carry and this gate could never pass for any ticket. When it is empty the
+    /// off-loop task resolves the PR from [`pr_owner`](Self::pr_owner)/[`pr_repo`](Self::pr_repo)
+    /// and [`pr_head_branch`](Self::pr_head_branch), and drops the request if GitHub has no open
+    /// PR either. When it is set, the attachment wins and no lookup is made.
     pub pr_url: String,
+    /// The run's repository and the branch its worktree pushed, so the off-loop task can ask GitHub
+    /// for the open PR when [`pr_url`](Self::pr_url) is empty (STUDIO-674). Derived on the control
+    /// task from config alone — the repo URL the run was dispatched against and
+    /// `symphony/<identifier>`, the frozen branch-naming contract — so the dispatch path makes no
+    /// network call. Any of the three may be empty (a project with no GitHub remote); the task then
+    /// has nothing to ask and drops the request.
+    pub pr_owner: String,
+    pub pr_repo: String,
+    pub pr_head_branch: String,
     /// The roster identity the handed-off run wore. Excluded from its own review (§0.6: "at least
     /// two OTHER teammates").
     pub author: String,
@@ -164,6 +206,12 @@ pub struct QuorumDeps<TF> {
     /// lost. A `dyn RoomLog` for triage's reason: nothing here runs on the control task, and the
     /// seam is what lets a test substitute a failing room to prove the fan-out survives one.
     pub room: Option<Arc<dyn RoomLog>>,
+    /// Resolves the open PR by head branch when the ticket carries no GitHub attachment
+    /// (STUDIO-674). `None` disables the fallback entirely, which is the pre-STUDIO-674 behaviour:
+    /// a request with no `pr_url` is then simply dropped. It lives HERE, on the off-loop task's
+    /// deps, and deliberately nowhere the control task can reach — that is what keeps the dispatch
+    /// path network-free.
+    pub pr_source: Option<Arc<dyn OpenPrSource>>,
     /// The back-off ceiling; [`MAX_QUORUM_BACKOFF_MS`] in production, milliseconds in tests.
     pub max_backoff_ms: i64,
 }
@@ -179,6 +227,11 @@ pub(crate) enum FanOutcome {
     /// The tracker refused everything (no viewer to assign to, or every create failed). Back off,
     /// and leave the parent UNMARKED so a later handoff may still try.
     TrackerFailure,
+    /// Neither the Linear attachment nor GitHub itself yielded an open PR for the ticket's branch,
+    /// so there is nothing to review (STUDIO-674). Nothing was written; the parent is NOT settled,
+    /// because a PR opened after this handoff should still be reviewable on the next one. Not a
+    /// failure either — a ticket without a PR is a normal state, not an outage.
+    NoPullRequest,
 }
 
 impl FanOutcome {
@@ -187,10 +240,11 @@ impl FanOutcome {
         matches!(self, FanOutcome::TrackerFailure)
     }
 
-    /// Whether the parent should be considered handled for this process's lifetime. A total failure
-    /// is not.
+    /// Whether the parent should be considered handled for this process's lifetime. Neither a total
+    /// failure nor a missing pull request settles anything: both leave the parent unmarked, and a
+    /// later handoff is the only thing that should ever ask again.
     fn settles_the_parent(self) -> bool {
-        !self.is_failure()
+        matches!(self, FanOutcome::Fanned { .. } | FanOutcome::NoReviewers)
     }
 }
 
@@ -274,6 +328,23 @@ pub(crate) async fn fan_out<TF>(deps: &QuorumDeps<TF>, req: &QuorumRequest) -> F
 where
     TF: Fn() -> Option<QuorumTarget>,
 {
+    // STUDIO-674: the PR, first, because every write below names it. An attachment on the candidate
+    // wins outright and costs nothing; only its absence asks GitHub, and only here — the control
+    // task that built this request made no network call.
+    let req: Cow<'_, QuorumRequest> = if req.pr_url.is_empty() {
+        match resolve_open_pr(deps, req).await {
+            Some(pr_url) => {
+                let mut resolved = req.clone();
+                resolved.pr_url = pr_url;
+                Cow::Owned(resolved)
+            }
+            None => return FanOutcome::NoPullRequest,
+        }
+    } else {
+        Cow::Borrowed(req)
+    };
+    let req = req.as_ref();
+
     let Some(target) = (deps.target)() else {
         tracing::warn!(
             issue = %req.parent_identifier,
@@ -434,6 +505,78 @@ where
     FanOutcome::Fanned {
         created: created.len(),
         wanted: req.reviewers.len(),
+    }
+}
+
+/// Asks GitHub for the open PR on the request's head branch (STUDIO-674), returning `None` when
+/// there is nothing to review — no configured source, no repo/branch to ask about, no open PR, or a
+/// lookup that could not be made.
+///
+/// Every `None` is a DEBUG line except a lookup that FAILED, which is a warning: "GitHub says there
+/// is no PR" is a normal state of a ticket, while "we could not ask GitHub" is an operator problem
+/// that would otherwise look identical from the outside. Neither retries here — a handoff is the
+/// only thing that asks, so a failed lookup costs one `gh` call and waits for the next handoff
+/// rather than spinning.
+async fn resolve_open_pr<TF>(deps: &QuorumDeps<TF>, req: &QuorumRequest) -> Option<String>
+where
+    TF: Fn() -> Option<QuorumTarget>,
+{
+    let Some(src) = deps.pr_source.as_ref() else {
+        tracing::debug!(
+            issue = %req.parent_identifier,
+            "teams quorum: the handed-off ticket has no linked PR and no PR source is configured; \
+             nothing to review"
+        );
+        return None;
+    };
+    // Bounded exactly as the poll path's summons fetch is, and for the same reason. The bound is on
+    // THIS task only: the quorum owns all of its own network I/O, so even an unbounded stall parks
+    // the fan-out and never the control loop. (As in `ghenrich`, a `gh` runner that blocks rather
+    // than yields cannot be interrupted mid-call; the timeout bounds everything else.)
+    let looked_up = tokio::time::timeout(
+        PR_LOOKUP_TIMEOUT,
+        src.open_pr_for_branch(&req.pr_owner, &req.pr_repo, &req.pr_head_branch),
+    )
+    .await;
+    match looked_up {
+        Ok(Ok(Some(url))) => {
+            tracing::info!(
+                issue = %req.parent_identifier,
+                branch = %req.pr_head_branch,
+                pr = %url,
+                "teams quorum resolved the ticket's open PR by head branch (no Linear attachment)"
+            );
+            Some(url)
+        }
+        Ok(Ok(None)) => {
+            tracing::debug!(
+                issue = %req.parent_identifier,
+                repo = %format!("{}/{}", req.pr_owner, req.pr_repo),
+                branch = %req.pr_head_branch,
+                "teams quorum: the handed-off ticket has no Linear attachment and no open PR on \
+                 its branch; nothing to review"
+            );
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                issue = %req.parent_identifier,
+                branch = %req.pr_head_branch,
+                err = %e,
+                "teams quorum could not ask GitHub for the ticket's open PR; no review was \
+                 requested (the handoff itself already succeeded)"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                issue = %req.parent_identifier,
+                branch = %req.pr_head_branch,
+                timeout_ms = PR_LOOKUP_TIMEOUT.as_millis(),
+                "teams quorum's open-PR lookup timed out; no review was requested"
+            );
+            None
+        }
     }
 }
 
@@ -721,17 +864,13 @@ impl Orchestrator {
         }
         let teams = self.teams.as_ref()?;
         let facts = self.quorum_facts.get(&re.issue.id);
-        // A ticket the poller has not seen since it acquired a PR simply has no URL yet, and a
-        // review request with no PR in it is not worth making.
+        // The Linear GitHub attachment when there is one, and NOT a gate (STUDIO-674): an
+        // installation whose Linear↔GitHub link never materializes holds `attachments: []` on every
+        // issue, so requiring a URL here made the quorum structurally dead for every ticket. An
+        // empty URL is carried through to the off-loop task, which asks GitHub by head branch — the
+        // source of truth the attachment was only ever a cache of — and drops the request there if
+        // GitHub has no open PR either. Nothing on this path touches the network.
         let pr_url = facts.map(|f| f.pr_url.clone()).unwrap_or_default();
-        if pr_url.is_empty() {
-            tracing::debug!(
-                issue = %re.issue.identifier,
-                "teams quorum: the handed-off ticket has no open linked PR in the last candidate \
-                 snapshot; nothing to review"
-            );
-            return None;
-        }
         // The marker is checked from the candidate's already-fetched labels, and from the RUN's own
         // copy too: a fresh dispatch stamps the issue it was dispatched with, so a re-handoff after
         // review fixes carries the marker even if a tick has not landed yet.
@@ -749,12 +888,21 @@ impl Orchestrator {
             );
             return None;
         }
+        let (pr_owner, pr_repo) =
+            crate::ghsummons::parse_repo(&re.project_repo).unwrap_or_default();
         Some(QuorumRequest {
             parent_issue_id: re.issue.id.clone(),
             parent_team_id: re.issue.team_id.clone(),
             parent_identifier: re.issue.identifier.clone(),
             parent_title: re.issue.title.clone(),
             pr_url,
+            // Derived from config alone, and carried even when the attachment already won so the
+            // request's shape never depends on which path filled the URL. `symphony/<key>` is the
+            // branch the run's worktree was created on (`rhapsody_workspace::Manager::ensure_*`), a
+            // frozen cross-process contract; `project_repo` is the remote it was pushed to.
+            pr_owner,
+            pr_repo,
+            pr_head_branch: format!("symphony/{}", sanitize_key(&re.issue.identifier)),
             author: re.identity.clone(),
             reviewers: select_reviewers(teams, &re.identity, &self.quorum_load),
             state_name: self.quorum_create_state(&re.project_slug),
@@ -809,7 +957,10 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::ghsummons::OpenPrResult;
     use crate::testsupport::{TempDir, issue};
     use rhapsody_config::room::{Cursor, LocalRoom, RoomError};
     use rhapsody_config::teams::{Identity, Quorum};
@@ -851,6 +1002,51 @@ mod tests {
             reviewers: reviewers.iter().map(|r| (*r).to_string()).collect(),
             state_name: "Todo".into(),
             summon_token: "@symphony".into(),
+            // The attachment path: `pr_url` is already set, so the branch fields go unread.
+            ..Default::default()
+        }
+    }
+
+    /// The STUDIO-674 shape: a ticket whose Linear carries NO GitHub attachment, so the request
+    /// arrives with an empty `pr_url` and the branch the off-loop task must ask GitHub about.
+    fn request_without_attachment(reviewers: &[&str]) -> QuorumRequest {
+        QuorumRequest {
+            pr_url: String::new(),
+            pr_owner: "o".into(),
+            pr_repo: "r".into(),
+            pr_head_branch: "symphony/MT-1".into(),
+            ..request(reviewers)
+        }
+    }
+
+    /// An [`OpenPrSource`] that answers every lookup with `answer`, recording what it was asked.
+    struct FakePrSource {
+        answer: Box<dyn Fn() -> OpenPrResult + Send + Sync>,
+        seen: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl FakePrSource {
+        fn new(answer: impl Fn() -> OpenPrResult + Send + Sync + 'static) -> Arc<FakePrSource> {
+            Arc::new(FakePrSource {
+                answer: Box::new(answer),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OpenPrSource for FakePrSource {
+        async fn open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> OpenPrResult {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).push((
+                owner.to_string(),
+                repo.to_string(),
+                branch.to_string(),
+            ));
+            (self.answer)()
         }
     }
 
@@ -863,7 +1059,20 @@ mod tests {
                 })
             },
             room: None,
+            pr_source: None,
             max_backoff_ms: 20,
+        }
+    }
+
+    /// [`deps`] with the STUDIO-674 fallback lookup wired in.
+    fn deps_with_pr_source(
+        teams: Teams,
+        tr: Arc<Fake>,
+        src: Arc<FakePrSource>,
+    ) -> QuorumDeps<impl Fn() -> Option<QuorumTarget>> {
+        QuorumDeps {
+            pr_source: Some(src as Arc<dyn OpenPrSource>),
+            ..deps(teams, tr)
         }
     }
 
@@ -1246,12 +1455,219 @@ mod tests {
             teams: Arc::new(teams_quorum(&["alice", "bob"], 2)),
             target: || None,
             room: None,
+            pr_source: None,
             max_backoff_ms: 20,
         };
         assert_eq!(
             fan_out(&d, &request(&["bob"])).await,
             FanOutcome::TrackerFailure
         );
+    }
+
+    // ── the head-branch PR fallback (STUDIO-674) ────────────────────────────────────────────────
+
+    // The whole point of the ticket: an installation whose Linear holds no GitHub attachment still
+    // fans out, because the off-loop task asks GitHub for the open PR on `symphony/<identifier>`
+    // and the reviewers are handed THAT url.
+    #[tokio::test]
+    async fn a_request_without_an_attachment_resolves_the_pr_by_head_branch() {
+        let tr = Arc::new(tracker_with_viewer());
+        let src = FakePrSource::new(|| Ok(Some("https://github.com/o/r/pull/64".to_string())));
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+
+        assert_eq!(
+            fan_out(&d, &request_without_attachment(&["bob", "carol"])).await,
+            FanOutcome::Fanned {
+                created: 2,
+                wanted: 2
+            }
+        );
+
+        assert_eq!(
+            src.calls(),
+            vec![(
+                "o".to_string(),
+                "r".to_string(),
+                "symphony/MT-1".to_string()
+            )],
+            "exactly one lookup, for the run's repo and its branch"
+        );
+        let created = tr.create_issue_calls();
+        assert_eq!(created.len(), 2, "one review ticket per reviewer");
+        for call in &created {
+            assert!(
+                call.spec
+                    .description
+                    .contains("https://github.com/o/r/pull/64"),
+                "the reviewer is pointed at the RESOLVED pr, not an empty url: {}",
+                call.spec.description
+            );
+        }
+        let labels = tr.add_label_calls();
+        assert_eq!(
+            labels.len(),
+            1,
+            "a resolved fan-out marks the parent exactly as an attachment-driven one does"
+        );
+        assert_eq!(labels[0].label_name, QUORUM_REQUESTED_LABEL);
+    }
+
+    // The attachment still wins: a request that already carries a url makes NO network call. This
+    // is the "behaviour unchanged where Linear works" half of the ticket.
+    #[tokio::test]
+    async fn an_attachment_wins_and_costs_no_lookup() {
+        let tr = Arc::new(tracker_with_viewer());
+        let src = FakePrSource::new(|| panic!("the attachment path must not query GitHub"));
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob"])).await,
+            FanOutcome::Fanned {
+                created: 1,
+                wanted: 1
+            }
+        );
+        assert!(
+            src.calls().is_empty(),
+            "no lookup when Linear already knows"
+        );
+        assert!(
+            tr.create_issue_calls()[0]
+                .spec
+                .description
+                .contains("https://github.com/o/r/pull/7"),
+            "the attachment's url is what reviewers get"
+        );
+    }
+
+    // No open PR on the branch either: the request is dropped where the ticket says it should be —
+    // in the off-loop task — writing NOTHING. The parent stays unmarked, so a PR opened later is
+    // still reviewable on the next handoff.
+    #[tokio::test]
+    async fn no_open_pr_on_the_branch_writes_nothing_and_does_not_settle_the_parent() {
+        let tr = Arc::new(tracker_with_viewer());
+        let src = FakePrSource::new(|| Ok(None));
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob", "carol"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+
+        assert_eq!(
+            fan_out(&d, &request_without_attachment(&["bob", "carol"])).await,
+            FanOutcome::NoPullRequest
+        );
+        assert!(tr.create_issue_calls().is_empty(), "no review ticket");
+        assert!(tr.add_label_calls().is_empty(), "the parent is NOT marked");
+        assert!(
+            !FanOutcome::NoPullRequest.settles_the_parent(),
+            "a later handoff, once the PR exists, must still be able to fan out"
+        );
+        assert!(
+            !FanOutcome::NoPullRequest.is_failure(),
+            "a ticket without a PR is a normal state, not an outage to back off from"
+        );
+    }
+
+    // A lookup that could not be MADE is treated the same way — nothing written, nothing marked —
+    // because a review request naming no PR is worse than none. It is warned about rather than
+    // debugged (see `resolve_open_pr`), and it is not a back-off failure: only a handoff asks.
+    #[tokio::test]
+    async fn a_failing_lookup_writes_nothing() {
+        let tr = Arc::new(tracker_with_viewer());
+        let src = FakePrSource::new(|| Err("gh: command not found".into()));
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+
+        assert_eq!(
+            fan_out(&d, &request_without_attachment(&["bob"])).await,
+            FanOutcome::NoPullRequest
+        );
+        assert!(tr.create_issue_calls().is_empty() && tr.add_label_calls().is_empty());
+    }
+
+    // With no source configured at all, the fallback is simply off and the pre-STUDIO-674 outcome
+    // stands: an attachment-less request is dropped, silently and without writing.
+    #[tokio::test]
+    async fn without_a_pr_source_an_attachment_less_request_is_dropped() {
+        let tr = Arc::new(tracker_with_viewer());
+        let d = deps(teams_quorum(&["alice", "bob"], 2), Arc::clone(&tr));
+
+        assert_eq!(
+            fan_out(&d, &request_without_attachment(&["bob"])).await,
+            FanOutcome::NoPullRequest
+        );
+        assert!(tr.create_issue_calls().is_empty() && tr.add_label_calls().is_empty());
+    }
+
+    // A request with no repo to ask about (a project with no GitHub remote) never reaches `gh`:
+    // the source itself refuses an empty owner/repo/branch, so the outcome is the same drop.
+    #[tokio::test]
+    async fn a_request_with_no_repo_resolves_nothing() {
+        let tr = Arc::new(tracker_with_viewer());
+        let src = FakePrSource::new(|| Ok(None));
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+        let req = QuorumRequest {
+            pr_owner: String::new(),
+            pr_repo: String::new(),
+            pr_head_branch: String::new(),
+            ..request_without_attachment(&["bob"])
+        };
+
+        assert_eq!(fan_out(&d, &req).await, FanOutcome::NoPullRequest);
+        assert!(tr.create_issue_calls().is_empty() && tr.add_label_calls().is_empty());
+    }
+
+    // The task-level consequence of not settling: two handoffs of the same ticket, the first before
+    // the PR exists and the second after, fan out on the second. The `settled` set must not have
+    // swallowed it.
+    #[tokio::test]
+    async fn a_second_handoff_after_the_pr_appears_fans_out() {
+        let tr = Arc::new(tracker_with_viewer());
+        let answers = Arc::new(Mutex::new(vec![
+            Ok(None),
+            Ok(Some("https://github.com/o/r/pull/64".to_string())),
+        ]));
+        let queue = Arc::clone(&answers);
+        let src = FakePrSource::new(move || {
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            if q.is_empty() { Ok(None) } else { q.remove(0) }
+        });
+        let deps = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 2),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::default();
+        let task = tokio::spawn(run_quorum_task(signal.wait(), deps, rx));
+
+        tx.send(request_without_attachment(&["bob"])).expect("send");
+        tx.send(request_without_attachment(&["bob"])).expect("send");
+        drop(tx);
+        task.await.expect("the task ends when the sender is gone");
+
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            1,
+            "the first handoff found no PR and settled nothing; the second fanned out"
+        );
+        assert_eq!(src.calls().len(), 2, "both handoffs asked GitHub");
     }
 
     // ── the shipped prompt prose ────────────────────────────────────────────────────────────────

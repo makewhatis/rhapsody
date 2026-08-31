@@ -408,6 +408,18 @@ where
             },
             // The same room triage posts to, resolved the same way and for the same reason.
             room: quorum_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+            // STUDIO-674: the fallback PR lookup, for the installations whose Linear holds no
+            // GitHub attachments. It is handed to the TASK and to nothing else, which is what keeps
+            // the control loop network-free — a handoff still decides everything without asking
+            // anybody. The summon token is the only construction input `GH` takes; the open-PR
+            // query does not use it, so a daemon with no readable workflow still resolves PRs.
+            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+                &resolved
+                    .as_ref()
+                    .map(|c| c.tracker.summon_token.clone())
+                    .unwrap_or_default(),
+                None,
+            ))),
             max_backoff_ms: rhapsody_orchestrator::MAX_QUORUM_BACKOFF_MS,
         };
         tokio::spawn(async move {

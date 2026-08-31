@@ -172,11 +172,9 @@ impl OpenPrSource for GH {
             "--limit",
             "1",
         ];
-        let body = (self.run)(&args).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("gh pr list --repo {slug} --head {branch}: {e}").into()
-            },
-        )?;
+        let body = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("gh pr list --repo {slug} --head {branch}: {e}").into()
+        })?;
         let prs: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("decode gh pr list --repo {slug} --head {branch}: {e}").into()
@@ -279,8 +277,8 @@ impl SummonSource for GH {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use chrono::TimeZone;
 
