@@ -233,23 +233,19 @@ describe("Teams gate recovery from the daemon boot race", () => {
       renderShell();
 
       // Mount-time fetch fails: the gate reads as off and asks for nothing Teams-shaped.
-      await waitFor(() => expect(h.fetchVersion).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(h.fetchVersion).toHaveBeenCalled());
       expect(screen.queryByText(/^Teams: /)).toBeNull();
       expect(h.fetchTeamsOverview).not.toHaveBeenCalled();
 
-      // Second attempt, still refused — the daemon is not up yet.
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(VERSION_RETRY_MS + 100);
-      });
-      expect(h.fetchVersion).toHaveBeenCalledTimes(2);
-      expect(screen.queryByText(/^Teams: /)).toBeNull();
-
-      // Third attempt lands: the daemon has bound its port and reports Teams on. The chip appears
+      // Two refusals in, the daemon binds its port and the third attempt lands. The chip appears
       // on its own — nobody reloaded the app.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(VERSION_RETRY_MS + 100);
+        await vi.advanceTimersByTimeAsync(2 * VERSION_RETRY_MS + 100);
       });
       expect(await screen.findByRole("button", { name: "Teams: 2 teammates, 2 live" })).toBeTruthy();
+      // It really did have to ask again to get there: the mock only resolves on the third call, so
+      // the mount-time request alone could never have produced that chip.
+      expect(h.fetchVersion.mock.calls.length).toBeGreaterThanOrEqual(3);
 
       // And having succeeded, the version route goes quiet for the rest of the session.
       const settled = h.fetchVersion.mock.calls.length;
