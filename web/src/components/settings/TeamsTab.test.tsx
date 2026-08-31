@@ -281,6 +281,9 @@ describe("TeamsTab — memory, the manager and the roster overrides", () => {
     fireEvent.click(screen.getByRole("button", { name: "Replace" }));
     expect(screen.getByText(/Save with this blank and the stored key is removed/)).toBeTruthy();
 
+    // An unrelated edit made while in the replace state must survive the take-back: the undo is
+    // scoped to the key, not a discard of the whole form.
+    fireEvent.change(screen.getByLabelText("Bank prefix"), { target: { value: "team-" } });
     fireEvent.click(screen.getByRole("button", { name: "Keep existing" }));
     // Back to the masked state — and the literal still never appeared on screen.
     expect(screen.getByText(/A key is stored in teams.yaml and is not shown/)).toBeTruthy();
@@ -289,7 +292,10 @@ describe("TeamsTab — memory, the manager and the roster overrides", () => {
     h.saveTeamsConfig.mockResolvedValue(view({ present: true, config: stored }));
     fireEvent.click(screen.getByRole("button", { name: "Save teams.yaml" }));
     await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalledTimes(1));
-    expect((h.saveTeamsConfig.mock.calls[0][0] as TeamsConfig).memory.api_key).toBe("sk-live-abc123");
+    const sent = h.saveTeamsConfig.mock.calls[0][0] as TeamsConfig;
+    expect(sent.memory.api_key).toBe("sk-live-abc123");
+    expect(sent.memory.bank_prefix).toBe("team-");
+    expect(document.body.innerHTML).not.toContain("sk-live-abc123");
   });
 
   // …but the undo is offered ONLY when there is something to keep. A fresh hindsight config with no
@@ -326,42 +332,6 @@ describe("TeamsTab — memory, the manager and the roster overrides", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save teams.yaml" }));
     await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalledTimes(1));
     expect((h.saveTeamsConfig.mock.calls[0][0] as TeamsConfig).memory.api_key).toBe("$HINDSIGHT_API_KEY");
-  });
-
-  // Replace is one click and it destroys a credential. The way back has to survive the click that
-  // creates the need for it, or an accidental press plus any unrelated save silently leaves the
-  // hindsight backend unauthenticated.
-  it("takes back a Replace without losing the stored key or the rest of the edit", async () => {
-    const stored: TeamsConfig = {
-      ...config,
-      memory: { ...config.memory, backend: "hindsight", api_key: "sk-live-abc123" },
-    };
-    await openEditor(view({ present: true, config: stored }));
-    fireEvent.click(screen.getByRole("button", { name: "Replace" }));
-    expect(screen.getByText(/the stored key is removed/)).toBeTruthy();
-    // An unrelated edit made while in the replace state must survive the take-back.
-    fireEvent.change(screen.getByLabelText("Bank prefix"), { target: { value: "team-" } });
-    fireEvent.click(screen.getByRole("button", { name: "Keep existing" }));
-
-    h.saveTeamsConfig.mockResolvedValue(view({ present: true, config: stored }));
-    fireEvent.click(screen.getByRole("button", { name: "Save teams.yaml" }));
-    await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalledTimes(1));
-    const sent = h.saveTeamsConfig.mock.calls[0][0] as TeamsConfig;
-    expect(sent.memory.api_key).toBe("sk-live-abc123");
-    expect(sent.memory.bank_prefix).toBe("team-");
-    // And the take-back never put the secret on screen.
-    expect(document.body.innerHTML).not.toContain("sk-live-abc123");
-  });
-
-  // The offer only makes sense when there is something to keep.
-  it("offers no take-back when no key is stored", async () => {
-    const noKey: TeamsConfig = {
-      ...config,
-      memory: { ...config.memory, backend: "hindsight", api_key: "" },
-    };
-    await openEditor(view({ present: true, config: noKey }));
-    expect(screen.queryByRole("button", { name: "Keep existing" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Replace" })).toBeNull();
   });
 
   it("picks a default teammate from the roster rather than asking for a typed name", async () => {
