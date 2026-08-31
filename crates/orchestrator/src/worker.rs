@@ -14,10 +14,9 @@
 //!     dropped future (O7 owns the task's abort handle), so there is no `ctx` parameter.
 //!   * Telemetry is P6: Go's `symphony.run`/`worktree.ensure`/`turn` spans and the `turn.duration` /
 //!     token metrics are NOT emitted here (the `WorkerDeps` telemetry fields — `Tracer`, `Metrics`,
-//!     `Model`, `DispatchSpanContext` — and `RunID` are dropped; the per-event `tracing::debug!`
-//!     forwarding line is kept). The bounded metric labels live in [`crate::telemetry_attrs`].
-//!   * Go threads the store run id onto the session (`SetRunID`); the A1 `Session` trait exposes no
-//!     setter yet (a documented P5 wiring concern in the agent crate), so that call is a no-op here.
+//!     `Model`, `DispatchSpanContext` — are dropped; the per-event `tracing::debug!` forwarding line
+//!     is kept). The bounded metric labels live in [`crate::telemetry_attrs`]. `RunID` is NOT
+//!     telemetry and IS carried: it reaches the session via `set_run_id` (STUDIO-675).
 //!   * The operator-message mailbox (`messages`, INF-250) is threaded to [`Session::run_turn`] for
 //!     parity; its delivery source (the mailbox + control-loop routing) is O6/O7, so every O3 caller
 //!     passes `None`.
@@ -112,6 +111,14 @@ pub struct WorkerDeps {
     pub teammate_section: String,
     /// The GitHub label name the post-run labeler adds to every PR in this run's stack (AIE-301).
     pub pr_label: String,
+    /// The store run-row id for this attempt (Go `WorkerDeps.RunID`), threaded onto the session so
+    /// the agent child's env carries `SYMPHONY_RUN_ID` (STUDIO-675). `0` when the store is off or
+    /// `start_run` failed, which [`Session::set_run_id`] treats as "unknown" and emits nothing for.
+    ///
+    /// This is what lets a dispatched teammate call `teams_post` / `teams_retain` at all: both
+    /// resolve the calling run from that env alone, and the daemon resolves run → identity from the
+    /// dispatch-time binding.
+    pub run_id: i64,
     /// The review state a declared HANDOFF parks the ticket in (a review-state name; `None` ⇒ the
     /// feature is off, giving Go-identical behavior). Dispatched agents cannot move Linear state
     /// themselves — the runner injects the mcp_config with `--strict-mcp-config`, so only the
@@ -383,8 +390,10 @@ pub async fn run_agent_attempt(
             return (issue.state.clone(), false, Some(e.into()));
         }
     };
-    // (Go threads the store run id onto the session via SetRunID here; the A1 `Session` trait exposes
-    // no setter yet, so it is a no-op — see the module docs.)
+    // Thread the store run id onto the session (Go: the optional-interface `SetRunID` right after
+    // `StartSession`, before the first turn) so the agent child's env carries SYMPHONY_RUN_ID for
+    // the injected MCP server's "me" default. A zero id is a no-op inside the setter's consumer.
+    sess.set_run_id(deps.run_id);
 
     let (final_state, result_text, loop_err) = deps
         .run_turns(
@@ -578,6 +587,7 @@ mod tests {
             teammate_section: String::new(),
             pr_label: String::new(),
             review_handoff_state: None,
+            run_id: 0,
         }
     }
 
@@ -747,6 +757,41 @@ mod tests {
             run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
         assert_eq!(ag.last_prompt(), "from file MT-1", "file wins over inline");
+    }
+
+    /// STUDIO-675: the worker MUST thread the store run id onto the session (Go's `SetRunID` right
+    /// after `StartSession`), because the Claude backend turns it into the agent child's
+    /// `SYMPHONY_RUN_ID` — the only thing `teams_post` / `teams_retain` resolve the calling run
+    /// from. Without this the tools fail with "SYMPHONY_RUN_ID is not set" on every dispatch.
+    #[tokio::test]
+    async fn worker_threads_run_id_onto_the_session() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.run_id = 412;
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert_eq!(
+            ag.last_run_id(),
+            Some(412),
+            "the dispatch run id must reach the session"
+        );
+    }
+
+    /// A store-disabled run (`run_id` 0) still calls the setter — the zero guard lives in the
+    /// backend, which emits no env for it — so behaviour is unchanged when there is no run row.
+    #[tokio::test]
+    async fn worker_threads_zero_run_id_when_the_store_is_off() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert_eq!(ag.last_run_id(), Some(0), "a zero id is still threaded");
     }
 
     // Mirrors Go `TestWorkerInstallsGraphiteGuard`: git_flow=graphite writes the guard hook +

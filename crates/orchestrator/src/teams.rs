@@ -360,6 +360,30 @@ fn at_capacity(i: &Identity, load: &LoadSnapshot) -> bool {
     i.max_concurrent > 0 && load.live(&i.name) >= i.max_concurrent
 }
 
+/// The one paragraph that teaches `teams_post` (STUDIO-675).
+///
+/// The whole posting chain — the MCP tool, the host-stamped room append, the dispatch-time run →
+/// identity binding — was built and reachable, but nothing ever TOLD a teammate to use it, so no
+/// teammate did. This is that instruction.
+///
+/// **Why the header and not a profile body.** Posting is a mechanic of being a teammate, exactly
+/// like the identity line above it — not a role behaviour like "review adversarially". A built-in
+/// profile bump (§4) reaches only an unpinned `extends: swe`; it never reaches `extends: swe@1`,
+/// which §4 promises the pinned bytes forever, nor `extends: none`, which Rhapsody contributes
+/// nothing to. The header reaches every routed teammate on every dispatch.
+///
+/// **Why ONE post, and why hand-offs only.** Every message in the room is turn-1 prompt tokens for
+/// every future run that catches up on it, forever (§0.5's bounded-window rule, §0.11.6's budget).
+/// So the instruction is explicitly capped and explicitly scoped to decisions and hand-offs. It is
+/// also purely an instruction: the daemon posts nothing on the teammate's behalf, because teammate
+/// speech is run-scoped, host-stamped and agent-authored by design (§0.11.4), and a mechanical
+/// per-lifecycle post would inflate every teammate's prompt with text nobody chose to write.
+///
+/// Held as its own `const` rather than inlined into the `format!` above for the reason
+/// [`crate::teamscompose`]'s preamble is: a `\`-continued literal carries its source indentation
+/// into the rendered prompt, and nothing downstream would ever show it.
+const HANDOFF_POST_INSTRUCTION: &str = "Before you finish, post ONE short hand-off to the team room with `teams_post` — what you did, the pull request link if there is one, and anything a teammate would need to pick this up. Keep the room to decisions and hand-offs rather than chatter: everything posted there is read back into your teammates' prompts on their future runs. Posting never assigns a ticket and never starts a run.";
+
 /// The turn-1 teammate section: the identity header plus the identity's resolved
 /// profile text (§0.11.6's fixed order is capabilities → teammate header → room
 /// catch-up → memory recall; the last two are T5's, and the composer that owns
@@ -376,6 +400,8 @@ pub(crate) fn teammate_section(identity: &str, profile_prompt: &str) -> String {
          You are working as **{identity}**, a named teammate on this Rhapsody team. \
          Work this ticket as {identity}, and follow the profile below for the whole run.\n\n"
     );
+    out.push_str(HANDOFF_POST_INSTRUCTION);
+    out.push_str("\n\n");
     out.push_str(profile_prompt);
     out.trim_end().to_string()
 }
@@ -1831,6 +1857,37 @@ mod tests {
             "{bare:?}"
         );
         assert_eq!(bare, bare.trim_end());
+    }
+
+    /// STUDIO-675: the header must TEACH `teams_post`. The posting chain was fully built and
+    /// wired, but no builtin profile and no header ever mentioned the tool or the room, so
+    /// teammates were never told to post and never did (STUDIO-670 shipped without a single post).
+    ///
+    /// This lives in the HEADER, not in a profile body, deliberately: posting is a Teams mechanic
+    /// every identity has, not a role behaviour. A profile bump would reach only unpinned
+    /// `extends: swe` users, and never an `extends: swe@1` pin or an `extends: none` fork (§4),
+    /// while the header reaches every routed teammate.
+    #[test]
+    fn teammate_section_teaches_posting_a_handoff_to_the_room() {
+        let s = teammate_section("alice", "profile prose");
+        assert!(
+            s.contains("teams_post"),
+            "the header must name the tool by the name the agent calls: {s:?}"
+        );
+        // §0.5: the room carries decisions and hand-offs, not chatter — the instruction has to say
+        // so, because an unbounded room is turn-1 prompt tokens on every future run, forever.
+        assert!(
+            s.contains("one") || s.contains("ONE"),
+            "the instruction must bound the post to one: {s:?}"
+        );
+        // The profile still terminates the section, so a role prompt is never buried mid-header.
+        assert!(s.ends_with("profile prose"), "s = {s:?}");
+        // A `\`-continued Rust literal silently carries its source indentation into the shipped
+        // prompt and nothing downstream would reveal it, so assert on the RENDERED whitespace.
+        assert!(
+            !HANDOFF_POST_INSTRUCTION.contains("  ") && !HANDOFF_POST_INSTRUCTION.contains('\n'),
+            "the instruction leaked source formatting: {HANDOFF_POST_INSTRUCTION:?}"
+        );
     }
 
     // ---- dispatch-level acceptance (§2.4 rows 5, 6 and 9) -------------------

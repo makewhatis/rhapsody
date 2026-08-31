@@ -138,6 +138,20 @@ pub trait Session: Send + Sync {
     /// Returns the stable backend thread/session id (empty before turn 1).
     fn thread_id(&self) -> String;
 
+    /// Records the store run-row id for this session, so the backend can expose it to the agent
+    /// child as `SYMPHONY_RUN_ID`/`RHAPSODY_RUN_ID` (the "me" identity env, INF-473). Mirrors Go's
+    /// `SetRunID`, which the worker calls once right after `StartSession` and before the first
+    /// turn; a zero id (store disabled, or `start_run` failed) is a no-op, leaving the env unset
+    /// rather than naming a run that does not exist.
+    ///
+    /// Takes `&self` because the worker holds the session behind a `Box<dyn Session>` — backends
+    /// keep the id in interior-mutable state, as they already do for `thread_id`/`turn_n`.
+    ///
+    /// Defaulted to a no-op: Go reaches this through an OPTIONAL interface assertion
+    /// (`sess.(interface{ SetRunID(int64) })`), so a backend that carries no run id is required to
+    /// ignore it rather than to implement it.
+    fn set_run_id(&self, _id: i64) {}
+
     /// Runs one turn with the given prompt, forwarding events to `on_event`. The returned
     /// `(TurnResult, Option<AgentError>)` mirrors Go's `(TurnResult, error)`: a `Some` error means
     /// the turn failed/timed out, and the `TurnResult` STILL carries the status (both are
