@@ -368,13 +368,12 @@ impl IdentityHistory for StoreIdentityHistory {
 /// Pulls the identity out of a `teams.route` event's text, which
 /// [`route_teams`](crate::orchestrator::Orchestrator) writes as `identity=<name> reason=<why>`.
 ///
-/// Parsed rather than pattern-matched loosely: a `reason` that ever contained the word `identity`
-/// must not be mistaken for one. An empty name yields `None`, since no roster member can be called
-/// that.
+/// Read from the FIRST field only, exactly where the writer puts it, rather than searched for
+/// anywhere in the text: the `reason` is free prose that can and does quote model output, and a
+/// reason containing `identity=` must never be able to name who a run was. An empty name yields
+/// `None`, since no roster member can be called that (roster names are validated label-safe).
 fn route_event_identity(text: &str) -> Option<String> {
-    let name = text
-        .split_whitespace()
-        .find_map(|f| f.strip_prefix("identity="))?;
+    let name = text.split_whitespace().next()?.strip_prefix("identity=")?;
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -1185,6 +1184,9 @@ where
             continue; // unreachable: every kept issue was inserted with its owner
         };
         for name in orphans {
+            if removed.len() >= MAX_RECONCILE {
+                break;
+            }
             if worn.iter().any(|w| w.eq_ignore_ascii_case(&name)) {
                 continue; // she really did work this ticket; the label is hers
             }
@@ -3318,9 +3320,9 @@ mod tests {
         assert_eq!(route_event_identity("reason=unrouted"), None);
         assert_eq!(route_event_identity("identity= reason=label"), None);
         assert_eq!(
-            route_event_identity("reason=the identity=x was rejected"),
-            Some("x".to_string()),
-            "a field is a field wherever it appears; only a bare mention is ignored"
+            route_event_identity("reason=the model named identity=mallory"),
+            None,
+            "a reason is free prose and must never be able to name who a run was"
         );
     }
 
