@@ -66,7 +66,7 @@ pub struct HandoffPlan {
     /// design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.12). `None` whenever the
     /// quorum does not fire — which is every handoff on an installation that has not opted in, and
     /// the common case even on one that has (see
-    /// [`plan_quorum`](Orchestrator::plan_quorum) for the four gates).
+    /// [`plan_quorum`](Orchestrator::plan_quorum) for the gates).
     ///
     /// Decided HERE, on the control task, from state already in memory — the reviewers, the PR and
     /// the target state are all resolved before this struct exists — so the handoff itself never

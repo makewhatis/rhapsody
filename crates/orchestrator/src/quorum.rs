@@ -122,7 +122,17 @@ pub const QUORUM_REQUESTED_LABEL: &str = "rhapsody:quorum-requested";
 pub const MAX_QUORUM_BACKOFF_MS: i64 = 15 * 60 * 1000;
 
 /// Bounds the open-PR lookup (STUDIO-674), [`crate::ghenrich`]'s `GH_SUMMONS_TIMEOUT` and its
-/// reason: a network-stalled `gh` must not park the fan-out indefinitely.
+/// reason: a network-stalled lookup must not park the fan-out indefinitely.
+///
+/// Honest reach, because a bound that reads stronger than it is, is worse than none: against the
+/// PRODUCTION source it is currently INERT. [`crate::ghsummons::GH`] shells out through a
+/// synchronous `std::process::Command`, so its future has no await point and runs to completion in
+/// its first poll — `tokio::time::timeout` never gets to cancel it. The bound is real for any
+/// source that actually yields, which today means the tests. What makes it real everywhere is the
+/// non-blocking runner (`spawn_blocking` / `tokio::process`) already noted as a follow-up on
+/// `ghsummons::default_run`, and until then the containment is structural rather than temporal: a
+/// hung `gh` parks THIS task, which owns all of the quorum's network I/O and no lock the control
+/// task takes, and the daemon keeps ticking.
 const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the per-tick candidate sweep learned about ONE ticket, so the handoff moment can decide
@@ -240,6 +250,16 @@ impl FanOutcome {
         matches!(self, FanOutcome::TrackerFailure)
     }
 
+    /// Whether this outcome is EVIDENCE that the tracker is healthy again, and may therefore clear
+    /// a back-off earned by earlier failures. Everything except [`FanOutcome::NoPullRequest`] is:
+    /// it alone returns before the tracker is touched at all, so treating it as a success would let
+    /// one attachment-less handoff during a Linear outage erase the back-off the outage earned.
+    /// It does not extend the back-off either — a ticket without a PR is a normal state, not an
+    /// outage — so it simply leaves the counter where it found it.
+    fn clears_the_backoff(self) -> bool {
+        !matches!(self, FanOutcome::NoPullRequest)
+    }
+
     /// Whether the parent should be considered handled for this process's lifetime. Neither a total
     /// failure nor a missing pull request settles anything: both leave the parent unmarked, and a
     /// later handoff is the only thing that should ever ask again.
@@ -313,7 +333,7 @@ pub async fn run_quorum_task<TF>(
                 consecutive_failures = failures,
                 "teams quorum fan-out failed; backing off (the handoff itself already succeeded)"
             );
-        } else {
+        } else if outcome.clears_the_backoff() {
             failures = 0;
         }
     }
@@ -529,10 +549,10 @@ where
         );
         return None;
     };
-    // Bounded exactly as the poll path's summons fetch is, and for the same reason. The bound is on
-    // THIS task only: the quorum owns all of its own network I/O, so even an unbounded stall parks
-    // the fan-out and never the control loop. (As in `ghenrich`, a `gh` runner that blocks rather
-    // than yields cannot be interrupted mid-call; the timeout bounds everything else.)
+    // Bounded exactly as the poll path's summons fetch is, and for the same reason — but see
+    // `PR_LOOKUP_TIMEOUT`: the real `gh` runner blocks rather than yields, so this cannot interrupt
+    // it today. What holds either way is that the stall is confined to THIS task, which owns all of
+    // the quorum's network I/O and no lock the control task takes.
     let looked_up = tokio::time::timeout(
         PR_LOOKUP_TIMEOUT,
         src.open_pr_for_branch(&req.pr_owner, &req.pr_repo, &req.pr_head_branch),
@@ -838,9 +858,16 @@ impl Orchestrator {
     /// 1. Teams and `quorum.enabled` are both on.
     /// 2. The run was dispatched AS a roster identity. A run with no identity is an ordinary
     ///    Rhapsody run and the quorum has no author to exclude and no team to ask.
-    /// 3. The ticket has an open linked PR. A handoff with nothing to read fans out nothing.
+    /// 3. The ticket names a team to create the review tickets in.
     /// 4. The ticket is not already marked (§0.12's "once per ticket"): a re-handoff after review
     ///    fixes must NOT fan out a second time.
+    ///
+    /// §0.12's remaining gate — "the ticket has an open linked PR" — is deliberately NOT one of
+    /// these (STUDIO-674). It has moved to [`fan_out`], off the loop: the URL is filled from the
+    /// candidate's Linear attachment when there is one and carried EMPTY when there is not, and the
+    /// quorum task resolves it by head branch and drops the request there if GitHub has no open PR
+    /// either. Keeping it here would mean either a network call on the control task or, as before,
+    /// a quorum that is structurally dead wherever Linear holds no attachments.
     pub(crate) fn plan_quorum(
         &self,
         re: &crate::orchestrator::RunningEntry,
@@ -1898,5 +1925,29 @@ mod tests {
             "one attempt per REQUEST, never a retry of a failed one"
         );
         signal.cancel();
+    }
+
+    // A no-PR outcome never reached the tracker, so it is not evidence the tracker recovered:
+    // mid-Linear-outage one attachment-less handoff would otherwise clear the back-off the outage
+    // earned. It does not extend the back-off either (a ticket without a PR is a normal state), so
+    // it leaves the counter exactly where it found it. The loop reads `is_failure` first, which is
+    // why `TrackerFailure` answering both is not a contradiction.
+    #[test]
+    fn a_no_pr_outcome_neither_extends_nor_clears_the_back_off() {
+        assert!(!FanOutcome::NoPullRequest.is_failure());
+        assert!(!FanOutcome::NoPullRequest.clears_the_backoff());
+        for reached_the_tracker in [
+            FanOutcome::Fanned {
+                created: 1,
+                wanted: 2,
+            },
+            FanOutcome::NoReviewers,
+        ] {
+            assert!(
+                reached_the_tracker.clears_the_backoff(),
+                "{reached_the_tracker:?} says the tracker answered"
+            );
+        }
+        assert!(FanOutcome::TrackerFailure.is_failure());
     }
 }
