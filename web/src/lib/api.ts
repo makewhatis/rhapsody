@@ -962,8 +962,21 @@ export interface TeamsMemoryConfig {
   backend: string;
   path: string;
   endpoint: string;
+  /**
+   * The `hindsight` credential. A bare `$NAME` is resolved from the daemon's environment
+   * (`crates/config/src/resolve.rs`), which is the spelling the editor encourages — a literal is
+   * accepted but is a secret sitting in teams.yaml, so the UI masks it rather than rendering it.
+   */
+  api_key: string;
   bank_prefix: string;
   recall_top_k: number;
+}
+
+// TeamsQuorumConfig is the `quorum:` block (STUDIO-659): notified review. `enabled` defaults FALSE
+// because each handoff costs `reviewers` extra agent runs — the most expensive switch in teams.yaml.
+export interface TeamsQuorumConfig {
+  enabled: boolean;
+  reviewers: number;
 }
 
 // TeamsConfig mirrors `~/.rhapsody/teams.yaml` field for field (design §2.2). The daemon applies
@@ -973,6 +986,7 @@ export interface TeamsConfig {
   enabled: boolean;
   manager: TeamsManagerConfig;
   memory: TeamsMemoryConfig;
+  quorum: TeamsQuorumConfig;
   roster: TeamsIdentityConfig[];
   prompt_budget_bytes: number;
 }

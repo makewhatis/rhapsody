@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   draftErrors,
+  effectiveReviewers,
   emptyDraft,
+  emptyRow,
+  isStoredSecret,
+  MASKED_API_KEY,
+  quorumNote,
   roomAuthorLine,
   splitLabels,
   teamsChip,
@@ -84,29 +89,29 @@ describe("splitLabels", () => {
 });
 
 describe("draftErrors", () => {
-  const draft = (roster: TeamsDraft["roster"]): TeamsDraft => ({ ...emptyDraft(), roster });
+  const draft = (names: Array<{ name: string; labels?: string }>): TeamsDraft => ({
+    ...emptyDraft(),
+    roster: names.map((n) => ({ ...emptyRow(), name: n.name, labels: n.labels ?? "" })),
+  });
 
   it("accepts a label-safe roster", () => {
-    expect(draftErrors(draft([{ name: "alice", profile: "swe", labels: "rust" }]))).toEqual([]);
+    expect(draftErrors(draft([{ name: "alice", labels: "rust" }]))).toEqual([]);
   });
 
   // Mirrors the daemon's is_label_safe exactly: the name becomes a `rhapsody:@<name>` Linear label
   // and an `agent-<name>` bank id, so the charset is an external contract.
   it("rejects a name the daemon would reject", () => {
     for (const name of ["Alice", "1alice", "alice_b", "alice.b", "-alice"]) {
-      expect(draftErrors(draft([{ name, profile: "swe", labels: "" }])).length).toBeGreaterThan(0);
+      expect(draftErrors(draft([{ name }])).length).toBeGreaterThan(0);
     }
   });
 
   it("rejects a duplicate name and an unnamed row", () => {
     const dupes = draftErrors(
-      draft([
-        { name: "alice", profile: "swe", labels: "" },
-        { name: "alice", profile: "swe", labels: "" },
-      ]),
+      draft([{ name: "alice" }, { name: "alice" }]),
     );
     expect(dupes.some((e) => e.includes("duplicate"))).toBe(true);
-    expect(draftErrors(draft([{ name: "  ", profile: "swe", labels: "" }]))).toEqual([
+    expect(draftErrors(draft([{ name: "  " }]))).toEqual([
       "every teammate needs a name",
     ]);
   });
@@ -120,7 +125,8 @@ describe("toDraft / toConfig", () => {
   const onDisk: TeamsConfig = {
     enabled: true,
     manager: { mode: "labels+model", default_identity: "alice", model: "claude-opus-5", max_tokens: 4000, timeout_ms: 5000 },
-    memory: { backend: "local", path: "", endpoint: "", bank_prefix: "agent-", recall_top_k: 8 },
+    memory: { backend: "local", path: "", endpoint: "", api_key: "", bank_prefix: "agent-", recall_top_k: 8 },
+    quorum: { enabled: false, reviewers: 2 },
     roster: [{ name: "alice", profile: "swe", labels: ["rust", "config"], bank: "", max_concurrent: 0 }],
     prompt_budget_bytes: 16000,
   };
@@ -128,10 +134,13 @@ describe("toDraft / toConfig", () => {
   it("loads an existing file into the editor", () => {
     const d = toDraft(onDisk, true);
     expect(d).toEqual({
+      ...emptyDraft(),
       enabled: true,
       managerMode: "labels+model",
+      defaultIdentity: "alice",
+      managerModel: "claude-opus-5",
       backend: "local",
-      roster: [{ name: "alice", profile: "swe", labels: "rust, config" }],
+      roster: [{ name: "alice", profile: "swe", labels: "rust, config", bank: "", maxConcurrent: 0 }],
     });
   });
 
@@ -142,71 +151,212 @@ describe("toDraft / toConfig", () => {
     expect(toDraft(undefined, true)).toEqual(emptyDraft());
   });
 
-  // A minimal editor must not silently drop the keys it does not show — a hand-tuned
-  // `manager.model` has to survive a roster edit made in the app.
-  it("preserves config keys the editor does not expose", () => {
-    const saved = toConfig({ ...toDraft(onDisk, true), managerMode: "labels" }, onDisk);
-    expect(saved.manager?.model).toBe("claude-opus-5");
+  // THE property that made widening this editor safe: a key the editor does not model — including
+  // one a NEWER daemon serves that this build has never heard of — survives a round-trip untouched.
+  // Now that every declared field is modelled, the unknown key is what this test has to use.
+  it("preserves config keys the editor does not model", () => {
+    const withFuture = { ...onDisk, future_knob: { deep: [1, 2, 3] } } as unknown as TeamsConfig;
+    const saved = toConfig({ ...toDraft(withFuture, true), managerMode: "labels" }, withFuture);
+    expect((saved as Record<string, unknown>).future_knob).toEqual({ deep: [1, 2, 3] });
     expect(saved.manager?.mode).toBe("labels");
-    expect(saved.manager?.default_identity).toBe("alice");
-    expect(saved.memory?.bank_prefix).toBe("agent-");
-    expect(saved.prompt_budget_bytes).toBe(16000);
+    // …and everything the editor DOES model still round-trips byte-for-byte through a no-op edit.
+    expect(toConfig(toDraft(onDisk, true), onDisk)).toEqual(onDisk);
   });
 
-  // Carrying unexposed keys forward by ROW INDEX would slide alice's bank override onto bob the
-  // moment a row above him is deleted — one teammate silently pointed at another's memory.
-  it("carries a teammate's unexposed keys by name, not by row position", () => {
-    const twoUp: TeamsConfig = {
+  // Carrying unmodelled keys forward by ROW INDEX would slide one teammate's settings onto another
+  // the moment a row above them is deleted.
+  it("carries a teammate's unmodelled keys by name, not by row position", () => {
+    const twoUp = {
       ...onDisk,
       roster: [
-        { name: "alice", profile: "swe", labels: [], bank: "alice-bank", max_concurrent: 3 },
-        { name: "bob", profile: "reviewer", labels: [], bank: "", max_concurrent: 0 },
+        { name: "alice", profile: "swe", labels: [], bank: "alice-bank", max_concurrent: 3, future: "a" },
+        { name: "bob", profile: "reviewer", labels: [], bank: "", max_concurrent: 0, future: "b" },
       ],
-    };
-    const afterDeletingAlice = toConfig(
-      { ...toDraft(twoUp, true), roster: [{ name: "bob", profile: "reviewer", labels: "" }] },
-      twoUp,
-    );
+    } as unknown as TeamsConfig;
+    const draft = toDraft(twoUp, true);
+    const afterDeletingAlice = toConfig({ ...draft, roster: [draft.roster[1]] }, twoUp);
     expect(afterDeletingAlice.roster).toEqual([
-      { name: "bob", profile: "reviewer", labels: [], bank: "", max_concurrent: 0 },
+      { name: "bob", profile: "reviewer", labels: [], bank: "", max_concurrent: 0, future: "b" },
     ]);
   });
 
-  // The daemon refuses a file whose `manager.default_identity` names nobody, and this editor does
-  // not surface that field — so preserving it after its teammate is deleted would leave the
-  // operator unable to save and unable to see why.
-  it("clears a default_identity the roster edit just removed, and keeps a live one", () => {
-    const withDefault: TeamsConfig = {
+  it("round-trips a teammate's bank override and concurrency cap", () => {
+    const tuned: TeamsConfig = {
       ...onDisk,
-      manager: { ...onDisk.manager, default_identity: "alice" },
+      roster: [{ name: "alice", profile: "swe", labels: [], bank: "shared-bank", max_concurrent: 3 }],
     };
-    expect(toConfig(toDraft(withDefault, true), withDefault).manager?.default_identity).toBe("alice");
-    const gone = toConfig({ ...toDraft(withDefault, true), roster: [{ name: "bob", profile: "swe", labels: "" }] }, withDefault);
-    expect(gone.manager?.default_identity).toBe("");
+    const d = toDraft(tuned, true);
+    expect(d.roster[0]).toEqual({ name: "alice", profile: "swe", labels: "", bank: "shared-bank", maxConcurrent: 3 });
+    expect(toConfig(d, tuned).roster).toEqual(tuned.roster);
+  });
+
+  // The daemon refuses a file whose `manager.default_identity` names nobody. The dropdown cannot
+  // produce a dangling value, but renaming the chosen teammate afterwards can.
+  it("clears a default_identity the roster edit just removed, and keeps a live one", () => {
+    const d = toDraft(onDisk, true);
+    expect(toConfig(d, onDisk).manager?.default_identity).toBe("alice");
+    const renamed = toConfig({ ...d, roster: [{ ...d.roster[0], name: "bob" }] }, onDisk);
+    expect(renamed.manager?.default_identity).toBe("");
   });
 
   it("drops unnamed rows and parses the label field", () => {
     const saved = toConfig({
-      enabled: true,
-      managerMode: "labels",
+      ...emptyDraft(),
       backend: "none",
       roster: [
-        { name: "alice", profile: "", labels: "rust, web" },
-        { name: "  ", profile: "swe", labels: "x" },
+        { name: "alice", profile: "", labels: "rust, web", bank: "", maxConcurrent: 0 },
+        { name: "  ", profile: "swe", labels: "x", bank: "", maxConcurrent: 0 },
       ],
     });
-    expect(saved.roster).toEqual([{ name: "alice", profile: "swe", labels: ["rust", "web"] }]);
+    expect(saved.roster).toEqual([
+      { name: "alice", profile: "swe", labels: ["rust", "web"], bank: "", max_concurrent: 0 },
+    ]);
     expect(saved.memory?.backend).toBe("none");
+  });
+
+  it("edits the quorum, the manager advanced block and the memory block", () => {
+    const saved = toConfig(
+      {
+        ...toDraft(onDisk, true),
+        quorumEnabled: true,
+        quorumReviewers: 3,
+        managerModel: "claude-sonnet-5",
+        managerMaxTokens: 8000,
+        managerTimeoutMs: 9000,
+        backend: "hindsight",
+        memoryEndpoint: "https://hindsight.example.com",
+        apiKey: "$HINDSIGHT_API_KEY",
+        bankPrefix: "team-",
+        recallTopK: 12,
+        promptBudgetBytes: 20000,
+      },
+      onDisk,
+    );
+    expect(saved.quorum).toEqual({ enabled: true, reviewers: 3 });
+    expect(saved.manager).toEqual({
+      mode: "labels+model",
+      default_identity: "alice",
+      model: "claude-sonnet-5",
+      max_tokens: 8000,
+      timeout_ms: 9000,
+    });
+    expect(saved.memory).toEqual({
+      backend: "hindsight",
+      path: "",
+      endpoint: "https://hindsight.example.com",
+      api_key: "$HINDSIGHT_API_KEY",
+      bank_prefix: "team-",
+      recall_top_k: 12,
+    });
+    expect(saved.prompt_budget_bytes).toBe(20000);
+  });
+
+  // 0 is a value the schema gives MEANING to (unlimited / "use the default"), so a stored 0 must
+  // survive as 0 rather than being silently rewritten to the default the file never had.
+  it("keeps a stored zero rather than substituting a default", () => {
+    const zeroed: TeamsConfig = {
+      ...onDisk,
+      memory: { ...onDisk.memory, recall_top_k: 0 },
+      prompt_budget_bytes: 0,
+      roster: [{ ...onDisk.roster[0], max_concurrent: 0 }],
+    };
+    const d = toDraft(zeroed, true);
+    expect(d.recallTopK).toBe(0);
+    expect(d.promptBudgetBytes).toBe(0);
+    expect(toConfig(d, zeroed).memory?.recall_top_k).toBe(0);
+    expect(toConfig(d, zeroed).prompt_budget_bytes).toBe(0);
+  });
+
+  // A prefix is interpolated straight into a `<bank_prefix><name>` bank id, so a stray space is a
+  // typo that points a teammate at a bank nothing else resolves. Trimmed like every other string.
+  it("trims the bank prefix like every other string it sends", () => {
+    const d = { ...toDraft(onDisk, true), bankPrefix: "  team-  " };
+    expect(toConfig(d, onDisk).memory?.bank_prefix).toBe("team-");
+  });
+});
+
+describe("memory.api_key", () => {
+  const base: TeamsConfig = {
+    enabled: true,
+    manager: { mode: "labels", default_identity: "", model: "", max_tokens: 4000, timeout_ms: 5000 },
+    memory: { backend: "hindsight", path: "", endpoint: "https://h.example", api_key: "", bank_prefix: "agent-", recall_top_k: 8 },
+    quorum: { enabled: false, reviewers: 2 },
+    roster: [{ name: "alice", profile: "swe", labels: [], bank: "", max_concurrent: 0 }],
+    prompt_budget_bytes: 16000,
+  };
+
+  it("treats a literal as a secret and a $VAR or blank as not one", () => {
+    expect(isStoredSecret("sk-live-abc123")).toBe(true);
+    expect(isStoredSecret("$HINDSIGHT_API_KEY")).toBe(false);
+    expect(isStoredSecret("")).toBe(false);
+    expect(isStoredSecret(undefined)).toBe(false);
+    // `$` followed by something that is not a shell identifier is NOT the indirection the daemon
+    // resolves, so it is a literal — and therefore a secret.
+    expect(isStoredSecret("$9lives")).toBe(true);
+  });
+
+  // The stored literal never enters the draft at all. That makes "never rendered back in cleartext"
+  // a property of the MODEL, not a discipline each component has to remember.
+  it("never loads a stored literal into the draft, and carries it forward untouched", () => {
+    const stored: TeamsConfig = { ...base, memory: { ...base.memory, api_key: "sk-live-abc123" } };
+    const d = toDraft(stored, true);
+    expect(d.apiKey).toBe("");
+    expect(d.apiKeyStored).toBe(true);
+    expect(JSON.stringify(d)).not.toContain("sk-live-abc123");
+    // An unrelated edit must not wipe the key the operator never saw.
+    expect(toConfig({ ...d, quorumEnabled: true }, stored).memory?.api_key).toBe("sk-live-abc123");
+  });
+
+  it("loads a $VAR indirection verbatim — a pointer is not a secret", () => {
+    const env: TeamsConfig = { ...base, memory: { ...base.memory, api_key: "$HINDSIGHT_API_KEY" } };
+    const d = toDraft(env, true);
+    expect(d.apiKey).toBe("$HINDSIGHT_API_KEY");
+    expect(d.apiKeyStored).toBe(false);
+    expect(toConfig(d, env).memory?.api_key).toBe("$HINDSIGHT_API_KEY");
+  });
+
+  it("replaces or clears a stored literal once the operator asks to", () => {
+    const stored: TeamsConfig = { ...base, memory: { ...base.memory, api_key: "sk-live-abc123" } };
+    const replacing = { ...toDraft(stored, true), apiKeyStored: false, apiKey: "$HINDSIGHT_API_KEY" };
+    expect(toConfig(replacing, stored).memory?.api_key).toBe("$HINDSIGHT_API_KEY");
+    expect(toConfig({ ...replacing, apiKey: "  " }, stored).memory?.api_key).toBe("");
+  });
+});
+
+describe("quorum copy", () => {
+  const draft = (names: string[], reviewers: number): TeamsDraft => ({
+    ...emptyDraft(),
+    quorumEnabled: true,
+    quorumReviewers: reviewers,
+    roster: names.map((name) => ({ name, profile: "swe", labels: "", bank: "", maxConcurrent: 0 })),
+  });
+
+  // Mirrors `select_reviewers` (crates/orchestrator/src/quorum.rs): floor of 1, then clamped to the
+  // roster MINUS the author. The clamp degrades silently in the daemon, so the UI has to say it.
+  it("clamps to the roster minus the author", () => {
+    expect(effectiveReviewers(draft(["a", "b", "c", "d"], 2))).toBe(2);
+    expect(effectiveReviewers(draft(["a", "b"], 2))).toBe(1);
+    expect(effectiveReviewers(draft(["a"], 2))).toBe(0);
+    expect(effectiveReviewers(draft(["a", "b", "c"], 0))).toBe(1);
+  });
+
+  it("states the cost in runs, and names the degradation when the roster clamps it", () => {
+    expect(quorumNote(draft(["a", "b", "c"], 2))).toContain("fans out 2 review runs");
+    const clamped = quorumNote(draft(["a", "b"], 2));
+    expect(clamped).toContain("fans out 1 review run");
+    expect(clamped).toContain("2 teammates means 1");
+  });
+
+  it("says plainly that a one-person roster fans out nothing", () => {
+    expect(quorumNote(draft(["a"], 2))).toContain("Nothing would fan out");
   });
 });
 
 describe("teamsYamlSnippet", () => {
   it("renders the file the save would write", () => {
     const yaml = teamsYamlSnippet({
-      enabled: true,
-      managerMode: "labels",
-      backend: "local",
-      roster: [{ name: "alice", profile: "swe", labels: "rust, config" }],
+      ...emptyDraft(),
+      roster: [{ name: "alice", profile: "swe", labels: "rust, config", bank: "", maxConcurrent: 0 }],
     });
     expect(yaml).toContain("enabled: true");
     expect(yaml).toContain("  mode: labels");
@@ -217,5 +367,54 @@ describe("teamsYamlSnippet", () => {
 
   it("renders an empty roster as a list, not as a dangling key", () => {
     expect(teamsYamlSnippet({ ...emptyDraft(), roster: [] })).toContain("roster:\n  []");
+  });
+
+  // Schema defaults are omitted: the daemon re-applies every one on read, and a preview listing all
+  // eighteen keys would bury the two the operator just changed.
+  it("omits schema defaults and shows only what was changed", () => {
+    const yaml = teamsYamlSnippet(emptyDraft());
+    expect(yaml).not.toContain("max_tokens");
+    expect(yaml).not.toContain("recall_top_k");
+    expect(yaml).not.toContain("prompt_budget_bytes");
+    expect(yaml).not.toContain("quorum:");
+  });
+
+  it("shows the quorum, the hindsight endpoint and the per-row overrides once they are set", () => {
+    const yaml = teamsYamlSnippet({
+      ...emptyDraft(),
+      quorumEnabled: true,
+      quorumReviewers: 3,
+      backend: "hindsight",
+      memoryEndpoint: "https://h.example",
+      apiKey: "$HINDSIGHT_API_KEY",
+      promptBudgetBytes: 20000,
+      roster: [{ name: "alice", profile: "swe", labels: "", bank: "shared", maxConcurrent: 2 }],
+    });
+    expect(yaml).toContain("quorum:\n  enabled: true\n  reviewers: 3");
+    expect(yaml).toContain("  endpoint: https://h.example");
+    expect(yaml).toContain("  api_key: $HINDSIGHT_API_KEY");
+    expect(yaml).toContain("prompt_budget_bytes: 20000");
+    expect(yaml).toContain("    bank: shared");
+    expect(yaml).toContain("    max_concurrent: 2");
+  });
+
+  // The card is titled "What Save will configure", so it previews the FILE, not the daemon's
+  // effective reading of it. A hand-written `reviewers: 0` is written back as 0 (the daemon floors
+  // it on read); previewing 1 would have shown bytes the save does not send.
+  it("previews the reviewer count that will be written, not the floored one", () => {
+    const yaml = teamsYamlSnippet({ ...emptyDraft(), quorumEnabled: true, quorumReviewers: 0 });
+    expect(yaml).toContain("  reviewers: 0");
+  });
+
+  // The preview is a rendered surface like any other, so it obeys the same rule the form does.
+  it("masks a stored literal api_key rather than previewing it", () => {
+    const yaml = teamsYamlSnippet({
+      ...emptyDraft(),
+      backend: "hindsight",
+      apiKey: "",
+      apiKeyStored: true,
+      roster: [{ name: "alice", profile: "swe", labels: "", bank: "", maxConcurrent: 0 }],
+    });
+    expect(yaml).toContain(`  api_key: ${MASKED_API_KEY}`);
   });
 });
