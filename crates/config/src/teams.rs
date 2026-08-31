@@ -84,6 +84,7 @@ const DEFAULT_TIMEOUT_MS: i64 = 60000;
 /// whoever reads the room's failure reasons. The operator's explicit value
 /// still wins — this number buys a diagnosis, not a policy.
 pub const MIN_MODEL_TIMEOUT_MS: i64 = 15000;
+
 /// `memory.bank_prefix` — a bank id is `<bank_prefix><name>`.
 const DEFAULT_BANK_PREFIX: &str = "agent-";
 /// `memory.recall_top_k` — how many facts a recall returns.
@@ -643,9 +644,9 @@ mod tests {
     /// STUDIO-673: the shipped `manager.timeout_ms` must be a budget a REAL
     /// triage turn can finish inside. Measured on 2026-08-31 against
     /// v0.3.4-rc.8, the 5000ms this shipped with lost every race in a day of
-    /// live triage, so `labels+model` was silently pure `labels`. Pinned
-    /// against the floor rather than against a literal: the default is only
-    /// meaningful relative to the value the daemon calls starved.
+    /// live triage, so `labels+model` was silently pure `labels`. Pinned twice:
+    /// the literal the schema ships, and — in a const block, so the compiler
+    /// holds it — its relationship to the floor the daemon warns below.
     #[test]
     fn the_shipped_manager_timeout_clears_the_model_floor() {
         assert_eq!(DEFAULT_TIMEOUT_MS, 60000);

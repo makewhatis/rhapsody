@@ -109,6 +109,8 @@ const DEFAULT_MANAGER_MODE = "labels";
 const DEFAULT_BACKEND = "local";
 export const DEFAULT_MAX_TOKENS = 4000;
 export const DEFAULT_TIMEOUT_MS = 60000;
+/** `MIN_MODEL_TIMEOUT_MS` — below this the daemon warns at boot that the manager is starved. */
+export const MIN_MODEL_TIMEOUT_MS = 15000;
 export const DEFAULT_BANK_PREFIX = "agent-";
 export const DEFAULT_RECALL_TOP_K = 8;
 export const DEFAULT_PROMPT_BUDGET_BYTES = 16000;

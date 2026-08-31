@@ -9,6 +9,7 @@ import {
   MANAGER_MODES,
   MASKED_API_KEY,
   MEMORY_BACKENDS,
+  MIN_MODEL_TIMEOUT_MS,
   MIN_QUORUM_REVIEWERS,
   quorumNote,
   teamsYamlSnippet,
@@ -278,7 +279,7 @@ function TeamsEditor({
           <Field
             label="Triage timeout"
             inline
-            hint="Exceeded ⇒ the deterministic answer stands. Triage never blocks dispatch. A turn spawns a subprocess and waits on a model, so below 15000ms the daemon warns the manager is starved."
+            hint={`Exceeded ⇒ the deterministic answer stands. Triage never blocks dispatch. A turn spawns a subprocess and waits on a model, so below ${MIN_MODEL_TIMEOUT_MS}ms the daemon warns the manager is starved.`}
           >
             <Stepper
               value={draft.managerTimeoutMs}

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_TIMEOUT_MS,
+  MIN_MODEL_TIMEOUT_MS,
   draftErrors,
   effectiveReviewers,
   emptyDraft,
@@ -97,9 +98,10 @@ describe("schema defaults", () => {
   it("seeds a triage timeout a real model turn can finish inside", () => {
     expect(DEFAULT_TIMEOUT_MS).toBe(60000);
     expect(emptyDraft().managerTimeoutMs).toBe(DEFAULT_TIMEOUT_MS);
-    // And it is above the 15000ms floor the daemon warns below, so the editor never seeds a value
-    // that makes the daemon complain at the next boot.
-    expect(DEFAULT_TIMEOUT_MS).toBeGreaterThanOrEqual(15000);
+    // And it is above the floor the daemon warns below, so the editor never seeds a value that
+    // makes the daemon complain at the next boot.
+    expect(MIN_MODEL_TIMEOUT_MS).toBe(15000);
+    expect(DEFAULT_TIMEOUT_MS).toBeGreaterThanOrEqual(MIN_MODEL_TIMEOUT_MS);
   });
 });
 
