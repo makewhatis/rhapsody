@@ -841,8 +841,8 @@ export async function fetchCapabilitiesRegistry(): Promise<CapabilityDefDTO[]> {
 // --- Rhapsody Teams (STUDIO-652; Rhapsody-only, no Go v0.4.0 mirror) ---
 //
 // Every route below is additive and answers `teams_disabled` (409) on a daemon with Teams off, so
-// nothing here may be fetched speculatively. The gate is `DaemonVersion.teams_enabled`, read once
-// at shell mount from the request the app already makes — see `useTeamsEnabled`.
+// nothing here may be fetched speculatively. The gate is `DaemonVersion.teams_enabled`, read from
+// the version request the app already makes — once it answers, and no more — see `useTeamsEnabled`.
 
 // TeamsRosterRow is one identity as the daemon reports it: the configured record plus the status
 // derived from the runs live as that identity RIGHT NOW.

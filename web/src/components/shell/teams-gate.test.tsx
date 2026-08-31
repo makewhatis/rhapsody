@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DaemonVersion, StateResponse, TeamsOverview } from "@/lib/api";
 
@@ -76,6 +76,7 @@ vi.mock("@/lib/api", async (orig) => {
 });
 
 import { AppShell } from "@/components/shell/AppShell";
+import { VERSION_RETRY_MS } from "@/hooks/useTeams";
 
 const version = (teams: boolean | undefined): DaemonVersion => ({
   version: "v0.3.4",
@@ -137,13 +138,68 @@ describe("Teams off", () => {
     expect(h.fetchTeamsOverview).not.toHaveBeenCalled();
   });
 
-  // An unreachable daemon must not white-screen the shell or start guessing.
-  it("treats an unreachable version endpoint as off", async () => {
+  // An unreachable daemon must not white-screen the shell or start guessing. Since STUDIO-665 the
+  // gate keeps asking the *version* route while it has never had an answer, so "off" here means off
+  // *transiently* — and while that lasts it must stay off and touch no Teams route at all.
+  it("treats an unreachable version endpoint as off while it keeps retrying", async () => {
     h.fetchVersion.mockRejectedValue(new Error("connection refused"));
-    renderShell();
-    await waitFor(() => expect(h.fetchVersion).toHaveBeenCalled());
-    expect(screen.queryByText(/^Teams: /)).toBeNull();
-    expect(h.fetchTeamsOverview).not.toHaveBeenCalled();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderShell();
+      await waitFor(() => expect(h.fetchVersion).toHaveBeenCalled());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3 * VERSION_RETRY_MS + 100);
+      });
+      // Still asking — that is the whole point of the fix.
+      expect(h.fetchVersion.mock.calls.length).toBeGreaterThan(1);
+      // ...and still off, with no Teams route touched during the retry window.
+      expect(screen.queryByText(/^Teams: /)).toBeNull();
+      expect(h.fetchTeamsOverview).not.toHaveBeenCalled();
+      expect(h.fetchTeamsRoom).not.toHaveBeenCalled();
+      expect(h.fetchTeamsRecall).not.toHaveBeenCalled();
+      expect(h.fetchTeamsConfig).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Retrying is scoped to "has never answered". A real `teams_enabled: false` is an answer, so the
+  // Teams-off app still makes exactly ONE version request for the whole session — the pin the
+  // STUDIO-652 comment used to make about the mount-time fetch, now made about settling.
+  it("stops asking once a definitive Teams-off answer has arrived", async () => {
+    h.fetchVersion.mockResolvedValue(version(false));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderShell();
+      await waitFor(() => expect(h.fetchVersion).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * VERSION_RETRY_MS);
+      });
+      expect(h.fetchVersion).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText(/^Teams: /)).toBeNull();
+      expect(h.fetchTeamsOverview).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A daemon too old to carry the field still ANSWERED, so the retries stop there too: an old
+  // daemon is not polled forever just because it cannot say the word.
+  it("stops asking a daemon too old to report the field", async () => {
+    h.fetchVersion.mockResolvedValue(version(undefined));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderShell();
+      await waitFor(() => expect(h.fetchVersion).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * VERSION_RETRY_MS);
+      });
+      expect(h.fetchVersion).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText(/^Teams: /)).toBeNull();
+      expect(h.fetchTeamsOverview).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -160,5 +216,45 @@ describe("Teams on", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Teams: 2 teammates, 2 live" }));
     expect(await screen.findByRole("tabpanel", { name: "Teams" })).toBeTruthy();
     expect(await screen.findByRole("button", { name: "Show alice's memory" })).toBeTruthy();
+  });
+});
+
+// The STUDIO-665 repro: in the packaged app the supervisor starts the webview and the daemon
+// together, so the shell can mount and fire its version request seconds before the daemon has bound
+// its port. Before this ticket that single failure latched the gate off for the whole session.
+describe("Teams gate recovery from the daemon boot race", () => {
+  it("shows the chip once the daemon comes up, with no reload", async () => {
+    h.fetchVersion
+      .mockRejectedValueOnce(new Error("connection refused"))
+      .mockRejectedValueOnce(new Error("connection refused"))
+      .mockResolvedValue(version(true));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderShell();
+
+      // Mount-time fetch fails: the gate reads as off and asks for nothing Teams-shaped.
+      await waitFor(() => expect(h.fetchVersion).toHaveBeenCalled());
+      expect(screen.queryByText(/^Teams: /)).toBeNull();
+      expect(h.fetchTeamsOverview).not.toHaveBeenCalled();
+
+      // Two refusals in, the daemon binds its port and the third attempt lands. The chip appears
+      // on its own — nobody reloaded the app.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2 * VERSION_RETRY_MS + 100);
+      });
+      expect(await screen.findByRole("button", { name: "Teams: 2 teammates, 2 live" })).toBeTruthy();
+      // It really did have to ask again to get there: the mock only resolves on the third call, so
+      // the mount-time request alone could never have produced that chip.
+      expect(h.fetchVersion.mock.calls.length).toBeGreaterThanOrEqual(3);
+
+      // And having succeeded, the version route goes quiet for the rest of the session.
+      const settled = h.fetchVersion.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * VERSION_RETRY_MS);
+      });
+      expect(h.fetchVersion).toHaveBeenCalledTimes(settled);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
