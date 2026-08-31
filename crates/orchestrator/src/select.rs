@@ -73,6 +73,8 @@ impl Orchestrator {
 
         let mut active = Vec::new();
         let mut reopen = Vec::new();
+        // Set by the Teams assignment gate below; drained into ONE kick after the pass (§A.3.2).
+        let mut held_for_triage = false;
         for iss in issues {
             if global_remaining <= 0 {
                 break;
@@ -129,6 +131,21 @@ impl Orchestrator {
                 );
                 continue;
             }
+            // The Teams work-assignment gate (STUDIO-669; design record
+            // `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.1). A Teams-eligible candidate that
+            // nothing has assigned yet waits for the manager instead of dispatching identity-less:
+            // "if you have teams enabled, you want the work to go to the team". It is a SKIP, the
+            // same shape as every other skip above — no slot is reserved, no counter moves, nothing
+            // blocks, and the loop's cadence is untouched. Debug-level because a held ticket is a
+            // normal one-or-two-tick state on a healthy daemon, not a fault.
+            if self.teams_awaiting_assignment(&iss) {
+                tracing::debug!(
+                    issue_identifier = %iss.identifier,
+                    "skipping dispatch: awaiting team assignment"
+                );
+                held_for_triage = true;
+                continue;
+            }
             if count(&state_counts, &st)
                 >= state_limit(&iss.state, &eff.per_state_limits, eff.max_concurrent)
             {
@@ -140,6 +157,7 @@ impl Orchestrator {
             global_remaining -= 1;
             active.push(iss);
         }
+        self.kick_triage(held_for_triage);
         (active, reopen)
     }
 
@@ -184,6 +202,7 @@ impl Orchestrator {
 
         let mut picked = Vec::new();
         let mut reopen = Vec::new();
+        let mut held_for_triage = false;
         for ti in tagged {
             if global_remaining <= 0 {
                 break;
@@ -243,6 +262,21 @@ impl Orchestrator {
                 );
                 continue;
             }
+            // The Teams work-assignment gate (STUDIO-669; design record
+            // `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.1). A Teams-eligible candidate that
+            // nothing has assigned yet waits for the manager instead of dispatching identity-less:
+            // "if you have teams enabled, you want the work to go to the team". It is a SKIP, the
+            // same shape as every other skip above — no slot is reserved, no counter moves, nothing
+            // blocks, and the loop's cadence is untouched. Debug-level because a held ticket is a
+            // normal one-or-two-tick state on a healthy daemon, not a fault.
+            if self.teams_awaiting_assignment(&ti.iss) {
+                tracing::debug!(
+                    issue_identifier = %ti.iss.identifier,
+                    "skipping dispatch: awaiting team assignment"
+                );
+                held_for_triage = true;
+                continue;
+            }
             if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
                 continue;
             }
@@ -261,7 +295,29 @@ impl Orchestrator {
             *state_counts.entry(st).or_insert(0) += 1;
             picked.push(ti);
         }
+        self.kick_triage(held_for_triage);
         (picked, reopen)
+    }
+
+    /// The arrival kick (STUDIO-669; design record §A.3.2): when this pass held one or more
+    /// candidates for want of an assignment, ask the triage task to run a cycle **now** rather than
+    /// wait out [`TRIAGE_INTERVAL`](crate::triage::TRIAGE_INTERVAL).
+    ///
+    /// Three properties, all deliberate:
+    ///
+    /// * **Once per pass, not once per ticket.** Ten held tickets want one cycle; a cycle already
+    ///   sweeps up to `MAX_PER_CYCLE` of them.
+    /// * **No per-ticket work is spawned.** This is a `Notify` permit, so the control task pays a
+    ///   single atomic store and returns — the whole point of triage being off-loop stands.
+    /// * **Steady state is untouched.** Nothing held ⇒ nothing sent ⇒ the triage task keeps its
+    ///   own cadence exactly as before.
+    fn kick_triage(&self, held: bool) {
+        if !held {
+            return;
+        }
+        if let Some(handle) = self.teams_triage.as_ref() {
+            handle.kick();
+        }
     }
 
     /// Returns whether the project group has a free slot this pass, lazily computing its remaining
@@ -855,5 +911,249 @@ mod tests {
             0,
             "issA under project B (mismatched label) rejected"
         );
+    }
+
+    // ── the Teams work-assignment gate (STUDIO-669; §A of ~/.rhapsody/docs/STUDIO-668-multi-team.md)
+
+    /// An enabled `labels+model` Teams with one topic-labelled teammate, plus the triage seam.
+    /// Returns the handle so a test can observe the kick and drive the pending map.
+    fn orch_with_teams_gate(roster_labels: &[&str]) -> (Orchestrator, Arc<crate::TriageHandle>) {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "alice".to_string(),
+                profile: "swe".to_string(),
+                labels: roster_labels.iter().map(|s| (*s).to_string()).collect(),
+                bank: String::new(),
+                max_concurrent: 0,
+            }],
+            ..rhapsody_config::teams::Teams::disabled()
+        });
+        let handle = Arc::new(crate::TriageHandle::new());
+        o.teams_triage = Some(Arc::clone(&handle));
+        (o, handle)
+    }
+
+    /// A Todo candidate carrying exactly `labels`, in a real Linear team.
+    fn teams_issue(id: &str, ident: &str, labels: &[&str]) -> Issue {
+        Issue {
+            team_id: "team-1".to_string(),
+            labels: Some(labels.iter().map(|s| (*s).to_string()).collect()),
+            ..issue(id, ident, "Todo")
+        }
+    }
+
+    /// **The measured bug, as a test** (§A.1): a fresh unlabelled ticket, Teams on, a free seat and
+    /// an idle roster. Before STUDIO-669 this dispatched within one 2s tick wearing no identity —
+    /// "file it unlabelled and let the manager decide", the flagship flow, structurally losing a
+    /// race with its own manager. It is now held for the tick and the triage task is kicked.
+    #[test]
+    fn an_unassigned_teams_candidate_is_held_and_kicks_triage() {
+        let (o, handle) = orch_with_teams_gate(&["rust"]);
+        let picked = o.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])]);
+
+        assert!(
+            picked.is_empty(),
+            "an unassigned ticket must wait for the team, not dispatch anonymously"
+        );
+        // The kick is a Notify permit: a `notified()` that resolves at once proves it was sent.
+        assert!(
+            futures_lite_ready(handle.kicked()),
+            "the gate must wake triage now rather than wait out TRIAGE_INTERVAL"
+        );
+    }
+
+    /// Every way OUT of the hold, in one table — each one dispatches this tick, unheld.
+    #[test]
+    fn assigned_solo_and_matched_candidates_are_never_held() {
+        for (name, labels) in [
+            (
+                "an identity label is the assignment",
+                &["rhapsody:@alice"][..],
+            ),
+            ("a roster topic label matches", &["rust"][..]),
+            ("rhapsody:solo is the opt-out", &["rhapsody:solo"][..]),
+        ] {
+            let (o, handle) = orch_with_teams_gate(&["rust"]);
+            let picked = o.select_dispatch(vec![teams_issue("1", "MT-1", labels)]);
+            assert_eq!(picked.len(), 1, "{name}");
+            assert!(
+                !futures_lite_ready(handle.kicked()),
+                "{name}: nothing to kick for"
+            );
+        }
+    }
+
+    /// `default_identity` is the never-refuse floor, so it is also a catch that empties the gate:
+    /// with one set, no ticket is ever unassigned and none is ever held.
+    #[test]
+    fn a_default_identity_empties_the_gate() {
+        let (mut o, _) = orch_with_teams_gate(&["rust"]);
+        if let Some(t) = o.teams.as_mut() {
+            t.manager.default_identity = "alice".to_string();
+        }
+        assert_eq!(
+            o.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])])
+                .len(),
+            1,
+            "the default catches it, so nothing is pending"
+        );
+    }
+
+    /// §A.3.4's liveness valve seen from the dispatch side: triage decided, the label write failed,
+    /// and the run goes out NOW wearing the pending identity rather than stalling.
+    #[test]
+    fn a_pending_assignment_releases_the_hold() {
+        let (o, handle) = orch_with_teams_gate(&["rust"]);
+        let iss = teams_issue("1", "MT-1", &["docs"]);
+        assert!(
+            o.select_dispatch(vec![iss.clone()]).is_empty(),
+            "held first"
+        );
+
+        handle.record_pending("1", "alice");
+        assert_eq!(
+            o.select_dispatch(vec![iss]).len(),
+            1,
+            "an identity-worn run beats a stalled ticket (§A.3.4)"
+        );
+    }
+
+    /// The hold is never for a manager that does not exist: no triage seam, no gate. This is the
+    /// Teams-off path AND the `mode: off` / hermetic-daemon path, and it is why Teams-off dispatch
+    /// is byte-identical.
+    #[test]
+    fn no_triage_seam_means_no_hold() {
+        let (mut o, _) = orch_with_teams_gate(&["rust"]);
+        o.teams_triage = None;
+        assert_eq!(
+            o.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])])
+                .len(),
+            1
+        );
+
+        let mut off = orch_for_select(10, HashMap::new(), None);
+        off.teams = None;
+        assert_eq!(
+            off.select_dispatch(vec![teams_issue("1", "MT-1", &["docs"])])
+                .len(),
+            1,
+            "Teams off dispatches exactly as it always did"
+        );
+    }
+
+    /// A ticket whose `rhapsody:@` label names nobody on the roster — the `someone-who-left` case
+    /// §0.11.1 names — routes to no identity, but triage will never touch it either, because ANY
+    /// identity label makes the field occupied. Holding it would be a hold nothing could release,
+    /// and every tick's kick would be a cycle that could not act. It dispatches, exactly as it did
+    /// before the gate existed.
+    #[test]
+    fn a_label_naming_nobody_on_the_roster_is_not_held() {
+        let (o, handle) = orch_with_teams_gate(&["rust"]);
+        let picked = o.select_dispatch(vec![teams_issue("1", "MT-1", &["rhapsody:@who-left"])]);
+        assert_eq!(
+            picked.len(),
+            1,
+            "a hold nothing could release is never taken"
+        );
+        assert_eq!(picked[0].id, "1");
+        assert!(
+            !futures_lite_ready(handle.kicked()),
+            "and triage is not woken for it"
+        );
+    }
+
+    /// A ticket with no team id can never be labelled, so holding it would be a hold nothing could
+    /// release. Triage drops these candidates for the same reason.
+    #[test]
+    fn a_ticket_with_no_team_id_is_never_held() {
+        let (o, _) = orch_with_teams_gate(&["rust"]);
+        let iss = Issue {
+            labels: Some(vec!["docs".to_string()]),
+            ..issue("1", "MT-1", "Todo")
+        };
+        assert_eq!(o.select_dispatch(vec![iss]).len(), 1);
+    }
+
+    /// Held tickets do not consume slots: the gate is a SKIP, not a reservation, so a ticket behind
+    /// a held one still dispatches on the same tick. Loop cadence and the slot budget are untouched.
+    #[test]
+    fn a_held_ticket_reserves_no_slot() {
+        let (o, handle) = orch_with_teams_gate(&["rust"]);
+        let picked = o.select_dispatch(vec![
+            teams_issue("1", "MT-1", &["docs"]),
+            teams_issue("2", "MT-2", &["rust"]),
+        ]);
+        assert_eq!(
+            picked.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["2"],
+            "the matched ticket goes out on the same tick the unmatched one is held"
+        );
+        assert!(futures_lite_ready(handle.kicked()));
+    }
+
+    /// One kick per PASS, never one per ticket: ten held tickets want one triage cycle.
+    #[test]
+    fn many_held_tickets_send_one_kick() {
+        let (o, handle) = orch_with_teams_gate(&["rust"]);
+        let held: Vec<Issue> = (1..=5)
+            .map(|n| teams_issue(&n.to_string(), &format!("MT-{n}"), &["docs"]))
+            .collect();
+        assert!(o.select_dispatch(held).is_empty());
+
+        assert!(futures_lite_ready(handle.kicked()), "one permit");
+        assert!(
+            !futures_lite_ready(handle.kicked()),
+            "and only one: `Notify` coalesces, so five held tickets are not five cycles"
+        );
+    }
+
+    /// The multi-project pass gates identically — the invariant is about the ticket, not about how
+    /// many projects the daemon polls.
+    #[test]
+    fn the_multi_project_pass_gates_the_same_way() {
+        let projects = vec![proj("p1", 10, HashMap::new())];
+        let mut o = orch_for_multi(10, projects, None);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "alice".to_string(),
+                profile: "swe".to_string(),
+                labels: vec!["rust".to_string()],
+                bank: String::new(),
+                max_concurrent: 0,
+            }],
+            ..rhapsody_config::teams::Teams::disabled()
+        });
+        let handle = Arc::new(crate::TriageHandle::new());
+        o.teams_triage = Some(Arc::clone(&handle));
+
+        let picked = o.select_dispatch_multi(vec![
+            TaggedIssue {
+                iss: teams_issue("1", "MT-1", &["docs"]),
+                proj: Some(0),
+            },
+            TaggedIssue {
+                iss: teams_issue("2", "MT-2", &["rhapsody:solo"]),
+                proj: Some(0),
+            },
+        ]);
+        assert_eq!(
+            picked.iter().map(|t| t.iss.id.as_str()).collect::<Vec<_>>(),
+            vec!["2"],
+            "unassigned held, solo through"
+        );
+        assert!(futures_lite_ready(handle.kicked()));
+    }
+
+    /// Polls a future once and reports whether it was already ready. Enough for `Notify`, whose
+    /// `notified()` resolves immediately exactly when a permit is waiting — and it keeps these
+    /// tests synchronous, like every other test in this module.
+    fn futures_lite_ready(fut: impl std::future::Future<Output = ()>) -> bool {
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = Box::pin(fut);
+        matches!(fut.as_mut().poll(&mut cx), Poll::Ready(()))
     }
 }
