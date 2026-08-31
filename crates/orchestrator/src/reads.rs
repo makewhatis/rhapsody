@@ -20,6 +20,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use rhapsody_core::{Project, Viewer};
 use rhapsody_tracker::{Tracker, TrackerError};
 
+use crate::dispatch::DispatchStates;
 use crate::orchestrator::Orchestrator;
 use crate::stop::ControlHandle;
 
@@ -56,6 +57,10 @@ pub struct ReadsTarget {
     /// wedge STUDIO-671 reported. Anything that must see the daemon's WORK — as opposed to the
     /// account — reads these instead, the same clients the poll loop fans out over.
     pub project_trackers: Vec<Arc<dyn Tracker>>,
+    /// The reload's dispatchable-state sets (STUDIO-672), for the off-loop readers that must ask
+    /// "would the selection gate hold this ticket?" without holding the `Effective` that answers
+    /// it. Published beside `project_trackers`, from the same reload, for the same reason.
+    pub states: DispatchStates,
 }
 
 /// The resolved "connected as" account for the Settings identity endpoint (INF-224). `masked_token`
@@ -93,6 +98,20 @@ impl Orchestrator {
     pub fn set_reads_projects(&self, trackers: Vec<Arc<dyn Tracker>>) {
         let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
         w.project_trackers = trackers;
+    }
+
+    /// Records this reload's dispatchable-state sets for the off-loop Teams triage task
+    /// (STUDIO-672). Called from the reload path beside [`Orchestrator::set_reads_projects`], so a
+    /// hot-reloaded `active_states`/`terminal_states` reaches triage without a restart.
+    ///
+    /// Triage needs these because "who should take this ticket?" is only ever asked of work
+    /// somebody is about to do. The selection gate holds exactly the DISPATCHABLE candidates, and
+    /// triage exists to release that hold — so the two must filter by the identical predicate
+    /// ([`dispatchable_state`](crate::dispatch::dispatchable_state)), which means triage needs the
+    /// identical sets rather than a restatement of them.
+    pub fn set_reads_states(&self, states: DispatchStates) {
+        let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
+        w.states = states;
     }
 
     /// Lists the workspace's Linear projects for the add-agent picker (INF-224), reusing the
@@ -155,6 +174,17 @@ impl ControlHandle {
         let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
         r.tracker.as_ref()?;
         Some(r.project_trackers.clone())
+    }
+
+    /// The most recent reload's dispatchable-state sets (STUDIO-672), for the off-loop Teams triage
+    /// task. Default (empty) before the first config load — the same pre-load state
+    /// [`Self::reads_project_trackers`] reports as `None`, and the two are published by the same
+    /// reload, so a caller that reads both sees them together or sees neither.
+    ///
+    /// Cloning the sets out releases the lock immediately — it is never held across an `await`.
+    pub fn reads_dispatch_states(&self) -> DispatchStates {
+        let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
+        r.states.clone()
     }
 }
 

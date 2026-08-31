@@ -85,6 +85,7 @@ pub use agentupdate::AgentUpdate;
 pub use backoff::{CONTINUATION_DELAY_MS, failure_backoff_ms};
 pub use concurrency::{global_slots, state_limit};
 pub use control_loop::{CancelSignal, CancelWait, Event, WaitGroup};
+pub use dispatch::DispatchStates;
 pub use dispatch::{eligible, sort_for_dispatch};
 pub use effective::{Effective, ResolvedProject, build_effective, build_effective_with_runner};
 pub use handoff::HandoffResult;

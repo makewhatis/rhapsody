@@ -363,10 +363,18 @@ where
             // `project.slugId == ""` — a query Linear answers with zero rows and no error. The task
             // ran every cycle and found nothing to do, silently, while the selection gate held the
             // very tickets it was meant to release.
+            //
+            // The state sets ride along from the SAME reload (STUDIO-672): triage considers
+            // exactly the tickets the selection gate would hold, which means filtering by the
+            // gate's own dispatchable-state predicate rather than by labels alone. Without them
+            // triage assigned identities to In-Review tickets — parked design records and work
+            // already under human review — that the gate could never have held.
             target: move || {
-                triage_handle
-                    .reads_project_trackers()
-                    .map(|trackers| rhapsody_orchestrator::TriageTarget { trackers })
+                let trackers = triage_handle.reads_project_trackers()?;
+                Some(rhapsody_orchestrator::TriageTarget {
+                    trackers,
+                    states: triage_handle.reads_dispatch_states(),
+                })
             },
             arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
             agent_command: command,

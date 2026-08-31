@@ -109,11 +109,20 @@ impl Orchestrator {
             .filter(|p| !p.disabled)
             .map(|p| Arc::clone(&p.tracker))
             .collect();
+        // Snapshot the state sets the selection gate filters by, BEFORE `eff` moves into `self`.
+        let states = crate::dispatch::DispatchStates {
+            active: eff.active_states.clone(),
+            terminal: eff.terminal_states.clone(),
+        };
         let inputs = project_warn_inputs(&eff);
         let checker = self.prompt_file_checker_for(&eff);
         self.eff = Some(eff);
         self.set_reads_target(Arc::clone(&tracker), cfg.tracker.api_key.clone());
         self.set_reads_projects(project_trackers);
+        // The same reload's dispatchable-state sets, for the off-loop triage task (STUDIO-672).
+        // Published here rather than re-derived there so triage and the selection gate can never
+        // disagree about which tickets are work.
+        self.set_reads_states(states);
         // Resolve configured project slugs against Linear + flag any missing repo-relative prompt_file,
         // best-effort and OFF the control task (a no-op on the direct-reload test path where `o.ctx` is
         // nil). INF-277 / INF-279.

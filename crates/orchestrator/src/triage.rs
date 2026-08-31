@@ -73,6 +73,7 @@ use rhapsody_tracker::Tracker;
 
 use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
+use crate::dispatch::DispatchStates;
 use crate::preflight::{process_env, scrub_child_env};
 use crate::teams::IDENTITY_LABEL_PREFIX;
 
@@ -306,6 +307,14 @@ pub struct TriageTarget {
     /// There is nothing to sweep, exactly as there is nothing to poll — and the idle heartbeat says
     /// so rather than saying nothing.
     pub trackers: Vec<Arc<dyn Tracker>>,
+    /// The SAME dispatchable-state sets the selection gate filters by, from the same reload
+    /// (STUDIO-672). Triage considers exactly the tickets that gate would hold, so it must ask the
+    /// gate's own question rather than a restatement of it.
+    ///
+    /// Empty is meaningful: before the first config load nothing is dispatchable, so nothing is a
+    /// candidate. After one, an empty `active` set would mean the daemon dispatches nothing at all
+    /// — the cycle says so out loud rather than reporting a silent [`CycleOutcome::Idle`].
+    pub states: DispatchStates,
 }
 
 /// Everything [`run_triage_schedule`] runs against. The absence of an `Orchestrator`, a control
@@ -685,7 +694,17 @@ where
             outcome
         }
     };
-    let candidates = unlabelled_candidates(&issues);
+    // A daemon that has loaded a config and still admits no state dispatches nothing, so triage can
+    // assign nothing — and must say so, because a filter that quietly matches everything it is
+    // shown is indistinguishable from a quiet workspace (STUDIO-671's lesson, applied to
+    // STUDIO-672's new filter).
+    if target.states.is_empty() && fetched > 0 {
+        tracing::warn!(
+            issues = fetched,
+            "teams triage has no dispatchable states to filter by; assigning nothing this cycle"
+        );
+    }
+    let candidates = unlabelled_candidates(&issues, &target.states);
     if candidates.is_empty() {
         return report(failed_outcome(CycleOutcome::Idle), 0);
     }
@@ -1084,16 +1103,34 @@ pub(crate) fn has_any_identity_label(iss: &Issue) -> bool {
         .any(|l| l.starts_with(IDENTITY_LABEL_PREFIX))
 }
 
-/// The candidates a triage pass may act on: no `rhapsody:@` label, and not opted out.
+/// The candidates a triage pass may act on: **in a dispatchable state**, no `rhapsody:@` label,
+/// and not opted out.
 ///
 /// [`SOLO_LABEL`](crate::teams::SOLO_LABEL) is excluded here and not merely routed around later
 /// (§A.3.6: "triage never touches a solo ticket"). Excluding it at the candidate step is what makes
 /// that true of the model turn as well as of the write — a solo ticket's text never reaches an
 /// arbiter, so opting out of the team also opts out of being read by it.
-pub(crate) fn unlabelled_candidates(issues: &[Issue]) -> Vec<&Issue> {
+///
+/// **The state test is the selection gate's own** (STUDIO-672), through the one shared
+/// [`dispatchable_state`](crate::dispatch::dispatchable_state) the gate's `eligibility` runs. The
+/// candidate FETCH is deliberately wider than this — active ∪ review, because the reopen path needs
+/// review-state issues — but assignment exists to feed the gate, and the gate only ever holds
+/// dispatchable work. Labelling a parked review ticket did three bad things and no good one: it
+/// surprised the operator in Linear, it inflated the load counts the least-loaded assigner reads
+/// (one sweep took a teammate from 0 to 6 "open tickets" without a single run starting), and it
+/// pre-decided who would handle a reopen nobody had asked for. Review-state candidates stay
+/// candidates for reopen detection — that path reads the fetch, not this list, and is untouched. A
+/// review ticket that IS summon-reopened re-enters a dispatchable state and is triaged then, when
+/// it is actually work.
+pub(crate) fn unlabelled_candidates<'a>(
+    issues: &'a [Issue],
+    states: &DispatchStates,
+) -> Vec<&'a Issue> {
     issues
         .iter()
-        .filter(|iss| !has_any_identity_label(iss) && !crate::teams::is_solo(iss))
+        .filter(|iss| {
+            states.admits(iss) && !has_any_identity_label(iss) && !crate::teams::is_solo(iss)
+        })
         .collect()
 }
 
@@ -1352,7 +1389,7 @@ fn snippet(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testsupport::{TempDir, issue};
+    use crate::testsupport::{TempDir, issue, set_of};
     use rhapsody_config::room::{Cursor, LocalRoom};
     use rhapsody_config::teams::{Identity, Manager};
     use rhapsody_tracker::fake::Fake;
@@ -1387,6 +1424,23 @@ mod tests {
         iss.team_id = "team-1".to_string();
         iss.labels = Some(labels.iter().map(|s| (*s).to_string()).collect());
         iss
+    }
+
+    /// The same ticket parked in a REVIEW state — a state the selection gate never dispatches
+    /// from, and therefore one triage must never assign (STUDIO-672).
+    fn in_review(id: &str, labels: &[&str]) -> Issue {
+        let mut iss = labelled(id, labels);
+        iss.state = "In Review".to_string();
+        iss
+    }
+
+    /// The state sets a production reload publishes, reduced to what these tests need: `todo`
+    /// dispatches, `done` is terminal, and every other state — `in review` included — is neither.
+    fn states() -> DispatchStates {
+        DispatchStates {
+            active: set_of(&["todo"]),
+            terminal: set_of(&["done"]),
+        }
     }
 
     /// A programmable arbiter: answers from a queue of results, records every prompt it saw, and
@@ -1483,6 +1537,7 @@ mod tests {
             target: move || {
                 Some(TriageTarget {
                     trackers: vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+                    states: states(),
                 })
             },
             arbiter,
@@ -1524,6 +1579,7 @@ mod tests {
             target: move || {
                 Some(TriageTarget {
                     trackers: trackers.clone(),
+                    states: states(),
                 })
             },
             arbiter,
@@ -1632,7 +1688,7 @@ mod tests {
             labelled("i3", &["rhapsody:@someone-who-left"]),
             labelled("i4", &[]),
         ];
-        let got: Vec<&str> = unlabelled_candidates(&issues)
+        let got: Vec<&str> = unlabelled_candidates(&issues, &states())
             .iter()
             .map(|i| i.id.as_str())
             .collect();
@@ -1644,7 +1700,7 @@ mod tests {
     #[test]
     fn a_capability_label_is_not_an_identity_label() {
         let issues = vec![labelled("i1", &["rhapsody:code-review"])];
-        assert_eq!(unlabelled_candidates(&issues).len(), 1);
+        assert_eq!(unlabelled_candidates(&issues, &states()).len(), 1);
     }
 
     // ── load counting ───────────────────────────────────────────────────────────────────────────
@@ -2623,6 +2679,121 @@ mod tests {
         );
     }
 
+    // ── STUDIO-672: triage assigns only what the gate would hold ────────────────────────────────
+
+    /// The ticket's rule, on the MODEL path: a review-state candidate is not work anybody is about
+    /// to do, so it is never assigned — and, exactly as for a solo ticket, its text never reaches
+    /// an arbiter either. The Todo ticket beside it behaves exactly as it always has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_review_state_candidate_is_never_assigned() {
+        let mut tr = Fake::new();
+        // The production shape the bug was found in: the candidate fetch is active ∪ review, so a
+        // sweep sees both, and before this fix labelled every one of them.
+        tr.candidates = vec![
+            in_review("i1", &["docs"]),
+            labelled("i2", &["docs"]),
+            in_review("i3", &[]),
+        ];
+        let tr = Arc::new(tr);
+        let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
+        let d = deps(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Labelled(1)
+        );
+        let wrote: Vec<String> = tr
+            .add_label_calls()
+            .into_iter()
+            .map(|c| c.issue_id)
+            .collect();
+        assert_eq!(
+            wrote,
+            vec!["i2"],
+            "only the dispatchable ticket is assigned"
+        );
+        assert_eq!(
+            arbiter.prompts().len(),
+            1,
+            "and only its text is shown to a model"
+        );
+    }
+
+    /// The same rule on the DETERMINISTIC path (§A.3.3), which is the one that actually produced
+    /// the mess: `manager.mode: labels` has no model turn at all, so a review-state candidate had
+    /// nothing standing between it and the least-loaded assigner.
+    ///
+    /// A workspace of nothing but In-Review tickets assigns nothing and posts nothing per ticket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sweep_over_review_state_tickets_alone_assigns_and_posts_nothing() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![in_review("i1", &["docs"]), in_review("i2", &[])];
+        let tr = Arc::new(tr);
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let mut teams = teams_model(vec![ident("alice", &[]), ident("bob", &[])]);
+        teams.manager.mode = ManagerMode::Labels;
+        let d = deps_with_room(
+            teams,
+            Arc::clone(&tr),
+            FakeArbiter::answering(vec![]) as Arc<dyn TriageArbiter>,
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Idle
+        );
+        assert!(tr.add_label_calls().is_empty(), "no label");
+        assert_eq!(
+            tr.open_by_labels_calls(),
+            0,
+            "and no load read was worth doing"
+        );
+        assert!(
+            room.read_since("alice", &Cursor::default(), 0)
+                .expect("catch up")
+                .messages
+                .is_empty(),
+            "and the room carries no per-ticket post"
+        );
+    }
+
+    /// The one-source-of-truth requirement, pinned rather than merely intended: triage's candidate
+    /// filter and the selection gate's own `eligibility` answer the SAME question about state,
+    /// because both run [`crate::dispatch::dispatchable_state`]. If a future edit gave either its
+    /// own state test, this table would disagree.
+    #[test]
+    fn the_gate_and_triage_cannot_disagree_about_what_is_dispatchable() {
+        let states = DispatchStates {
+            active: set_of(&["todo", "in progress"]),
+            terminal: set_of(&["done", "in progress"]),
+        };
+        let gate = crate::dispatch::EligibilityGate {
+            active: &states.active,
+            terminal: &states.terminal,
+            required_labels: &set_of(&[]),
+            mode: "",
+            review: &set_of(&["in review"]),
+            canceled: &set_of(&[]),
+        };
+        let empty = std::collections::HashSet::new();
+        // Every interesting state: dispatchable, review, terminal, active-AND-terminal, unknown.
+        for state in ["Todo", "In Review", "Done", "In Progress", "Backlog"] {
+            let mut iss = labelled("i1", &[]);
+            iss.state = state.to_string();
+            let by_gate = crate::dispatch::eligibility(&iss, &empty, &empty, &gate).ok;
+            let by_triage = !unlabelled_candidates(std::slice::from_ref(&iss), &states).is_empty();
+            assert_eq!(
+                by_gate, by_triage,
+                "{state}: the gate and triage must agree about dispatchability"
+            );
+        }
+    }
+
     /// **§A.3.4's acceptance, end to end: a failing-then-healing tracker.** The first write is
     /// refused, so the decision is held in memory and the run dispatches wearing it; a later cycle
     /// reconciles the label onto the ticket and the pending entry is retired.
@@ -2842,7 +3013,10 @@ mod tests {
             target: move || {
                 control
                     .reads_project_trackers()
-                    .map(|trackers| TriageTarget { trackers })
+                    .map(|trackers| TriageTarget {
+                        trackers,
+                        states: states(),
+                    })
             },
             arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
             agent_command: "claude".to_string(),
