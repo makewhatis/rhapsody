@@ -568,9 +568,14 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
-/// One captured `tracing` event: its message and its string-rendered fields.
+/// One captured `tracing` event: its level, its message and its string-rendered
+/// fields.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CapturedEvent {
+    /// The event's level, rendered as `tracing` prints it (`WARN`, `INFO`, …) —
+    /// captured since STUDIO-673, because "this is logged at WARN" is itself a
+    /// requirement for the diagnostics an operator watches `/api/v1/logs` for.
+    pub level: String,
     pub message: String,
     pub fields: HashMap<String, String>,
 }
@@ -615,6 +620,7 @@ impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for RecordingLaye
             .lock()
             .expect("event buffer lock")
             .push(CapturedEvent {
+                level: event.metadata().level().to_string(),
                 message: v.message,
                 fields: v.fields,
             });

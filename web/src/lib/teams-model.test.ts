@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_TIMEOUT_MS,
+  MIN_MODEL_TIMEOUT_MS,
   draftErrors,
   effectiveReviewers,
   emptyDraft,
@@ -88,6 +90,21 @@ describe("splitLabels", () => {
   });
 });
 
+describe("schema defaults", () => {
+  // STUDIO-673: a new teams.yaml is seeded from these constants, so a stale one here ships the
+  // exact starvation the daemon-side default was raised to end — a triage turn spawns a subprocess
+  // and waits on a model, which 5000ms never survives. Keep in step with
+  // `DEFAULT_TIMEOUT_MS` in `crates/config/src/teams.rs`.
+  it("seeds a triage timeout a real model turn can finish inside", () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(60000);
+    expect(emptyDraft().managerTimeoutMs).toBe(DEFAULT_TIMEOUT_MS);
+    // And it is above the floor the daemon warns below, so the editor never seeds a value that
+    // makes the daemon complain at the next boot.
+    expect(MIN_MODEL_TIMEOUT_MS).toBe(15000);
+    expect(DEFAULT_TIMEOUT_MS).toBeGreaterThanOrEqual(MIN_MODEL_TIMEOUT_MS);
+  });
+});
+
 describe("draftErrors", () => {
   const draft = (names: Array<{ name: string; labels?: string }>): TeamsDraft => ({
     ...emptyDraft(),
@@ -139,6 +156,9 @@ describe("toDraft / toConfig", () => {
       managerMode: "labels+model",
       defaultIdentity: "alice",
       managerModel: "claude-opus-5",
+      // The file was written under the OLD 5000ms default (STUDIO-673), and what is on disk is
+      // what the editor shows: a raised seed must never silently rewrite a value already saved.
+      managerTimeoutMs: 5000,
       backend: "local",
       roster: [{ name: "alice", profile: "swe", labels: "rust, config", bank: "", maxConcurrent: 0 }],
     });
