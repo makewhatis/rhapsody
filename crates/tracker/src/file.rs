@@ -748,6 +748,39 @@ impl crate::Tracker for Tracker {
         }
     }
 
+    /// Drops `label_name` from the issue's labels and rewrites the file atomically (STUDIO-672).
+    /// `team_id` is ignored for the same reason the add ignores it: the file has no label registry
+    /// to resolve against. Idempotent — an issue that does not carry the label is a successful
+    /// no-op that does not even rewrite the file. Comparison is case-insensitive, matching the add.
+    /// An unknown id is an issue-not-found error.
+    async fn remove_issue_label(
+        &self,
+        issue_id: &str,
+        _team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError> {
+        if issue_id.is_empty() || label_name.is_empty() {
+            return Err(load_err(format!(
+                "remove label requires issueID and labelName (got {issue_id:?},{label_name:?})"
+            )));
+        }
+        let _guard = self.lock();
+        let mut doc = self.load_locked()?;
+        match doc.issues.iter().position(|j| j.id == issue_id) {
+            Some(i) => {
+                let before = doc.issues[i].labels.len();
+                doc.issues[i]
+                    .labels
+                    .retain(|l| !l.eq_ignore_ascii_case(label_name));
+                if doc.issues[i].labels.len() == before {
+                    return Ok(());
+                }
+                self.write_locked(&doc)
+            }
+            None => Err(issue_not_found_err(issue_id)),
+        }
+    }
+
     /// Reloads the file and returns issues carrying ANY of `label_names` whose state is NOT
     /// terminal, with `id`, `identifier` and (lowercased) `labels` populated — the per-identity
     /// load read (STUDIO-644). An empty slice returns an empty result without reading the file
@@ -1032,6 +1065,41 @@ mod tests {
             Some(vec!["bug".to_string(), "rhapsody:@alice".to_string()]),
             "the pre-existing label must survive and the identity label must be written once"
         );
+    }
+
+    // STUDIO-672: the removal drops exactly the named label, leaves every other one alone, and is
+    // idempotent + case-insensitive in both directions — the same contract as the add.
+    #[tokio::test]
+    async fn remove_issue_label_drops_only_the_named_label() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        tr.add_issue_label("SMK-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect("add");
+        // Case-differing removal, and then a repeat of it: neither may disturb `bug`.
+        tr.remove_issue_label("SMK-1", "team-1", "Rhapsody:@Alice")
+            .await
+            .expect("remove");
+        tr.remove_issue_label("SMK-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect("removing what is not there is a no-op, not an error");
+
+        let got = tr.fetch_candidate_issues().await.expect("no error");
+        let smk1 = got.iter().find(|i| i.id == "SMK-1").expect("SMK-1");
+        assert_eq!(
+            smk1.labels,
+            Some(vec!["bug".to_string()]),
+            "only the identity label is gone"
+        );
+    }
+
+    // An unknown id is an error rather than a silent success, so a caller can tell the removal did
+    // not land — the same shape `add_issue_label` has.
+    #[tokio::test]
+    async fn remove_issue_label_unknown_issue_errors() {
+        let (tr, _src) = new_tracker(SAMPLE);
+        tr.remove_issue_label("NOPE-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect_err("unknown issue");
     }
 
     // STUDIO-659, design §0.12: a created review ticket lands in the file with everything the

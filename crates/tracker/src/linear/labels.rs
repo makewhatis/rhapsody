@@ -92,6 +92,14 @@ struct SuccessNode {
     success: bool,
 }
 
+/// The `issueRemoveLabel { success }` envelope (STUDIO-672).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RemoveLabelResp {
+    #[serde(rename = "issueRemoveLabel")]
+    issue_remove_label: SuccessNode,
+}
+
 /// The lean `issues { nodes { id identifier labels } pageInfo }` envelope the load read uses.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -178,6 +186,70 @@ pub(super) async fn add_issue_label(
     .await
 }
 
+/// RemoveIssueLabel resolves `label_name` in `team_id` and REMOVES it from the issue (STUDIO-672).
+/// Empty arguments are [`ApiRequest`](LinearErrorKind::ApiRequest); a `success: false` is
+/// [`MoveRejected`](LinearErrorKind::MoveRejected).
+///
+/// **It never creates the label**, which is the one asymmetry with [`add_issue_label`] and the
+/// reason the resolve half is [`resolve_label`] rather than [`resolve_or_create_label`]: a name
+/// that exists nowhere in the workspace cannot be on the issue, so there is nothing to remove and
+/// creating one to remove it would be absurd. That case returns `Ok(())`, as does removing a label
+/// the issue does not carry (Linear treats it as a successful no-op), which makes the whole
+/// operation idempotent without a read-back.
+pub(super) async fn remove_issue_label(
+    c: &Client,
+    issue_id: &str,
+    team_id: &str,
+    label_name: &str,
+) -> Result<(), TrackerError> {
+    traced(crate::tracker_span!("remove_issue_label"), async move {
+        if issue_id.is_empty() || team_id.is_empty() || label_name.is_empty() {
+            return Err(LinearError::new(
+                LinearErrorKind::ApiRequest,
+                format!(
+                    "remove label requires issueID, teamID and labelName (got {issue_id:?},{team_id:?},{label_name:?})"
+                ),
+            )
+            .into());
+        }
+        let Some(label_id) = resolve_label(c, team_id, label_name).await? else {
+            // No such label anywhere in the workspace: the issue cannot be carrying it.
+            return Ok(());
+        };
+        let resp: RemoveLabelResp = c
+            .do_graphql(
+                query::MUTATION_ISSUE_REMOVE_LABEL,
+                Some(json!({ "id": issue_id, "labelId": label_id })),
+            )
+            .await?;
+        if !resp.issue_remove_label.success {
+            return Err(LinearError::new(
+                LinearErrorKind::MoveRejected,
+                format!("remove label {label_name:?} from issue {issue_id}"),
+            )
+            .into());
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// The find-only half, shared by the create path below and by [`remove_issue_label`]: looks
+/// `label_name` up and applies [`pick_label`]'s preference order, without creating anything.
+pub(super) async fn resolve_label(
+    c: &Client,
+    team_id: &str,
+    label_name: &str,
+) -> Result<Option<String>, TrackerError> {
+    let resp: LabelsResp = c
+        .do_graphql(
+            query::QUERY_LABELS_BY_NAME,
+            Some(json!({ "name": label_name, "first": LABEL_LOOKUP_PAGE })),
+        )
+        .await?;
+    Ok(pick_label(&resp.issue_labels.nodes, team_id, label_name))
+}
+
 /// The find-or-create half: look the name up, preferring a label already scoped to `team_id`, then
 /// a workspace-level label of the same name (an operator may well have created `rhapsody:@alice`
 /// there, and creating a second team-scoped copy would split the ledger this feature depends on).
@@ -187,13 +259,7 @@ pub(super) async fn resolve_or_create_label(
     team_id: &str,
     label_name: &str,
 ) -> Result<String, TrackerError> {
-    let resp: LabelsResp = c
-        .do_graphql(
-            query::QUERY_LABELS_BY_NAME,
-            Some(json!({ "name": label_name, "first": LABEL_LOOKUP_PAGE })),
-        )
-        .await?;
-    if let Some(id) = pick_label(&resp.issue_labels.nodes, team_id, label_name) {
+    if let Some(id) = resolve_label(c, team_id, label_name).await? {
         return Ok(id);
     }
     let created: LabelCreateResp = c
@@ -372,6 +438,106 @@ mod server_tests {
             "the add must be issueAddLabel (additive), not issueUpdate(labelIds:) which replaces \
              the whole set: {seen:?}"
         );
+    }
+
+    // STUDIO-672: the removal resolves the label and sends `issueRemoveLabel` — never
+    // `issueUpdate(labelIds:)`, which would replace the whole set and could drop a label a human
+    // added concurrently.
+    #[tokio::test]
+    async fn remove_issue_label_resolves_then_removes() {
+        let (seen, h) = recorder();
+        let server = MockServer::start(move |req| {
+            push(&h, &req.query);
+            if req.query.contains("issueLabels(") {
+                return MockResp::ok(
+                    r#"{"data":{"issueLabels":{"nodes":[{"id":"lbl-1","name":"rhapsody:@alice","team":{"id":"team-1"}}]}}}"#,
+                );
+            }
+            assert_eq!(
+                req.var_str("labelId"),
+                Some("lbl-1"),
+                "the removal must name the resolved label id"
+            );
+            MockResp::ok(r#"{"data":{"issueRemoveLabel":{"success":true}}}"#)
+        })
+        .await;
+
+        client_at(server.url())
+            .remove_issue_label("iss-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect("remove_issue_label");
+
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 2, "expected lookup + remove only, got {seen:?}");
+        assert!(
+            seen[1].contains("issueRemoveLabel(id: $id, labelId: $labelId)"),
+            "the removal must be issueRemoveLabel, not issueUpdate(labelIds:): {seen:?}"
+        );
+    }
+
+    // A label name that exists nowhere cannot be on the issue: nothing is created, nothing is
+    // mutated, and the call succeeds. The asymmetry with the add is the whole point.
+    #[tokio::test]
+    async fn remove_issue_label_is_a_no_op_when_the_label_does_not_exist() {
+        let (seen, h) = recorder();
+        let server = MockServer::start(move |req| {
+            push(&h, &req.query);
+            MockResp::ok(r#"{"data":{"issueLabels":{"nodes":[]}}}"#)
+        })
+        .await;
+
+        client_at(server.url())
+            .remove_issue_label("iss-1", "team-1", "rhapsody:@ghost")
+            .await
+            .expect("an absent label is nothing to remove");
+
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 1, "the lookup alone, got {seen:?}");
+        assert!(
+            !seen.iter().any(|q| q.contains("issueLabelCreate")),
+            "a removal must NEVER create the label it failed to find: {seen:?}"
+        );
+    }
+
+    // A rejected removal is an error the caller can act on, not a silent success.
+    #[tokio::test]
+    async fn remove_issue_label_rejected_removal_is_an_error() {
+        let server = MockServer::start(move |req| {
+            if req.query.contains("issueLabels(") {
+                return MockResp::ok(
+                    r#"{"data":{"issueLabels":{"nodes":[{"id":"lbl-1","name":"rhapsody:@alice","team":{"id":"team-1"}}]}}}"#,
+                );
+            }
+            MockResp::ok(r#"{"data":{"issueRemoveLabel":{"success":false}}}"#)
+        })
+        .await;
+
+        let err = client_at(server.url())
+            .remove_issue_label("iss-1", "team-1", "rhapsody:@alice")
+            .await
+            .expect_err("a rejected removal must surface");
+        assert!(is_kind(&err, LinearErrorKind::MoveRejected), "{err:?}");
+    }
+
+    // Empty arguments never reach the network.
+    #[tokio::test]
+    async fn remove_issue_label_rejects_empty_arguments() {
+        let server = MockServer::start(|_| {
+            panic!("no request must be sent for empty arguments");
+        })
+        .await;
+        let c = client_at(server.url());
+        for (i, t, l) in [
+            ("", "team-1", "rhapsody:@alice"),
+            ("iss-1", "", "rhapsody:@alice"),
+            ("iss-1", "team-1", ""),
+        ] {
+            let err = c
+                .remove_issue_label(i, t, l)
+                .await
+                .expect_err("empty arguments must be refused");
+            assert!(is_kind(&err, LinearErrorKind::ApiRequest), "{err:?}");
+        }
     }
 
     // The create half: an absent label is created in the issue's team, then added.

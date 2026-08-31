@@ -227,6 +227,31 @@ pub trait Tracker: Any + Send + Sync {
         label_name: &str,
     ) -> Result<(), TrackerError>;
 
+    /// RemoveIssueLabel REMOVES `label_name` from an issue, resolving the label id in `team_id`
+    /// first (Linear's remove takes a label id, not a name). STUDIO-672.
+    ///
+    /// **The narrow counterpart to [`Tracker::add_issue_label`], and deliberately not its
+    /// symmetric twin.** §0.11.1's human-conflict rule — "the manager never edits or removes an
+    /// existing `rhapsody:@` label" — stands; this exists for the one case that rule was never
+    /// about, the manager cleaning up after ITSELF. Triage once assigned identities to review-state
+    /// tickets it should never have considered, and the labels that bug wrote are removable only by
+    /// something that can remove a label. Callers own the "could this only have come from the bug?"
+    /// judgement; the adapter just performs the removal.
+    ///
+    /// Unlike the add, it **never creates**: a label name that does not exist cannot be on the
+    /// issue, so there is nothing to remove and the call is a successful no-op. Removing a label the
+    /// issue does not carry is likewise a successful no-op, which makes the whole operation
+    /// idempotent without a read-back.
+    ///
+    /// `team_id` is required for the same reason the add needs one: a Linear label is team-scoped
+    /// and must be resolved before it can be named in the mutation.
+    async fn remove_issue_label(
+        &self,
+        issue_id: &str,
+        team_id: &str,
+        label_name: &str,
+    ) -> Result<(), TrackerError>;
+
     /// FetchOpenIssuesByLabels returns OPEN (non-terminal) issues in the configured project that
     /// carry ANY of `label_names`, each with its `id`, `identifier` and `labels` populated —
     /// §0.11.1's "one new, additive tracker read (fetch id+labels by label across states)".
