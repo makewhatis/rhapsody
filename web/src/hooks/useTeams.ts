@@ -23,10 +23,24 @@ export const TEAMS_ROOM_QUERY_KEY = ["teams", "room"] as const;
 export const TEAMS_RECALL_QUERY_KEY = ["teams", "recall"] as const;
 export const TEAMS_CONFIG_QUERY_KEY = ["teams", "config"] as const;
 
-// useVersionQuery reads GET /api/v1/version ONCE (no polling: a daemon's build identity and its
-// Teams toggle are both boot-scoped). It is deliberately a shared query rather than a per-component
-// effect so the footer's build stamp and the Teams gate below cost exactly one request between
-// them.
+// How long to wait before asking /api/v1/version again while it has never answered. See
+// `useVersionQuery` for why it asks twice at all.
+export const VERSION_RETRY_MS = 2000;
+
+// useVersionQuery reads GET /api/v1/version until it gets ONE answer, and then never again — a
+// daemon's build identity and its Teams toggle are both boot-scoped, so the first settled answer is
+// final for the session (a mid-session toggle flip still needs the app restart it has always
+// needed). It is deliberately a shared query rather than a per-component effect so the footer's
+// build stamp and the Teams gate below cost one request between them.
+//
+// "Until it gets one answer" rather than "once at mount" is STUDIO-665: the packaged app's
+// supervisor starts the webview and the daemon together, so the shell routinely fires this request
+// seconds before the daemon has bound its port. A single unretried failure used to latch the Teams
+// gate off — invisibly, for the whole session, on a perfectly healthy daemon — while every other
+// surface polled and recovered from the same race. Note what is being retried: the *version* route,
+// which is not a Teams route. A daemon that answers `teams_enabled: false` settles on that first
+// response, so a Teams-off app still makes exactly one version request and zero `/api/v1/teams*`
+// requests, ever.
 export function useVersionQuery() {
   return useQuery<DaemonVersion>({
     queryKey: VERSION_QUERY_KEY,
@@ -34,13 +48,18 @@ export function useVersionQuery() {
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     retry: false,
+    // Terminates on the first success, whatever it says. `data` is set for ANY answer — including
+    // one from a daemon too old to carry `teams_enabled` — so an old daemon reads as off and is not
+    // polled forever for a field it will never grow.
+    refetchInterval: (q) => (q.state.data === undefined ? VERSION_RETRY_MS : false),
   });
 }
 
 // useTeamsEnabled is THE gate. Every Teams surface in the app hangs off it, and while it is false
 // nothing fetches `/api/v1/teams*` — an app on a Teams-off daemon is byte-for-byte the app before
-// this ticket, and it learns that from the one version request it already makes at mount. A daemon
-// too old to serve the field, or one that cannot be reached at all, reads as off.
+// STUDIO-652, and it learns that from the one version request it already makes. A daemon too old to
+// serve the field reads as off, and so does one that cannot be reached — the latter only until it
+// can be, since `useVersionQuery` keeps asking until it has an answer.
 export function useTeamsEnabled(): boolean {
   return useVersionQuery().data?.teams_enabled === true;
 }
