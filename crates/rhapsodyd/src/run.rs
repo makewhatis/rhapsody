@@ -25,7 +25,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use rhapsody_config::{Config, Otel, decode, resolve, workflow};
 use rhapsody_core::runtimeport;
-use rhapsody_orchestrator::{CancelSignal, CancelWait, Orchestrator};
+use rhapsody_orchestrator::{CancelSignal, CancelWait, Orchestrator, TriageHandle};
 use rhapsody_telemetry as telemetry;
 use rhapsody_tracker as tracker;
 
@@ -214,6 +214,22 @@ where
     // handoff cannot even represent a fan-out. §0.12's cost control, enforced by construction.
     let quorum_rx = spawn_quorum(&teams_cfg).then(|| o.open_quorum_channel());
 
+    // --- the Teams work-assignment seam (STUDIO-669; design record
+    // ~/.rhapsody/docs/STUDIO-668-multi-team.md §A) ---
+    //
+    // Built HERE, before `o.control()` moves the orchestrator into the control task, because BOTH
+    // ends need the same `Arc`: the control task kicks a triage cycle the moment its selection gate
+    // holds an unassigned candidate, and reads the pending-assignment map when a label write has
+    // failed. The triage task below takes the other end.
+    //
+    // It is created on exactly the condition that spawns the triage task, and that is the safety
+    // property, not a tidiness one: `o.teams_triage` is `None` on every boot that has no manager,
+    // and the gate holds nothing without it. A daemon can never hold work for a triage task that
+    // was not started.
+    let triage_seam =
+        spawn_triage(install_probe, &teams_cfg).then(|| Arc::new(TriageHandle::new()));
+    o.teams_triage = triage_seam.clone();
+
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
 
@@ -332,7 +348,7 @@ where
         .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
     let triage_room = teams_room.clone();
     let quorum_room = teams_room;
-    let triage_task = if spawn_triage(install_probe, &teams_cfg) {
+    let triage_task = if let Some(seam) = triage_seam {
         let triage_ctx = shutdown.wait();
         let triage_handle = handle.clone();
         let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
@@ -351,6 +367,8 @@ where
             tracker_api_key,
             interval: rhapsody_orchestrator::TRIAGE_INTERVAL,
             max_backoff_ms: rhapsody_orchestrator::MAX_TRIAGE_BACKOFF_MS,
+            // The other end of the seam built above `o.control()`.
+            handle: seam,
             // The room triage posts its decisions to (STUDIO-650, T5). Resolved here rather than
             // taken from `o` because the orchestrator has already moved into the control task by
             // this point; both resolve the same directory through `resolve_room_dir`.
@@ -642,14 +660,21 @@ fn report_profile_issues(teams: Option<&rhapsody_config::teams::Teams>, teams_pa
 /// Whether this boot spawns the Teams triage task (STUDIO-644) — the composition-root gate, named
 /// so it is testable at exactly the predicate `run` calls.
 ///
+/// Since STUDIO-669 it decides one more thing: this predicate also gates the
+/// [`TriageHandle`](rhapsody_orchestrator::TriageHandle) installed on the orchestrator, so a boot
+/// that spawns no triage task also has a selection gate that holds nothing. The two cannot drift
+/// apart, because they are the same `if`.
+///
 /// Two conditions, and both are "spawn NOTHING", not "spawn something inert":
 ///
-/// * [`triage_enabled`](rhapsody_orchestrator::triage_enabled) — the design's own gate (§0.11.2):
-///   Teams enabled, `manager.mode: labels+model`, and a non-empty roster. `mode: labels`, `mode:
-///   off` and Teams-off therefore have zero behaviour delta by construction; there is no task to
-///   have one.
+/// * [`triage_enabled`](rhapsody_orchestrator::triage_enabled) — the design's own gate: Teams
+///   enabled, a `manager.mode` that routes, and a non-empty roster. `mode: labels` now qualifies
+///   (STUDIO-669, §A.3.3: the task's deterministic assignment needs no model), while `mode: off`
+///   and Teams-off still have zero behaviour delta by construction — there is no task to have one,
+///   and nothing is ever held waiting for one.
 /// * `install_probe` — false in the hermetic daemon tests, which must never shell out to a real
-///   `claude`. The BO-59 credential probe is held back by the same flag for the same reason.
+///   `claude`. The BO-59 credential probe is held back by the same flag for the same reason, and
+///   holding the handle back with it is what keeps those tests' dispatch byte-identical.
 fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> bool {
     install_probe && rhapsody_orchestrator::triage_enabled(teams)
 }
@@ -1472,10 +1497,10 @@ mod tests {
     // STUDIO-644 (Teams T3b), design §0.11.2 and the slice's first acceptance criterion: the triage
     // task — the ONLY thing in the daemon that can call a model outside a dispatched run — spawns
     // for `labels+model` and for nothing else. This is the exact predicate `run` gates the spawn on,
-    // so `mode: labels` / `mode: off` / Teams-off provably have no task at all, rather than a task
-    // that returns early.
+    // so `mode: off` / Teams-off provably have no task at all, rather than a task that returns
+    // early — and, since STUDIO-669, provably no selection gate either.
     #[test]
-    fn spawn_triage_only_for_labels_plus_model_in_production() {
+    fn spawn_triage_for_every_routing_mode_in_production() {
         use rhapsody_config::teams::{Identity, ManagerMode, Teams};
 
         let with_mode = |mode: ManagerMode, enabled: bool| Teams {
@@ -1495,9 +1520,14 @@ mod tests {
             true,
             &with_mode(ManagerMode::LabelsModel, true)
         ));
+        // STUDIO-669, §A.3.3: `mode: labels` now spawns the task. It runs no model turn there, but
+        // it does the deterministic assignment that lets the selection gate hold work safely — and
+        // because this same predicate gates the `TriageHandle`, a mode that spawned nothing would
+        // be a mode whose gate held nothing either, leaving `labels` with the identity-less
+        // dispatch §A exists to end.
         assert!(
-            !spawn_triage(true, &with_mode(ManagerMode::Labels, true)),
-            "`mode: labels` must spawn no triage task"
+            spawn_triage(true, &with_mode(ManagerMode::Labels, true)),
+            "`mode: labels` assigns deterministically, so it spawns the task"
         );
         assert!(
             !spawn_triage(true, &with_mode(ManagerMode::Off, true)),

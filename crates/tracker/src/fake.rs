@@ -146,6 +146,11 @@ pub struct Fake {
     pub open_by_labels_err: Option<TrackerError>,
     /// When set, returned by `add_issue_label` (the call is still recorded).
     pub add_label_err: Option<TrackerError>,
+    /// When set, `add_issue_label` fails for exactly the first N calls and succeeds thereafter —
+    /// the FAILING-THEN-HEALING tracker (STUDIO-669), which is what proves a decision survives a
+    /// refused write in memory and reconciles onto the ticket on a later cycle. Mirrors
+    /// `create_issue_fail_first`; `add_label_err` still fails every call.
+    pub add_label_fail_first: usize,
     /// When set, returned by `create_issue` (the call is still recorded). STUDIO-659.
     pub create_issue_err: Option<TrackerError>,
     /// When set, `create_issue` fails for exactly the first N calls and succeeds thereafter — the
@@ -524,6 +529,12 @@ impl Tracker for Fake {
         }
         if let Some(e) = &self.add_label_err {
             return Err(e.clone());
+        }
+        let seq = self.lock().add_label_calls.len();
+        if seq <= self.add_label_fail_first {
+            return Err(TrackerError::Other(format!(
+                "fake_add_issue_label_failed: call {seq}"
+            )));
         }
         let mut inner = self.lock();
         for iss in inner.labelled.values_mut() {
