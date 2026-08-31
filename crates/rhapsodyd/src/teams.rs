@@ -4,11 +4,14 @@
 //! Two verbs, dispatched at the very top of [`crate::run::run`] beside `mcp` so
 //! the daemon's run-lock and flag parsing are untouched:
 //!
-//! * `rhapsodyd teams show <identity|profile>` — prints the fully-resolved
-//!   prompt text plus its provenance. §4 states the bar plainly: layering means
-//!   "what prompt does Alice actually get" is no longer answered by opening one
-//!   file, and *any implementation that cannot answer that question in one
-//!   command has got the trade wrong*. This is that command.
+//! * `rhapsodyd teams show <identity|profile> [--room N]` — prints the
+//!   fully-resolved prompt text plus its provenance. §4 states the bar plainly:
+//!   layering means "what prompt does Alice actually get" is no longer answered
+//!   by opening one file, and *any implementation that cannot answer that
+//!   question in one command has got the trade wrong*. This is that command.
+//!   Since STUDIO-670 it also prints the room's recent tail, so the second
+//!   question an operator in a terminal has — "what has the team been saying?" —
+//!   is answered by the same command instead of by tailing JSONL by hand.
 //! * `rhapsodyd teams fork <profile> [--force]` — materialises the resolved text
 //!   into `~/.rhapsody/teams/profiles/<profile>.md` with `extends: none`.
 //!
@@ -19,11 +22,28 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use chrono::SecondsFormat;
 use rhapsody_config::profiles::{self, BodyOrigin, Origin, ResolvedProfile};
+use rhapsody_config::room::{Cursor, LocalRoom, Message};
 use rhapsody_config::teams::Teams;
 use rhapsody_config::{Config, workflow};
 
-use crate::bootcfg::{resolve_profiles_dir, resolve_teams_path};
+use crate::bootcfg::{resolve_profiles_dir, resolve_room_dir, resolve_teams_path};
+
+/// How many room messages `teams show` prints when `--room` is not given
+/// (STUDIO-670). A glance, not a catch-up: the dashboard (STUDIO-652) is where
+/// an operator scrolls, and [`LocalRoom::read_since`] clamps anything wider to
+/// the room's own `MAX_ROOM_WINDOW` regardless.
+const DEFAULT_ROOM_TAIL: usize = 10;
+
+/// The widest one rendered room line may be, in CHARS. A room body is capped at
+/// 600 bytes on read, which is several terminal lines; the tail is only legible
+/// as a glance if one message is one line.
+const ROOM_LINE_WIDTH: usize = 120;
+
+/// The usage line both `show`'s argument errors quote, so a mistyped flag and a
+/// missing name teach the same syntax.
+const SHOW_USAGE: &str = "usage: rhapsodyd teams show <identity|profile> [--room N]";
 
 /// Runs `rhapsodyd teams <verb> …`, writing the report to `stdout` and any error
 /// to `stderr` behind the `symphony teams:` marker (the dispatch marker
@@ -71,11 +91,11 @@ where
 /// Resolves the paths the verbs work against, then dispatches. Factored out of
 /// [`run_teams`] so the verbs are unit-testable without hijacking stdout.
 fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<String, String> {
-    let (teams_path, profiles_dir) = resolve_paths(getenv)?;
+    let (teams_path, profiles_dir, room_dir) = resolve_paths(getenv)?;
     let verb = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or(&[]);
     match verb {
-        "show" => show(rest, &teams_path, &profiles_dir),
+        "show" => show(rest, &teams_path, &profiles_dir, &room_dir),
         "fork" => fork(rest, &profiles_dir),
         "" => Err("usage: rhapsodyd teams <show|fork> <name>".to_string()),
         other => Err(format!(
@@ -84,7 +104,7 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
     }
 }
 
-/// Locates `teams.yaml` and the profiles directory the same way the daemon does
+/// Locates `teams.yaml`, the profiles directory and the room the same way the daemon does
 /// — anchored to the resolved store home. A directory with no `WORKFLOW.md` is
 /// fine (see [`load_config`]: the defaults still land on `~/.rhapsody`).
 ///
@@ -94,16 +114,22 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
 /// `teams fork` quietly creating directories in whatever directory the operator
 /// happened to be standing in, which is exactly the kind of surprise write §4's
 /// read-only posture exists to avoid.
-fn resolve_paths(getenv: &dyn Fn(&str) -> String) -> Result<(PathBuf, PathBuf), String> {
+fn resolve_paths(getenv: &dyn Fn(&str) -> String) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let cfg = load_config(getenv);
-    resolve_teams_path(cfg.as_ref(), "", false)
-        .zip(resolve_profiles_dir(cfg.as_ref(), "", false))
-        .ok_or_else(|| {
+    // All three anchor to the same runtime home, so they resolve or fail together.
+    match (
+        resolve_teams_path(cfg.as_ref(), "", false),
+        resolve_profiles_dir(cfg.as_ref(), "", false),
+        resolve_room_dir(cfg.as_ref(), "", false),
+    ) {
+        (Some(teams), Some(profiles), Some(room)) => Ok((teams, profiles, room)),
+        _ => Err(
             "no Rhapsody runtime home to read profiles from: the workflow does not decode, or \
              storage.path is `off`/`:memory:`. Point SYMPHONY_WORKFLOW at a workflow with an \
              on-disk storage.path."
-                .to_string()
-        })
+                .to_string(),
+        ),
+    }
 }
 
 /// Loads + decodes + resolves the workflow the daemon would use (`SYMPHONY_WORKFLOW`,
@@ -123,18 +149,21 @@ fn load_config(getenv: &dyn Fn(&str) -> String) -> Option<Config> {
     rhapsody_config::resolve(cfg, &crate::bootcfg::workflow_dir(path)).ok()
 }
 
-/// `teams show <identity|profile>`: the arg is looked up as a roster identity
-/// first (printing the profile it wears), then as a profile name directly —
-/// which is what makes `teams show alice` and `teams show swe` both work.
-fn show(args: &[String], teams_path: &Path, profiles_dir: &Path) -> Result<String, String> {
-    let name = args
-        .first()
-        .filter(|a| !a.is_empty())
-        .ok_or("usage: rhapsodyd teams show <identity|profile>")?;
+/// `teams show <identity|profile> [--room N]`: the arg is looked up as a roster
+/// identity first (printing the profile it wears), then as a profile name
+/// directly — which is what makes `teams show alice` and `teams show swe` both
+/// work.
+fn show(
+    args: &[String],
+    teams_path: &Path,
+    profiles_dir: &Path,
+    room_dir: &Path,
+) -> Result<String, String> {
+    let (name, room_tail) = parse_show_args(args)?;
     // Best-effort: a broken teams.yaml must not stop an operator inspecting a
     // profile, so `show` falls back to treating the arg as a profile name.
     let teams = Teams::load(teams_path);
-    let identity = teams.roster.iter().find(|i| &i.name == name);
+    let identity = teams.roster.iter().find(|i| i.name == name);
     let profile_name = match identity {
         Some(i) if i.profile.is_empty() => {
             return Err(format!("identity {name:?} names no profile"));
@@ -144,13 +173,140 @@ fn show(args: &[String], teams_path: &Path, profiles_dir: &Path) -> Result<Strin
     };
     let resolved =
         profiles::resolve(profiles_dir, &profile_name).map_err(|e| format!("{name}: {e}"))?;
-    Ok(render_show(identity.map(|i| i.name.as_str()), &resolved))
+    // Teams off has no room to speak of, so its report is byte-identical to the
+    // one this command printed before the section existed (STUDIO-670).
+    let room = if teams.enabled && room_tail > 0 {
+        render_room(room_dir, room_tail)
+    } else {
+        String::new()
+    };
+    Ok(render_show(
+        identity.map(|i| i.name.as_str()),
+        &resolved,
+        &room,
+    ))
 }
 
-/// The `teams show` report: provenance first, then the resolved prompt, so the
-/// two questions §4 poses — "which base is this" and "what text does it produce"
-/// — are both answered by one screen.
-fn render_show(identity: Option<&str>, r: &ResolvedProfile) -> String {
+/// `show`'s arguments: one positional name plus the optional `--room N`.
+/// Written as a loop, like [`fork`]'s, so flag order never matters.
+fn parse_show_args(args: &[String]) -> Result<(String, usize), String> {
+    let mut name: Option<String> = None;
+    let mut tail = DEFAULT_ROOM_TAIL;
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "--room" => {
+                let v = rest.next().ok_or(SHOW_USAGE)?;
+                tail = v
+                    .parse()
+                    .map_err(|_| format!("--room takes a message count, got {v:?}"))?;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag {other:?}")),
+            other if name.is_none() && !other.is_empty() => name = Some(other.to_string()),
+            "" => return Err(SHOW_USAGE.to_string()),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    Ok((name.ok_or(SHOW_USAGE)?, tail))
+}
+
+/// The **Room** section: the newest `limit` room-wide posts, oldest first, one
+/// line each (STUDIO-670).
+///
+/// This is the same peek `teams_room_read` performs and nothing new: an empty
+/// reader, [`Cursor::default`] and the room's own clamp. Two properties follow
+/// from that empty reader, and both are load-bearing rather than incidental:
+///
+/// * **No cursor is advanced.** A glance from a terminal must never eat a
+///   teammate's catch-up, so this reads from the beginning of the window every
+///   time and never touches `Cursors`.
+/// * **Direct messages are not shown.** `Audience::visible_to("")` is false for
+///   every `to:` a named teammate, so a `to: alice` hand-off never renders here.
+///   That is deliberate: the CLI is the operator's glance at the room, not a way
+///   to read somebody else's mail.
+///
+/// A room that was never written renders nothing at all — and creating it to
+/// find that out is exactly what [`LocalRoom`] refuses to do.
+fn render_room(room_dir: &Path, limit: usize) -> String {
+    let got = match LocalRoom::new(room_dir).read_since("", &Cursor::default(), limit) {
+        Ok(got) => got,
+        // A room the CLI cannot read must not cost the operator the profile
+        // report they actually asked for: name the reason in one line, print
+        // the rest.
+        Err(e) => return format!("\n--- room ---\n({e})\n"),
+    };
+    if got.messages.is_empty() && got.skipped.is_empty() {
+        return String::new();
+    }
+    // "(last 0)" would read as a claim about the room rather than about what
+    // could be parsed out of it, so a section that carries only skips is bare.
+    let mut out = if got.messages.is_empty() {
+        "\n--- room ---\n".to_string()
+    } else {
+        format!("\n--- room (last {}) ---\n", got.messages.len())
+    };
+    for m in &got.messages {
+        out.push_str(&room_line(m));
+    }
+    // "Skipped loudly, never fatal" (§0.11.4): a corrupt line costs its own line
+    // and nothing else, but the operator is told it happened.
+    if !got.skipped.is_empty() {
+        let n = got.skipped.len();
+        out.push_str(&format!(
+            "({n} unreadable line{} skipped)\n",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
+/// One message as `<at>  <from>  <body-first-line>`, bounded by
+/// [`ROOM_LINE_WIDTH`] chars. Only the first line of the body is printed: the
+/// tail is a glance, and a message's own first line is what its author wrote as
+/// its headline.
+fn room_line(m: &Message) -> String {
+    let head = format!(
+        "{}  {}  ",
+        m.at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        m.from
+    );
+    let body = m.body.lines().next().unwrap_or_default().trim();
+    let budget = ROOM_LINE_WIDTH.saturating_sub(head.chars().count());
+    // `trim_end`: an empty body would otherwise leave the separator's two spaces
+    // dangling at the end of the line.
+    format!(
+        "{}\n",
+        format!("{head}{}", truncate_chars(body, budget)).trim_end()
+    )
+}
+
+/// `s` cut to at most `max` CHARS, the cut marked with a trailing `…` that
+/// itself counts against the budget — so the caller's width bound holds exactly.
+/// Char-indexed rather than byte-sliced, because a room body is arbitrary UTF-8.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let end = s
+        .char_indices()
+        .nth(max - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}…", &s[..end])
+}
+
+/// The `teams show` report: provenance first, then the room, then the resolved
+/// prompt, so the two questions §4 poses — "which base is this" and "what text
+/// does it produce" — are both answered by one screen.
+///
+/// `room` sits BETWEEN them rather than at the very end (STUDIO-670): the
+/// resolved prompt is unbounded prose, and a glance an operator has to scroll a
+/// screenful of it to reach is not a glance. It is empty whenever Teams is off
+/// or `--room 0` was passed, and then this renders exactly what it always did.
+fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str) -> String {
     let mut out = String::new();
     if let Some(i) = identity {
         out.push_str(&format!("identity:     {i}\n"));
@@ -209,6 +365,7 @@ fn render_show(identity: Option<&str>, r: &ResolvedProfile) -> String {
                 "from the overlay; its {{ base }} spliced nothing, because a fork has no base",
         }
     ));
+    out.push_str(room);
     out.push_str("\n--- resolved prompt ---\n");
     out.push_str(&r.prompt);
     out.push('\n');
@@ -288,6 +445,7 @@ fn fork(args: &[String], profiles_dir: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+    use chrono::DateTime;
 
     /// The newest shipped version of a built-in profile. Used instead of a
     /// hardcoded `@1` so a designed built-in bump (T4 shipped v2) moves these
@@ -548,6 +706,267 @@ mod tests {
         assert!(
             !dir.path.join("teams").exists() && !Path::new("teams").exists(),
             "nothing may be created when there is no runtime home"
+        );
+    }
+
+    // ── the room tail (STUDIO-670) ────────────────────────────────────────────
+
+    /// The room root the hermetic workflow anchors to, and the banks root whose
+    /// absence is what proves no cursor was written.
+    fn room_and_banks(dir: &TempDir) -> (PathBuf, PathBuf) {
+        (
+            dir.path.join("teams").join("room"),
+            dir.path.join("teams").join("banks"),
+        )
+    }
+
+    /// Turns Teams on with `alice` on the roster, so the room section is reached
+    /// at all (it is Teams-on only).
+    fn teams_on(dir: &TempDir) {
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+    }
+
+    /// Appends room-wide posts to the hermetic room, one minute apart from a
+    /// fixed clock so the rendered `at` column is deterministic.
+    fn post_room(dir: &TempDir, bodies: &[(&str, &str)]) {
+        let room = LocalRoom::new(room_and_banks(dir).0);
+        for (i, (from, body)) in bodies.iter().enumerate() {
+            let at = DateTime::from_timestamp(1_756_000_000 + 60 * i as i64, 0)
+                .expect("a valid fixed timestamp");
+            room.append(&Message::room(*from, at, *body))
+                .expect("append room post");
+        }
+    }
+
+    /// The section body: everything between the room header and the resolved
+    /// prompt, which is where the glance belongs.
+    fn room_lines(out: &str) -> Vec<String> {
+        let (_, after) = out
+            .split_once("--- room (")
+            .unwrap_or_else(|| panic!("no room section in {out}"));
+        let (_, body) = after
+            .split_once(") ---\n")
+            .unwrap_or_else(|| panic!("malformed room header in {out}"));
+        body.split("\n--- resolved prompt ---")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// The headline: `teams show` prints the roster report, then the bounded
+    /// room tail oldest-first, and reading it advances NO cursor.
+    #[test]
+    fn show_prints_the_room_tail_and_advances_no_cursor() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        teams_on(&dir);
+        post_room(
+            &dir,
+            &[
+                ("operator", "first post"),
+                ("@manager", "assigned STUDIO-670 to alice"),
+                ("alice", "took it"),
+            ],
+        );
+        let (_, banks) = room_and_banks(&dir);
+
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(out.contains("--- room (last 3) ---"), "out = {out}");
+        assert_eq!(
+            room_lines(&out),
+            vec![
+                "2025-08-24T01:46:40Z  operator  first post".to_string(),
+                "2025-08-24T01:47:40Z  @manager  assigned STUDIO-670 to alice".to_string(),
+                "2025-08-24T01:48:40Z  alice  took it".to_string(),
+            ],
+            "oldest first, `<at>  <from>  <body>`: {out}"
+        );
+        // The section is a glance, so it sits ABOVE the resolved prompt rather
+        // than behind a screenful of prose.
+        let room_at = out.find("--- room (").expect("room section");
+        let prompt_at = out.find("--- resolved prompt ---").expect("prompt section");
+        assert!(room_at < prompt_at, "room must precede the prompt: {out}");
+        // The peek must never eat a teammate's catch-up: no bank, and so no
+        // cursor file, may be created by a read.
+        assert!(
+            !banks.exists(),
+            "a peek must write no cursor: {} exists",
+            banks.display()
+        );
+    }
+
+    /// `--room N` narrows the tail; the default is [`DEFAULT_ROOM_TAIL`].
+    #[test]
+    fn room_flag_bounds_the_tail() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        teams_on(&dir);
+        let bodies: Vec<(&str, String)> = (0..14).map(|i| ("alice", format!("post {i}"))).collect();
+        let bodies: Vec<(&str, &str)> = bodies.iter().map(|(f, b)| (*f, b.as_str())).collect();
+        post_room(&dir, &bodies);
+
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains(&format!("--- room (last {DEFAULT_ROOM_TAIL}) ---")),
+            "the default tail is {DEFAULT_ROOM_TAIL}: {out}"
+        );
+        assert_eq!(room_lines(&out).len(), DEFAULT_ROOM_TAIL);
+        assert!(room_lines(&out)[0].ends_with("post 4"), "out = {out}");
+
+        let out = run(&["show", "alice", "--room", "2"], &env[0]).expect("show --room 2");
+        assert_eq!(room_lines(&out).len(), 2);
+        assert!(room_lines(&out)[1].ends_with("post 13"), "out = {out}");
+    }
+
+    /// `--room 0` suppresses the section entirely, and Teams-off output is
+    /// byte-identical to what it was before the section existed.
+    #[test]
+    fn room_zero_and_teams_off_print_no_section() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        teams_on(&dir);
+        post_room(&dir, &[("alice", "hello")]);
+
+        let zero = run(&["show", "alice", "--room", "0"], &env[0]).expect("show --room 0");
+        assert!(!zero.contains("--- room"), "zero = {zero}");
+
+        // Teams off: the same profile, and the same bytes, room or no room.
+        std::fs::write(dir.child("teams.yaml"), "enabled: false\n").expect("write teams.yaml");
+        let off = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(!off.contains("--- room"), "off = {off}");
+        std::fs::remove_dir_all(room_and_banks(&dir).0).expect("remove the room");
+        assert_eq!(
+            off,
+            run(&["show", "swe"], &env[0]).expect("show swe"),
+            "Teams off must print the same bytes with and without a room"
+        );
+    }
+
+    /// A room that was never written is simply no section — and no `mkdir`.
+    #[test]
+    fn no_room_dir_is_no_section_and_creates_nothing() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        teams_on(&dir);
+        let (room, _) = room_and_banks(&dir);
+
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(!out.contains("--- room"), "out = {out}");
+        assert!(!room.exists(), "a read must not create {}", room.display());
+    }
+
+    /// Direct messages are NOT shown: the CLI is the operator's glance at the
+    /// room, not a way to read another teammate's mail.
+    #[test]
+    fn room_hides_direct_messages() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        teams_on(&dir);
+        let room = LocalRoom::new(room_and_banks(&dir).0);
+        let at = DateTime::from_timestamp(1_756_000_000, 0).expect("fixed timestamp");
+        room.append(&Message::room("@manager", at, "room-wide notice"))
+            .expect("append room post");
+        room.append(&Message::addressed(
+            "@manager",
+            "alice",
+            at,
+            "private hand-off",
+        ))
+        .expect("append direct post");
+
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(out.contains("room-wide notice"), "out = {out}");
+        assert!(
+            !out.contains("private hand-off"),
+            "a direct message must never be printed: {out}"
+        );
+        assert_eq!(room_lines(&out).len(), 1);
+    }
+
+    /// A long or multi-line body is flattened to its first line and truncated,
+    /// so one message is always one line under the width bound.
+    #[test]
+    fn room_lines_are_one_line_and_bounded() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        teams_on(&dir);
+        post_room(
+            &dir,
+            &[
+                ("alice", "the headline\nthe body nobody asked for\nand more"),
+                ("alice", &"x".repeat(400)),
+            ],
+        );
+
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        let lines = room_lines(&out);
+        assert_eq!(lines.len(), 2, "out = {out}");
+        assert!(lines[0].ends_with("the headline"), "lines = {lines:?}");
+        assert!(
+            !out.contains("the body nobody asked for"),
+            "only the first line of a body is printed: {out}"
+        );
+        assert!(lines[1].ends_with('…'), "a cut body is marked: {lines:?}");
+        for l in &lines {
+            assert!(
+                l.chars().count() <= ROOM_LINE_WIDTH,
+                "{l:?} is {} chars, over the {ROOM_LINE_WIDTH} bound",
+                l.chars().count()
+            );
+        }
+    }
+
+    /// A corrupt line is skipped and COUNTED — never fatal, and never silent.
+    #[test]
+    fn room_counts_unreadable_lines() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        teams_on(&dir);
+        post_room(&dir, &[("alice", "good one")]);
+        let (room, _) = room_and_banks(&dir);
+        let log = std::fs::read_dir(&room)
+            .expect("read room")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .next()
+            .expect("one log file");
+        let mut text = std::fs::read_to_string(&log).expect("read log");
+        text.push_str("{not json\n{\"from\":\"alice\"}\n");
+        std::fs::write(&log, text).expect("write log");
+
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(out.contains("good one"), "out = {out}");
+        assert!(
+            out.contains("(2 unreadable lines skipped)"),
+            "the skip must be counted: {out}"
+        );
+    }
+
+    /// `--room` wants a number, and says so rather than guessing one.
+    #[test]
+    fn room_flag_rejects_a_missing_or_bad_count() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        assert!(
+            run(&["show", "swe", "--room"], &env[0])
+                .expect_err("no count")
+                .contains("usage:")
+        );
+        assert!(
+            run(&["show", "swe", "--room", "lots"], &env[0])
+                .expect_err("bad count")
+                .contains("--room takes a message count")
+        );
+        assert!(
+            run(&["show", "swe", "--wat"], &env[0])
+                .expect_err("bad flag")
+                .contains("unknown flag")
         );
     }
 
