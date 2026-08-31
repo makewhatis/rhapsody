@@ -382,7 +382,7 @@ fn at_capacity(i: &Identity, load: &LoadSnapshot) -> bool {
 /// Held as its own `const` rather than inlined into the `format!` above for the reason
 /// [`crate::teamscompose`]'s preamble is: a `\`-continued literal carries its source indentation
 /// into the rendered prompt, and nothing downstream would ever show it.
-const HANDOFF_POST_INSTRUCTION: &str = "Before you finish, post ONE short hand-off to the team room with `teams_post` — what you did, the pull request link, and anything a teammate would need to pick this up. Keep the room to decisions and hand-offs rather than chatter: everything posted there is read back into your teammates' prompts on their future runs. Posting never assigns a ticket and never starts a run.";
+const HANDOFF_POST_INSTRUCTION: &str = "Before you finish, post ONE short hand-off to the team room with `teams_post` — what you did, the pull request link if there is one, and anything a teammate would need to pick this up. Keep the room to decisions and hand-offs rather than chatter: everything posted there is read back into your teammates' prompts on their future runs. Posting never assigns a ticket and never starts a run.";
 
 /// The turn-1 teammate section: the identity header plus the identity's resolved
 /// profile text (§0.11.6's fixed order is capabilities → teammate header → room
