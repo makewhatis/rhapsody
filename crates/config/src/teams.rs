@@ -64,7 +64,27 @@ pub enum MemoryBackend {
 /// `manager.max_tokens` — the hard cap on the (future) triage arbitration turn.
 const DEFAULT_MAX_TOKENS: i64 = 4000;
 /// `manager.timeout_ms` — exceeded ⇒ fall back to the deterministic answer.
-const DEFAULT_TIMEOUT_MS: i64 = 5000;
+///
+/// **60 seconds, raised from the 5000ms §2.2 specified (STUDIO-673).** A triage
+/// turn spawns a `claude -p` subprocess, authenticates it, and waits on a
+/// model; measured across a full day of live triage on v0.3.4-rc.8
+/// (2026-08-31), *every* turn lost that race and 100% of the day's assignments
+/// came from the deterministic fallback — `labels+model` was silently pure
+/// `labels`. A bound the real work can never meet is not a bound, it is the
+/// feature switched off, so the budget is now one a turn can finish inside.
+/// Nothing else about it changes: exceeded still means the deterministic answer
+/// stands, and dispatch still never waits on it.
+const DEFAULT_TIMEOUT_MS: i64 = 60000;
+
+/// The smallest `manager.timeout_ms` a *model* turn can realistically finish
+/// inside — the floor the daemon WARNS about at boot (STUDIO-673) and never
+/// clamps to. Subprocess spawn plus one model round-trip is seconds, not
+/// milliseconds, so a smaller value starves the manager: the turn always times
+/// out and the deterministic router decides every ticket, visibly only to
+/// whoever reads the room's failure reasons. The operator's explicit value
+/// still wins — this number buys a diagnosis, not a policy.
+pub const MIN_MODEL_TIMEOUT_MS: i64 = 15000;
+
 /// `memory.bank_prefix` — a bank id is `<bank_prefix><name>`.
 const DEFAULT_BANK_PREFIX: &str = "agent-";
 /// `memory.recall_top_k` — how many facts a recall returns.
@@ -327,6 +347,25 @@ impl Teams {
             .ok()
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_PROMPT_BUDGET_BYTES as usize)
+    }
+
+    /// The configured `manager.timeout_ms` when it is too small for the model
+    /// turn it bounds, else `None` — the whole decision behind the daemon's
+    /// boot-time starvation warning (STUDIO-673), kept beside the constants it
+    /// compares so the boot path only has to render it.
+    ///
+    /// Three things it deliberately does not do. It does not fire outside
+    /// `labels+model`: no other mode runs a model turn, so no other mode can be
+    /// starved by this value. It does not fire on a non-positive value: that
+    /// means "no value", and the triage task substitutes the schema default for
+    /// it. And it does not clamp — it returns the operator's own number, to be
+    /// named back to them.
+    pub fn starved_manager_timeout_ms(&self) -> Option<i64> {
+        (self.enabled
+            && self.manager.mode == ManagerMode::LabelsModel
+            && self.manager.timeout_ms > 0
+            && self.manager.timeout_ms < MIN_MODEL_TIMEOUT_MS)
+            .then_some(self.manager.timeout_ms)
     }
 }
 
@@ -602,6 +641,86 @@ mod tests {
         assert!(!fresh.exists(), "a rejected save must create no file");
     }
 
+    /// STUDIO-673: the shipped `manager.timeout_ms` must be a budget a REAL
+    /// triage turn can finish inside. Measured on 2026-08-31 against
+    /// v0.3.4-rc.8, the 5000ms this shipped with lost every race in a day of
+    /// live triage, so `labels+model` was silently pure `labels`. Pinned twice:
+    /// the literal the schema ships, and — in a const block, so the compiler
+    /// holds it — its relationship to the floor the daemon warns below.
+    #[test]
+    fn the_shipped_manager_timeout_clears_the_model_floor() {
+        assert_eq!(DEFAULT_TIMEOUT_MS, 60000);
+        // A const block, so a future edit that drops the default back under the
+        // floor fails to COMPILE rather than to run.
+        const {
+            assert!(
+                DEFAULT_TIMEOUT_MS >= MIN_MODEL_TIMEOUT_MS,
+                "the shipped default must not be a value the daemon itself warns about"
+            )
+        };
+        let t = Teams {
+            enabled: true,
+            manager: Manager {
+                mode: ManagerMode::LabelsModel,
+                ..Manager::default()
+            },
+            ..Teams::default()
+        };
+        assert_eq!(t.starved_manager_timeout_ms(), None);
+    }
+
+    /// The boot warning's whole decision (STUDIO-673): a model-consulting
+    /// manager whose timeout is below the floor, and nothing else. It reports
+    /// the configured value, never a clamped one — the operator's explicit
+    /// number still wins.
+    #[test]
+    fn starved_manager_timeout_reports_only_a_model_mode_below_the_floor() {
+        let teams = |mode: ManagerMode, enabled: bool, timeout_ms: i64| Teams {
+            enabled,
+            manager: Manager {
+                mode,
+                timeout_ms,
+                ..Manager::default()
+            },
+            ..Teams::default()
+        };
+
+        assert_eq!(
+            teams(ManagerMode::LabelsModel, true, 5000).starved_manager_timeout_ms(),
+            Some(5000),
+            "the shipped-5000 case this ticket exists for"
+        );
+        assert_eq!(
+            teams(ManagerMode::LabelsModel, true, MIN_MODEL_TIMEOUT_MS)
+                .starved_manager_timeout_ms(),
+            None,
+            "the floor itself is not starved"
+        );
+        // Non-positive is "no value", and the triage task substitutes the
+        // schema default for it — warning here would name a number nothing
+        // ever uses.
+        for ms in [0, -1] {
+            assert_eq!(
+                teams(ManagerMode::LabelsModel, true, ms).starved_manager_timeout_ms(),
+                None,
+                "({ms})"
+            );
+        }
+        // No other mode runs a model turn, so no other mode can be starved.
+        for mode in [ManagerMode::Labels, ManagerMode::Off] {
+            assert_eq!(
+                teams(mode, true, 5000).starved_manager_timeout_ms(),
+                None,
+                "({mode:?})"
+            );
+        }
+        assert_eq!(
+            teams(ManagerMode::LabelsModel, false, 5000).starved_manager_timeout_ms(),
+            None,
+            "teams off ⇒ no triage task ⇒ nothing to starve"
+        );
+    }
+
     /// The off state is the schema's defaults with the toggle off, and it is
     /// what `Default` yields — so a future consumer that reaches for either
     /// spelling gets the same thing.
@@ -623,7 +742,7 @@ mod tests {
             assert_eq!(t.manager.default_identity, "", "({text:?})");
             assert_eq!(t.manager.model, "", "({text:?})");
             assert_eq!(t.manager.max_tokens, 4000, "({text:?})");
-            assert_eq!(t.manager.timeout_ms, 5000, "({text:?})");
+            assert_eq!(t.manager.timeout_ms, 60000, "({text:?})");
             assert_eq!(t.memory.backend, MemoryBackend::Local, "({text:?})");
             assert_eq!(t.memory.path, "", "({text:?})");
             assert_eq!(t.memory.endpoint, "", "({text:?})");
@@ -698,7 +817,7 @@ mod tests {
         assert_eq!(t.manager.model, "claude-opus-5");
         // Unset manager keys still take the §2.2 defaults.
         assert_eq!(t.manager.max_tokens, 4000);
-        assert_eq!(t.manager.timeout_ms, 5000);
+        assert_eq!(t.manager.timeout_ms, 60000);
         assert_eq!(t.memory.backend, MemoryBackend::Hindsight);
         assert_eq!(t.memory.endpoint, "https://hindsight.example.ts.net/mcp/");
         // Unset memory keys likewise.
