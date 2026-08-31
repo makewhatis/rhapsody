@@ -125,6 +125,7 @@ impl crate::Runner for Runner {
             turn_n: AtomicI64::new(0),
             transcript: Mutex::new(transcript),
             transcript_warned: AtomicBool::new(false),
+            run_id: AtomicI64::new(0),
         }))
     }
 }
@@ -148,6 +149,15 @@ struct ClaudeSession {
     /// Warn-once guard for a failing transcript sink (Go `s.transcriptWarned` + `bestEffortStderr`'s
     /// `sync.Once`, unified here — the warning is observability only, never asserted).
     transcript_warned: AtomicBool,
+    /// The store run-row id (Go `s.runID`), set once by the worker via [`Session::set_run_id`]
+    /// after `start_session` and before the first turn; `0` when unknown (store disabled, or a
+    /// coordinator session that has no run). Injected into the agent child's env as
+    /// `SYMPHONY_RUN_ID`/`RHAPSODY_RUN_ID` so the daemon's own MCP server can resolve WHICH run is
+    /// calling — the whole basis on which `teams_post` / `teams_retain` stamp an author
+    /// (STUDIO-675).
+    ///
+    /// Atomic rather than plain: `set_run_id` takes `&self`, and the value is read on every turn.
+    run_id: AtomicI64,
 }
 
 impl ClaudeSession {
@@ -207,6 +217,12 @@ impl Session for ClaudeSession {
         self.locked_thread_id().clone()
     }
 
+    /// Mirrors Go `func (s *session) SetRunID(id int64) { s.runID = id }` — a plain store, guarded
+    /// against a zero id by [`append_me_env`], which omits the variable entirely for `0`.
+    fn set_run_id(&self, id: i64) {
+        self.run_id.store(id, Ordering::SeqCst);
+    }
+
     async fn stop(&self) -> Result<(), AgentError> {
         Ok(()) // per-turn processes; nothing persistent
     }
@@ -252,9 +268,10 @@ impl Session for ClaudeSession {
         cmd.current_dir(&self.ws_path);
         // Env scrub (re-applied every turn, incl. --resume turns): the tracker credential is ALWAYS
         // withheld (by name AND by value); billing/routing vars are withheld only when the guard is
-        // on. appendMeEnv adds the "me" identity AFTER the scrub so it survives. SYMPHONY_RUN_ID is
-        // 0 here (Go's `SetRunID` is worker-called and the A1 `Session` trait exposes no setter yet
-        // — a P5 wiring concern; SYMPHONY_ISSUE alone is set, matching Go's SetRunID-uncalled default).
+        // on. appendMeEnv adds the "me" identity AFTER the scrub so it survives, including
+        // SYMPHONY_RUN_ID when the worker threaded one on via `set_run_id` (STUDIO-675). A session
+        // nobody set an id on still emits SYMPHONY_ISSUE alone, matching Go's SetRunID-uncalled
+        // default.
         let drop_names: Vec<&str> = if guard_on {
             scrubbed_env_vars()
         } else {
@@ -264,7 +281,11 @@ impl Session for ClaudeSession {
             .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
             .collect();
         let scrubbed = scrub_env(&base_env, &drop_names, &[self.cfg.tracker_api_key.as_str()]);
-        let env = append_me_env(scrubbed, &self.issue.identifier, 0);
+        let env = append_me_env(
+            scrubbed,
+            &self.issue.identifier,
+            self.run_id.load(Ordering::SeqCst),
+        );
         cmd.env_clear();
         for kv in &env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -1683,6 +1704,94 @@ mod tests {
             err.to_string().len() <= 8 * 1024,
             "formatted error unexpectedly large ({} bytes); stderr not bounded",
             err.to_string().len()
+        );
+    }
+
+    /// STUDIO-675: the run id the worker threads onto the session MUST reach the agent child as
+    /// `SYMPHONY_RUN_ID` (and its `RHAPSODY_*` twin), because `teams_post` / `teams_retain` resolve
+    /// the posting run from that env and nothing else. Before this wiring the runner hardcoded 0,
+    /// so every dispatched teammate's post failed with "SYMPHONY_RUN_ID is not set".
+    ///
+    /// Mirrors Go `worker.go`'s `SetRunID` call right after `StartSession`.
+    #[tokio::test]
+    async fn run_turn_emits_run_id_env_after_set_run_id() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-RUNID");
+        let (_s, script) = env_dump_script();
+        let r = new_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("r1", "MT-RUNID"), None)
+            .await
+            .expect("start session");
+        sess.set_run_id(412);
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "RunTurn err = {err:?}");
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert_eq!(
+            env.get("SYMPHONY_RUN_ID").map(String::as_str),
+            Some("412"),
+            "SYMPHONY_RUN_ID must carry the threaded run id"
+        );
+        assert_eq!(
+            env.get("RHAPSODY_RUN_ID").map(String::as_str),
+            Some("412"),
+            "RHAPSODY_RUN_ID (STUDIO-603's twin spelling) must match"
+        );
+        assert_eq!(
+            env.get("SYMPHONY_ISSUE").map(String::as_str),
+            Some("MT-RUNID"),
+            "SYMPHONY_ISSUE must still be set"
+        );
+    }
+
+    /// The un-set default is unchanged: a session nobody called `set_run_id` on (a coordinator
+    /// session, or any Teams-off dispatch) emits NO run-id env at all, exactly as Go does when
+    /// `SetRunID` is never called. This is the byte-identical half of the change.
+    #[tokio::test]
+    async fn run_turn_without_set_run_id_emits_no_run_id_env() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-NORUNID");
+        let (_s, script) = env_dump_script();
+        let r = new_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("r2", "MT-NORUNID"), None)
+            .await
+            .expect("start session");
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "RunTurn err = {err:?}");
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert!(
+            !env.contains_key("SYMPHONY_RUN_ID") && !env.contains_key("RHAPSODY_RUN_ID"),
+            "an unset run id must emit no run-id env"
+        );
+    }
+
+    /// A zero id is a no-op, mirroring Go's `SetRunID` guard: the store being disabled (or
+    /// `start_run` having failed) must not emit `SYMPHONY_RUN_ID=0`, which would resolve to no run
+    /// and produce a confusing failure instead of the honest "not set".
+    #[tokio::test]
+    async fn set_run_id_zero_emits_no_run_id_env() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-ZERORUNID");
+        let (_s, script) = env_dump_script();
+        let r = new_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("r3", "MT-ZERORUNID"), None)
+            .await
+            .expect("start session");
+        sess.set_run_id(0);
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "RunTurn err = {err:?}");
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert!(
+            !env.contains_key("SYMPHONY_RUN_ID") && !env.contains_key("RHAPSODY_RUN_ID"),
+            "a zero run id must emit no run-id env"
         );
     }
 }
