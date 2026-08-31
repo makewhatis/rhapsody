@@ -122,6 +122,103 @@ fn default_run(args: &[&str]) -> RunResult {
     Ok(out.stdout)
 }
 
+/// The fallible result of an [`OpenPrSource`] query: the open PR's browser URL, `None` when the
+/// branch has no open pull request, or an error when the lookup itself could not be made. The three
+/// cases are kept distinct because they mean different things to the quorum — "nothing to review",
+/// "nothing to review", and "we do not know" — and only the third is worth a warning.
+pub type OpenPrResult = Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+/// How many of a branch's open pull requests [`OpenPrSource::open_pr_for_branch`] inspects before
+/// giving up. Greater than one because the head filter matches on branch NAME across forks, so a
+/// fork's PR is ordered by recency among the repository's own and asking for just the newest would
+/// let one hide the agent's; small because a branch with twenty open PRs is a repository anomaly,
+/// not a case to reconcile here.
+const PR_LIST_LIMIT: &str = "20";
+
+/// Resolves the open pull request whose head is a given branch (STUDIO-674).
+///
+/// **No Go counterpart** — this is Rhapsody Teams' fallback for an installation whose Linear
+/// GitHub integration never attaches PRs to issues, in which case the poller's candidate snapshot
+/// carries no `linked_prs` and the review quorum has no PR to hand a reviewer. GitHub itself always
+/// knows, because the agent pushed the branch; asking it by head branch is the source of truth the
+/// attachment was only ever a cache of.
+///
+/// Object-safe (held as `dyn OpenPrSource` by the off-loop quorum task), so it is declared via
+/// `async_trait`. Kept separate from [`SummonSource`] rather than added to it: `SummonSource` is a
+/// field-for-field port of a Go interface, and a Rhapsody-only capability does not belong in it.
+#[async_trait]
+pub trait OpenPrSource: Send + Sync {
+    async fn open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> OpenPrResult;
+}
+
+#[async_trait]
+impl OpenPrSource for GH {
+    /// One bounded `gh pr list --repo <owner>/<repo> --head <branch> --state open --json
+    /// url,headRepositoryOwner --limit <PR_LIST_LIMIT>`, answering the newest matching PR whose
+    /// head repository belongs to the account that was queried.
+    ///
+    /// `--state open` is the whole unmerged/unclosed filter, so the caller needs no second check.
+    /// An empty owner, repo or branch is not an error and not a query — there is simply nothing to
+    /// ask, so it answers `None` without spawning `gh`.
+    ///
+    /// **A pull request from a fork is rejected.** `--head` filters on the branch's name alone and
+    /// matches forks too, so on a public repository anyone may open a PR whose head branch is
+    /// called `symphony/<key>`; resolving it would point the quorum's reviewer agents at a
+    /// stranger's diff, which the Linear-attachment path could never do. Every candidate's
+    /// `headRepositoryOwner.login` is therefore compared against the owner that was asked about
+    /// (case-insensitively — GitHub logins are), and a candidate that does not state its head
+    /// repository at all (a deleted fork answers `null`) is rejected for the same reason: it cannot
+    /// be shown to be ours. Rejected candidates are skipped rather than terminal, which is what
+    /// [`PR_LIST_LIMIT`] is for.
+    ///
+    /// The comparison is on the OWNER and not on the whole `owner/repo` slug, deliberately. A fork
+    /// under the same account is inside the same trust boundary — the point of the check is that a
+    /// stranger cannot get a URL in here — and matching the slug would additionally break on a
+    /// repository RENAME, where `gh` follows GitHub's redirect and answers under the canonical name
+    /// while this daemon still asks under the stale one from config.
+    async fn open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> OpenPrResult {
+        if owner.is_empty() || repo.is_empty() || branch.is_empty() {
+            return Ok(None);
+        }
+        let slug = format!("{owner}/{repo}");
+        let args = [
+            "pr",
+            "list",
+            "--repo",
+            slug.as_str(),
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "url,headRepositoryOwner",
+            "--limit",
+            PR_LIST_LIMIT,
+        ];
+        let body = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("gh pr list --repo {slug} --head {branch}: {e}").into()
+        })?;
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr list --repo {slug} --head {branch}: {e}").into()
+            },
+        )?;
+        Ok(prs.iter().find_map(|p| {
+            let url = p
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .filter(|u| !u.is_empty())?;
+            let head_owner = p
+                .get("headRepositoryOwner")
+                .and_then(|o| o.get("login"))
+                .and_then(serde_json::Value::as_str)?;
+            head_owner
+                .eq_ignore_ascii_case(owner)
+                .then(|| url.to_string())
+        }))
+    }
+}
+
 #[async_trait]
 impl SummonSource for GH {
     /// Makes exactly two `gh api` calls (issues/comments + pulls/comments), matches the summon
@@ -211,8 +308,8 @@ impl SummonSource for GH {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use chrono::TimeZone;
 
@@ -430,6 +527,221 @@ mod tests {
         assert!(
             msg.contains("gh: command not found"),
             "error wraps the underlying cause: {msg}"
+        );
+    }
+
+    // ── open_pr_for_branch (STUDIO-674; no Go counterpart) ──────────────────────────────────────
+
+    /// One open PR on the branch, opened from the queried repository itself.
+    const PR_LIST_OWN: &str = r#"[{"url":"https://github.com/o/r/pull/64",
+        "headRepositoryOwner":{"login":"o"}}]"#;
+
+    /// A runner that records the argv it was handed and answers with `body`.
+    fn run_recording(body: &'static str, seen: Arc<Mutex<Vec<String>>>) -> RunFn {
+        Box::new(move |args| {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(args.join(" "));
+            Ok(body.as_bytes().to_vec())
+        })
+    }
+
+    // The happy path: one bounded `gh pr list` scoped to the repo AND the head branch, and the
+    // browser URL is read out of it. The argv is asserted in full because it IS the contract with
+    // GitHub — a dropped `--state open` would hand a reviewer a merged PR.
+    #[tokio::test]
+    async fn open_pr_for_branch_returns_the_open_prs_url() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(PR_LIST_OWN, Arc::clone(&seen))),
+        );
+
+        let got = src
+            .open_pr_for_branch("o", "r", "symphony/MT-1")
+            .await
+            .expect("open_pr_for_branch");
+
+        assert_eq!(got.as_deref(), Some("https://github.com/o/r/pull/64"));
+        let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            calls,
+            vec![
+                "pr list --repo o/r --head symphony/MT-1 --state open --json \
+                 url,headRepositoryOwner --limit 20"
+                    .to_string()
+            ],
+            "exactly one gh call, scoped to the repo and the head branch"
+        );
+    }
+
+    // A branch with no open PR is `None`, not an error: the quorum treats it as "nothing to
+    // review", which is a normal outcome and not a failure to report.
+    #[tokio::test]
+    async fn open_pr_for_branch_no_open_pr_is_none() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("[]", Arc::clone(&seen))));
+        assert_eq!(
+            src.open_pr_for_branch("o", "r", "symphony/MT-1")
+                .await
+                .expect("open_pr_for_branch"),
+            None
+        );
+    }
+
+    // An empty owner/repo/branch asks GitHub nothing at all — a `gh pr list --repo /` would be a
+    // guaranteed error, and "we were never told the repo" is not an error worth reporting.
+    #[tokio::test]
+    async fn open_pr_for_branch_without_a_repo_asks_nothing() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(PR_LIST_OWN, Arc::clone(&seen))),
+        );
+        for (owner, repo, branch) in [
+            ("", "r", "symphony/MT-1"),
+            ("o", "", "symphony/MT-1"),
+            ("o", "r", ""),
+        ] {
+            assert_eq!(
+                src.open_pr_for_branch(owner, repo, branch)
+                    .await
+                    .expect("open_pr_for_branch"),
+                None,
+                "({owner:?}, {repo:?}, {branch:?})"
+            );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh call is made without a repo and a branch"
+        );
+    }
+
+    // A runner error is propagated (not swallowed as "no PR"), wrapping the cause and naming the
+    // repo/branch — `summons_since`'s contract, for its reason: the caller must be able to tell
+    // "GitHub says there is none" from "we could not ask".
+    #[tokio::test]
+    async fn open_pr_for_branch_run_error_is_propagated() {
+        let run: RunFn = Box::new(|_args| Err("gh: command not found".into()));
+        let src = GH::new("@symphony", Some(run));
+        let msg = src
+            .open_pr_for_branch("o", "r", "symphony/MT-1")
+            .await
+            .expect_err("expected an error")
+            .to_string();
+        assert!(msg.contains("o/r"), "error names the repo: {msg}");
+        assert!(
+            msg.contains("symphony/MT-1"),
+            "error names the branch: {msg}"
+        );
+        assert!(
+            msg.contains("gh: command not found"),
+            "error wraps the underlying cause: {msg}"
+        );
+    }
+
+    // Unparseable output is an error too, for the same reason: silently reading it as "no PR"
+    // would turn a broken `gh` into a permanently quiet quorum.
+    #[tokio::test]
+    async fn open_pr_for_branch_undecodable_output_is_an_error() {
+        let run: RunFn = Box::new(|_args| Ok(b"not json".to_vec()));
+        let src = GH::new("@symphony", Some(run));
+        let msg = src
+            .open_pr_for_branch("o", "r", "symphony/MT-1")
+            .await
+            .expect_err("expected an error")
+            .to_string();
+        assert!(msg.contains("decode"), "error says what failed: {msg}");
+    }
+
+    // A public repository's branch-name filter also matches FORKS, so a third party can open a PR
+    // whose head branch is `symphony/<key>`. Resolving it would aim the quorum's reviewer agents at
+    // a stranger's diff — a review and prompt-injection surface the Linear-attachment path never
+    // had — so a PR whose head repository is not the queried one is not a match at all.
+    #[tokio::test]
+    async fn open_pr_for_branch_rejects_a_forks_pull_request() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"[{"url":"https://github.com/stranger/r/pull/9",
+                    "headRepositoryOwner":{"login":"stranger"}}]"#,
+                Arc::clone(&seen),
+            )),
+        );
+        assert_eq!(
+            src.open_pr_for_branch("o", "r", "symphony/MT-1")
+                .await
+                .expect("open_pr_for_branch"),
+            None,
+            "a fork's PR on the same branch name is not this repo's PR"
+        );
+    }
+
+    // …and rejecting it must not cost the agent its OWN review: `gh` orders by recency, so a fork's
+    // PR opened after the agent's would come first. The scan continues past it.
+    #[tokio::test]
+    async fn open_pr_for_branch_skips_a_fork_to_reach_the_repos_own() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"[{"url":"https://github.com/stranger/r/pull/9",
+                     "headRepositoryOwner":{"login":"stranger"}},
+                    {"url":"https://github.com/o/r/pull/64",
+                     "headRepositoryOwner":{"login":"o"}}]"#,
+                Arc::clone(&seen),
+            )),
+        );
+        assert_eq!(
+            src.open_pr_for_branch("o", "r", "symphony/MT-1")
+                .await
+                .expect("open_pr_for_branch")
+                .as_deref(),
+            Some("https://github.com/o/r/pull/64"),
+            "a newer fork PR must not hide the repository's own"
+        );
+    }
+
+    // A candidate that states no head repository (a deleted fork answers `null`) cannot be shown to
+    // be ours, so it is rejected on the same rule rather than accepted by omission.
+    #[tokio::test]
+    async fn open_pr_for_branch_rejects_a_pr_with_no_head_repository() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"[{"url":"https://github.com/o/r/pull/64","headRepositoryOwner":null}]"#,
+                Arc::clone(&seen),
+            )),
+        );
+        assert_eq!(
+            src.open_pr_for_branch("o", "r", "symphony/MT-1")
+                .await
+                .expect("open_pr_for_branch"),
+            None
+        );
+    }
+
+    // GitHub logins are case-insensitive, and the owner this daemon asks with comes from a git
+    // remote a human typed. Matching case-sensitively would reject the repository's own PR.
+    #[tokio::test]
+    async fn open_pr_for_branch_matches_the_owner_case_insensitively() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"[{"url":"https://github.com/MakeWhatIs/r/pull/64",
+                     "headRepositoryOwner":{"login":"MakeWhatIs"}}]"#,
+                Arc::clone(&seen),
+            )),
+        );
+        assert_eq!(
+            src.open_pr_for_branch("makewhatis", "r", "symphony/MT-1")
+                .await
+                .expect("open_pr_for_branch")
+                .as_deref(),
+            Some("https://github.com/MakeWhatIs/r/pull/64")
         );
     }
 }
