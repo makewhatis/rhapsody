@@ -3645,19 +3645,21 @@ mod tests {
             "lin_api_key_value_1234",
         );
         o.set_reads_projects(vec![Arc::clone(&proj) as Arc<dyn Tracker>]);
+        // The third write `reload` makes, and the one triage filters candidates by (STUDIO-672).
+        // Without it the daemon publishes trackers but no dispatchable state, and triage correctly
+        // assigns nothing — which is what this line existing proves is a wiring requirement.
+        o.set_reads_states(states());
 
         let seam = Arc::new(TriageHandle::new());
         let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
         let d = TriageDeps {
             teams: Arc::new(teams_model(vec![ident("alice", &["rust"])])),
-            // The production target closure, in `run.rs`'s exact shape.
+            // The production target closure, in `run.rs`'s exact shape — including the SINGLE
+            // `reads_triage_target` read (STUDIO-672). Two reads here would let this test pass over
+            // a wiring that can hand triage trackers without the states they must filter by.
             target: move || {
-                control
-                    .reads_project_trackers()
-                    .map(|trackers| TriageTarget {
-                        trackers,
-                        states: states(),
-                    })
+                let (trackers, states) = control.reads_triage_target()?;
+                Some(TriageTarget { trackers, states })
             },
             arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
             agent_command: "claude".to_string(),
