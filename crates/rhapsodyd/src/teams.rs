@@ -175,6 +175,12 @@ fn show(
         profiles::resolve(profiles_dir, &profile_name).map_err(|e| format!("{name}: {e}"))?;
     // Teams off has no room to speak of, so its report is byte-identical to the
     // one this command printed before the section existed (STUDIO-670).
+    //
+    // `room_tail > 0` is what makes `--room 0` SUPPRESS the section, and it has
+    // to be decided here: the room reads a `limit` of 0 as "no particular
+    // limit" and answers with its DEFAULT window (`effective_limit`), so
+    // passing the count straight through would turn the documented way to
+    // silence the tail into the widest one this command can print.
     let room = if teams.enabled && room_tail > 0 {
         render_room(room_dir, room_tail)
     } else {
