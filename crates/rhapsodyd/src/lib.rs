@@ -11,7 +11,8 @@
 //!   shutdown/drain.
 //! * [`mcp`] — the `symphony mcp` subcommand (`mcp.go`): the local MCP facade over stdio (→ `crates/mcp`).
 //! * [`teams`] — the `rhapsodyd teams show|fork` subcommand (STUDIO-642, Rhapsody-only): prints and
-//!   forks resolved Teams profiles. No Go counterpart — Teams is a Rhapsody feature.
+//!   forks resolved Teams profiles, and prints the room's recent tail beside them (STUDIO-670).
+//!   No Go counterpart — Teams is a Rhapsody feature.
 //! * [`runlock`] — the advisory single-instance flock (`run.go`'s lock section).
 //! * [`state`] — the httpapi [`rhapsody_httpapi::StateProvider`] adapter over the orchestrator's
 //!   off-loop [`rhapsody_orchestrator::ControlHandle`] (Go passes `*Orchestrator` directly; Rust can't

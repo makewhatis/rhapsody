@@ -170,6 +170,7 @@ where
         o.teams_profiles_dir = resolve_profiles_dir(resolved.as_ref(), &flags.db, flags.no_store);
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
+        report_starved_manager(o.teams.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
         //
@@ -946,6 +947,26 @@ fn report_inert_manager(teams: Option<&rhapsody_config::teams::Teams>) {
              of `enabled: false`. Set manager.default_identity to run every ticket as one teammate."
         );
     }
+}
+
+/// Warns when a model-consulting manager is given a timeout too small for the turn it bounds
+/// (STUDIO-673). Reported at boot, never clamped: the operator's explicit value still wins and
+/// triage keeps working, deterministically — this line is what stops that being discoverable only
+/// by reading a day of the room's failure reasons.
+fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams else { return };
+    let Some(ms) = teams.starved_manager_timeout_ms() else {
+        return;
+    };
+    let floor = rhapsody_config::teams::MIN_MODEL_TIMEOUT_MS;
+    tracing::warn!(
+        timeout_ms = ms,
+        floor_ms = floor,
+        "manager.mode consults a model but manager.timeout_ms is {ms}ms, below the {floor}ms a \
+         triage turn needs: a turn spawns a subprocess and waits on a model, so every turn will \
+         time out and every ticket will be assigned by the deterministic fallback. The value is \
+         honoured as written — raise manager.timeout_ms in teams.yaml to use the model at all."
+    );
 }
 
 fn load_resolved(path: &Path) -> Option<Config> {

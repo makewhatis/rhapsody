@@ -409,6 +409,9 @@ impl Orchestrator {
         let stack_context = re.stack_context.clone();
         let capabilities_section = re.capabilities_section.clone();
         let teammate_section = re.teammate_section.clone();
+        // Stamped by `persist_start_run` above; 0 when the store is off or the insert failed, which
+        // the runner treats as "unknown" and emits no env for (STUDIO-675).
+        let run_id = re.run_id;
         let started_at = re.started_at;
         // Hand the entry to the injected TEST seam (Go `o.spawn(...)`) BEFORE moving it into
         // `o.running` — the borrow of `self.spawn` must not alias `self.running`. In production
@@ -428,6 +431,7 @@ impl Orchestrator {
                 stack_context,
                 capabilities_section,
                 teammate_section,
+                run_id,
                 started_at,
             );
         }
