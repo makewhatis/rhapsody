@@ -1152,6 +1152,15 @@ where
     TF: Fn() -> Option<TriageTarget>,
 {
     let history = deps.history.as_ref()?;
+    // Defence in depth behind `reads_triage_target`'s single lock: a snapshot that names no review
+    // state cannot recognise the tickets this sweep exists to clean, so it must report "did not
+    // run" rather than "ran and found nothing" — the latter would retire the one-time cleanup
+    // against a state snapshot that could not have found anything in the first place. A workflow
+    // that genuinely configures no review states leaves the sweep pending forever, which costs a
+    // loop over zero matching issues per cycle and nothing else.
+    if states.review.is_empty() {
+        return None;
+    }
     let mut removed: Vec<String> = Vec::new();
     for iss in issues.iter().filter(|i| states.is_in_review(i)) {
         if removed.len() >= MAX_RECONCILE {
@@ -3123,14 +3132,35 @@ mod tests {
         history: Arc<dyn IdentityHistory>,
         room: Arc<dyn RoomLog>,
     ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
+        deps_with_history_states(teams, tr, history, room, states())
+    }
+
+    /// The same, over a caller-supplied state snapshot — spelled out rather than `..deps(..)`
+    /// because struct-update syntax cannot change the closure type the struct is generic over.
+    fn deps_with_history_states(
+        teams: Teams,
+        tr: Arc<Fake>,
+        history: Arc<dyn IdentityHistory>,
+        room: Arc<dyn RoomLog>,
+        states: DispatchStates,
+    ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
         TriageDeps {
-            history: Some(history),
+            teams: Arc::new(teams),
+            target: move || {
+                Some(TriageTarget {
+                    trackers: vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+                    states: states.clone(),
+                })
+            },
+            arbiter: FakeArbiter::answering(vec![]) as Arc<dyn TriageArbiter>,
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            interval: Duration::from_millis(5),
+            max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
             room: Some(room),
-            ..deps(
-                teams,
-                tr,
-                FakeArbiter::answering(vec![]) as Arc<dyn TriageArbiter>,
-            )
+            history: Some(history),
         }
     }
 
@@ -3281,6 +3311,36 @@ mod tests {
 
         let report = triage_cycle_reporting(&CancelWait::default(), &d, true, true).await;
         assert_eq!(report.reconciled, None, "deferred, not completed");
+    }
+
+    /// A state snapshot that names no review state cannot recognise a parked ticket, so a cycle
+    /// holding one must report "did not run" — otherwise a boot-race snapshot would retire the
+    /// one-time cleanup without having been able to clean anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_snapshot_with_no_review_states_defers_the_reconcile() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![in_review("STUDIO-572", &["rhapsody:@alice"])];
+        let tr = Arc::new(tr);
+        let history = FakeHistory::new(&[]);
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        // The daemon has a config and trackers, but no review state is named — the shape a read
+        // that straddled the reload's two writes used to be able to produce.
+        let d = deps_with_history_states(
+            teams_model(vec![ident("alice", &[])]),
+            Arc::clone(&tr),
+            Arc::clone(&history) as Arc<dyn IdentityHistory>,
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+            DispatchStates {
+                active: set_of(&["todo"]),
+                terminal: set_of(&["done"]),
+                review: set_of(&[]),
+            },
+        );
+
+        let report = triage_cycle_reporting(&CancelWait::default(), &d, true, true).await;
+        assert_eq!(report.reconciled, None, "deferred, not completed");
+        assert!(tr.remove_label_calls().is_empty());
+        assert!(history.reads().is_empty(), "and nothing was even judged");
     }
 
     /// The sweep is retired by the FIRST cycle that completes one, and a cycle that could not run it

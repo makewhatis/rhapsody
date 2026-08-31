@@ -370,11 +370,8 @@ where
             // triage assigned identities to In-Review tickets — parked design records and work
             // already under human review — that the gate could never have held.
             target: move || {
-                let trackers = triage_handle.reads_project_trackers()?;
-                Some(rhapsody_orchestrator::TriageTarget {
-                    trackers,
-                    states: triage_handle.reads_dispatch_states(),
-                })
+                let (trackers, states) = triage_handle.reads_triage_target()?;
+                Some(rhapsody_orchestrator::TriageTarget { trackers, states })
             },
             arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
             agent_command: command,

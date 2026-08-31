@@ -176,15 +176,23 @@ impl ControlHandle {
         Some(r.project_trackers.clone())
     }
 
-    /// The most recent reload's dispatchable-state sets (STUDIO-672), for the off-loop Teams triage
-    /// task. Default (empty) before the first config load — the same pre-load state
-    /// [`Self::reads_project_trackers`] reports as `None`, and the two are published by the same
-    /// reload, so a caller that reads both sees them together or sees neither.
+    /// Everything the off-loop Teams triage task needs from the last reload, under **ONE** lock
+    /// (STUDIO-672): every enabled project's tracker, and the dispatchable-state sets triage must
+    /// filter by. `None` before the first config load, exactly as
+    /// [`Self::reads_project_trackers`] reports it.
     ///
-    /// Cloning the sets out releases the lock immediately — it is never held across an `await`.
-    pub fn reads_dispatch_states(&self) -> DispatchStates {
+    /// **The single acquisition is the point, not a micro-optimisation.** The reload publishes the
+    /// trackers and the states in separate writes, so two separate reads can straddle one and hand
+    /// the caller trackers with a default (empty) state snapshot. Triage filters candidates by
+    /// those states and — worse — runs its ONE-TIME reconcile against them, so a cycle that landed
+    /// in that window would sweep nothing, report a completed sweep, and retire a cleanup that
+    /// never happened. Reading both under one lock makes that window unreachable.
+    ///
+    /// Cloning the values out releases the lock immediately — it is never held across an `await`.
+    pub fn reads_triage_target(&self) -> Option<(Vec<Arc<dyn Tracker>>, DispatchStates)> {
         let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
-        r.states.clone()
+        r.tracker.as_ref()?;
+        Some((r.project_trackers.clone(), r.states.clone()))
     }
 }
 
