@@ -98,10 +98,22 @@ impl Orchestrator {
         // + the warning resolver inputs from the freshly-built effective BEFORE moving it into
         // `self.eff` (so there is no re-borrow / fallible unwrap after the swap).
         let tracker = Arc::clone(&eff.tracker);
+        // Every ENABLED project's slug-bound tracker, in the poll loop's own order (STUDIO-671).
+        // The top-level `tracker` above is NOT a substitute for these: in the `projects:` config
+        // form it is bound to a `tracker.project_slug` that validation allows to be empty, so it
+        // sees none of the daemon's work. Paused projects are filtered here for the same reason the
+        // poll loop skips them — a project nothing dispatches from has nothing to triage either.
+        let project_trackers: Vec<Arc<dyn rhapsody_tracker::Tracker>> = eff
+            .projects
+            .iter()
+            .filter(|p| !p.disabled)
+            .map(|p| Arc::clone(&p.tracker))
+            .collect();
         let inputs = project_warn_inputs(&eff);
         let checker = self.prompt_file_checker_for(&eff);
         self.eff = Some(eff);
         self.set_reads_target(Arc::clone(&tracker), cfg.tracker.api_key.clone());
+        self.set_reads_projects(project_trackers);
         // Resolve configured project slugs against Linear + flag any missing repo-relative prompt_file,
         // best-effort and OFF the control task (a no-op on the direct-reload test path where `o.ctx` is
         // nil). INF-277 / INF-279.
@@ -288,6 +300,94 @@ Do {{ issue.identifier }}.
             o.eff.as_ref().unwrap().max_turns,
             11,
             "reload should apply the new config"
+        );
+    }
+
+    // STUDIO-671: a `projects:` config with NO top-level `tracker.project_slug` — the shape
+    // `config::validate` deliberately accepts, and the shape the daemon that wedged was running.
+    // The account-level client is bound to that empty slug, so it is NOT a substitute for the
+    // per-project ones: its candidate query filters `project.slugId == ""`, which Linear answers
+    // with zero rows and no error. Triage read through it and found nothing, silently, forever.
+    const MULTI_PROJECT_WF: &str = "---
+tracker:
+  kind: linear
+  api_key: tok
+  active_states: [Todo]
+  terminal_states: [Done]
+repo: git@github.com:acme/widget.git
+projects:
+  - slugs: [558008ab185c]
+  - slugs: [beefcafe1234]
+  - slugs: [dadfaced0001]
+    enabled: false
+agent:
+  backend: claude
+claude:
+  command: claude
+---
+Do {{ issue.identifier }}.
+";
+
+    // The reload path must publish every ENABLED project's tracker, not just the account-level one.
+    #[test]
+    fn reload_publishes_every_enabled_project_tracker() {
+        let (path, _dir) = write_workflow(MULTI_PROJECT_WF);
+        let mut o = Orchestrator::new(path.clone());
+        let control = o.control();
+        assert!(
+            control.reads_project_trackers().is_none(),
+            "no config has loaded yet"
+        );
+        o.reload_from_disk().expect("reload");
+
+        let eff = o.eff.as_ref().expect("eff built");
+        assert_eq!(
+            eff.cfg.tracker.project_slug, "",
+            "the projects: form supplies the slugs; the top-level one is legitimately empty"
+        );
+        // The root cause, pinned: the account-level client is a DIFFERENT client from every
+        // project's, so reading candidates through it can never see the daemon's work.
+        for p in &eff.projects {
+            assert!(
+                !std::sync::Arc::ptr_eq(&p.tracker, &eff.tracker),
+                "project {} must not be served by the slug-less account-level client",
+                p.slug
+            );
+        }
+
+        let published = control.reads_project_trackers().expect("config loaded");
+        assert_eq!(
+            published.len(),
+            2,
+            "both enabled projects are published; the paused one is not"
+        );
+        let enabled: Vec<&crate::effective::ResolvedProject> =
+            eff.projects.iter().filter(|p| !p.disabled).collect();
+        for (got, want) in published.iter().zip(enabled.iter()) {
+            assert!(
+                std::sync::Arc::ptr_eq(got, &want.tracker),
+                "published trackers must be the projects' own clients, in poll order"
+            );
+        }
+
+        // A hot-reload that un-pauses the third project republishes it.
+        std::fs::write(
+            &path,
+            MULTI_PROJECT_WF.replace(
+                "    enabled: false
+",
+                "",
+            ),
+        )
+        .unwrap();
+        o.on_reload();
+        assert_eq!(
+            control
+                .reads_project_trackers()
+                .expect("config loaded")
+                .len(),
+            3,
+            "a reload must republish the live project set"
         );
     }
 

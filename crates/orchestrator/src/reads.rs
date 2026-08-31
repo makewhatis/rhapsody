@@ -46,6 +46,16 @@ pub enum ReadsError {
 pub struct ReadsTarget {
     pub tracker: Option<Arc<dyn Tracker>>,
     pub api_key: String,
+    /// Every ENABLED project's slug-bound tracker, in poll order (STUDIO-671).
+    ///
+    /// `tracker` above is the top-level/legacy client, and in the `projects:` config form it is
+    /// bound to `tracker.project_slug` — which validation deliberately allows to be EMPTY, because
+    /// the `projects:` block supplies the slugs (`config::validate`'s `missing_tracker_project_slug`
+    /// fires only when BOTH are absent). A candidate query through it filters
+    /// `project.slugId == ""`, which Linear answers with zero rows and no error: the exact silent
+    /// wedge STUDIO-671 reported. Anything that must see the daemon's WORK — as opposed to the
+    /// account — reads these instead, the same clients the poll loop fans out over.
+    pub project_trackers: Vec<Arc<dyn Tracker>>,
 }
 
 /// The resolved "connected as" account for the Settings identity endpoint (INF-224). `masked_token`
@@ -68,6 +78,21 @@ impl Orchestrator {
         let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
         w.tracker = Some(tracker);
         w.api_key = api_key.into();
+    }
+
+    /// Records every ENABLED project's slug-bound tracker for the off-loop readers that need the
+    /// daemon's WORK rather than its account (STUDIO-671). Called from the reload path beside
+    /// [`Orchestrator::set_reads_target`], on every (re)load, so a hot-reload that adds, removes or
+    /// pauses a project is reflected without a restart.
+    ///
+    /// Additive rather than folded into `set_reads_target` because that one mirrors Go
+    /// `setReadsTarget`, whose two fields back the account-level Settings surfaces; the Go daemon
+    /// has no reader of this list at all. The two writes are separate, and that is harmless: no
+    /// reader correlates the account tracker with the project list, so a cycle that lands between
+    /// them sees one of the two a moment stale and nothing inconsistent.
+    pub fn set_reads_projects(&self, trackers: Vec<Arc<dyn Tracker>>) {
+        let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
+        w.project_trackers = trackers;
     }
 
     /// Lists the workspace's Linear projects for the add-agent picker (INF-224), reusing the
@@ -111,6 +136,25 @@ impl ControlHandle {
     /// the handle out releases the lock immediately — it is never held across the caller's `await`.
     pub fn reads_tracker(&self) -> Option<Arc<dyn Tracker>> {
         reads_snapshot(&self.reads).0
+    }
+
+    /// Every ENABLED project's slug-bound tracker, or `None` before the first config load
+    /// (STUDIO-671). It reads the SAME shared reads cell as the surfaces above, so a hot-reload is
+    /// reflected without the caller round-tripping the control channel.
+    ///
+    /// The `Option` and the `Vec` mean different things, and the off-loop Teams tasks report both:
+    /// `None` is "no config has loaded yet" (the pre-load state [`Self::reads_tracker`] also
+    /// reports), while `Some(vec![])` is "a config IS loaded and every project in it is paused" —
+    /// a daemon that legitimately has no work to sweep. Collapsing the two would make a
+    /// misconfiguration and a boot race look identical in the log, which is the class of silence
+    /// STUDIO-671 was about.
+    ///
+    /// Cloning the handles out releases the lock immediately — it is never held across the
+    /// caller's `await`.
+    pub fn reads_project_trackers(&self) -> Option<Vec<Arc<dyn Tracker>>> {
+        let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
+        r.tracker.as_ref()?;
+        Some(r.project_trackers.clone())
     }
 }
 
