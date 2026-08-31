@@ -266,6 +266,13 @@ describe("toDraft / toConfig", () => {
     expect(toConfig(d, zeroed).memory?.recall_top_k).toBe(0);
     expect(toConfig(d, zeroed).prompt_budget_bytes).toBe(0);
   });
+
+  // A prefix is interpolated straight into a `<bank_prefix><name>` bank id, so a stray space is a
+  // typo that points a teammate at a bank nothing else resolves. Trimmed like every other string.
+  it("trims the bank prefix like every other string it sends", () => {
+    const d = { ...toDraft(onDisk, true), bankPrefix: "  team-  " };
+    expect(toConfig(d, onDisk).memory?.bank_prefix).toBe("team-");
+  });
 });
 
 describe("memory.api_key", () => {

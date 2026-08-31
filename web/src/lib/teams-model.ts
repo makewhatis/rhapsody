@@ -259,10 +259,16 @@ export function quorumNote(draft: TeamsDraft): string {
 export const LABEL_SAFE = /^[a-z][a-z0-9-]*$/;
 
 // draftErrors reports what the daemon would reject, so the editor can disable Save rather than
-// invite a round-trip that cannot succeed. Deliberately the same three rules `Teams::validate`
-// enforces, in the same order, and nothing more — a client that validated MORE than the daemon
-// would block a config the daemon would happily load. In particular the new fields add NO client
-// rules: `Teams::validate` has no opinion on a reviewer count or a bank prefix, so neither has this.
+// invite a round-trip that cannot succeed. Deliberately the label-safe and duplicate-name rules
+// `Teams::validate` enforces, in the same order, and — apart from the empty-roster rule below —
+// nothing more: a client that validated MORE than the daemon would block a config the daemon would
+// happily load. In particular the fields STUDIO-667 added contribute NO client rules, because
+// `Teams::validate` has no opinion on a reviewer count, a bank prefix or a budget either.
+//
+// The one client-only rule, inherited from STUDIO-652 and deliberately left as it is: the empty
+// roster. `Teams::validate` accepts one (`validates_a_default_identity ... even with an empty
+// roster`), but a roster-less team can do nothing, and this editor is the surface that creates the
+// file. Called out because the "nothing more" claim above was previously written as absolute.
 export function draftErrors(draft: TeamsDraft): string[] {
   const errors: string[] = [];
   const seen = new Set<string>();
@@ -293,7 +299,9 @@ export function draftErrors(draft: TeamsDraft): string[] {
 // The v1 note that this editor "can never silently pin a value a future default changes" no longer
 // holds for the fields it now models, and cannot: exposing `max_tokens` means sending one. It costs
 // nothing — `Teams::save` writes the CANONICAL serialization with every schema default made
-// explicit, so the file has always pinned all eighteen keys the moment it is written from the app.
+// explicit, so the file has always pinned every key the daemon models the moment it is written from
+// the app. That same rewrite is why the carry-forward below is a property of THIS CLIENT and not of
+// the file: a key the daemon does not model is dropped by its serializer no matter what we send.
 export function toConfig(draft: TeamsDraft, base?: TeamsConfig): Partial<TeamsConfig> {
   const roster = namedRoster(draft).map((r) => {
     const name = r.name.trim();
@@ -335,7 +343,10 @@ export function toConfig(draft: TeamsDraft, base?: TeamsConfig): Partial<TeamsCo
       path: draft.memoryPath.trim(),
       endpoint: draft.memoryEndpoint.trim(),
       api_key,
-      bank_prefix: draft.bankPrefix,
+      // Trimmed like every other string this form sends: a prefix is interpolated straight into a
+      // `<bank_prefix><name>` bank id, so stray whitespace is a typo that silently points a
+      // teammate at a bank nobody else resolves.
+      bank_prefix: draft.bankPrefix.trim(),
       recall_top_k: draft.recallTopK,
     },
     quorum: { ...(base?.quorum ?? {}), enabled: draft.quorumEnabled, reviewers: draft.quorumReviewers },
@@ -350,7 +361,7 @@ export function toConfig(draft: TeamsDraft, base?: TeamsConfig): Partial<TeamsCo
 // with no on-disk runtime home to save into.
 //
 // Schema defaults are omitted rather than spelled out: the daemon re-applies every one on read, and
-// a preview that listed all eighteen keys would bury the two the operator just changed. `api_key` is
+// a preview that listed every key would bury the two the operator just changed. `api_key` is
 // the one field that is never shown verbatim — a stored literal renders masked, exactly as the form
 // above renders it.
 export function teamsYamlSnippet(draft: TeamsDraft): string {

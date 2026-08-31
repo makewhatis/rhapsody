@@ -5,6 +5,7 @@ import {
   draftErrors,
   emptyRow,
   errText,
+  isStoredSecret,
   MANAGER_MODES,
   MASKED_API_KEY,
   MEMORY_BACKENDS,
@@ -60,6 +61,11 @@ export function TeamsTab() {
       <TeamsEditor
         draft={draft}
         onChange={setDraft}
+        // Whether a literal is on disk is a fact about the FETCHED config, not about the draft:
+        // `draft.apiKeyStored` flips to false the moment Replace is pressed, and deriving the
+        // "there is something to keep" affordance from the draft would make the way back vanish
+        // with the click that created the need for it.
+        hasStoredKey={isStoredSecret(onDisk?.memory?.api_key)}
         path={view?.path ?? ""}
         restartRequired={view?.restart_required ?? true}
         saving={save.isPending}
@@ -128,6 +134,7 @@ export function TeamsTab() {
 function TeamsEditor({
   draft,
   onChange,
+  hasStoredKey,
   path,
   restartRequired,
   saving,
@@ -137,6 +144,7 @@ function TeamsEditor({
 }: {
   draft: TeamsDraft;
   onChange: (d: TeamsDraft) => void;
+  hasStoredKey: boolean;
   path: string;
   restartRequired: boolean;
   saving: boolean;
@@ -307,7 +315,7 @@ function TeamsEditor({
                   onChange={(e) => set("memoryEndpoint", e.target.value)}
                 />
               </Field>
-              <ApiKeyField draft={draft} onChange={onChange} />
+              <ApiKeyField draft={draft} onChange={onChange} hasStoredKey={hasStoredKey} />
             </>
           ) : null}
           <Field label="Bank prefix" inline hint="A teammate's bank id is `<prefix><name>` unless their row overrides it.">
@@ -376,7 +384,7 @@ function TeamsEditor({
 
       <SectionCard
         title="What Save will configure"
-        desc={`${path || "~/.rhapsody/teams.yaml"} — the daemon writes this as a full file, with every schema default made explicit. Comments and key order in an existing file are not preserved. Keys this editor does not model are carried through untouched.`}
+        desc={`${path || "~/.rhapsody/teams.yaml"} — the daemon writes this as a full file, rebuilt from its own schema with every default made explicit. Comments, key order, and any key the daemon does not model are not preserved.`}
       >
         <pre
           className="mono"
@@ -419,7 +427,22 @@ function TeamsEditor({
 // literal is accepted (the schema takes one) but is masked on read — `toDraft` refuses to load it
 // into the draft, so "Replace" is the only way to change it and there is no state this component
 // could accidentally render.
-function ApiKeyField({ draft, onChange }: { draft: TeamsDraft; onChange: (d: TeamsDraft) => void }) {
+//
+// Replace is DESTRUCTIVE and one click away, which is why it is reversible here. Pressing it clears
+// the carry-forward flag, so saving from that state writes `api_key: ""` and de-authenticates the
+// backend — hindsight answers every `/v1/**` with 401, and the daemon then warns and runs
+// memoryless. An operator who pressed it to look, or by accident, must be able to get back without
+// abandoning every other edit in the form, and must be told what a blank save does. `hasStoredKey`
+// comes from the FETCHED config rather than the draft precisely so the way back outlives the click.
+function ApiKeyField({
+  draft,
+  onChange,
+  hasStoredKey,
+}: {
+  draft: TeamsDraft;
+  onChange: (d: TeamsDraft) => void;
+  hasStoredKey: boolean;
+}) {
   const hint =
     "May name an environment variable — `$HINDSIGHT_API_KEY` is read from the daemon's environment, so the secret stays out of the file. A literal works too, but then it lives in teams.yaml.";
   if (draft.apiKeyStored) {
@@ -444,7 +467,27 @@ function ApiKeyField({ draft, onChange }: { draft: TeamsDraft; onChange: (d: Tea
     );
   }
   return (
-    <Field label="API key" inline hint={hint}>
+    <Field
+      label="API key"
+      inline
+      hint={
+        hasStoredKey
+          ? `Replacing the key stored in teams.yaml. Save with this blank and the stored key is removed, which leaves the backend unauthenticated. ${hint}`
+          : hint
+      }
+      action={
+        hasStoredKey ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => onChange({ ...draft, apiKey: "", apiKeyStored: true })}
+          >
+            Keep existing
+          </Button>
+        ) : undefined
+      }
+    >
       <TextInput
         mono
         value={draft.apiKey}
