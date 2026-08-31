@@ -32,7 +32,7 @@ use rhapsody_tracker as tracker;
 use crate::bootcfg::{
     assignee_label, banner_color_enabled, open_store, resolve_banks_dir, resolve_banner_data,
     resolve_capabilities_path, resolve_profiles_dir, resolve_room_dir, resolve_server_port,
-    resolve_teams_path, workflow_dir,
+    resolve_teams_path, resolve_teams_reconcile_path, workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -120,7 +120,10 @@ where
     // (the Rust orchestrator defers disk store-open to the daemon). A best-effort load failure leaves
     // the config `None`, so open_store falls back to Noop and Run's own reload reports the error.
     let resolved = load_resolved(&flags.path);
-    let store = open_store(resolved.as_ref(), &flags.db, flags.no_store);
+    // `durable_store` is false for every fallback — storage off, --no-store, :memory:, AND a
+    // failed open. Only the one reader that would ACT on an absence uses it (the Teams
+    // identity-label reconcile, STUDIO-672); everything else is guard-free by design.
+    let (store, durable_store) = open_store(resolved.as_ref(), &flags.db, flags.no_store);
     o.set_store(store);
     // Load the agent-capabilities registry (~/.rhapsody/capabilities.yaml, colocated with the durable
     // store), seeding defaults on first run, and inject it before Run (BO-12). Best-effort: a load
@@ -386,14 +389,31 @@ where
             // this point; both resolve the same directory through `resolve_room_dir`.
             room: triage_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
             // The evidence the one-time review-label reconcile judges by (STUDIO-672): the
-            // `teams.route` events row every routed dispatch already writes. Teams itself only
-            // exists where there IS an on-disk runtime home (`resolve_teams_path` gates the config
-            // load above on exactly that), so the store this reads is a real one wherever this task
-            // is spawned at all — and a store that answers with an error answers "cannot tell",
-            // never "nobody", so an unreadable history costs nobody a label she earned.
-            history: Some(Arc::new(rhapsody_orchestrator::StoreIdentityHistory::new(
-                handle.store(),
-            ))),
+            // `teams.route` events row every routed dispatch already writes.
+            //
+            // Armed ONLY for the durable on-disk store. A `Noop` answers every read `Ok(empty)` and
+            // never `Err` — so a store that failed to open would tell this sweep that nobody has
+            // ever worn any identity, and it would strip every roster label in the workspace,
+            // including the earned ones. Teams needs an on-disk runtime home to exist at all, so a
+            // non-durable store here means the open FAILED, and a failed open must disable the
+            // sweep rather than answer its question with silence.
+            history: durable_store.then(|| {
+                Arc::new(rhapsody_orchestrator::StoreIdentityHistory::new(
+                    handle.store(),
+                    // `resolve()` defaults this to 30; the fallback is unreachable here because a
+                    // config that failed to load leaves `resolve_teams_path` `None` and Teams off.
+                    resolved
+                        .as_ref()
+                        .and_then(|c| c.storage.retention_days)
+                        .unwrap_or(30),
+                )) as Arc<dyn rhapsody_orchestrator::IdentityHistory>
+            }),
+            // Where a completed sweep is recorded, so "one-time" outlives this process.
+            reconcile_marker: resolve_teams_reconcile_path(
+                resolved.as_ref(),
+                &flags.db,
+                flags.no_store,
+            ),
         };
         Some(tokio::spawn(async move {
             rhapsody_orchestrator::run_triage_schedule(triage_ctx, deps).await;

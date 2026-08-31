@@ -58,14 +58,21 @@ pub fn resolve_server_port(flag_port: i64, workflow_path: &Path) -> (i64, bool) 
 /// store-open to the daemon (P6), which injects the result via `set_store` before `Run`. `cfg` is
 /// `None` when the daemon's own best-effort load failed (the orchestrator's `Run` then reports the
 /// config error and exits). Mirrors Go `orchestrator.openStore`.
+///
+/// The second return value is **durability**: `true` only when the handle really is the on-disk
+/// SQLite store. Every fallback above answers `false`, including the one an operator never asked
+/// for — a `Sqlite::open` that FAILED still yields a working [`Noop`] handle, and a [`Noop`] answers
+/// every read with an empty result rather than an error (STUDIO-672). A caller that would act on an
+/// absence must be able to tell "this store has nothing to say" from "nothing happened", and from
+/// the handle alone it cannot.
 pub fn open_store(
     cfg: Option<&Config>,
     db_override: &str,
     disabled: bool,
-) -> Arc<dyn Store + Send + Sync> {
+) -> (Arc<dyn Store + Send + Sync>, bool) {
     if disabled {
         tracing::info!("storage disabled (--no-store); history + recovery off");
-        return Arc::new(Noop);
+        return (Arc::new(Noop), false);
     }
     // The flag override wins over config when non-empty.
     let mut path = db_override.to_string();
@@ -77,16 +84,17 @@ pub fn open_store(
     let sp = parse_store_path(&path);
     if path.is_empty() || sp == StorePath::Off {
         tracing::info!("storage disabled (storage.path: off); history + recovery off");
-        return Arc::new(Noop);
+        return (Arc::new(Noop), false);
     }
+    let on_disk = matches!(sp, StorePath::Disk(_));
     match Sqlite::open(sp) {
         Ok(st) => {
             tracing::info!(path = %path, "durable history store open");
-            Arc::new(st)
+            (Arc::new(st), on_disk)
         }
         Err(e) => {
             tracing::error!(path = %path, err = %e, "open store failed; continuing with persistence disabled");
-            Arc::new(Noop)
+            (Arc::new(Noop), false)
         }
     }
 }
@@ -137,6 +145,25 @@ pub fn resolve_profiles_dir(
     no_store: bool,
 ) -> Option<PathBuf> {
     resolve_runtime_home_file(cfg, db_override, no_store, "teams").map(|d| d.join("profiles"))
+}
+
+/// Resolves the marker file the one-time Teams identity-label reconcile records its retirement in
+/// (`teams/reconcile.json`, STUDIO-672), colocated with `teams.yaml` and `teams/profiles/` by the
+/// same rule every other Teams sidecar follows.
+///
+/// The sweep removes labels, so "have I already done this?" must survive a restart — a daemon
+/// redeploys far more often than an operator relabels a review ticket, and a process-local flag
+/// would re-strip a deliberate human label at every boot. `None` (a disabled / in-memory store, or a
+/// failed config load) means there is nowhere to record the retirement, which disables the sweep
+/// rather than making it a per-boot duty.
+///
+/// Naming the file does not create it; the triage task writes it once, after a completed sweep.
+pub fn resolve_teams_reconcile_path(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, "teams").map(|d| d.join("reconcile.json"))
 }
 
 /// Resolves the Rhapsody Teams memory BANKS directory (STUDIO-645, T4; design record §5.4).
@@ -458,6 +485,41 @@ mod tests {
         assert_eq!(resolve_capabilities_path(None, "off", false), None);
         assert_eq!(resolve_capabilities_path(None, ":memory:", false), None);
         assert_eq!(resolve_capabilities_path(None, "", false), None); // failed load (cfg None)
+    }
+
+    // STUDIO-672: the reconcile marker follows the same runtime-home rule as every other Teams
+    // sidecar. `None` for a store with no on-disk home is load-bearing, not incidental — the triage
+    // task reads it as "there is nowhere to record a completed sweep", and disables the sweep.
+    #[test]
+    fn resolve_teams_reconcile_path_variants() {
+        let dir = TempDir::new();
+        let ws = dir.child("ws");
+        let wf = write_wf(&dir, &valid_wf(&ws));
+        let cfg = resolve(
+            decode(&workflow::load(&wf).expect("load")).expect("decode"),
+            &workflow_dir(&wf),
+        )
+        .expect("resolve");
+        let got =
+            resolve_teams_reconcile_path(Some(&cfg), "", false).expect("on-disk default → Some");
+        assert!(
+            got.ends_with(".rhapsody/teams/reconcile.json"),
+            "default path should be ~/.rhapsody/teams/reconcile.json, got {}",
+            got.display()
+        );
+        assert_eq!(
+            resolve_teams_reconcile_path(None, "/tmp/somewhere/store.db", false)
+                .expect("--db → Some"),
+            PathBuf::from("/tmp/somewhere/teams/reconcile.json")
+        );
+        assert_eq!(resolve_teams_reconcile_path(Some(&cfg), "", true), None); // --no-store
+        assert_eq!(resolve_teams_reconcile_path(None, "off", false), None);
+        assert_eq!(resolve_teams_reconcile_path(None, ":memory:", false), None);
+        assert_eq!(resolve_teams_reconcile_path(None, "", false), None); // failed load
+        assert!(
+            !got.exists(),
+            "resolving a path never creates the file; only a completed sweep writes it"
+        );
     }
 
     // STUDIO-639 (Teams T1): teams.yaml colocates with the on-disk store by exactly the same rule as

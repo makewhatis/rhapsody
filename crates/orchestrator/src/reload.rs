@@ -119,11 +119,11 @@ impl Orchestrator {
         let checker = self.prompt_file_checker_for(&eff);
         self.eff = Some(eff);
         self.set_reads_target(Arc::clone(&tracker), cfg.tracker.api_key.clone());
-        self.set_reads_projects(project_trackers);
-        // The same reload's dispatchable-state sets, for the off-loop triage task (STUDIO-672).
-        // Published here rather than re-derived there so triage and the selection gate can never
-        // disagree about which tickets are work.
-        self.set_reads_states(states);
+        // The project trackers and the same reload's dispatchable-state sets, published TOGETHER
+        // under one write (STUDIO-672). Together because the off-loop triage task reads them as a
+        // pair and acts on the pair; from this reload rather than re-derived there so triage and
+        // the selection gate can never disagree about which tickets are work.
+        self.set_reads_triage_snapshot(project_trackers, states);
         // Resolve configured project slugs against Linear + flag any missing repo-relative prompt_file,
         // best-effort and OFF the control task (a no-op on the direct-reload test path where `o.ctx` is
         // nil). INF-277 / INF-279.

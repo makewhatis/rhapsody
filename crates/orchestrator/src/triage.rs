@@ -321,6 +321,22 @@ pub trait IdentityHistory: Send + Sync {
     /// empty `Some` is a positive answer — this daemon has a record of the ticket and no run on it
     /// ever wore an identity.
     fn identities_for(&self, issue_identifier: &str) -> Option<Vec<String>>;
+
+    /// **The earliest instant this history can speak to**, or `None` when it can speak to nothing.
+    ///
+    /// [`Self::identities_for`] answering `Some(vec![])` means "no run of this ticket wore an
+    /// identity **as far as this record goes**", and that qualifier is load-bearing: history is
+    /// pruned ([`rhapsody_store::Store::prune`], 30 days by default) and a database can be young,
+    /// replaced or restored. Before the horizon an empty answer is not evidence of anything, so the
+    /// reconcile judges a ticket only when the ticket itself is NEWER than this instant — a ticket
+    /// created after the horizon cannot have had a run before it, so every run it ever had is still
+    /// on the record.
+    ///
+    /// `None` disables the sweep outright. That is the answer for a store that holds no runs
+    /// (fresh, replaced, or storage off) and for one that has never recorded a single routed
+    /// dispatch — in both, "nobody ever wore anything" is the shape of an empty ledger, not a fact
+    /// about the workspace.
+    fn horizon(&self) -> Option<chrono::DateTime<Utc>>;
 }
 
 /// [`IdentityHistory`] over the durable history store: the `teams.route` events row every routed
@@ -331,11 +347,39 @@ pub trait IdentityHistory: Send + Sync {
 /// for an unworn label and cost a teammate a label she earned.
 pub struct StoreIdentityHistory {
     store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    /// `storage.retention_days` as the prune scheduler reads it. `<= 0` means "keep forever", so
+    /// nothing has been deleted for age and the horizon is the store's own coverage alone.
+    retention_days: i64,
 }
 
 impl StoreIdentityHistory {
-    pub fn new(store: Arc<dyn rhapsody_store::Store + Send + Sync>) -> Self {
-        StoreIdentityHistory { store }
+    pub fn new(store: Arc<dyn rhapsody_store::Store + Send + Sync>, retention_days: i64) -> Self {
+        StoreIdentityHistory {
+            store,
+            retention_days,
+        }
+    }
+
+    /// Whether this store has EVER recorded a routed dispatch. A store with runs but not one
+    /// `teams.route` row is a store whose Teams ledger has never been written to — every label
+    /// would read as unworn — so it answers "cannot tell" rather than "nobody".
+    fn has_route_evidence(&self) -> bool {
+        let q = rhapsody_store::EventQuery {
+            text: String::new(),
+            issue: String::new(),
+            kind: crate::teams::EVENT_ROUTE.to_string(),
+            limit: 1,
+        };
+        match self.store.search_events(q) {
+            Ok(hits) => !hits.is_empty(),
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "teams triage could not probe the run history for routed dispatches"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -362,6 +406,59 @@ impl IdentityHistory for StoreIdentityHistory {
                 None
             }
         }
+    }
+
+    /// `max(prune cutoff, the oldest run this store still holds)` — the later of the two instants
+    /// before which an empty answer is uninformative, and `None` when either half cannot be
+    /// established.
+    ///
+    /// The two halves close different holes and neither closes the other's:
+    ///
+    /// * **The prune cutoff** (`now - retention_days`) is where a HEALTHY, long-lived store stops
+    ///   remembering. A label earned 40 days ago on a 30-day store has no surviving `teams.route`
+    ///   row, and stripping it would punish a teammate for the passage of time.
+    /// * **The oldest retained run** is where a YOUNG or REPLACED store starts remembering. A
+    ///   database created yesterday satisfies any retention window vacuously — every question about
+    ///   last month answers "no record" — so the cutoff alone would licence stripping every label
+    ///   in the workspace, which is exactly the failure this bound exists to make unreachable.
+    ///
+    /// A store with no runs at all yields `None`: it has no coverage to bound anything by. So does
+    /// a store that has never written a routed dispatch, because an unwritten ledger and an honest
+    /// "nobody" are the same rows.
+    fn horizon(&self) -> Option<chrono::DateTime<Utc>> {
+        let earliest = match self.store.earliest_run_start() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "teams triage could not establish the run history's horizon; \
+                     no label will be removed"
+                );
+                return None;
+            }
+        }?;
+        let coverage = chrono::DateTime::parse_from_rfc3339(&earliest)
+            .map(|t| t.with_timezone(&Utc))
+            .map_err(|e| {
+                tracing::warn!(
+                    started_at = %earliest,
+                    err = %e,
+                    "teams triage could not parse the oldest run's start; no label will be removed"
+                );
+            })
+            .ok()?;
+        if !self.has_route_evidence() {
+            tracing::info!(
+                "teams triage found no routed-dispatch history at all; it cannot tell an unworn \
+                 label from an unwritten ledger, so it removes nothing"
+            );
+            return None;
+        }
+        if self.retention_days <= 0 {
+            return Some(coverage); // nothing is deleted for age; coverage is the only bound
+        }
+        let cutoff = Utc::now() - chrono::Duration::days(self.retention_days);
+        Some(coverage.max(cutoff))
     }
 }
 
@@ -441,6 +538,17 @@ pub struct TriageDeps<TF> {
     /// reconcile outright — a sweep with nothing to judge by would have to guess, and guessing here
     /// means removing labels a teammate earned.
     pub history: Option<Arc<dyn IdentityHistory>>,
+    /// Where the one-time reconcile records that it has RUN (STUDIO-672) — a sidecar file in the
+    /// runtime home beside `teams.yaml`, resolved by the daemon's `resolve_teams_reconcile_path`.
+    ///
+    /// **The persistence is the "one-time", not the flag in the loop.** A process-local bool re-arms
+    /// the sweep at every boot, and daemons restart at every deploy — so a label an operator
+    /// deliberately places on a review ticket would be stripped again the next morning, which is the
+    /// exact fight §0.11.1's "a present label is authoritative whoever wrote it" forbids.
+    ///
+    /// `None` disables the reconcile outright rather than running it unrecorded: a sweep that cannot
+    /// remember having run is not one-time, it is every-boot.
+    pub reconcile_marker: Option<std::path::PathBuf>,
 }
 
 /// What one cycle did — the input to the back-off decision, and the assertion surface for the
@@ -576,7 +684,7 @@ where
     // first cycle that can reach a tracker and retired the moment one completes, so the cleanup
     // survives a daemon that boots before Linear answers without becoming a standing duty that
     // fights an operator over every label they place on a review ticket.
-    let mut reconcile_pending = deps.history.is_some();
+    let mut reconcile_pending = reconcile_armed(&deps);
     loop {
         // WHY this cycle woke decides what it may do. The arrival kick (STUDIO-669, §A.3.2) and
         // the deadline are both wake-ups, and treating them identically would break one of the two
@@ -603,12 +711,12 @@ where
         // from a backlog — which drains [`MAX_PER_CYCLE`] at a time.
         if kicked && failures > 0 {
             let report = triage_cycle_reporting(&ctx, &deps, false, reconcile_pending).await;
-            reconcile_pending = retire_reconcile(reconcile_pending, &report);
+            reconcile_pending = retire_reconcile(&deps, reconcile_pending, &report);
             reporter.report(report);
             continue;
         }
         let report = triage_cycle_reporting(&ctx, &deps, true, reconcile_pending).await;
-        reconcile_pending = retire_reconcile(reconcile_pending, &report);
+        reconcile_pending = retire_reconcile(&deps, reconcile_pending, &report);
         let outcome = report.outcome;
         reporter.report(report);
         if outcome.is_failure() {
@@ -634,21 +742,91 @@ where
     }
 }
 
+/// Whether the one-time reconcile still owes a sweep in THIS runtime home (STUDIO-672).
+///
+/// Three things must all hold: a history to judge by, a marker path to record the retirement in,
+/// and no marker already written. The middle one is not bookkeeping — a sweep whose retirement is
+/// not durable re-runs at every restart, so "cannot record it" and "must not run it" are the same
+/// condition.
+fn reconcile_armed<TF>(deps: &TriageDeps<TF>) -> bool {
+    if deps.history.is_none() {
+        return false;
+    }
+    let Some(marker) = deps.reconcile_marker.as_deref() else {
+        tracing::info!(
+            "teams triage has no runtime home to record a completed reconcile in; the one-time \
+             review-label sweep is disabled rather than repeated at every restart"
+        );
+        return false;
+    };
+    match std::fs::metadata(marker) {
+        Ok(_) => {
+            tracing::info!(
+                marker = %marker.display(),
+                "teams triage already completed its one-time review-label reconcile; not repeating it"
+            );
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            // Unreadable is not absent. Assuming "not yet run" here is how a permissions problem
+            // turns a one-time sweep into a nightly one.
+            tracing::warn!(
+                marker = %marker.display(),
+                err = %e,
+                "teams triage cannot read its reconcile marker; the one-time review-label sweep is \
+                 skipped rather than risked"
+            );
+            false
+        }
+    }
+}
+
 /// Retires the one-time reconcile once a cycle has actually completed one (STUDIO-672), and says
 /// so on the log — including when it removed nothing, which is the healthy steady state and would
 /// otherwise be indistinguishable from a sweep that never ran.
-fn retire_reconcile(pending: bool, report: &CycleReport) -> bool {
+///
+/// The retirement is WRITTEN before it is believed: a marker that cannot be persisted leaves the
+/// sweep pending for this process rather than silently becoming a per-boot duty next time.
+fn retire_reconcile<TF>(deps: &TriageDeps<TF>, pending: bool, report: &CycleReport) -> bool {
     match report.reconciled {
         Some(n) if pending => {
+            let Some(marker) = deps.reconcile_marker.as_deref() else {
+                return false; // unreachable: `reconcile_armed` refuses to arm without one
+            };
+            if let Err(e) = write_reconcile_marker(marker, n) {
+                tracing::warn!(
+                    marker = %marker.display(),
+                    err = %e,
+                    "teams triage completed its one-time review-label reconcile but could not \
+                     record it; it will not run again this process, and an operator should create \
+                     that file so a restart does not repeat the sweep"
+                );
+                return false;
+            }
             tracing::info!(
                 removed = n,
-                "teams triage completed its one-time review-label reconcile; it will not run again \
-                 this process"
+                marker = %marker.display(),
+                "teams triage completed its one-time review-label reconcile; it will not run again"
             );
             false
         }
         _ => pending,
     }
+}
+
+/// Writes the reconcile's retirement record: when it ran and how much it removed, so an operator
+/// reading the runtime home can tell a completed sweep from one that never happened.
+fn write_reconcile_marker(marker: &std::path::Path, removed: usize) -> std::io::Result<()> {
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body = serde_json::json!({
+        "reconciled_at": Utc::now().to_rfc3339(),
+        "labels_removed": removed,
+        "ticket": "STUDIO-672",
+    });
+    std::fs::write(marker, format!("{body}\n"))
 }
 
 /// Turns a stream of [`CycleReport`]s into a BOUNDED stream of INFO lines (STUDIO-671).
@@ -1131,9 +1309,15 @@ where
 ///   whoever wrote it" still holds for every label the manager did not author.
 /// * **Positive evidence only.** A history that cannot be read ([`IdentityHistory`] answering
 ///   `None`) leaves the ticket alone. "Cannot tell" is never "nobody".
-/// * **[`MAX_RECONCILE`] removals, ONCE per process.** The caller runs this on the first cycle that
-///   can complete it and never again, so a human who deliberately labels a review ticket afterwards
-///   is not fought over it every minute.
+/// * **Inside the history's own horizon.** [`IdentityHistory::horizon`] names the earliest instant
+///   the record can speak to; only tickets CREATED after it are judged. An older ticket's evidence
+///   may have been pruned or may have lived in a database this one replaced, and an absence with an
+///   innocent explanation is not evidence. A ticket with no `created_at` at all is likewise
+///   unjudgeable and kept.
+/// * **[`MAX_RECONCILE`] removals, ONCE per runtime home.** The caller runs this on the first cycle
+///   that can complete it and — because the retirement is written to a marker file beside
+///   `teams.yaml`, not held in a task-local flag — never again across restarts, so a human who
+///   deliberately labels a review ticket afterwards is not fought over it at the next deploy.
 ///
 /// One aggregated room post names everything it removed — never one per ticket, because the point
 /// of the whole ticket is that a parked review ticket generates no per-ticket noise.
@@ -1161,7 +1345,19 @@ where
     if states.review.is_empty() {
         return None;
     }
+    // The bound on "absence of evidence" (STUDIO-672 review). Established ONCE per sweep, before
+    // any judging: a history that can vouch for no instant at all cannot support a single removal,
+    // and reporting "did not run" rather than "ran and removed nothing" is what keeps the one-time
+    // sweep pending until a store that CAN answer is open.
+    let Some(horizon) = history.horizon() else {
+        tracing::info!(
+            "teams triage has no history horizon to judge review-state labels against; \
+             the one-time reconcile stays pending and nothing is removed"
+        );
+        return None;
+    };
     let mut removed: Vec<String> = Vec::new();
+    let mut out_of_window = 0usize;
     for iss in issues.iter().filter(|i| states.is_in_review(i)) {
         if removed.len() >= MAX_RECONCILE {
             tracing::warn!(
@@ -1183,6 +1379,14 @@ where
             .map(|name| name.to_string())
             .collect();
         if orphans.is_empty() {
+            continue;
+        }
+        // Older than the record itself ⇒ unjudgeable. A ticket created before the horizon could
+        // have been worked in a run whose rows are pruned or whose database is gone, so an empty
+        // history says nothing about it. Checked AFTER the cheap label filters so an ordinary
+        // workspace of old, unlabelled review tickets costs nothing.
+        if !iss.created_at.is_some_and(|c| c >= horizon) {
+            out_of_window += 1;
             continue;
         }
         // ONE history read per ticket, not per label: the answer is the same for every label on it.
@@ -1230,6 +1434,14 @@ where
                 }
             }
         }
+    }
+    if out_of_window > 0 {
+        tracing::info!(
+            issues = out_of_window,
+            horizon = %horizon.to_rfc3339(),
+            "teams triage left identity labels on review tickets older than the run history it \
+             could check them against; remove those by hand if they are wrong"
+        );
     }
     if !removed.is_empty() {
         post(
@@ -1706,6 +1918,17 @@ mod tests {
     fn in_review(id: &str, labels: &[&str]) -> Issue {
         let mut iss = labelled(id, labels);
         iss.state = "In Review".to_string();
+        // Created inside the reconcile's evidence window (STUDIO-672): a ticket older than the run
+        // history could not be judged by it, so the default here is a ticket that CAN be.
+        iss.created_at = Some(Utc::now() - chrono::Duration::days(1));
+        iss
+    }
+
+    /// The same review-state ticket, but filed before the history's horizon — old enough that an
+    /// empty history says nothing about it.
+    fn in_review_aged(id: &str, labels: &[&str], days: i64) -> Issue {
+        let mut iss = in_review(id, labels);
+        iss.created_at = Some(Utc::now() - chrono::Duration::days(days));
         iss
     }
 
@@ -1825,6 +2048,7 @@ mod tests {
             handle: Arc::new(TriageHandle::new()),
             room: None,
             history: None,
+            reconcile_marker: None,
         }
     }
 
@@ -1868,6 +2092,7 @@ mod tests {
             handle: Arc::new(TriageHandle::new()),
             room: None,
             history: None,
+            reconcile_marker: None,
         }
     }
 
@@ -2619,6 +2844,7 @@ mod tests {
             handle: Arc::new(TriageHandle::new()),
             room: None,
             history: None,
+            reconcile_marker: None,
         };
         assert_eq!(
             triage_cycle(&CancelWait::default(), &d, true).await,
@@ -3045,6 +3271,21 @@ mod tests {
     /// filter and the selection gate's own `eligibility` answer the SAME question about state,
     /// because both run [`crate::dispatch::dispatchable_state`]. If a future edit gave either its
     /// own state test, this table would disagree.
+    ///
+    /// **What is shared is the STATE axis, and only that.** `eligibility` has four more gates that
+    /// [`unlabelled_candidates`] does not run, and the exclusions are deliberate:
+    ///
+    /// * `running` / `claimed` — a ticket already dispatching is work in flight; triage labelling it
+    ///   is exactly the ahead-of-dispatch assignment the feature is for.
+    /// * blocker holds — a blocked Todo ticket is still work somebody is about to do once the
+    ///   blocker clears, and pre-assigning it is the point.
+    /// * **`required_labels`** — the one real divergence. When `labels:` is configured, the gate
+    ///   holds only tickets carrying one of them, so triage can still assign an identity to a
+    ///   dispatchable ticket the gate will never pick up. It is NOT closed here because the label
+    ///   set is PER-PROJECT (`select.rs` reads `p.labels`, not one account-wide set) while triage's
+    ///   published snapshot is a flat tracker list, so sharing it means re-shaping [`TriageTarget`]
+    ///   — a change with no bearing on STUDIO-672's harm, which was review-state tickets. Noted in
+    ///   the PR body as a follow-up, and asserted below so it cannot widen unnoticed.
     #[test]
     fn the_gate_and_triage_cannot_disagree_about_what_is_dispatchable() {
         let states = DispatchStates {
@@ -3072,6 +3313,23 @@ mod tests {
                 "{state}: the gate and triage must agree about dispatchability"
             );
         }
+        // The known, documented divergence, pinned at its current width: a required-label MISS is
+        // the ONLY way the two answers can differ. If this ever starts failing, either the gap was
+        // closed (delete this) or a second axis drifted apart (fix that).
+        let labelled_gate = crate::dispatch::EligibilityGate {
+            required_labels: &set_of(&["ready"]),
+            ..gate
+        };
+        let mut iss = labelled("i1", &["docs"]);
+        iss.state = "Todo".to_string();
+        assert!(
+            !crate::dispatch::eligibility(&iss, &empty, &empty, &labelled_gate).ok,
+            "the gate declines a ticket missing every required label"
+        );
+        assert!(
+            !unlabelled_candidates(std::slice::from_ref(&iss), &states).is_empty(),
+            "triage still considers it — the label axis is not shared (see this test's doc)"
+        );
     }
 
     // ── STUDIO-672: the one-time reconcile ──────────────────────────────────────────────────────
@@ -3081,6 +3339,8 @@ mod tests {
         worn: HashMap<String, Vec<String>>,
         /// Identifiers the history refuses to answer for — the "cannot tell" case.
         opaque: Vec<String>,
+        /// How far back this record reaches. `None` is a record that can vouch for nothing.
+        horizon: Option<chrono::DateTime<Utc>>,
         reads: Mutex<Vec<String>>,
     }
 
@@ -3097,6 +3357,7 @@ mod tests {
                     })
                     .collect(),
                 opaque: Vec::new(),
+                horizon: Some(Utc::now() - chrono::Duration::days(7)),
                 reads: Mutex::new(Vec::new()),
             })
         }
@@ -3104,8 +3365,23 @@ mod tests {
             Arc::new(FakeHistory {
                 worn: HashMap::new(),
                 opaque: names.iter().map(|s| (*s).to_string()).collect(),
+                horizon: Some(Utc::now() - chrono::Duration::days(7)),
                 reads: Mutex::new(Vec::new()),
             })
+        }
+        /// A record that reaches back no further than `days` — everything filed before that is
+        /// outside the window it can be judged in.
+        fn reaching_back(worn: &[(&str, &[&str])], days: i64) -> Arc<Self> {
+            let mut h = FakeHistory::new(worn);
+            Arc::get_mut(&mut h).expect("sole owner").horizon =
+                Some(Utc::now() - chrono::Duration::days(days));
+            h
+        }
+        /// A record that can vouch for nothing: storage off, a fresh database, a failed open.
+        fn horizonless() -> Arc<Self> {
+            let mut h = FakeHistory::new(&[]);
+            Arc::get_mut(&mut h).expect("sole owner").horizon = None;
+            h
         }
         fn reads(&self) -> Vec<String> {
             self.reads.lock().expect("reads").clone()
@@ -3122,6 +3398,10 @@ mod tests {
                 return None;
             }
             Some(self.worn.get(issue_identifier).cloned().unwrap_or_default())
+        }
+
+        fn horizon(&self) -> Option<chrono::DateTime<Utc>> {
+            self.horizon
         }
     }
 
@@ -3161,6 +3441,7 @@ mod tests {
             handle: Arc::new(TriageHandle::new()),
             room: Some(room),
             history: Some(history),
+            reconcile_marker: None,
         }
     }
 
@@ -3343,30 +3624,193 @@ mod tests {
         assert!(history.reads().is_empty(), "and nothing was even judged");
     }
 
-    /// The sweep is retired by the FIRST cycle that completes one, and a cycle that could not run it
-    /// leaves it owing — that is the whole of "one-time, in-code and bounded".
-    #[test]
-    fn the_reconcile_is_retired_only_by_a_cycle_that_ran_it() {
-        let report = |reconciled| CycleReport {
+    /// A report shaped like the cycle's, carrying only the field retirement turns on.
+    fn cycle_report(reconciled: Option<usize>) -> CycleReport {
+        CycleReport {
             outcome: CycleOutcome::Idle,
             target: true,
             trackers: 1,
             fetched: 0,
             candidates: 0,
             reconciled,
-        };
+        }
+    }
+
+    /// Deps whose only interesting field is where the retirement is written.
+    fn deps_with_marker(
+        marker: Option<std::path::PathBuf>,
+        history: Option<Arc<dyn IdentityHistory>>,
+    ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
+        let mut d = deps(
+            teams_model(vec![ident("alice", &[])]),
+            Arc::new(Fake::new()),
+            FakeArbiter::answering(vec![]) as Arc<dyn TriageArbiter>,
+        );
+        d.history = history;
+        d.reconcile_marker = marker;
+        d
+    }
+
+    /// **Absence of evidence is not evidence, when the absence has an innocent explanation**
+    /// (STUDIO-672 review finding 2). History is pruned — `storage.retention_days` defaults to 30 —
+    /// so a label a teammate earned two months ago has no surviving `teams.route` row and reads
+    /// exactly like one the bug wrote. The ticket's own age against the record's horizon is what
+    /// tells the two apart, and a ticket older than the record is kept, not stripped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_older_than_the_history_keeps_its_label() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![
+            // Filed long before the record begins: its evidence could have been pruned.
+            in_review_aged("STUDIO-100", &["rhapsody:@alice"], 90),
+            // Filed inside the window: an empty history really does mean nobody wore it.
+            in_review("STUDIO-660", &["rhapsody:@alice"]),
+        ];
+        let tr = Arc::new(tr);
+        let history = FakeHistory::reaching_back(&[], 30);
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let d = deps_with_history(
+            teams_model(vec![ident("alice", &[])]),
+            Arc::clone(&tr),
+            Arc::clone(&history) as Arc<dyn IdentityHistory>,
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        let report = triage_cycle_reporting(&CancelWait::default(), &d, true, true).await;
+        assert_eq!(
+            report.reconciled,
+            Some(1),
+            "only the judgeable one is swept"
+        );
+        let removed: Vec<String> = tr
+            .remove_label_calls()
+            .into_iter()
+            .map(|c| c.issue_id)
+            .collect();
+        assert_eq!(removed, vec!["STUDIO-660".to_string()]);
+        assert_eq!(
+            history.reads(),
+            vec!["STUDIO-660".to_string()],
+            "the out-of-window ticket is not even asked about — its answer could not be trusted"
+        );
+    }
+
+    /// **A record that can vouch for nothing removes nothing** (STUDIO-672 review finding 1).
+    ///
+    /// This is the shape a `Noop` store takes: it answers every read `Ok(empty)` and never `Err`,
+    /// so "nobody ever wore anything" is what a failed store-open, a fresh database and storage
+    /// switched off all say. Answering that with a workspace-wide strip is the worst outcome this
+    /// sweep has, so a `None` horizon disables it — and leaves it OWING, so a later boot with a
+    /// readable store still gets its one cleanup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_history_that_vouches_for_nothing_removes_nothing() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![
+            in_review("STUDIO-572", &["rhapsody:@alice"]),
+            in_review("STUDIO-670", &["rhapsody:@alice"]),
+        ];
+        let tr = Arc::new(tr);
+        let history = FakeHistory::horizonless();
+        let room = Arc::new(LocalRoom::new(TempDir::new().child("room")));
+        let d = deps_with_history(
+            teams_model(vec![ident("alice", &[])]),
+            Arc::clone(&tr),
+            Arc::clone(&history) as Arc<dyn IdentityHistory>,
+            Arc::clone(&room) as Arc<dyn RoomLog>,
+        );
+
+        let report = triage_cycle_reporting(&CancelWait::default(), &d, true, true).await;
+        assert_eq!(
+            report.reconciled, None,
+            "not 'ran and removed nothing' — 'could not run', so the sweep stays owed"
+        );
         assert!(
-            retire_reconcile(true, &report(None)),
+            tr.remove_label_calls().is_empty(),
+            "and no label is touched"
+        );
+        assert!(history.reads().is_empty(), "nothing was even judged");
+    }
+
+    /// The sweep is retired by the FIRST cycle that completes one, and a cycle that could not run it
+    /// The sweep is retired by the FIRST cycle that completes one, and a cycle that could not run it
+    /// leaves it owing — that is the whole of "one-time, in-code and bounded".
+    #[test]
+    fn the_reconcile_is_retired_only_by_a_cycle_that_ran_it() {
+        let dir = TempDir::new();
+        let d = deps_with_marker(
+            Some(std::path::PathBuf::from(dir.child("teams/reconcile.json"))),
+            Some(FakeHistory::new(&[]) as Arc<dyn IdentityHistory>),
+        );
+        assert!(
+            retire_reconcile(&d, true, &cycle_report(None)),
             "a cycle that did not sweep leaves the sweep owing"
         );
         assert!(
-            !retire_reconcile(true, &report(Some(0))),
+            !retire_reconcile(&d, true, &cycle_report(Some(0))),
             "a sweep that cleaned nothing still counts as done"
         );
         assert!(
-            !retire_reconcile(false, &report(Some(3))),
+            !retire_reconcile(&d, false, &cycle_report(Some(3))),
             "and once retired it stays retired"
         );
+    }
+
+    /// **The retirement outlives the process** (STUDIO-672 review finding 3). A daemon restarts at
+    /// every deploy; a task-local bool would re-arm the sweep each time and re-strip a label an
+    /// operator had deliberately placed on a review ticket since. The marker file is what makes
+    /// "one-time" mean once, not once per boot.
+    #[test]
+    fn a_completed_reconcile_is_remembered_across_a_restart() {
+        let dir = TempDir::new();
+        let marker = std::path::PathBuf::from(dir.child("teams/reconcile.json"));
+        let d = deps_with_marker(
+            Some(marker.clone()),
+            Some(FakeHistory::new(&[]) as Arc<dyn IdentityHistory>),
+        );
+        assert!(
+            reconcile_armed(&d),
+            "nothing recorded yet ⇒ the sweep owes one"
+        );
+
+        assert!(!retire_reconcile(&d, true, &cycle_report(Some(2))));
+        assert!(
+            marker.exists(),
+            "the retirement is written, not just believed"
+        );
+        let body = std::fs::read_to_string(&marker).expect("marker");
+        assert!(
+            body.contains("\"labels_removed\":2"),
+            "and it records what the sweep did, for an operator reading the runtime home: {body}"
+        );
+
+        // A fresh process over the same runtime home: same deps, rebuilt from scratch.
+        let restarted = deps_with_marker(
+            Some(marker),
+            Some(FakeHistory::new(&[]) as Arc<dyn IdentityHistory>),
+        );
+        assert!(
+            !reconcile_armed(&restarted),
+            "a restart must not re-arm a sweep that already ran"
+        );
+    }
+
+    /// No durable home to record the retirement in ⇒ the sweep does not run at all. Running it
+    /// unrecorded is not "one-time", it is "every boot" — the worse of the two failures, because it
+    /// is the one that removes labels.
+    #[test]
+    fn a_reconcile_that_cannot_be_recorded_does_not_run() {
+        let d = deps_with_marker(
+            None,
+            Some(FakeHistory::new(&[]) as Arc<dyn IdentityHistory>),
+        );
+        assert!(!reconcile_armed(&d));
+        // And with no history seam either — belt and braces, both must be present.
+        let d = deps_with_marker(
+            Some(std::path::PathBuf::from(
+                TempDir::new().child("teams/reconcile.json"),
+            )),
+            None,
+        );
+        assert!(!reconcile_armed(&d));
     }
 
     /// The `teams.route` event text is `identity=<name> reason=<why>`; the identity is read out of
@@ -3422,7 +3866,7 @@ mod tests {
             )
             .expect("append events");
 
-        let history = StoreIdentityHistory::new(Arc::clone(&store));
+        let history = StoreIdentityHistory::new(Arc::clone(&store), 30);
         assert_eq!(
             history.identities_for("STUDIO-670"),
             Some(vec!["alice".to_string()])
@@ -3432,6 +3876,87 @@ mod tests {
             Some(Vec::new()),
             "a ticket this daemon has no route row for wore nobody — a positive answer, not a \
              refusal"
+        );
+    }
+
+    /// The store-backed horizon, against a REAL store: what the seam can vouch for, and when it
+    /// admits it can vouch for nothing (STUDIO-672 review findings 1 and 2).
+    #[test]
+    fn the_store_horizon_refuses_to_vouch_for_what_it_cannot_hold() {
+        // A store with no runs at all — a fresh or replaced database, or a failed open falling back
+        // to `Noop`. It has no coverage, so it bounds nothing and the sweep must not run.
+        let (_o, empty) = crate::testsupport::orch_with_store();
+        assert_eq!(
+            StoreIdentityHistory::new(Arc::clone(&empty), 30).horizon(),
+            None
+        );
+        assert_eq!(
+            StoreIdentityHistory::new(Arc::new(rhapsody_store::Noop), 30).horizon(),
+            None,
+            "a Noop answers Ok(empty) to every read; it must never be read as 'nobody'"
+        );
+
+        // A store with runs but not one routed dispatch: an unwritten Teams ledger looks exactly
+        // like an honest "nobody", so it is not one either.
+        let (_o2, store) = crate::testsupport::orch_with_store();
+        let started = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        let run = store
+            .start_run(rhapsody_store::RunStart {
+                issue_id: "i1".into(),
+                issue_identifier: "STUDIO-670".into(),
+                title: "t".into(),
+                started_at: started.clone(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start run");
+        assert_eq!(
+            StoreIdentityHistory::new(Arc::clone(&store), 30).horizon(),
+            None,
+            "no teams.route row anywhere ⇒ cannot tell"
+        );
+
+        // With a route row, the horizon is the store's own coverage when that is LATER than the
+        // prune cutoff — the young-database case, where the retention window is satisfied vacuously.
+        store
+            .append_events(
+                run,
+                &[rhapsody_store::EventRow {
+                    seq: 1,
+                    at: started.clone(),
+                    kind: crate::teams::EVENT_ROUTE.into(),
+                    tool: String::new(),
+                    text: "identity=alice reason=label".into(),
+                }],
+            )
+            .expect("append events");
+        let coverage = chrono::DateTime::parse_from_rfc3339(&started)
+            .expect("parse")
+            .with_timezone(&Utc);
+        let young = StoreIdentityHistory::new(Arc::clone(&store), 30)
+            .horizon()
+            .expect("a store with runs and route rows can vouch for something");
+        assert_eq!(
+            young, coverage,
+            "a 10-day-old store cannot answer questions about last month, whatever retention says"
+        );
+
+        // And the prune cutoff when THAT is later — the long-lived-store case, where evidence older
+        // than the window has been deleted for age.
+        let pruning = StoreIdentityHistory::new(Arc::clone(&store), 3)
+            .horizon()
+            .expect("still vouches");
+        assert!(
+            pruning > coverage,
+            "a 3-day retention deletes the evidence for anything older, so the horizon moves up: \
+             {pruning} vs {coverage}"
+        );
+
+        // `retention_days <= 0` keeps everything forever, so coverage is the only bound.
+        assert_eq!(
+            StoreIdentityHistory::new(Arc::clone(&store), 0)
+                .horizon()
+                .expect("still vouches"),
+            coverage
         );
     }
 
@@ -3644,11 +4169,11 @@ mod tests {
             Arc::clone(&account) as Arc<dyn Tracker>,
             "lin_api_key_value_1234",
         );
-        o.set_reads_projects(vec![Arc::clone(&proj) as Arc<dyn Tracker>]);
-        // The third write `reload` makes, and the one triage filters candidates by (STUDIO-672).
-        // Without it the daemon publishes trackers but no dispatchable state, and triage correctly
-        // assigns nothing — which is what this line existing proves is a wiring requirement.
-        o.set_reads_states(states());
+        // The trackers and the states, published TOGETHER exactly as `reload` publishes them
+        // (STUDIO-672). The states are what triage filters candidates by; without them the daemon
+        // would publish trackers but no dispatchable state, and triage would correctly assign
+        // nothing — which is what this call being the production one proves is a wiring requirement.
+        o.set_reads_triage_snapshot(vec![Arc::clone(&proj) as Arc<dyn Tracker>], states());
 
         let seam = Arc::new(TriageHandle::new());
         let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
@@ -3676,6 +4201,7 @@ mod tests {
             handle: Arc::clone(&seam),
             room: None,
             history: None,
+            reconcile_marker: None,
         };
         let signal = crate::control_loop::CancelSignal::new();
         let ctx = signal.wait();

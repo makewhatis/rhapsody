@@ -100,17 +100,31 @@ impl Orchestrator {
         w.project_trackers = trackers;
     }
 
-    /// Records this reload's dispatchable-state sets for the off-loop Teams triage task
-    /// (STUDIO-672). Called from the reload path beside [`Orchestrator::set_reads_projects`], so a
-    /// hot-reloaded `active_states`/`terminal_states` reaches triage without a restart.
+    /// Publishes BOTH halves of the off-loop triage snapshot under **one** write acquisition —
+    /// every enabled project's tracker and this reload's dispatchable-state sets (STUDIO-672).
     ///
-    /// Triage needs these because "who should take this ticket?" is only ever asked of work
+    /// Triage needs the states because "who should take this ticket?" is only ever asked of work
     /// somebody is about to do. The selection gate holds exactly the DISPATCHABLE candidates, and
     /// triage exists to release that hold — so the two must filter by the identical predicate
     /// ([`dispatchable_state`](crate::dispatch::dispatchable_state)), which means triage needs the
-    /// identical sets rather than a restatement of them.
-    pub fn set_reads_states(&self, states: DispatchStates) {
+    /// gate's identical sets rather than a restatement of them.
+    ///
+    /// Separate writes are what [`Self::reads_triage_target`]'s single read was defending against
+    /// only half of: a reader can hold the lock between two writes just as easily as it can take it
+    /// twice, so publishing the pair in two acquisitions leaves the identical straddle window open
+    /// from the other side. Written together, the pair a reader sees is always one reload's.
+    ///
+    /// The account-level tracker ([`Self::set_reads_target`], the Go-parity write) stays separate
+    /// and that is safe: `reads_triage_target` reads it only as a "has a config ever loaded"
+    /// sentinel and never correlates it with either field, so a reader between the two writes sees
+    /// the previous reload's pair — stale together, never mixed.
+    pub fn set_reads_triage_snapshot(
+        &self,
+        trackers: Vec<Arc<dyn Tracker>>,
+        states: DispatchStates,
+    ) {
         let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
+        w.project_trackers = trackers;
         w.states = states;
     }
 
@@ -181,12 +195,13 @@ impl ControlHandle {
     /// filter by. `None` before the first config load, exactly as
     /// [`Self::reads_project_trackers`] reports it.
     ///
-    /// **The single acquisition is the point, not a micro-optimisation.** The reload publishes the
-    /// trackers and the states in separate writes, so two separate reads can straddle one and hand
-    /// the caller trackers with a default (empty) state snapshot. Triage filters candidates by
-    /// those states and — worse — runs its ONE-TIME reconcile against them, so a cycle that landed
-    /// in that window would sweep nothing, report a completed sweep, and retire a cleanup that
-    /// never happened. Reading both under one lock makes that window unreachable.
+    /// **The single acquisition is the point, not a micro-optimisation.** Two separate reads can
+    /// straddle a reload and hand the caller trackers with a default (empty) state snapshot. Triage
+    /// filters candidates by those states and — worse — runs its ONE-TIME reconcile against them,
+    /// so a cycle that landed in that window would sweep nothing, report a completed sweep, and
+    /// retire a cleanup that never happened. Reading both under one lock closes half of that
+    /// window; [`Self::set_reads_triage_snapshot`] writing both under one lock closes the other
+    /// half. Neither alone is sufficient, which is why the reload path uses that publisher.
     ///
     /// Cloning the values out releases the lock immediately — it is never held across an `await`.
     pub fn reads_triage_target(&self) -> Option<(Vec<Arc<dyn Tracker>>, DispatchStates)> {
