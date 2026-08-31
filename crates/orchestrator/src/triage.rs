@@ -129,6 +129,16 @@ fn turn_timeout(timeout_ms: i64) -> Duration {
     })
 }
 
+/// How many cycles of an UNCHANGED outcome pass before the schedule says so again (STUDIO-671).
+///
+/// Applied as a WINDOW rather than a counter — `interval * IDLE_HEARTBEAT_CYCLES` — because cycles
+/// are not paced by the interval alone. The selection gate kicks a cycle every tick it holds a
+/// ticket (a couple of seconds on a live daemon), so a plain "every 15th cycle" heartbeat would
+/// fire every half-minute during exactly the wedge it exists to report. Bounding by elapsed time
+/// caps the line at one per quarter-hour in production while a millisecond-cadence test still sees
+/// it promptly, and the count it carries is what makes the summary honest either way.
+const IDLE_HEARTBEAT_CYCLES: u32 = 15;
+
 /// The most pending assignments the liveness valve will hold at once.
 ///
 /// The map only ever grows on a **failed** label write, so in a healthy daemon it is empty and in a
@@ -281,9 +291,21 @@ pub trait TriageArbiter: Send + Sync {
 /// The live inputs one cycle needs, read fresh each cycle so a hot-reloaded tracker is honoured
 /// (the same "read it lazily per cycle" stance the prune scheduler takes with its store handle).
 pub struct TriageTarget {
-    /// The account-level tracker captured by the most recent config load; `None` before the first
-    /// load, which simply skips the cycle.
-    pub tracker: Arc<dyn Tracker>,
+    /// Every ENABLED project's slug-bound tracker, in the poll loop's order — the SAME clients
+    /// `on_tick` fans its candidate fetch over.
+    ///
+    /// **It is a list, and that is the STUDIO-671 fix.** T3b gave this seam the single
+    /// account-level tracker (`eff.tracker`), which is bound to the top-level
+    /// `tracker.project_slug`. In the `projects:` config form that slug is legitimately EMPTY — the
+    /// projects supply the slugs, and `config::validate` only rejects both being absent — so the
+    /// candidate query filtered `project.slugId == ""`, Linear answered zero rows with no error,
+    /// and every cycle fell out at `candidates.is_empty()` as a silent [`CycleOutcome::Idle`].
+    /// Triage saw none of the daemon's work while the selection gate held it, forever.
+    ///
+    /// EMPTY is meaningful and not a failure: a config IS loaded and every project in it is paused.
+    /// There is nothing to sweep, exactly as there is nothing to poll — and the idle heartbeat says
+    /// so rather than saying nothing.
+    pub trackers: Vec<Arc<dyn Tracker>>,
 }
 
 /// Everything [`run_triage_schedule`] runs against. The absence of an `Orchestrator`, a control
@@ -345,6 +367,51 @@ impl CycleOutcome {
             CycleOutcome::ModelFailure | CycleOutcome::TrackerFailure
         )
     }
+
+    /// A stable, low-cardinality name for the log line — and the key the schedule's reporter
+    /// compares to decide whether an outcome is a REPEAT or a change worth an immediate line.
+    fn kind(self) -> &'static str {
+        match self {
+            CycleOutcome::Idle => "idle",
+            CycleOutcome::Labelled(_) => "labelled",
+            CycleOutcome::ModelFailure => "model_failure",
+            CycleOutcome::TrackerFailure => "tracker_failure",
+        }
+    }
+}
+
+/// What one cycle SAW, beside what it did (STUDIO-671).
+///
+/// The wedge this exists for produced no log line at all, because "fetched nothing" and "every
+/// candidate was already labelled" are the same [`CycleOutcome::Idle`] and neither says anything.
+/// These three counters are the difference between them, and they are what the idle heartbeat
+/// prints: a triage that is idle because the daemon is quiet reads very differently from one that
+/// is idle because it is pointed at no projects, or at projects that answer with nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CycleReport {
+    pub(crate) outcome: CycleOutcome,
+    /// Whether a config had loaded at all — `(deps.target)()` answered `Some`.
+    pub(crate) target: bool,
+    /// How many project trackers that target carried. `0` with `target: true` means every
+    /// configured project is paused.
+    pub(crate) trackers: usize,
+    /// Issues the candidate fetch returned across every tracker, after de-duplication.
+    pub(crate) fetched: usize,
+    /// How many of those were untriaged and actionable — the tickets this cycle could assign.
+    pub(crate) candidates: usize,
+}
+
+impl CycleReport {
+    /// The report of a cycle that never reached a tracker.
+    fn stalled(outcome: CycleOutcome, target: bool, trackers: usize) -> Self {
+        CycleReport {
+            outcome,
+            target,
+            trackers,
+            fetched: 0,
+            candidates: 0,
+        }
+    }
 }
 
 /// Whether the triage task should exist at all: Teams enabled, a `manager.mode` that routes, and a
@@ -391,6 +458,11 @@ where
         "teams triage task started (off-loop; dispatch is never blocked on it)"
     );
     let mut failures: i64 = 0;
+    // The bounded cycle-outcome reporter (STUDIO-671). Before it, a cycle that did nothing said
+    // nothing, and a triage pointed at no work was indistinguishable in `/api/v1/logs` from a
+    // triage that had none — which is how this task ran for ten minutes in production looking
+    // exactly like a healthy one.
+    let mut reporter = OutcomeReporter::new(deps.interval);
     // The next time the model may be asked. Held as a DEADLINE rather than re-derived from a sleep
     // each pass, because the two wake-ups below must not be able to postpone each other: a kick
     // that restarted the back-off timer would let a steady trickle of new tickets starve the
@@ -421,10 +493,12 @@ where
         // which is held. A kick storm is therefore not reachable from a failing dependency, only
         // from a backlog — which drains [`MAX_PER_CYCLE`] at a time.
         if kicked && failures > 0 {
-            triage_cycle(&ctx, &deps, false).await;
+            reporter.report(triage_cycle_reporting(&ctx, &deps, false).await);
             continue;
         }
-        let outcome = triage_cycle(&ctx, &deps, true).await;
+        let report = triage_cycle_reporting(&ctx, &deps, true).await;
+        let outcome = report.outcome;
+        reporter.report(report);
         if outcome.is_failure() {
             failures += 1;
             tracing::warn!(
@@ -448,6 +522,81 @@ where
     }
 }
 
+/// Turns a stream of [`CycleReport`]s into a BOUNDED stream of INFO lines (STUDIO-671).
+///
+/// The rule is one sentence: **say it the moment it changes, then say it again no more than once a
+/// window, with the count of how many times it happened in between.** That gives an operator both
+/// halves of what the silent wedge denied them — a triage that starts working, stops working, or
+/// starts failing is on the log within one cycle, and a triage that is steadily idle still proves
+/// it is alive (and prints WHAT it is seeing) at a cadence `/api/v1/logs` can carry all day.
+///
+/// `Labelled` is exempt from the rate limit: an assignment retires its own candidate, so it cannot
+/// repeat unboundedly, and every one of them is worth a line.
+struct OutcomeReporter {
+    /// The window a repeated outcome is summarised over.
+    window: Duration,
+    /// The last outcome KIND logged, and how many cycles have produced it since that line.
+    last: Option<(&'static str, u64, tokio::time::Instant)>,
+}
+
+impl OutcomeReporter {
+    fn new(interval: Duration) -> Self {
+        OutcomeReporter {
+            window: interval.saturating_mul(IDLE_HEARTBEAT_CYCLES),
+            last: None,
+        }
+    }
+
+    fn report(&mut self, r: CycleReport) {
+        let kind = r.outcome.kind();
+        let now = tokio::time::Instant::now();
+        let repeats = match self.last {
+            // A change of outcome is news: log it immediately, and open a fresh window.
+            Some((prev, _, _)) if prev != kind => 1,
+            Some((_, seen, at)) => {
+                let seen = seen.saturating_add(1);
+                if !matches!(r.outcome, CycleOutcome::Labelled(_))
+                    && now.duration_since(at) < self.window
+                {
+                    // Same outcome, inside the window: count it and stay quiet.
+                    self.last = Some((kind, seen, at));
+                    return;
+                }
+                seen
+            }
+            None => 1,
+        };
+        self.last = Some((kind, 0, now));
+        tracing::info!(
+            outcome = kind,
+            cycles = repeats,
+            labelled = match r.outcome {
+                CycleOutcome::Labelled(n) => n,
+                _ => 0,
+            },
+            candidates_seen = r.candidates,
+            issues_seen = r.fetched,
+            projects = r.trackers,
+            target = if r.target { "present" } else { "absent" },
+            "teams triage cycle"
+        );
+    }
+}
+
+/// [`triage_cycle_reporting`]'s outcome-only form, which is what the cycle's own tests assert
+/// against — the schedule calls the reporting one, so this is test-gated rather than dead.
+#[cfg(test)]
+pub(crate) async fn triage_cycle<TF>(
+    ctx: &CancelWait,
+    deps: &TriageDeps<TF>,
+    ask_model: bool,
+) -> CycleOutcome
+where
+    TF: Fn() -> Option<TriageTarget>,
+{
+    triage_cycle_reporting(ctx, deps, ask_model).await.outcome
+}
+
 /// One triage pass: reconcile what failed to write last time, then decide who takes every held
 /// ticket — from the model when there is one to ask, deterministically when there is not.
 ///
@@ -466,25 +615,55 @@ where
 ///   write still leaves a pending assignment that routes — so continuing is progress rather than
 ///   waste. The cycle is capped at [`MAX_PER_CYCLE`] either way, and the outcome still backs the
 ///   schedule off.
-pub(crate) async fn triage_cycle<TF>(
+///
+/// It returns a [`CycleReport`] rather than a bare outcome (STUDIO-671) so the schedule's
+/// visibility line can tell "nothing needed doing" from "nothing was even looked at" — the two
+/// that used to be the same silent `Idle`.
+pub(crate) async fn triage_cycle_reporting<TF>(
     ctx: &CancelWait,
     deps: &TriageDeps<TF>,
     ask_model: bool,
-) -> CycleOutcome
+) -> CycleReport
 where
     TF: Fn() -> Option<TriageTarget>,
 {
     let Some(target) = (deps.target)() else {
-        return CycleOutcome::Idle; // no config loaded yet
+        // No config loaded yet.
+        return CycleReport::stalled(CycleOutcome::Idle, false, 0);
     };
-    let tracker = target.tracker;
-    let issues = match tracker.fetch_candidate_issues().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(err = %e, "teams triage could not fetch candidates");
-            return CycleOutcome::TrackerFailure;
+    let trackers = target.trackers;
+    // Fan the candidate fetch out over every enabled project, exactly as the poll loop does, and
+    // de-duplicate on issue id with FIRST PROJECT WINS — the same rule `on_tick` uses, so a ticket
+    // reachable through two configured slugs is triaged by the same client that would dispatch it.
+    // `owner` remembers which tracker each kept issue arrived through, so the label is written back
+    // through that project's own client rather than through an arbitrary one.
+    let mut issues: Vec<Issue> = Vec::new();
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    let mut fetch_failed = false;
+    for (idx, tracker) in trackers.iter().enumerate() {
+        match tracker.fetch_candidate_issues().await {
+            Ok(v) => {
+                for iss in v {
+                    if owner.contains_key(&iss.id) {
+                        continue;
+                    }
+                    owner.insert(iss.id.clone(), idx);
+                    issues.push(iss);
+                }
+            }
+            Err(e) => {
+                // One unreachable project must not blind triage to the others: the cycle still
+                // assigns everything it CAN see, and still reports the failure so the schedule
+                // backs off. Losing the whole sweep to one bad slug is how a partial outage
+                // becomes a total one.
+                tracing::warn!(err = %e, "teams triage could not fetch candidates for a project");
+                fetch_failed = true;
+            }
         }
-    };
+    }
+    if fetch_failed && issues.is_empty() {
+        return CycleReport::stalled(CycleOutcome::TrackerFailure, true, trackers.len());
+    }
     // A label that arrived by any route — this task's own earlier reconcile, another daemon, a
     // human — retires the pending entry that stood in for it. Doing it over the whole fetch and not
     // just the candidates is what keeps the map from holding an entry for a ticket that is no
@@ -494,9 +673,24 @@ where
             deps.handle.clear_pending(&iss.id);
         }
     }
+    let fetched = issues.len();
+    let report = |outcome: CycleOutcome, candidates: usize| CycleReport {
+        outcome,
+        target: true,
+        trackers: trackers.len(),
+        fetched,
+        candidates,
+    };
+    let failed_outcome = |outcome: CycleOutcome| {
+        if fetch_failed {
+            CycleOutcome::TrackerFailure
+        } else {
+            outcome
+        }
+    };
     let candidates = unlabelled_candidates(&issues);
     if candidates.is_empty() {
-        return CycleOutcome::Idle;
+        return report(failed_outcome(CycleOutcome::Idle), 0);
     }
     // Without a team there is nothing to find-or-create the label in, so those tickets are dropped
     // BEFORE the cap rather than inside the loop — otherwise a run of team-less tickets could eat a
@@ -516,23 +710,33 @@ where
     // Every candidate was unactionable: skip the load read too rather than spend a Linear call on a
     // cycle that cannot write anything.
     if actionable.is_empty() {
-        return CycleOutcome::Idle;
+        return report(failed_outcome(CycleOutcome::Idle), 0);
     }
+    let actionable_count = actionable.len();
 
     // Load is the input to BOTH brains now (§0.11.1's definition — open tickets carrying
     // `rhapsody:@x` in non-terminal states — is what §A.3.3's "least-loaded roster member" means).
     // A failed load read still degrades to "everybody looks idle" rather than failing the cycle: a
     // decision without load counts is much better than no decision, and under §A.3.3 "no decision"
     // now means a held ticket rather than an unlabelled one.
-    let mut load = match tracker
-        .fetch_open_issues_by_labels(&roster_labels(&deps.teams))
-        .await
-    {
-        Ok(v) => tally_load(&deps.teams, &v),
-        Err(e) => {
-            tracing::warn!(err = %e, "teams triage could not count per-identity load; proceeding without it");
-            HashMap::new()
+    //
+    // Unioned across the projects for the same reason the candidate fetch is (STUDIO-671): this
+    // read is project-scoped too, so a single account-level client counted nobody's load and every
+    // teammate looked equally idle. De-duplicated on issue id so a ticket reachable through two
+    // configured slugs is not counted twice against whoever holds it.
+    let mut load = {
+        let labels = roster_labels(&deps.teams);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut open: Vec<Issue> = Vec::new();
+        for tracker in &trackers {
+            match tracker.fetch_open_issues_by_labels(&labels).await {
+                Ok(v) => open.extend(v.into_iter().filter(|i| seen.insert(i.id.clone()))),
+                Err(e) => {
+                    tracing::warn!(err = %e, "teams triage could not count per-identity load for a project; proceeding without it");
+                }
+            }
         }
+        tally_load(&deps.teams, &open)
     };
 
     // Is there a model to ask at all? `mode: labels` has no model turn by definition (§A.3.3), and
@@ -550,6 +754,14 @@ where
         if ctx.is_cancelled() {
             break;
         }
+        // The client the ticket arrived through — its own project's (STUDIO-671). `add_issue_label`
+        // resolves the label from the issue's TEAM rather than from the client's project, so any
+        // client could carry the write; using the owning one keeps a ticket's reads and its write
+        // on a single Linear client, which is what makes a per-project credential or endpoint
+        // override mean the same thing on both halves.
+        let Some(tracker) = owner.get(&iss.id).and_then(|i| trackers.get(*i)) else {
+            continue; // unreachable: every kept issue was inserted with its owner
+        };
         // Already decided, only unwritten (§A.3.4): retry the write, decide nothing.
         if let Some(identity) = deps.handle.pending_identity(&iss.id) {
             match write_label(tracker.as_ref(), iss, &identity).await {
@@ -737,7 +949,7 @@ where
             labelled += 1;
         }
     }
-    if write_failed {
+    let outcome = if write_failed || fetch_failed {
         CycleOutcome::TrackerFailure
     } else if model_failed {
         CycleOutcome::ModelFailure
@@ -745,7 +957,8 @@ where
         CycleOutcome::Idle
     } else {
         CycleOutcome::Labelled(labelled)
-    }
+    };
+    report(outcome, actionable_count)
 }
 
 /// Why a decision was NOT the model's — rendered verbatim into the room post so an operator reading
@@ -1272,7 +1485,7 @@ mod tests {
             teams: Arc::new(teams),
             target: move || {
                 Some(TriageTarget {
-                    tracker: Arc::clone(&tr) as Arc<dyn Tracker>,
+                    trackers: vec![Arc::clone(&tr) as Arc<dyn Tracker>],
                 })
             },
             arbiter,
@@ -1297,6 +1510,33 @@ mod tests {
         TriageDeps {
             handle,
             ..deps(teams, tr, arbiter)
+        }
+    }
+
+    /// Deps over SEVERAL project trackers — the production shape since STUDIO-671, where the target
+    /// yields every enabled project's client rather than one account-level one.
+    fn deps_over(
+        teams: Teams,
+        trackers: Vec<Arc<dyn Tracker>>,
+        arbiter: Arc<dyn TriageArbiter>,
+    ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
+        // Spelled out rather than `..deps(..)`: struct-update syntax cannot change the closure type
+        // the struct is generic over.
+        TriageDeps {
+            teams: Arc::new(teams),
+            target: move || {
+                Some(TriageTarget {
+                    trackers: trackers.clone(),
+                })
+            },
+            arbiter,
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            interval: Duration::from_millis(5),
+            max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
+            room: None,
         }
     }
 
@@ -2559,5 +2799,309 @@ mod tests {
         );
         signal.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ── STUDIO-671: the wiring around the cycle, not just the cycle ─────────────────────────────
+
+    /// The wedge, at the level it actually lived: the task **wired the way `run.rs` wires it**,
+    /// against the daemon's own reads cell — the same `Arc`-shared cell the reload path publishes
+    /// into and the same `TriageHandle` instance the selection gate kicks.
+    ///
+    /// Every `triage_cycle` test above hands the cycle its candidates directly, so all of them
+    /// passed throughout the outage. What was broken was the seam between the daemon and the cycle:
+    /// the target closure yielded the ACCOUNT-level tracker, which in the `projects:` config form
+    /// is bound to a `tracker.project_slug` that `config::validate` deliberately allows to be empty
+    /// (the projects supply the slugs). Its candidate query filters `project.slugId == ""`, which
+    /// Linear answers with zero rows and NO error — so the cycle fell out at
+    /// `candidates.is_empty()` as a silent `Idle`, once a minute and once per gate kick, for as
+    /// long as the daemon ran.
+    ///
+    /// Against the pre-fix wiring this asserted `left: 0, right: 1`: no label, no room post, no
+    /// warning. That is the whole bug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_task_triages_a_ticket_in_a_configured_project() {
+        // `build_effective`'s top-level client: reachable, credentialled, and pointed at no
+        // project. A Fake with no candidates is exactly what it answers with.
+        let account = Arc::new(Fake::new());
+        // `eff.projects[0].tracker` — the client the poll loop fetches the held ticket through.
+        let mut proj = Fake::new();
+        proj.candidates = vec![labelled("STUDIO-670", &["docs"])];
+        let proj = Arc::new(proj);
+
+        let o = crate::orchestrator::Orchestrator::new("WORKFLOW.md");
+        let control = o.control(); // built pre-load, exactly as the daemon does
+        // Both halves of what the reload path publishes, in its order.
+        o.set_reads_target(
+            Arc::clone(&account) as Arc<dyn Tracker>,
+            "lin_api_key_value_1234",
+        );
+        o.set_reads_projects(vec![Arc::clone(&proj) as Arc<dyn Tracker>]);
+
+        let seam = Arc::new(TriageHandle::new());
+        let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
+        let d = TriageDeps {
+            teams: Arc::new(teams_model(vec![ident("alice", &["rust"])])),
+            // The production target closure, in `run.rs`'s exact shape.
+            target: move || {
+                control
+                    .reads_project_trackers()
+                    .map(|trackers| TriageTarget { trackers })
+            },
+            arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            // An interval no test would ever wait out, so the ONE kick below is the only thing that
+            // can produce a cycle and the label count is exact. (A millisecond cadence would keep
+            // re-labelling: the Fake's candidate list is programmed, so a labelled ticket stays a
+            // candidate and every further cycle writes again.)
+            interval: Duration::from_secs(3600),
+            max_backoff_ms: 20,
+            // The SAME instance the gate kicks — `run.rs` passes `seam` here and installs its clone
+            // on the orchestrator, so a divergence would lose every kick.
+            handle: Arc::clone(&seam),
+            room: None,
+        };
+        let signal = crate::control_loop::CancelSignal::new();
+        let ctx = signal.wait();
+        let task = tokio::spawn(async move { run_triage_schedule(ctx, d).await });
+
+        seam.kick(); // what the selection gate does the moment it holds a candidate
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while proj.add_label_calls().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        signal.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        let calls = proj.add_label_calls();
+        assert_eq!(calls.len(), 1, "the held ticket must be triaged");
+        assert_eq!(calls[0].label_name, "rhapsody:@alice");
+        assert!(
+            account.add_label_calls().is_empty(),
+            "the write belongs to the project the ticket came from"
+        );
+        assert_eq!(
+            account.candidate_calls(),
+            0,
+            "the account-level tracker is not a candidate source; it sees no project"
+        );
+    }
+
+    /// The reads cell's own contract, which the closure above depends on: `None` until a config has
+    /// loaded, then every ENABLED project, live across a reload.
+    #[tokio::test]
+    async fn the_reads_cell_publishes_every_project_tracker() {
+        let o = crate::orchestrator::Orchestrator::new("WORKFLOW.md");
+        let control = o.control();
+        assert!(
+            control.reads_project_trackers().is_none(),
+            "before the first load there is no config, and that is not the same as no projects"
+        );
+
+        let a = Arc::new(Fake::new()) as Arc<dyn Tracker>;
+        let b = Arc::new(Fake::new()) as Arc<dyn Tracker>;
+        o.set_reads_target(Arc::new(Fake::new()), "lin_api_key_value_1234");
+        o.set_reads_projects(vec![Arc::clone(&a), Arc::clone(&b)]);
+        let got = control.reads_project_trackers().expect("config is loaded");
+        assert_eq!(got.len(), 2);
+        assert!(Arc::ptr_eq(&got[0], &a) && Arc::ptr_eq(&got[1], &b));
+
+        // A reload that pauses a project republishes the survivors, and the handle sees it live.
+        o.set_reads_projects(vec![Arc::clone(&b)]);
+        let got = control.reads_project_trackers().expect("config is loaded");
+        assert_eq!(got.len(), 1);
+        assert!(Arc::ptr_eq(&got[0], &b));
+
+        // A config whose every project is paused: loaded, and legitimately nothing to sweep.
+        o.set_reads_projects(Vec::new());
+        assert_eq!(
+            control
+                .reads_project_trackers()
+                .expect("config is loaded")
+                .len(),
+            0
+        );
+    }
+
+    /// Multi-project sweep: every configured project is fetched, a ticket reachable through two of
+    /// them is triaged once (first project wins, the poll loop's own rule), and the label is
+    /// written back through the client the ticket arrived on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cycle_sweeps_every_project_and_de_duplicates() {
+        let mut first = Fake::new();
+        first.candidates = vec![labelled("i1", &["rust"]), labelled("shared", &[])];
+        let first = Arc::new(first);
+        let mut second = Fake::new();
+        second.candidates = vec![labelled("shared", &[]), labelled("i2", &["docs"])];
+        let second = Arc::new(second);
+
+        let d = deps_over(
+            teams_model(vec![ident("alice", &[])]),
+            vec![
+                Arc::clone(&first) as Arc<dyn Tracker>,
+                Arc::clone(&second) as Arc<dyn Tracker>,
+            ],
+            FakeArbiter::answering(vec![
+                FakeArbiter::ok("alice"),
+                FakeArbiter::ok("alice"),
+                FakeArbiter::ok("alice"),
+            ]) as Arc<dyn TriageArbiter>,
+        );
+        let outcome = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(outcome, CycleOutcome::Labelled(3), "i1, shared, i2");
+        let firsts: Vec<String> = first
+            .add_label_calls()
+            .iter()
+            .map(|c| c.issue_id.clone())
+            .collect();
+        assert_eq!(
+            firsts,
+            vec!["i1".to_string(), "shared".to_string()],
+            "the duplicate is written through the FIRST project that offered it"
+        );
+        let seconds: Vec<String> = second
+            .add_label_calls()
+            .iter()
+            .map(|c| c.issue_id.clone())
+            .collect();
+        assert_eq!(seconds, vec!["i2".to_string()]);
+    }
+
+    /// One unreachable project must not blind triage to the rest: the reachable project's ticket is
+    /// still assigned, and the cycle still reports the failure so the schedule backs off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_failing_project_does_not_lose_the_others() {
+        let mut broken = Fake::new();
+        broken.candidates_err = Some(rhapsody_tracker::TrackerError::Other("boom".to_string()));
+        let broken = Arc::new(broken);
+        let mut healthy = Fake::new();
+        healthy.candidates = vec![labelled("i1", &["rust"])];
+        let healthy = Arc::new(healthy);
+
+        let d = deps_over(
+            teams_model(vec![ident("alice", &[])]),
+            vec![
+                Arc::clone(&broken) as Arc<dyn Tracker>,
+                Arc::clone(&healthy) as Arc<dyn Tracker>,
+            ],
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice")]) as Arc<dyn TriageArbiter>,
+        );
+        let outcome = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(
+            healthy.add_label_calls().len(),
+            1,
+            "the reachable project is still swept"
+        );
+        assert_eq!(
+            outcome,
+            CycleOutcome::TrackerFailure,
+            "and the failure still backs the schedule off"
+        );
+    }
+
+    /// The load read is unioned across projects too, and de-duplicated — otherwise a per-identity
+    /// count read through one account-level client saw nobody's load and every teammate looked
+    /// equally idle, which is what picks the deterministic assignee.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_is_counted_across_every_project() {
+        let mut first = Fake::new();
+        first.candidates = vec![labelled("new", &[])];
+        first.open_by_labels = vec![labelled("a1", &["rhapsody:@alice"])];
+        let first = Arc::new(first);
+        let mut second = Fake::new();
+        // The same ticket reachable twice must not count twice, and bob's is the only other load.
+        second.open_by_labels = vec![
+            labelled("a1", &["rhapsody:@alice"]),
+            labelled("b1", &["rhapsody:@bob"]),
+        ];
+        let second = Arc::new(second);
+
+        let mut teams = teams_model(vec![ident("alice", &[]), ident("bob", &[])]);
+        teams.manager.mode = ManagerMode::Labels; // deterministic: least-loaded wins
+        let d = deps_over(
+            teams,
+            vec![
+                Arc::clone(&first) as Arc<dyn Tracker>,
+                Arc::clone(&second) as Arc<dyn Tracker>,
+            ],
+            FakeArbiter::answering(Vec::new()) as Arc<dyn TriageArbiter>,
+        );
+        assert_eq!(
+            triage_cycle(&CancelWait::default(), &d, true).await,
+            CycleOutcome::Labelled(1)
+        );
+        let calls = first.add_label_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].label_name, "rhapsody:@alice",
+            "alice and bob are tied at one open ticket each, so roster order breaks it — a \
+             double-counted `a1` would have handed it to bob"
+        );
+    }
+
+    // ── STUDIO-671: the silence itself ──────────────────────────────────────────────────────────
+
+    /// The reporter's contract, which is what makes this class of wedge unhideable: a change of
+    /// outcome is on the log immediately, a repeat is summarised at most once a window with its
+    /// count, and an assignment is never suppressed.
+    #[tokio::test]
+    async fn the_outcome_reporter_is_immediate_on_change_and_bounded_on_repeat() {
+        let mut r = OutcomeReporter::new(Duration::from_secs(3600));
+        let idle = CycleReport::stalled(CycleOutcome::Idle, true, 2);
+
+        r.report(idle);
+        assert_eq!(r.last.map(|(k, n, _)| (k, n)), Some(("idle", 0)));
+        // Nine more idle cycles inside the window: counted, not logged.
+        for _ in 0..9 {
+            r.report(idle);
+        }
+        assert_eq!(
+            r.last.map(|(k, n, _)| (k, n)),
+            Some(("idle", 9)),
+            "a repeat inside the window is counted rather than printed"
+        );
+
+        // A change of outcome is news, whatever the window says.
+        r.report(CycleReport::stalled(CycleOutcome::TrackerFailure, true, 2));
+        assert_eq!(
+            r.last.map(|(k, n, _)| (k, n)),
+            Some(("tracker_failure", 0)),
+            "a changed outcome logs immediately and opens a fresh window"
+        );
+
+        // An assignment is never rate-limited: it retires its own candidate, so it cannot storm.
+        let labelled = CycleReport::stalled(CycleOutcome::Labelled(1), true, 2);
+        r.report(labelled);
+        r.report(labelled);
+        assert_eq!(
+            r.last.map(|(k, n, _)| (k, n)),
+            Some(("labelled", 0)),
+            "every assignment gets its own line"
+        );
+    }
+
+    /// The heartbeat an operator would have needed: a steadily idle triage still says what it is
+    /// looking at, at a cadence the window bounds. With a millisecond interval the window is
+    /// milliseconds too, so the repeat line arrives inside the test rather than in a quarter hour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_streak_still_reports_what_it_saw() {
+        let mut r = OutcomeReporter::new(Duration::from_millis(1));
+        let idle = CycleReport {
+            outcome: CycleOutcome::Idle,
+            target: true,
+            trackers: 0,
+            fetched: 0,
+            candidates: 0,
+        };
+        r.report(idle);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        r.report(idle);
+        r.report(idle);
+        assert_eq!(
+            r.last.map(|(k, n, _)| (k, n)),
+            Some(("idle", 1)),
+            "the window elapsed, so the streak was reported and a new one began"
+        );
     }
 }

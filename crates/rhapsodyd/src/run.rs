@@ -355,11 +355,18 @@ where
         let deps = rhapsody_orchestrator::TriageDeps {
             teams: Arc::new(teams_cfg.clone()),
             // Read lazily each cycle, exactly as the prune scheduler reads its store handle: the
-            // handle is built before the first reload, so the tracker arrives later.
+            // handle is built before the first reload, so the trackers arrive later.
+            //
+            // These are the PER-PROJECT trackers, not the account-level one (STUDIO-671). The
+            // account-level client is bound to the top-level `tracker.project_slug`, which the
+            // `projects:` config form leaves empty by design, so triaging through it filtered
+            // `project.slugId == ""` — a query Linear answers with zero rows and no error. The task
+            // ran every cycle and found nothing to do, silently, while the selection gate held the
+            // very tickets it was meant to release.
             target: move || {
                 triage_handle
-                    .reads_tracker()
-                    .map(|tracker| rhapsody_orchestrator::TriageTarget { tracker })
+                    .reads_project_trackers()
+                    .map(|trackers| rhapsody_orchestrator::TriageTarget { trackers })
             },
             arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
             agent_command: command,
