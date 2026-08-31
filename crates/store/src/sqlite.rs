@@ -795,6 +795,21 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn earliest_run_start(&self) -> Result<Option<String>, StoreError> {
+        // Empty `started_at` is the column default, not a real instant, so it is excluded rather
+        // than sorted to the front — a single defaulted row would otherwise claim a horizon of
+        // "the beginning of time" and vouch for history this store never held.
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT started_at FROM runs WHERE started_at <> '' ORDER BY started_at ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError> {
         // started_at is RFC3339; substr(...,1,10) yields the YYYY-MM-DD bucket. sinceDays<=0 => all.
         let mut args: Vec<Value> = Vec::new();
@@ -2071,6 +2086,39 @@ mod tests {
 
     // Mirror TestPrune: retentionDays 0 keeps everything; 30 removes only the OLD ended run and its
     // events + operator messages, leaving the recent and still-running rows intact.
+    /// The evidence horizon (STUDIO-672): the oldest run this store still holds, `None` when it
+    /// holds none, and moving forward as `prune` deletes the old ones. A caller that would act on
+    /// an absence bounds itself by this, so "no rows" must never read as "the beginning of time".
+    #[test]
+    fn earliest_run_start_reports_the_stores_coverage() {
+        let st = open_mem();
+        assert_eq!(
+            st.earliest_run_start().expect("empty store"),
+            None,
+            "a store with no runs vouches for no instant at all"
+        );
+
+        let old = days_ago_rfc3339(40);
+        let recent = days_ago_rfc3339(1);
+        // Inserted newest-first, so the answer cannot come from insertion order.
+        for at in [&recent, &old] {
+            st.start_run(RunStart {
+                issue_identifier: "MT-1".into(),
+                started_at: at.clone(),
+                ..Default::default()
+            })
+            .expect("start");
+        }
+        // A run with the column default is not an instant and must not claim the horizon.
+        st.start_run(RunStart {
+            issue_identifier: "MT-2".into(),
+            started_at: String::new(),
+            ..Default::default()
+        })
+        .expect("start defaulted");
+        assert_eq!(st.earliest_run_start().expect("populated"), Some(old));
+    }
+
     #[test]
     fn prune() {
         let st = open_mem();

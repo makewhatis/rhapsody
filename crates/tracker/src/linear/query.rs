@@ -306,6 +306,16 @@ mutation AddIssueLabel($id: String!, $labelId: String!) {
   issueAddLabel(id: $id, labelId: $labelId) { success }
 }"#;
 
+/// `mutationIssueRemoveLabel` — REMOVES one label from an issue (STUDIO-672).
+///
+/// The counterpart to [`MUTATION_ISSUE_ADD_LABEL`] and chosen over `issueUpdate(labelIds:)` for the
+/// same reason: `issueUpdate` replaces the whole set, so it could silently drop a label a human
+/// added concurrently. `issueRemoveLabel` touches exactly the one label named.
+pub const MUTATION_ISSUE_REMOVE_LABEL: &str = r#"
+mutation RemoveIssueLabel($id: String!, $labelId: String!) {
+  issueRemoveLabel(id: $id, labelId: $labelId) { success }
+}"#;
+
 /// `queryOpenIssuesByLabels` — open (non-terminal) issues in the project carrying ANY of the named
 /// labels, with just the fields the per-identity load count needs (id, identifier, labels).
 /// "Open" is expressed by Linear state TYPE (`completed`/`canceled` excluded), which is config-free

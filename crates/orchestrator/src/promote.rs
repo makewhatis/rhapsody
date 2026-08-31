@@ -630,6 +630,9 @@ mod tests {
         fn search_events(&self, q: EventQuery) -> Result<Vec<EventHit>, StoreError> {
             self.0.search_events(q)
         }
+        fn earliest_run_start(&self) -> Result<Option<String>, StoreError> {
+            self.0.earliest_run_start()
+        }
         fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError> {
             self.0.metrics(since_days, project)
         }

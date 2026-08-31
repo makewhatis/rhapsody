@@ -81,6 +81,11 @@ impl Store for Noop {
     fn search_events(&self, _q: EventQuery) -> Result<Vec<EventHit>, StoreError> {
         Ok(Vec::new())
     }
+    /// `None` — the honest answer for a store that holds nothing: it can vouch for no instant at
+    /// all, so a caller that would act on an absence must not act.
+    fn earliest_run_start(&self) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
     fn metrics(&self, _since_days: i64, _project: &str) -> Result<Vec<DayRollup>, StoreError> {
         Ok(Vec::new())
     }
