@@ -122,6 +122,74 @@ fn default_run(args: &[&str]) -> RunResult {
     Ok(out.stdout)
 }
 
+/// The fallible result of an [`OpenPrSource`] query: the open PR's browser URL, `None` when the
+/// branch has no open pull request, or an error when the lookup itself could not be made. The three
+/// cases are kept distinct because they mean different things to the quorum — "nothing to review",
+/// "nothing to review", and "we do not know" — and only the third is worth a warning.
+pub type OpenPrResult = Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Resolves the open pull request whose head is a given branch (STUDIO-674).
+///
+/// **No Go counterpart** — this is Rhapsody Teams' fallback for an installation whose Linear
+/// GitHub integration never attaches PRs to issues, in which case the poller's candidate snapshot
+/// carries no `linked_prs` and the review quorum has no PR to hand a reviewer. GitHub itself always
+/// knows, because the agent pushed the branch; asking it by head branch is the source of truth the
+/// attachment was only ever a cache of.
+///
+/// Object-safe (held as `dyn OpenPrSource` by the off-loop quorum task), so it is declared via
+/// `async_trait`. Kept separate from [`SummonSource`] rather than added to it: `SummonSource` is a
+/// field-for-field port of a Go interface, and a Rhapsody-only capability does not belong in it.
+#[async_trait]
+pub trait OpenPrSource: Send + Sync {
+    async fn open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> OpenPrResult;
+}
+
+#[async_trait]
+impl OpenPrSource for GH {
+    /// One `gh pr list --repo <owner>/<repo> --head <branch> --state open --json url --limit 1`.
+    ///
+    /// `--state open` is the whole unmerged/unclosed filter, so the caller needs no second check;
+    /// `--limit 1` bounds the output to the newest matching PR, which is the one a reviewer wants
+    /// (a branch with two open PRs is a repository anomaly, not a case to reconcile here). An empty
+    /// owner, repo or branch is not an error and not a query — there is simply nothing to ask, so
+    /// it answers `None` without spawning `gh`.
+    async fn open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> OpenPrResult {
+        if owner.is_empty() || repo.is_empty() || branch.is_empty() {
+            return Ok(None);
+        }
+        let slug = format!("{owner}/{repo}");
+        let args = [
+            "pr",
+            "list",
+            "--repo",
+            slug.as_str(),
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "url",
+            "--limit",
+            "1",
+        ];
+        let body = (self.run)(&args).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr list --repo {slug} --head {branch}: {e}").into()
+            },
+        )?;
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr list --repo {slug} --head {branch}: {e}").into()
+            },
+        )?;
+        Ok(prs
+            .iter()
+            .filter_map(|p| p.get("url").and_then(|v| v.as_str()))
+            .find(|u| !u.is_empty())
+            .map(str::to_string))
+    }
+}
+
 #[async_trait]
 impl SummonSource for GH {
     /// Makes exactly two `gh api` calls (issues/comments + pulls/comments), matches the summon
@@ -211,7 +279,7 @@ impl SummonSource for GH {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::TimeZone;
@@ -431,5 +499,130 @@ mod tests {
             msg.contains("gh: command not found"),
             "error wraps the underlying cause: {msg}"
         );
+    }
+
+    // ── open_pr_for_branch (STUDIO-674; no Go counterpart) ──────────────────────────────────────
+
+    /// A runner that records the argv it was handed and answers with `body`.
+    fn run_recording(body: &'static str, seen: Arc<Mutex<Vec<String>>>) -> RunFn {
+        Box::new(move |args| {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(args.join(" "));
+            Ok(body.as_bytes().to_vec())
+        })
+    }
+
+    // The happy path: one bounded `gh pr list` scoped to the repo AND the head branch, and the
+    // browser URL is read out of it. The argv is asserted in full because it IS the contract with
+    // GitHub — a dropped `--state open` would hand a reviewer a merged PR.
+    #[tokio::test]
+    async fn open_pr_for_branch_returns_the_open_prs_url() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"[{"url":"https://github.com/o/r/pull/64"}]"#,
+                Arc::clone(&seen),
+            )),
+        );
+
+        let got = src
+            .open_pr_for_branch("o", "r", "symphony/MT-1")
+            .await
+            .expect("open_pr_for_branch");
+
+        assert_eq!(got.as_deref(), Some("https://github.com/o/r/pull/64"));
+        let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            calls,
+            vec![
+                "pr list --repo o/r --head symphony/MT-1 --state open --json url --limit 1"
+                    .to_string()
+            ],
+            "exactly one gh call, scoped to the repo and the head branch"
+        );
+    }
+
+    // A branch with no open PR is `None`, not an error: the quorum treats it as "nothing to
+    // review", which is a normal outcome and not a failure to report.
+    #[tokio::test]
+    async fn open_pr_for_branch_no_open_pr_is_none() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("[]", Arc::clone(&seen))));
+        assert_eq!(
+            src.open_pr_for_branch("o", "r", "symphony/MT-1")
+                .await
+                .expect("open_pr_for_branch"),
+            None
+        );
+    }
+
+    // An empty owner/repo/branch asks GitHub nothing at all — a `gh pr list --repo /` would be a
+    // guaranteed error, and "we were never told the repo" is not an error worth reporting.
+    #[tokio::test]
+    async fn open_pr_for_branch_without_a_repo_asks_nothing() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"[{"url":"https://github.com/o/r/pull/64"}]"#,
+                Arc::clone(&seen),
+            )),
+        );
+        for (owner, repo, branch) in [
+            ("", "r", "symphony/MT-1"),
+            ("o", "", "symphony/MT-1"),
+            ("o", "r", ""),
+        ] {
+            assert_eq!(
+                src.open_pr_for_branch(owner, repo, branch)
+                    .await
+                    .expect("open_pr_for_branch"),
+                None,
+                "({owner:?}, {repo:?}, {branch:?})"
+            );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh call is made without a repo and a branch"
+        );
+    }
+
+    // A runner error is propagated (not swallowed as "no PR"), wrapping the cause and naming the
+    // repo/branch — `summons_since`'s contract, for its reason: the caller must be able to tell
+    // "GitHub says there is none" from "we could not ask".
+    #[tokio::test]
+    async fn open_pr_for_branch_run_error_is_propagated() {
+        let run: RunFn = Box::new(|_args| Err("gh: command not found".into()));
+        let src = GH::new("@symphony", Some(run));
+        let msg = src
+            .open_pr_for_branch("o", "r", "symphony/MT-1")
+            .await
+            .expect_err("expected an error")
+            .to_string();
+        assert!(msg.contains("o/r"), "error names the repo: {msg}");
+        assert!(
+            msg.contains("symphony/MT-1"),
+            "error names the branch: {msg}"
+        );
+        assert!(
+            msg.contains("gh: command not found"),
+            "error wraps the underlying cause: {msg}"
+        );
+    }
+
+    // Unparseable output is an error too, for the same reason: silently reading it as "no PR"
+    // would turn a broken `gh` into a permanently quiet quorum.
+    #[tokio::test]
+    async fn open_pr_for_branch_undecodable_output_is_an_error() {
+        let run: RunFn = Box::new(|_args| Ok(b"not json".to_vec()));
+        let src = GH::new("@symphony", Some(run));
+        let msg = src
+            .open_pr_for_branch("o", "r", "symphony/MT-1")
+            .await
+            .expect_err("expected an error")
+            .to_string();
+        assert!(msg.contains("decode"), "error says what failed: {msg}");
     }
 }
