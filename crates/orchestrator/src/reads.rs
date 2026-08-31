@@ -85,23 +85,13 @@ impl Orchestrator {
         w.api_key = api_key.into();
     }
 
-    /// Records every ENABLED project's slug-bound tracker for the off-loop readers that need the
-    /// daemon's WORK rather than its account (STUDIO-671). Called from the reload path beside
-    /// [`Orchestrator::set_reads_target`], on every (re)load, so a hot-reload that adds, removes or
-    /// pauses a project is reflected without a restart.
-    ///
-    /// Additive rather than folded into `set_reads_target` because that one mirrors Go
-    /// `setReadsTarget`, whose two fields back the account-level Settings surfaces; the Go daemon
-    /// has no reader of this list at all. The two writes are separate, and that is harmless: no
-    /// reader correlates the account tracker with the project list, so a cycle that lands between
-    /// them sees one of the two a moment stale and nothing inconsistent.
-    pub fn set_reads_projects(&self, trackers: Vec<Arc<dyn Tracker>>) {
-        let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
-        w.project_trackers = trackers;
-    }
-
     /// Publishes BOTH halves of the off-loop triage snapshot under **one** write acquisition —
     /// every enabled project's tracker and this reload's dispatchable-state sets (STUDIO-672).
+    ///
+    /// The tracker list is every ENABLED project's slug-bound client, for the off-loop readers that
+    /// need the daemon's WORK rather than its account (STUDIO-671). Called from the reload path on
+    /// every (re)load, so a hot-reload that adds, removes or pauses a project — or changes
+    /// `active_states` — reaches triage without a restart.
     ///
     /// Triage needs the states because "who should take this ticket?" is only ever asked of work
     /// somebody is about to do. The selection gate holds exactly the DISPATCHABLE candidates, and

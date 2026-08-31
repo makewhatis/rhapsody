@@ -680,10 +680,11 @@ where
     // that restarted the back-off timer would let a steady trickle of new tickets starve the
     // model's recovery probe indefinitely, leaving a healthy model permanently unasked.
     let mut next_cycle = tokio::time::Instant::now() + deps.interval;
-    // The one-time review-label reconcile (STUDIO-672) still owes a sweep. It is attempted from the
-    // first cycle that can reach a tracker and retired the moment one completes, so the cleanup
-    // survives a daemon that boots before Linear answers without becoming a standing duty that
-    // fights an operator over every label they place on a review ticket.
+    // Whether the one-time review-label reconcile (STUDIO-672) still owes a sweep IN THIS RUNTIME
+    // HOME — a marker file, not just this process's memory. It is attempted from the first cycle
+    // that can reach a tracker and retired the moment one completes, so the cleanup survives a
+    // daemon that boots before Linear answers, and survives the next deploy without becoming a
+    // standing duty that fights an operator over every label they place on a review ticket.
     let mut reconcile_pending = reconcile_armed(&deps);
     loop {
         // WHY this cycle woke decides what it may do. The arrival kick (STUDIO-669, §A.3.2) and
@@ -786,8 +787,10 @@ fn reconcile_armed<TF>(deps: &TriageDeps<TF>) -> bool {
 /// so on the log — including when it removed nothing, which is the healthy steady state and would
 /// otherwise be indistinguishable from a sweep that never ran.
 ///
-/// The retirement is WRITTEN before it is believed: a marker that cannot be persisted leaves the
-/// sweep pending for this process rather than silently becoming a per-boot duty next time.
+/// The retirement is WRITTEN before it is announced. A marker that cannot be persisted still retires
+/// the sweep for this process — retrying the write every cycle would re-sweep the whole fetch every
+/// cycle against a path that is not going to become writable — and says so loudly enough that an
+/// operator can create the file before the next restart re-arms it.
 fn retire_reconcile<TF>(deps: &TriageDeps<TF>, pending: bool, report: &CycleReport) -> bool {
     match report.reconciled {
         Some(n) if pending => {
@@ -4243,19 +4246,19 @@ mod tests {
         let a = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         let b = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         o.set_reads_target(Arc::new(Fake::new()), "lin_api_key_value_1234");
-        o.set_reads_projects(vec![Arc::clone(&a), Arc::clone(&b)]);
+        o.set_reads_triage_snapshot(vec![Arc::clone(&a), Arc::clone(&b)], states());
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 2);
         assert!(Arc::ptr_eq(&got[0], &a) && Arc::ptr_eq(&got[1], &b));
 
         // A reload that pauses a project republishes the survivors, and the handle sees it live.
-        o.set_reads_projects(vec![Arc::clone(&b)]);
+        o.set_reads_triage_snapshot(vec![Arc::clone(&b)], states());
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 1);
         assert!(Arc::ptr_eq(&got[0], &b));
 
         // A config whose every project is paused: loaded, and legitimately nothing to sweep.
-        o.set_reads_projects(Vec::new());
+        o.set_reads_triage_snapshot(Vec::new(), states());
         assert_eq!(
             control
                 .reads_project_trackers()
