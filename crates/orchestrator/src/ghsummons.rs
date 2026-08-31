@@ -154,8 +154,8 @@ pub trait OpenPrSource: Send + Sync {
 #[async_trait]
 impl OpenPrSource for GH {
     /// One bounded `gh pr list --repo <owner>/<repo> --head <branch> --state open --json
-    /// url,headRepositoryOwner --limit <PR_LIST_LIMIT>`, answering the newest matching PR that is
-    /// the repository's OWN.
+    /// url,headRepositoryOwner --limit <PR_LIST_LIMIT>`, answering the newest matching PR whose
+    /// head repository belongs to the account that was queried.
     ///
     /// `--state open` is the whole unmerged/unclosed filter, so the caller needs no second check.
     /// An empty owner, repo or branch is not an error and not a query — there is simply nothing to
@@ -170,6 +170,12 @@ impl OpenPrSource for GH {
     /// repository at all (a deleted fork answers `null`) is rejected for the same reason: it cannot
     /// be shown to be ours. Rejected candidates are skipped rather than terminal, which is what
     /// [`PR_LIST_LIMIT`] is for.
+    ///
+    /// The comparison is on the OWNER and not on the whole `owner/repo` slug, deliberately. A fork
+    /// under the same account is inside the same trust boundary — the point of the check is that a
+    /// stranger cannot get a URL in here — and matching the slug would additionally break on a
+    /// repository RENAME, where `gh` follows GitHub's redirect and answers under the canonical name
+    /// while this daemon still asks under the stale one from config.
     async fn open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> OpenPrResult {
         if owner.is_empty() || repo.is_empty() || branch.is_empty() {
             return Ok(None);

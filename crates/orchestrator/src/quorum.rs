@@ -250,12 +250,12 @@ impl FanOutcome {
         matches!(self, FanOutcome::TrackerFailure)
     }
 
-    /// Whether this outcome is EVIDENCE that the tracker is healthy again, and may therefore clear
-    /// a back-off earned by earlier failures. Everything except [`FanOutcome::NoPullRequest`] is:
-    /// it alone returns before the tracker is touched at all, so treating it as a success would let
-    /// one attachment-less handoff during a Linear outage erase the back-off the outage earned.
-    /// It does not extend the back-off either — a ticket without a PR is a normal state, not an
-    /// outage — so it simply leaves the counter where it found it.
+    /// Whether this outcome may clear a back-off earned by earlier failures. Everything except
+    /// [`FanOutcome::NoPullRequest`] may: it alone returns from [`fan_out`] above the `deps.target`
+    /// lookup, having neither reached the tracker nor learned anything about it, so reading it as a
+    /// success would let one attachment-less handoff during a Linear outage erase the back-off that
+    /// outage earned. It does not EXTEND the back-off either — a ticket without a PR is a normal
+    /// state, not an outage — so it simply leaves the counter where it found it.
     fn clears_the_backoff(self) -> bool {
         !matches!(self, FanOutcome::NoPullRequest)
     }
@@ -1927,16 +1927,18 @@ mod tests {
         signal.cancel();
     }
 
-    // A no-PR outcome never reached the tracker, so it is not evidence the tracker recovered:
-    // mid-Linear-outage one attachment-less handoff would otherwise clear the back-off the outage
-    // earned. It does not extend the back-off either (a ticket without a PR is a normal state), so
-    // it leaves the counter exactly where it found it. The loop reads `is_failure` first, which is
-    // why `TrackerFailure` answering both is not a contradiction.
+    // A no-PR outcome returns before the tracker is even reached, so it is not evidence the tracker
+    // recovered: mid-Linear-outage one attachment-less handoff would otherwise clear the back-off
+    // the outage earned. It does not extend the back-off either (a ticket without a PR is a normal
+    // state), so it leaves the counter exactly where it found it. The loop reads `is_failure`
+    // first, which is why `TrackerFailure` answering both is not a contradiction. That
+    // `NoReviewers` clears the back-off having made no tracker CALL is pre-existing behaviour,
+    // pinned here as-is rather than changed by this ticket.
     #[test]
     fn a_no_pr_outcome_neither_extends_nor_clears_the_back_off() {
         assert!(!FanOutcome::NoPullRequest.is_failure());
         assert!(!FanOutcome::NoPullRequest.clears_the_backoff());
-        for reached_the_tracker in [
+        for got_to_the_tracker in [
             FanOutcome::Fanned {
                 created: 1,
                 wanted: 2,
@@ -1944,8 +1946,8 @@ mod tests {
             FanOutcome::NoReviewers,
         ] {
             assert!(
-                reached_the_tracker.clears_the_backoff(),
-                "{reached_the_tracker:?} says the tracker answered"
+                got_to_the_tracker.clears_the_backoff(),
+                "{got_to_the_tracker:?} got as far as the tracker"
             );
         }
         assert!(FanOutcome::TrackerFailure.is_failure());
