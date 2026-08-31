@@ -661,9 +661,6 @@ where
             }
         }
     }
-    if fetch_failed && issues.is_empty() {
-        return CycleReport::stalled(CycleOutcome::TrackerFailure, true, trackers.len());
-    }
     // A label that arrived by any route — this task's own earlier reconcile, another daemon, a
     // human — retires the pending entry that stood in for it. Doing it over the whole fetch and not
     // just the candidates is what keeps the map from holding an entry for a ticket that is no
@@ -2942,14 +2939,21 @@ mod tests {
                 Arc::clone(&first) as Arc<dyn Tracker>,
                 Arc::clone(&second) as Arc<dyn Tracker>,
             ],
+            // One more answer than there are distinct candidates, so a lost de-duplication fails
+            // on the label count rather than on the arbiter running dry.
             FakeArbiter::answering(vec![
+                FakeArbiter::ok("alice"),
                 FakeArbiter::ok("alice"),
                 FakeArbiter::ok("alice"),
                 FakeArbiter::ok("alice"),
             ]) as Arc<dyn TriageArbiter>,
         );
         let outcome = triage_cycle(&CancelWait::default(), &d, true).await;
-        assert_eq!(outcome, CycleOutcome::Labelled(3), "i1, shared, i2");
+        assert_eq!(
+            outcome,
+            CycleOutcome::Labelled(3),
+            "i1, shared and i2 — `shared` once, not once per project"
+        );
         let firsts: Vec<String> = first
             .add_label_calls()
             .iter()
