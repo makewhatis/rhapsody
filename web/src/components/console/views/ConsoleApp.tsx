@@ -14,6 +14,7 @@ import { useReinstateFact, useVersionQuery } from "@/hooks/useTeams";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
+import { ManageTeamView } from "./ManageTeamView";
 import { MemoryView } from "./MemoryView";
 import { SettingsView } from "./SettingsView";
 
@@ -105,7 +106,8 @@ function ConsoleBody({
     case "settings":
       return <SettingsView teamsEnabled={teamsEnabled === true} onManageTeam={() => go("manage")} />;
     // teams / memory / manage are only ever reached with Teams ON — `useConsoleRoute` sends
-    // them to Jobs otherwise (§2.4) — and their views are sub-tickets 3–5 of STUDIO-681.
+    // them to Jobs otherwise (§2.4). §6's memory page (STUDIO-685) and §7's manage form
+    // (STUDIO-686) are built; the room (§5) is sub-ticket 3 of STUDIO-681.
     case "teams":
       return <Pending title="Teams" section="§5" subTicket={3} />;
     case "memory":
@@ -113,7 +115,7 @@ function ConsoleBody({
       // detail, which is where the runs list already is.
       return <MemoryPage go={go} />;
     case "manage":
-      return <Pending title="Manage team" section="§7" subTicket={5} />;
+      return <ManageTeamView onNavigate={(to) => go(to)} />;
     default:
       return <JobsView onOpenJob={(issue) => go("job", issue)} />;
   }
