@@ -59,9 +59,18 @@
 //! The cursor ([`rhapsody_config::room::CursorFile`], temp+rename) is written AFTER acting, so a
 //! crash in between re-reads the post rather than losing it. Re-reading is safe because the reply
 //! carries the post's `file:seq` id in its `refs`: a restarted manager scans its own replies in the
-//! same page before acting ([`already_answered`]), and the two writes a re-act could repeat are
-//! idempotent anyway (the quorum marker is once-per-ticket; a label already present is not written
-//! twice). That is what makes `file:seq` load-bearing, and why `LocalRoom::append` grew a real lock.
+//! same page before acting ([`already_answered`]). That is what makes `file:seq` load-bearing, and
+//! why `LocalRoom::append` grew a real lock.
+//!
+//! **The reply is the record, so the one gap is a post whose ACTIONS landed and whose REPLY did
+//! not** — a room append that failed, which is logged. That post is answered again on the next
+//! pass. Two of the three actions absorb it exactly: the quorum marker makes a second filing
+//! impossible, and a label already present is not written twice. The third, the live-run relay,
+//! does **not** — the same text can reach the same mailbox twice. Named rather than papered over:
+//! the duplicate is the identical body, wrapped as untrusted data, into the run it was already
+//! delivered to, which is a bounded annoyance and not a new capability. Making it exact would mean
+//! persisting a delivery record outside the room, which is the ledger the design deliberately does
+//! not build (§0.11.4: the room is advisory, Linear is the ledger).
 //!
 //! # Off-loop, on the manager's budget
 //!
