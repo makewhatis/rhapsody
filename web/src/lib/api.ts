@@ -940,6 +940,13 @@ export interface TeamsInvalidateResponse {
   reason: string;
 }
 
+export interface TeamsReinstateResponse {
+  identity: string;
+  fact_id: string;
+  /** false ⇒ the record was already valid (a no-op, not a failure). */
+  reinstated: boolean;
+}
+
 // --- teams.yaml, for the enable flow ---
 
 export interface TeamsIdentityConfig {
@@ -1023,8 +1030,16 @@ export async function fetchTeamsRoom(limit?: number): Promise<TeamsRoomResponse>
 // fetchTeamsRecall lists what an identity remembers. An EMPTY query is a browse — "everything,
 // bounded by recall_top_k" — which is what the memory panel wants: a wrong fact has to be visible
 // before it can be invalidated (design §5.2.3).
-export async function fetchTeamsRecall(identity: string, query = ""): Promise<TeamsRecallResponse> {
+// `state` is the daemon's record-state filter (STUDIO-689): "" or "valid" is what an agent sees,
+// "invalidated" the corrections alone, "all" the bank as it is on disk. The Memory page asks for
+// "all", because a correction made in an earlier session is invisible otherwise.
+export async function fetchTeamsRecall(
+  identity: string,
+  query = "",
+  state = "",
+): Promise<TeamsRecallResponse> {
   const params = new URLSearchParams({ identity, query });
+  if (state !== "") params.set("state", state);
   const r = await getJSON<TeamsRecallResponse>(`/api/v1/teams/recall?${params}`);
   r.facts ??= [];
   r.skipped ??= [];
@@ -1065,6 +1080,19 @@ export async function postTeamsInvalidate(
     identity,
     fact_id: factID,
     reason,
+  });
+}
+
+// postTeamsReinstate undoes an invalidation (STUDIO-689): the record goes back into recall and the
+// reason it was invalidated for is dropped with it. No `reason` argument — a correction has to be
+// justified, undoing one restores the original and justifies nothing new.
+export async function postTeamsReinstate(
+  identity: string,
+  factID: string,
+): Promise<TeamsReinstateResponse> {
+  return postJSON<TeamsReinstateResponse>("/api/v1/teams/reinstate", {
+    identity,
+    fact_id: factID,
   });
 }
 

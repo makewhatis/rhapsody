@@ -10,7 +10,7 @@ import {
 import { useConsoleRoute } from "@/hooks/useConsoleRoute";
 import { useIssueRuns } from "@/hooks/useHistory";
 import { useStateQuery } from "@/hooks/useStateQuery";
-import { useVersionQuery } from "@/hooks/useTeams";
+import { useReinstateFact, useVersionQuery } from "@/hooks/useTeams";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
@@ -61,6 +61,26 @@ export function ConsoleApp() {
   );
 }
 
+/**
+ * The Memory page plus its one write seam.
+ *
+ * `MemoryView` takes reinstate as a prop rather than calling the mutation itself, so the view stays
+ * a pure render of what it is handed — the shape it shipped with. What changed with STUDIO-689 is
+ * that there is now something to hand it: `POST /api/v1/teams/reinstate`. A wrapper component,
+ * because `ConsoleBody`'s route switch may not call a hook.
+ */
+function MemoryPage({ go }: { go: (name: ConsoleRouteName, key?: string) => void }) {
+  const reinstate = useReinstateFact();
+  return (
+    <MemoryView
+      onNavigate={(to, key) => go(to, key)}
+      onReinstate={async (fact) => {
+        await reinstate.mutateAsync({ identity: fact.identity, factID: fact.id });
+      }}
+    />
+  );
+}
+
 function ConsoleBody({
   route,
   teamsEnabled,
@@ -91,7 +111,7 @@ function ConsoleBody({
     case "memory":
       // "View run" has no run route of its own (§2.3) — a fact's run lives on its ticket's Job
       // detail, which is where the runs list already is.
-      return <MemoryView onNavigate={(to, key) => go(to, key)} />;
+      return <MemoryPage go={go} />;
     case "manage":
       return <Pending title="Manage team" section="§7" subTicket={5} />;
     default:

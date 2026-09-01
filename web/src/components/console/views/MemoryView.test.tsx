@@ -6,8 +6,13 @@ import type { TeamsFact, TeamsOverview, TeamsRecallResponse, TeamsRosterRow } fr
 
 // STUDIO-681 §10, sub-ticket 4 — the Memory page's acceptance boxes 4.1 … 4.6, driven through
 // the real view against the endpoints §9 has: `GET /api/v1/teams` for the roster and the memory
-// backend, `GET /api/v1/teams/recall` (empty query = browse) for each teammate's bank, and
-// `POST /api/v1/teams/invalidate` for the correction.
+// backend, `GET /api/v1/teams/recall` (empty query = browse, `state=all` since STUDIO-689) for
+// each teammate's bank, and `POST /api/v1/teams/invalidate` for the correction.
+//
+// Boxes 4.1 and 4.6 were the two that degraded honestly when this page shipped: the daemon could
+// neither list a bank's already-invalidated records nor undo an invalidation. STUDIO-689 added
+// both, so the browse below asserts the state filter it now sends, and the reinstate seam is a
+// required prop rather than an optional one.
 
 const h = vi.hoisted(() => ({
   fetchTeamsOverview: vi.fn(),
@@ -104,7 +109,10 @@ function mount(over: Harness = {}) {
   });
   return render(
     <QueryClientProvider client={client}>
-      <MemoryView onNavigate={over.onNavigate ?? (() => {})} onReinstate={over.onReinstate} />
+      <MemoryView
+        onNavigate={over.onNavigate ?? (() => {})}
+        onReinstate={over.onReinstate ?? (async () => {})}
+      />
     </QueryClientProvider>,
   );
 }
@@ -167,12 +175,40 @@ describe("Memory page", () => {
     expect(stat("banks")).toBe("2");
   });
 
-  it("4.1 — browses EVERY roster member's bank, because recall reads one identity at a time", async () => {
+  it("4.1 — browses every bank for ALL states, so a stored correction is visible", async () => {
     seed();
     mount();
     await settled();
-    expect(h.fetchTeamsRecall).toHaveBeenCalledWith("alice", "");
-    expect(h.fetchTeamsRecall).toHaveBeenCalledWith("jimmy", "");
+    // One read per identity — recall reads one bank at a time — and every one of them asks for
+    // `state=all`, which is what makes the invalidated stat and filter mean the bank on disk
+    // rather than the corrections made in this session (STUDIO-689).
+    expect(h.fetchTeamsRecall).toHaveBeenCalledWith("alice", "", "all");
+    expect(h.fetchTeamsRecall).toHaveBeenCalledWith("jimmy", "", "all");
+  });
+
+  it("4.1 — counts a record the daemon reports as already invalidated", async () => {
+    // The gap STUDIO-689 closed: before it, this record could not come back from a browse at all,
+    // so the page could only show corrections made while it was open.
+    h.fetchTeamsOverview.mockResolvedValue(OVERVIEW);
+    h.fetchTeamsRecall.mockImplementation(async (identity: string) => ({
+      identity,
+      facts:
+        identity === "alice"
+          ? [
+              ALICE_FACTS[0],
+              { ...ALICE_FACTS[1], state: "invalidated", reason: "measured otherwise in MT-2" },
+            ]
+          : JIMMY_FACTS,
+      skipped: [],
+    }));
+    mount();
+    await settled();
+    expect(stat("invalidated")).toBe("1");
+    expect(stat("valid")).toBe("2");
+    const dead = await card("vision Router");
+    expect(dead.className).toContain("dead");
+    expect(within(dead).getByRole("status").textContent).toContain("measured otherwise in MT-2");
+    expect(within(dead).getByRole("button", { name: "Reinstate" })).toBeTruthy();
   });
 
   it("4.2 — search filters by free text", async () => {
@@ -311,9 +347,10 @@ describe("Memory page", () => {
     mount();
     const c = await card("rebase hazard");
 
-    // What the real daemon does the instant the correction lands: recall serves VALID records
-    // only, so the record the operator just invalidated stops being returned. The card carries
-    // the undo, so it has to survive the refetch the invalidate itself triggers.
+    // A bank read that comes back without the record — a backend whose listing is bounded
+    // differently, or a `state=all` browse the daemon could not serve. The card carries the undo,
+    // so it has to survive the refetch the invalidate itself triggers rather than deleting the one
+    // control that reverses what just happened.
     h.fetchTeamsRecall.mockImplementation(async (identity: string) => ({
       identity,
       facts: identity === "alice" ? ALICE_FACTS.filter((f) => f.id !== "a1") : JIMMY_FACTS,
@@ -393,9 +430,14 @@ describe("Memory page", () => {
     expect(within(alive).getByRole("button", { name: "Invalidate" })).toBeTruthy();
   });
 
-  it("4.6 — with no reinstate capability the fact stays invalidated and says what is missing", async () => {
+  it("4.6 — a rejected reinstate leaves the fact invalidated and says why", async () => {
     seed();
-    mount();
+    // The bank is unchanged when the daemon refuses, so the card must stay dimmed: showing it
+    // restored would tell the operator an undo landed that did not.
+    const onReinstate = vi.fn(async () => {
+      throw new Error("memory_backend_error: bank unreadable");
+    });
+    mount({ onReinstate });
     const c = await card("rebase hazard");
     fireEvent.click(within(c).getByRole("button", { name: "Invalidate" }));
     fireEvent.change(within(c).getByLabelText("Why is this wrong?"), { target: { value: "stale" } });
@@ -405,7 +447,9 @@ describe("Memory page", () => {
     const dead = await card("rebase hazard");
     fireEvent.click(within(dead).getByRole("button", { name: "Reinstate" }));
 
-    await waitFor(() => expect(within(dead).getByRole("alert").textContent).toMatch(/endpoint/i));
+    await waitFor(() =>
+      expect(within(dead).getByRole("alert").textContent).toContain("bank unreadable"),
+    );
     expect(dead.className).toContain("dead");
     expect(stat("invalidated")).toBe("1");
   });
