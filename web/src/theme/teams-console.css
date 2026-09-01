@@ -1,0 +1,112 @@
+/*
+ * The Teams console's own rules — STUDIO-681 §5, built by STUDIO-684.
+ *
+ * Everything shared lives in `console.css` (§1.3/§1.4) and is composed, not restated: this file
+ * declares only what the room, the roster card and the memory preview add on top, traced from the
+ * prototype's markup (`~/.rhapsody/docs/STUDIO-681-prototype.html`). No color, radius or type
+ * family is spelled out here — every one is a token from `tokens.css`.
+ *
+ * Scoped under `.rh-console` for the reason STUDIO-682 gives: `src/index.css` declares `--ink`,
+ * `--line` and `--accent` with other meanings, so an unscoped rule would repaint the shipped
+ * Podium dashboard mid-migration.
+ *
+ * Imported by the view rather than by `main.tsx`, so a build that never renders the console never
+ * carries these bytes.
+ */
+
+/* ===== view header (the team switcher's placement is §5's; multi-team is STUDIO-668) ===== */
+.rh-console .head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
+.rh-console .head h1 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -.01em; }
+.rh-console .head .spacer { flex: 1; }
+.rh-console .teamsw { font: inherit; display: inline-flex; align-items: center; gap: 8px; padding: 6px 11px; border: 1px solid var(--line); border-radius: 99px; background: var(--panel); color: var(--ink-2); font-size: 12.5px; cursor: pointer; }
+.rh-console .teamsw:hover:not(:disabled) { border-color: #34343c; color: var(--ink); }
+.rh-console .teamsw:disabled { cursor: default; color: var(--ink-3); }
+.rh-console .teamsw .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.rh-console .teamsw .car { color: var(--ink-4); font-size: 10px; }
+.rh-console .build { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); border: 1px solid var(--line-soft); border-radius: 99px; padding: 4px 10px; }
+
+/* A `.link` that has to be a button: it performs an action (routing), not a document jump. */
+.rh-console button.link { font: inherit; font-size: 12px; border: 0; background: none; padding: 0; }
+
+/* ===== the room ===== */
+.rh-console .roomtop { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line-soft); }
+.rh-console .filters { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 12px 14px 10px; }
+.rh-console .filters .selwrap { margin-left: auto; }
+.rh-console .search { display: flex; align-items: center; gap: 8px; padding: 0 14px 10px; }
+.rh-console .search input { flex: 1; font-size: 12.5px; }
+.rh-console .composer { padding: 0 14px 13px; display: flex; flex-direction: column; gap: 8px; }
+.rh-console .composer textarea { width: 100%; resize: vertical; min-height: 50px; }
+.rh-console .composer .row { display: flex; gap: 8px; }
+.rh-console .composer .row input { flex: 1; font-size: 12.5px; font-family: var(--mono); }
+.rh-console .composer .row input::placeholder { font-family: var(--sans); }
+
+.rh-console .feed { padding: 4px 0 0; }
+.rh-console .day { display: flex; align-items: center; gap: 12px; padding: 14px 16px 8px; }
+.rh-console .day .t { font-size: 11px; font-weight: 600; color: var(--ink-3); text-transform: uppercase; letter-spacing: .09em; white-space: nowrap; }
+.rh-console .day .ln { height: 1px; background: var(--line-soft); flex: 1; }
+.rh-console .quiet { padding: 10px 16px 14px; color: var(--ink-4); font-size: 12.5px; font-style: italic; }
+
+.rh-console .event { position: relative; padding: 9px 16px 9px 40px; border-left: 2px solid transparent; }
+.rh-console .event::before { content: ""; position: absolute; left: 16px; top: 14px; width: 15px; height: 15px; border-radius: 50%; background: var(--raise); border: 1px solid var(--line); }
+.rh-console .event .ic { position: absolute; left: 19px; top: 12px; width: 12px; height: 12px; color: var(--ink-3); z-index: 1; }
+.rh-console .event .meta { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.rh-console .event .from { font-weight: 600; font-size: 12.5px; }
+.rh-console .event .kind { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; }
+.rh-console .event .at { margin-left: auto; }
+.rh-console .event .body { font-size: 13px; color: var(--ink-2); margin: 3px 0 0; }
+.rh-console .event .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+
+/* The rail, the icon and the author carry the kind's color — §5's "left color rail + icon". */
+.rh-console .event[data-kind="operator"] { border-left-color: var(--operator); background: linear-gradient(90deg, var(--operator-soft), transparent 40%); }
+.rh-console .event[data-kind="operator"] .ic,
+.rh-console .event[data-kind="operator"] .from { color: var(--operator); }
+.rh-console .event[data-kind="handoff"] { border-left-color: var(--handoff); }
+.rh-console .event[data-kind="handoff"] .ic,
+.rh-console .event[data-kind="handoff"] .from { color: var(--handoff); }
+.rh-console .event[data-kind="quorum"] { border-left-color: var(--bad); }
+.rh-console .event[data-kind="quorum"] .ic,
+.rh-console .event[data-kind="quorum"] .kind { color: var(--bad); }
+
+.rh-console details.more { margin-top: 2px; }
+.rh-console details.more > summary { list-style: none; cursor: pointer; color: var(--ink-4); font-size: 11.5px; font-family: var(--mono); padding-top: 2px; }
+.rh-console details.more > summary::-webkit-details-marker { display: none; }
+.rh-console details.more > summary:hover { color: var(--accent); }
+.rh-console details.more .full { font-size: 13px; color: var(--ink-2); margin-top: 6px; padding-left: 11px; border-left: 2px solid var(--line-soft); }
+
+.rh-console details.group { margin: 2px 16px 4px 40px; border: 1px dashed var(--line); border-radius: var(--r-sm); background: var(--panel-2); }
+.rh-console details.group > summary { list-style: none; cursor: pointer; padding: 9px 13px; display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--ink-2); }
+.rh-console details.group > summary::-webkit-details-marker { display: none; }
+.rh-console details.group > summary .car { color: var(--ink-4); transition: .15s; font-size: 10px; }
+.rh-console details.group[open] > summary .car { transform: rotate(90deg); }
+.rh-console details.group > summary b { color: var(--ink); font-weight: 600; }
+.rh-console details.group .inner { border-top: 1px dashed var(--line); padding: 4px 0; }
+.rh-console details.group .gline { display: flex; align-items: center; gap: 10px; padding: 6px 14px; font-size: 12px; color: var(--ink-3); }
+.rh-console details.group .gline .at { width: 44px; flex: none; }
+.rh-console details.group .gline .who { color: var(--ink-2); }
+.rh-console details.group .gline .tk { margin-left: auto; }
+
+.rh-console .older { display: flex; justify-content: center; padding: 14px 16px 16px; }
+.rh-console .older button { font: inherit; font-size: 12px; color: var(--ink-2); background: var(--panel-2); border: 1px solid var(--line); border-radius: 99px; padding: 7px 16px; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
+.rh-console .older button:hover { border-color: #34343c; color: var(--ink); }
+.rh-console .older .sp { width: 11px; height: 11px; border: 1.6px solid var(--ink-4); border-top-color: var(--accent); border-radius: 50%; animation: rh-spin 1s linear infinite; }
+@keyframes rh-spin { to { transform: rotate(360deg); } }
+
+.rh-console .legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 12px 15px; color: var(--ink-3); font-size: 11.5px; border-top: 1px solid var(--line-soft); }
+.rh-console .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+
+/* ===== the side: roster, memory preview ===== */
+.rh-console .rtbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.rh-console .rtbl th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 8px 15px; border-bottom: 1px solid var(--line-soft); }
+.rh-console .rtbl td { padding: 11px 15px; border-bottom: 1px solid var(--line-soft); }
+.rh-console .rtbl tr:last-child td { border-bottom: 0; }
+.rh-console .rtbl .nm { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.rh-console .rtbl .nm .st { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-4); }
+.rh-console .rtbl .nm.run .st { background: var(--ok); box-shadow: 0 0 0 3px rgba(99, 192, 122, .16); }
+.rh-console .rtbl .m { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.rh-console .rtbl .now-col { color: var(--ink-3); }
+
+.rh-console .memprev { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.rh-console .mcard { border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--panel-2); padding: 11px 12px; }
+.rh-console .mcard .top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.rh-console .mcard .top .at { margin-left: auto; }
+.rh-console .mcard p { margin: 0; font-size: 12.5px; color: var(--ink-2); }

@@ -349,6 +349,17 @@ export function groupLabel(events: readonly RoomEvent[]): string {
   return `${n} ticket${n === 1 ? "" : "s"} assigned deterministically${span}`;
 }
 
+/**
+ * The three facts a triage assignment carries, pulled back out of the post triage.rs writes:
+ * `Assigned <KEY> to <identity>[ (deterministic)]. Reason: <why>`. Returns null for anything that
+ * is not that sentence, so a reworded body degrades to the raw text rather than to a wrong parse.
+ */
+export function parseAssignment(body: string): { ticket: string; identity: string; reason: string } | null {
+  const m = /^Assigned (\S+) to (\S+?)(?: \(deterministic\))?\.? Reason: ([\s\S]*)$/.exec(body ?? "");
+  if (!m) return null;
+  return { ticket: m[1], identity: m[2], reason: m[3].trim().replace(/\.$/, "") };
+}
+
 /** A body split for §5's truncate-with-expand. `rest` is "" when the whole body already fits. */
 export function truncateBody(body: string, at: number = BODY_TRUNCATE_AT): { head: string; rest: string } {
   const text = body ?? "";
