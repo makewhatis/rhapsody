@@ -2512,6 +2512,17 @@ mod tests {
                     "disk on fire".to_string(),
                 ))
             }
+            fn read_forward(
+                &self,
+                _reader: &str,
+                _cursor: &Cursor,
+                _limit: usize,
+            ) -> Result<rhapsody_config::room::CaughtUp, rhapsody_config::room::RoomError>
+            {
+                Err(rhapsody_config::room::RoomError::Io(
+                    "disk on fire".to_string(),
+                ))
+            }
         }
         let mut tr = Fake::new();
         tr.candidates = vec![labelled("i1", &["rust"])];
