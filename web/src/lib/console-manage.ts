@@ -9,6 +9,21 @@ import { MIN_MODEL_TIMEOUT_MS, splitLabels, type RosterDraft, type TeamsDraft } 
 // functions. Two editors of one file must not disagree about what the file says, so §7 adds no
 // second serializer and no second validator — only the §7-specific reveal rules below.
 
+/**
+ * The manager-mode Seg's options, in the order §7 and the prototype both print them —
+ * `labels / labels + model / off`, cheapest-to-most-capable then the opt-out.
+ *
+ * Deliberately NOT `MANAGER_MODES` order: that array is the schema's (`off` first), which the
+ * Podium editor renders as a dropdown where order carries no meaning. A Seg is a row on screen,
+ * so its order is part of the design. `console-manage.test.ts` pins that the two stay the same
+ * SET, so a mode added to the schema cannot silently vanish from this control.
+ */
+export const MANAGER_MODE_OPTIONS = [
+  { value: "labels", label: "labels" },
+  { value: "labels+model", label: "labels + model" },
+  { value: "off", label: "off" },
+] as const;
+
 /** The profiles compiled into the daemon (`crates/config/src/profiles/builtin`). */
 export const BUILTIN_PROFILES = ["swe", "sre", "reviewer"] as const;
 

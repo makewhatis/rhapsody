@@ -2,6 +2,7 @@ import * as React from "react";
 import { Button, Note, Seg, Select, Stepper, TagInput, Toggle } from "@/components/console";
 import { useSaveTeamsConfig, useTeamsConfigQuery } from "@/hooks/useTeams";
 import {
+  MANAGER_MODE_OPTIONS,
   defaultIdentityOptions,
   joinRowLabels,
   managerModelDisabled,
@@ -11,7 +12,6 @@ import {
   starvedTimeoutMs,
 } from "@/lib/console-manage";
 import {
-  MANAGER_MODES,
   MASKED_API_KEY,
   MEMORY_BACKENDS,
   MIN_MODEL_TIMEOUT_MS,
@@ -196,9 +196,13 @@ function Section({ title, desc, children }: { title: string; desc?: React.ReactN
 }
 
 /**
- * One labelled row. `htmlFor` is passed only for the plain inputs and selects that can carry an
- * id; the composite controls (Seg, Stepper, Toggle, TagInput) name themselves through the
- * `label` prop §1.3 requires, so their visible label here stays purely visual.
+ * One labelled row.
+ *
+ * `htmlFor` is passed only for the plain inputs and selects that can carry an id. The composite
+ * controls (Seg, Stepper, Toggle, TagInput) name themselves through the `label` prop §1.3
+ * requires, and for those the caption renders as a `<span>` rather than a `<label>`: a `<label>`
+ * associated with no control is not a label, and duplicating the name onto one would make a
+ * screen reader announce it twice. Both spellings take the same `.field .lb` styling.
  */
 function Field({
   label,
@@ -214,7 +218,7 @@ function Field({
   return (
     <div className="field">
       <div className="lb">
-        <label htmlFor={htmlFor}>{label}</label>
+        {htmlFor === undefined ? <span className="fl">{label}</span> : <label htmlFor={htmlFor}>{label}</label>}
         {hint ? <div className="h">{hint}</div> : null}
       </div>
       <div className="ct">{children}</div>
@@ -335,9 +339,6 @@ function RosterRow({
   );
 }
 
-/** The manager mode Seg's labels — the schema's values, spaced the way the prototype prints them. */
-const MODE_OPTIONS = MANAGER_MODES.map((m) => ({ value: m, label: m === "labels+model" ? "labels + model" : m }));
-
 function Manager({
   draft,
   set,
@@ -355,7 +356,7 @@ function Manager({
         <Seg
           accent
           aria-label="Mode"
-          options={MODE_OPTIONS}
+          options={MANAGER_MODE_OPTIONS}
           value={draft.managerMode}
           onChange={(v) => set("managerMode", v)}
         />

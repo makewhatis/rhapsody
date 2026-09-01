@@ -174,6 +174,16 @@ describe("5.2 — manager mode Seg switches; off disables the model field", () =
     expect(within(seg("Mode")).getByRole("button", { name: "labels + model" }).getAttribute("aria-pressed")).toBe("true");
   });
 
+  // The order is part of the design, not an accident of the schema array: §7 and the prototype
+  // both print it cheapest-first with the opt-out last.
+  it("renders the modes in the order §7 prints them", async () => {
+    await ready();
+    const labels = within(seg("Mode"))
+      .getAllByRole("button")
+      .map((b) => b.textContent);
+    expect(labels).toEqual(["labels", "labels + model", "off"]);
+  });
+
   it("switches mode", async () => {
     await ready();
     press("Mode", "labels");

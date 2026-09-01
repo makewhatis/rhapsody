@@ -28,7 +28,10 @@
 .rh-console .field { display: grid; grid-template-columns: 180px 1fr; gap: 14px; align-items: start; padding: 12px 0; border-bottom: 1px solid var(--line-soft); }
 .rh-console .field:last-child { border-bottom: 0; }
 .rh-console .field > .lb { padding-top: 7px; }
-.rh-console .field .lb label { font-size: 13px; font-weight: 500; }
+/* `.fl` is the caption for a control that names itself (Seg, Stepper, Toggle, TagInput); see
+   the Field component for why those are not `<label>` elements. */
+.rh-console .field .lb label,
+.rh-console .field .lb .fl { display: block; font-size: 13px; font-weight: 500; }
 .rh-console .field .lb .h { color: var(--ink-4); font-size: 11.5px; margin-top: 2px; line-height: 1.45; }
 .rh-console .field .ct { min-width: 0; }
 .rh-console .in-wide { width: 100%; }

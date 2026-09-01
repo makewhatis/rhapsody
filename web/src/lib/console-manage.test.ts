@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { emptyDraft, type TeamsDraft } from "@/lib/teams-model";
+import { MANAGER_MODES, emptyDraft, type TeamsDraft } from "@/lib/teams-model";
 import {
   BUILTIN_PROFILES,
   LEAST_LOADED_LABEL,
+  MANAGER_MODE_OPTIONS,
   defaultIdentityOptions,
   joinRowLabels,
   managerModelDisabled,
@@ -19,6 +20,21 @@ import {
 function draft(patch: Partial<TeamsDraft> = {}): TeamsDraft {
   return { ...emptyDraft(), ...patch };
 }
+
+describe("MANAGER_MODE_OPTIONS", () => {
+  // §7 and the prototype both print the Seg as `labels / labels + model / off`. The schema's own
+  // array starts with `off`, so rendering it directly would put the opt-out first.
+  it("is ordered the way §7 prints it", () => {
+    expect(MANAGER_MODE_OPTIONS.map((o) => o.value)).toEqual(["labels", "labels+model", "off"]);
+    expect(MANAGER_MODE_OPTIONS.map((o) => o.label)).toEqual(["labels", "labels + model", "off"]);
+  });
+
+  // Reordering is a design choice; DROPPING one would be a mode the operator cannot select and
+  // cannot see, so the set is pinned against the schema rather than restated.
+  it("covers exactly the modes the schema declares", () => {
+    expect(new Set(MANAGER_MODE_OPTIONS.map((o) => o.value))).toEqual(new Set(MANAGER_MODES));
+  });
+});
 
 describe("profileOptions", () => {
   it("offers the built-in profiles", () => {
