@@ -102,6 +102,8 @@ impl Facade {
                 "teams_roster",
                 "teams_recall",
                 "teams_invalidate",
+                // STUDIO-689: the invalidate's reversal, gated by exactly the same removal.
+                "teams_reinstate",
                 "teams_retain",
                 // STUDIO-650, T5: the room's read side, gated by exactly the same removal.
                 "teams_room_read",

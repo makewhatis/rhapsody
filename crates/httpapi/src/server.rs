@@ -12,8 +12,8 @@ use axum::routing::any;
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::teamsmemory::{
-    InvalidateView, PostView, RecallView, RetainView, RoomView, RosterView, TeamsMemoryError,
-    TeamsView,
+    InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
+    TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
     HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot,
@@ -33,7 +33,7 @@ use crate::handlers_projects::handle_projects;
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
 use crate::handlers_teams::{
     handle_run_post, handle_run_retain, handle_teams, handle_teams_config, handle_teams_invalidate,
-    handle_teams_recall, handle_teams_room, handle_teams_roster,
+    handle_teams_recall, handle_teams_reinstate, handle_teams_room, handle_teams_roster,
 };
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
@@ -185,10 +185,15 @@ pub trait StateProvider: Send + Sync {
     }
 
     /// One identity's recalled memory for a free-text query (`GET /api/v1/teams/recall`).
+    ///
+    /// `state` is the `?state=` filter's wire spelling — `""`/`valid`,
+    /// `invalidated` or `all` (STUDIO-689). Empty is what every agent-facing caller sends, and it
+    /// keeps the valid-only answer §5.3 requires.
     async fn teams_recall(
         &self,
         _identity: &str,
         _query: &str,
+        _state: &str,
     ) -> Result<RecallView, TeamsMemoryError> {
         Err(TeamsMemoryError::Disabled)
     }
@@ -206,6 +211,17 @@ pub trait StateProvider: Send + Sync {
         _fact_id: &str,
         _reason: &str,
     ) -> Result<InvalidateView, TeamsMemoryError> {
+        Err(TeamsMemoryError::Disabled)
+    }
+
+    /// Put one invalidated record back into recall (`POST /api/v1/teams/reinstate`, §5.3's
+    /// reversal; STUDIO-689). No `reason`: undoing a correction restores the original and
+    /// justifies nothing new.
+    async fn teams_reinstate(
+        &self,
+        _identity: &str,
+        _fact_id: &str,
+    ) -> Result<ReinstateView, TeamsMemoryError> {
         Err(TeamsMemoryError::Disabled)
     }
 
@@ -393,6 +409,9 @@ where
         .route("/api/v1/teams/roster", any(handle_teams_roster))
         .route("/api/v1/teams/recall", any(handle_teams_recall))
         .route("/api/v1/teams/invalidate", any(handle_teams_invalidate))
+        // §5.3's reversal, the one route that makes "nothing is deleted" worth anything to an
+        // operator (STUDIO-689). Same shape as the invalidate above, one field shorter.
+        .route("/api/v1/teams/reinstate", any(handle_teams_reinstate))
         // The team room, dispatched by method (the shape `/api/v1/teams/config` uses): GET is
         // T5's bounded, read-only peek that advances no identity's cursor; POST is STUDIO-661's
         // human door, an operator post the daemon stamps `operator` on.

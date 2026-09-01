@@ -362,11 +362,12 @@ impl StateProvider for FakeProvider {
         &self,
         identity: &str,
         query: &str,
+        state: &str,
     ) -> Result<
         rhapsody_orchestrator::teamsmemory::RecallView,
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
-        self.teams()?.recall(identity, query).await
+        self.teams()?.recall(identity, query, state).await
     }
 
     async fn teams_invalidate(
@@ -379,6 +380,17 @@ impl StateProvider for FakeProvider {
         rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
     > {
         self.teams()?.invalidate(identity, fact_id, reason).await
+    }
+
+    async fn teams_reinstate(
+        &self,
+        identity: &str,
+        fact_id: &str,
+    ) -> Result<
+        rhapsody_orchestrator::teamsmemory::ReinstateView,
+        rhapsody_orchestrator::teamsmemory::TeamsMemoryError,
+    > {
+        self.teams()?.reinstate(identity, fact_id).await
     }
 
     async fn teams_retain(
