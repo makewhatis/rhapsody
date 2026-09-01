@@ -46,7 +46,7 @@ export function ConsoleApp() {
     [teamsEnabled, openJobs],
   );
 
-  const go = (name: ConsoleRouteName, key = "") => navigate({ name, key } as ConsoleRoute);
+  const go = (name: ConsoleRouteName, key = "") => navigate({ name, key });
 
   return (
     <AppShell
@@ -86,26 +86,31 @@ function ConsoleBody({
     // teams / memory / manage are only ever reached with Teams ON — `useConsoleRoute` sends
     // them to Jobs otherwise (§2.4) — and their views are sub-tickets 3–5 of STUDIO-681.
     case "teams":
-      return <Pending title="Teams" ticket="STUDIO-684" section="§5" />;
+      return <Pending title="Teams" section="§5" subTicket={3} />;
     case "memory":
-      return <Pending title="Memory" ticket="STUDIO-685" section="§6" />;
+      return <Pending title="Memory" section="§6" subTicket={4} />;
     case "manage":
-      return <Pending title="Manage team" ticket="STUDIO-686" section="§7" />;
+      return <Pending title="Manage team" section="§7" subTicket={5} />;
     default:
       return <JobsView onOpenJob={(issue) => go("job", issue)} />;
   }
 }
 
-/** A view this slice does not build, named with the sub-ticket that does. */
-function Pending({ title, ticket, section }: { title: string; ticket: string; section: string }) {
+/**
+ * A view this slice does not build, named by the SPEC section and sub-ticket that do. It cites
+ * the epic rather than a specific issue id on purpose: the sub-ticket numbering is in the spec
+ * and verifiable, whereas guessing at the issue key for a ticket this run cannot read would put
+ * an unverified reference into shipped UI text.
+ */
+function Pending({ title, section, subTicket }: { title: string; section: string; subTicket: number }) {
   return (
     <section>
       <div className="head">
         <h1>{title}</h1>
       </div>
       <p className="lead">
-        {section} of the dashboard redesign is built by {ticket}. This slice (STUDIO-683) builds
-        the shell, Jobs, Job detail and Settings.
+        {section} of the dashboard redesign is sub-ticket {subTicket} of STUDIO-681, and is not
+        built yet. This slice (STUDIO-683) builds the shell, Jobs, Job detail and Settings.
       </p>
     </section>
   );
