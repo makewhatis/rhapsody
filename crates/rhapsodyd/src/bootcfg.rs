@@ -622,9 +622,9 @@ mod tests {
         // VACUOUS the moment a live daemon's first `teams_retain` created that directory: `!got
         // .exists()` went permanently false, and the `||` meant the whole claim rode on
         // `/somewhere/banks`, which nothing here could have created anyway (STUDIO-688).
-        let db = dir.child("rhapsody.db");
-        let anchored = resolve_banks_dir(None, "", &db.to_string_lossy(), false)
-            .expect("temp-dir --db → Some");
+        let anchored =
+            resolve_banks_dir(None, "", &dir.child("rhapsody.db").to_string_lossy(), false)
+                .expect("temp-dir --db → Some");
         assert_eq!(anchored, dir.child("teams").join("banks"));
         let overridden = dir.child("elsewhere-banks");
         assert_eq!(
