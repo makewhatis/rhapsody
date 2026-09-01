@@ -389,6 +389,16 @@ impl PassWrites {
         self.labelled.get(id).map(String::as_str)
     }
 
+    /// Records that a review ticket now exists for `id`.
+    fn record_filed(&mut self, id: &str) {
+        self.filed.insert(id.to_string());
+    }
+
+    /// Records that `identity`'s label was written to `id`.
+    fn record_labelled(&mut self, id: &str, identity: &str) {
+        self.labelled.insert(id.to_string(), identity.to_string());
+    }
+
     /// Issue ids this pass gave an identity label to — what triage must not re-label.
     pub(crate) fn labelled_ids(&self) -> impl Iterator<Item = &str> {
         self.labelled.keys().map(String::as_str)
@@ -577,8 +587,13 @@ async fn act_on_post(
         refs.extend(done.refs);
     }
     if truncated {
+        // "looked at", not "answered": a pasted URL now costs a lookup only while the answer has
+        // room for it, so the cap can bite on candidates that were never resolved to a ticket at
+        // all. Claiming five answers when the reply above says none were found would be wrong in
+        // exactly that case — and saying nothing about the rest is the silence this module exists
+        // to fix.
         lines.push(format!(
-            "That post named more than {MAX_TARGETS_PER_POST} tickets; I answered the first \
+            "That post named more than {MAX_TARGETS_PER_POST} tickets; I only looked at the first \
              {MAX_TARGETS_PER_POST}. Post the rest separately."
         ));
     }
@@ -974,7 +989,7 @@ async fn file_review(
     };
     // Recorded on the CREATE, not on the marker write below: the review ticket exists either way,
     // and a marker write that fails must not let the next post in this page file a second one.
-    report.wrote.filed.insert(iss.id.clone());
+    report.wrote.record_filed(&iss.id);
     let mut line = format!(
         "{reviewer} — filed {filed} to review {}'s PR ({pr_url}).",
         iss.identifier
@@ -1084,10 +1099,7 @@ async fn confirm_assignment(
             // Both halves matter: the guard above for the rest of THIS pass, and triage's
             // assignment pass — which runs after the ears pass over the same stale snapshot — for
             // the rest of this cycle.
-            report
-                .wrote
-                .labelled
-                .insert(iss.id.clone(), identity.clone());
+            report.wrote.record_labelled(&iss.id, &identity);
             Done::acted(
                 format!("{identity} takes {}.", iss.identifier),
                 vec![iss.identifier.clone()],

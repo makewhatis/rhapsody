@@ -1093,7 +1093,9 @@ where
     }
     let mut candidates = unlabelled_candidates(&issues, &target.states);
     // The operator's answer stands: a ticket the ears pass just labelled is claimed, however
-    // unclaimed this cycle's fetch still shows it.
+    // unclaimed this cycle's fetch still shows it. That covers a PENDING entry too — skipping the
+    // retry of an older, unwritten decision is the point, not a leak: the next cycle's fetch shows
+    // the label the ears pass wrote, and the sweep at the top of this function retires the entry.
     candidates.retain(|iss| !ears_labelled.contains(&iss.id));
     if candidates.is_empty() {
         return report(failed_outcome(CycleOutcome::Idle), 0);
