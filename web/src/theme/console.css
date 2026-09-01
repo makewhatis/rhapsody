@@ -38,11 +38,11 @@
 .rh-console .rail .logo { display: flex; align-items: center; gap: 9px; padding: 4px 8px 16px; }
 .rh-console .rail .logo b { font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
 .rh-console .rail .logo .mk { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(150deg, var(--accent), #b5643a); display: grid; place-items: center; color: #160c05; font-weight: 700; font-size: 13px; }
-.rh-console .nav { display: flex; flex-direction: column; gap: 3px; }
-.rh-console .nav a { display: flex; align-items: center; gap: 11px; padding: 8px 10px; border-radius: var(--r-sm); color: var(--ink-2); font-size: 13px; font-weight: 450; cursor: pointer; background: none; border: 0; font-family: inherit; text-align: left; width: 100%; }
+.rh-console .nav a { display: flex; align-items: center; gap: 11px; padding: 8px 10px; border-radius: var(--r-sm); color: var(--ink-2); font-size: 13px; font-weight: 450; cursor: pointer; }
 .rh-console .nav a:hover { background: var(--panel-2); color: var(--ink); }
 .rh-console .nav a.active { background: var(--raise); color: var(--ink); font-weight: 600; }
-.rh-console .nav a .ic { width: 16px; height: 16px; color: var(--ink-3); flex: none; }
+.rh-console .nav a .ic { width: 16px; height: 16px; color: var(--ink-3); flex: none; display: grid; place-items: center; }
+.rh-console .nav a .ic > svg { width: 100%; height: 100%; }
 .rh-console .nav a.active .ic { color: var(--accent); }
 .rh-console .nav a .ct { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); background: var(--panel-2); border-radius: 99px; padding: 1px 7px; }
 .rh-console .nav .sep { height: 1px; background: var(--line-soft); margin: 8px 6px; }
@@ -53,7 +53,9 @@
 /* §1.7 — below 860px the rail keeps its icons and drops everything else. */
 @media (max-width: 860px) {
   .app.rh-console { grid-template-columns: 52px 1fr; }
-  .rh-console .rail .logo b, .rh-console .nav a span, .rh-console .nav a .ct, .rh-console .rail .foot { display: none; }
+  /* `:not(.ic)` keeps the glyph: NavItem wraps its icon in a span, where the prototype
+     put the class straight on the <svg>. Everything else in the row goes. */
+  .rh-console .rail .logo b, .rh-console .nav a > span:not(.ic), .rh-console .nav a .ct, .rh-console .rail .foot { display: none; }
   .rh-console .nav a { justify-content: center; padding: 9px 0; }
 }
 

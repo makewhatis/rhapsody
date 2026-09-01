@@ -181,7 +181,7 @@ describe("1.7 — the rail collapses to icon-only below 860px", () => {
   it("hides the wordmark, nav labels, counts and the foot, leaving only icons", () => {
     const collapsed = block?.[1] ?? "";
     expect(collapsed).toMatch(/\.rail \.logo b/);
-    expect(collapsed).toMatch(/\.nav a span/);
+    expect(collapsed).toMatch(/\.nav a > span:not\(\.ic\)/);
     expect(collapsed).toMatch(/\.nav a \.ct/);
     expect(collapsed).toMatch(/\.rail \.foot/);
     expect(collapsed).toMatch(/display:\s*none/);
