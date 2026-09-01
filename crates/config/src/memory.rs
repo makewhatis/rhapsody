@@ -21,8 +21,8 @@
 //!    every method must be awaitable. That is precisely why the dispatch path
 //!    may never hold a `dyn MemoryBackend`: `dispatch_issue` is `fn`, not
 //!    `async fn`, and cannot await one. The trait is the **off-loop** surface —
-//!    the daemon's retain / recall / invalidate endpoints, which run on the HTTP
-//!    task.
+//!    the daemon's retain / recall / invalidate / reinstate endpoints, which run
+//!    on the HTTP task.
 //! 2. **[`LocalBank`]'s own methods are plain `fn` over local files.** That is
 //!    what the dispatch path holds — concretely, never as a trait object — so a
 //!    reviewer can clear the turn-1 prompt path by reading one type name. A
@@ -63,15 +63,74 @@ pub const DEFAULT_BANKS_SUBDIR: &str = "teams/banks";
 /// human can open — that is the whole point of `local` (§5.4).
 pub const RECORD_EXT: &str = "md";
 
-/// `state: valid` — the only state [`LocalBank::recall`] will return. Mirrors
-/// Hindsight's `readableByModel`, which "refuses **any** non-`valid` state"
-/// (§5.3), so switching backends does not change what the model can see.
+/// `state: valid` — the only state [`LocalBank::recall`] will return unless the
+/// caller asks for more ([`RecallState`]). Mirrors Hindsight's
+/// `readableByModel`, which "refuses **any** non-`valid` state" (§5.3), so
+/// switching backends does not change what the model can see.
 pub const STATE_VALID: &str = "valid";
 
 /// `state: invalidated` — §5.3's per-record correction. The record is NOT
 /// deleted: its content and the invalidation reason stay on disk, and flipping
 /// the flag back restores it ([`LocalBank::set_state`]).
 pub const STATE_INVALIDATED: &str = "invalidated";
+
+/// Which record states a recall may return (STUDIO-689).
+///
+/// [`Valid`](RecallState::Valid) is the default everywhere and is what the
+/// dispatch path asks for, so **turn-1 recall is unchanged**: a model still
+/// never sees a corrected fact, exactly as §5.3's `readableByModel` requires.
+/// The other two exist for the operator UI, which cannot show that a correction
+/// happened — nor offer to undo one made in an earlier session — if the only
+/// readable state is `valid`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecallState {
+    /// Only `state: valid`. The default, and the only state an agent sees.
+    #[default]
+    Valid,
+    /// Only `state: invalidated` — the corrections, and nothing else.
+    Invalidated,
+    /// Both, so one read can render a bank the way it is on disk.
+    All,
+}
+
+impl RecallState {
+    /// The wire spelling, as `GET /api/v1/teams/recall?state=` carries it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecallState::Valid => "valid",
+            RecallState::Invalidated => "invalidated",
+            RecallState::All => "all",
+        }
+    }
+
+    /// Parses the wire spelling. Absent or empty ⇒ [`Valid`](RecallState::Valid)
+    /// — the default has to survive a caller that says nothing, because every
+    /// caller that predates this parameter says nothing.
+    ///
+    /// An unrecognised value is `None` rather than a silent fall back to
+    /// `valid`: a mistyped filter that quietly answered "the valid ones" would
+    /// look exactly like a bank with no corrections in it.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "" | "valid" => Some(RecallState::Valid),
+            "invalidated" => Some(RecallState::Invalidated),
+            "all" => Some(RecallState::All),
+            _ => None,
+        }
+    }
+
+    /// Whether a record carrying `state` belongs in the answer. An unknown state
+    /// on disk is admitted only by [`All`](RecallState::All): it is neither
+    /// valid nor a correction, and a recall must never widen into "whatever the
+    /// file said".
+    pub fn admits(&self, state: &str) -> bool {
+        match self {
+            RecallState::Valid => state == STATE_VALID,
+            RecallState::Invalidated => state == STATE_INVALIDATED,
+            RecallState::All => true,
+        }
+    }
+}
 
 /// The most content one `retain` may store, in bytes. §5.1's payload is a
 /// *constructed record, never a transcript*; this is the backstop that keeps an
@@ -181,6 +240,10 @@ pub struct Query {
     /// `teams_recall` browse surface turns it on, and only when the free-text
     /// query is empty.
     pub browse: bool,
+    /// Which record states may come back (STUDIO-689). Defaults to
+    /// [`RecallState::Valid`], which is what every pre-existing caller — the
+    /// dispatch path included — keeps getting.
+    pub state: RecallState,
 }
 
 impl Query {
@@ -232,8 +295,8 @@ pub trait MemoryBackend: Send + Sync {
     /// retain logs and the run completes (§5.1). Returns the new record's id.
     async fn retain(&self, rec: &Record) -> Result<String, MemoryError>;
 
-    /// The identity's valid records matching `q`, bounded by
-    /// [`Query::top_k`]. Never creates anything.
+    /// The identity's records matching `q` in the states [`Query::state`]
+    /// admits, bounded by [`Query::top_k`]. Never creates anything.
     async fn recall(&self, identity: &str, q: &Query) -> Result<Recalled, MemoryError>;
 
     /// Mark one record non-valid, storing `reason` (§5.3). Reversible: nothing
@@ -244,6 +307,17 @@ pub trait MemoryBackend: Send + Sync {
         fact_id: &str,
         reason: &str,
     ) -> Result<bool, MemoryError>;
+
+    /// Put one invalidated record back into recall (STUDIO-689). `Ok(false)` ⇒
+    /// it was already valid, so nothing changed.
+    ///
+    /// The reversal §5.3 requires, on the trait rather than only on the two
+    /// concrete banks: an invalidation that cannot be undone through the same
+    /// surface that made it is reversible only in principle. It carries no
+    /// `reason` — the stored one is dropped with the correction it explained,
+    /// which is what makes the record identical to one that was never
+    /// invalidated.
+    async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError>;
 }
 
 /// `memory.backend: none` — routing and profiles with no memory at all (§5.4).
@@ -267,6 +341,10 @@ impl MemoryBackend for NoneBackend {
         _fact_id: &str,
         _reason: &str,
     ) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+
+    async fn revalidate(&self, _identity: &str, _fact_id: &str) -> Result<bool, MemoryError> {
         Ok(false)
     }
 }
@@ -414,8 +492,9 @@ impl LocalBank {
         Ok(id)
     }
 
-    /// The identity's **valid** records matching `q`, best-scoring first,
-    /// truncated to [`Query::top_k`].
+    /// The identity's records matching `q` in the states [`Query::state`]
+    /// admits — **valid only** unless the caller widened it — best-scoring
+    /// first, truncated to [`Query::top_k`].
     ///
     /// Never creates anything: a bank directory that does not exist is an empty
     /// result, not an error and not a `mkdir`. A record file that cannot be read
@@ -476,7 +555,7 @@ impl LocalBank {
                     continue;
                 }
             };
-            if fact.state != STATE_VALID {
+            if !q.state.admits(&fact.state) {
                 continue;
             }
             let score = score_fact(&fact, q);
@@ -585,6 +664,10 @@ impl MemoryBackend for LocalBank {
         reason: &str,
     ) -> Result<bool, MemoryError> {
         LocalBank::invalidate(self, identity, fact_id, reason)
+    }
+
+    async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError> {
+        LocalBank::revalidate(self, identity, fact_id)
     }
 }
 
@@ -1258,6 +1341,115 @@ mod tests {
                 .facts
                 .is_empty()
         );
+        // The reversal is on the TRAIT, not only on the concrete bank
+        // (STUDIO-689): the operator UI holds a `dyn MemoryBackend` and cannot
+        // reach `LocalBank::revalidate`.
+        assert!(
+            backend
+                .revalidate("alice", &id)
+                .await
+                .expect("revalidate through the trait")
+        );
+        assert_eq!(
+            b.recall("alice", &ticket_query("STUDIO-645"))
+                .expect("recall")
+                .facts
+                .len(),
+            1,
+            "a reinstated record is recalled again"
+        );
+        assert!(
+            !backend
+                .revalidate("alice", &id)
+                .await
+                .expect("revalidate twice"),
+            "reinstating a valid record is a no-op, not an error"
+        );
+    }
+
+    /// STUDIO-689: an invalidated record is *listable* on request, so the
+    /// operator surface can show a correction made in an earlier session — while
+    /// the default stays valid-only, which is what turn-1 recall asks for.
+    #[test]
+    fn recall_lists_invalidated_records_only_when_asked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = bank(dir.path());
+        let kept = b
+            .retain(&record("alice", "STUDIO-689", "1", "still true"))
+            .expect("retain");
+        let dropped = b
+            .retain(&record("alice", "STUDIO-689", "2", "never was true"))
+            .expect("retain");
+        assert!(
+            b.invalidate("alice", &dropped, "the run it named was rolled back")
+                .expect("invalidate")
+        );
+
+        let query = |state| Query {
+            ticket: "STUDIO-689".to_string(),
+            top_k: 8,
+            state,
+            ..Query::default()
+        };
+
+        let valid = b
+            .recall("alice", &query(RecallState::Valid))
+            .expect("recall");
+        assert_eq!(
+            valid
+                .facts
+                .iter()
+                .map(|f| f.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![kept.as_str()],
+            "the default is unchanged: valid records only"
+        );
+
+        let corrected = b
+            .recall("alice", &query(RecallState::Invalidated))
+            .expect("recall");
+        assert_eq!(
+            corrected
+                .facts
+                .iter()
+                .map(|f| f.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![dropped.as_str()],
+            "the corrections, and nothing else"
+        );
+        assert_eq!(corrected.facts[0].state, STATE_INVALIDATED);
+        assert_eq!(
+            corrected.facts[0].reason, "the run it named was rolled back",
+            "the reason travels with the listed record, or the correction is unreadable"
+        );
+
+        let all = b.recall("alice", &query(RecallState::All)).expect("recall");
+        let mut ids: Vec<&str> = all.facts.iter().map(|f| f.id.as_str()).collect();
+        ids.sort_unstable();
+        let mut want = vec![kept.as_str(), dropped.as_str()];
+        want.sort_unstable();
+        assert_eq!(ids, want, "`all` is the bank as it is on disk");
+    }
+
+    /// The wire spellings, and the one that must NOT be lenient: a mistyped
+    /// filter answered with the valid records would read as a bank nobody has
+    /// ever corrected.
+    #[test]
+    fn recall_state_parses_its_wire_spellings_and_refuses_the_rest() {
+        assert_eq!(RecallState::parse(""), Some(RecallState::Valid));
+        assert_eq!(RecallState::parse("  "), Some(RecallState::Valid));
+        assert_eq!(RecallState::parse("valid"), Some(RecallState::Valid));
+        assert_eq!(
+            RecallState::parse("invalidated"),
+            Some(RecallState::Invalidated)
+        );
+        assert_eq!(RecallState::parse("all"), Some(RecallState::All));
+        assert_eq!(RecallState::parse("Valid"), None);
+        assert_eq!(RecallState::parse("invalid"), None);
+        assert_eq!(RecallState::default(), RecallState::Valid);
+        assert_eq!(RecallState::All.as_str(), "all");
+        assert!(!RecallState::Valid.admits("unknown-state"));
+        assert!(RecallState::All.admits("unknown-state"));
     }
 
     /// The roster's `bank:` override selects the directory records actually
