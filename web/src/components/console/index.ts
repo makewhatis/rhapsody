@@ -31,6 +31,7 @@ export {
   Stat,
   TeammateAvatar,
   Timestamp,
+  type DivProps,
   type MateProps,
   type StatProps,
   type TeammateAvatarProps,

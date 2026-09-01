@@ -58,6 +58,26 @@ describe("adding", () => {
   });
 });
 
+describe("committing on blur", () => {
+  // Deliberate: labels route work, so a typed-but-uncommitted label that vanished when the
+  // operator clicked Save would silently drop a routing rule. Committing on blur makes the
+  // label visible as a chip instead, which is one click to undo.
+  it("commits a pending draft when focus leaves the field", () => {
+    const onChange = vi.fn();
+    render(<TagInput tags={[]} onChange={onChange} label="Extra labels" />);
+    fireEvent.change(field(), { target: { value: "reviewer" } });
+    fireEvent.blur(field());
+    expect(onChange).toHaveBeenCalledWith(["reviewer"]);
+  });
+
+  it("commits nothing when the field is left empty", () => {
+    const onChange = vi.fn();
+    render(<TagInput tags={["sre"]} onChange={onChange} label="Extra labels" />);
+    fireEvent.blur(field());
+    expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
 describe("removing", () => {
   it("renders one chip per tag and removes the one whose × is clicked", () => {
     const onChange = vi.fn();

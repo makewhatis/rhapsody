@@ -4,12 +4,13 @@ import { cn } from "@/lib/utils";
 // Layout primitives — STUDIO-681 §1.4. The two-column `.grid` (Teams console, Job detail)
 // and the `.now` summary strip (Jobs, Teams), plus the small mono spans §1.2 asks for.
 
-export interface GridProps extends HTMLAttributes<HTMLDivElement> {
+/** Shared shape for the plain wrapper primitives below — a div with children. */
+export interface DivProps extends HTMLAttributes<HTMLDivElement> {
   children?: ReactNode;
 }
 
 /** `.grid` — 1fr + 336px, collapsing to a single column below 1000px. */
-export function Grid({ className, children, ...rest }: GridProps) {
+export function Grid({ className, children, ...rest }: DivProps) {
   return (
     <div className={cn("grid", className)} {...rest}>
       {children}
@@ -18,7 +19,7 @@ export function Grid({ className, children, ...rest }: GridProps) {
 }
 
 /** `.side` — the 336px column's vertical stack of cards. */
-export function GridSide({ className, children, ...rest }: GridProps) {
+export function GridSide({ className, children, ...rest }: DivProps) {
   return (
     <div className={cn("side", className)} {...rest}>
       {children}
@@ -27,7 +28,7 @@ export function GridSide({ className, children, ...rest }: GridProps) {
 }
 
 /** `.now` — the summary strip: teammate states on the left, stat pills on the right. */
-export function NowStrip({ className, children, ...rest }: GridProps) {
+export function NowStrip({ className, children, ...rest }: DivProps) {
   return (
     <div className={cn("now", className)} {...rest}>
       {children}
@@ -36,7 +37,7 @@ export function NowStrip({ className, children, ...rest }: GridProps) {
 }
 
 /** `.now .who` — the teammate-state group. */
-export function NowMates({ className, children, ...rest }: GridProps) {
+export function NowMates({ className, children, ...rest }: DivProps) {
   return (
     <div className={cn("who", className)} {...rest}>
       {children}
@@ -45,7 +46,7 @@ export function NowMates({ className, children, ...rest }: GridProps) {
 }
 
 /** `.stats` — the stat-pill group. */
-export function NowStats({ className, children, ...rest }: GridProps) {
+export function NowStats({ className, children, ...rest }: DivProps) {
   return (
     <div className={cn("stats", className)} {...rest}>
       {children}
