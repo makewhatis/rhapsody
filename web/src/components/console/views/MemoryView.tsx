@@ -365,9 +365,14 @@ function FactCard({
           host-stamped · {bank} · {dead ? STATE_INVALIDATED : STATE_VALID}
         </span>
         <div className="acts">
+          {/*
+            A host-stamped record always carries its run, but a record written before the stamp
+            existed may not — and "View run " with nothing after it is not a label. The
+            destination is the ticket either way, so name that instead.
+          */}
           {fact.ticket === "" ? null : (
             <button type="button" className="ghost" onClick={onViewRun}>
-              View run {fact.run_id}
+              {fact.run_id === "" ? "View ticket" : `View run ${fact.run_id}`}
             </button>
           )}
           {dead || armed ? null : (

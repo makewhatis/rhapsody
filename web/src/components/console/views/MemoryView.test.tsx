@@ -269,6 +269,22 @@ describe("Memory page", () => {
     expect(onNavigate).toHaveBeenCalledWith("job", "STUDIO-676");
   });
 
+  it("4.4 — a record with no run stamped names its ticket instead of an empty run label", async () => {
+    h.fetchTeamsOverview.mockResolvedValue({ ...OVERVIEW, roster: [rosterRow("alice")] });
+    h.fetchTeamsRecall.mockResolvedValue({
+      identity: "alice",
+      facts: [fact({ id: "a9", identity: "alice", run_id: "", content: "an unstamped record" })],
+      skipped: [],
+    });
+    const onNavigate = vi.fn();
+    mount({ onNavigate });
+
+    const c = await card("an unstamped record");
+    expect(within(c).queryByText(/^View run/)).toBeNull();
+    fireEvent.click(within(c).getByRole("button", { name: "View ticket" }));
+    expect(onNavigate).toHaveBeenCalledWith("job", "STUDIO-654");
+  });
+
   it("4.5 — Invalidate captures a reason and moves the fact to invalidated, dimmed with a banner", async () => {
     seed();
     mount();
