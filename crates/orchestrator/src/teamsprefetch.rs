@@ -656,6 +656,10 @@ mod tests {
         ) -> Result<bool, MemoryError> {
             Ok(false)
         }
+
+        async fn revalidate(&self, _identity: &str, _fact_id: &str) -> Result<bool, MemoryError> {
+            Ok(false)
+        }
     }
 
     /// The shared programmable tracker (`rhapsody_tracker::fake::Fake`), which
@@ -1043,6 +1047,14 @@ mod tests {
                 _identity: &str,
                 _fact_id: &str,
                 _reason: &str,
+            ) -> Result<bool, MemoryError> {
+                Ok(false)
+            }
+
+            async fn revalidate(
+                &self,
+                _identity: &str,
+                _fact_id: &str,
             ) -> Result<bool, MemoryError> {
                 Ok(false)
             }

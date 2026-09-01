@@ -6,6 +6,7 @@ import {
   fetchTeamsRoom,
   fetchVersion,
   postTeamsInvalidate,
+  postTeamsReinstate,
   postTeamsRoom,
   saveTeamsConfig,
   type DaemonVersion,
@@ -131,6 +132,20 @@ export function useInvalidateFact() {
   return useMutation({
     mutationFn: (v: { identity: string; factID: string; reason: string }) =>
       postTeamsInvalidate(v.identity, v.factID, v.reason),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: TEAMS_RECALL_QUERY_KEY });
+    },
+  });
+}
+
+// useReinstateFact undoes one invalidation (STUDIO-689) — §5.3's reversal, refreshing the same
+// recall cache the invalidate does, so the card the operator is looking at agrees with the bank
+// without a reload.
+export function useReinstateFact() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { identity: string; factID: string }) =>
+      postTeamsReinstate(v.identity, v.factID),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: TEAMS_RECALL_QUERY_KEY });
     },

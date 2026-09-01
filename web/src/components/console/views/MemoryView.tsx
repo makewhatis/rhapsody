@@ -41,30 +41,20 @@ import "@/theme/memory.css";
 // The Memory page — STUDIO-681 §6, the fourth slice of the dashboard redesign.
 //
 // Reachable only when the daemon reports `teams_enabled` (§2.2), so every read below is safe to
-// fire. It uses three routes that already exist and invents none (§11):
+// fire. It uses four routes that already exist and invents none (§11):
 //
 //   GET  /api/v1/teams              roster (bank names, color order) + the memory backend
-//   GET  /api/v1/teams/recall       one identity's bank; an EMPTY query browses it
+//   GET  /api/v1/teams/recall       one identity's bank; an EMPTY query browses it, and
+//                                   `state=all` browses it INCLUDING the corrections (STUDIO-689)
 //   POST /api/v1/teams/invalidate   the §5.3 correction, with its reason
+//   POST /api/v1/teams/reinstate    its reversal (STUDIO-689)
 //
-// TWO reads §6 asks for have NO endpoint on the current daemon, confirmed against
-// `crates/httpapi/src/server.rs` and `crates/config/src/memory.rs`:
-//
-//   1. Recall serves VALID records only (`memory.rs`: `if fact.state != STATE_VALID { continue }`),
-//      so a bank's invalidated records cannot be listed at all. This page therefore shows the
-//      records invalidated in THIS SESSION — enough for the correction to be visible and undone
-//      where it was made, and honest about the rest (the note below says so on screen).
-//   2. There is no reinstate route. `LocalBank::revalidate` exists and is documented as "the
-//      reversal §5.3 requires", but it is on neither the `MemoryBackend` trait nor any HTTP or MCP
-//      surface. `onReinstate` is the seam it plugs into; unwired, the button reports the gap
-//      rather than faking a restore the bank on disk would contradict.
-//
-// Both are dependency tickets, not things to invent here.
-
-/** How the reinstate control explains itself when the daemon has no route behind it. */
-const NO_REINSTATE =
-  "This daemon has no reinstate endpoint yet, so the record is still invalidated in the bank. " +
-  "Reversing it needs a daemon route over the bank's existing revalidate (STUDIO-681 §6 dependency).";
+// The last two of those were the page's two disclosed gaps when it shipped: recall served valid
+// records only, so an invalidation made in an earlier session was invisible, and there was no
+// reinstate route at all, so the button could only report what was missing. STUDIO-689 added both
+// to the daemon, and this page now reads the bank as it is on disk and can undo a correction it
+// did not make. What remains true, and is still said on screen, is that a browse is bounded by
+// `recall_top_k`.
 
 const STATE_OPTIONS: readonly { value: MemoryStateFilter; label: string }[] = [
   { value: ANY, label: "All" },
@@ -84,13 +74,13 @@ export interface MemoryViewProps {
   /** Route to a fact's ticket — the card's "View run" (§2.3 has no run route of its own). */
   onNavigate: (route: "job", key: string) => void;
   /**
-   * Put a record back into recall (box 4.6).
+   * Put a record back into recall (box 4.6) — `POST /api/v1/teams/reinstate`.
    *
-   * Optional because the daemon has no route for it yet (see the module note): unwired, Reinstate
-   * still renders and still explains itself, and the fact stays invalidated rather than appearing
-   * to come back. Supplying this is a one-line change once the endpoint lands.
+   * Required, not optional: the route exists (STUDIO-689), so a card offering Reinstate must have
+   * something behind it. A rejection is reported on the card and the fact stays invalidated, which
+   * is the honest reading of a bank the daemon did not change.
    */
-  onReinstate?: (fact: TeamsFact) => Promise<void>;
+  onReinstate: (fact: TeamsFact) => Promise<void>;
 }
 
 export function MemoryView({ onNavigate, onReinstate }: MemoryViewProps) {
@@ -106,8 +96,9 @@ export function MemoryView({ onNavigate, onReinstate }: MemoryViewProps) {
   const read = useMemoryBanks(names);
 
   // What the operator changed in this session, keyed by bank+record. It is an OVERLAY rather than
-  // an edit of the query cache because a refetch would drop it: recall cannot return an
-  // invalidated record, so the correction would erase the very card the operator is looking at.
+  // an edit of the query cache so the card answers the click immediately, and so a bank read that
+  // does not carry the record back — a backend whose listing is bounded differently, or one that
+  // failed on the refetch — cannot erase the very card the operator is looking at.
   const [session, setSession] = React.useState<Record<string, TeamsFact>>({});
   const banks = React.useMemo<MemoryBank[]>(
     () =>
@@ -171,9 +162,9 @@ export function MemoryView({ onNavigate, onReinstate }: MemoryViewProps) {
         page is talking to, and both disappear when the dependency lands.
       */}
       <Note className="memnote">
-        A browse is bounded by <code>recall_top_k</code>, and recall serves valid records only — so
-        an invalidated record is listed here while the correction is fresh, and is not read back on
-        a reload.
+        A browse is bounded by <code>recall_top_k</code>, so a large bank is shown newest-scoring
+        first rather than in full. Invalidated records are listed too (the daemon is read with{" "}
+        <code>state=all</code>) and only valid ones are ever recalled into a prompt.
       </Note>
 
       {/*
@@ -267,7 +258,7 @@ interface FactCardProps {
   color: string;
   onViewRun: () => void;
   onInvalidated: (fact: TeamsFact) => void;
-  onReinstate: ((fact: TeamsFact) => Promise<void>) | undefined;
+  onReinstate: (fact: TeamsFact) => Promise<void>;
   onReinstated: (fact: TeamsFact) => void;
 }
 
@@ -314,10 +305,6 @@ function FactCard({
 
   const reinstate = () => {
     setFailed("");
-    if (onReinstate === undefined) {
-      setFailed(NO_REINSTATE);
-      return;
-    }
     void onReinstate(fact).then(
       () => onReinstated(withState(fact, STATE_VALID, "")),
       (e: unknown) => setFailed(errText(e)),

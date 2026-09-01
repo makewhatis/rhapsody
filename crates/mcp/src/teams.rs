@@ -2,7 +2,7 @@
 //! `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.7, §6.7).
 //!
 //! **No Go v0.4.0 counterpart** — the Go facade has no analog, exactly as
-//! `symphony_handoff` has none. Six tools, each a thin proxy of a NEW additive
+//! `symphony_handoff` has none. Seven tools, each a thin proxy of a NEW additive
 //! daemon endpoint:
 //!
 //! | Tool | Reads/Writes | Endpoint |
@@ -10,6 +10,7 @@
 //! | `teams_roster` | read | `GET /api/v1/teams/roster` |
 //! | `teams_recall {identity, query}` | read | `GET /api/v1/teams/recall` |
 //! | `teams_invalidate {identity, fact_id, reason}` | write | `POST /api/v1/teams/invalidate` |
+//! | `teams_reinstate {identity, fact_id}` | write | `POST /api/v1/teams/reinstate` (STUDIO-689) |
 //! | `teams_retain {content}` | write | `POST /api/v1/runs/{id}/retain` |
 //! | `teams_room_read {limit?}` | read | `GET /api/v1/teams/room` (STUDIO-650, T5) |
 //! | `teams_post {body, to?, refs?}` | write | `POST /api/v1/runs/{id}/post` (STUDIO-653, T6) |
@@ -21,7 +22,7 @@
 //!
 //! # Off ⇒ invisible, not merely inert (§6.7, §2.4 row 7)
 //!
-//! When Teams is off, [`Facade::new`] REMOVES all six routes, so `list_tools`
+//! When Teams is off, [`Facade::new`] REMOVES all seven routes, so `list_tools`
 //! is byte-identical to a daemon built before Teams existed. That is the
 //! `allow_handoff` mechanism, reused unchanged — the gate is the enabled-tool
 //! set, so a disabled tool is absent rather than surfacing a runtime
@@ -93,6 +94,16 @@ pub(crate) struct InvalidateArgs {
     reason: String,
 }
 
+/// `teams_reinstate` args (§5.3's reversal, STUDIO-689). There is deliberately no `reason`: a
+/// correction has to be justified, undoing one restores the original and justifies nothing new.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub(crate) struct ReinstateArgs {
+    /// the teammate whose bank holds the record.
+    identity: String,
+    /// the record id, as `teams_recall` reports it in each fact's `id`.
+    fact_id: String,
+}
+
 /// `teams_room_read` args. `limit` is optional and can only ever NARROW: the daemon clamps it to
 /// the room's own ceiling, so no caller can widen the window §0.5 calls non-negotiable.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -132,6 +143,13 @@ struct InvalidateBody<'a> {
     identity: &'a str,
     fact_id: &'a str,
     reason: &'a str,
+}
+
+/// The `POST /api/v1/teams/reinstate` body.
+#[derive(Serialize)]
+struct ReinstateBody<'a> {
+    identity: &'a str,
+    fact_id: &'a str,
 }
 
 /// The `POST /api/v1/runs/{id}/retain` body.
@@ -216,6 +234,34 @@ impl Facade {
         match self
             .client
             .post_json("/api/v1/teams/invalidate", payload)
+            .await
+        {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    #[tool(
+        name = "teams_reinstate",
+        description = "Undo an invalidation: put one corrected fact back into recall, exactly as it was. Nothing was ever deleted, so this restores the record and drops the reason it was invalidated for. Use it when the correction itself turns out to be the wrong call. Proxies POST /api/v1/teams/reinstate."
+    )]
+    async fn teams_reinstate(&self, Parameters(args): Parameters<ReinstateArgs>) -> CallToolResult {
+        if args.identity.is_empty() || args.fact_id.is_empty() {
+            return err_result(&FacadeError::new(
+                "bad_request",
+                "identity and fact_id are required (see teams_recall for a fact's id)",
+            ));
+        }
+        let payload = match serde_json::to_vec(&ReinstateBody {
+            identity: &args.identity,
+            fact_id: &args.fact_id,
+        }) {
+            Ok(p) => p,
+            Err(e) => return err_result(&FacadeError::new("encode_error", e.to_string())),
+        };
+        match self
+            .client
+            .post_json("/api/v1/teams/reinstate", payload)
             .await
         {
             Ok(body) => text_result(&body),
@@ -444,9 +490,9 @@ mod tests {
     /// else — the precise statement of "byte-identical when off", checked from
     /// both directions so a future tool cannot slip in unnoticed.
     ///
-    /// STUDIO-650 (T5) extended this list with `teams_room_read` and STUDIO-653
-    /// (T6) with `teams_post`; the assertion is unchanged in kind, only in the
-    /// set it names.
+    /// STUDIO-650 (T5) extended this list with `teams_room_read`, STUDIO-653
+    /// (T6) with `teams_post` and STUDIO-689 with `teams_reinstate`; the
+    /// assertion is unchanged in kind, only in the set it names.
     #[tokio::test]
     async fn enabling_teams_only_adds_the_teams_tools() {
         let off = tool_names(facade(Options::default(), 0)).await;
@@ -460,6 +506,7 @@ mod tests {
                 "teams_invalidate",
                 "teams_post",
                 "teams_recall",
+                "teams_reinstate",
                 "teams_retain",
                 "teams_room_read",
                 "teams_roster"
@@ -555,6 +602,39 @@ mod tests {
         assert!(
             seen.lock().expect("seen lock").is_empty(),
             "a reasonless invalidate must not reach the daemon"
+        );
+        let _ = client.cancel().await;
+    }
+
+    /// `teams_reinstate` proxies §5.3's reversal, and refuses an incomplete one
+    /// before it reaches the daemon — the same door `teams_invalidate` keeps.
+    #[tokio::test]
+    async fn reinstate_proxies_its_endpoint_and_refuses_an_incomplete_one() {
+        let (port, seen) = stub_daemon().await;
+        let client = connect(facade(teams_on(), port)).await;
+
+        let out = call_text(
+            &client,
+            "teams_reinstate",
+            serde_json::json!({"identity": "alice", "fact_id": ""}),
+        )
+        .await;
+        assert!(out.contains("bad_request"), "out = {out}");
+        assert!(
+            seen.lock().expect("seen lock").is_empty(),
+            "an incomplete reinstate must not reach the daemon"
+        );
+
+        let out = call_text(
+            &client,
+            "teams_reinstate",
+            serde_json::json!({"identity": "alice", "fact_id": "20260101T000000Z-run-1"}),
+        )
+        .await;
+        assert!(out.contains("\"ok\""), "out = {out}");
+        assert_eq!(
+            seen.lock().expect("seen lock").clone(),
+            vec![("POST".to_string(), "/api/v1/teams/reinstate".to_string())]
         );
         let _ = client.cancel().await;
     }

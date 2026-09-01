@@ -8,8 +8,12 @@ import { TEAMS_RECALL_QUERY_KEY } from "@/hooks/useTeams";
  * A memory bank is per IDENTITY, and `GET /api/v1/teams/recall` reads one identity at a time —
  * there is no by-ticket read, and inventing one is out of scope (§11). So this browses each
  * roster member's bank once and keeps the records stamped with this ticket. The fan-out is
- * bounded by the roster, which is a handful of teammates, and every request is a query
- * react-query already de-duplicates against the Memory page's own reads.
+ * bounded by the roster, which is a handful of teammates.
+ *
+ * This browse stays VALID-only, which is the default and what a "what did the runs on this ticket
+ * learn" card should show. The Memory page reads the same banks with `state=all` (STUDIO-689) and
+ * therefore under its own cache entry — the corrections belong on the page that can undo them, not
+ * on this one.
  *
  * Callers pass an EMPTY roster when Teams is off, which fires no request at all.
  */

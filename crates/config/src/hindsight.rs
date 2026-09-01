@@ -61,7 +61,7 @@ use serde_json::{Value, json};
 
 use crate::memory::{
     Fact, MAX_FACT_CONTENT_BYTES, MAX_RETAIN_CONTENT_BYTES, MemoryBackend, MemoryError, Query,
-    Recalled, Record, STATE_INVALIDATED, STATE_VALID, bank_id_for, truncate_bytes,
+    RecallState, Recalled, Record, STATE_INVALIDATED, STATE_VALID, bank_id_for, truncate_bytes,
 };
 
 /// The tenant every Rhapsody bank lives in (§5's backend table, and the only
@@ -307,10 +307,31 @@ impl HindsightBackend {
     /// [`LocalBank::revalidate`](crate::memory::LocalBank::revalidate) is, so
     /// "reversible" is a property this code has rather than one the wire format
     /// merely permits.
+    ///
+    /// `Ok(false)` ⇒ already valid, read from the fact's own `state` before the
+    /// PATCH exactly as [`invalidate`](HindsightBackend::invalidate) reads it —
+    /// so the two backends answer the same question the same way and the
+    /// reinstate view means one thing regardless of which bank served it. When
+    /// that read cannot answer, the PATCH goes ahead: doing the work is the safe
+    /// side of that doubt.
     pub async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError> {
         let bank = self.checked_bank_id(identity)?;
         let id = checked_fact_id(fact_id)?;
         let url = format!("{}/memories/{id}", self.bank_url(&bank));
+        let current = self
+            .send(self.http.get(&url), "hindsight read fact")
+            .await?;
+        if current.status == 404 {
+            return Err(MemoryError::NotFound(format!(
+                "no fact {fact_id:?} in bank {bank:?}"
+            )));
+        }
+        if current.status < 400
+            && let Ok(v) = serde_json::from_str::<Value>(&current.body)
+            && v.get("state").and_then(Value::as_str) == Some(STATE_VALID)
+        {
+            return Ok(false);
+        }
         self.send(
             self.http.patch(&url).json(&json!({ "state": STATE_VALID })),
             "hindsight revalidate",
@@ -328,8 +349,9 @@ impl HindsightBackend {
     ///
     /// [`Query::browse`] with no terms has no query to score against, and
     /// hindsight's recall *requires* a query string, so a browse cannot go
-    /// through search: it goes through the list endpoint, filtered to valid
-    /// experience facts and bounded by `top_k`.
+    /// through search: it goes through the list endpoint, filtered to the
+    /// requested states and bounded by `top_k`. [`RecallState::All`] sends no
+    /// `state` filter at all, which is how the endpoint spells "every state".
     ///
     /// `ListMemoryUnitsResponse.items` is the one shape the OpenAPI leaves
     /// untyped (`object` with `additionalProperties: true`), so the mapping reads
@@ -341,17 +363,21 @@ impl HindsightBackend {
         bank: &str,
         identity: &str,
         top_k: usize,
+        state: RecallState,
     ) -> Result<Recalled, MemoryError> {
         let url = format!("{}/memories/list", self.bank_url(bank));
+        let mut params = vec![
+            ("type", FACT_TYPE_EXPERIENCE.to_string()),
+            ("limit", top_k.to_string()),
+        ];
+        match state {
+            RecallState::Valid => params.push(("state", STATE_VALID.to_string())),
+            RecallState::Invalidated => params.push(("state", STATE_INVALIDATED.to_string())),
+            // No filter: the caller asked for the bank as it is.
+            RecallState::All => {}
+        }
         let resp = self
-            .send(
-                self.http.get(&url).query(&[
-                    ("type", FACT_TYPE_EXPERIENCE.to_string()),
-                    ("state", STATE_VALID.to_string()),
-                    ("limit", top_k.to_string()),
-                ]),
-                "hindsight browse",
-            )
+            .send(self.http.get(&url).query(&params), "hindsight browse")
             .await?
             .ok("browse")?;
         let listed: ListResponse = decode_json(&resp, "browse")?;
@@ -436,13 +462,23 @@ impl MemoryBackend for HindsightBackend {
     async fn recall(&self, identity: &str, q: &Query) -> Result<Recalled, MemoryError> {
         let bank = self.checked_bank_id(identity)?;
         let top_k = effective_top_k(q);
+        // Anything but `valid` cannot go through search at all: §5.3 records
+        // that hindsight's `readableByModel` "refuses **any** non-`valid`
+        // state", so `POST …/memories/recall` would answer a state-widened
+        // query with the valid records and no sign that the rest were dropped.
+        // The list endpoint is the only surface that can serve them, so a
+        // state-widened read is a bounded LIST rather than a scored search —
+        // and the query narrows nothing there (STUDIO-689).
+        if q.state != RecallState::Valid {
+            return self.browse(&bank, identity, top_k, q.state).await;
+        }
         let query = query_text(q);
         if query.is_empty() {
             // A browse with no terms, or a query whose every term was empty. The
             // recall endpoint requires a query string, so the honest answer to
             // "what does this teammate remember" comes from the list endpoint.
             return if q.browse {
-                self.browse(&bank, identity, top_k).await
+                self.browse(&bank, identity, top_k, q.state).await
             } else {
                 Ok(Recalled::default())
             };
@@ -514,6 +550,13 @@ impl MemoryBackend for HindsightBackend {
             &format!("no fact {fact_id:?} in bank {bank:?}"),
         )?;
         Ok(true)
+    }
+
+    /// The reversal, on the trait (STUDIO-689) — the same PATCH
+    /// [`HindsightBackend::revalidate`] sends, reached through the backend the
+    /// daemon's endpoints actually hold.
+    async fn revalidate(&self, identity: &str, fact_id: &str) -> Result<bool, MemoryError> {
+        HindsightBackend::revalidate(self, identity, fact_id).await
     }
 }
 
@@ -627,6 +670,13 @@ struct ListResponse {
 /// Maps one untyped list item onto a [`Fact`], or `None` when it names neither
 /// an id nor text — which is the only way to tell a memory unit from whatever
 /// else a future `items` might carry.
+///
+/// Unlike [`RecallResult::into_fact`], this reads the item's own `state` and
+/// `reason` when they are there: the list endpoint is the one path that CAN
+/// return a non-valid record (STUDIO-689), and a correction rendered as `valid`
+/// would be a card the operator cannot tell from a fact still in use. An item
+/// that names no state is `valid`, which is what the endpoint's own default
+/// filter means.
 fn fact_from_value(v: &Value, identity: &str) -> Option<Fact> {
     let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
     let text = v.get("text").and_then(Value::as_str).unwrap_or_default();
@@ -652,7 +702,14 @@ fn fact_from_value(v: &Value, identity: &str) -> Option<Fact> {
             .get("metadata")
             .and_then(|m| serde_json::from_value(m.clone()).ok()),
     };
-    Some(result.into_fact(identity))
+    let mut fact = result.into_fact(identity);
+    if let Some(state) = v.get("state").and_then(Value::as_str) {
+        fact.state = state.to_string();
+    }
+    if let Some(reason) = v.get("reason").and_then(Value::as_str) {
+        fact.reason = reason.to_string();
+    }
+    Some(fact)
 }
 
 /// The search text one recall sends: the ticket, its title and its labels, in
@@ -1114,6 +1171,7 @@ mod tests {
                     labels: vec!["rust".to_string(), "  ".to_string()],
                     top_k: 8,
                     browse: false,
+                    state: RecallState::Valid,
                 },
             )
             .await
@@ -1539,6 +1597,94 @@ mod tests {
             "the bank we asked is authoritative"
         );
         assert_eq!(got.skipped.len(), 1, "and it is skipped LOUDLY");
+    }
+
+    /// STUDIO-689: a state-widened read is the LIST endpoint, never the recall
+    /// one — `readableByModel` refuses a non-valid state, so a search would
+    /// answer with the valid records and no sign the rest were dropped.
+    #[tokio::test]
+    async fn a_state_widened_read_lists_rather_than_searching() {
+        let stub = Stub::start(|_| {
+            Reply::ok(
+                r#"{"items":[{"id":"f1","text":"never was true","state":"invalidated",
+                              "reason":"the run it named was rolled back"}],
+                    "total":1,"limit":100,"offset":0}"#,
+            )
+        })
+        .await;
+        let got = backend(&stub)
+            .recall(
+                "alice",
+                &Query {
+                    ticket: "STUDIO-689".to_string(),
+                    top_k: 5,
+                    state: RecallState::Invalidated,
+                    ..Query::default()
+                },
+            )
+            .await
+            .expect("list");
+        assert!(
+            !stub.requests().iter().any(|r| r.method == "POST"),
+            "a state-widened read must not go through the recall endpoint"
+        );
+        let req = stub.request("GET", "/memories/list");
+        assert!(req.query.contains("state=invalidated"), "{}", req.query);
+        assert_eq!(got.facts.len(), 1);
+        assert_eq!(
+            got.facts[0].state, "invalidated",
+            "the listed record keeps the state it was served with"
+        );
+        assert_eq!(
+            got.facts[0].reason, "the run it named was rolled back",
+            "and the reason, or the correction is unreadable"
+        );
+    }
+
+    /// `all` is the absence of a filter: the endpoint's `state` parameter can
+    /// only ever narrow, so asking for every state means sending none.
+    #[tokio::test]
+    async fn all_sends_no_state_filter() {
+        let stub =
+            Stub::start(|_| Reply::ok(r#"{"items":[],"total":0,"limit":100,"offset":0}"#)).await;
+        backend(&stub)
+            .recall(
+                "alice",
+                &Query {
+                    top_k: 5,
+                    browse: true,
+                    state: RecallState::All,
+                    ..Query::default()
+                },
+            )
+            .await
+            .expect("list");
+        let req = stub.request("GET", "/memories/list");
+        assert!(!req.query.contains("state="), "{}", req.query);
+        assert!(req.query.contains("type=experience"), "{}", req.query);
+    }
+
+    /// Reinstating a record that is already valid changes nothing and sends no
+    /// PATCH — the same answer `local` gives, read from the fact's own state.
+    #[tokio::test]
+    async fn revalidating_a_valid_fact_is_a_no_op() {
+        let stub = Stub::start(|req| {
+            if req.method == "GET" {
+                Reply::ok(r#"{"id":"fact-1","state":"valid"}"#)
+            } else {
+                Reply::ok("{}")
+            }
+        })
+        .await;
+        let done = backend(&stub)
+            .revalidate("alice", "fact-1")
+            .await
+            .expect("revalidate");
+        assert!(!done);
+        assert!(
+            !stub.requests().iter().any(|r| r.method == "PATCH"),
+            "an already-valid fact is not patched back"
+        );
     }
 
     /// A *search* with no terms is not a browse: it recalls nothing rather than
