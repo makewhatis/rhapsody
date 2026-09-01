@@ -290,6 +290,33 @@ describe("Memory page", () => {
     expect(stat("valid")).toBe("2");
   });
 
+  it("4.5 — keeps the dimmed card when the refetch answers without the record", async () => {
+    seed();
+    mount();
+    const c = await card("rebase hazard");
+
+    // What the real daemon does the instant the correction lands: recall serves VALID records
+    // only, so the record the operator just invalidated stops being returned. The card carries
+    // the undo, so it has to survive the refetch the invalidate itself triggers.
+    h.fetchTeamsRecall.mockImplementation(async (identity: string) => ({
+      identity,
+      facts: identity === "alice" ? ALICE_FACTS.filter((f) => f.id !== "a1") : JIMMY_FACTS,
+      skipped: [],
+    }));
+
+    fireEvent.click(within(c).getByRole("button", { name: "Invalidate" }));
+    fireEvent.change(within(c).getByLabelText("Why is this wrong?"), { target: { value: "stale" } });
+    fireEvent.click(within(c).getByRole("button", { name: "Confirm invalidate" }));
+
+    await waitFor(() => expect(h.fetchTeamsRecall.mock.calls.length).toBeGreaterThan(2));
+
+    const dead = await card("rebase hazard");
+    await waitFor(() => expect(dead.className).toContain("dead"));
+    expect(within(dead).getByRole("button", { name: "Reinstate" })).toBeTruthy();
+    await waitFor(() => expect(stat("invalidated")).toBe("1"));
+    expect(stat("facts")).toBe("3");
+  });
+
   it("4.5 — a reasonless invalidate is refused, because the daemon refuses it too", async () => {
     seed();
     mount();

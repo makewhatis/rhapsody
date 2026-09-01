@@ -111,10 +111,17 @@ export function MemoryView({ onNavigate, onReinstate }: MemoryViewProps) {
   const [session, setSession] = React.useState<Record<string, TeamsFact>>({});
   const banks = React.useMemo<MemoryBank[]>(
     () =>
-      read.banks.map((b) => ({
-        ...b,
-        facts: b.facts.map((f) => session[factKey(f)] ?? f),
-      })),
+      read.banks.map((b) => {
+        const served = new Set(b.facts.map(factKey));
+        const facts = b.facts.map((f) => session[factKey(f)] ?? f);
+        // Re-attach, not just override. A successful invalidate refetches the bank, and that
+        // answer no longer contains the record — so without this the card carrying the undo
+        // would delete itself the moment the undo became worth offering.
+        for (const [key, fact] of Object.entries(session)) {
+          if (fact.identity === b.identity && !served.has(key)) facts.push(fact);
+        }
+        return { ...b, facts };
+      }),
     [read.banks, session],
   );
 
