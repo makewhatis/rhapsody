@@ -11,9 +11,9 @@
    `.run`, `.checks` and `.kv` are far too generic to publish alongside the
    Podium screens.
 
-   Every color is a token. The two literal hexes (`#34343c` hover hairline,
-   `#8fb98f` the PR chip's green) are the prototype's own one-off shades, already
-   present in console.css for the same elements — not duplicates of a token.
+   Every color is a token. The one literal hex — `#34343c`, the hover hairline —
+   is the prototype's own one-off shade, already present in console.css on the
+   same treatment. It is not a duplicate of a token.
 
    The room-slice, memory, manage and teams-console views are sub-tickets 3–5;
    `.memprev`/`.mcard` land here because §4's side column uses them.
