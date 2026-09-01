@@ -1499,6 +1499,58 @@ mod tests {
         );
     }
 
+    // STUDIO-678 (design §0.13): **every appender shares ONE `LocalRoom` handle.**
+    //
+    // The lock that serializes `append` lives inside the value, so a second `LocalRoom::new` over the
+    // same directory mints a second, independent lock and two appends can race to mint the same
+    // `file:seq` id. §0.13 makes that id load-bearing — the manager's reply carries the operator
+    // post's id as its dedupe record — so a collision would let one reply stand in for a post it
+    // never answered. This asserts the wiring the way the bug would present: the handle the DISPATCH
+    // path catches up from and the handle the off-loop tasks post through must be the same
+    // allocation, not merely the same path.
+    #[test]
+    fn every_room_appender_shares_one_handle() {
+        use rhapsody_config::teams::{Identity, Teams};
+
+        let dir = TempDir::new();
+        let flags = Flags {
+            db: String::new(),
+            no_store: false,
+            no_color: false,
+            port: 0,
+            path: PathBuf::from("WORKFLOW.md"),
+        };
+        let cfg = load_resolved(std::path::Path::new(&write_wf(&dir, "", "")));
+        let teams = Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+
+        // The one handle `run` builds and hands everywhere.
+        let room = resolve_room_dir(cfg.as_ref(), &flags.db, flags.no_store)
+            .map(|d| Arc::new(rhapsody_config::room::LocalRoom::new(d)));
+        assert!(room.is_some(), "an on-disk runtime home has a room");
+
+        let mut o = rhapsody_orchestrator::Orchestrator::new(String::new());
+        install_teams_memory(&mut o, &teams, cfg.as_ref(), &flags, &room);
+
+        let installed = o
+            .teams_room
+            .as_ref()
+            .expect("the dispatch path gets the room");
+        assert!(
+            Arc::ptr_eq(installed, room.as_ref().expect("some")),
+            "install_teams_memory must take the handle it is given, never resolve a second one"
+        );
+        // And what `run` gives the off-loop tasks is a clone of that same allocation.
+        let triage_room = room.clone().expect("some");
+        assert!(Arc::ptr_eq(installed, &triage_room));
+    }
+
     // STUDIO-645 (Teams T4), §5.4 + §2.4 row 8: which memory handles a boot installs is decided by
     // the toggle and `memory.backend` alone. This is the exact function `run` calls, so "off costs
     // nothing" is checked at the composition root rather than inferred from it.
