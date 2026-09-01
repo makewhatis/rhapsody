@@ -375,7 +375,9 @@ describe("3.8 — 'Load older' asks the daemon for the previous day's page", () 
   // A wider window is a different query key, so without the room query keeping its previous page
   // the feed would blank to "Loading the room…" every time the operator asked for one more day.
   it("keeps the feed on screen while the wider read is in flight, and spins the pager", async () => {
-    renderConsole();
+    // A fourth day, so the pager is still offered after the click and its spinner is observable.
+    const older = m({ id: `${day(-3)}:1`, from: "alice", at: at(-3, 10), body: "Three days ago." });
+    renderConsole({}, { room: { messages: [older, ...messages], skipped: [] } });
     await ready();
     // The widened read never settles, so the in-flight state is what the assertions see.
     h.fetchTeamsRoom.mockReturnValue(new Promise(() => {}));
@@ -386,6 +388,16 @@ describe("3.8 — 'Load older' asks the daemon for the previous day's page", () 
     expect(screen.getByText(/Someone want to review the export PR/)).toBeTruthy();
     expect(screen.queryByText(/Loading the room/)).toBeNull();
   });
+
+  // A window that came back short IS the whole room, so offering another page would be offering
+  // nothing — the pager retires rather than spending two more clicks to prove it.
+  it("retires the pager once every day of a short window is on screen", async () => {
+    renderConsole();
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: /Load older/ }));
+    await waitFor(() => expect(document.querySelectorAll(".day")).toHaveLength(3));
+    expect(screen.queryByRole("button", { name: /Load older/ })).toBeNull();
+  });
 });
 
 describe("3.9 — the composer posts as the operator, with refs", () => {
@@ -395,7 +407,8 @@ describe("3.9 — the composer posts as the operator, with refs", () => {
     const body = screen.getByLabelText("Post to the team room");
     const refs = screen.getByLabelText("Refs");
     fireEvent.change(body, { target: { value: "Someone review the export PR" } });
-    fireEvent.change(refs, { target: { value: "STUDIO-498, https://github.com/x/y/pull/9" } });
+    // Typed as a human types it: a stray space, a trailing comma, neither posted as a ref.
+    fireEvent.change(refs, { target: { value: " STUDIO-498,  https://github.com/x/y/pull/9, " } });
     fireEvent.click(screen.getByRole("button", { name: "Post as operator" }));
 
     await waitFor(() =>

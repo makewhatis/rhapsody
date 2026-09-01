@@ -87,8 +87,11 @@ export function TeamsConsole({ onNavigate, pollMs, now }: TeamsConsoleProps) {
   );
 
   const shown = sections.slice(0, visibleDays);
+  // A read that came back FULL is the only evidence that the room holds more than was served, so a
+  // short window retires the pager instead of offering two more clicks that can return nothing.
+  const windowFull = (room.data?.messages.length ?? 0) >= limit;
   // Older history may be one reveal away, or one wider read away — offer the pager for either.
-  const hasOlder = sections.length > visibleDays || limit < MAX_ROOM_WINDOW;
+  const hasOlder = sections.length > visibleDays || (windowFull && limit < MAX_ROOM_WINDOW);
   const loadOlder = () => {
     setVisibleDays((d) => d + 1);
     setLimit((l) => nextRoomLimit(l));
@@ -97,7 +100,9 @@ export function TeamsConsole({ onNavigate, pollMs, now }: TeamsConsoleProps) {
   const idle = roster.filter((r) => r.live_runs === 0).length;
 
   return (
-    <section className="rh-console teams-console">
+    // `.rh-console` is normally inherited from AppShell, which carries the theme scope; it is
+    // repeated here so the view is also correct rendered on its own (a test, a gallery route).
+    <section className="rh-console">
       <div className="head">
         <h1>Teams</h1>
         <TeamSwitcher count={roster.length} />
