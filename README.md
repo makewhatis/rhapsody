@@ -330,13 +330,17 @@ another's context. A recipient who is not running, or whose bounded mailbox is f
 catch-up: the post is already in the log, nothing is queued and nothing is retried. A live delivery
 is therefore also seen again in the recipient's next catch-up; that duplicate exposure of one
 bounded message is accepted deliberately, in preference to writing one identity's watermark from
-another identity's request. **A post never dispatches:** it starts no run, writes no label and
-touches no tracker, however it is addressed.
+another identity's request. **A teammate's post never dispatches:** it starts no run, writes no
+label and touches no tracker, however it is addressed. (An *operator* post can now cause the manager
+to file or label — see "The manager acts on operator room posts" below — but it still starts no run,
+and the room itself still has no dispatch power.)
 
 One thing Teams deliberately does **not** fix: the pre-existing `agent_send_message` /
 `POST /api/v1/runs/{id}/message` surface lets any caller push text to any live run wearing the
 *operator* wrap. That is outside Teams' scope, `teams_post` does not route through it, and closing
-it is separate work.
+it is separate work. (STUDIO-678 adds a second, *bounded* user of that mailbox — see below — which
+wraps its text as untrusted data rather than as operator authority, and names that endpoint as
+something a future auth pass must cover.)
 
 **With Teams on, work goes to the team (STUDIO-669).** A ticket carrying no `rhapsody:@<identity>`
 label, matching no teammate's topic labels and caught by no `manager.default_identity` is **held at
@@ -389,6 +393,39 @@ not. `rhapsody:quorum-requested` on the parent is the idempotency record, so a r
 review fixes never fans out twice. The trigger is the **daemon-mediated handoff above**, the moment
 the daemon executes rather than infers; an agent that moves its own ticket through the Linear-MCP
 fallback is not observed.
+
+**The manager acts on operator room posts (STUDIO-678).** An operator post used to be inert:
+"someone want to review the Photo in chat PR? STUDIO-654" reached every teammate's next prompt and
+caused nothing. The manager now *reads* the room — only `operator` posts, only off the control loop
+on the triage cycle it already pays for — and answers each one. Ticket keys are taken **verbatim**
+from the post (a pasted pull-request URL resolves through the same `symphony/<key>` head branch the
+quorum uses) and validated against the issues the team's own project trackers returned; a key that
+is not on one of those projects earns a reply and never an action. The actions are a closed set:
+file **one** review ticket through the quorum's own fan-out (host-written description, reusing the
+`rhapsody:quorum-requested` marker so it happens once per ticket ever), confirm who takes an
+unclaimed ticket by writing the `rhapsody:@` label triage would have written anyway, relay the post
+to that ticket's live run, or ask for a ticket. Reopening the parent is deliberately **not** on that
+list. Every post gets exactly one reply enumerating every ticket's disposition, including "not
+found" — silence is a bug.
+
+The trust posture is stated plainly because it is the design: `from: operator` on a room line is
+**forgeable** by any local process (the loopback write API is unauthenticated, and the log is a
+plain JSONL file a run under `bypassPermissions` can append to). So the manager does not treat that
+field as authorization. Instead the blast radius is bounded so that forging it buys nothing the
+quorum does not already do autonomously — at worst one review ticket, against a real open PR, on one
+of the team's own tickets, once. A model turn may **choose** among the verbatim-extracted keys and
+may never introduce one; an occupied `rhapsody:@` label is never edited; and the one path that moves
+post text into a running agent wraps it as explicitly unverified data, never as the operator wrap. A
+bearer token on the loopback write surfaces would raise the bar on the HTTP vector but cannot close
+the on-disk one, so it is defence in depth rather than a precondition.
+
+Two consequences worth knowing. The manager's watermark lives at
+`~/.rhapsody/teams/manager-room.cursor` (written temp+rename, and a daemon with no durable home
+simply does not read the room — a reader that cannot remember where it got to would re-answer its
+window at every restart). And **`manager.mode` now defaults to `labels+model`** rather than
+`labels`: without a model turn the manager can still file, confirm and ask, but it cannot read
+intent out of prose, so a fresh install would meet the feature only in part. Writing `mode: labels`
+still opts out; Teams remains entirely off unless `enabled: true`.
 
 **The dashboard surface** (STUDIO-652) is where an operator sees all of this. It adds one more
 endpoint, `GET`/`POST /api/v1/teams/config`, which is the **only** Teams route not gated on Teams

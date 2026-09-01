@@ -75,6 +75,7 @@ use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
 use crate::dispatch::DispatchStates;
 use crate::preflight::{process_env, scrub_child_env};
+use crate::reads::ProjectFacts;
 use crate::teams::IDENTITY_LABEL_PREFIX;
 
 /// The triage pass's own cadence — deliberately **not** the control loop's tick (§0.11.2).
@@ -476,6 +477,7 @@ fn route_event_identity(text: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+#[derive(Default)]
 pub struct TriageTarget {
     /// Every ENABLED project's slug-bound tracker, in the poll loop's order — the SAME clients
     /// `on_tick` fans its candidate fetch over.
@@ -500,6 +502,14 @@ pub struct TriageTarget {
     /// candidate. After one, an empty `active` set would mean the daemon dispatches nothing at all
     /// — the cycle says so out loud rather than reporting a silent [`CycleOutcome::Idle`].
     pub states: DispatchStates,
+    /// One [`ProjectFacts`] per entry of [`Self::trackers`], **positionally** — the state a review
+    /// ticket opens in and the GitHub remote its pull request lives on, for the manager's room
+    /// reader (STUDIO-678). Empty until a reload has published it, which simply means a filing has
+    /// no state to open in and is refused with a reply rather than created somewhere arbitrary.
+    pub facts: Vec<ProjectFacts>,
+    /// The configured summon token, so a host-composed reviewer instruction names the token THIS
+    /// installation re-engages on.
+    pub summon_token: String,
 }
 
 /// Everything [`run_triage_schedule`] runs against. The absence of an `Orchestrator`, a control
@@ -551,6 +561,16 @@ pub struct TriageDeps<TF> {
     /// `None` disables the reconcile outright rather than running it unrecorded: a sweep that cannot
     /// remember having run is not one-time, it is every-boot.
     pub reconcile_marker: Option<std::path::PathBuf>,
+    /// The manager's ROOM READER (STUDIO-678, §0.13) — the half of this task that answers operator
+    /// posts instead of assigning tickets. `None` leaves the room unread, which is exactly T3b's
+    /// behaviour and is what a daemon with no on-disk runtime home (and therefore no room and no
+    /// watermark to keep) gets.
+    ///
+    /// It lives HERE rather than in a task of its own because it needs precisely what a triage cycle
+    /// has already paid for — the candidate fetch that is its validation set, the load tally, and
+    /// the manager's own model budget — and because §0.13 puts it "off-loop, on the manager's
+    /// budget". A second task would duplicate the fetch and race this one for the same turn budget.
+    pub ears: Option<Arc<crate::teamsears::Ears>>,
 }
 
 /// What one cycle did — the input to the back-off decision, and the assertion surface for the
@@ -995,6 +1015,57 @@ where
     } else {
         None
     };
+    // §0.13's manager room reader, BEFORE the assignment pass and BEFORE every early return below.
+    //
+    // Before the assignment pass because a post that confirms who takes a ticket writes the same
+    // additive label this cycle would have written a moment later, and doing it first means the
+    // operator's answer is the one that stands. Before the early returns because the headline case —
+    // "someone review STUDIO-654's PR" — names an IN-REVIEW ticket, which is never an assignment
+    // candidate at all: a reader placed after `candidates.is_empty()` would be deaf on exactly the
+    // post this feature exists for.
+    //
+    // Skipped when the fetch failed, for the reconcile's reason: a partial fetch would answer "not
+    // found on any project this team works" about a ticket a healthy fetch would have shown, and
+    // that reply is durable and wrong.
+    // What the ears pass labelled, which `issues` — fetched once, above — cannot show. The
+    // assignment pass below reads that same snapshot, so without this a ticket the operator just
+    // gave to someone still looks unclaimed and is re-decided a few lines later.
+    let mut ears_labelled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ears) = deps.ears.as_ref()
+        && let Some(room) = deps.room.as_ref()
+        && !fetch_failed
+    {
+        // The load the reader ranks reviewers by, tallied from the candidate fetch alone. Narrower
+        // than §0.11.1's definition and knowingly so — `record_quorum_state` makes the same trade
+        // for the same reason (§0.12 chose the free in-memory count over a tracker read), and the
+        // direction of the error is benign: under-counting a backlog can only spread reviews wider.
+        let ears_load = tally_load(&deps.teams, &issues);
+        let cycle = crate::teamsears::EarsCycle {
+            trackers: &trackers,
+            owner: &owner,
+            issues: &issues,
+            states: &target.states,
+            facts: &target.facts,
+            summon_token: &target.summon_token,
+            load: &ears_load,
+            model: ask_model && deps.teams.manager.mode == ManagerMode::LabelsModel,
+            agent_command: &deps.agent_command,
+            billing_guard: deps.billing_guard,
+            tracker_api_key: &deps.tracker_api_key,
+        };
+        let heard =
+            crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
+        ears_labelled.extend(heard.wrote.labelled_ids().map(str::to_string));
+        if !heard.is_quiet() {
+            tracing::info!(
+                answered = heard.answered,
+                filed = heard.filed,
+                assigned = heard.assigned,
+                relayed = heard.relayed,
+                "teams manager answered operator posts in the team room"
+            );
+        }
+    }
     let report = |outcome: CycleOutcome, candidates: usize| CycleReport {
         outcome,
         target: true,
@@ -1020,7 +1091,12 @@ where
             "teams triage has no dispatchable states to filter by; assigning nothing this cycle"
         );
     }
-    let candidates = unlabelled_candidates(&issues, &target.states);
+    let mut candidates = unlabelled_candidates(&issues, &target.states);
+    // The operator's answer stands: a ticket the ears pass just labelled is claimed, however
+    // unclaimed this cycle's fetch still shows it. That covers a PENDING entry too — skipping the
+    // retry of an older, unwritten decision is the point, not a leak: the next cycle's fetch shows
+    // the label the ears pass wrote, and the sweep at the top of this function retires the entry.
+    candidates.retain(|iss| !ears_labelled.contains(&iss.id));
     if candidates.is_empty() {
         return report(failed_outcome(CycleOutcome::Idle), 0);
     }
@@ -1738,7 +1814,7 @@ pub(crate) fn build_prompt(teams: &Teams, iss: &Issue, load: &HashMap<String, i6
 /// budget is therefore applied to the INPUT, which is the half this code actually controls, at the
 /// usual ~4 bytes/token. A zero or negative value falls back to [`MIN_PROMPT_BYTES`] rather than
 /// producing an empty prompt.
-fn prompt_budget_chars(max_tokens: i64) -> usize {
+pub(crate) fn prompt_budget_chars(max_tokens: i64) -> usize {
     let budget = max_tokens.max(0) as usize * BYTES_PER_TOKEN;
     budget.max(MIN_PROMPT_BYTES)
 }
@@ -1764,6 +1840,29 @@ pub struct ClaudeTriageArbiter;
 #[async_trait]
 impl TriageArbiter for ClaudeTriageArbiter {
     async fn arbitrate(&self, req: &TriageRequest) -> Result<TriageDecision, String> {
+        parse_decision(&run_turn(req).await?)
+    }
+}
+
+#[async_trait]
+impl crate::teamsears::RoomArbiter for ClaudeTriageArbiter {
+    /// The manager's ROOM turn (STUDIO-678, §0.13) — the same subprocess, the same env, the same
+    /// budget as the assignment turn, differing only in prompt and answer shape. Sharing
+    /// [`run_turn`] is what keeps "the daemon has exactly one way to ask a model something, and it
+    /// needs no API key of its own" (§0.11.2) a structural fact rather than a convention.
+    async fn resolve(&self, req: &TriageRequest) -> Result<Vec<crate::teamsears::Target>, String> {
+        crate::teamsears::parse_targets(&run_turn(req).await?)
+    }
+}
+
+/// Runs ONE bounded `claude -p <prompt>` turn and hands back its stdout.
+///
+/// The BO-59 credential probe's exact shape — the runner's own scrubbed environment,
+/// `kill_on_drop` so a timeout reaps the child, `--model` before `-p` because a flag trailing the
+/// prompt is at the mercy of positional parsing. Shared by both of this daemon's model turns; the
+/// only thing either adds is how it reads the answer.
+async fn run_turn(req: &TriageRequest) -> Result<String, String> {
+    {
         let (name, base_args) = rhapsody_agent::claude::split_command(&req.command)
             .map_err(|e| format!("invalid claude command {:?}: {e}", req.command))?;
         let env = scrub_child_env(&process_env(), req.billing_guard, &req.tracker_api_key);
@@ -1795,7 +1894,7 @@ impl TriageArbiter for ClaudeTriageArbiter {
         if !out.status.success() {
             return Err(turn_failure_reason(out.status.code(), &out.stderr));
         }
-        parse_decision(&String::from_utf8_lossy(&out.stdout))
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -2066,6 +2165,7 @@ mod tests {
                 Some(TriageTarget {
                     trackers: vec![Arc::clone(&tr) as Arc<dyn Tracker>],
                     states: states(),
+                    ..TriageTarget::default()
                 })
             },
             arbiter,
@@ -2078,6 +2178,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         }
     }
 
@@ -2110,6 +2211,7 @@ mod tests {
                 Some(TriageTarget {
                     trackers: trackers.clone(),
                     states: states(),
+                    ..TriageTarget::default()
                 })
             },
             arbiter,
@@ -2122,6 +2224,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         }
     }
 
@@ -2408,6 +2511,97 @@ mod tests {
         );
     }
 
+    // ── the ears pass and the assignment pass share one snapshot (STUDIO-678, §0.13) ────────────
+
+    /// **The operator's answer stands for the rest of the cycle.** `issues` is fetched once, at the
+    /// top of the cycle, and the ears pass writes its identity label to the TRACKER — so the
+    /// assignment pass a few lines later still sees an unlabelled ticket in that snapshot and used
+    /// to re-decide it, writing a second `rhapsody:@<name>` label over the operator's choice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_the_ears_pass_just_assigned_is_not_re_labelled_by_the_same_cycle() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        room.append(&Message::room(
+            rhapsody_config::room::OPERATOR_IDENTITY,
+            Utc::now(),
+            "bob should take MT-2",
+        ))
+        .expect("append");
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("MT-2", &[])];
+        let tr = Arc::new(tr);
+        // The room turn names bob — a choice the deterministic floor cannot make, so the label that
+        // lands says which pass wrote it. Triage's own arbiter is given NOTHING to answer with: if
+        // the assignment pass reaches this ticket at all, that is the bug.
+        // Spelled out rather than `..deps_with_room(..)`: the ears pass needs the per-project facts
+        // the default target leaves empty, and struct-update syntax cannot change the closure type
+        // the struct is generic over.
+        let tr_for_target = Arc::clone(&tr);
+        let d = TriageDeps {
+            teams: Arc::new(teams_model(vec![
+                ident("alice", &["rust"]),
+                ident("bob", &["rust"]),
+            ])),
+            target: move || {
+                Some(TriageTarget {
+                    trackers: vec![Arc::clone(&tr_for_target) as Arc<dyn Tracker>],
+                    states: states(),
+                    facts: vec![ProjectFacts {
+                        create_state: "Todo".to_string(),
+                        pr_owner: "o".to_string(),
+                        pr_repo: "r".to_string(),
+                    }],
+                    summon_token: "@symphony".to_string(),
+                })
+            },
+            arbiter: FakeArbiter::answering(Vec::new()),
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            interval: Duration::from_millis(5),
+            max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            history: None,
+            reconcile_marker: None,
+            ears: Some(Arc::new(crate::teamsears::Ears::new(
+                dir.child("manager.cursor"),
+                Arc::new(NamesBob) as Arc<dyn crate::teamsears::RoomArbiter>,
+            ))),
+        };
+
+        triage_cycle(&CancelWait::default(), &d, true).await;
+
+        let calls = tr.add_label_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the ears pass labelled it; the assignment pass must not label it again: {calls:?}"
+        );
+        assert_eq!(calls[0].issue_id, "MT-2");
+        assert_eq!(
+            calls[0].label_name, "rhapsody:@bob",
+            "the operator's choice stands"
+        );
+    }
+
+    /// A room turn that reads the post's intent the way `labels+model` is meant to: bob, by name.
+    struct NamesBob;
+
+    #[async_trait::async_trait]
+    impl crate::teamsears::RoomArbiter for NamesBob {
+        async fn resolve(
+            &self,
+            _req: &TriageRequest,
+        ) -> Result<Vec<crate::teamsears::Target>, String> {
+            Ok(vec![crate::teamsears::Target {
+                key: "MT-2".to_string(),
+                intent: crate::teamsears::Intent::Assign,
+                assignee: Some("bob".to_string()),
+            }])
+        }
+    }
+
     // ── the durable room record (STUDIO-650, T5) ────────────────────────────────────────────────
 
     /// §0.11.1 / §0.11.2: a triage decision leaves a durable manager post in the room, carrying the
@@ -2502,6 +2696,17 @@ mod tests {
                 ))
             }
             fn read_since(
+                &self,
+                _reader: &str,
+                _cursor: &Cursor,
+                _limit: usize,
+            ) -> Result<rhapsody_config::room::CaughtUp, rhapsody_config::room::RoomError>
+            {
+                Err(rhapsody_config::room::RoomError::Io(
+                    "disk on fire".to_string(),
+                ))
+            }
+            fn read_forward(
                 &self,
                 _reader: &str,
                 _cursor: &Cursor,
@@ -2901,6 +3106,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         };
         assert_eq!(
             triage_cycle(&CancelWait::default(), &d, true).await,
@@ -3486,6 +3692,7 @@ mod tests {
                 Some(TriageTarget {
                     trackers: vec![Arc::clone(&tr) as Arc<dyn Tracker>],
                     states: states.clone(),
+                    ..TriageTarget::default()
                 })
             },
             arbiter: FakeArbiter::answering(vec![]) as Arc<dyn TriageArbiter>,
@@ -3498,6 +3705,7 @@ mod tests {
             room: Some(room),
             history: Some(history),
             reconcile_marker: None,
+            ears: None,
         }
     }
 
@@ -4229,13 +4437,14 @@ mod tests {
         // (STUDIO-672). The states are what triage filters candidates by; without them the daemon
         // would publish trackers but no dispatchable state, and triage would correctly assign
         // nothing — which is what this call being the production one proves is a wiring requirement.
-        o.set_reads_triage_snapshot(
-            vec![project_tracker(
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![project_tracker(
                 "proj",
                 Arc::clone(&proj) as Arc<dyn Tracker>,
             )],
-            states(),
-        );
+            states: states(),
+            ..Default::default()
+        });
 
         let seam = Arc::new(TriageHandle::new());
         let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
@@ -4245,8 +4454,16 @@ mod tests {
             // `reads_triage_target` read (STUDIO-672). Two reads here would let this test pass over
             // a wiring that can hand triage trackers without the states they must filter by.
             target: move || {
-                let (trackers, states) = control.reads_triage_target()?;
-                Some(TriageTarget { trackers, states })
+                let snap = control.reads_triage_target()?;
+                Some(TriageTarget {
+                    // Triage sweeps every project, so it takes the clients and drops the slugs each
+                    // is bound to (STUDIO-677 keeps those beside them for the writers, which pick
+                    // exactly one project). `facts` stays positionally aligned with what is left.
+                    trackers: snap.trackers.into_iter().map(|p| p.tracker).collect(),
+                    states: snap.states,
+                    facts: snap.facts,
+                    summon_token: snap.summon_token,
+                })
             },
             arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
             agent_command: "claude".to_string(),
@@ -4264,6 +4481,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         };
         let signal = crate::control_loop::CancelSignal::new();
         let ctx = signal.wait();
@@ -4305,25 +4523,34 @@ mod tests {
         let a = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         let b = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         o.set_reads_target(Arc::new(Fake::new()), "lin_api_key_value_1234");
-        o.set_reads_triage_snapshot(
-            vec![
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![
                 project_tracker("proj-a", Arc::clone(&a)),
                 project_tracker("proj-b", Arc::clone(&b)),
             ],
-            states(),
-        );
+            states: states(),
+            ..Default::default()
+        });
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 2);
         assert!(Arc::ptr_eq(&got[0], &a) && Arc::ptr_eq(&got[1], &b));
 
         // A reload that pauses a project republishes the survivors, and the handle sees it live.
-        o.set_reads_triage_snapshot(vec![project_tracker("proj-b", Arc::clone(&b))], states());
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![project_tracker("proj-b", Arc::clone(&b))],
+            states: states(),
+            ..Default::default()
+        });
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 1);
         assert!(Arc::ptr_eq(&got[0], &b));
 
         // A config whose every project is paused: loaded, and legitimately nothing to sweep.
-        o.set_reads_triage_snapshot(Vec::new(), states());
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: Vec::new(),
+            states: states(),
+            ..Default::default()
+        });
         assert_eq!(
             control
                 .reads_project_trackers()
