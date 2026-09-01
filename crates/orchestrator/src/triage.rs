@@ -1962,6 +1962,15 @@ mod tests {
         }
     }
 
+    /// One published project tracker, as a reload builds it: the client beside the slug it is
+    /// bound to (STUDIO-677). Triage reads only the client; the slug is there for the writers.
+    fn project_tracker(slug: &str, tracker: Arc<dyn Tracker>) -> crate::reads::ProjectTracker {
+        crate::reads::ProjectTracker {
+            slug: slug.to_string(),
+            tracker,
+        }
+    }
+
     /// A programmable arbiter: answers from a queue of results, records every prompt it saw, and
     /// tracks the MAXIMUM number of turns that were ever in flight at once.
     struct FakeArbiter {
@@ -4220,7 +4229,13 @@ mod tests {
         // (STUDIO-672). The states are what triage filters candidates by; without them the daemon
         // would publish trackers but no dispatchable state, and triage would correctly assign
         // nothing — which is what this call being the production one proves is a wiring requirement.
-        o.set_reads_triage_snapshot(vec![Arc::clone(&proj) as Arc<dyn Tracker>], states());
+        o.set_reads_triage_snapshot(
+            vec![project_tracker(
+                "proj",
+                Arc::clone(&proj) as Arc<dyn Tracker>,
+            )],
+            states(),
+        );
 
         let seam = Arc::new(TriageHandle::new());
         let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
@@ -4290,13 +4305,19 @@ mod tests {
         let a = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         let b = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         o.set_reads_target(Arc::new(Fake::new()), "lin_api_key_value_1234");
-        o.set_reads_triage_snapshot(vec![Arc::clone(&a), Arc::clone(&b)], states());
+        o.set_reads_triage_snapshot(
+            vec![
+                project_tracker("proj-a", Arc::clone(&a)),
+                project_tracker("proj-b", Arc::clone(&b)),
+            ],
+            states(),
+        );
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 2);
         assert!(Arc::ptr_eq(&got[0], &a) && Arc::ptr_eq(&got[1], &b));
 
         // A reload that pauses a project republishes the survivors, and the handle sees it live.
-        o.set_reads_triage_snapshot(vec![Arc::clone(&b)], states());
+        o.set_reads_triage_snapshot(vec![project_tracker("proj-b", Arc::clone(&b))], states());
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 1);
         assert!(Arc::ptr_eq(&got[0], &b));

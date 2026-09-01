@@ -435,11 +435,23 @@ where
             // boot-loaded config (Teams config is not hot-reloaded in this slice).
             teams: Arc::new(teams_cfg.clone()),
             // Read lazily per request, exactly as triage reads its tracker per cycle: the handle is
-            // built before the first reload, so the tracker arrives later.
+            // built before the first reload, so the trackers arrive later.
+            //
+            // BOTH the account-level client and every enabled project's slug-bound one, under the
+            // single `reads_quorum_target` read (STUDIO-677). The fan-out CREATES tickets, and
+            // `create_issue` refuses a client with no `tracker.project_slug` — which is exactly
+            // what the account client is in the `projects:` config form (STUDIO-671's wedge, on the
+            // write side). So the review ticket is created through the parent project's own client,
+            // and the account client is only the legacy single-project form's fallback.
             target: move || {
                 quorum_handle
-                    .reads_tracker()
-                    .map(|tracker| rhapsody_orchestrator::QuorumTarget { tracker })
+                    .reads_quorum_target()
+                    .map(
+                        |(tracker, project_trackers)| rhapsody_orchestrator::QuorumTarget {
+                            tracker,
+                            project_trackers,
+                        },
+                    )
             },
             // The same room triage posts to, resolved the same way and for the same reason.
             room: quorum_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),

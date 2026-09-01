@@ -38,6 +38,21 @@ pub enum ReadsError {
     Tracker(#[from] TrackerError),
 }
 
+/// One enabled project's tracker, beside the slug that client is bound to.
+///
+/// STUDIO-671 published the clients so the off-loop Teams tasks could READ the daemon's work
+/// through something other than the slug-less account client. The slug rides along because a
+/// WRITE has to pick ONE of them (STUDIO-677): the review quorum creates its tickets in the
+/// parent's own project, and `create_issue` refuses a client with no `project_slug` rather than
+/// mint an issue outside the candidate query that would ever find it. No `Debug` for
+/// [`ReadsTarget`]'s reason — the trait object is not `Debug`.
+#[derive(Clone)]
+pub struct ProjectTracker {
+    /// The Linear project slug this client is bound to, from the reload that published it.
+    pub slug: String,
+    pub tracker: Arc<dyn Tracker>,
+}
+
 /// The account-level tracker + resolved key backing the read-only Linear surfaces, guarded by
 /// [`Orchestrator::reads`]. `tracker` is `None` before the first config load; `api_key` is kept
 /// ONLY to render a masked indicator ([`mask_token`]) and is never returned raw. Mirrors the Go
@@ -47,7 +62,8 @@ pub enum ReadsError {
 pub struct ReadsTarget {
     pub tracker: Option<Arc<dyn Tracker>>,
     pub api_key: String,
-    /// Every ENABLED project's slug-bound tracker, in poll order (STUDIO-671).
+    /// Every ENABLED project's slug-bound tracker, in poll order (STUDIO-671), each carrying the
+    /// slug it is bound to (STUDIO-677).
     ///
     /// `tracker` above is the top-level/legacy client, and in the `projects:` config form it is
     /// bound to `tracker.project_slug` — which validation deliberately allows to be EMPTY, because
@@ -56,7 +72,7 @@ pub struct ReadsTarget {
     /// `project.slugId == ""`, which Linear answers with zero rows and no error: the exact silent
     /// wedge STUDIO-671 reported. Anything that must see the daemon's WORK — as opposed to the
     /// account — reads these instead, the same clients the poll loop fans out over.
-    pub project_trackers: Vec<Arc<dyn Tracker>>,
+    pub project_trackers: Vec<ProjectTracker>,
     /// The reload's dispatchable-state sets (STUDIO-672), for the off-loop readers that must ask
     /// "would the selection gate hold this ticket?" without holding the `Effective` that answers
     /// it. Published beside `project_trackers`, from the same reload, for the same reason.
@@ -108,11 +124,7 @@ impl Orchestrator {
     /// and that is safe: `reads_triage_target` reads it only as a "has a config ever loaded"
     /// sentinel and never correlates it with either field, so a reader between the two writes sees
     /// the previous reload's pair — stale together, never mixed.
-    pub fn set_reads_triage_snapshot(
-        &self,
-        trackers: Vec<Arc<dyn Tracker>>,
-        states: DispatchStates,
-    ) {
+    pub fn set_reads_triage_snapshot(&self, trackers: Vec<ProjectTracker>, states: DispatchStates) {
         let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
         w.project_trackers = trackers;
         w.states = states;
@@ -177,7 +189,33 @@ impl ControlHandle {
     pub fn reads_project_trackers(&self) -> Option<Vec<Arc<dyn Tracker>>> {
         let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
         r.tracker.as_ref()?;
-        Some(r.project_trackers.clone())
+        Some(
+            r.project_trackers
+                .iter()
+                .map(|p| p.tracker.clone())
+                .collect(),
+        )
+    }
+
+    /// Everything the off-loop review quorum needs from the last reload, under **ONE** lock
+    /// (STUDIO-677): the account-level tracker and every enabled project's slug-bound tracker.
+    /// `None` before the first config load, exactly as [`Self::reads_project_trackers`] reports it.
+    ///
+    /// The quorum needs BOTH because it picks one client to create through and the two answer
+    /// different questions. The parent's project client is the right one — it carries the
+    /// `project_slug` `create_issue` requires, and it is the project whose candidate query would
+    /// later find the review ticket. The account client is the fallback the legacy single-project
+    /// config needs, where it IS the slug-bound client and no `projects:` block ever published one.
+    ///
+    /// One acquisition for [`Self::reads_triage_target`]'s reason: read separately, the pair could
+    /// straddle a reload and hand the quorum an account client from one config beside project
+    /// clients from another.
+    ///
+    /// Cloning the handles out releases the lock immediately — it is never held across an `await`.
+    pub fn reads_quorum_target(&self) -> Option<(Arc<dyn Tracker>, Vec<ProjectTracker>)> {
+        let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
+        let account = r.tracker.clone()?;
+        Some((account, r.project_trackers.clone()))
     }
 
     /// Everything the off-loop Teams triage task needs from the last reload, under **ONE** lock
@@ -197,7 +235,14 @@ impl ControlHandle {
     pub fn reads_triage_target(&self) -> Option<(Vec<Arc<dyn Tracker>>, DispatchStates)> {
         let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
         r.tracker.as_ref()?;
-        Some((r.project_trackers.clone(), r.states.clone()))
+        // Triage sweeps every project, so it wants the clients and not the slugs they are bound to
+        // (STUDIO-677 kept the slug beside each one for the quorum, which picks exactly one).
+        let trackers = r
+            .project_trackers
+            .iter()
+            .map(|p| p.tracker.clone())
+            .collect();
+        Some((trackers, r.states.clone()))
     }
 }
 
