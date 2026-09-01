@@ -1,0 +1,65 @@
+/* ============================================================================
+   Rhapsody Console — the Manage-team form (STUDIO-681 §7, built by STUDIO-686)
+
+   Ported rule-for-rule from the committed prototype's `<style>` block
+   (`~/.rhapsody/docs/STUDIO-681-prototype.html`, its "manage form" section) so a
+   reviewer can diff the two side by side. `theme/console.css` (STUDIO-682) holds
+   the §1 shared components this composes from — the Seg, Stepper, Toggle, Note,
+   Select, TagInput and buttons — and nothing here re-declares one. `.tags` in
+   particular is the design system's, not a copy.
+
+   Scoped under `.rh-console` for the same reason the other console sheets are:
+   `.field`, `.sect` and `.yaml` are far too generic to publish alongside the
+   Podium screens, which share this document.
+
+   The one literal hex is `#0a0a0c`, the YAML block's background: it is the
+   prototype's own one-off shade, deliberately a step darker than `--bg` so the
+   generated file reads as a terminal rather than as another panel.
+   ============================================================================ */
+
+/* ===== a settings section ===== */
+.rh-console .sect { border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); margin-bottom: 16px; overflow: hidden; max-width: 820px; }
+.rh-console .sect > .sh { padding: 13px 16px; border-bottom: 1px solid var(--line-soft); }
+.rh-console .sect > .sh h2 { margin: 0; font-size: 13.5px; font-weight: 600; }
+.rh-console .sect > .sh p { margin: 3px 0 0; color: var(--ink-3); font-size: 12px; }
+.rh-console .sect > .bd { padding: 6px 16px 14px; }
+
+/* ===== a labelled field row ===== */
+.rh-console .field { display: grid; grid-template-columns: 180px 1fr; gap: 14px; align-items: start; padding: 12px 0; border-bottom: 1px solid var(--line-soft); }
+.rh-console .field:last-child { border-bottom: 0; }
+.rh-console .field > .lb { padding-top: 7px; }
+.rh-console .field .lb label { font-size: 13px; font-weight: 500; }
+.rh-console .field .lb .h { color: var(--ink-4); font-size: 11.5px; margin-top: 2px; line-height: 1.45; }
+.rh-console .field .ct { min-width: 0; }
+.rh-console .in-wide { width: 100%; }
+.rh-console .togline { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
+.rh-console .togline .tx { font-size: 12.5px; color: var(--ink-2); }
+
+@media (max-width: 620px) {
+  .rh-console .field { grid-template-columns: 1fr; gap: 6px; }
+}
+
+/* ===== the roster table ===== */
+.rh-console .rform { width: 100%; border-collapse: collapse; }
+.rh-console .rform th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 8px 10px; }
+.rh-console .rform td { padding: 8px 10px; border-top: 1px solid var(--line-soft); vertical-align: middle; }
+.rh-console .rform .nm { display: flex; align-items: center; gap: 8px; }
+/* The dot is painted from the §1.5 ramp by roster POSITION, so no name appears here. */
+.rh-console .rform .av { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+.rh-console .rform .nm input { width: 100px; }
+.rh-console .rform .tags { min-width: 140px; }
+.rh-console .rform .rm { color: var(--ink-4); background: none; border: 0; cursor: pointer; font: inherit; font-size: 16px; padding: 4px 8px; }
+.rh-console .rform .rm:hover { color: var(--bad); }
+.rh-console .addrow { display: inline-flex; align-items: center; gap: 8px; margin: 12px 2px 2px; font: inherit; font-size: 12.5px; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent); border-radius: var(--r-sm); padding: 7px 13px; cursor: pointer; }
+.rh-console .addrow:hover { background: var(--accent); color: #160c05; }
+
+/* ===== the generated file ===== */
+.rh-console .yaml { border: 1px solid var(--line); border-radius: var(--r); background: #0a0a0c; padding: 14px 16px; margin-bottom: 16px; font-family: var(--mono); font-size: 12px; color: var(--ink-2); white-space: pre; overflow-x: auto; line-height: 1.7; max-width: 820px; }
+
+/* ===== the sticky footer ===== */
+.rh-console .barbot { position: sticky; bottom: 0; display: flex; align-items: center; gap: 10px; padding: 13px 0; margin-top: 6px; background: linear-gradient(0deg, var(--bg) 70%, transparent); max-width: 820px; flex-wrap: wrap; }
+.rh-console .barbot .sp { flex: 1; }
+.rh-console .barbot .lft { color: var(--ink-4); font-size: 12px; }
+
+/* The prototype's inline `margin-top:9px` on a Note that sits under its own control. */
+.rh-console .note.mt { margin-top: 9px; }
