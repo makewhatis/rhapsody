@@ -10,7 +10,15 @@
 // without a DOM.
 
 /** Every route the console serves (§2.3). `job` is the only one that carries a key. */
-export const CONSOLE_ROUTES = ["jobs", "job", "teams", "memory", "manage", "settings"] as const;
+export const CONSOLE_ROUTES = [
+  "jobs",
+  "job",
+  "teams",
+  "memory",
+  "manage",
+  "settings",
+  "workflow",
+] as const;
 
 export type ConsoleRouteName = (typeof CONSOLE_ROUTES)[number];
 
@@ -34,10 +42,16 @@ export const DEFAULT_CONSOLE_ROUTE: ConsoleRoute = { name: "jobs", key: "" };
  */
 export const TEAMS_ONLY_ROUTES = ["teams", "memory", "manage"] as const satisfies readonly ConsoleRouteName[];
 
-/** Child route → the nav item that owns it (§2.3): `job` sits under Jobs, `manage` under Teams. */
+/**
+ * Child route → the nav item that owns it (§2.3): `job` sits under Jobs, `manage` under Teams,
+ * and `workflow` — the WORKFLOW.md editor the Settings "Workflow" row opens (STUDIO-690) — under
+ * Settings. It is a route of its own rather than local state so the editor is deep-linkable and
+ * the browser Back button returns to Settings, exactly as `manage` does for Teams.
+ */
 const NAV_PARENT: Partial<Record<ConsoleRouteName, ConsoleRouteName>> = {
   job: "jobs",
   manage: "teams",
+  workflow: "settings",
 };
 
 function isRouteName(v: string): v is ConsoleRouteName {

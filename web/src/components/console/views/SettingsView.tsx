@@ -15,9 +15,11 @@ import type { ReactNode } from "react";
 export function SettingsView({
   teamsEnabled,
   onManageTeam,
+  onEditWorkflow,
 }: {
   teamsEnabled: boolean;
   onManageTeam: () => void;
+  onEditWorkflow: () => void;
 }) {
   return (
     <section>
@@ -30,7 +32,7 @@ export function SettingsView({
       </p>
       <div className="setgrp">
         {teamsEnabled ? <TeamsOnRow onManageTeam={onManageTeam} /> : <TeamsOffRow />}
-        <WorkflowRow />
+        <WorkflowRow onEdit={onEditWorkflow} />
         <StorageRow />
         <TelemetryRow />
       </div>
@@ -112,13 +114,21 @@ function TeamsOffRow() {
 
 // GET /api/v1/config returns the WORKFLOW.md front matter and prompt body, but not the file's
 // path, so the row names the documented default rather than claiming to have read a location.
-function WorkflowRow() {
+//
+// "Edit →" opens the console's WORKFLOW.md editor (STUDIO-690). Until it existed this row was
+// inert, which is exactly the parity gap §2.2.1 refuses to flip over: the shipped Podium Settings
+// can edit WORKFLOW.md, so the console has to be able to before it becomes the dashboard.
+function WorkflowRow({ onEdit }: { onEdit: () => void }) {
   return (
     <SettingRow
       icon={<WorkflowRowGlyph />}
       title="Workflow"
       detail={<code>~/.rhapsody/WORKFLOW.md</code>}
-      action={null}
+      action={
+        <Button variant="sec" onClick={onEdit}>
+          Edit →
+        </Button>
+      }
     />
   );
 }
