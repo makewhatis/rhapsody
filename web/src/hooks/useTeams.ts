@@ -79,10 +79,18 @@ export function useTeamsOverview(enabled: boolean, pollMs?: number) {
 
 // useTeamsRoom tails the room. Reading advances no identity's cursor (the daemon's guarantee), so
 // polling here can never eat a teammate's catch-up.
+//
+// `limit` is part of the query key, because a wider window is a different answer — which is what
+// the Teams console's day pager (STUDIO-684) moves when it asks for older history. That makes
+// `placeholderData` load-bearing rather than a nicety: without it, widening the window would drop
+// the caller to a key with no cached data and blank the feed to "Loading the room…" every time the
+// operator asked for one more day. Keeping the previous page on screen also gives the pager an
+// honest "a wider read is in flight" signal (`isPlaceholderData`) that the 5s poll never trips.
 export function useTeamsRoom(enabled: boolean, limit?: number, pollMs?: number) {
   return useQuery<TeamsRoomResponse>({
     queryKey: [...TEAMS_ROOM_QUERY_KEY, limit ?? 0],
     queryFn: () => fetchTeamsRoom(limit),
+    placeholderData: (prev) => prev,
     refetchInterval: pollMs ?? 5000,
     refetchOnWindowFocus: false,
     enabled,
