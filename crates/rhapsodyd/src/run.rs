@@ -374,8 +374,17 @@ where
             // triage assigned identities to In-Review tickets — parked design records and work
             // already under human review — that the gate could never have held.
             target: move || {
-                let (trackers, states) = triage_handle.reads_triage_target()?;
-                Some(rhapsody_orchestrator::TriageTarget { trackers, states })
+                let snap = triage_handle.reads_triage_target()?;
+                Some(rhapsody_orchestrator::TriageTarget {
+                    // Triage sweeps every project, so it takes the clients and drops the slug each
+                    // is bound to (STUDIO-677 keeps those beside them for the WRITERS — the quorum
+                    // picks exactly one project to create through). `facts` below stays
+                    // positionally aligned with the clients that survive this map.
+                    trackers: snap.trackers.into_iter().map(|p| p.tracker).collect(),
+                    states: snap.states,
+                    facts: snap.facts,
+                    summon_token: snap.summon_token,
+                })
             },
             arbiter: Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
             agent_command: command,

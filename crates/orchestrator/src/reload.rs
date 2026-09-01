@@ -114,6 +114,31 @@ impl Orchestrator {
                 tracker: Arc::clone(&p.tracker),
             })
             .collect();
+        // The per-project facts the manager's room reader files a review ticket with (STUDIO-678),
+        // in the SAME order and under the same filter as the trackers above — the reader indexes
+        // one by the other, so an entry that drifted would file into another project's state.
+        //
+        // `create_state` is `Orchestrator::quorum_create_state`'s answer, resolved here instead of
+        // there because this reader holds no orchestrator: the project's FIRST configured active
+        // state, per-project ⊕ top-level exactly as every other override resolves.
+        let project_facts: Vec<crate::reads::ProjectFacts> = eff
+            .projects
+            .iter()
+            .filter(|p| !p.disabled)
+            .map(|p| {
+                let project = cfg.projects.iter().find(|c| c.slugs.contains(&p.slug));
+                let (pr_owner, pr_repo) = crate::ghsummons::parse_repo(&p.repo).unwrap_or_default();
+                crate::reads::ProjectFacts {
+                    create_state: rhapsody_config::effective_for(&cfg, project)
+                        .active_states
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default(),
+                    pr_owner,
+                    pr_repo,
+                }
+            })
+            .collect();
         // Snapshot the state sets the selection gate filters by, BEFORE `eff` moves into `self`.
         let states = crate::dispatch::DispatchStates {
             active: eff.active_states.clone(),
@@ -128,7 +153,12 @@ impl Orchestrator {
         // under one write (STUDIO-672). Together because the off-loop triage task reads them as a
         // pair and acts on the pair; from this reload rather than re-derived there so triage and
         // the selection gate can never disagree about which tickets are work.
-        self.set_reads_triage_snapshot(project_trackers, states);
+        self.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: project_trackers,
+            states,
+            facts: project_facts,
+            summon_token: cfg.tracker.summon_token.clone(),
+        });
         // Resolve configured project slugs against Linear + flag any missing repo-relative prompt_file,
         // best-effort and OFF the control task (a no-op on the direct-reload test path where `o.ctx` is
         // nil). INF-277 / INF-279.

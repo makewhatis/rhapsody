@@ -75,6 +75,7 @@ use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
 use crate::dispatch::DispatchStates;
 use crate::preflight::{process_env, scrub_child_env};
+use crate::reads::ProjectFacts;
 use crate::teams::IDENTITY_LABEL_PREFIX;
 
 /// The triage pass's own cadence — deliberately **not** the control loop's tick (§0.11.2).
@@ -476,6 +477,7 @@ fn route_event_identity(text: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+#[derive(Default)]
 pub struct TriageTarget {
     /// Every ENABLED project's slug-bound tracker, in the poll loop's order — the SAME clients
     /// `on_tick` fans its candidate fetch over.
@@ -500,6 +502,14 @@ pub struct TriageTarget {
     /// candidate. After one, an empty `active` set would mean the daemon dispatches nothing at all
     /// — the cycle says so out loud rather than reporting a silent [`CycleOutcome::Idle`].
     pub states: DispatchStates,
+    /// One [`ProjectFacts`] per entry of [`Self::trackers`], **positionally** — the state a review
+    /// ticket opens in and the GitHub remote its pull request lives on, for the manager's room
+    /// reader (STUDIO-678). Empty until a reload has published it, which simply means a filing has
+    /// no state to open in and is refused with a reply rather than created somewhere arbitrary.
+    pub facts: Vec<ProjectFacts>,
+    /// The configured summon token, so a host-composed reviewer instruction names the token THIS
+    /// installation re-engages on.
+    pub summon_token: String,
 }
 
 /// Everything [`run_triage_schedule`] runs against. The absence of an `Orchestrator`, a control
@@ -2066,6 +2076,7 @@ mod tests {
                 Some(TriageTarget {
                     trackers: vec![Arc::clone(&tr) as Arc<dyn Tracker>],
                     states: states(),
+                    ..TriageTarget::default()
                 })
             },
             arbiter,
@@ -2110,6 +2121,7 @@ mod tests {
                 Some(TriageTarget {
                     trackers: trackers.clone(),
                     states: states(),
+                    ..TriageTarget::default()
                 })
             },
             arbiter,
@@ -3497,6 +3509,7 @@ mod tests {
                 Some(TriageTarget {
                     trackers: vec![Arc::clone(&tr) as Arc<dyn Tracker>],
                     states: states.clone(),
+                    ..TriageTarget::default()
                 })
             },
             arbiter: FakeArbiter::answering(vec![]) as Arc<dyn TriageArbiter>,
@@ -4240,13 +4253,14 @@ mod tests {
         // (STUDIO-672). The states are what triage filters candidates by; without them the daemon
         // would publish trackers but no dispatchable state, and triage would correctly assign
         // nothing — which is what this call being the production one proves is a wiring requirement.
-        o.set_reads_triage_snapshot(
-            vec![project_tracker(
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![project_tracker(
                 "proj",
                 Arc::clone(&proj) as Arc<dyn Tracker>,
             )],
-            states(),
-        );
+            states: states(),
+            ..Default::default()
+        });
 
         let seam = Arc::new(TriageHandle::new());
         let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
@@ -4256,8 +4270,16 @@ mod tests {
             // `reads_triage_target` read (STUDIO-672). Two reads here would let this test pass over
             // a wiring that can hand triage trackers without the states they must filter by.
             target: move || {
-                let (trackers, states) = control.reads_triage_target()?;
-                Some(TriageTarget { trackers, states })
+                let snap = control.reads_triage_target()?;
+                Some(TriageTarget {
+                    // Triage sweeps every project, so it takes the clients and drops the slugs each
+                    // is bound to (STUDIO-677 keeps those beside them for the writers, which pick
+                    // exactly one project). `facts` stays positionally aligned with what is left.
+                    trackers: snap.trackers.into_iter().map(|p| p.tracker).collect(),
+                    states: snap.states,
+                    facts: snap.facts,
+                    summon_token: snap.summon_token,
+                })
             },
             arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
             agent_command: "claude".to_string(),
@@ -4316,25 +4338,34 @@ mod tests {
         let a = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         let b = Arc::new(Fake::new()) as Arc<dyn Tracker>;
         o.set_reads_target(Arc::new(Fake::new()), "lin_api_key_value_1234");
-        o.set_reads_triage_snapshot(
-            vec![
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![
                 project_tracker("proj-a", Arc::clone(&a)),
                 project_tracker("proj-b", Arc::clone(&b)),
             ],
-            states(),
-        );
+            states: states(),
+            ..Default::default()
+        });
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 2);
         assert!(Arc::ptr_eq(&got[0], &a) && Arc::ptr_eq(&got[1], &b));
 
         // A reload that pauses a project republishes the survivors, and the handle sees it live.
-        o.set_reads_triage_snapshot(vec![project_tracker("proj-b", Arc::clone(&b))], states());
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![project_tracker("proj-b", Arc::clone(&b))],
+            states: states(),
+            ..Default::default()
+        });
         let got = control.reads_project_trackers().expect("config is loaded");
         assert_eq!(got.len(), 1);
         assert!(Arc::ptr_eq(&got[0], &b));
 
         // A config whose every project is paused: loaded, and legitimately nothing to sweep.
-        o.set_reads_triage_snapshot(Vec::new(), states());
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: Vec::new(),
+            states: states(),
+            ..Default::default()
+        });
         assert_eq!(
             control
                 .reads_project_trackers()
