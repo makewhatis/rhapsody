@@ -1,0 +1,158 @@
+/* ============================================================================
+   Rhapsody Console — shared component + layout styles (STUDIO-682)
+
+   The §1.3 components and §1.4 layout primitives of the STUDIO-681 spec, ported
+   rule-for-rule from the committed prototype's `<style>` block
+   (`~/.rhapsody/docs/STUDIO-681-prototype.html`) so a reviewer can diff the two
+   side by side. Only the foundation ships here — the room feed, jobs table,
+   memory cards, job detail and manage form are sub-tickets 2–5.
+
+   Every selector is scoped under `.rh-console` (see tokens.css for why): the
+   prototype's class names — `.card`, `.chip`, `.btn`, `.grid`, `.link` — are far
+   too generic to publish globally alongside the Podium screens.
+
+   Literal hexes below (`#34343c` hover hairline, `#f0a670` accent hover, …) are
+   the prototype's own one-off shades. They are NOT duplicates of a token; every
+   value that has a token uses `var(--…)`.
+   ============================================================================ */
+
+/* ===== base ===== */
+.rh-console,
+.rh-console * { box-sizing: border-box; }
+.rh-console a { color: inherit; text-decoration: none; }
+.rh-console ::selection { background: var(--accent-soft); color: #fff; }
+.rh-console code { font-family: var(--mono); font-size: .9em; color: var(--ink); background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
+.rh-console .mono { font-family: var(--mono); }
+.rh-console .at { font-family: var(--mono); font-size: 11px; color: var(--ink-4); }
+.rh-console input[type=text],
+.rh-console input[type=number],
+.rh-console textarea { font: inherit; font-size: 13px; color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px 11px; }
+.rh-console input:focus,
+.rh-console select:focus,
+.rh-console textarea:focus { outline: none; border-color: #3a3a44; }
+.rh-console input::placeholder { color: var(--ink-4); }
+
+/* ===== shell (§1.3 AppShell / NavItem) ===== */
+.app.rh-console { display: grid; grid-template-columns: 214px 1fr; min-height: 100vh; }
+.rh-console .rail { border-right: 1px solid var(--line); background: var(--panel); padding: 16px 12px; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 3px; }
+.rh-console .rail .logo { display: flex; align-items: center; gap: 9px; padding: 4px 8px 16px; }
+.rh-console .rail .logo b { font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
+.rh-console .rail .logo .mk { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(150deg, var(--accent), #b5643a); display: grid; place-items: center; color: #160c05; font-weight: 700; font-size: 13px; }
+.rh-console .nav a { display: flex; align-items: center; gap: 11px; padding: 8px 10px; border-radius: var(--r-sm); color: var(--ink-2); font-size: 13px; font-weight: 450; cursor: pointer; }
+.rh-console .nav a:hover { background: var(--panel-2); color: var(--ink); }
+.rh-console .nav a.active { background: var(--raise); color: var(--ink); font-weight: 600; }
+.rh-console .nav a .ic { width: 16px; height: 16px; color: var(--ink-3); flex: none; display: grid; place-items: center; }
+.rh-console .nav a .ic > svg { width: 100%; height: 100%; }
+.rh-console .nav a.active .ic { color: var(--accent); }
+.rh-console .nav a .ct { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); background: var(--panel-2); border-radius: 99px; padding: 1px 7px; }
+.rh-console .nav .sep { height: 1px; background: var(--line-soft); margin: 8px 6px; }
+.rh-console .rail .foot { margin-top: auto; padding: 10px 8px 2px; border-top: 1px solid var(--line-soft); color: var(--ink-4); font-family: var(--mono); font-size: 10.5px; line-height: 1.7; }
+.rh-console .rail .foot .live { color: var(--ok); }
+.rh-console .main { padding: 22px clamp(14px, 2.6vw, 30px) 60px; min-width: 0; }
+
+/* §1.7 — below 860px the rail keeps its icons and drops everything else. */
+@media (max-width: 860px) {
+  .app.rh-console { grid-template-columns: 52px 1fr; }
+  /* `:not(.ic)` keeps the glyph: NavItem wraps its icon in a span, where the prototype
+     put the class straight on the <svg>. Everything else in the row goes. */
+  .rh-console .rail .logo b, .rh-console .nav a > span:not(.ic), .rh-console .nav a .ct, .rh-console .rail .foot { display: none; }
+  .rh-console .nav a { justify-content: center; padding: 9px 0; }
+}
+
+/* ===== atoms (§1.3) ===== */
+.rh-console .card { border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); overflow: hidden; }
+.rh-console .card > .hd { display: flex; align-items: center; gap: 10px; padding: 13px 15px; border-bottom: 1px solid var(--line-soft); }
+.rh-console .card > .hd h2 { margin: 0; font-size: 13px; font-weight: 600; }
+.rh-console .card > .hd .sub { color: var(--ink-3); font-size: 11.5px; }
+.rh-console .card > .hd .rt { margin-left: auto; }
+
+.rh-console .link { color: var(--ink-3); font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
+.rh-console .link:hover { color: var(--accent); }
+
+.rh-console .tk { font-family: var(--mono); font-size: 11px; color: var(--ticket); background: var(--ticket-bg); border: 1px solid var(--ticket-line); border-radius: 6px; padding: 2px 8px; }
+.rh-console .tk.pr { color: #8fb98f; background: #16241a; border-color: #264a2c; }
+.rh-console .tk.sha { color: var(--ink-3); background: var(--panel-2); border-color: var(--line); }
+
+.rh-console .chip { font: inherit; font-size: 12px; color: var(--ink-2); cursor: pointer; border: 1px solid var(--line); background: var(--panel-2); border-radius: 99px; padding: 5px 11px; display: inline-flex; align-items: center; gap: 6px; transition: .12s; }
+.rh-console .chip:hover { border-color: #34343c; color: var(--ink); }
+.rh-console .chip[aria-pressed="true"] { background: var(--ink); color: #111; border-color: var(--ink); font-weight: 600; }
+.rh-console .chip .k { font-family: var(--mono); font-size: 10.5px; opacity: .7; }
+
+.rh-console .selwrap { position: relative; display: inline-block; }
+.rh-console .sel { font: inherit; font-size: 12.5px; color: var(--ink-2); background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 30px 8px 12px; cursor: pointer; -webkit-appearance: none; appearance: none; }
+.rh-console .selwrap::after { content: "\25BE"; position: absolute; right: 11px; top: 50%; transform: translateY(-50%); color: var(--ink-4); font-size: 10px; pointer-events: none; }
+
+.rh-console .seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r-sm); overflow: hidden; }
+.rh-console .seg button { font: inherit; font-size: 12.5px; color: var(--ink-2); background: var(--panel-2); border: 0; padding: 8px 13px; cursor: pointer; border-right: 1px solid var(--line); }
+.rh-console .seg button:last-child { border-right: 0; }
+.rh-console .seg button[aria-pressed="true"] { background: var(--raise); color: var(--ink); font-weight: 600; }
+.rh-console .seg.acc button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+
+.rh-console .btn { font: inherit; font-weight: 600; font-size: 12.5px; cursor: pointer; border-radius: var(--r-sm); padding: 8px 15px; border: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent); }
+.rh-console .btn:hover { background: var(--accent); color: #1a0f06; }
+.rh-console .btn.pri { background: var(--accent); color: #160c05; }
+.rh-console .btn.pri:hover { background: #f0a670; }
+.rh-console .btn.sec { border-color: var(--line); background: var(--panel); color: var(--ink-2); }
+.rh-console .btn.sec:hover { color: var(--ink); border-color: #34343c; }
+.rh-console .btn.link { border: 0; background: none; color: var(--ink-3); padding: 8px 6px; }
+.rh-console .btn.link:hover { color: var(--accent); background: none; }
+
+.rh-console .stepper { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: var(--r-sm); overflow: hidden; background: var(--panel-2); }
+.rh-console .stepper button { font: inherit; font-size: 15px; color: var(--ink-2); background: none; border: 0; width: 32px; height: 34px; cursor: pointer; }
+.rh-console .stepper button:hover { background: var(--raise); color: var(--ink); }
+.rh-console .stepper input { border: 0; background: none; width: 74px; text-align: center; font-family: var(--mono); color: var(--ink); border-left: 1px solid var(--line); border-right: 1px solid var(--line); border-radius: 0; padding: 9px 0; }
+.rh-console .unit { color: var(--ink-4); font-size: 12px; margin-left: 9px; }
+
+.rh-console .toggle { position: relative; width: 40px; height: 23px; border-radius: 99px; background: var(--line); border: 1px solid var(--line); cursor: pointer; transition: .15s; flex: none; padding: 0; }
+.rh-console .toggle::after { content: ""; position: absolute; top: 2px; left: 2px; width: 17px; height: 17px; border-radius: 50%; background: var(--ink-3); transition: .15s; }
+.rh-console .toggle[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.rh-console .toggle[aria-pressed="true"]::after { left: 19px; background: var(--accent); }
+.rh-console .toggle.sm { width: 34px; height: 19px; }
+.rh-console .toggle.sm::after { width: 13px; height: 13px; }
+.rh-console .toggle.sm[aria-pressed="true"]::after { left: 17px; }
+
+.rh-console .note { display: flex; gap: 9px; align-items: flex-start; font-size: 12px; border-radius: var(--r-sm); padding: 9px 12px; }
+.rh-console .note svg { width: 14px; height: 14px; flex: none; margin-top: 1px; }
+.rh-console .note.warn { background: var(--warn-soft); border: 1px solid #453915; color: var(--warn); }
+.rh-console .note.info { background: var(--panel-2); border: 1px solid var(--line); color: var(--ink-3); }
+
+.rh-console .pill { font-size: 11px; font-weight: 600; border-radius: 99px; padding: 2px 10px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.rh-console .pill .d { width: 6px; height: 6px; border-radius: 50%; }
+.rh-console .pill.run { color: var(--ok); background: rgba(99, 192, 122, .12); }
+.rh-console .pill.run .d { background: var(--ok); }
+.rh-console .pill.review { color: var(--accent); background: var(--accent-soft); }
+.rh-console .pill.review .d { background: var(--accent); }
+.rh-console .pill.queued { color: var(--ink-3); background: var(--panel-2); }
+.rh-console .pill.queued .d { background: var(--ink-4); }
+.rh-console .pill.done { color: var(--info); background: rgba(127, 167, 230, .1); }
+.rh-console .pill.done .d { background: var(--info); }
+.rh-console .pill.blocked { color: var(--bad); background: var(--bad-soft); }
+.rh-console .pill.blocked .d { background: var(--bad); }
+
+.rh-console .tags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 5px 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.rh-console .tags input { border: 0; background: none; flex: 1; min-width: 70px; padding: 4px; }
+.rh-console .tags .rm { color: var(--ink-4); background: none; border: 0; cursor: pointer; padding: 0 0 0 2px; font: inherit; font-size: 11px; line-height: 1; }
+.rh-console .tags .rm:hover { color: var(--bad); }
+
+/* ===== layout primitives (§1.4) ===== */
+.rh-console .now { display: flex; gap: 10px; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r); background: linear-gradient(180deg, var(--panel-2), var(--panel)); margin-bottom: 16px; }
+.rh-console .now .who { display: flex; gap: 10px; flex-wrap: wrap; flex: 1; min-width: 220px; }
+.rh-console .mate { display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px 7px 10px; border: 1px solid var(--line); border-radius: 99px; background: var(--panel); font-size: 12.5px; }
+.rh-console .mate .st { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-4); }
+.rh-console .mate.run .st { background: var(--ok); box-shadow: 0 0 0 3px rgba(99, 192, 122, .16); }
+.rh-console .mate b { font-weight: 600; }
+.rh-console .mate.run b { color: var(--ok); }
+.rh-console .mate .task { color: var(--ink-3); font-family: var(--mono); font-size: 11.5px; }
+.rh-console .stats { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.rh-console .stat { text-align: center; padding: 4px 12px; border-radius: var(--r-sm); background: var(--panel); border: 1px solid var(--line-soft); min-width: 74px; }
+.rh-console .stat .n { font-family: var(--mono); font-weight: 600; font-size: 17px; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.rh-console .stat .l { font-size: 10.5px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .06em; }
+.rh-console .stat.bad .n { color: var(--bad); }
+.rh-console .stat.acc .n { color: var(--accent); }
+
+.rh-console .grid { display: grid; grid-template-columns: 1fr 336px; gap: 16px; align-items: start; }
+.rh-console .side { display: flex; flex-direction: column; gap: 16px; }
+
+@media (max-width: 1000px) {
+  .rh-console .grid { grid-template-columns: 1fr; }
+}
