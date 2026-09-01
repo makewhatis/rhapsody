@@ -375,6 +375,30 @@ describe("5.6 — View as YAML renders a teams.yaml consistent with the form", (
 });
 
 describe("5.7 — Save posts to /teams/config and states that changes apply on restart", () => {
+  // The endpoint itself, not just "the client function was called": box 5.7 names the route, and
+  // nothing else in the suite pins it. The real `saveTeamsConfig` runs here against a stubbed
+  // fetch, so a change to the URL, the method or the `{config}` envelope turns this red.
+  it("POSTs the {config} envelope to /api/v1/teams/config", async () => {
+    const realApi = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+    h.saveTeamsConfig.mockImplementation(realApi.saveTeamsConfig);
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(view()), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await ready();
+      fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe("/api/v1/teams/config");
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(String(init.body)).config.roster.map((r: { name: string }) => r.name)).toEqual([
+        "alice",
+        "jimmy",
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("posts the form's config", async () => {
     await ready();
     fireEvent.change(nameField(1), { target: { value: "carol" } });

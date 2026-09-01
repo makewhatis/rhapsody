@@ -346,6 +346,9 @@ function Manager({
   set: <K extends keyof TeamsDraft>(key: K, value: TeamsDraft[K]) => void;
 }) {
   const starved = starvedTimeoutMs(draft);
+  // React-generated so the label/control pairing cannot collide with another instance of the
+  // form, or with an id the Podium screens sharing this document already use.
+  const id = React.useId();
   return (
     <Section title="Manager (triage)" desc="How unlabelled work gets routed.">
       <Field label="Mode" hint="Deterministic, or a model turn that falls back to deterministic on a miss.">
@@ -357,9 +360,9 @@ function Manager({
           onChange={(v) => set("managerMode", v)}
         />
       </Field>
-      <Field label="Model" htmlFor="mgr-model">
+      <Field label="Model" htmlFor={`${id}-model`}>
         <input
-          id="mgr-model"
+          id={`${id}-model`}
           type="text"
           className="mono"
           style={{ maxWidth: 280 }}
@@ -386,9 +389,9 @@ function Manager({
           </Note>
         )}
       </Field>
-      <Field label="Default identity" hint="Fallback picks this teammate; otherwise least-loaded." htmlFor="mgr-identity">
+      <Field label="Default identity" hint="Fallback picks this teammate; otherwise least-loaded." htmlFor={`${id}-identity`}>
         <Select
-          id="mgr-identity"
+          id={`${id}-identity`}
           aria-label="Default identity"
           value={draft.defaultIdentity}
           options={defaultIdentityOptions(draft)}
@@ -410,6 +413,7 @@ function MemoryAndQuorum({
   onChange: (next: TeamsDraft) => void;
   set: <K extends keyof TeamsDraft>(key: K, value: TeamsDraft[K]) => void;
 }) {
+  const id = React.useId();
   return (
     <Section title="Memory & quorum">
       <Field label="Memory backend">
@@ -423,9 +427,9 @@ function MemoryAndQuorum({
       </Field>
       {showsHindsightFields(draft.backend) ? (
         <>
-          <Field label="Hindsight endpoint" htmlFor="mem-endpoint">
+          <Field label="Hindsight endpoint" htmlFor={`${id}-endpoint`}>
             <input
-              id="mem-endpoint"
+              id={`${id}-endpoint`}
               type="text"
               className="mono in-wide"
               placeholder="https://hindsight.example.ts.net/mcp/"
@@ -481,6 +485,7 @@ function ApiKeyField({
   storedKey: boolean;
   onChange: (next: TeamsDraft) => void;
 }) {
+  const id = React.useId();
   if (draft.apiKeyStored) {
     return (
       <Field label="API key" hint="A key is stored in teams.yaml and is never shown.">
@@ -501,11 +506,11 @@ function ApiKeyField({
           ? "Replacing the key stored in teams.yaml. Saving this blank removes the stored key, which leaves the backend unauthenticated."
           : "Name an environment variable — $HINDSIGHT_API_KEY is read from the daemon's environment, so the secret stays out of the file."
       }
-      htmlFor="mem-key"
+      htmlFor={`${id}-key`}
     >
       <div className="togline">
         <input
-          id="mem-key"
+          id={`${id}-key`}
           type="text"
           className="mono"
           aria-label="API key"
