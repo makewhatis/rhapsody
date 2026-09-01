@@ -7,6 +7,7 @@ import {
   mergeNote,
   runDescription,
   runMeta,
+  runOutcomePill,
   runsNewestFirst,
   transcriptTimeline,
   type PullRequestView,
@@ -91,6 +92,14 @@ describe("buildJobSummary", () => {
     expect(buildJobSummary([run({ id: 1, outcome: "failed" })], { nowMs: NOW }).status).toBe("blocked");
   });
 
+  it("reads a live ticket as running even before its run row is persisted", () => {
+    // A just-dispatched ticket has no history yet. Losing the live signal here would show it
+    // as "queued" — the daemon idle on work it is actively running.
+    expect(buildJobSummary([], { live: true, nowMs: NOW }).status).toBe("run");
+    // …and a live ticket whose newest stored row is an older completed run is still running.
+    expect(buildJobSummary([run({ id: 1, outcome: "completed" })], { live: true, nowMs: NOW }).status).toBe("run");
+  });
+
   it("survives a ticket with no runs at all", () => {
     const summary = buildJobSummary([], { nowMs: NOW });
     expect(summary.runs).toBe(0);
@@ -102,6 +111,18 @@ describe("buildJobSummary", () => {
     // The daemon serves none (see the module's DEPENDENCY note) — the field must stay empty
     // rather than fabricate a number.
     expect(buildJobSummary([run({ id: 1 })], { nowMs: NOW }).pullRequest).toBe("");
+  });
+});
+
+describe("runOutcomePill", () => {
+  it("keeps a run's own outcome distinct from the ticket's status", () => {
+    expect(runOutcomePill("running")).toBe("run");
+    expect(runOutcomePill("completed")).toBe("done");
+    expect(runOutcomePill("failed")).toBe("blocked");
+    // A stopped or interrupted run is emphatically NOT "done".
+    expect(runOutcomePill("stopped")).toBe("queued");
+    expect(runOutcomePill("interrupted")).toBe("queued");
+    expect(runOutcomePill("")).toBe("queued");
   });
 });
 

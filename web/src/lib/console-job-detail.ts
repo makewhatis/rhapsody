@@ -70,15 +70,13 @@ export function buildJobSummary(
 ): JobSummary {
   const ordered = runsNewestFirst(runs);
   const newest = ordered[0];
-  const status = consoleJobStatus(
-    jobStatus(
-      ordered.map((r) => ({
-        outcome: r.outcome,
-        live: (opts.live ?? false) && r === newest,
-        queued: false,
-      })),
-    ),
-  );
+  // Liveness is its own signal, prepended rather than stamped onto a stored row: the run that
+  // is in flight may not have been persisted yet, so marking the newest HISTORY row live would
+  // both misdescribe that row and, for a ticket with no history at all, lose the signal
+  // entirely — a just-dispatched ticket would read "queued".
+  const signals = ordered.map((r) => ({ outcome: r.outcome, live: false, queued: false }));
+  if (opts.live ?? false) signals.unshift({ outcome: "running", live: true, queued: false });
+  const status = consoleJobStatus(jobStatus(signals));
   const updatedAtMs = ordered.reduce(
     (max, r) => Math.max(max, parseMs(r.ended_at) || parseMs(r.started_at)),
     0,
@@ -126,6 +124,25 @@ export function runMeta(run: RunSummary, identity = ""): RunMeta {
 export function runDescription(run: RunSummary): string {
   if (run.error !== "") return run.error;
   return run.outcome === "" ? DASH : run.outcome;
+}
+
+/**
+ * The Pill a RUN's own outcome paints in the runs list. This is the run's state, not the
+ * ticket's, so it keeps the taxonomy-v2 spelling: only a clean `completed` is blue-`done`, a
+ * `failed` run is red, and `stopped`/`interrupted` are grey — a stopped run is emphatically
+ * not "done".
+ */
+export function runOutcomePill(outcome: string): ConsoleJobStatus {
+  switch (outcome) {
+    case "running":
+      return "run";
+    case "completed":
+      return "done";
+    case "failed":
+      return "blocked";
+    default:
+      return "queued";
+  }
 }
 
 /** The transcript timeline's line kinds (§4) — each paints its own glyph. */

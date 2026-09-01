@@ -36,6 +36,8 @@
 
 /* ===== §3 jobs ===== */
 .rh-console .jfilters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+/* The project Select sits at the far right of the filter bar, as the prototype has it. */
+.rh-console .jfilters .selwrap { margin-left: auto; }
 .rh-console .jtbl { width: 100%; border-collapse: collapse; }
 .rh-console .jtbl th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 9px 14px; border-bottom: 1px solid var(--line-soft); }
 .rh-console .jtbl td { padding: 12px 14px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }

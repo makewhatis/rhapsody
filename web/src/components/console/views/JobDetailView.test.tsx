@@ -194,6 +194,31 @@ describe("the runs list (§4)", () => {
     expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547);
   });
 
+  // Box 2.10 — "expanding a run" is a real interaction, not just the default-open row.
+  it("fetches and renders a collapsed run's transcript when it is expanded", async () => {
+    h.fetchRunTranscript.mockImplementation(async (id: number) => ({
+      run_id: id,
+      generated_at: "",
+      entries: [{ seq: 1, kind: "tool_use", tool: "Bash", text: `transcript of run ${id}` }],
+    }));
+    mountDetail([
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+    ]);
+    await waitFor(() => expect(screen.getByText(/transcript of run 547/)).toBeTruthy());
+    expect(screen.queryByText(/transcript of run 522/)).toBeNull();
+
+    // jsdom does not implement <details> toggling from a summary click, so drive the element's
+    // own open state — which is exactly what the browser would do before firing `toggle`.
+    const older = [...document.querySelectorAll("details.run")][1] as HTMLDetailsElement;
+    fireEvent(
+      Object.assign(older, { open: true }),
+      new Event("toggle", { bubbles: false }),
+    );
+    await waitFor(() => expect(screen.getByText(/transcript of run 522/)).toBeTruthy());
+    expect(h.fetchRunTranscript).toHaveBeenCalledWith(522);
+  });
+
   it("says so when a run recorded no transcript", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     mountDetail([run({ id: 547 })]);

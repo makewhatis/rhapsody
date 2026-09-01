@@ -17,7 +17,7 @@
 //               finished run shows "—": no teammate identity is recorded on a stored run row.
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
 import type { RunSummary, TeamsOverview } from "@/lib/api";
-import type { JobRow, JobStatusKey } from "@/lib/runs-model";
+import type { JobRow } from "@/lib/runs-model";
 
 /** The five states the console's Pill paints (§1.3). */
 export type ConsoleJobStatus = "run" | "review" | "queued" | "done" | "blocked";
@@ -51,8 +51,12 @@ export const CONSOLE_STATUS_LABELS: Record<ConsoleJobStatus, string> = {
  * says; `stopped` leaves the ticket idle awaiting its next dispatch, which is `queued`.
  *
  * `done` is unreachable from run outcomes alone — see this module's DEPENDENCY note.
+ *
+ * Takes a plain string rather than `JobStatusKey`: `JobRow.status` is typed as the wider
+ * `StatusKey`, and narrowing it with a cast would hide exactly the case the default arm is
+ * here to survive.
  */
-export function consoleJobStatus(status: JobStatusKey): ConsoleJobStatus {
+export function consoleJobStatus(status: string): ConsoleJobStatus {
   switch (status) {
     case "running":
       return "run";
@@ -169,7 +173,7 @@ export function buildConsoleJobs(
   const activity = lastActivityByIssue(issueRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
-    const status = consoleJobStatus(job.status as JobStatusKey);
+    const status = consoleJobStatus(job.status);
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     return {
       key: job.key,

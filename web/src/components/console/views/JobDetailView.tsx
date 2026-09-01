@@ -24,6 +24,7 @@ import {
   mergeNote,
   runDescription,
   runMeta,
+  runOutcomePill,
   runsNewestFirst,
   transcriptTimeline,
   type PullRequestView,
@@ -173,7 +174,7 @@ function RunRow({
         <span className="lab">attempt {run.attempt}</span>
         <span className="desc">{runDescription(run)}</span>
         <span className="rt">
-          <Pill variant={run.outcome === "running" ? "run" : run.outcome === "failed" ? "blocked" : "done"}>
+          <Pill variant={runOutcomePill(run.outcome)}>
             {run.outcome === "" ? "unknown" : run.outcome}
           </Pill>
           <span className="car" aria-hidden="true">

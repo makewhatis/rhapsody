@@ -107,8 +107,6 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
         />
         <Select
           aria-label="Filter by project"
-          wrapperClassName="jproj"
-          style={{ marginLeft: "auto" }}
           options={projectOptions}
           value={project}
           onChange={(e) => setProject(e.target.value)}
