@@ -573,6 +573,7 @@ mod tests {
     /// only NAMES a path — the directory appears on the first `retain` and at no other time.
     #[test]
     fn resolve_banks_dir_defaults_beside_teams_yaml_and_honours_memory_path() {
+        let dir = TempDir::new();
         let cfg = resolve(
             decode(&workflow::Definition {
                 config: workflow::YamlMap::new(),
@@ -616,9 +617,25 @@ mod tests {
         assert_eq!(resolve_banks_dir(None, "", ":memory:", false), None);
         assert_eq!(resolve_banks_dir(None, "", "", false), None);
 
+        // Resolving must never create a banks directory — asserted on paths this test owns, never on
+        // `got` (the real `~/.rhapsody/teams/banks`). Stat-ing the real home made this assertion
+        // VACUOUS the moment a live daemon's first `teams_retain` created that directory: `!got
+        // .exists()` went permanently false, and the `||` meant the whole claim rode on
+        // `/somewhere/banks`, which nothing here could have created anyway (STUDIO-688).
+        let db = dir.child("rhapsody.db");
+        let anchored = resolve_banks_dir(None, "", &db.to_string_lossy(), false)
+            .expect("temp-dir --db → Some");
+        assert_eq!(anchored, dir.child("teams").join("banks"));
+        let overridden = dir.child("elsewhere-banks");
+        assert_eq!(
+            resolve_banks_dir(None, &overridden.to_string_lossy(), "", false),
+            Some(overridden.clone())
+        );
         assert!(
-            !got.exists() || !PathBuf::from("/somewhere/banks").exists(),
-            "resolving must never create a banks directory"
+            !anchored.exists() && !overridden.exists(),
+            "resolving must never create a banks directory ({} / {})",
+            anchored.display(),
+            overridden.display()
         );
     }
 
@@ -647,11 +664,23 @@ mod tests {
             teams.parent(),
             "the profiles dir must live beside teams.yaml"
         );
-        assert!(!got.exists(), "resolving must not create {}", got.display());
         // --db override wins, and the same off/in-memory/no-config rules apply.
         assert_eq!(
             resolve_profiles_dir(None, "/tmp/somewhere/store.db", false).expect("--db → Some"),
             PathBuf::from("/tmp/somewhere/teams/profiles")
+        );
+        // Resolving must not create the directory — asserted on a store inside this test's own
+        // TempDir, never on `got` (the real `~/.rhapsody/teams/profiles`). Stat-ing the real home is
+        // what broke the sibling reconcile test, and this one fails the same way the first time an
+        // operator runs `rhapsodyd teams fork`, which is the one thing that creates it (STUDIO-688).
+        let anchored =
+            resolve_profiles_dir(None, &dir.child("rhapsody.db").to_string_lossy(), false)
+                .expect("temp-dir --db → Some");
+        assert_eq!(anchored, dir.child("teams").join("profiles"));
+        assert!(
+            !anchored.exists(),
+            "resolving must not create {}",
+            anchored.display()
         );
         assert_eq!(resolve_profiles_dir(Some(&cfg), "", true), None); // --no-store
         assert_eq!(resolve_profiles_dir(None, "off", false), None);
