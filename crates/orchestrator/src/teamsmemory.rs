@@ -10,6 +10,7 @@
 //! * `teams_retain` — write a host-stamped record for the calling run.
 //! * `teams_recall` — read an identity's bank.
 //! * `teams_invalidate` — mark one record non-valid, with the reason.
+//! * `teams_reinstate` — put one invalidated record back (STUDIO-689).
 //! * `teams_roster` — who exists, and what each of them is doing right now.
 //! * `teams_post` — append a host-stamped message to the room (STUDIO-653, T6).
 //!
@@ -49,7 +50,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, Record};
+use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, RecallState, Record};
 use rhapsody_config::room::{
     AUDIENCE_ROOM, Cursor, Message, OPERATOR_IDENTITY, RoomError, RoomLog,
 };
@@ -126,6 +127,11 @@ pub struct TeamsView {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RecallView {
     pub identity: String,
+    /// Which states this answer was allowed to contain: `valid` (the default and
+    /// what an agent asks for), `invalidated`, or `all` (STUDIO-689). Echoed
+    /// back so a reader can tell "this bank holds no corrections" from "you did
+    /// not ask for them".
+    pub state: String,
     pub facts: Vec<Fact>,
     /// Record files that could not be read — reported rather than hidden, so
     /// "skipped loudly" is true of the API as well as of the log.
@@ -194,6 +200,20 @@ pub struct InvalidateView {
     /// `false` ⇒ the record was already invalidated (a no-op, not a failure).
     pub invalidated: bool,
     pub reason: String,
+}
+
+/// `POST /api/v1/teams/reinstate` (STUDIO-689) — the mirror of
+/// [`InvalidateView`], one field shorter.
+///
+/// There is no `reason` because a reinstate clears the stored one: the record
+/// goes back to being indistinguishable from one that was never corrected, which
+/// is what makes §5.3's "nothing is deleted" worth anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReinstateView {
+    pub identity: String,
+    pub fact_id: String,
+    /// `false` ⇒ the record was already valid (a no-op, not a failure).
+    pub reinstated: bool,
 }
 
 /// Why a Teams memory request could not be served. The HTTP layer maps each
@@ -555,10 +575,16 @@ impl TeamsMemory {
 
     /// Recalls an identity's memory for a free-text `query` (§6.7's
     /// `teams_recall {identity, query}` — the memory-first path, no live turn).
+    ///
+    /// `state` is the wire spelling of [`RecallState`] — empty or `valid` for
+    /// what an agent may see, `invalidated` for the corrections alone, `all` for
+    /// the bank as it is on disk (STUDIO-689). Every caller that predates the
+    /// parameter passes `""` and keeps the old answer exactly.
     pub async fn recall(
         &self,
         identity: &str,
         query: &str,
+        state: &str,
     ) -> Result<RecallView, TeamsMemoryError> {
         if !self.enabled() {
             return Err(TeamsMemoryError::Disabled);
@@ -569,6 +595,13 @@ impl TeamsMemory {
                 "identity is required".to_string(),
             ));
         }
+        // Loud rather than lenient: a mistyped filter served with the valid
+        // records reads as a bank nobody has ever corrected.
+        let Some(state) = RecallState::parse(state) else {
+            return Err(TeamsMemoryError::Invalid(format!(
+                "state {state:?} is not one of valid, invalidated, all"
+            )));
+        };
         // The query is offered BOTH ways, and it has to be.
         //
         // As a title it contributes its 4+-character tokens, which is what a
@@ -592,6 +625,7 @@ impl TeamsMemory {
             // can notice a wrong fact and invalidate it (§5.2.3, STUDIO-652). Still bounded by
             // `recall_top_k`: browse widens what matches, never how much comes back.
             browse: query.trim().is_empty(),
+            state,
         };
         let recalled = self.backend.recall(identity, &q).await?;
         for (file, why) in &recalled.skipped {
@@ -604,6 +638,7 @@ impl TeamsMemory {
         }
         Ok(RecallView {
             identity: identity.to_string(),
+            state: state.as_str().to_string(),
             facts: recalled.facts,
             skipped: recalled.skipped.into_iter().map(|(f, _)| f).collect(),
         })
@@ -637,6 +672,37 @@ impl TeamsMemory {
             fact_id: fact_id.to_string(),
             invalidated,
             reason: reason.to_string(),
+        })
+    }
+
+    /// Puts one invalidated record back into recall (STUDIO-689) — §5.3's
+    /// reversal, reachable from the same surface the invalidate was made on.
+    ///
+    /// There is no `reason` argument, deliberately: a reinstate *drops* the
+    /// stored reason with the correction it explained, so the record is again
+    /// indistinguishable from one that was never invalidated. That asymmetry
+    /// with [`invalidate`](TeamsMemory::invalidate) is the point — a correction
+    /// has to be justified, undoing one restores the original and justifies
+    /// nothing new.
+    pub async fn reinstate(
+        &self,
+        identity: &str,
+        fact_id: &str,
+    ) -> Result<ReinstateView, TeamsMemoryError> {
+        if !self.enabled() {
+            return Err(TeamsMemoryError::Disabled);
+        }
+        let (identity, fact_id) = (identity.trim(), fact_id.trim());
+        if identity.is_empty() || fact_id.is_empty() {
+            return Err(TeamsMemoryError::Invalid(
+                "identity and fact_id are required".to_string(),
+            ));
+        }
+        let reinstated = self.backend.revalidate(identity, fact_id).await?;
+        Ok(ReinstateView {
+            identity: identity.to_string(),
+            fact_id: fact_id.to_string(),
+            reinstated,
         })
     }
 
@@ -860,14 +926,14 @@ mod tests {
             mem.retain_for_run(7, content, now()).await.expect("retain");
         }
 
-        let browsed = mem.recall("alice", "   ").await.expect("recall");
+        let browsed = mem.recall("alice", "   ", "").await.expect("recall");
         assert_eq!(
             browsed.facts.len(),
             2,
             "an empty query lists everything the bank holds: {browsed:?}"
         );
 
-        let searched = mem.recall("alice", "goldens").await.expect("recall");
+        let searched = mem.recall("alice", "goldens", "").await.expect("recall");
         assert_eq!(searched.facts.len(), 1, "a real query still searches");
         assert_eq!(searched.facts[0].content, "goldens are recaptured only");
     }
@@ -892,11 +958,11 @@ mod tests {
         assert_eq!(view.document_id, "run-7", "§5.1's document_id shape");
 
         // And it really landed in bob's bank, not alice's.
-        let got = mem.recall("bob", "mirror lock").await.expect("recall");
+        let got = mem.recall("bob", "mirror lock", "").await.expect("recall");
         assert_eq!(got.facts.len(), 1);
         assert_eq!(got.facts[0].content, "the mirror lock is per-repo");
         assert!(
-            mem.recall("alice", "mirror lock")
+            mem.recall("alice", "mirror lock", "")
                 .await
                 .expect("recall")
                 .facts
@@ -994,7 +1060,7 @@ mod tests {
         assert!(view.invalidated);
         assert_eq!(view.reason, "the follow-up shipped in MT-2");
         assert!(
-            mem.recall("alice", "follow-up")
+            mem.recall("alice", "follow-up", "")
                 .await
                 .expect("recall")
                 .facts
@@ -1008,6 +1074,108 @@ mod tests {
             .await
             .expect("invalidate");
         assert!(!again.invalidated);
+    }
+
+    /// STUDIO-689: the correction is undoable through the daemon, not only in
+    /// the file format — and the record that comes back is the original, with
+    /// the reason it was invalidated for dropped.
+    #[tokio::test]
+    async fn reinstate_puts_an_invalidated_fact_back_into_recall() {
+        let dir = TempDir::new();
+        let mem = local(&dir, teams_on(vec![ident("alice")]));
+        mem.bind_run(7, bound("alice", "MT-1"));
+        let id = mem
+            .retain_for_run(7, "MT-1 needs a follow-up", now())
+            .await
+            .expect("retain")
+            .id;
+        mem.invalidate("alice", &id, "the follow-up shipped in MT-2")
+            .await
+            .expect("invalidate");
+
+        let view = mem.reinstate("alice", &id).await.expect("reinstate");
+        assert!(view.reinstated);
+        assert_eq!(view.fact_id, id);
+        let back = mem.recall("alice", "follow-up", "").await.expect("recall");
+        assert_eq!(back.facts.len(), 1, "the fact is recalled again");
+        assert_eq!(
+            back.facts[0].reason, "",
+            "the reason goes with the correction it explained"
+        );
+
+        // Twice is a no-op, not a failure — the mirror of invalidate's.
+        let again = mem.reinstate("alice", &id).await.expect("reinstate");
+        assert!(!again.reinstated);
+
+        assert!(matches!(
+            mem.reinstate("alice", "   ").await,
+            Err(TeamsMemoryError::Invalid(_))
+        ));
+        assert!(matches!(
+            mem.reinstate("alice", "20260101T000000Z-run-9").await,
+            Err(TeamsMemoryError::NotFound(_))
+        ));
+    }
+
+    /// STUDIO-689: an invalidated record is listable on request, so the
+    /// operator UI can show a correction made in an earlier session — while the
+    /// DEFAULT stays valid-only, which is the state an agent may see.
+    #[tokio::test]
+    async fn recall_serves_invalidated_records_only_when_the_state_asks() {
+        let dir = TempDir::new();
+        let mem = local(&dir, teams_on(vec![ident("alice")]));
+        mem.bind_run(7, bound("alice", "MT-1"));
+        let kept = mem
+            .retain_for_run(7, "the mirror lock is per repo", now())
+            .await
+            .expect("retain")
+            .id;
+        let dropped = mem
+            .retain_for_run(7, "the mirror lock is global", now())
+            .await
+            .expect("retain")
+            .id;
+        mem.invalidate("alice", &dropped, "MT-2 measured it per repo")
+            .await
+            .expect("invalidate");
+
+        let ids = |view: &RecallView| {
+            let mut out: Vec<String> = view.facts.iter().map(|f| f.id.clone()).collect();
+            out.sort();
+            out
+        };
+
+        let default = mem.recall("alice", "", "").await.expect("recall");
+        assert_eq!(default.state, "valid");
+        assert_eq!(
+            ids(&default),
+            vec![kept.clone()],
+            "the default is unchanged"
+        );
+
+        let corrections = mem
+            .recall("alice", "", "invalidated")
+            .await
+            .expect("recall");
+        assert_eq!(corrections.state, "invalidated");
+        assert_eq!(ids(&corrections), vec![dropped.clone()]);
+        assert_eq!(
+            corrections.facts[0].reason, "MT-2 measured it per repo",
+            "the reason travels with the listed record"
+        );
+
+        let all = mem.recall("alice", "", "all").await.expect("recall");
+        assert_eq!(all.state, "all");
+        let mut want = vec![kept, dropped];
+        want.sort();
+        assert_eq!(ids(&all), want);
+
+        // Loud, not lenient: a mistyped filter answered with the valid records
+        // would read as a bank nobody has ever corrected.
+        assert!(matches!(
+            mem.recall("alice", "", "Invalidated").await,
+            Err(TeamsMemoryError::Invalid(_))
+        ));
     }
 
     /// **Querying by ticket identifier must work** — it is the most obvious use
@@ -1028,7 +1196,7 @@ mod tests {
             .expect("retain");
 
         for query in ["MT-9", "mt-9", "MT-9 mirror lock"] {
-            let got = mem.recall("alice", query).await.expect("recall");
+            let got = mem.recall("alice", query, "").await.expect("recall");
             assert_eq!(
                 got.facts.len(),
                 1,
@@ -1038,7 +1206,7 @@ mod tests {
         // A short query that names nothing still matches nothing — offering the
         // query as a ticket must not turn recall into "return everything".
         assert!(
-            mem.recall("alice", "zz-1")
+            mem.recall("alice", "zz-1", "")
                 .await
                 .expect("recall")
                 .facts
@@ -1069,7 +1237,7 @@ mod tests {
         mem.bind_run(7, bound("alice", "MT-1"));
         assert_eq!(mem.roster(), Err(TeamsMemoryError::Disabled));
         assert_eq!(
-            mem.recall("alice", "q").await,
+            mem.recall("alice", "q", "").await,
             Err(TeamsMemoryError::Disabled)
         );
         assert_eq!(
@@ -1100,7 +1268,7 @@ mod tests {
             .await
             .expect("retain");
         assert!(
-            mem.recall("alice", "vanishes")
+            mem.recall("alice", "vanishes", "")
                 .await
                 .expect("recall")
                 .facts
@@ -1233,7 +1401,7 @@ mod tests {
             .expect("retain");
         assert_eq!(view.commit_sha, "");
         assert_eq!(
-            mem.recall("alice", "recorded anyway")
+            mem.recall("alice", "recorded anyway", "")
                 .await
                 .expect("recall")
                 .facts
