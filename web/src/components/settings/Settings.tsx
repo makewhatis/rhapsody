@@ -1,32 +1,8 @@
 import * as React from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Check, SkeletonCard, StatusDot } from "@/components/ui";
-import {
-  LINEAR_IDENTITY_QUERY_KEY,
-  useLinearIdentity,
-  useLinearProjects,
-  useProjectStatuses,
-  useSaveTypedConfig,
-  useTypedConfigQuery,
-} from "@/hooks/useConfig";
-import { appVersion, clearLinearToken, setLinearToken, type VersionDTO } from "@/lib/bindings";
-import type { GlobalConfigDTO, LinearProject, ProjectConfigDTO } from "@/lib/api";
-import { ConfigSaveError } from "@/lib/api";
-import {
-  applyUiAgent,
-  applyUiGlobal,
-  autosaveView,
-  clampProjectCaps,
-  doctorHasWarnings,
-  duplicateSlugs,
-  globalPromoteValid,
-  newProjectConfig,
-  reviewPromoteValid,
-  toUiAgents,
-  toUiGlobal,
-  type UiAgent,
-  type UiGlobal,
-} from "@/lib/settings-model";
+import { useConfigDraft } from "@/hooks/useConfigDraft";
+import { appVersion, type VersionDTO } from "@/lib/bindings";
+import { autosaveView, doctorHasWarnings } from "@/lib/settings-model";
 import { useToolDoctor } from "@/hooks/useToolDoctor";
 import { handleTablistKeyDown } from "@/components/shell/tabs";
 import {
@@ -43,10 +19,6 @@ import { TeamsTab } from "./TeamsTab";
 import { ToolsTab } from "./ToolsTab";
 import { LogsTab } from "./LogsTab";
 import { UpdatesTab } from "./UpdatesTab";
-
-// Autosave debounce: coalesce rapid edits (stepper clicks, typing) into one POST after the user
-// pauses. The Save button is retired (mock 2a/2b) — edits persist on their own.
-const AUTOSAVE_DEBOUNCE_MS = 600;
 
 // The Settings rail is text-only (mock 2a–2d): no leading icons. "Projects" carries a live count
 // badge; "Tools" carries an amber warning-dot slot lit by the doctor (wired in D6).
@@ -205,8 +177,6 @@ function AutosaveIndicator({ dirty, saving, blocked, error }: {
   );
 }
 
-type Draft = { global: GlobalConfigDTO; projects: ProjectConfigDTO[] };
-
 export interface SettingsProps {
   tab: SettingsTabId;
   onTab: (tab: SettingsTabId) => void;
@@ -223,12 +193,10 @@ export interface SettingsProps {
 // editor, the list enable/pause toggle, remove, and Add-agent — is a draft edit AUTOSAVED after a
 // short debounce (the Save button is retired); the header shows "Saving…" → "✓ All changes saved".
 export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
-  const cfg = useTypedConfigQuery();
-  const identity = useLinearIdentity();
-  const linearProjects = useLinearProjects();
-  const statuses = useProjectStatuses();
-  const save = useSaveTypedConfig();
-  const qc = useQueryClient();
+  // The working config draft + its debounced autosave (STUDIO-690 lifted them into a hook so the
+  // console's Workflow editor renders the SAME model — see hooks/useConfigDraft.ts).
+  const cfg = useConfigDraft();
+  const [sheetOpen, setSheetOpen] = React.useState(false);
   // The preflight/doctor probe, shared with the Tools tab via TanStack's cache (same query key). It
   // mounts here so the probe runs as soon as Settings opens ("re-checked on launch"), lighting the
   // rail's Tools amber dot even before the Tools tab is visited. The Tools tab's "Re-run preflight"
@@ -236,175 +204,13 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
   const doctor = useToolDoctor();
   const toolsWarn = doctorHasWarnings(doctor.data ?? []);
 
-  const [draft, setDraft] = React.useState<Draft | null>(null);
-  const [dirty, setDirty] = React.useState(false);
-  const [token, setToken] = React.useState("");
-  const [error, setError] = React.useState<string | null>(null);
-  const [sheetOpen, setSheetOpen] = React.useState(false);
-  const [flushing, setFlushing] = React.useState(false);
-  // The originally-loaded global, so a persist-artifacts off→on toggle can restore the real path.
-  const baseGlobal = React.useRef<GlobalConfigDTO | null>(null);
-  // Monotonic counter bumped synchronously on every draft/token edit. A save captures it at start
-  // and only marks the form clean if it's unchanged when the POST resolves — so an edit racing the
-  // in-flight save is never silently discarded (a render-updated ref would be subject to paint
-  // timing and could miss the race).
-  const editSeq = React.useRef(0);
-
-  // Re-sync the draft from the server whenever a fresh config arrives and there are no local edits
-  // in flight (so a background refetch / post-save echo never clobbers an in-progress edit).
-  React.useEffect(() => {
-    if (cfg.data?.global && !dirty) {
-      // Only remember a baseline with a REAL storage path, so a persist-artifacts off→on toggle can
-      // restore the on-disk database path even after a save that wrote "off" (see applyUiGlobal).
-      if (cfg.data.global.storage.path !== "off") baseGlobal.current = cfg.data.global;
-      setDraft({
-        global: structuredClone(cfg.data.global),
-        projects: structuredClone(cfg.data.projects ?? []),
-      });
-    }
-  }, [cfg.data, dirty]);
-
-  const onGlobalChange = (ui: UiGlobal) => {
-    editSeq.current++;
-    setDraft((d) => (d ? { ...d, global: applyUiGlobal(d.global, ui, baseGlobal.current ?? undefined) } : d));
-    setError(null);
-    setDirty(true);
-  };
-
-  const onTokenChange = (t: string) => {
-    editSeq.current++;
-    setToken(t);
-    setError(null);
-    setDirty(true);
-  };
-
-  // onAgentChange folds a detail-editor edit into the draft. review_promote_state is global in the
-  // daemon, so an agent's promote selection is written onto the global (validated per-agent in the
-  // editor); the rest of the edit lands on that agent's project entry.
-  const onAgentChange = (index: number, ui: UiAgent) => {
-    editSeq.current++;
-    setDraft((d) => {
-      if (!d) return d;
-      const projects = d.projects.slice();
-      projects[index] = applyUiAgent(d.projects[index], ui, d.global);
-      const global =
-        ui.reviewPromote !== d.global.review_promote_state
-          ? { ...d.global, review_promote_state: ui.reviewPromote }
-          : d.global;
-      return { global, projects };
-    });
-    setError(null);
-    setDirty(true);
-  };
-
-  // flushPendingToken writes a pasted Linear token to the macOS keychain (Go binding). Returns true
-  // when a token was flushed (so the caller refreshes the connected-as identity). The raw token
-  // never enters the config payload.
-  const flushPendingToken = async (): Promise<boolean> => {
-    const pending = token.trim();
-    if (pending === "") return false;
-    setFlushing(true);
-    try {
-      await setLinearToken(pending);
-    } finally {
-      setFlushing(false);
-    }
-    return true;
-  };
-
-  // persist flushes any pending token, POSTs `snapshot`, and — only if no edit raced the in-flight
-  // save (the edit sequence captured at `seqAtStart` is unchanged) — marks the form clean. Staying
-  // dirty on a race keeps the resync effect (gated on !dirty) from clobbering the newer edit and
-  // re-arms the autosave for the racing edit.
-  const persist = (snapshot: Draft, seqAtStart: number): Promise<void> =>
-    (async () => {
-      const flushed = await flushPendingToken();
-      // Clamp per-agent caps to the (possibly just-lowered) global max before POST.
-      const projects = clampProjectCaps(snapshot.projects, snapshot.global.agent.max_concurrent_agents);
-      await save.mutateAsync({ global: snapshot.global, projects });
-      if (flushed) void qc.invalidateQueries({ queryKey: LINEAR_IDENTITY_QUERY_KEY });
-      if (editSeq.current === seqAtStart) {
-        setDirty(false);
-        setToken("");
-      }
-    })();
-
-  // The list enable/pause toggle and remove are plain draft edits: they mark the form dirty and the
-  // autosave persists them with the rest of the config (one atomic POST).
-  const onToggleAgent = (index: number, enabled: boolean) => {
-    editSeq.current++;
-    setDraft((d) => (d ? { ...d, projects: d.projects.map((p, i) => (i === index ? { ...p, enabled } : p)) } : d));
-    setError(null);
-    setDirty(true);
-  };
-
-  const onRemoveAgent = (index: number) => {
-    editSeq.current++;
-    setDraft((d) => (d ? { ...d, projects: d.projects.filter((_, i) => i !== index) } : d));
-    setError(null);
-    setDirty(true);
-  };
-
-  // Creating an agent appends it to the draft as a dirty edit and closes the sheet; the autosave
-  // persists it with the rest of the config. On a save failure the new agent stays in the draft as a
-  // pending edit (surfaced via the error indicator) rather than being lost.
-  const onCreate = (project: LinearProject, repo: string) => {
-    if (!draft) return;
-    editSeq.current++;
-    setDraft({ global: draft.global, projects: [...draft.projects, newProjectConfig(project, repo)] });
-    setDirty(true);
+  // Creating an agent closes the sheet; the draft edit itself is the hook's.
+  const onCreate = (project: Parameters<typeof cfg.onCreateAgent>[0], repo: string) => {
+    cfg.onCreateAgent(project, repo);
     setSheetOpen(false);
-    setError(null);
-  };
-
-  const onDisconnect = () => {
-    void clearLinearToken()
-      .then(() => qc.invalidateQueries({ queryKey: LINEAR_IDENTITY_QUERY_KEY }))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : "Disconnect failed"));
   };
 
   const meta = TAB_META[tab];
-  const uiGlobal = draft ? toUiGlobal(draft.global) : null;
-  const agents =
-    draft ? toUiAgents(draft.projects, draft.global, linearProjects.data ?? [], statuses.data ?? []) : [];
-  const projectCount = draft?.projects.length ?? cfg.data?.projects?.length ?? 0;
-  // Block autosave when the review-promote state would fail the daemon's validation — at the global
-  // scope (global review on → promote ∈ global active states) and/or any agent's per-project scope.
-  // The daemon would reject such a POST; the detail editor flags an offending agent inline.
-  const promoteGlobalInvalid = draft ? !globalPromoteValid(draft.global) : false;
-  const promoteAgentInvalid = agents.some((a) => !reviewPromoteValid(a));
-  // Each agent must watch a unique Linear project; the daemon rejects duplicate slugs.
-  const slugConflict = draft ? duplicateSlugs(draft.projects) : false;
-  const saveBlocked = promoteGlobalInvalid || promoteAgentInvalid || slugConflict;
-  // Scope-specific message so a global-scope failure doesn't point the user at the per-agent editors.
-  const blockMessage = slugConflict
-    ? "Each agent must watch a unique Linear project."
-    : promoteGlobalInvalid
-      ? "Review-promote state must be one of the global active states."
-      : promoteAgentInvalid
-        ? "Review-promote state must be one of each agent's active states."
-        : null;
-
-  const saving = save.isPending || flushing;
-
-  // Autosave: debounce edits, then persist — but never while blocked by validation (the daemon would
-  // reject the POST) or while a save/token-flush is already in flight. The effect re-runs on every
-  // edit (draft/token change), so the timer always fires with the latest snapshot.
-  React.useEffect(() => {
-    if (!draft || !dirty || saveBlocked || saving) return;
-    const seq = editSeq.current;
-    const snapshot = draft;
-    const timer = setTimeout(() => {
-      setError(null);
-      void persist(snapshot, seq).catch((e: unknown) => {
-        setError(e instanceof ConfigSaveError || e instanceof Error ? e.message : "Save failed");
-      });
-    }, AUTOSAVE_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-    // Deps intentionally cover the edit signals (draft/token/dirty) + the save gates
-    // (saveBlocked/saving); `persist` is a fresh per-render closure captured at fire time, so it is
-    // deliberately not a dependency (adding it would re-arm the timer every render).
-  }, [draft, token, dirty, saveBlocked, saving]);
 
   // Tools, Logs, and Updates are read-only, config-independent panels: they don't read the config
   // draft, so they render before the config load/skeleton guards (and hide the autosave indicator).
@@ -421,9 +227,9 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
     body = <LogsTab />;
   } else if (tab === "updates") {
     body = <UpdatesTab updater={updater} />;
-  } else if (cfg.isError || (cfg.data && !cfg.data.global)) {
+  } else if (cfg.unavailable) {
     body = <ComingSoonPanel note="Couldn't load the daemon configuration. Is the daemon running?" />;
-  } else if (!draft || !uiGlobal) {
+  } else if (!cfg.draft || !cfg.uiGlobal) {
     body = (
       <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
         <SkeletonCard />
@@ -433,25 +239,25 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
   } else if (tab === "general") {
     body = (
       <GeneralTab
-        value={uiGlobal}
-        onChange={onGlobalChange}
-        account={identity.data ?? null}
-        token={token}
-        onTokenChange={onTokenChange}
-        onDisconnect={onDisconnect}
+        value={cfg.uiGlobal}
+        onChange={cfg.onGlobalChange}
+        account={cfg.account}
+        token={cfg.token}
+        onTokenChange={cfg.onTokenChange}
+        onDisconnect={cfg.onDisconnect}
       />
     );
   } else {
     body = (
       <ProjectsTab
-        agents={agents}
-        global={uiGlobal}
-        linearProjects={linearProjects.data ?? []}
+        agents={cfg.agents}
+        global={cfg.uiGlobal}
+        linearProjects={cfg.linearProjects}
         mode="quiet"
         listStyle="rows"
-        onToggle={onToggleAgent}
-        onAgentChange={onAgentChange}
-        onRemove={onRemoveAgent}
+        onToggle={cfg.onToggleAgent}
+        onAgentChange={cfg.onAgentChange}
+        onRemove={cfg.onRemoveAgent}
         openSheet={() => setSheetOpen(true)}
       />
     );
@@ -527,7 +333,7 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
                 label={s.label}
                 active={tab === s.id}
                 onClick={() => onTab(s.id)}
-                badge={s.id === "projects" ? projectCount : undefined}
+                badge={s.id === "projects" ? cfg.projectCount : undefined}
                 // The Tools warning dot lights whenever the preflight/doctor probe reports a warning
                 // (a required CLI missing from PATH or unhealthy) — derived from the shared doctor query.
                 warn={s.id === "tools" ? toolsWarn : undefined}
@@ -553,21 +359,26 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
               </p>
             </div>
             {!readOnlyTab ? (
-              <AutosaveIndicator dirty={dirty} saving={saving} blocked={blockMessage} error={error} />
+              <AutosaveIndicator
+                dirty={cfg.dirty}
+                saving={cfg.saving}
+                blocked={cfg.blocked}
+                error={cfg.error}
+              />
             ) : null}
           </div>
           {body}
         </div>
       </div>
-      {draft && uiGlobal ? (
+      {cfg.draft && cfg.uiGlobal ? (
         <AddAgentSheet
           open={sheetOpen}
           onClose={() => setSheetOpen(false)}
           onCreate={onCreate}
-          projects={linearProjects.data ?? []}
-          usedSlugs={draft.projects.flatMap((p) => p.slugs)}
-          blockedReason={saveBlocked ? blockMessage : null}
-          global={uiGlobal}
+          projects={cfg.linearProjects}
+          usedSlugs={cfg.draft.projects.flatMap((p) => p.slugs)}
+          blockedReason={cfg.blocked}
+          global={cfg.uiGlobal}
         />
       ) : null}
     </>
