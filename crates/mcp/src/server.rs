@@ -117,7 +117,7 @@ impl Facade {
         // the `mcp:` write gates and the Teams toggle alike — so a gated tool has no alias either
         // and no gate can be walked around by spelling the tool the other way. Only `symphony_*`
         // tools are aliased: `teams_*` is a post-Go name that never carried the old brand, and
-        // aliasing it would break Teams' own "enabling Teams adds exactly four tools" assertion.
+        // aliasing it would break Teams' own "enabling Teams adds exactly these tools" assertion.
         // See [`register_brand_aliases`].
         register_brand_aliases(&mut tool_router);
         Self {

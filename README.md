@@ -267,22 +267,23 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
 | Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/`, no `teams/room/` |
 
-Eight **additive** Rhapsody-only endpoints back the Teams tools and the dashboard; no existing
+Nine **additive** Rhapsody-only endpoints back the Teams tools and the dashboard; no existing
 payload changes shape and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 
 | Endpoint | Serves |
 | --- | --- |
 | `GET /api/v1/teams/roster` | the roster, each identity's profile, and its live runs |
-| `GET /api/v1/teams/recall?identity=&query=` | one identity's retained memory, bounded |
+| `GET /api/v1/teams/recall?identity=&query=&state=` | one identity's retained memory, bounded. `state` is `valid` (the default, and all an agent ever sees), `invalidated` or `all` (STUDIO-689) |
 | `POST /api/v1/teams/invalidate` | mark one record non-valid, with the reason; reversible |
+| `POST /api/v1/teams/reinstate` | undo one invalidation: the record returns to recall and the stored reason is dropped (STUDIO-689) |
 | `POST /api/v1/runs/{id}/retain` | record what a live run learned, provenance stamped by the host |
 | `GET /api/v1/teams/room?limit=` | the newest posts in the team room, bounded; advances no cursor |
 | `POST /api/v1/teams/room` | the OPERATOR's own post to the room, `from` stamped `operator` (STUDIO-661) |
 | `POST /api/v1/runs/{id}/post` | post to the team room as a live run, `from` stamped by the host |
 | `GET /api/v1/teams` | the dashboard's one view: the roster with derived status, the manager mode and the memory backend (STUDIO-652) |
 
-The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_retain`,
-`teams_room_read` and `teams_post`. `teams_retain` takes `content` and nothing else on purpose: the
+The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_reinstate`,
+`teams_retain`, `teams_room_read` and `teams_post`. `teams_retain` takes `content` and nothing else on purpose: the
 identity, ticket, run and commit are resolved by the daemon from the run id it injected into that
 worker, so a run dispatched as one identity cannot write into another's memory bank.
 `teams_room_read` takes only an optional `limit`, which can narrow the window but never widen it,
