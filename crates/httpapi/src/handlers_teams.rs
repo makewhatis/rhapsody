@@ -526,7 +526,7 @@ mod tests {
     use rhapsody_config::room::{
         Cursor, DEFAULT_ROOM_SUBDIR, LocalRoom, MAX_ROOM_WINDOW, Message as RoomMessage, RoomLog,
     };
-    use rhapsody_config::teams::{Identity, Teams};
+    use rhapsody_config::teams::{Identity, Manager, ManagerMode, Teams};
     use rhapsody_orchestrator::teamsmemory::{RunProvenance, TeamsMemory};
     use serde_json::Value;
 
@@ -557,6 +557,14 @@ mod tests {
     fn teams_memory(dir: &TempDir) -> Arc<TeamsMemory> {
         let teams = Teams {
             enabled: true,
+            // Stated rather than inherited: this fixture backs a test that asserts the overview
+            // SERVES the configured manager mode, and a fixture that took the schema default would
+            // make that assertion track whatever the default happens to be (it moved in
+            // STUDIO-678) instead of proving the field is carried.
+            manager: Manager {
+                mode: ManagerMode::Labels,
+                ..Manager::default()
+            },
             roster: vec![Identity {
                 name: "alice".to_string(),
                 profile: "swe".to_string(),

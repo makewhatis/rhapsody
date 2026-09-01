@@ -166,6 +166,28 @@ pub fn resolve_teams_reconcile_path(
     resolve_runtime_home_file(cfg, db_override, no_store, "teams").map(|d| d.join("reconcile.json"))
 }
 
+/// Resolves the MANAGER's room watermark (STUDIO-678, design §0.13:
+/// `~/.rhapsody/teams/manager-room.cursor`).
+///
+/// Beside `teams.yaml` and `teams/reconcile.json`, by the rule every other sidecar follows — and NOT
+/// in a memory bank, because the manager is not a roster identity and giving it one would invent an
+/// identity in the memory tree nothing else agrees exists.
+///
+/// `None` (a disabled / in-memory store, or a failed config load) means there is nowhere to keep a
+/// watermark. That disables the room reader rather than running it watermark-less, which would
+/// re-answer the same posts at every restart — the durability IS the "act once", exactly as the
+/// reconcile marker's is.
+///
+/// Naming the file does not create it; the triage task writes it after a pass that acted.
+pub fn resolve_teams_ears_cursor_path(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, "teams")
+        .map(|d| d.join(rhapsody_config::room::MANAGER_CURSOR_FILE))
+}
+
 /// Resolves the Rhapsody Teams memory BANKS directory (STUDIO-645, T4; design record §5.4).
 ///
 /// `memory.path` wins when set — an operator who points memory somewhere else means it. Otherwise

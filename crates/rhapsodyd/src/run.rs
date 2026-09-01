@@ -32,7 +32,7 @@ use rhapsody_tracker as tracker;
 use crate::bootcfg::{
     assignee_label, banner_color_enabled, open_store, resolve_banks_dir, resolve_banner_data,
     resolve_capabilities_path, resolve_profiles_dir, resolve_room_dir, resolve_server_port,
-    resolve_teams_path, resolve_teams_reconcile_path, workflow_dir,
+    resolve_teams_ears_cursor_path, resolve_teams_path, resolve_teams_reconcile_path, workflow_dir,
 };
 use crate::logsource::LogBufferSource;
 use crate::otel::resolve_otel_config;
@@ -154,6 +154,10 @@ where
     // `memory.backend: hindsight` with a usable endpoint. Carried out of the Teams block so the
     // task can be spawned beside triage and the quorum, where every other Teams task lives.
     let mut teams_prefetch: Option<PrefetchWiring> = None;
+    // **THE** room handle for this process (STUDIO-678, §0.13). Built once, here, and handed to
+    // every appender: the dispatch-path catch-up, the HTTP post surface, triage, the quorum and the
+    // manager's replies. See the sharing note where the off-loop tasks take their clones.
+    let mut teams_room: Option<Arc<rhapsody_config::room::LocalRoom>> = None;
     if let Some(teams_path) = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store) {
         teams_cfg = match rhapsody_config::teams::Teams::try_load(&teams_path) {
             Ok(t) => t,
@@ -192,7 +196,10 @@ where
         // dispatch path reads non-blockingly, and the remote client that fills it lives on the
         // off-loop prefetch task spawned below. `teams_bank` stays `None` for hindsight, so the
         // control task still cannot reach a network backend by any path.
-        teams_prefetch = install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags);
+        teams_room = resolve_room_dir(resolved.as_ref(), &flags.db, flags.no_store)
+            .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
+        teams_prefetch =
+            install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags, &teams_room);
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
     // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
@@ -345,16 +352,26 @@ where
     // disabled spawn NOTHING, so those configurations have no task that could have a behaviour delta.
     // `install_probe` additionally holds it back in the hermetic daemon tests, which must never shell
     // out to a real `claude` — the same reason it gates the BO-59 credential probe above.
-    // One room handle, shared by both off-loop Teams tasks (triage's decisions, STUDIO-650; the
-    // quorum's fan-out post, STUDIO-659). `LocalRoom` is a path plus a lock, so cloning the `Arc`
-    // is what keeps the room's single-writer discipline across the two tasks.
-    let teams_room = resolve_room_dir(resolved.as_ref(), &flags.db, flags.no_store)
-        .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
+    // **ONE room handle for every appender in this process** (STUDIO-678, design §0.13): the
+    // dispatch path's catch-up, the HTTP operator/teammate post surface, triage's decisions, the
+    // quorum's fan-out post, and the manager's replies all share it.
+    //
+    // It is taken from `o.teams_room` — the handle `install_teams_memory` built above — rather than
+    // resolved a second time, and that is now a correctness requirement rather than tidiness.
+    // `LocalRoom`'s append lock is an `Arc` INSIDE the value, so every clone of this one handle
+    // serializes against every other; a second `LocalRoom::new` over the same directory would mint
+    // a second, independent lock and two appends could race to mint the same `file:seq` id. §0.13
+    // makes that id load-bearing (the manager's reply carries the operator post's id as its dedupe
+    // record), so a collision would let one reply stand in for a post it never answered.
+    //
+    // `None` — no on-disk runtime home, or Teams off — leaves every Teams task room-less, which is
+    // the pre-T5 behaviour: the work still happens and only the history is lost.
     let triage_room = teams_room.clone();
     let quorum_room = teams_room;
     let triage_task = if let Some(seam) = triage_seam {
         let triage_ctx = shutdown.wait();
         let triage_handle = handle.clone();
+        let ears_handle = handle.clone();
         let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
         let deps = rhapsody_orchestrator::TriageDeps {
             teams: Arc::new(teams_cfg.clone()),
@@ -423,6 +440,43 @@ where
                 resolved.as_ref(),
                 &flags.db,
                 flags.no_store,
+            ),
+            // --- the manager's room reader (STUDIO-678; design record §0.13) ---
+            //
+            // The half of this task that answers the operator instead of assigning tickets. It is
+            // armed ONLY when there is a watermark file to keep, and that is a safety property
+            // rather than tidiness: a reader that cannot remember where it got to would re-answer
+            // every post in its window at each restart, which turns "act once" into "act per boot".
+            // `resolve_teams_ears_cursor_path` is `None` for exactly the daemons that have no
+            // durable home, which are the same ones that have no room to read.
+            //
+            // The GitHub seams are handed to the TASK and to nothing the control loop can reach —
+            // the quorum's rule and its reason. One `GH` serves both directions: PR URL → ticket
+            // (`PrBranchSource`, so a pasted URL can be validated against the team's projects) and
+            // ticket → open PR (`OpenPrSource`, STUDIO-674's fallback for the installations whose
+            // Linear carries no attachments).
+            ears: resolve_teams_ears_cursor_path(resolved.as_ref(), &flags.db, flags.no_store).map(
+                |cursor| {
+                    let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+                        &resolved
+                            .as_ref()
+                            .map(|c| c.tracker.summon_token.clone())
+                            .unwrap_or_default(),
+                        None,
+                    ));
+                    Arc::new(
+                        rhapsody_orchestrator::teamsears::Ears::new(
+                            cursor,
+                            Arc::new(rhapsody_orchestrator::ClaudeTriageArbiter),
+                        )
+                        .with_github(Arc::clone(&gh) as _, gh as _)
+                        // The live-run mailbox (§6.2). Through the `ControlHandle` seam, so the
+                        // admission itself stays loop-confined and this task holds no orchestrator.
+                        .with_relay(Arc::new(
+                            rhapsody_orchestrator::teamsears::ControlRelay::new(ears_handle),
+                        )),
+                    )
+                },
             ),
         };
         Some(tokio::spawn(async move {
@@ -819,6 +873,7 @@ fn install_teams_memory(
     teams_cfg: &rhapsody_config::teams::Teams,
     resolved: Option<&rhapsody_config::Config>,
     flags: &Flags,
+    room: &Option<Arc<rhapsody_config::room::LocalRoom>>,
 ) -> Option<PrefetchWiring> {
     use rhapsody_config::hindsight::HindsightBackend;
     use rhapsody_config::memory::{LocalBank, MemoryBackend, NoneBackend};
@@ -918,8 +973,11 @@ fn install_teams_memory(
     // The room (STUDIO-650, T5). Independent of `memory.backend`: a roster running with
     // `backend: none` still has a room, because the room is the team's shared log rather than any
     // one identity's memory. Only the absence of an on-disk runtime home turns it off.
-    let room = resolve_room_dir(resolved, &flags.db, flags.no_store)
-        .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
+    //
+    // **Passed in rather than resolved here** (STUDIO-678, §0.13): every appender in the process
+    // must share ONE handle, because `LocalRoom`'s append lock lives inside the value and a second
+    // handle over the same directory would mint a second, independent lock — letting two appends
+    // race to mint the same `file:seq` id, which the manager's reply dedupe now depends on.
     // A backstop rather than a live branch: this function is only reached from inside
     // `resolve_teams_path(..).is_some()`, which already required the same runtime home, so today
     // `room` is always `Some` here. It stays because the two resolutions are independent and a
@@ -962,7 +1020,7 @@ fn install_teams_memory(
     let mut mem =
         rhapsody_orchestrator::teamsmemory::TeamsMemory::new(Arc::new(teams_cfg.clone()), backend);
     if let Some(room) = room {
-        mem = mem.with_room(room as Arc<dyn rhapsody_config::room::RoomLog>);
+        mem = mem.with_room(Arc::clone(room) as Arc<dyn rhapsody_config::room::RoomLog>);
     }
     o.teams_memory = Some(Arc::new(mem));
     wiring
@@ -1414,7 +1472,14 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(rec.clone());
         let mut o = rhapsody_orchestrator::Orchestrator::new(String::new());
         let wiring = tracing::subscriber::with_default(subscriber, || {
-            install_teams_memory(&mut o, &teams, cfg.as_ref(), &flags)
+            install_teams_memory(
+                &mut o,
+                &teams,
+                cfg.as_ref(),
+                &flags,
+                &resolve_room_dir(cfg.as_ref(), &flags.db, flags.no_store)
+                    .map(|d| Arc::new(rhapsody_config::room::LocalRoom::new(d))),
+            )
         });
 
         assert!(
@@ -1466,7 +1531,14 @@ mod tests {
         // (dispatch-path local bank, off-loop runtime, dispatch-path prefetch cache).
         let install = |teams: &Teams| {
             let mut o = rhapsody_orchestrator::Orchestrator::new(String::new());
-            let wiring = install_teams_memory(&mut o, teams, cfg.as_ref(), &flags);
+            let wiring = install_teams_memory(
+                &mut o,
+                teams,
+                cfg.as_ref(),
+                &flags,
+                &resolve_room_dir(cfg.as_ref(), &flags.db, flags.no_store)
+                    .map(|d| Arc::new(rhapsody_config::room::LocalRoom::new(d))),
+            );
             assert_eq!(
                 wiring.is_some(),
                 o.teams_prefetch.is_some(),

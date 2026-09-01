@@ -561,6 +561,16 @@ pub struct TriageDeps<TF> {
     /// `None` disables the reconcile outright rather than running it unrecorded: a sweep that cannot
     /// remember having run is not one-time, it is every-boot.
     pub reconcile_marker: Option<std::path::PathBuf>,
+    /// The manager's ROOM READER (STUDIO-678, §0.13) — the half of this task that answers operator
+    /// posts instead of assigning tickets. `None` leaves the room unread, which is exactly T3b's
+    /// behaviour and is what a daemon with no on-disk runtime home (and therefore no room and no
+    /// watermark to keep) gets.
+    ///
+    /// It lives HERE rather than in a task of its own because it needs precisely what a triage cycle
+    /// has already paid for — the candidate fetch that is its validation set, the load tally, and
+    /// the manager's own model budget — and because §0.13 puts it "off-loop, on the manager's
+    /// budget". A second task would duplicate the fetch and race this one for the same turn budget.
+    pub ears: Option<Arc<crate::teamsears::Ears>>,
 }
 
 /// What one cycle did — the input to the back-off decision, and the assertion surface for the
@@ -1005,6 +1015,52 @@ where
     } else {
         None
     };
+    // §0.13's manager room reader, BEFORE the assignment pass and BEFORE every early return below.
+    //
+    // Before the assignment pass because a post that confirms who takes a ticket writes the same
+    // additive label this cycle would have written a moment later, and doing it first means the
+    // operator's answer is the one that stands. Before the early returns because the headline case —
+    // "someone review STUDIO-654's PR" — names an IN-REVIEW ticket, which is never an assignment
+    // candidate at all: a reader placed after `candidates.is_empty()` would be deaf on exactly the
+    // post this feature exists for.
+    //
+    // Skipped when the fetch failed, for the reconcile's reason: a partial fetch would answer "not
+    // found on any project this team works" about a ticket a healthy fetch would have shown, and
+    // that reply is durable and wrong.
+    if let Some(ears) = deps.ears.as_ref()
+        && let Some(room) = deps.room.as_ref()
+        && !fetch_failed
+    {
+        // The load the reader ranks reviewers by, tallied from the candidate fetch alone. Narrower
+        // than §0.11.1's definition and knowingly so — `record_quorum_state` makes the same trade
+        // for the same reason (§0.12 chose the free in-memory count over a tracker read), and the
+        // direction of the error is benign: under-counting a backlog can only spread reviews wider.
+        let ears_load = tally_load(&deps.teams, &issues);
+        let cycle = crate::teamsears::EarsCycle {
+            trackers: &trackers,
+            owner: &owner,
+            issues: &issues,
+            states: &target.states,
+            facts: &target.facts,
+            summon_token: &target.summon_token,
+            load: &ears_load,
+            model: ask_model && deps.teams.manager.mode == ManagerMode::LabelsModel,
+            agent_command: &deps.agent_command,
+            billing_guard: deps.billing_guard,
+            tracker_api_key: &deps.tracker_api_key,
+        };
+        let heard =
+            crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
+        if !heard.is_quiet() {
+            tracing::info!(
+                answered = heard.answered,
+                filed = heard.filed,
+                assigned = heard.assigned,
+                relayed = heard.relayed,
+                "teams manager answered operator posts in the team room"
+            );
+        }
+    }
     let report = |outcome: CycleOutcome, candidates: usize| CycleReport {
         outcome,
         target: true,
@@ -1774,6 +1830,29 @@ pub struct ClaudeTriageArbiter;
 #[async_trait]
 impl TriageArbiter for ClaudeTriageArbiter {
     async fn arbitrate(&self, req: &TriageRequest) -> Result<TriageDecision, String> {
+        parse_decision(&run_turn(req).await?)
+    }
+}
+
+#[async_trait]
+impl crate::teamsears::RoomArbiter for ClaudeTriageArbiter {
+    /// The manager's ROOM turn (STUDIO-678, §0.13) — the same subprocess, the same env, the same
+    /// budget as the assignment turn, differing only in prompt and answer shape. Sharing
+    /// [`run_turn`] is what keeps "the daemon has exactly one way to ask a model something, and it
+    /// needs no API key of its own" (§0.11.2) a structural fact rather than a convention.
+    async fn resolve(&self, req: &TriageRequest) -> Result<Vec<crate::teamsears::Target>, String> {
+        crate::teamsears::parse_targets(&run_turn(req).await?)
+    }
+}
+
+/// Runs ONE bounded `claude -p <prompt>` turn and hands back its stdout.
+///
+/// The BO-59 credential probe's exact shape — the runner's own scrubbed environment,
+/// `kill_on_drop` so a timeout reaps the child, `--model` before `-p` because a flag trailing the
+/// prompt is at the mercy of positional parsing. Shared by both of this daemon's model turns; the
+/// only thing either adds is how it reads the answer.
+async fn run_turn(req: &TriageRequest) -> Result<String, String> {
+    {
         let (name, base_args) = rhapsody_agent::claude::split_command(&req.command)
             .map_err(|e| format!("invalid claude command {:?}: {e}", req.command))?;
         let env = scrub_child_env(&process_env(), req.billing_guard, &req.tracker_api_key);
@@ -1805,7 +1884,7 @@ impl TriageArbiter for ClaudeTriageArbiter {
         if !out.status.success() {
             return Err(turn_failure_reason(out.status.code(), &out.stderr));
         }
-        parse_decision(&String::from_utf8_lossy(&out.stdout))
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -2089,6 +2168,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         }
     }
 
@@ -2134,6 +2214,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         }
     }
 
@@ -2924,6 +3005,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         };
         assert_eq!(
             triage_cycle(&CancelWait::default(), &d, true).await,
@@ -3522,6 +3604,7 @@ mod tests {
             room: Some(room),
             history: Some(history),
             reconcile_marker: None,
+            ears: None,
         }
     }
 
@@ -4297,6 +4380,7 @@ mod tests {
             room: None,
             history: None,
             reconcile_marker: None,
+            ears: None,
         };
         let signal = crate::control_loop::CancelSignal::new();
         let ctx = signal.wait();

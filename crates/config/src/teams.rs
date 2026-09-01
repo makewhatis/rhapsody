@@ -34,13 +34,32 @@ pub enum ManagerMode {
     #[serde(rename = "off")]
     Off,
     /// Deterministic only: the ticket's `rhapsody:@<name>` label, then
-    /// roster-labels ∩ ticket-labels (§0.11.2 Tier 0 + fallback). The §2.2
-    /// default.
-    #[default]
+    /// roster-labels ∩ ticket-labels (§0.11.2 Tier 0 + fallback).
     #[serde(rename = "labels")]
     Labels,
-    /// Deterministic, plus an off-loop triage model turn for tickets no label
-    /// matched (§0.11.2). The model turn is a FUTURE slice (T3b), not this one.
+    /// Deterministic, plus an off-loop model turn (§0.11.2) — for tickets no
+    /// label matched, and for reading intent out of an operator's room post
+    /// (§0.13).
+    ///
+    /// **The default, changed from `labels` by STUDIO-678.** §2.2 shipped
+    /// `labels` as the cheap, model-free default, and §0.13 makes that choice
+    /// cost something it did not used to: without a model turn the manager can
+    /// still file a review, confirm an assignment and ask a question, but it
+    /// cannot read INTENT out of prose — so David's ruling ("if I post something
+    /// in there, it should be actionable") is only partly met on a fresh
+    /// install. §0.13 asks for the default to move, in as many words, and this
+    /// is where "enabling Teams" is actually decided: a hand-written
+    /// `teams.yaml` with no `manager:` block lands here, and so does the
+    /// dashboard's enable flow, which renders whatever this answers.
+    ///
+    /// It is not a cost surprise. The turn already had a budget it can finish
+    /// inside (STUDIO-673's 60s), it already runs off the control task and can
+    /// never stall dispatch (§0.11.2), and every failure of it already degrades
+    /// to the deterministic answer. An installation that wants the old
+    /// behaviour writes `mode: labels`, which is now a choice rather than a
+    /// silence — and Teams remains off entirely unless `enabled: true`, so
+    /// nothing changes for a daemon that never opted in at all.
+    #[default]
     #[serde(rename = "labels+model")]
     LabelsModel,
 }
@@ -721,6 +740,31 @@ mod tests {
         );
     }
 
+    /// **§0.13's "enabling Teams should default the manager to `labels+model`"**, pinned as a
+    /// property rather than as a constant (STUDIO-678).
+    ///
+    /// The mode matters because `labels` gives the manager no model turn, and without one it cannot
+    /// read intent out of an operator's room post — so a fresh install would meet David's ruling
+    /// only in part. What this asserts is the shape of the failure it prevents: a `teams.yaml` a
+    /// human wrote by hand with nothing but `enabled` and a roster is a config that opted IN to
+    /// Teams and said nothing about the manager, and that config must hear the operator.
+    #[test]
+    fn enabling_teams_defaults_to_the_mode_that_hears_the_operator() {
+        let t = Teams::parse("enabled: true\nroster:\n  - name: alice\n").expect("parse");
+        assert!(t.enabled);
+        assert_eq!(
+            t.manager.mode,
+            ManagerMode::LabelsModel,
+            "a teams.yaml that enables Teams and says nothing about the manager must get the mode \
+             that can act on an operator's room post (§0.13)"
+        );
+        // And saying so explicitly still wins: the default is a default, not a policy.
+        let explicit =
+            Teams::parse("enabled: true\nmanager:\n  mode: labels\nroster:\n  - name: alice\n")
+                .expect("parse");
+        assert_eq!(explicit.manager.mode, ManagerMode::Labels);
+    }
+
     /// The off state is the schema's defaults with the toggle off, and it is
     /// what `Default` yields — so a future consumer that reaches for either
     /// spelling gets the same thing.
@@ -738,7 +782,10 @@ mod tests {
         for text in ["", "   \n", "{}", "---\n"] {
             let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
             assert!(!t.enabled, "enabled defaults false ({text:?})");
-            assert_eq!(t.manager.mode, ManagerMode::Labels, "({text:?})");
+            // `labels+model` since STUDIO-678 — see [`ManagerMode::LabelsModel`] for why the
+            // default moved, and `enabling_teams_defaults_to_the_mode_that_hears_the_operator`
+            // for the property that move exists to hold.
+            assert_eq!(t.manager.mode, ManagerMode::LabelsModel, "({text:?})");
             assert_eq!(t.manager.default_identity, "", "({text:?})");
             assert_eq!(t.manager.model, "", "({text:?})");
             assert_eq!(t.manager.max_tokens, 4000, "({text:?})");
