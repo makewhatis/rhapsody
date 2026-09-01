@@ -516,8 +516,19 @@ mod tests {
         assert_eq!(resolve_teams_reconcile_path(None, "off", false), None);
         assert_eq!(resolve_teams_reconcile_path(None, ":memory:", false), None);
         assert_eq!(resolve_teams_reconcile_path(None, "", false), None); // failed load
+        // Resolving only NAMES a path; it never creates the file. Asserted against a store inside
+        // this test's own TempDir — NEVER `got`, which names the real `~/.rhapsody` (STUDIO-688):
+        // once a live daemon completed its own sweep and wrote that marker, stat-ing it measured the
+        // operator's disk rather than this function, and the assertion failed on every machine
+        // sharing that home, CI runner included. That nothing creates the file is proven at the real
+        // boundary by `run::tests::run_seeds_capabilities_but_never_seeds_teams_yaml`, which boots
+        // the daemon and asserts no `teams/` directory appears beside its store at all.
+        let hermetic =
+            resolve_teams_reconcile_path(None, &dir.child("rhapsody.db").to_string_lossy(), false)
+                .expect("temp-dir --db → Some");
+        assert_eq!(hermetic, dir.child("teams").join("reconcile.json"));
         assert!(
-            !got.exists(),
+            !hermetic.exists(),
             "resolving a path never creates the file; only a completed sweep writes it"
         );
     }
