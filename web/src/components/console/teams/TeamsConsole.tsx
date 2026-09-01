@@ -276,8 +276,13 @@ function MemoryPreview({ identity, onOpenMemory }: { identity: string; onOpenMem
   const facts = React.useMemo(() => {
     const all = [...(recall.data?.facts ?? [])];
     // Recall is bounded by `recall_top_k` and ordered by the bank, not by us: sort before slicing
-    // so "2 recent" is actually the two most recent.
-    all.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+    // so "2 recent" is actually the two most recent. A record the daemon could not stamp cleanly
+    // sorts oldest rather than into an arbitrary slot, the same rule the room's feed uses.
+    const when = (iso: string) => {
+      const ms = Date.parse(iso);
+      return Number.isNaN(ms) ? -Infinity : ms;
+    };
+    all.sort((a, b) => when(b.at) - when(a.at));
     return all.slice(0, MEMORY_PREVIEW);
   }, [recall.data]);
 
