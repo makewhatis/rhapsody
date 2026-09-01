@@ -1,6 +1,7 @@
 import * as React from "react";
 import { ArrowLeft, Check, SkeletonCard, StatusDot } from "@/components/ui";
 import { useConfigDraft } from "@/hooks/useConfigDraft";
+import type { LinearProject } from "@/lib/api";
 import { appVersion, type VersionDTO } from "@/lib/bindings";
 import { autosaveView, doctorHasWarnings } from "@/lib/settings-model";
 import { useToolDoctor } from "@/hooks/useToolDoctor";
@@ -187,11 +188,12 @@ export interface SettingsProps {
 }
 
 // Settings — the Settings surface (mock 2a–2d): a 188px rail (← Jobs, nav, count badge, Tools
-// warning-dot slot, version footer) beside a titled content pane. It owns the working config draft
-// (deep-cloned from the daemon's typed view), the dirty flag, and the pending Linear token (kept out
-// of config — written to the keychain on save). Every edit — General fields, the agent detail
-// editor, the list enable/pause toggle, remove, and Add-agent — is a draft edit AUTOSAVED after a
-// short debounce (the Save button is retired); the header shows "Saving…" → "✓ All changes saved".
+// warning-dot slot, version footer) beside a titled content pane. The working config draft, the
+// dirty flag and the pending Linear token (kept out of config — written to the keychain on save)
+// live in `useConfigDraft`, which the console's Workflow editor renders too. Every edit — General
+// fields, the agent detail editor, the list enable/pause toggle, remove, and Add-agent — is a draft
+// edit AUTOSAVED after a short debounce (the Save button is retired); the header shows "Saving…" →
+// "✓ All changes saved".
 export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
   // The working config draft + its debounced autosave (STUDIO-690 lifted them into a hook so the
   // console's Workflow editor renders the SAME model — see hooks/useConfigDraft.ts).
@@ -205,7 +207,7 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
   const toolsWarn = doctorHasWarnings(doctor.data ?? []);
 
   // Creating an agent closes the sheet; the draft edit itself is the hook's.
-  const onCreate = (project: Parameters<typeof cfg.onCreateAgent>[0], repo: string) => {
+  const onCreate = (project: LinearProject, repo: string) => {
     cfg.onCreateAgent(project, repo);
     setSheetOpen(false);
   };

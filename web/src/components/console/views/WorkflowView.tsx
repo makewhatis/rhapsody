@@ -37,14 +37,16 @@ export function WorkflowView({ onNavigate }: WorkflowViewProps) {
   const [section, setSection] = React.useState<Section>("general");
   const [sheetOpen, setSheetOpen] = React.useState(false);
 
-  // A daemon that cannot serve its own config (unreachable, or a WORKFLOW.md it failed to parse)
-  // gets said out loud. An empty form would invite edits that have nothing to save onto.
+  // A daemon that cannot serve its own config gets said out loud, with BOTH causes named: the
+  // query failed (the daemon is unreachable), or it answered without a typed view (WORKFLOW.md is
+  // on disk but does not parse). An empty form would invite edits that have nothing to save onto.
   if (cfg.unavailable) {
     return (
       <Page onNavigate={onNavigate}>
         <div role="alert">
           <Note variant="warn">
-            Could not read <code>WORKFLOW.md</code>. Is the daemon running?
+            Could not read <code>WORKFLOW.md</code> — the daemon did not serve a config. It may be
+            down, or the file on disk may not parse.
           </Note>
         </div>
       </Page>
