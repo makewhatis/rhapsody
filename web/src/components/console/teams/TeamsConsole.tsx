@@ -17,6 +17,7 @@ import {
 import { RoomFeed, RoomLegend } from "@/components/console/teams/RoomFeed";
 import { SearchIcon } from "@/components/console/teams/icons";
 import { useTeamsOverview, useTeamsRecall, useTeamsRoom, usePostToRoom } from "@/hooks/useTeams";
+import { formatDateTime } from "@/lib/format";
 import { errText } from "@/lib/teams-model";
 import {
   DEFAULT_ROOM_WINDOW,
@@ -166,7 +167,7 @@ export function TeamsConsole({ onNavigate, pollMs, now }: TeamsConsoleProps) {
             loading={room.isLoading}
             error={room.isError ? errText(room.error) : undefined}
             hasOlder={hasOlder && sections.length > 0}
-            fetchingOlder={room.isFetching}
+            fetchingOlder={room.isPlaceholderData}
             onLoadOlder={loadOlder}
           />
           <RoomLegend />
@@ -182,7 +183,11 @@ export function TeamsConsole({ onNavigate, pollMs, now }: TeamsConsoleProps) {
               </button>
             }
           >
-            <RosterTable rows={roster} />
+            {overview.isError ? (
+              <div className="quiet">Could not read the roster: {errText(overview.error)}</div>
+            ) : (
+              <RosterTable rows={roster} />
+            )}
           </Card>
 
           <MemoryPreview
@@ -292,7 +297,7 @@ function MemoryPreview({ identity, onOpenMemory }: { identity: string; onOpenMem
               <div className="top">
                 {fact.ticket === "" ? null : <TicketChip>{fact.ticket}</TicketChip>}
                 {fact.run_id === "" ? null : <TicketChip variant="sha">run {fact.run_id}</TicketChip>}
-                <Timestamp>{fact.at.slice(0, 16).replace("T", " ")}</Timestamp>
+                <Timestamp>{formatDateTime(fact.at)}</Timestamp>
               </div>
               {/* Untrusted content, same as a room post (design §0.11.5) — quoted, never asserted. */}
               <blockquote>

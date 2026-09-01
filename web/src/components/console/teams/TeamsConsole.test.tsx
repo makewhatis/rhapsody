@@ -371,6 +371,21 @@ describe("3.8 — 'Load older' asks the daemon for the previous day's page", () 
     expect(h.fetchTeamsRoom).toHaveBeenCalledWith(2 * DEFAULT_ROOM_WINDOW);
     expect(screen.getByText("Two days ago, from jimmy.")).toBeTruthy();
   });
+
+  // A wider window is a different query key, so without the room query keeping its previous page
+  // the feed would blank to "Loading the room…" every time the operator asked for one more day.
+  it("keeps the feed on screen while the wider read is in flight, and spins the pager", async () => {
+    renderConsole();
+    await ready();
+    // The widened read never settles, so the in-flight state is what the assertions see.
+    h.fetchTeamsRoom.mockReturnValue(new Promise(() => {}));
+
+    fireEvent.click(screen.getByRole("button", { name: /Load older/ }));
+
+    await waitFor(() => expect(document.querySelector(".older .sp")).toBeTruthy());
+    expect(screen.getByText(/Someone want to review the export PR/)).toBeTruthy();
+    expect(screen.queryByText(/Loading the room/)).toBeNull();
+  });
 });
 
 describe("3.9 — the composer posts as the operator, with refs", () => {

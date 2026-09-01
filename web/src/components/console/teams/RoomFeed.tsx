@@ -63,10 +63,10 @@ export function RoomFeed({ sections, loading, error, hasOlder, fetchingOlder, on
 }
 
 function Event({ event }: { event: RoomEvent }) {
-  const { message, kind, kindLabel, teammates, time } = event;
+  const { message, kind, kindLabel, time } = event;
   const { head, rest } = truncateBody(message.body ?? "");
   return (
-    <article className="event" data-kind={kind} data-who={teammates.join(" ") || "all"}>
+    <article className="event" data-kind={kind}>
       <KindIcon kind={kind} />
       <div className="meta">
         <span className="from">{message.from}</span>
