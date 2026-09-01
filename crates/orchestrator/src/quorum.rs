@@ -1550,6 +1550,14 @@ mod tests {
             ) -> Result<rhapsody_config::room::CaughtUp, RoomError> {
                 Err(RoomError::Io("disk on fire".into()))
             }
+            fn read_forward(
+                &self,
+                _reader: &str,
+                _cursor: &Cursor,
+                _limit: usize,
+            ) -> Result<rhapsody_config::room::CaughtUp, RoomError> {
+                Err(RoomError::Io("disk on fire".into()))
+            }
         }
         let tr = Arc::new(tracker_with_viewer());
         let d = deps_with_room(

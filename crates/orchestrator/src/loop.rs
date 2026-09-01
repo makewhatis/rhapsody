@@ -273,6 +273,20 @@ pub enum Event {
         post: crate::teamspost::TeamsPost,
         reply: oneshot::Sender<i64>,
     },
+    /// Admit an ALREADY-WRAPPED team-room post into the live run on `identifier`'s mailbox
+    /// (STUDIO-678, §0.13; NEW beyond Go v0.4.0). The manager's room reader decides off-loop and
+    /// wraps the text itself ([`crate::teamsears::room_operator_wrap`]); only the admission needs
+    /// `running` and `mailboxes`, which the control task owns. Replies with whether it landed.
+    ///
+    /// Keyed by the human IDENTIFIER rather than a run id, deliberately: the reader knows the
+    /// TICKET, and a run id it looked up a moment earlier could belong to a different run by the
+    /// time this is handled. The identifier cannot drift that way — at most one run is live per
+    /// issue.
+    TeamsRelay {
+        identifier: String,
+        wrapped: String,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// How long [`ControlHandle::record_teams_post`] waits for the control task to report back on a
@@ -505,6 +519,13 @@ impl Orchestrator {
             }
             Event::TeamsPost { post, reply } => {
                 let _ = reply.send(self.handle_teams_post(&post));
+            }
+            Event::TeamsRelay {
+                identifier,
+                wrapped,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_teams_relay(&identifier, &wrapped));
             }
         }
     }
@@ -1136,6 +1157,35 @@ impl ControlHandle {
                 0
             }
         }
+    }
+
+    /// Relays an already-wrapped team-room post into the live run on `identifier` (STUDIO-678,
+    /// §0.13), round-tripping the control channel so the mailbox admission stays loop-confined.
+    ///
+    /// The wait is bounded by [`TEAMS_POST_MIRROR_WAIT`], the sibling relay's bound and its reason:
+    /// this is called from the off-loop triage task while it holds a room page it must finish
+    /// answering, and a tick busy on the network must cost the manager one honest "no live run to
+    /// pass that to" rather than parking the whole pass behind it.
+    pub async fn relay_room_post(&self, identifier: &str, wrapped: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let ev = Event::TeamsRelay {
+            identifier: identifier.to_string(),
+            wrapped: wrapped.to_string(),
+            reply: tx,
+        };
+        if self.events.send(ev).is_err() {
+            return false; // the loop is gone: there is no live run to reach.
+        }
+        let mut lifetime = self.ctx.clone();
+        let reply = async {
+            tokio::select! {
+                r = rx => r.unwrap_or(false),
+                _ = lifetime.cancelled() => false,
+            }
+        };
+        tokio::time::timeout(TEAMS_POST_MIRROR_WAIT, reply)
+            .await
+            .unwrap_or(false)
     }
 
     /// Requests a coalesced poll+reconcile tick (Go's non-blocking `evTick` send), backing the P6
