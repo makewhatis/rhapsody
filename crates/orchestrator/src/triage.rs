@@ -1027,6 +1027,10 @@ where
     // Skipped when the fetch failed, for the reconcile's reason: a partial fetch would answer "not
     // found on any project this team works" about a ticket a healthy fetch would have shown, and
     // that reply is durable and wrong.
+    // What the ears pass labelled, which `issues` — fetched once, above — cannot show. The
+    // assignment pass below reads that same snapshot, so without this a ticket the operator just
+    // gave to someone still looks unclaimed and is re-decided a few lines later.
+    let mut ears_labelled: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(ears) = deps.ears.as_ref()
         && let Some(room) = deps.room.as_ref()
         && !fetch_failed
@@ -1051,6 +1055,7 @@ where
         };
         let heard =
             crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
+        ears_labelled.extend(heard.wrote.labelled_ids().map(str::to_string));
         if !heard.is_quiet() {
             tracing::info!(
                 answered = heard.answered,
@@ -1086,7 +1091,10 @@ where
             "teams triage has no dispatchable states to filter by; assigning nothing this cycle"
         );
     }
-    let candidates = unlabelled_candidates(&issues, &target.states);
+    let mut candidates = unlabelled_candidates(&issues, &target.states);
+    // The operator's answer stands: a ticket the ears pass just labelled is claimed, however
+    // unclaimed this cycle's fetch still shows it.
+    candidates.retain(|iss| !ears_labelled.contains(&iss.id));
     if candidates.is_empty() {
         return report(failed_outcome(CycleOutcome::Idle), 0);
     }
@@ -2499,6 +2507,97 @@ mod tests {
             1,
             "load is ONE read for the whole roster, not one per identity"
         );
+    }
+
+    // ── the ears pass and the assignment pass share one snapshot (STUDIO-678, §0.13) ────────────
+
+    /// **The operator's answer stands for the rest of the cycle.** `issues` is fetched once, at the
+    /// top of the cycle, and the ears pass writes its identity label to the TRACKER — so the
+    /// assignment pass a few lines later still sees an unlabelled ticket in that snapshot and used
+    /// to re-decide it, writing a second `rhapsody:@<name>` label over the operator's choice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_the_ears_pass_just_assigned_is_not_re_labelled_by_the_same_cycle() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        room.append(&Message::room(
+            rhapsody_config::room::OPERATOR_IDENTITY,
+            Utc::now(),
+            "bob should take MT-2",
+        ))
+        .expect("append");
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("MT-2", &[])];
+        let tr = Arc::new(tr);
+        // The room turn names bob — a choice the deterministic floor cannot make, so the label that
+        // lands says which pass wrote it. Triage's own arbiter is given NOTHING to answer with: if
+        // the assignment pass reaches this ticket at all, that is the bug.
+        // Spelled out rather than `..deps_with_room(..)`: the ears pass needs the per-project facts
+        // the default target leaves empty, and struct-update syntax cannot change the closure type
+        // the struct is generic over.
+        let tr_for_target = Arc::clone(&tr);
+        let d = TriageDeps {
+            teams: Arc::new(teams_model(vec![
+                ident("alice", &["rust"]),
+                ident("bob", &["rust"]),
+            ])),
+            target: move || {
+                Some(TriageTarget {
+                    trackers: vec![Arc::clone(&tr_for_target) as Arc<dyn Tracker>],
+                    states: states(),
+                    facts: vec![ProjectFacts {
+                        create_state: "Todo".to_string(),
+                        pr_owner: "o".to_string(),
+                        pr_repo: "r".to_string(),
+                    }],
+                    summon_token: "@symphony".to_string(),
+                })
+            },
+            arbiter: FakeArbiter::answering(Vec::new()),
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            interval: Duration::from_millis(5),
+            max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            history: None,
+            reconcile_marker: None,
+            ears: Some(Arc::new(crate::teamsears::Ears::new(
+                dir.child("manager.cursor"),
+                Arc::new(NamesBob) as Arc<dyn crate::teamsears::RoomArbiter>,
+            ))),
+        };
+
+        triage_cycle(&CancelWait::default(), &d, true).await;
+
+        let calls = tr.add_label_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the ears pass labelled it; the assignment pass must not label it again: {calls:?}"
+        );
+        assert_eq!(calls[0].issue_id, "MT-2");
+        assert_eq!(
+            calls[0].label_name, "rhapsody:@bob",
+            "the operator's choice stands"
+        );
+    }
+
+    /// A room turn that reads the post's intent the way `labels+model` is meant to: bob, by name.
+    struct NamesBob;
+
+    #[async_trait::async_trait]
+    impl crate::teamsears::RoomArbiter for NamesBob {
+        async fn resolve(
+            &self,
+            _req: &TriageRequest,
+        ) -> Result<Vec<crate::teamsears::Target>, String> {
+            Ok(vec![crate::teamsears::Target {
+                key: "MT-2".to_string(),
+                intent: crate::teamsears::Intent::Assign,
+                assignee: Some("bob".to_string()),
+            }])
+        }
     }
 
     // ── the durable room record (STUDIO-650, T5) ────────────────────────────────────────────────

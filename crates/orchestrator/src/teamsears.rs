@@ -62,6 +62,11 @@
 //! same page before acting ([`already_answered`]). That is what makes `file:seq` load-bearing, and
 //! why `LocalRoom::append` grew a real lock.
 //!
+//! That covers the gap BETWEEN passes. The gap WITHIN one pass is [`PassWrites`]: the cycle's issue
+//! list is one immutable fetch, so a marker or a label this pass wrote to the tracker is invisible
+//! to every guard that reads that snapshot afterwards — and "once per ticket ever" is a claim about
+//! the pass as much as about the restart. Both halves are needed; neither substitutes for the other.
+//!
 //! **The reply is the record, so the one gap is a post whose ACTIONS landed and whose REPLY did
 //! not** — a room append that failed, which is logged. That post is answered again on the next
 //! pass. Two of the three actions absorb it exactly: the quorum marker makes a second filing
@@ -345,8 +350,53 @@ pub(crate) struct EarsCycle<'a> {
     pub(crate) tracker_api_key: &'a str,
 }
 
-/// What one ears pass did, for the cycle's log line.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What THIS pass has already written to the tracker, by issue id.
+///
+/// [`EarsCycle::issues`] is fetched ONCE per triage cycle and never mutated, so a label or a marker
+/// written during the pass is invisible to every guard that reads that snapshot afterwards. Three
+/// guards read it — [`file_review`]'s `rhapsody:quorum-requested` check, [`confirm_assignment`]'s
+/// "is the identity label occupied" check, and, after the pass, triage's own
+/// [`unlabelled_candidates`](crate::triage::unlabelled_candidates) — and without this record each
+/// of them re-decides on stale state:
+///
+/// * three posts naming one in-review ticket would file THREE review tickets, breaking §0.13's
+///   load-bearing "one review ticket, once per ticket ever" bound (the marker is on the tracker,
+///   not in the snapshot);
+/// * two posts naming different reviewers for one unclaimed ticket would write two different
+///   `rhapsody:@<name>` labels to it, contradicting §0.11.1's "an occupied identity label is never
+///   edited";
+/// * the assignment pass that runs after the ears pass would re-label the ticket the ears pass just
+///   assigned.
+///
+/// So the pass carries its own writes forward. Nothing here is persisted: it is the missing half of
+/// ONE cycle's view, and the next cycle's fetch supplies it for real.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PassWrites {
+    /// Issue ids a review ticket was filed against — i.e. whose marker this pass wrote (or tried to).
+    filed: HashSet<String>,
+    /// Issue id → the identity label this pass wrote to it.
+    labelled: HashMap<String, String>,
+}
+
+impl PassWrites {
+    /// Whether a review ticket has already been filed against `id` DURING this pass.
+    fn already_filed(&self, id: &str) -> bool {
+        self.filed.contains(id)
+    }
+
+    /// Who this pass has already given `id` to, if anyone.
+    fn holder(&self, id: &str) -> Option<&str> {
+        self.labelled.get(id).map(String::as_str)
+    }
+
+    /// Issue ids this pass gave an identity label to — what triage must not re-label.
+    pub(crate) fn labelled_ids(&self) -> impl Iterator<Item = &str> {
+        self.labelled.keys().map(String::as_str)
+    }
+}
+
+/// What one ears pass did, for the cycle's log line — and what it wrote, for the rest of the cycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EarsReport {
     /// Operator posts answered (each of which produced exactly one reply).
     pub(crate) answered: usize,
@@ -356,12 +406,15 @@ pub(crate) struct EarsReport {
     pub(crate) assigned: usize,
     /// Post bodies relayed into a live run.
     pub(crate) relayed: usize,
+    /// This pass's own tracker writes, which [`EarsCycle::issues`] cannot show. Read by the guards
+    /// inside the pass and by triage after it.
+    pub(crate) wrote: PassWrites,
 }
 
 impl EarsReport {
     /// Whether this pass did anything at all worth a log line.
-    pub(crate) fn is_quiet(self) -> bool {
-        self == EarsReport::default()
+    pub(crate) fn is_quiet(&self) -> bool {
+        *self == EarsReport::default()
     }
 }
 
@@ -570,14 +623,28 @@ fn no_target_reply(keys: &[String]) -> String {
 /// bounded to [`MAX_TARGETS_PER_POST`]. Returns `(keys, whether more were named)`.
 async fn resolve_keys(ears: &Ears, cycle: &EarsCycle<'_>, body: &str) -> (Vec<String>, bool) {
     let mut keys = extract_keys(body);
-    for pr in extract_pr_urls(body) {
-        if let Some(key) = ticket_for_pr(ears, cycle, &pr).await
+    // The candidate URLs are cut to the answer's cap BEFORE the network loop, not after it. Each
+    // one costs a `gh pr view --repo <owner>/<repo>` with the owner and repo taken VERBATIM from a
+    // post whose `from: operator` is forgeable, and resolving up to `MAX_KEYS_SCANNED` of them to
+    // then throw all but five away would let one post aim that many outbound calls at repositories
+    // it chose. Read-only and fork-checked either way, so this is a cost bound rather than a
+    // posture fix — but an unnecessary bound is still worth having.
+    let prs = extract_pr_urls(body);
+    let mut truncated = prs.len() > MAX_TARGETS_PER_POST;
+    for pr in prs.iter().take(MAX_TARGETS_PER_POST) {
+        if keys.len() >= MAX_TARGETS_PER_POST {
+            // The answer is already full, so every remaining URL is a call whose result could not
+            // be reported anyway.
+            truncated = true;
+            break;
+        }
+        if let Some(key) = ticket_for_pr(ears, cycle, pr).await
             && !keys.iter().any(|k| k == &key)
         {
             keys.push(key);
         }
     }
-    let truncated = keys.len() > MAX_TARGETS_PER_POST;
+    truncated |= keys.len() > MAX_TARGETS_PER_POST;
     keys.truncate(MAX_TARGETS_PER_POST);
     (keys, truncated)
 }
@@ -735,9 +802,12 @@ async fn execute(
             target.key
         ));
     };
+    // The two writing branches take the report MUTABLY: their idempotency guards have to see what
+    // an EARLIER post in this same pass wrote, which `cycle.issues` — one immutable fetch — cannot
+    // show them (see [`PassWrites`]).
     let done = match target.intent {
-        Intent::Review => file_review(teams, ears, cycle, iss, target).await,
-        Intent::Assign => confirm_assignment(teams, cycle, iss, target).await,
+        Intent::Review => file_review(teams, ears, cycle, iss, target, report).await,
+        Intent::Assign => confirm_assignment(teams, cycle, iss, target, report).await,
         Intent::Relay => relay(ears, iss, post).await,
         // Writes nothing by definition, so it has no counter — `Done::say` is the only thing it can
         // return and `acted` is false.
@@ -776,6 +846,7 @@ async fn file_review(
     cycle: &EarsCycle<'_>,
     iss: &Issue,
     target: &Target,
+    report: &mut EarsReport,
 ) -> Done {
     if !cycle.states.is_in_review(iss) {
         return Done::say(format!(
@@ -784,11 +855,16 @@ async fn file_review(
             iss.identifier, iss.state
         ));
     }
-    if iss
-        .labels
-        .iter()
-        .flatten()
-        .any(|l| l.eq_ignore_ascii_case(QUORUM_REQUESTED_LABEL))
+    // The marker, read from BOTH halves of this cycle's view: the fetch (a marker that was already
+    // there) and this pass's own writes (a marker an earlier post in this same page put there,
+    // which the fetch cannot show). Consulting only the fetch is how N posts naming one ticket
+    // filed N review tickets and woke N reviewers.
+    if report.wrote.already_filed(&iss.id)
+        || iss
+            .labels
+            .iter()
+            .flatten()
+            .any(|l| l.eq_ignore_ascii_case(QUORUM_REQUESTED_LABEL))
     {
         return Done::say(format!(
             "{} is already under review — I asked once and I do not ask twice.",
@@ -819,8 +895,14 @@ async fn file_review(
         ));
     };
     // Who did the work: whoever wears the ticket's identity label. Excluded from its own review
-    // (§0.6: "at least two OTHER teammates" — here, one other).
-    let author = identity_label_holder(teams, iss).unwrap_or_default();
+    // (§0.6: "at least two OTHER teammates" — here, one other). A label this pass wrote counts, for
+    // the same reason the marker above does — the fetch predates it.
+    let author = report
+        .wrote
+        .holder(&iss.id)
+        .map(str::to_string)
+        .or_else(|| identity_label_holder(teams, iss))
+        .unwrap_or_default();
     let reviewer = match target
         .assignee
         .clone()
@@ -890,6 +972,9 @@ async fn file_review(
             ));
         }
     };
+    // Recorded on the CREATE, not on the marker write below: the review ticket exists either way,
+    // and a marker write that fails must not let the next post in this page file a second one.
+    report.wrote.filed.insert(iss.id.clone());
     let mut line = format!(
         "{reviewer} — filed {filed} to review {}'s PR ({pr_url}).",
         iss.identifier
@@ -945,8 +1030,17 @@ async fn confirm_assignment(
     cycle: &EarsCycle<'_>,
     iss: &Issue,
     target: &Target,
+    report: &mut EarsReport,
 ) -> Done {
-    if let Some(held) = identity_label_holder(teams, iss) {
+    // Occupied by the fetch OR by this pass's own earlier write — otherwise two posts naming two
+    // different reviewers for one unclaimed ticket both pass this guard and both write, leaving the
+    // ticket wearing two identity labels and counted against two queues.
+    if let Some(held) = report
+        .wrote
+        .holder(&iss.id)
+        .map(str::to_string)
+        .or_else(|| identity_label_holder(teams, iss))
+    {
         return Done::say(format!("{} is already {held}'s.", iss.identifier));
     }
     if crate::teams::is_solo(iss) {
@@ -987,6 +1081,13 @@ async fn confirm_assignment(
     {
         Ok(()) => {
             tracing::info!(issue = %iss.identifier, %identity, "teams manager confirmed an assignment from an operator room post");
+            // Both halves matter: the guard above for the rest of THIS pass, and triage's
+            // assignment pass — which runs after the ears pass over the same stale snapshot — for
+            // the rest of this cycle.
+            report
+                .wrote
+                .labelled
+                .insert(iss.id.clone(), identity.clone());
             Done::acted(
                 format!("{identity} takes {}.", iss.identifier),
                 vec![iss.identifier.clone()],
@@ -2329,6 +2430,115 @@ mod tests {
         assert_eq!(ears_pass(&t, fx.room.as_ref(), &ears, &c).await.answered, 2);
     }
 
+    // ── the same-pass bound: a write this pass made is a write this pass can see ────────────────
+
+    /// **The once-per-ticket bound holds WITHIN one pass, not just across passes.** The cycle's
+    /// issue list is fetched once, so the `rhapsody:quorum-requested` marker post 1 writes to the
+    /// tracker is invisible in the snapshot post 2 reads. Without the pass's own record of what it
+    /// wrote, three posts naming one in-review ticket file three review tickets and wake three
+    /// reviewers — reachable by appending three lines to the room's JSONL, and by an operator
+    /// simply double-posting.
+    #[tokio::test]
+    async fn several_posts_naming_one_ticket_file_exactly_one_review_ticket() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("someone review STUDIO-654");
+        fx.operator_says("really, STUDIO-654 needs a review");
+        fx.operator_says("STUDIO-654 please");
+        let t = teams(&["alice", "jimmy", "kim"], ManagerMode::Labels);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(|| Ok(None)))),
+            Arc::new(FakeOpenPr(Box::new(|| {
+                Ok(Some("https://github.com/o/r/pull/230".into()))
+            }))),
+        );
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        assert_eq!(
+            report.answered, 3,
+            "silence is a bug: every post is answered"
+        );
+        assert_eq!(report.filed, 1, "one review ticket, once per ticket ever");
+        assert_eq!(
+            fx.tracker.create_issue_calls().len(),
+            1,
+            "the second and third posts must not reach `create_issue`"
+        );
+        let replies = fx.reply_bodies();
+        assert_eq!(replies.len(), 3);
+        assert!(replies[0].contains("filed"), "{}", replies[0]);
+        for later in &replies[1..] {
+            assert!(
+                later.contains("already under review"),
+                "the refusal is said out loud, not silently skipped: {later}"
+            );
+        }
+    }
+
+    /// **§0.11.1 holds within one pass too.** Two posts naming two DIFFERENT teammates for one
+    /// unclaimed ticket used to write two `rhapsody:@<name>` labels to it, because the "is the
+    /// identity label occupied" guard read the same pre-pass snapshot twice. First post wins; the
+    /// second is told who has it.
+    #[tokio::test]
+    async fn two_posts_naming_different_teammates_do_not_double_label_one_ticket() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("alice should take MT-2");
+        fx.operator_says("actually jimmy should take MT-2");
+        let t = teams(&["alice", "jimmy"], ManagerMode::LabelsModel);
+        let issues = vec![todo("MT-2")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        // The model names a different teammate each time — the case the deterministic floor cannot
+        // produce, and the one that makes the two writes visibly disagree.
+        let turn = StdMutex::new(0usize);
+        let ears = fx.ears(FakeArbiter::answering(move || {
+            let mut n = turn.lock().unwrap_or_else(PoisonError::into_inner);
+            *n += 1;
+            Ok(vec![Target {
+                key: "MT-2".to_string(),
+                intent: Intent::Assign,
+                assignee: Some(if *n == 1 { "alice" } else { "jimmy" }.to_string()),
+            }])
+        }));
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, true),
+        )
+        .await;
+
+        assert_eq!(report.answered, 2);
+        assert_eq!(report.assigned, 1, "only the first post's write happened");
+        let labels = fx.tracker.add_label_calls();
+        assert_eq!(labels.len(), 1, "one identity label, not two: {labels:?}");
+        let replies = fx.reply_bodies();
+        assert!(replies[0].contains("alice takes MT-2"), "{}", replies[0]);
+        assert!(
+            replies[1].contains("already alice's"),
+            "the second post is told who holds it: {}",
+            replies[1]
+        );
+        // And the id is published, so triage's assignment pass — which reads the same stale
+        // snapshot a few lines later — does not re-decide the ticket.
+        assert_eq!(
+            report.wrote.labelled_ids().collect::<Vec<_>>(),
+            vec!["iss-2"]
+        );
+    }
+
     // ── the relay, and its wrap ─────────────────────────────────────────────────────────────────
 
     /// The relay carries the post as **untrusted data**, never as operator authority — the one v1
@@ -2501,6 +2711,46 @@ mod tests {
     }
 
     // ── PR URL resolution ───────────────────────────────────────────────────────────────────────
+
+    /// **The `gh` fan-out is bounded BEFORE the network, not after it.** Each pasted URL costs a
+    /// `gh pr view --repo <owner>/<repo>` with owner and repo taken verbatim from a post whose
+    /// `from: operator` is forgeable, so resolving every extracted URL and then keeping five would
+    /// let one post aim `MAX_KEYS_SCANNED` outbound calls at repositories it named.
+    #[tokio::test]
+    async fn a_post_pasting_many_pull_requests_makes_a_bounded_number_of_github_calls() {
+        let fx = Fixture::new(tracker_with_viewer());
+        let body: String = (1..=20)
+            .map(|n| format!("https://github.com/o/r{n}/pull/{n} "))
+            .collect();
+        fx.operator_says(&body);
+        let t = teams(&["alice"], ManagerMode::Labels);
+        let (issues, trackers): (Vec<Issue>, Vec<Arc<dyn Tracker>>) = (Vec::new(), Vec::new());
+        let owner = HashMap::new();
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let ears = fx.ears(FakeArbiter::never()).with_github(
+            Arc::new(FakeBranches(Box::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            }))),
+            Arc::new(FakeOpenPr(Box::new(|| Ok(None)))),
+        );
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) <= MAX_TARGETS_PER_POST,
+            "20 pasted URLs cost at most {MAX_TARGETS_PER_POST} lookups, not one each: {}",
+            calls.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
 
     /// A pasted PR URL resolves to its ticket through the `symphony/<key>` head branch — STUDIO-674's
     /// contract read the other way — and the resolved key is then validated like any other.
