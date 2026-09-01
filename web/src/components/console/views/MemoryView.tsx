@@ -163,8 +163,8 @@ export function MemoryView({ onNavigate, onReinstate }: MemoryViewProps) {
       */}
       <Note className="memnote">
         A browse is bounded by <code>recall_top_k</code>, so a large bank is shown newest-scoring
-        first rather than in full. Invalidated records are listed too — the daemon is read with
-        <code>state=all</code> — and only valid ones are ever recalled into a prompt.
+        first rather than in full. Invalidated records are listed too (the daemon is read with{" "}
+        <code>state=all</code>) and only valid ones are ever recalled into a prompt.
       </Note>
 
       {/*

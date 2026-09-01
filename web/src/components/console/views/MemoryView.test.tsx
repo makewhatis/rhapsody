@@ -211,6 +211,18 @@ describe("Memory page", () => {
     expect(within(dead).getByRole("button", { name: "Reinstate" })).toBeTruthy();
   });
 
+  it("says what the browse does and does not show, with the words spaced", async () => {
+    // The note is the page's own disclosure, and its `<code>` runs sit mid-sentence — JSX drops a
+    // newline adjacent to a tag, so a wrapped line silently reads "withstate=all". Assert the
+    // rendered sentence, not the source.
+    seed();
+    const { container } = mount();
+    await settled();
+    const note = container.querySelector(".memnote");
+    expect(note?.textContent).toContain("bounded by recall_top_k");
+    expect(note?.textContent).toContain("read with state=all");
+  });
+
   it("4.2 — search filters by free text", async () => {
     seed();
     mount();
