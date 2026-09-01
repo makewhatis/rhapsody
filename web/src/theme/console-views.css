@@ -1,0 +1,108 @@
+/* ============================================================================
+   Rhapsody Console — view styles for §2–§4 and §8 (STUDIO-683)
+
+   The Jobs worklist, the Job-detail page and Settings, ported rule-for-rule from
+   the committed prototype's `<style>` block
+   (`~/.rhapsody/docs/STUDIO-681-prototype.html`) so a reviewer can diff the two
+   side by side. `theme/console.css` (STUDIO-682) holds the §1 shared components
+   these compose from; nothing here re-declares one.
+
+   Scoped under `.rh-console` for the same reason console.css is: `.head`,
+   `.run`, `.checks` and `.kv` are far too generic to publish alongside the
+   Podium screens.
+
+   Every color is a token. The two literal hexes (`#34343c` hover hairline,
+   `#8fb98f` the PR chip's green) are the prototype's own one-off shades, already
+   present in console.css for the same elements — not duplicates of a token.
+
+   The room-slice, memory, manage and teams-console views are sub-tickets 3–5;
+   `.memprev`/`.mcard` land here because §4's side column uses them.
+   ============================================================================ */
+
+/* ===== page furniture ===== */
+.rh-console .head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
+.rh-console .head h1 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -.01em; }
+.rh-console .head .sub { color: var(--ink-3); font-size: 12.5px; }
+.rh-console .head .spacer { flex: 1; }
+.rh-console .build { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); border: 1px solid var(--line-soft); border-radius: 99px; padding: 4px 10px; }
+.rh-console .crumbs { color: var(--ink-4); font-size: 12px; margin-bottom: 8px; }
+.rh-console .crumbs a { cursor: pointer; }
+.rh-console .crumbs a:hover { color: var(--accent); }
+.rh-console .lead { color: var(--ink-3); font-size: 12.5px; margin: 0 0 18px; max-width: 72ch; }
+.rh-console .ghost { font: inherit; font-size: 12px; color: var(--ink-2); background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+.rh-console .ghost:hover { border-color: #34343c; color: var(--ink); }
+/* The empty state a list falls back to — and where an absent data source is named. */
+.rh-console .empty { padding: 26px 15px; text-align: center; color: var(--ink-3); font-size: 12.5px; }
+
+/* ===== §3 jobs ===== */
+.rh-console .jfilters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.rh-console .jtbl { width: 100%; border-collapse: collapse; }
+.rh-console .jtbl th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 9px 14px; border-bottom: 1px solid var(--line-soft); }
+.rh-console .jtbl td { padding: 12px 14px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
+.rh-console .jtbl tr:last-child td { border-bottom: 0; }
+.rh-console .jtbl tbody tr { cursor: pointer; }
+.rh-console .jtbl tbody tr:hover { background: var(--panel-2); }
+.rh-console .jtbl tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.rh-console .jtbl .ti { font-weight: 600; font-size: 13px; }
+.rh-console .jtbl .pj { color: var(--ink-4); font-size: 11px; }
+.rh-console .who2 { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+.rh-console .jtbl .up { font-family: var(--mono); font-size: 11px; color: var(--ink-4); }
+
+/* ===== §4 job detail ===== */
+.rh-console .jobhd { display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+.rh-console .jobhd .tt { min-width: 0; }
+.rh-console .jobhd h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.01em; text-wrap: balance; }
+.rh-console .jobhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-bottom: 4px; }
+.rh-console .jobhd .acts { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.rh-console .jsummary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.rh-console .kv { border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--panel); padding: 7px 13px; }
+.rh-console .kv .l { font-size: 10px; color: var(--ink-4); text-transform: uppercase; letter-spacing: .06em; }
+.rh-console .kv .v { font-size: 12.5px; color: var(--ink); margin-top: 3px; display: flex; align-items: center; gap: 6px; }
+
+.rh-console .runs { padding: 2px 0; }
+.rh-console .run { border-top: 1px solid var(--line-soft); }
+.rh-console .run:first-child { border-top: 0; }
+.rh-console .run > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 12px; padding: 12px 15px; }
+.rh-console .run > summary::-webkit-details-marker { display: none; }
+.rh-console .run > summary:hover { background: var(--panel-2); }
+.rh-console .run .rid { font-family: var(--mono); font-size: 11px; color: var(--ink-3); width: 60px; flex: none; }
+.rh-console .run .lab { font-weight: 600; font-size: 13px; flex: none; }
+.rh-console .run .desc { color: var(--ink-3); font-size: 12px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rh-console .run .rt { margin-left: auto; display: flex; align-items: center; gap: 10px; flex: none; }
+.rh-console .run .car { color: var(--ink-4); font-size: 10px; transition: .15s; }
+.rh-console .run[open] .car { transform: rotate(90deg); }
+.rh-console .run .exp { padding: 0 15px 15px 75px; }
+.rh-console .rmeta { display: flex; gap: 14px; flex-wrap: wrap; margin: 0 0 12px; color: var(--ink-4); font-size: 11px; font-family: var(--mono); }
+.rh-console .trace { border-left: 2px solid var(--line-soft); padding-left: 14px; display: flex; flex-direction: column; gap: 9px; }
+.rh-console .tline { display: flex; gap: 9px; align-items: baseline; font-size: 12px; color: var(--ink-2); }
+.rh-console .tline .tic { width: 13px; height: 13px; color: var(--ink-4); flex: none; position: relative; top: 2px; }
+.rh-console .tline.done { color: var(--ok); }
+.rh-console .tline.done .tic { color: var(--ok); }
+.rh-console .tline .tt2 { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); margin-left: auto; flex: none; }
+.rh-console .tline code { font-size: 11px; }
+
+.rh-console .checks { padding: 4px 14px 8px; }
+.rh-console .chk { display: flex; align-items: center; gap: 9px; padding: 6px 0; font-size: 12.5px; border-bottom: 1px solid var(--line-soft); }
+.rh-console .chk:last-child { border-bottom: 0; }
+.rh-console .chk .st { width: 13px; height: 13px; flex: none; }
+.rh-console .chk.ok .st { color: var(--ok); }
+.rh-console .chk.bad .st { color: var(--bad); }
+.rh-console .chk.pending .st { color: var(--warn); }
+.rh-console .chk .nm2 { color: var(--ink-2); }
+.rh-console .chk .rt { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); }
+.rh-console .prnote { padding: 2px 14px 13px; color: var(--ink-3); font-size: 12px; }
+.rh-console .prnote b { color: var(--warn); }
+
+.rh-console .memprev { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.rh-console .mcard { border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--panel-2); padding: 11px 12px; }
+.rh-console .mcard .top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.rh-console .mcard .top .at { margin-left: auto; }
+.rh-console .mcard p { margin: 0; font-size: 12.5px; color: var(--ink-2); }
+
+/* ===== §8 settings ===== */
+.rh-console .setgrp { max-width: 760px; }
+.rh-console .setrow { display: flex; align-items: center; gap: 14px; padding: 15px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); margin-bottom: 12px; }
+.rh-console .setrow .ic2 { width: 34px; height: 34px; border-radius: var(--r-sm); background: var(--panel-2); border: 1px solid var(--line-soft); display: grid; place-items: center; color: var(--ink-3); flex: none; }
+.rh-console .setrow .tx b { font-size: 13.5px; }
+.rh-console .setrow .tx p { margin: 2px 0 0; color: var(--ink-3); font-size: 12px; }
+.rh-console .setrow .rt { margin-left: auto; display: flex; align-items: center; gap: 10px; }
