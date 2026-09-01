@@ -250,6 +250,7 @@ function Roster({
             <th>Name</th>
             <th>Profile</th>
             <th>Extra labels</th>
+            <th>Bank</th>
             <th>Max concurrent</th>
             <th />
           </tr>
@@ -262,6 +263,7 @@ function Roster({
               key={i}
               n={i + 1}
               row={row}
+              prefix={draft.bankPrefix}
               color={teammateColorAt(i)}
               onChange={(patch) => onRow(i, patch)}
               onRemove={() => onChange({ ...draft, roster: draft.roster.filter((_, n) => n !== i) })}
@@ -274,7 +276,9 @@ function Roster({
       </button>
       <Note>
         <b>Max concurrent 0</b> means unlimited — the teammate takes as much work as the daemon's own
-        dispatch limit allows. Any other number caps their live runs.
+        dispatch limit allows. Any other number caps their live runs. A blank <b>bank</b> is the
+        default memory bank for that name; naming one points the teammate somewhere else, and two
+        rows naming the same bank share a memory.
       </Note>
     </Section>
   );
@@ -283,12 +287,15 @@ function Roster({
 function RosterRow({
   n,
   row,
+  prefix,
   color,
   onChange,
   onRemove,
 }: {
   n: number;
   row: RosterDraft;
+  /** The current `memory.bank_prefix`, so the placeholder shows the default this row would get. */
+  prefix: string;
   color: string;
   onChange: (patch: Partial<RosterDraft>) => void;
   onRemove: () => void;
@@ -321,6 +328,16 @@ function RosterRow({
           placeholder="add a label…"
           tags={rowLabels(row)}
           onChange={(tags) => onChange({ labels: joinRowLabels(tags) })}
+        />
+      </td>
+      <td>
+        <input
+          type="text"
+          className="mono bk"
+          aria-label={`Teammate ${n} bank`}
+          placeholder={`${prefix}<name>`}
+          value={row.bank}
+          onChange={(e) => onChange({ bank: e.target.value })}
         />
       </td>
       <td>
@@ -373,6 +390,14 @@ function Manager({
           value={draft.managerModel}
           placeholder="claude-opus-5"
           onChange={(e) => set("managerModel", e.target.value)}
+        />
+      </Field>
+      <Field label="Triage max tokens" hint="Hard cap on that arbitration turn.">
+        <Stepper
+          value={draft.managerMaxTokens}
+          onChange={(v) => set("managerMaxTokens", v)}
+          min={1}
+          label="Triage max tokens"
         />
       </Field>
       <Field label="Turn timeout" hint="Exceeded ⇒ the deterministic answer stands. Never blocks dispatch.">
@@ -441,6 +466,47 @@ function MemoryAndQuorum({
           <ApiKeyField draft={draft} storedKey={storedKey} onChange={onChange} />
         </>
       ) : null}
+      <Field
+        label="Bank prefix"
+        hint={
+          <>
+            A teammate's bank id is <code>&lt;prefix&gt;&lt;name&gt;</code> unless their row overrides it.
+          </>
+        }
+        htmlFor={`${id}-prefix`}
+      >
+        <input
+          id={`${id}-prefix`}
+          type="text"
+          className="mono"
+          style={{ maxWidth: 220 }}
+          placeholder="agent-"
+          value={draft.bankPrefix}
+          onChange={(e) => set("bankPrefix", e.target.value)}
+        />
+      </Field>
+      {/* Ungated, unlike endpoint and key. Box 5.4 names exactly one reveal rule — the two
+          hindsight-only fields — and `path` is not it: teams.yaml keeps it whatever the backend
+          is, and `toConfig` sends it either way, so a gate would hide a value that is still
+          being saved. The hint names the backend that reads it instead. */}
+      <Field
+        label="Bank directory"
+        hint={
+          <>
+            Where the <code>local</code> backend keeps its banks. Blank ⇒ <code>~/.rhapsody/teams/banks/</code>.
+          </>
+        }
+        htmlFor={`${id}-path`}
+      >
+        <input
+          id={`${id}-path`}
+          type="text"
+          className="mono in-wide"
+          placeholder="~/.rhapsody/teams/banks"
+          value={draft.memoryPath}
+          onChange={(e) => set("memoryPath", e.target.value)}
+        />
+      </Field>
       <Field label="Recall top-k" hint="How many facts a recall returns.">
         <Stepper value={draft.recallTopK} onChange={(v) => set("recallTopK", v)} label="Recall top-k" />
       </Field>

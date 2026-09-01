@@ -503,3 +503,101 @@ describe("the view's own edges", () => {
     expect(sent.manager.default_identity).toBe("jimmy");
   });
 });
+
+// The four fields the shipped Podium teams editor (`settings/TeamsTab.tsx`, STUDIO-667) lets an
+// operator EDIT and this form at first only round-tripped. They are not new spec — §7's own list
+// stops at the boxes above — they are the teams half of the STUDIO-687 §6.4 go-live gate, which
+// requires the console to be at parity with the editor it replaces. `teams-model.ts` already
+// carries all four through `toDraft`/`toConfig`, so what is asserted here is the CONTROL.
+//
+// The Enable/Disable switch is deliberately still absent: turning Teams off is the Settings §8
+// card's job, not this form's.
+describe("Settings parity — the four fields the Podium editor also edits", () => {
+  it("edits the manager's max tokens", async () => {
+    await ready();
+    const tokens = screen.getByRole("spinbutton", { name: "Triage max tokens" });
+    expect(tokens).toHaveProperty("value", "4000");
+    fireEvent.change(tokens, { target: { value: "8000" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+    await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalled());
+    expect(h.saveTeamsConfig.mock.calls[0][0].manager.max_tokens).toBe(8000);
+  });
+
+  it("edits the bank prefix, and the preview follows it", async () => {
+    await ready();
+    const prefix = screen.getByRole("textbox", { name: "Bank prefix" });
+    expect(prefix).toHaveProperty("value", "agent-");
+    fireEvent.change(prefix, { target: { value: "rhap-" } });
+    fireEvent.click(screen.getByRole("button", { name: /View as YAML/ }));
+    await waitFor(() => expect(yamlText()).toContain("bank_prefix: rhap-"));
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+    await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalled());
+    expect(h.saveTeamsConfig.mock.calls[0][0].memory.bank_prefix).toBe("rhap-");
+  });
+
+  it("edits the bank directory, and the preview follows it", async () => {
+    await ready();
+    const dir = screen.getByRole("textbox", { name: "Bank directory" });
+    expect(dir).toHaveProperty("value", "");
+    fireEvent.change(dir, { target: { value: "/srv/banks" } });
+    fireEvent.click(screen.getByRole("button", { name: /View as YAML/ }));
+    await waitFor(() => expect(yamlText()).toContain("path: /srv/banks"));
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+    await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalled());
+    expect(h.saveTeamsConfig.mock.calls[0][0].memory.path).toBe("/srv/banks");
+  });
+
+  it("edits one teammate's bank override without touching another's", async () => {
+    await ready();
+    const bank = screen.getByRole("textbox", { name: "Teammate 2 bank" });
+    expect(bank).toHaveProperty("value", "");
+    fireEvent.change(bank, { target: { value: "shared-bank" } });
+    fireEvent.click(screen.getByRole("button", { name: /View as YAML/ }));
+    await waitFor(() => expect(yamlText()).toContain("bank: shared-bank"));
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+    await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalled());
+    const sent = h.saveTeamsConfig.mock.calls[0][0] as TeamsConfig;
+    expect(sent.roster.map((r) => r.bank)).toEqual(["", "shared-bank"]);
+  });
+
+  // The property the parity gate actually rests on: an operator who opens this form and saves it
+  // unchanged must get back the file they had. Every field the editor models is non-default here,
+  // so a control that failed to load its value would write the default over it.
+  it("saves an untouched config byte-for-byte, losing nothing", async () => {
+    const on_disk = config({
+      manager: {
+        mode: "labels",
+        default_identity: "jimmy",
+        model: "claude-sonnet-5",
+        max_tokens: 9000,
+        timeout_ms: 45000,
+      },
+      memory: {
+        backend: "local",
+        path: "/srv/banks",
+        endpoint: "",
+        api_key: "",
+        bank_prefix: "rhap-",
+        recall_top_k: 12,
+      },
+      quorum: { enabled: true, reviewers: 3 },
+      roster: [
+        { name: "alice", profile: "swe", labels: ["rust"], bank: "alice-bank", max_concurrent: 2 },
+        { name: "jimmy", profile: "reviewer", labels: ["web"], bank: "", max_concurrent: 0 },
+      ],
+      prompt_budget_bytes: 24000,
+    });
+    h.fetchTeamsConfig.mockResolvedValue(view({ config: on_disk }));
+    await ready();
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+    await waitFor(() => expect(h.saveTeamsConfig).toHaveBeenCalled());
+    expect(h.saveTeamsConfig.mock.calls[0][0]).toEqual(on_disk);
+  });
+
+  // Turning Teams off stays the Settings §8 card's job (§7): this form edits the file's contents,
+  // it is not the switch.
+  it("offers no enable/disable switch", async () => {
+    await ready();
+    expect(screen.queryByRole("button", { name: /^(Enable|Disable) teams$/i })).toBeNull();
+  });
+});
