@@ -1,8 +1,8 @@
 # CLAUDE.md — crates/orchestrator
 
 Parity port of Go `internal/orchestrator` — one Go package split across 26 source files, all
-mutating a single `Orchestrator` struct. The Rust port mirrors that file split one-to-one (36
-files under `src/`, one per Go source file plus a couple of Rust-only internal ports — see below);
+mutating a single `Orchestrator` struct. The Rust port mirrors that file split one-to-one (one file
+under `src/` per Go source file, plus the Rust-only additions listed below);
 resist the urge to further decompose or merge modules; the file boundary IS the port boundary and
 every file's own top-of-file doc comment names its exact Go source. Read that comment first when
 touching a file you don't know — it also records that file's specific Go→Rust deviations, which
@@ -54,7 +54,7 @@ the `Orchestrator` struct itself. Concretely:
   try to hold a borrow of `self.eff` across an `.await` — follow the existing owned-locals pattern
   instead of fighting the borrow checker with `Arc<Mutex<..>>`.
 
-## Module groups (36 files)
+## Module groups
 
 - **Core state**: `orchestrator.rs` (the `Orchestrator` struct + `RunningEntry`/`EventRecord`),
   `effective.rs` (`Config` → `Effective`/`ResolvedProject`, rebuilt+swapped on reload).
@@ -115,7 +115,20 @@ the `Orchestrator` struct itself. Concretely:
   the review-state move having succeeded, which is why the sender is on the handle rather than
   reached through `Event` — the move happens off-loop, after the control round-trip returned.
   `quorum.enabled` defaults false and spawns no task at all, so a default installation has no delta
-  to have.
+  to have. `teamsears.rs` is §0.13's **manager room reader**: it runs INSIDE `triage.rs`'s cycle
+  rather than in a task of its own (it needs exactly what a cycle already fetched — the candidate
+  set is its validation set, and the manager's model budget is the one it spends), reads only
+  `operator` posts, and can take only actions the manager was already authorized to take. Three
+  boundaries there are security properties rather than style, and each is enforced by construction:
+  ticket keys are extracted VERBATIM from the post and validated against the fetched issues (a model
+  may choose among them and may never introduce one — `validate_targets`); the intent map is a
+  CLOSED enum, so widening what a room post can cause requires editing it and shows in a diff; and
+  the one path that moves post text into a running agent uses `room_operator_wrap`, deliberately NOT
+  `message.rs`'s `operator_wrap`, because `from: operator` on a room line is forgeable by any local
+  process. Don't add a variant to `Intent`, don't let a key reach an action without going through
+  `find_issue`, and don't "unify" the two wraps. Its live-run relay rides the `stop.rs` seam
+  (`Event::TeamsRelay` → `handle_teams_relay`, which reuses `admit_to_mailbox`), so it is not a
+  fifth state seam.
 - **Cross-cutting constants**: `backoff.rs` (retry-cadence math), `telemetry_attrs.rs` (the
   bounded metric-label cardinality contract — project/model/outcome/reason only; never add an
   issue/run/session id here, that's a correctness bug, not a style nit).

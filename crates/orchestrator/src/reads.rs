@@ -53,6 +53,49 @@ pub struct ProjectTracker {
     pub tracker: Arc<dyn Tracker>,
 }
 
+/// What the off-loop Teams tasks need to know about ONE enabled project that no tracker call can
+/// answer, snapshotted from the reload that built it (STUDIO-678, design §0.13).
+///
+/// Both fields exist for the same reason: the manager's room reader files a review ticket off the
+/// control task, and the two things a filing needs beyond the ticket itself — the state it opens in
+/// and the GitHub remote its pull request lives on — are properties of the daemon's CONFIG, not of
+/// Linear. The quorum reads them straight off `Orchestrator` because it plans on the control task;
+/// this reader has no orchestrator by construction, so they are published to it instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectFacts {
+    /// The workflow state a filed review ticket opens in: this project's FIRST configured active
+    /// state. `Orchestrator::quorum_create_state`'s rule verbatim, and for its reason — a review
+    /// ticket created in a state this daemon does not dispatch from wakes nobody, so the literal
+    /// "Todo" would be worse than wrong in a workspace that spells it otherwise.
+    pub create_state: String,
+    /// The GitHub remote this project's runs push to, parsed from its repo URL. Empty for a project
+    /// with no GitHub remote, which simply means no pull request can be resolved for it.
+    pub pr_owner: String,
+    pub pr_repo: String,
+}
+
+/// Everything the off-loop Teams tasks need from ONE reload, read under one lock.
+///
+/// A struct rather than the tuple it grew out of: the fields must move together (see
+/// [`Orchestrator::set_reads_triage_snapshot`]), and a tuple that has to stay in sync is one a
+/// future field will quietly be added outside of.
+#[derive(Clone, Default)]
+pub struct TriageSnapshot {
+    /// Every ENABLED project's slug-bound tracker, in the poll loop's order, each carrying the slug
+    /// it is bound to (STUDIO-677). Triage itself sweeps every project and reads only the clients;
+    /// the slug is here because this is the one snapshot the reload publishes, and the writers that
+    /// must pick exactly one project take it from the same `ReadsTarget` field.
+    pub trackers: Vec<ProjectTracker>,
+    /// The same reload's dispatchable-state sets.
+    pub states: DispatchStates,
+    /// One entry per tracker in [`Self::trackers`], **positionally**, so the client an issue
+    /// arrived through selects the facts a filing about it uses.
+    pub facts: Vec<ProjectFacts>,
+    /// The configured summon token (e.g. `@symphony`), so host-composed reviewer instructions name
+    /// the token THIS installation re-engages on rather than a hard-coded guess.
+    pub summon_token: String,
+}
+
 /// The account-level tracker + resolved key backing the read-only Linear surfaces, guarded by
 /// [`Orchestrator::reads`]. `tracker` is `None` before the first config load; `api_key` is kept
 /// ONLY to render a masked indicator ([`mask_token`]) and is never returned raw. Mirrors the Go
@@ -77,6 +120,11 @@ pub struct ReadsTarget {
     /// "would the selection gate hold this ticket?" without holding the `Effective` that answers
     /// it. Published beside `project_trackers`, from the same reload, for the same reason.
     pub states: DispatchStates,
+    /// Per-project facts the manager's room reader files review tickets with (STUDIO-678), one per
+    /// entry of `project_trackers` and positionally aligned with it.
+    pub project_facts: Vec<ProjectFacts>,
+    /// The configured summon token, published with the rest of the reload for the same reason.
+    pub summon_token: String,
 }
 
 /// The resolved "connected as" account for the Settings identity endpoint (INF-224). `masked_token`
@@ -124,10 +172,12 @@ impl Orchestrator {
     /// and that is safe: `reads_triage_target` reads it only as a "has a config ever loaded"
     /// sentinel and never correlates it with either field, so a reader between the two writes sees
     /// the previous reload's pair — stale together, never mixed.
-    pub fn set_reads_triage_snapshot(&self, trackers: Vec<ProjectTracker>, states: DispatchStates) {
+    pub fn set_reads_triage_snapshot(&self, snapshot: TriageSnapshot) {
         let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
-        w.project_trackers = trackers;
-        w.states = states;
+        w.project_trackers = snapshot.trackers;
+        w.states = snapshot.states;
+        w.project_facts = snapshot.facts;
+        w.summon_token = snapshot.summon_token;
     }
 
     /// Lists the workspace's Linear projects for the add-agent picker (INF-224), reusing the
@@ -232,17 +282,15 @@ impl ControlHandle {
     /// half. Neither alone is sufficient, which is why the reload path uses that publisher.
     ///
     /// Cloning the values out releases the lock immediately — it is never held across an `await`.
-    pub fn reads_triage_target(&self) -> Option<(Vec<Arc<dyn Tracker>>, DispatchStates)> {
+    pub fn reads_triage_target(&self) -> Option<TriageSnapshot> {
         let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
         r.tracker.as_ref()?;
-        // Triage sweeps every project, so it wants the clients and not the slugs they are bound to
-        // (STUDIO-677 kept the slug beside each one for the quorum, which picks exactly one).
-        let trackers = r
-            .project_trackers
-            .iter()
-            .map(|p| p.tracker.clone())
-            .collect();
-        Some((trackers, r.states.clone()))
+        Some(TriageSnapshot {
+            trackers: r.project_trackers.clone(),
+            states: r.states.clone(),
+            facts: r.project_facts.clone(),
+            summon_token: r.summon_token.clone(),
+        })
     }
 }
 

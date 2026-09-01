@@ -219,6 +219,79 @@ impl OpenPrSource for GH {
     }
 }
 
+/// The fallible result of a [`PrBranchSource`] query: the pull request's head branch, `None` when
+/// there is no such PR in the queried repository (or its head is a fork's), or an error when the
+/// lookup itself could not be made. [`OpenPrResult`]'s three cases and their reason.
+pub type PrBranchResult = Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Resolves the head branch of a pull request named by number (STUDIO-678, design §0.13).
+///
+/// **No Go counterpart**, and the exact inverse of [`OpenPrSource`]. STUDIO-674 established that
+/// `symphony/<key>` is the link between a ticket and its pull request on installations whose Linear
+/// holds no GitHub attachments; the manager's room reader needs that link read the other way, because
+/// an operator pastes a PR URL and the ticket it belongs to is what has to be validated against the
+/// team's projects. One `gh` call answers it, and the branch is then parsed back to a key by the
+/// caller — the SAME frozen `symphony/<key>` contract, not a second convention.
+///
+/// Kept out of [`OpenPrSource`] rather than added to it: that trait is the quorum's PR gate and its
+/// implementors exist to answer one question. A reader that needs both asks both.
+#[async_trait]
+pub trait PrBranchSource: Send + Sync {
+    async fn head_branch_for_pr(&self, owner: &str, repo: &str, number: i64) -> PrBranchResult;
+}
+
+#[async_trait]
+impl PrBranchSource for GH {
+    /// One bounded `gh pr view <number> --repo <owner>/<repo> --json headRefName,headRepositoryOwner`.
+    ///
+    /// **A pull request whose head is a fork is rejected**, for the reason
+    /// [`OpenPrSource::open_pr_for_branch`] rejects one: a stranger may open a PR against a public
+    /// repository from a branch called anything at all, and resolving its head would let a pasted URL
+    /// name a ticket key that this daemon then acts on. A candidate that does not state its head
+    /// repository (a deleted fork answers `null`) is rejected for the same reason — it cannot be shown
+    /// to be ours. The comparison is on the OWNER, case-insensitively, exactly as STUDIO-674's is.
+    ///
+    /// An empty owner or repo, or a non-positive number, is not an error and not a query: there is
+    /// nothing to ask, so it answers `None` without spawning `gh`.
+    async fn head_branch_for_pr(&self, owner: &str, repo: &str, number: i64) -> PrBranchResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Ok(None);
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let args = [
+            "pr",
+            "view",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--json",
+            "headRefName,headRepositoryOwner",
+        ];
+        let body = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("gh pr view {num} --repo {slug}: {e}").into()
+        })?;
+        let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr view {num} --repo {slug}: {e}").into()
+            },
+        )?;
+        let head_owner = pr
+            .get("headRepositoryOwner")
+            .and_then(|o| o.get("login"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !head_owner.eq_ignore_ascii_case(owner) {
+            return Ok(None);
+        }
+        Ok(pr
+            .get("headRefName")
+            .and_then(serde_json::Value::as_str)
+            .filter(|b| !b.is_empty())
+            .map(str::to_string))
+    }
+}
+
 #[async_trait]
 impl SummonSource for GH {
     /// Makes exactly two `gh api` calls (issues/comments + pulls/comments), matches the summon
@@ -528,6 +601,110 @@ mod tests {
             msg.contains("gh: command not found"),
             "error wraps the underlying cause: {msg}"
         );
+    }
+
+    // ── head_branch_for_pr (STUDIO-678, §0.13; no Go counterpart) ──────────────────────────────
+
+    /// The happy path: one bounded `gh pr view`, and the head branch read out of it. The argv is
+    /// asserted in full because it IS the contract with GitHub.
+    #[tokio::test]
+    async fn head_branch_for_pr_returns_the_head_branch() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"headRefName":"symphony/STUDIO-654","headRepositoryOwner":{"login":"o"}}"#,
+                Arc::clone(&seen),
+            )),
+        );
+
+        let got = src
+            .head_branch_for_pr("o", "r", 230)
+            .await
+            .expect("head_branch_for_pr");
+
+        assert_eq!(got.as_deref(), Some("symphony/STUDIO-654"));
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr view 230 --repo o/r --json headRefName,headRepositoryOwner".to_string()],
+        );
+    }
+
+    /// A fork's pull request resolves to NOTHING. `gh pr view` will happily describe a stranger's
+    /// PR against a public repository, and its head branch could be called `symphony/STUDIO-1` —
+    /// which would let a pasted URL name one of this team's tickets. The owner check is what stops
+    /// a URL from choosing its own answer.
+    #[tokio::test]
+    async fn head_branch_for_pr_rejects_a_forks_pull_request() {
+        for body in [
+            r#"{"headRefName":"symphony/STUDIO-654","headRepositoryOwner":{"login":"stranger"}}"#,
+            r#"{"headRefName":"symphony/STUDIO-654","headRepositoryOwner":null}"#,
+            r#"{"headRefName":"symphony/STUDIO-654"}"#,
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert_eq!(
+                src.head_branch_for_pr("o", "r", 230).await.expect("lookup"),
+                None,
+                "a head this daemon cannot show is its own must not resolve: {body}"
+            );
+        }
+    }
+
+    /// A login differing only in case is the same account — GitHub logins are case-insensitive, and
+    /// config spells the owner however the operator typed it.
+    #[tokio::test]
+    async fn head_branch_for_pr_matches_the_owner_case_insensitively() {
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"headRefName":"symphony/STUDIO-654","headRepositoryOwner":{"login":"O"}}"#,
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        assert_eq!(
+            src.head_branch_for_pr("o", "r", 230).await.expect("lookup"),
+            Some("symphony/STUDIO-654".to_string())
+        );
+    }
+
+    /// Nothing to ask ⇒ no `gh` process. An empty repo or a zero number is a caller that parsed
+    /// nothing, not a query.
+    #[tokio::test]
+    async fn head_branch_for_pr_without_a_target_asks_nothing() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("[]", Arc::clone(&seen))));
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0), ("o", "r", -3)] {
+            assert_eq!(
+                src.head_branch_for_pr(owner, repo, n)
+                    .await
+                    .expect("lookup"),
+                None
+            );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh call should have been made"
+        );
+    }
+
+    /// A lookup that could not be MADE is an error, distinct from "no such PR" — the caller warns
+    /// on one and stays quiet on the other.
+    #[tokio::test]
+    async fn head_branch_for_pr_propagates_a_failed_lookup() {
+        let src = GH::new(
+            "@symphony",
+            Some(Box::new(|_: &[&str]| Err("gh: not logged in".into()))),
+        );
+        assert!(src.head_branch_for_pr("o", "r", 1).await.is_err());
+
+        let undecodable = GH::new(
+            "@symphony",
+            Some(run_recording("not json", Arc::new(Mutex::new(Vec::new())))),
+        );
+        assert!(undecodable.head_branch_for_pr("o", "r", 1).await.is_err());
     }
 
     // ── open_pr_for_branch (STUDIO-674; no Go counterpart) ──────────────────────────────────────

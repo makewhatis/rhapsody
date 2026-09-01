@@ -166,6 +166,28 @@ pub fn resolve_teams_reconcile_path(
     resolve_runtime_home_file(cfg, db_override, no_store, "teams").map(|d| d.join("reconcile.json"))
 }
 
+/// Resolves the MANAGER's room watermark (STUDIO-678, design §0.13:
+/// `~/.rhapsody/teams/manager-room.cursor`).
+///
+/// Beside `teams.yaml` and `teams/reconcile.json`, by the rule every other sidecar follows — and NOT
+/// in a memory bank, because the manager is not a roster identity and giving it one would invent an
+/// identity in the memory tree nothing else agrees exists.
+///
+/// `None` (a disabled / in-memory store, or a failed config load) means there is nowhere to keep a
+/// watermark. That disables the room reader rather than running it watermark-less, which would
+/// re-answer the same posts at every restart — the durability IS the "act once", exactly as the
+/// reconcile marker's is.
+///
+/// Naming the file does not create it; the triage task writes it after a pass that acted.
+pub fn resolve_teams_ears_cursor_path(
+    cfg: Option<&Config>,
+    db_override: &str,
+    no_store: bool,
+) -> Option<PathBuf> {
+    resolve_runtime_home_file(cfg, db_override, no_store, "teams")
+        .map(|d| d.join(rhapsody_config::room::MANAGER_CURSOR_FILE))
+}
+
 /// Resolves the Rhapsody Teams memory BANKS directory (STUDIO-645, T4; design record §5.4).
 ///
 /// `memory.path` wins when set — an operator who points memory somewhere else means it. Otherwise
@@ -530,6 +552,51 @@ mod tests {
         assert!(
             !hermetic.exists(),
             "resolving a path never creates the file; only a completed sweep writes it"
+        );
+    }
+
+    /// STUDIO-678 (design §0.13): the MANAGER's room watermark colocates with `teams.yaml` and
+    /// `teams/reconcile.json` by the same rule, and is `None` for every daemon with no durable home.
+    ///
+    /// The `None` cases are the load-bearing half rather than an edge: a room reader with nowhere to
+    /// keep a watermark would re-answer its whole window at every restart, so "no home" must disable
+    /// it rather than run it forgetfully — exactly as it disables the one-time reconcile.
+    #[test]
+    fn resolve_teams_ears_cursor_path_variants() {
+        let dir = TempDir::new();
+        let ws = dir.child("ws");
+        let wf = write_wf(&dir, &valid_wf(&ws));
+        let cfg = resolve(
+            decode(&workflow::load(&wf).expect("load")).expect("decode"),
+            &workflow_dir(&wf),
+        )
+        .expect("resolve");
+        let got =
+            resolve_teams_ears_cursor_path(Some(&cfg), "", false).expect("on-disk default → Some");
+        assert!(
+            got.ends_with(".rhapsody/teams/manager-room.cursor"),
+            "default should be ~/.rhapsody/teams/manager-room.cursor, got {}",
+            got.display()
+        );
+        assert_eq!(
+            resolve_teams_ears_cursor_path(None, "/tmp/somewhere/store.db", false)
+                .expect("--db → Some"),
+            PathBuf::from("/tmp/somewhere/teams/manager-room.cursor")
+        );
+        assert_eq!(resolve_teams_ears_cursor_path(Some(&cfg), "", true), None); // --no-store
+        assert_eq!(resolve_teams_ears_cursor_path(None, "off", false), None);
+        assert_eq!(
+            resolve_teams_ears_cursor_path(None, ":memory:", false),
+            None
+        );
+        assert_eq!(resolve_teams_ears_cursor_path(None, "", false), None); // failed load
+        // It sits beside the reconcile marker rather than in a memory bank: the manager is not a
+        // roster identity and has no bank to put a cursor in.
+        assert_eq!(
+            got.parent(),
+            resolve_teams_reconcile_path(Some(&cfg), "", false)
+                .expect("some")
+                .parent()
         );
     }
 

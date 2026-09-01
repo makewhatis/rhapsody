@@ -340,6 +340,40 @@ mod tests {
             .collect()
     }
 
+    /// **The manager's room relay** (STUDIO-678, §0.13): an operator room post reaches the live run
+    /// on the ticket the manager resolved, carrying the caller's wrap verbatim and NOT the operator
+    /// wrap — the relay must not lend a room line authority the daemon cannot prove it has.
+    ///
+    /// Keyed by the human identifier rather than a run id, because the reader knows the TICKET and a
+    /// run id it looked up a moment earlier could belong to a different run by the time this lands.
+    #[tokio::test]
+    async fn a_room_relay_reaches_the_live_run_on_that_ticket_without_the_operator_wrap() {
+        let Harness { mut o, .. } = post_harness(&["alice"]);
+        dispatch_as(&mut o, "ID-A", "MT-1", "alice");
+
+        let wrapped = crate::teamsears::room_operator_wrap("try the other lock ordering");
+        assert!(
+            o.handle_teams_relay("MT-1", &wrapped),
+            "alice's run is live"
+        );
+
+        let got = o
+            .mailbox_try_recv("ID-A")
+            .expect("alice's mailbox is empty");
+        assert_eq!(
+            got, wrapped,
+            "the caller's wrap is passed through unchanged"
+        );
+        assert!(got.contains("UNVERIFIED"), "got = {got}");
+        assert!(
+            !got.contains("OPERATOR MESSAGE"),
+            "the operator wrap must appear NOWHERE in a room relay: {got}"
+        );
+
+        // A ticket with no live run is `false`, not an error — the manager then says so.
+        assert!(!o.handle_teams_relay("MT-9", &wrapped));
+    }
+
     /// The teammate wrap is not the operator wrap, and shares no phrasing with it (§0.11.4). Pinned
     /// as a single-line literal so a spacing slip in the multi-line format string fails, the way
     /// `operator_wrap_matches_go` pins its counterpart.

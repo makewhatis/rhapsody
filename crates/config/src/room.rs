@@ -163,6 +163,20 @@ pub const DEFAULT_ROOM_WINDOW: usize = 20;
 /// [`MAX_BANK_SCAN`](crate::memory::MAX_BANK_SCAN).
 pub const MAX_ROOM_FILE_SCAN: usize = 32;
 
+/// The file the MANAGER's own room watermark is stored in (§0.13). It sits in
+/// the runtime home beside `teams.yaml` and `teams/reconcile.json` rather than
+/// in a bank, because the manager is not a roster identity and has no bank:
+/// [`RESERVED_IDENTITIES`] exists precisely so no teammate can take that name.
+pub const MANAGER_CURSOR_FILE: &str = "manager-room.cursor";
+
+/// The hard ceiling on one [`LocalRoom::read_forward`] page.
+///
+/// Deliberately its own constant rather than [`MAX_ROOM_WINDOW`]. That window
+/// bounds what is rendered into a turn-1 prompt, where every message is tokens
+/// on every run forever; this one bounds a page of a background reader that
+/// renders nothing, so the two have no reason to move together.
+pub const MAX_FORWARD_WINDOW: usize = 100;
+
 /// Who a message is for (§0.5's "one log, two audiences").
 ///
 /// There is deliberately no `Everyone-except` and no group: the room's whole
@@ -406,6 +420,30 @@ pub trait RoomLog: Send + Sync {
         cursor: &Cursor,
         limit: usize,
     ) -> Result<CaughtUp, RoomError>;
+
+    /// One OLDEST-first page of what is new for `reader` at `cursor`, plus the
+    /// advanced watermark (§0.13).
+    ///
+    /// **This is not [`read_since`](RoomLog::read_since) with the sort reversed,
+    /// and the difference is the whole reason it exists.** `read_since` answers
+    /// "what should this teammate see NOW", so when more is available than the
+    /// window holds it keeps the newest and drops the rest permanently — a
+    /// catch-up that showed a run a week-old post instead of yesterday's would be
+    /// worse than useless. A reader that must ACT on every message cannot lose
+    /// the ones it did not get to: this returns the OLDEST `limit` messages after
+    /// the cursor and leaves the remainder for the next page, so a backlog is
+    /// drained rather than skipped.
+    ///
+    /// The watermark it returns therefore advances past every line this page
+    /// **examined**, not merely past the ones it returned — otherwise a page of
+    /// nothing-for-me would be re-read forever. It is capped by
+    /// [`MAX_FORWARD_WINDOW`] and never creates anything.
+    fn read_forward(
+        &self,
+        reader: &str,
+        cursor: &Cursor,
+        limit: usize,
+    ) -> Result<CaughtUp, RoomError>;
 }
 
 /// The JSONL wire record — one line of a log file.
@@ -436,13 +474,41 @@ struct Wire {
 #[derive(Debug, Clone)]
 pub struct LocalRoom {
     root: PathBuf,
+    /// Serializes [`append`](LocalRoom::append) across every appender that
+    /// shares this handle (§0.13).
+    ///
+    /// §0.11.4 pinned "single writer: the daemon", and that was enough while
+    /// `file:seq` was only a catch-up watermark: two appends racing could
+    /// interleave their count-then-write and mint the same id, which cost a
+    /// reader nothing an unordered log did not already cost. §0.13 makes the id
+    /// load-bearing — the manager's reply carries the operator post's id as its
+    /// `refs`, and that is the restart dedupe — so a collision would let one
+    /// reply stand in for a post it never answered. The lock makes the pin true
+    /// at TASK granularity, not merely at process granularity.
+    ///
+    /// It is an `Arc` inside the value rather than around it so a CLONE shares
+    /// it. `LocalRoom` is `Clone` and is cloned at several wiring points; a lock
+    /// that cloning duplicated would be a lock that silently stopped working the
+    /// first time somebody wrote `room.clone()` instead of `Arc::clone(&room)`.
+    /// What it cannot serialize is a writer OUTSIDE this process — §0.13
+    /// residual 2 names that and accepts it.
+    append_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl LocalRoom {
     /// Names a room root. **Creates nothing** — not the root, not a log file.
     /// The first [`append`](LocalRoom::append) does that.
+    ///
+    /// Each call mints its OWN append lock, so two `LocalRoom`s built over the
+    /// same directory do not serialize against each other. That is why the
+    /// daemon builds exactly one and shares it (§0.13's "all appenders share ONE
+    /// `Arc<LocalRoom>`"); building a second is a read-only convenience, never a
+    /// second writer.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            append_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        }
     }
 
     /// The directory the log files sit in. Naming it does not create it.
@@ -518,6 +584,16 @@ impl LocalRoom {
                 "a room message must name who wrote it (`from` is host-stamped)".to_string(),
             ));
         }
+        // Held across count-then-write, which is what makes the minted id unique
+        // (see [`LocalRoom::append_lock`]). A poisoned lock is recovered rather
+        // than propagated: the guarded region owns no invariant a panic could
+        // corrupt — the file is the state — and a room that stopped accepting
+        // posts because one appender panicked would be a worse outcome than the
+        // panic. Same stance as the orchestrator's mailbox lock.
+        let _appending = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::fs::create_dir_all(&self.root)
             .map_err(|e| RoomError::Io(format!("create room {}: {e}", self.root.display())))?;
         let stem = Self::file_stem(msg.at);
@@ -640,9 +716,102 @@ impl LocalRoom {
     }
 }
 
+impl LocalRoom {
+    /// One OLDEST-first page from `cursor`. See [`RoomLog::read_forward`].
+    ///
+    /// Walks log files **oldest first** from the cursor's own file, and stops the
+    /// instant `limit` visible messages are in hand — so the scan is bounded by
+    /// what it returns, exactly as [`read_since`](LocalRoom::read_since)'s is,
+    /// only from the other end of the log.
+    pub fn read_forward(
+        &self,
+        reader: &str,
+        cursor: &Cursor,
+        limit: usize,
+    ) -> Result<CaughtUp, RoomError> {
+        let limit = forward_limit(limit);
+        let mut out = CaughtUp {
+            cursor: cursor.clone(),
+            ..CaughtUp::default()
+        };
+        let stems = self.stems()?;
+        let pending: Vec<&String> = stems
+            .iter()
+            .filter(|s| cursor.file.is_empty() || s.as_str() >= cursor.file.as_str())
+            // Oldest first, and the NEWEST days fall off the file-scan cap here —
+            // the opposite end from `read_since`, and for the same reason: this
+            // read drops what it will reach on its next page, not what it will
+            // never reach at all.
+            .take(MAX_ROOM_FILE_SCAN)
+            .collect();
+
+        // The last line this page actually EXAMINED, so the watermark can advance
+        // past lines that yielded no message — a corrupt line, an empty one, a
+        // direct post addressed to somebody else. Advancing only past RETURNED
+        // messages (`read_since`'s rule, right for a catch-up that must not skip)
+        // would stall a pager forever on a window that holds nothing for it.
+        let mut consumed: Option<(&str, u64)> = None;
+        'files: for stem in pending {
+            let path = self.path_for(stem);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    // One unreadable day never costs the reader the others — and
+                    // it is NOT marked consumed, so a file that becomes readable
+                    // again is still read.
+                    out.skipped
+                        .push((format!("{stem}:*"), format!("read log: {e}")));
+                    continue;
+                }
+            };
+            let skip = if stem == &cursor.file { cursor.seq } else { 0 };
+            for (idx, line) in text.lines().enumerate() {
+                if (idx as u64) < skip {
+                    continue;
+                }
+                // Full page: this line is deliberately NOT consumed, so the next
+                // page starts exactly here.
+                if out.messages.len() >= limit {
+                    break 'files;
+                }
+                consumed = Some((stem, idx as u64));
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let id = format!("{stem}:{idx}");
+                match parse_line(&id, line) {
+                    Ok(msg) => {
+                        if msg.to.visible_to(reader) {
+                            out.messages.push(msg);
+                        }
+                    }
+                    Err(why) => out.skipped.push((id, why)),
+                }
+            }
+        }
+        if let Some((file, seq)) = consumed {
+            out.cursor = Cursor {
+                file: file.to_string(),
+                seq: seq + 1,
+            };
+        }
+        Ok(out)
+    }
+}
+
 impl RoomLog for LocalRoom {
     fn append(&self, msg: &Message) -> Result<String, RoomError> {
         LocalRoom::append(self, msg)
+    }
+
+    fn read_forward(
+        &self,
+        reader: &str,
+        cursor: &Cursor,
+        limit: usize,
+    ) -> Result<CaughtUp, RoomError> {
+        LocalRoom::read_forward(self, reader, cursor, limit)
     }
 
     fn read_since(
@@ -675,6 +844,18 @@ fn effective_limit(limit: usize) -> usize {
     }
 }
 
+/// The page one [`LocalRoom::read_forward`] may return: the caller's ask, with
+/// `0` meaning [`DEFAULT_ROOM_WINDOW`] and everything clamped to
+/// [`MAX_FORWARD_WINDOW`]. [`effective_limit`]'s rule against a different
+/// ceiling, for the reason [`MAX_FORWARD_WINDOW`] states.
+fn forward_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEFAULT_ROOM_WINDOW.min(MAX_FORWARD_WINDOW)
+    } else {
+        limit.min(MAX_FORWARD_WINDOW)
+    }
+}
+
 /// Parses one JSONL line into a [`Message`] carrying the positional `id`.
 fn parse_line(id: &str, line: &str) -> Result<Message, String> {
     let wire: Wire = serde_json::from_str(line).map_err(|e| e.to_string())?;
@@ -694,6 +875,79 @@ fn parse_line(id: &str, line: &str) -> Result<Message, String> {
         body: crate::memory::truncate_bytes(&wire.body, MAX_MESSAGE_BODY_BYTES),
         refs: wire.refs,
     })
+}
+
+/// ONE watermark at an explicit path — the manager's own (§0.13).
+///
+/// [`Cursors`] resolves a path from a bank id, which is exactly what the manager
+/// does not have: it is not a roster identity ([`RESERVED_IDENTITIES`] keeps the
+/// name out of a roster's reach), so it owns no bank and giving it one would
+/// invent an identity in the memory tree that nothing else agrees exists. Its
+/// watermark therefore sits beside `teams.yaml` in the runtime home, at
+/// [`MANAGER_CURSOR_FILE`], and this type is the reader/writer for it.
+///
+/// **Written temp+rename**, unlike [`Cursors::save`]'s plain write, and the
+/// asymmetry is deliberate rather than an inconsistency. A teammate's watermark
+/// governs catch-up: a torn one degrades to a bounded re-read of posts that are
+/// only rendered into a prompt. This one governs ACTION — every post it fails to
+/// skip past is a post the manager acts on twice — so it gets the atomic write
+/// every other `~/.rhapsody` sidecar that matters gets.
+///
+/// **Creates nothing on read**, and creates only the parent directory on write.
+#[derive(Debug, Clone)]
+pub struct CursorFile {
+    path: PathBuf,
+}
+
+impl CursorFile {
+    /// Names a cursor file. **Creates nothing.**
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// The path this reads and writes, for a caller that logs it.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The stored watermark, TOTAL: absent, unreadable or unparseable all read
+    /// as [`Cursor::default`]. [`Cursors::load`]'s rule.
+    pub fn load(&self) -> Cursor {
+        self.try_load().unwrap_or_default()
+    }
+
+    /// [`CursorFile::load`] with the reason preserved — absent is
+    /// `Ok(Cursor::default())`, unreadable is `Err`, unparseable is
+    /// `Ok(Cursor::default())`. [`Cursors::try_load`]'s split, verbatim.
+    pub fn try_load(&self) -> Result<Cursor, RoomError> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => Ok(Cursor::parse(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Cursor::default()),
+            Err(e) => Err(RoomError::Io(format!(
+                "read cursor {}: {e}",
+                self.path.display()
+            ))),
+        }
+    }
+
+    /// Stores the watermark, creating the parent directory, temp+rename.
+    pub fn save(&self, cursor: &Cursor) -> Result<(), RoomError> {
+        let dir = match self.path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::create_dir_all(dir)
+            .map_err(|e| RoomError::Io(format!("create {}: {e}", dir.display())))?;
+        let (file, tmp) = crate::workflow::create_temp(dir, "manager-room")
+            .map_err(|e| RoomError::Io(format!("create temp in {}: {e}", dir.display())))?;
+        let body = format!("{}\n", cursor.as_text());
+        crate::workflow::write_temp_and_rename(file, &tmp, body.as_bytes(), 0o600, &self.path)
+            .map_err(|e| {
+                // A temp file left behind would accumulate one per failed write.
+                let _ = std::fs::remove_file(&tmp);
+                RoomError::Io(format!("write cursor {}: {e}", self.path.display()))
+            })
+    }
 }
 
 /// Where each identity's room watermark is stored: `<root>/<bank-id>/cursor`
@@ -1275,5 +1529,277 @@ mod tests {
 
     fn bodies(c: &CaughtUp) -> Vec<String> {
         c.messages.iter().map(|m| m.body.clone()).collect()
+    }
+}
+
+/// §0.13's room primitives: the oldest-first pager, the manager's own cursor
+/// file, and the append lock that keeps `file:seq` unique now that a reply's
+/// `refs` depend on it.
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(day: u32, hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, day, hour, 0, 0)
+            .single()
+            .expect("a real instant")
+    }
+
+    fn room(dir: &Path) -> LocalRoom {
+        LocalRoom::new(dir.join(DEFAULT_ROOM_SUBDIR))
+    }
+
+    fn post(r: &LocalRoom, from: &str, day: u32, hour: u32, body: &str) -> String {
+        r.append(&Message::room(from, at(day, hour), body))
+            .expect("append")
+    }
+
+    fn bodies(c: &CaughtUp) -> Vec<&str> {
+        c.messages.iter().map(|m| m.body.as_str()).collect()
+    }
+
+    /// **The bug this whole read exists for.** `read_since` keeps the NEWEST
+    /// `limit` and drops the rest forever, so a manager behind a backlog would
+    /// never see the post at the front of it. `read_forward` keeps the OLDEST
+    /// and leaves the remainder for the next page.
+    #[test]
+    fn a_backlogged_post_is_paged_oldest_first_never_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = room(dir.path());
+        for n in 0..5 {
+            post(&r, "operator", 1, 9 + n, &format!("post {n}"));
+        }
+
+        let newest = r.read_since("", &Cursor::default(), 2).expect("read_since");
+        assert_eq!(
+            bodies(&newest),
+            vec!["post 3", "post 4"],
+            "read_since keeps the newest and silently drops posts 0-2"
+        );
+
+        let page1 = r
+            .read_forward("", &Cursor::default(), 2)
+            .expect("read_forward");
+        assert_eq!(bodies(&page1), vec!["post 0", "post 1"]);
+        let page2 = r.read_forward("", &page1.cursor, 2).expect("read_forward");
+        assert_eq!(bodies(&page2), vec!["post 2", "post 3"]);
+        let page3 = r.read_forward("", &page2.cursor, 2).expect("read_forward");
+        assert_eq!(bodies(&page3), vec!["post 4"]);
+        let page4 = r.read_forward("", &page3.cursor, 2).expect("read_forward");
+        assert!(page4.messages.is_empty(), "the log is drained");
+        assert_eq!(page4.cursor, page3.cursor, "an empty page does not move");
+    }
+
+    /// Paging crosses day-partitioned files in chronological order, because the
+    /// stems sort that way and the walk is oldest-first.
+    #[test]
+    fn paging_crosses_files_oldest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = room(dir.path());
+        post(&r, "operator", 1, 9, "monday");
+        post(&r, "operator", 2, 9, "tuesday");
+        post(&r, "operator", 3, 9, "wednesday");
+
+        let page = r
+            .read_forward("", &Cursor::default(), 2)
+            .expect("read_forward");
+        assert_eq!(bodies(&page), vec!["monday", "tuesday"]);
+        assert_eq!(page.cursor.file, "2026-08-02");
+        let rest = r.read_forward("", &page.cursor, 2).expect("read_forward");
+        assert_eq!(bodies(&rest), vec!["wednesday"]);
+    }
+
+    /// The watermark advances past lines that yielded this reader NOTHING — a
+    /// corrupt line and a direct post addressed to somebody else. Advancing only
+    /// past returned messages would park a pager on them forever.
+    #[test]
+    fn the_watermark_advances_past_lines_that_yielded_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = room(dir.path());
+        post(&r, "operator", 1, 9, "for everyone");
+        r.append(&Message::addressed("bob", "alice", at(1, 10), "for alice"))
+            .expect("append");
+        let log = dir
+            .path()
+            .join(DEFAULT_ROOM_SUBDIR)
+            .join("2026-08-01.jsonl");
+        let mut text = std::fs::read_to_string(&log).expect("read log");
+        text.push_str("{not json\n");
+        std::fs::write(&log, &text).expect("write log");
+
+        let page = r
+            .read_forward("carol", &Cursor::default(), 50)
+            .expect("read");
+        assert_eq!(
+            bodies(&page),
+            vec!["for everyone"],
+            "alice's post is not carol's"
+        );
+        assert_eq!(
+            page.skipped.len(),
+            1,
+            "the corrupt line is reported: {:?}",
+            page.skipped
+        );
+        assert_eq!(
+            page.cursor,
+            Cursor {
+                file: "2026-08-01".to_string(),
+                seq: 3
+            },
+            "every examined line is consumed, not only the returned one"
+        );
+
+        let again = r.read_forward("carol", &page.cursor, 50).expect("read");
+        assert!(again.messages.is_empty() && again.skipped.is_empty());
+    }
+
+    /// A full page stops exactly ON the unread line, never past it.
+    #[test]
+    fn a_full_page_does_not_consume_the_line_it_stopped_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = room(dir.path());
+        post(&r, "operator", 1, 9, "a");
+        post(&r, "operator", 1, 10, "b");
+
+        let page = r.read_forward("", &Cursor::default(), 1).expect("read");
+        assert_eq!(bodies(&page), vec!["a"]);
+        assert_eq!(
+            page.cursor,
+            Cursor {
+                file: "2026-08-01".to_string(),
+                seq: 1
+            }
+        );
+        assert_eq!(
+            bodies(&r.read_forward("", &page.cursor, 1).expect("read")),
+            vec!["b"]
+        );
+    }
+
+    /// Reading a room that was never written is an empty page, not an error and
+    /// not a `mkdir` — the module's never-create-on-read rule, extended.
+    #[test]
+    fn reading_an_absent_room_forward_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = room(dir.path());
+        let page = r.read_forward("", &Cursor::default(), 10).expect("read");
+        assert!(page.messages.is_empty());
+        assert_eq!(page.cursor, Cursor::default());
+        assert!(!dir.path().join(DEFAULT_ROOM_SUBDIR).exists());
+    }
+
+    /// The page is clamped to [`MAX_FORWARD_WINDOW`], and `0` means the default
+    /// window rather than "everything" — [`effective_limit`]'s trap, closed the
+    /// same way on this side.
+    #[test]
+    fn the_forward_page_is_clamped_and_zero_is_the_default() {
+        assert_eq!(forward_limit(0), DEFAULT_ROOM_WINDOW);
+        assert_eq!(forward_limit(7), 7);
+        assert_eq!(forward_limit(usize::MAX), MAX_FORWARD_WINDOW);
+    }
+
+    /// §0.13's concurrency bound: concurrent appends through ONE shared handle
+    /// mint distinct `file:seq` ids. Without the lock the count-then-write races
+    /// and two posts collide on one id — which, now that a reply's `refs` carry
+    /// that id, would let one reply stand in for a post it never answered.
+    #[test]
+    fn concurrent_appends_through_one_handle_never_collide_on_an_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = std::sync::Arc::new(room(dir.path()));
+        let mut handles = Vec::new();
+        for n in 0..8 {
+            let r = std::sync::Arc::clone(&r);
+            handles.push(std::thread::spawn(move || {
+                (0..8)
+                    .map(|i| {
+                        r.append(&Message::room("operator", at(1, 9), format!("{n}-{i}")))
+                            .expect("append")
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let ids: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "an id was minted twice: {ids:?}");
+
+        // And every line is readable: a torn interleave would have produced a
+        // line the parser rejects.
+        let page = r
+            .read_forward("", &Cursor::default(), MAX_FORWARD_WINDOW)
+            .expect("read");
+        assert_eq!(page.messages.len(), 64);
+        assert!(page.skipped.is_empty(), "{:?}", page.skipped);
+    }
+
+    /// A clone shares the lock, so `room.clone()` at a wiring point cannot
+    /// silently turn the single-writer pin off.
+    #[test]
+    fn a_clone_shares_the_append_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = room(dir.path());
+        let b = a.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&a.append_lock, &b.append_lock),
+            "cloning a LocalRoom must not mint a second, useless lock"
+        );
+    }
+
+    /// The manager's watermark round-trips, and an absent one is "never read
+    /// anything" rather than an error.
+    #[test]
+    fn the_manager_cursor_file_round_trips_and_creates_nothing_on_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams").join(MANAGER_CURSOR_FILE);
+        let cf = CursorFile::new(&path);
+
+        assert_eq!(cf.load(), Cursor::default());
+        assert_eq!(cf.try_load().expect("absent is Ok"), Cursor::default());
+        assert!(!path.exists(), "reading must not create {}", path.display());
+
+        let c = Cursor {
+            file: "2026-08-31".to_string(),
+            seq: 12,
+        };
+        cf.save(&c).expect("save");
+        assert_eq!(CursorFile::new(&path).load(), c);
+
+        // Garbage reads as "never read anything", never as an error that would
+        // block the manager — `Cursors::try_load`'s rule.
+        std::fs::write(&path, "not a cursor\n").expect("write");
+        assert_eq!(cf.load(), Cursor::default());
+    }
+
+    /// The write is atomic: no temp file survives it, and the destination is
+    /// never observed half-written.
+    #[test]
+    fn the_manager_cursor_write_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("teams");
+        let cf = CursorFile::new(home.join(MANAGER_CURSOR_FILE));
+        cf.save(&Cursor {
+            file: "2026-08-31".to_string(),
+            seq: 1,
+        })
+        .expect("save");
+        cf.save(&Cursor {
+            file: "2026-08-31".to_string(),
+            seq: 2,
+        })
+        .expect("save");
+        let leftovers: Vec<String> = std::fs::read_dir(&home)
+            .expect("read dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != MANAGER_CURSOR_FILE)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 }

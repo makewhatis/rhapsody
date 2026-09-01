@@ -105,7 +105,9 @@ export const MEMORY_BACKENDS = ["none", "local", "hindsight"] as const;
 // file to inherit them from. The daemon re-applies every one of them on read, so a draft that omits
 // a key gets the same answer either way — these exist so the editor shows the truth before the
 // first save. Keep them in step with the Rust constants they mirror.
-const DEFAULT_MANAGER_MODE = "labels";
+// STUDIO-678 moved this from "labels": without the model turn the manager cannot read intent out of
+// an operator's room post, so design §0.13's ruling is only partly met on a fresh install.
+const DEFAULT_MANAGER_MODE = "labels+model";
 const DEFAULT_BACKEND = "local";
 export const DEFAULT_MAX_TOKENS = 4000;
 export const DEFAULT_TIMEOUT_MS = 60000;
