@@ -98,7 +98,7 @@ pub use quorum::{
     MAX_QUORUM_BACKOFF_MS, QUORUM_REQUESTED_LABEL, QuorumDeps, QuorumRequest, QuorumTarget,
     run_quorum_task,
 };
-pub use reads::{Identity, ReadsError, ReadsTarget};
+pub use reads::{Identity, ProjectTracker, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
 pub use reload::ReloadError;
 pub use retry::{EvRetry, EvWorkerExit};

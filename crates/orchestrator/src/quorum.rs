@@ -103,6 +103,7 @@ use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
 use crate::ghsummons::OpenPrSource;
 use crate::orchestrator::Orchestrator;
+use crate::reads::ProjectTracker;
 use crate::teams::IDENTITY_LABEL_PREFIX;
 use crate::triage::MANAGER_IDENTITY;
 
@@ -164,6 +165,14 @@ pub struct QuorumRequest {
     pub parent_team_id: String,
     pub parent_identifier: String,
     pub parent_title: String,
+    /// The owning project's slug, so the off-loop task can create the review ticket through THAT
+    /// project's tracker rather than the account-level one (STUDIO-677).
+    ///
+    /// **May be empty**, and legitimately so: the legacy single-project config form stamps no slug
+    /// on a run, and there the account tracker is itself bound to `tracker.project_slug`. An empty
+    /// slug therefore means "use the account tracker", not "the project is unknown" — see
+    /// [`tracker_for`].
+    pub parent_project_slug: String,
     /// The pull request under review, as read off the ticket's Linear GitHub attachment.
     ///
     /// **May be empty** (STUDIO-674). An installation whose Linear↔GitHub integration never
@@ -200,7 +209,14 @@ pub struct QuorumRequest {
 /// The live tracker one fan-out runs against, read fresh per request so a hot-reloaded tracker is
 /// honoured — [`crate::triage::TriageTarget`]'s shape and its reason.
 pub struct QuorumTarget {
+    /// The account-level/top-level client. In the `projects:` config form its `project_slug` is
+    /// EMPTY by design, which is why it can no longer be the thing the fan-out creates through
+    /// (STUDIO-677); it remains the legacy single-project form's slug-bound client, and so the
+    /// fallback when no project tracker matches.
     pub tracker: Arc<dyn Tracker>,
+    /// Every enabled project's slug-bound client, as the last reload published them (STUDIO-677).
+    /// The fan-out creates through the one whose slug is the parent's.
+    pub project_trackers: Vec<ProjectTracker>,
 }
 
 /// Everything [`run_quorum_task`] runs against. The absence of an `Orchestrator`, a control channel
@@ -372,7 +388,7 @@ where
         );
         return FanOutcome::TrackerFailure;
     };
-    let tracker = target.tracker;
+    let tracker = tracker_for(&target, req);
 
     if req.reviewers.is_empty() {
         // §0.12: "zero ⇒ skip with a loud room post", never an error. A team of one is a valid
@@ -525,6 +541,52 @@ where
     FanOutcome::Fanned {
         created: created.len(),
         wanted: req.reviewers.len(),
+    }
+}
+
+/// Picks the client the fan-out writes through: the parent's OWN project tracker when the request
+/// names a project the last reload published one for, and the account-level tracker otherwise
+/// (STUDIO-677).
+///
+/// The account tracker cannot be the default. In the `projects:` config form it is bound to a
+/// `tracker.project_slug` validation deliberately allows to be empty — STUDIO-671's read-side wedge,
+/// here on the write side — and [`Tracker::create_issue`] REFUSES a slug-less client rather than
+/// mint an issue outside the candidate query that would ever find it. So every fan-out on such an
+/// installation failed with `create issue requires a configured tracker.project_slug`, which is the
+/// bug this resolves. The parent's project client has the slug, and it is the project the
+/// reviewer's own candidate query sweeps, so the review ticket is both creatable and findable.
+///
+/// The fallback is not a silent one. An EMPTY slug is the legacy single-project path, where the
+/// account tracker is the slug-bound client and this is simply correct. A slug that matches nothing
+/// is a project paused or removed between the dispatch and the handoff: the account tracker is then
+/// the only client left to try, and if it too is slug-less the create fails into the fan-out's
+/// existing loud "REVIEW QUORUM FAILED" room post rather than dropping the request quietly.
+fn tracker_for(target: &QuorumTarget, req: &QuorumRequest) -> Arc<dyn Tracker> {
+    if req.parent_project_slug.is_empty() {
+        tracing::debug!(
+            issue = %req.parent_identifier,
+            "teams quorum: the handed-off run names no project, so the review ticket is created \
+             through the top-level tracker (the legacy single-project form's slug-bound client)"
+        );
+        return Arc::clone(&target.tracker);
+    }
+    match target
+        .project_trackers
+        .iter()
+        .find(|p| p.slug == req.parent_project_slug)
+    {
+        Some(p) => Arc::clone(&p.tracker),
+        None => {
+            tracing::warn!(
+                issue = %req.parent_identifier,
+                project = %req.parent_project_slug,
+                projects = target.project_trackers.len(),
+                "teams quorum has no tracker for the handed-off ticket's project (paused or \
+                 removed since dispatch?); falling back to the top-level tracker, which cannot \
+                 create an issue unless it is itself bound to a project slug"
+            );
+            Arc::clone(&target.tracker)
+        }
     }
 }
 
@@ -933,6 +995,10 @@ impl Orchestrator {
             parent_team_id: re.issue.team_id.clone(),
             parent_identifier: re.issue.identifier.clone(),
             parent_title: re.issue.title.clone(),
+            // The owning project, so the off-loop task creates the review ticket through THAT
+            // project's slug-bound tracker (STUDIO-677). Empty on the legacy single-project path,
+            // which is the account tracker's own slug and handled as such.
+            parent_project_slug: re.project_slug.clone(),
             pr_url,
             // Derived from config alone, and carried even when the attachment already won so the
             // request's shape never depends on which path filled the URL. `symphony/<key>` is the
@@ -1088,18 +1154,63 @@ mod tests {
         }
     }
 
+    /// The legacy single-project shape: one tracker, which is BOTH the account client and the
+    /// slug-bound one, and no published project trackers. Requests built by [`request`] name no
+    /// project, so the fan-out writes through it.
     fn deps(teams: Teams, tr: Arc<Fake>) -> QuorumDeps<impl Fn() -> Option<QuorumTarget>> {
         QuorumDeps {
             teams: Arc::new(teams),
             target: move || {
                 Some(QuorumTarget {
                     tracker: Arc::clone(&tr) as Arc<dyn Tracker>,
+                    project_trackers: Vec::new(),
                 })
             },
             room: None,
             pr_source: None,
             max_backoff_ms: 20,
         }
+    }
+
+    /// The `projects:` shape (STUDIO-677): a slug-less ACCOUNT tracker beside the per-project
+    /// clients the reload publishes. `account` stands in for the real thing by refusing every
+    /// create with Linear's own message, so a fan-out that reached for it fails the test loudly
+    /// rather than passing on a client the production one would have refused.
+    fn deps_multi_project(
+        teams: Teams,
+        account: Arc<Fake>,
+        projects: Vec<(&str, Arc<Fake>)>,
+    ) -> QuorumDeps<impl Fn() -> Option<QuorumTarget>> {
+        let published: Vec<ProjectTracker> = projects
+            .into_iter()
+            .map(|(slug, tr)| ProjectTracker {
+                slug: slug.to_string(),
+                tracker: tr as Arc<dyn Tracker>,
+            })
+            .collect();
+        QuorumDeps {
+            teams: Arc::new(teams),
+            target: move || {
+                Some(QuorumTarget {
+                    tracker: Arc::clone(&account) as Arc<dyn Tracker>,
+                    project_trackers: published.clone(),
+                })
+            },
+            room: None,
+            pr_source: None,
+            max_backoff_ms: 20,
+        }
+    }
+
+    /// A tracker with a viewer that refuses every create exactly as the real slug-less Linear
+    /// client does — `resolve_project_id`'s pre-flight error, verbatim.
+    fn slug_less_account_tracker() -> Fake {
+        let mut tr = tracker_with_viewer();
+        tr.create_issue_err = Some(TrackerError::Other(
+            "linear_api_request: create issue requires a configured tracker.project_slug"
+                .to_string(),
+        ));
+        tr
     }
 
     /// [`deps`] with the STUDIO-674 fallback lookup wired in.
@@ -1499,6 +1610,154 @@ mod tests {
         assert_eq!(
             fan_out(&d, &request(&["bob"])).await,
             FanOutcome::TrackerFailure
+        );
+    }
+
+    // ── the writing tracker (STUDIO-677) ────────────────────────────────────────────────────────
+
+    // The bug, pinned: on a `projects:` config the ACCOUNT tracker's `project_slug` is empty by
+    // design, and `create_issue` refuses a slug-less client rather than mint a lost issue — so the
+    // fan-out must write through the parent project's OWN client. The account fake here refuses
+    // every create with Linear's real message, so a regression to `target.tracker` fails loudly.
+    #[tokio::test]
+    async fn a_slug_less_account_tracker_fans_out_through_the_parents_project_tracker() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let account = Arc::new(slug_less_account_tracker());
+        let mine = Arc::new(tracker_with_viewer());
+        let other = Arc::new(tracker_with_viewer());
+        let d = QuorumDeps {
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            ..deps_multi_project(
+                teams_quorum(&["alice", "bob", "carol"], 2),
+                Arc::clone(&account),
+                vec![
+                    ("other-proj", Arc::clone(&other)),
+                    ("my-proj", Arc::clone(&mine)),
+                ],
+            )
+        };
+        let req = QuorumRequest {
+            parent_project_slug: "my-proj".into(),
+            ..request(&["bob", "carol"])
+        };
+
+        assert_eq!(
+            fan_out(&d, &req).await,
+            FanOutcome::Fanned {
+                created: 2,
+                wanted: 2
+            },
+            "the parent's project tracker has the slug `create_issue` requires"
+        );
+
+        assert_eq!(
+            mine.create_issue_calls().len(),
+            2,
+            "both review tickets are created in the parent's own project"
+        );
+        assert!(
+            account.create_issue_calls().is_empty(),
+            "the slug-less account tracker is never asked to create anything"
+        );
+        assert!(
+            other.create_issue_calls().is_empty(),
+            "and neither is another project's client"
+        );
+        assert_eq!(
+            mine.add_label_calls().len(),
+            1,
+            "the parent is marked through the same client"
+        );
+        let posts = room_posts(&room);
+        assert_eq!(posts.len(), 1, "one ordinary fan-out post: {posts:?}");
+        assert!(
+            posts[0].body.starts_with("Requested review of"),
+            "{}",
+            posts[0].body
+        );
+    }
+
+    // The legacy single-project form stamps no project slug on a run, and THERE the account tracker
+    // is the slug-bound client. An empty slug must therefore keep writing through it — this is the
+    // path every pre-STUDIO-677 test exercises, asserted directly so the fallback is not accidental.
+    #[tokio::test]
+    async fn an_unnamed_project_still_writes_through_the_top_level_tracker() {
+        let account = Arc::new(tracker_with_viewer());
+        let proj = Arc::new(tracker_with_viewer());
+        let d = deps_multi_project(
+            teams_quorum(&["alice", "bob"], 1),
+            Arc::clone(&account),
+            vec![("some-proj", Arc::clone(&proj))],
+        );
+
+        assert_eq!(
+            fan_out(&d, &request(&["bob"])).await,
+            FanOutcome::Fanned {
+                created: 1,
+                wanted: 1
+            }
+        );
+        assert_eq!(account.create_issue_calls().len(), 1);
+        assert!(
+            proj.create_issue_calls().is_empty(),
+            "a run with no project must not be guessed into one"
+        );
+    }
+
+    // A project paused or removed between the dispatch and the handoff publishes no tracker. The
+    // fall-back is the account client, and when THAT is the slug-less one every create fails — which
+    // must degrade into the fan-out's existing loud room post and an unmarked parent, never a
+    // silent drop.
+    #[tokio::test]
+    async fn an_unresolvable_project_fails_loudly_and_leaves_the_parent_unmarked() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let account = Arc::new(slug_less_account_tracker());
+        let other = Arc::new(tracker_with_viewer());
+        let d = QuorumDeps {
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            ..deps_multi_project(
+                teams_quorum(&["alice", "bob", "carol"], 2),
+                Arc::clone(&account),
+                vec![("other-proj", Arc::clone(&other))],
+            )
+        };
+        let req = QuorumRequest {
+            parent_project_slug: "gone-proj".into(),
+            ..request(&["bob", "carol"])
+        };
+
+        assert_eq!(
+            fan_out(&d, &req).await,
+            FanOutcome::TrackerFailure,
+            "nothing was created, so the parent must stay unmarked for a later handoff"
+        );
+        assert!(
+            other.create_issue_calls().is_empty(),
+            "an unmatched slug never falls through to some OTHER project's client"
+        );
+        assert_eq!(
+            account.create_issue_calls().len(),
+            2,
+            "the only client left IS tried — the failure is Linear's, not a refusal to ask"
+        );
+        assert!(
+            account.add_label_calls().is_empty(),
+            "a fan-out that created nothing does not mark the parent"
+        );
+
+        let posts = room_posts(&room);
+        assert_eq!(posts.len(), 1, "the failure is said out loud: {posts:?}");
+        assert!(
+            posts[0].body.starts_with("REVIEW QUORUM FAILED for MT-1"),
+            "{}",
+            posts[0].body
+        );
+        assert!(
+            posts[0].body.contains("bob, carol"),
+            "naming who was asked: {}",
+            posts[0].body
         );
     }
 

@@ -103,11 +103,16 @@ impl Orchestrator {
         // form it is bound to a `tracker.project_slug` that validation allows to be empty, so it
         // sees none of the daemon's work. Paused projects are filtered here for the same reason the
         // poll loop skips them — a project nothing dispatches from has nothing to triage either.
-        let project_trackers: Vec<Arc<dyn rhapsody_tracker::Tracker>> = eff
+        // Each client's own slug rides along (STUDIO-677) so a WRITE can pick the one bound to a
+        // given project; triage, which sweeps all of them, still reads the clients alone.
+        let project_trackers: Vec<crate::reads::ProjectTracker> = eff
             .projects
             .iter()
             .filter(|p| !p.disabled)
-            .map(|p| Arc::clone(&p.tracker))
+            .map(|p| crate::reads::ProjectTracker {
+                slug: p.slug.clone(),
+                tracker: Arc::clone(&p.tracker),
+            })
             .collect();
         // Snapshot the state sets the selection gate filters by, BEFORE `eff` moves into `self`.
         let states = crate::dispatch::DispatchStates {

@@ -380,10 +380,12 @@ mod tests {
         // `dispatch_issue` stamps the identity only when routing produced one; these tests state it
         // directly so the trigger, not the router, is what is under test. `project_repo` is the
         // remote the run's worktree pushed to, which is where STUDIO-674's head-branch PR lookup is
-        // aimed; the resolved-project wiring that normally fills it is not under test here.
+        // aimed, and `project_slug` is the project whose tracker STUDIO-677's fan-out creates
+        // through; the resolved-project wiring that normally fills both is not under test here.
         if let Some(re) = o.running.get_mut(&id) {
             re.identity = identity.to_string();
             re.project_repo = "git@github.com:o/r.git".to_string();
+            re.project_slug = "proj-a".to_string();
         }
         let run_id = o.running[&id].run_id;
         let (task, handle) = start(o, &env.signal);
@@ -426,6 +428,11 @@ mod tests {
         assert_eq!(req.parent_title, "do the thing");
         assert_eq!(req.pr_url, "https://github.com/o/r/pull/7");
         assert_eq!(req.author, "alice");
+        assert_eq!(
+            req.parent_project_slug, "proj-a",
+            "the run's OWNING project, so the off-loop task creates the review ticket through \
+             that project's slug-bound tracker rather than the slug-less account one (STUDIO-677)"
+        );
         assert_eq!(
             req.reviewers,
             vec!["bob".to_string(), "carol".to_string()],
