@@ -11,6 +11,7 @@ import {
   filterEvents,
   groupLabel,
   nextRoomLimit,
+  parseAssignment,
   roomEvents,
   roomStats,
   truncateBody,
@@ -254,6 +255,37 @@ describe("3.5 — a run of deterministic assignments collapses into one group", 
   it("labels the group with the run's span, oldest time first", () => {
     const events = roomEvents(run, ROSTER);
     expect(groupLabel(events)).toMatch(/, \d\d:\d\d–\d\d:\d\d$/);
+  });
+});
+
+describe("an assignment's group line reads the ticket, the teammate and the reason back out", () => {
+  it("parses the deterministic body triage.rs writes", () => {
+    expect(parseAssignment("Assigned STUDIO-674 to jimmy (deterministic). Reason: least-loaded (7 open).")).toEqual({
+      ticket: "STUDIO-674",
+      identity: "jimmy",
+      reason: "least-loaded (7 open)",
+    });
+  });
+
+  it("parses the model-decided body, which ends without a full stop", () => {
+    expect(parseAssignment("Assigned MT-1 to alice. Reason: owns the rust label")).toEqual({
+      ticket: "MT-1",
+      identity: "alice",
+      reason: "owns the rust label",
+    });
+  });
+
+  it("keeps the label-write caveat triage.rs appends, rather than truncating the sentence", () => {
+    const parsed = parseAssignment(
+      "Assigned MT-1 to alice. Reason: least-loaded (the label write failed; the run wears the " +
+        "assignment from memory and the label reconciles on a later cycle)",
+    );
+    expect(parsed?.reason).toContain("the label write failed");
+  });
+
+  it("returns null for anything that is not that sentence, so a reword degrades to raw text", () => {
+    expect(parseAssignment("Cleaned up 2 stray identity label(s)")).toBeNull();
+    expect(parseAssignment("Assigned MT-1 to alice")).toBeNull();
   });
 });
 
