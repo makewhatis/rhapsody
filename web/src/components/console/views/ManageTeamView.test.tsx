@@ -528,6 +528,11 @@ describe("Settings parity — the four fields the Podium editor also edits", () 
     const prefix = screen.getByRole("textbox", { name: "Bank prefix" });
     expect(prefix).toHaveProperty("value", "agent-");
     fireEvent.change(prefix, { target: { value: "rhap-" } });
+    // The roster placeholder restates the default this prefix implies, so a row left blank is
+    // never a mystery — it follows the prefix rather than promising a hardcoded `agent-`.
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Teammate 1 bank" }).getAttribute("placeholder")).toBe("rhap-<name>"),
+    );
     fireEvent.click(screen.getByRole("button", { name: /View as YAML/ }));
     await waitFor(() => expect(yamlText()).toContain("bank_prefix: rhap-"));
     fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
