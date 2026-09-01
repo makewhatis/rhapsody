@@ -1,0 +1,97 @@
+/* ============================================================================
+   Rhapsody Console — design tokens (STUDIO-682; STUDIO-681 spec §1.1/§1.2/§1.5)
+
+   Extracted verbatim from the committed prototype's `<style>` `:root` block
+   (`~/.rhapsody/docs/STUDIO-681-prototype.html`). This file is the ONLY place a
+   console color, radius or type family is written down; every console component
+   and every later view (§3–§8) reads them through `var(--…)` and hardcodes no hex.
+
+   SCOPE — why these are not on `:root`.
+   `src/index.css` (the "Podium" palette the current dashboard renders on) already
+   declares `--ink`, `--line` and `--accent` with different meanings: its `--accent`
+   is a hover BACKGROUND, not the brand amber. Publishing the console palette at
+   `:root` would silently repaint the shipped dashboard mid-migration. So the
+   console palette lives on a `.rh-console` scope class, which `AppShell` puts on
+   its root element; everything inside inherits. When the redesign has replaced the
+   old screens (STUDIO-681 sub-tickets 2–6) the Podium layer retires and this scope
+   can be promoted to `:root` in one commit.
+
+   Dark, single-committed theme — the product is dark-only, so the scope root
+   paints its own background and text color rather than inheriting either.
+   The neutrals carry a slight COOL bias on purpose; do not substitute pure greys.
+   ============================================================================ */
+
+.rh-console {
+  /* ---- surfaces ---- */
+  --bg: #0c0c0e;
+  --panel: #131315;
+  --panel-2: #17171a;
+  --raise: #1c1c20;
+
+  /* ---- hairlines ---- */
+  --line: #26262c;
+  --line-soft: #1e1e23;
+
+  /* ---- text ramp (ink → ink-4, brightest to faintest) ---- */
+  --ink: #ededf0;
+  --ink-2: #9a9aa4;
+  --ink-3: #6b6b74;
+  --ink-4: #48484f;
+
+  /* ---- voices: amber is the product/teammate voice, teal is the operator's ---- */
+  --accent: #e79457;
+  --accent-soft: #2a1d13;
+  --operator: #57c3cc;
+  --operator-soft: #0f2427;
+  --handoff: #e79457;
+
+  /* ---- status ---- */
+  --ok: #63c07a;
+  --warn: #e0b64c;
+  /* --warn-soft is in the prototype's :root but omitted from the spec's §1.1 list;
+     `.note.warn` cannot render without it, and §0 makes the prototype authoritative
+     on a detail the doc leaves out. */
+  --warn-soft: #2a2312;
+  --bad: #e0685f;
+  --bad-soft: #2a1414;
+
+  /* ---- the two named teammate colors the prototype ships, plus info ----
+     Kept because §1.1 lists them; NOTHING assigns a teammate color from these by
+     name — see the --mate-* ramp below and `theme/teammates.ts` (§1.5). */
+  --alice: #e79457;
+  --jimmy: #7fa7e6;
+  --info: #7fa7e6;
+
+  /* ---- ticket keys ---- */
+  --ticket: #93a0c8;
+  --ticket-bg: #1a2033;
+  --ticket-line: #28324e;
+
+  /* ---- type (§1.2) — webfont first, then a real fallback stack ---- */
+  --sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+
+  /* ---- radii ---- */
+  --r: 12px;
+  --r-sm: 8px;
+
+  /* ---- teammate ramp (§1.5) ----
+     Assigned by ROSTER POSITION, never per name. The first two are the pair the
+     prototype shows (the values --alice/--jimmy carry); the rest extend the ramp
+     with hues already declared above, so scaling to N teammates invents no new
+     brand color. --bad is deliberately absent: red reads as "blocked". */
+  --mate-1: var(--accent);
+  --mate-2: var(--jimmy);
+  --mate-3: var(--ok);
+  --mate-4: var(--ticket);
+  --mate-5: var(--operator);
+  --mate-6: var(--warn);
+
+  /* ---- scope root: dark theme painted explicitly ---- */
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
