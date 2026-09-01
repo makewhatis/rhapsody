@@ -1804,7 +1804,7 @@ pub(crate) fn build_prompt(teams: &Teams, iss: &Issue, load: &HashMap<String, i6
 /// budget is therefore applied to the INPUT, which is the half this code actually controls, at the
 /// usual ~4 bytes/token. A zero or negative value falls back to [`MIN_PROMPT_BYTES`] rather than
 /// producing an empty prompt.
-fn prompt_budget_chars(max_tokens: i64) -> usize {
+pub(crate) fn prompt_budget_chars(max_tokens: i64) -> usize {
     let budget = max_tokens.max(0) as usize * BYTES_PER_TOKEN;
     budget.max(MIN_PROMPT_BYTES)
 }

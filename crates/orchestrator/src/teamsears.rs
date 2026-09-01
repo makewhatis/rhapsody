@@ -399,6 +399,11 @@ pub(crate) async fn ears_pass(
         tracing::warn!(line = %id, reason = %why, "teams manager skipped a corrupt room line");
     }
     if page.messages.is_empty() {
+        // Still persist the watermark. A page can consume lines and hand back NO message — corrupt
+        // ones, blank ones, a direct post addressed elsewhere — and returning here without saving
+        // would re-scan them every cycle, re-emitting the warning above forever for a single
+        // unparseable line. There is nothing to act on, so this is safe to record as read.
+        save_cursor(ears, &page.cursor);
         return report;
     }
     // Every post this manager has ALREADY answered, taken from its own replies in this same page —
@@ -450,9 +455,16 @@ pub(crate) async fn ears_pass(
     };
     // Persisted LAST — act-then-persist (§0.13). A crash before this re-reads the posts, and the
     // replies already in the log are what stop them being acted on twice.
-    if let Some(c) = final_cursor
-        && let Err(e) = ears.cursor.save(&c)
-    {
+    if let Some(c) = final_cursor {
+        save_cursor(ears, &c);
+    }
+    report
+}
+
+/// Records the watermark, best-effort. A failure costs a re-read whose posts are then skipped by
+/// their own replies, so it is loud but never fatal.
+fn save_cursor(ears: &Ears, cursor: &Cursor) {
+    if let Err(e) = ears.cursor.save(cursor) {
         tracing::warn!(
             path = %ears.cursor.path().display(),
             err = %e,
@@ -460,7 +472,6 @@ pub(crate) async fn ears_pass(
              re-read and skipped by their replies"
         );
     }
-    report
 }
 
 /// Every post id this manager has already replied to, read out of its OWN replies' `refs`.
@@ -715,27 +726,25 @@ async fn execute(
             target.key
         ));
     };
-    let (done, counter): (Done, &mut usize) = match target.intent {
-        Intent::Review => (
-            file_review(teams, ears, cycle, iss, target).await,
-            &mut report.filed,
-        ),
-        Intent::Assign => (
-            confirm_assignment(teams, cycle, iss, target).await,
-            &mut report.assigned,
-        ),
-        Intent::Relay => (relay(ears, iss, post).await, &mut report.relayed),
-        Intent::Ask => (
-            Done::say(format!(
-                "{} is in `{}`, which is not something I route from a room post on its own. Tell \
-                 me what you want done with it.",
-                iss.identifier, iss.state
-            )),
-            &mut report.answered,
-        ),
+    let done = match target.intent {
+        Intent::Review => file_review(teams, ears, cycle, iss, target).await,
+        Intent::Assign => confirm_assignment(teams, cycle, iss, target).await,
+        Intent::Relay => relay(ears, iss, post).await,
+        // Writes nothing by definition, so it has no counter — `Done::say` is the only thing it can
+        // return and `acted` is false.
+        Intent::Ask => Done::say(format!(
+            "{} is in `{}`, which is not something I route from a room post on its own. Tell me \
+             what you want done with it.",
+            iss.identifier, iss.state
+        )),
     };
-    if done.acted && !matches!(target.intent, Intent::Ask) {
-        *counter += 1;
+    if done.acted {
+        match target.intent {
+            Intent::Review => report.filed += 1,
+            Intent::Assign => report.assigned += 1,
+            Intent::Relay => report.relayed += 1,
+            Intent::Ask => {}
+        }
     }
     done
 }
@@ -1205,12 +1214,12 @@ pub(crate) fn extract_pr_urls(body: &str) -> Vec<PrRef> {
         if owner.is_empty() || repo.is_empty() || kind != "pull" {
             continue;
         }
-        let number: i64 = match num
-            .trim_end_matches(|c: char| !c.is_ascii_digit())
-            .parse()
-            .ok()
-            .filter(|n| *n > 0)
-        {
+        // The LEADING digits, not the whole segment: a pasted browser URL routinely carries a
+        // fragment or query after the number (`/pull/231#issuecomment-9`, `/pull/231?w=1`), and
+        // trimming from the END instead would leave `231#issuecomment-9` — which ends in a digit,
+        // so it would survive the trim and then fail to parse, silently losing the pull request.
+        let digits: String = num.chars().take_while(char::is_ascii_digit).collect();
+        let number: i64 = match digits.parse().ok().filter(|n| *n > 0) {
             Some(n) => n,
             None => continue,
         };
@@ -1337,7 +1346,15 @@ pub(crate) fn build_room_prompt(
     );
     s.push_str(&truncate_chars(&post.body, POST_HEAD_CHARS));
     s.push_str("\n```\n");
-    s
+    // The SAME `manager.max_tokens` budget the assignment turn applies, for the same reason and by
+    // the same reading of the key (`prompt_budget_chars`): one manager, one budget. Applied to the
+    // whole prompt and from the END, so the only thing a cap can ever cut is the tail of the post —
+    // never the rules and never the closed ticket list, which is what keeps the truncation safe as
+    // well as bounded.
+    truncate_chars(
+        &s,
+        crate::triage::prompt_budget_chars(teams.manager.max_tokens),
+    )
 }
 
 /// Parses a room turn's stdout into targets.
@@ -1713,6 +1730,97 @@ mod tests {
                     number: 231
                 },
             ]
+        );
+    }
+
+    /// A pasted browser URL carries a fragment or a query after the number; the pull request must
+    /// still resolve. Reading the LEADING digits is what makes that true — trimming trailing
+    /// non-digits leaves `231#issuecomment-9`, which ends in a digit and so survives the trim only
+    /// to fail parsing, losing the PR silently.
+    #[test]
+    fn a_pr_url_with_a_fragment_or_query_still_parses() {
+        for url in [
+            "https://github.com/o/r/pull/231#issuecomment-4321",
+            "https://github.com/o/r/pull/231?w=1",
+            "https://github.com/o/r/pull/231/files#diff-abc",
+            "see <https://github.com/o/r/pull/231>",
+        ] {
+            assert_eq!(
+                extract_pr_urls(url),
+                vec![PrRef {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 231
+                }],
+                "url = {url}"
+            );
+        }
+        // And a segment with no leading digits is still not a pull request.
+        assert!(extract_pr_urls("https://github.com/o/r/pull/new/branch").is_empty());
+    }
+
+    /// A page that consumes lines but yields NO message still records the watermark. Without that,
+    /// one corrupt line would be re-scanned every cycle and re-warned about forever.
+    #[tokio::test]
+    async fn a_page_that_yields_nothing_still_records_the_watermark() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.room
+            .append(&Message::addressed(
+                "alice",
+                "bob",
+                Utc::now(),
+                "just for bob",
+            ))
+            .expect("append");
+        let t = teams(&["alice"], ManagerMode::Labels);
+        let (issues, trackers): (Vec<Issue>, Vec<Arc<dyn Tracker>>) = (Vec::new(), Vec::new());
+        let owner = HashMap::new();
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let ears = fx.ears(FakeArbiter::never());
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, false),
+        )
+        .await;
+
+        assert_eq!(report, EarsReport::default(), "nothing to act on");
+        assert_ne!(
+            CursorFile::new(fx.cursor_path()).load(),
+            Cursor::default(),
+            "the line was consumed, so the watermark must have moved past it"
+        );
+    }
+
+    /// The room turn honours `manager.max_tokens` — one manager, one budget — and truncates from the
+    /// END, so a very long paste can only ever cost itself.
+    #[test]
+    fn the_room_prompt_honours_the_manager_token_budget() {
+        let mut t = teams(&["alice"], ManagerMode::LabelsModel);
+        t.manager.max_tokens = 1; // ⇒ the MIN_PROMPT_BYTES floor, far below a huge post
+        let issues = vec![todo("MT-2")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = Vec::new();
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let post = Message::room(OPERATOR_IDENTITY, Utc::now(), "x".repeat(50_000));
+
+        let p = build_room_prompt(
+            &t,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, true),
+            &post,
+            &["MT-2".to_string()],
+        );
+
+        assert!(
+            p.chars().count() <= 2048,
+            "budget not applied: {} chars",
+            p.chars().count()
+        );
+        assert!(
+            p.contains("Rules you cannot break"),
+            "truncation must cut the POST, never the rules"
         );
     }
 
