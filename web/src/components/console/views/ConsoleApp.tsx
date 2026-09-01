@@ -14,6 +14,7 @@ import { useVersionQuery } from "@/hooks/useTeams";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
+import { MemoryView } from "./MemoryView";
 import { SettingsView } from "./SettingsView";
 
 // The Rhapsody Console shell — STUDIO-681 §2, built by STUDIO-683. The persistent rail on every
@@ -88,7 +89,9 @@ function ConsoleBody({
     case "teams":
       return <Pending title="Teams" section="§5" subTicket={3} />;
     case "memory":
-      return <Pending title="Memory" section="§6" subTicket={4} />;
+      // "View run" has no run route of its own (§2.3) — a fact's run lives on its ticket's Job
+      // detail, which is where the runs list already is.
+      return <MemoryView onNavigate={(to, key) => go(to, key)} />;
     case "manage":
       return <Pending title="Manage team" section="§7" subTicket={5} />;
     default:

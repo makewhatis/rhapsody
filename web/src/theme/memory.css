@@ -1,0 +1,87 @@
+/* The Memory page — STUDIO-681 §6, built by STUDIO-685.
+ *
+ * Ported from the committed prototype's `===== memory page =====` block
+ * (`~/.rhapsody/docs/STUDIO-681-prototype.html`). Scoped under `.rh-console` for the same reason
+ * `console.css` and `teams-console.css` are: `.bar`, `.fact`, `.badge` and `.who` are generic
+ * names, and the Podium dashboard still owns the document while the console lands dark (§2.2.1).
+ *
+ * Every color is a token from `tokens.css` (§1.1). The one literal, `#3a1c1c`, is the
+ * prototype's danger hairline: it duplicates no token (it sits between --bad-soft and --bad),
+ * and `console-views.css` carries its hover greys the same way.
+ */
+
+.rh-console .memstats { margin-bottom: 16px; }
+.rh-console .memnote { margin-bottom: 14px; max-width: 1000px; }
+
+/* The sticky filter bar (§6). `top` clears the shell's own padding, as the prototype's does. */
+.rh-console .bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 11px 12px; border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--panel); margin-bottom: 14px; position: sticky; top: 12px; z-index: 5;
+}
+.rh-console .bar .srch {
+  flex: 1; min-width: 200px; display: flex; align-items: center; gap: 8px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 0 10px;
+}
+.rh-console .bar .srch svg { width: 14px; height: 14px; color: var(--ink-4); flex: none; }
+.rh-console .bar .srch input {
+  flex: 1; font: inherit; font-size: 13px; color: var(--ink);
+  background: none; border: 0; padding: 9px 0;
+}
+.rh-console .bar .srch input:focus { outline: none; }
+.rh-console .bar .srch:focus-within { border-color: var(--accent); }
+
+.rh-console .facts { display: flex; flex-direction: column; gap: 12px; max-width: 1000px; }
+.rh-console .fact {
+  border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); padding: 14px 15px;
+}
+.rh-console .fact .top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
+/* The teammate's own color comes from §1.5's roster-position ramp, set inline by the view. */
+.rh-console .fact .who { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13px; }
+.rh-console .fact .top .rt { margin-left: auto; display: flex; align-items: center; gap: 9px; }
+.rh-console .badge {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
+  border: 1px solid var(--line-soft); border-radius: 99px; padding: 2px 8px;
+}
+.rh-console .badge.local { color: var(--ok); }
+.rh-console .fact .body { font-size: 13.5px; color: var(--ink-2); line-height: 1.6; white-space: pre-wrap; }
+.rh-console .fact .foot {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--line-soft);
+}
+.rh-console .prov { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); }
+.rh-console .fact .acts { margin-left: auto; display: flex; gap: 8px; }
+.rh-console .ghost.danger { color: var(--bad); border-color: #3a1c1c; background: var(--bad-soft); }
+.rh-console .ghost.danger:hover:not(:disabled) { background: #3a1c1c; color: var(--ink); }
+.rh-console .ghost:disabled { opacity: .45; cursor: not-allowed; }
+
+/* The armed "why is this wrong?" row — revealed by the Invalidate button (§6, box 4.5). */
+.rh-console .invrow { display: flex; gap: 8px; margin-top: 10px; }
+.rh-console .invrow input {
+  flex: 1; font: inherit; font-size: 12.5px; color: var(--ink);
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: var(--r-sm); padding: 7px 10px;
+}
+.rh-console .invrow input:focus { outline: none; border-color: var(--accent); }
+
+/* An invalidated record: dimmed with a struck body, and its banner (§6, box 4.5). Nothing is
+   removed — the card stays where it was, because the undo is right there on it. */
+.rh-console .fact.dead { opacity: .55; border-color: var(--line-soft); }
+.rh-console .fact.dead .body { text-decoration: line-through; color: var(--ink-3); }
+.rh-console .deadbanner {
+  display: flex; align-items: center; gap: 8px; margin: -4px 0 11px;
+  padding: 7px 10px; border-radius: var(--r-sm);
+  background: var(--bad-soft); border: 1px solid #3a1c1c;
+  color: var(--bad); font-size: 12px;
+}
+.rh-console .deadbanner .rs { min-width: 0; }
+.rh-console .deadbanner .rein {
+  margin-left: auto; flex: none; font: inherit; font-size: 12px;
+  color: var(--ok); background: none; border: 0; padding: 0; cursor: pointer;
+}
+.rh-console .deadbanner .rein:hover { text-decoration: underline; }
+
+.rh-console .facterr { margin-top: 10px; font-size: 12px; color: var(--bad); }
+/* A bank the daemon could not read. A line rather than a Note (see the view), matching how the
+   Teams console reports a failed roster read. */
+.rh-console .memerr { margin-bottom: 14px; font-size: 12.5px; color: var(--bad); }
