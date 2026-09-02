@@ -1,0 +1,36 @@
+/* ============================================================================
+   Rhapsody Console — the first-run screen (STUDIO-692; STUDIO-681 spec §8.1)
+
+   The chrome the console puts around the SHIPPED Onboarding wizard when the
+   supervisor reports `configured: false`: the branded setup bar, the narrow
+   centred column the wizard lives in, and the scope that hands the embedded
+   wizard back the two token names both palettes spell the same way.
+
+   Scoped under `.rh-console` like every other console stylesheet, and declares
+   no colour of its own. The gradient stop `#b5643a` is the logo mark's, copied
+   from console.css's `.rail .logo .mk` because it is the same mark — the
+   prototype writes that shade as a literal there too.
+   ============================================================================ */
+
+/* The page: full height, no rail. The `.rh-console` scope already paints the background and text
+   (tokens.css), so nothing is repeated here. */
+.rh-console.setup { min-height: 100vh; display: flex; flex-direction: column; }
+
+/* The setup bar — the rail's logo lockup laid on its side, plus the SETUP marker. */
+.rh-console .setuphead { display: flex; align-items: center; gap: 9px; padding: 13px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.rh-console .setuphead b { font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
+.rh-console .setuphead .mk { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(150deg, var(--accent), #b5643a); display: grid; place-items: center; color: #160c05; font-weight: 700; font-size: 13px; }
+.rh-console .setuphead .caps { margin-left: auto; font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-4); }
+
+/* The wizard's column (Podium's first run centres on ~560px; matched so the two hosts frame the
+   same wizard the same way). */
+.rh-console .setupwrap { flex: 1; width: 100%; max-width: 560px; margin: 0 auto; padding: 34px 34px 60px; }
+.rh-console .setuperr { margin: 0 0 18px; }
+.rh-console .setuperr .link { margin-left: 4px; text-decoration: underline; }
+
+/* ---- the embedded Podium wizard ----
+   See the same note on `.wfembed` in console-workflow.css: inside `.rh-console` these two names
+   carry the console's meanings, and the wizard is built from Podium components, so the Podium
+   meanings are restored from the Podium-only aliases they are declared as at `:root` — no value
+   is duplicated here. `--ink` is deliberately NOT restored, for the reason given there. */
+.rh-console .obembed { --accent: var(--bg-hover); --line: var(--hair-card); }
