@@ -61,12 +61,16 @@
    host (never in a browser, never where the OS draws its own bar), so the served dashboard keeps
    the prototype's spacing to the pixel.
 
-   ONE strip does both jobs. It is the window's drag region, pulled full-bleed out of the rail's
-   own padding so the grab target reaches the window's top and left edges; and its height is the
-   inset, because the logo is laid out AFTER it. 28px is the standard macOS title-bar height, so
-   the lights (~y7–21) clear the mark, which starts below the strip plus the rail's 3px gap and the
-   lockup's 4px top padding. Podium's toolbar reserved the same space horizontally: a 78px left
-   pad on one 46px `data-tauri-drag-region` bar. */
+   ONE strip does both jobs. It is the window's drag region, and its height is the inset, because
+   the logo is laid out AFTER it. 28px is the standard macOS title-bar height, so the lights
+   (~y7–21) clear the mark, which starts below the strip plus the rail's 3px gap and the lockup's
+   4px top padding. Podium's toolbar reserved the same space horizontally: a 78px left pad on one
+   46px `data-tauri-drag-region` bar.
+
+   The negative margin MIRRORS `.rail`'s own `padding: 16px 12px` above, pulling the strip
+   full-bleed so the grab target reaches the window's top and left edges — change that padding and
+   change this with it. Getting them out of step only loses grab area at the very edge; the inset
+   itself comes from the height, which is why that is the number the tests pin. */
 .rh-console.overlay-titlebar .rail .drag { flex: none; height: 28px; margin: -16px -12px 0; }
 
 /* §1.7 — below 860px the rail keeps its icons and drops everything else. */

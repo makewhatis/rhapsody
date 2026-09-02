@@ -163,6 +163,20 @@ describe("source contracts", () => {
   // Podium <AppShell /> — was retired by STUDIO-687's box-6.4 flip. The root is now pinned once, in
   // ConsoleApp.test.tsx ("the flip — App.tsx renders the console").
 
+  // STUDIO-701 — same gap as `AppShell.test.tsx`'s: the setup bar's drag region is visible in the
+  // DOM, but the traffic-light reserve that stops the lights landing on the wordmark is a single
+  // CSS rule, and it is gated so a browser never sees it.
+  it("reserves the traffic lights' corner on the desktop, and only there", () => {
+    const css = src("../../../theme/console-firstrun.css");
+    const rule = /\.rh-console\.overlay-titlebar \.setuphead \{([^}]*)\}/.exec(css);
+    expect(rule).not.toBeNull();
+    // 78px is Podium `Toolbar.tsx`'s own reserve, copied rather than re-derived.
+    expect(rule?.[1]).toMatch(/padding-left:\s*78px/);
+    for (const line of css.split("\n")) {
+      if (/padding-left:\s*78px/.test(line)) expect(line).toContain(".overlay-titlebar");
+    }
+  });
+
   // §9 — "no invented endpoints". The wizard owns the whole first-run data path; this view adds
   // no request of its own, so it reaches neither the API layer nor `fetch`.
   it("adds no data path of its own", () => {

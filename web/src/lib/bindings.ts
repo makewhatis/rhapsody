@@ -72,6 +72,13 @@ export function hasBridge(): boolean {
 // Both halves of the test matter. A plain browser (the daemon's served dashboard, `vite dev`, a
 // unit test) has real browser chrome, and on Windows/Linux Tauri ignores the setting and draws a
 // normal system title bar; in either host the reserve would be dead space.
+//
+// The platform half is a UA sniff because the alternatives cost a dependency for one boolean:
+// `@tauri-apps/plugin-os` would have to be added and awaited, and `navigator.userAgentData` does
+// not exist in WKWebView. macOS WKWebView reports "Mozilla/5.0 (Macintosh; Intel Mac OS X …)" —
+// including on Apple Silicon — while the Windows (WebView2) and Linux (WebKitGTK) webviews report
+// "Windows NT" and "X11; Linux". Being wrong is cosmetic in both directions, never broken: a false
+// positive reserves space nobody needed, a false negative restores today's behaviour.
 export function hasOverlayTitlebar(): boolean {
   if (!tauriAvailable()) return false;
   return typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);

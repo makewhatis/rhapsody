@@ -2,6 +2,8 @@
 // STUDIO-681 §1.3 / §10 box 1.3 — AppShell and NavItem render from props with the states
 // the prototype shows: active, an optional count, a separator, and the capability gate
 // that §2.2 depends on (a disabled item is ABSENT, not greyed).
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { AppShell, type NavItemSpec } from "./AppShell";
@@ -124,6 +126,30 @@ describe("AppShell", () => {
     expect(container.querySelector(".rail .foot")).toBeNull();
     rerender(<AppShell items={rail(true)} active="jobs" foot={<span className="live">● live</span>} />);
     expect(container.querySelector(".rail .foot")?.textContent).toContain("live");
+  });
+});
+
+// Source contracts — the half of STUDIO-701 the DOM cannot see. The drag strip is an empty div;
+// everything that makes it a title bar (its height, and therefore the inset that keeps the logo
+// off the traffic lights) lives in CSS, so deleting that one rule would restore the collision with
+// every test above still green. Checked against the source, the `FirstRunView.test.tsx` precedent.
+describe("source contracts", () => {
+  const css = readFileSync(path.resolve(__dirname, "../../theme/console.css"), "utf8");
+
+  it("gives the drag strip a real height — the strip IS the traffic-light inset", () => {
+    const rule = /\.rh-console\.overlay-titlebar \.rail \.drag \{([^}]*)\}/.exec(css);
+    expect(rule).not.toBeNull();
+    const height = /height:\s*(\d+)px/.exec(rule?.[1] ?? "");
+    // The macOS title bar is 28px and the lights sit at ~y7-21, so anything under ~24 would put
+    // the mark back under them.
+    expect(Number(height?.[1] ?? 0)).toBeGreaterThanOrEqual(24);
+  });
+
+  it("scopes every chrome rule under .overlay-titlebar, so a browser sees none of it", () => {
+    // The gate is the whole reason the daemon-served dashboard keeps the prototype's spacing.
+    for (const line of css.split("\n")) {
+      if (line.includes(".drag")) expect(line).toContain(".overlay-titlebar");
+    }
   });
 });
 

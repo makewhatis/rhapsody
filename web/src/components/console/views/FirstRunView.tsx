@@ -48,8 +48,11 @@ export function FirstRunView({
           `SetupToolbar` makes the same trade). */}
       {/* Unlike the rail, this bar IS horizontal, so it takes the traffic lights the way Podium's
           toolbar did: the drag region is the bar itself, with a left reserve for the lights
-          (console-firstrun.css). The attribute is inert without the Tauri host, and the reserve
-          only applies under `.overlay-titlebar`, so a browser sees the bar it always saw. */}
+          (console-firstrun.css). The attribute is unconditional where the rail's strip is not,
+          and the difference is deliberate — the rail's is an ELEMENT, which would take layout
+          space in a browser that does not need it, while this is an attribute on a bar that
+          exists either way, inert without the Tauri host exactly as Podium's `Toolbar` leaves it.
+          The reserve is still gated, so a browser sees the bar it always saw. */}
       <header className="setuphead" data-tauri-drag-region="">
         <span className="logo">
           <span className="mk" aria-hidden="true">
