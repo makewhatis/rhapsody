@@ -412,6 +412,18 @@ pub struct Orchestrator {
     /// off-loop review-state move succeeds, so a handoff whose Linear write failed never fans out.
     pub(crate) quorum_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::quorum::QuorumRequest>>,
 
+    /// The off-loop ticketless review INTRODUCTION task's inbox (STUDIO-720, slice 6). `None`
+    /// whenever the ticketless path is off or no task was spawned, in which case a handoff
+    /// introduces nothing — unrepresentable rather than merely skipped, which for this channel is a
+    /// security property and not an optimisation: a request on it names the repository a
+    /// `bypassPermissions` agent will check out (design §14.1 F-SEC).
+    ///
+    /// Cloned into every [`ControlHandle`](crate::stop::ControlHandle), which sends it after the
+    /// review-state move succeeds — a handoff Linear refused has not happened, so it introduces
+    /// nothing, exactly as it fans nothing out.
+    pub(crate) review_intro_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::reviewintro::ReviewIntroRequest>>,
+
     /// The **off-loop** Teams memory runtime (STUDIO-645, T4): the loaded config, the constructed
     /// backend, and the live run → identity binding a `teams_retain` is stamped from. Shared by
     /// `Arc` with the daemon's HTTP layer.
@@ -640,6 +652,7 @@ impl Orchestrator {
             quorum_load: HashMap::new(),
             quorum_facts: HashMap::new(),
             quorum_tx: None,
+            review_intro_tx: None,
             teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),

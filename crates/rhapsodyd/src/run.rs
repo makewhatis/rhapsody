@@ -225,6 +225,16 @@ where
     // handoff cannot even represent a fan-out. §0.12's cost control, enforced by construction.
     let quorum_rx = spawn_quorum(&teams_cfg).then(|| o.open_quorum_channel());
 
+    // --- ticketless review introduction (STUDIO-720, slice 6; design record
+    // ~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md §14.1 F-SEC, §15-a) ---
+    //
+    // The quorum channel's ticketless sibling, created here and for the same reason — the sender has
+    // to be on the handle that performs the handoff. Created ONLY on the ticketless path, which for
+    // THIS channel is a security property rather than a cost control: a request on it names the
+    // repository a `bypassPermissions` agent will check out, so on every other installation the
+    // introduction is unrepresentable rather than merely skipped.
+    let review_intro_rx = spawn_review_intro(&teams_cfg).then(|| o.open_review_intro_channel());
+
     // --- the Teams work-assignment seam (STUDIO-669; design record
     // ~/.rhapsody/docs/STUDIO-668-multi-team.md §A) ---
     //
@@ -537,6 +547,34 @@ where
         })
     });
 
+    // The introduction task, the ticketless path's only off-loop component in this slice. Its whole
+    // job is the ONE `gh` call that resolves a head branch to an open pull request's number — the
+    // one coordinate configuration cannot supply — after which it hands the answer back to the
+    // control task, which does the watch-set write and re-validates the repository against the
+    // configured allowlist. It performs no writes of its own and holds no `Orchestrator`.
+    let review_intro_task = review_intro_rx.map(|rx| {
+        let intro_ctx = shutdown.wait();
+        let deps = rhapsody_orchestrator::reviewintro::ReviewIntroDeps {
+            // The same `gh` seam and the same construction input as the quorum's: the summon token
+            // is all `GH::new` takes and the open-PR query does not use it, so a daemon with no
+            // readable workflow still resolves pull requests. Handed to the TASK and to nothing
+            // else, which is what keeps the control loop network-free.
+            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+                &resolved
+                    .as_ref()
+                    .map(|c| c.tracker.summon_token.clone())
+                    .unwrap_or_default(),
+                None,
+            ))),
+            sink: Arc::new(rhapsody_orchestrator::reviewintro::ControlIntroSink::new(
+                handle.clone(),
+            )),
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::reviewintro::run_review_intro_task(intro_ctx, deps, rx).await;
+        })
+    });
+
     // --- Rhapsody Teams memory prefetch (STUDIO-660, slice T8; design record §5, §5.4) ---
     //
     // The third off-loop Teams task, beside triage and the quorum, and spawned for exactly the same
@@ -588,6 +626,11 @@ where
     // The quorum task is cancelled by the same signal and checks it on both sides of its receive,
     // so the wait is bounded by whatever tracker write is already in flight.
     if let Some(t) = quorum_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // The introduction task is cancelled by the same signal and checks it on both sides of its
+    // receive, so the wait is bounded by whatever `gh` lookup is already in flight.
+    if let Some(t) = review_intro_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // The prefetch task is cancelled by the same signal and checks it on both sides of its sleep as
@@ -831,6 +874,22 @@ fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> b
 /// is a duplicate of rather than depending on the loader to have rejected the file.
 fn spawn_quorum(teams: &rhapsody_config::teams::Teams) -> bool {
     teams.enabled && teams.quorum.enabled && !teams.roster.is_empty() && !teams.review_ticketless()
+}
+
+/// Whether the ticketless review INTRODUCTION task should exist at all (STUDIO-720, slice 6;
+/// design record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md` §15-a, §16): the ticketless
+/// review path is on, and there is a roster to draw a reviewer from.
+///
+/// [`spawn_quorum`]'s exact complement on the mode, which is what makes "one handoff fires exactly
+/// one review path" true of the daemon's SPAWN decision and not only of its gates: `off` and
+/// `tickets` spawn this task not at all, and `ticketless` spawns the fan-out task not at all.
+///
+/// An EMPTY roster is excluded, unlike the quorum's case: the quorum keeps a one-person roster
+/// alive so the task can make the loud room post §0.12 asks for, whereas a ticketless introduction
+/// has no room post to make — §15-e keeps the room advisory — so with nobody to review there is
+/// nothing for the task to do at all.
+fn spawn_review_intro(teams: &rhapsody_config::teams::Teams) -> bool {
+    teams.review_ticketless() && !teams.roster.is_empty()
 }
 
 /// The claude command, effective billing guard and tracker credential the Teams triage turn runs
@@ -1733,6 +1792,77 @@ mod tests {
             !spawn_quorum(&with_mode(ReviewMode::Ticketless)),
             "the ticketless path must not also spawn the ticket fan-out"
         );
+    }
+
+    // STUDIO-720 (slice 6), design §15-a and §16: the ticketless review INTRODUCTION task exists
+    // only on the ticketless path with somebody to review, and it is `spawn_quorum`'s exact
+    // complement on the mode — so the daemon's spawn decision, not just its gates, guarantees that
+    // one handoff can fire at most one review path.
+    #[test]
+    fn spawn_review_intro_only_on_the_ticketless_path_with_somebody_to_ask() {
+        use rhapsody_config::teams::{Identity, Quorum, Review, ReviewMode, Teams};
+
+        let team = |enabled: bool, mode: ReviewMode, names: &[&str]| Teams {
+            enabled,
+            review: Review { mode },
+            quorum: Quorum {
+                enabled: false,
+                reviewers: 2,
+            },
+            roster: names
+                .iter()
+                .map(|n| Identity {
+                    name: (*n).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Teams::disabled()
+        };
+
+        assert!(spawn_review_intro(&team(
+            true,
+            ReviewMode::Ticketless,
+            &["alice", "bob"]
+        )));
+        for mode in [ReviewMode::Off, ReviewMode::Tickets] {
+            assert!(
+                !spawn_review_intro(&team(true, mode, &["alice", "bob"])),
+                "{mode:?} must spawn no introduction task"
+            );
+        }
+        assert!(
+            !spawn_review_intro(&team(false, ReviewMode::Ticketless, &["alice", "bob"])),
+            "Teams off is dormant end to end (§16), including this task"
+        );
+        assert!(
+            !spawn_review_intro(&team(true, ReviewMode::Ticketless, &[])),
+            "an empty roster has nobody to review, and this task has no room post to make about it"
+        );
+        assert!(
+            !spawn_review_intro(&Teams::disabled()),
+            "the shipped state must spawn no introduction task"
+        );
+
+        // The complement, stated as the property it exists for: no configuration spawns both.
+        for (enabled, quorum, mode) in [
+            (true, true, ReviewMode::Off),
+            (true, true, ReviewMode::Tickets),
+            (true, true, ReviewMode::Ticketless),
+            (true, false, ReviewMode::Ticketless),
+            (false, true, ReviewMode::Ticketless),
+        ] {
+            let t = Teams {
+                quorum: Quorum {
+                    enabled: quorum,
+                    reviewers: 2,
+                },
+                ..team(enabled, mode, &["alice", "bob"])
+            };
+            assert!(
+                !(spawn_quorum(&t) && spawn_review_intro(&t)),
+                "enabled={enabled} quorum={quorum} mode={mode:?} spawned both review paths"
+            );
+        }
     }
 
     // STUDIO-644 (Teams T3b), design §0.11.2 and the slice's first acceptance criterion: the triage
