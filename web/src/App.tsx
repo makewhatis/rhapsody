@@ -1,15 +1,21 @@
 import * as React from "react";
-import { AppShell } from "@/components/shell/AppShell";
+import { ConsoleApp } from "@/components/console/views/ConsoleApp";
 import { useIsDemoRoute } from "@/components/demo/route";
 
 // The primitive gallery is a verification-only route (#/demo), code-split so it never ships in
 // the main bundle. See components/demo/PrimitiveGallery.
 const PrimitiveGallery = React.lazy(() => import("@/components/demo/PrimitiveGallery"));
 
-// The Symphony app shell (INF-225) replaces the legacy Live/History/Settings dashboard. The
-// re-skinned Runs view (INF-227) and Settings tab bodies (INF-226) mount into the shell's
-// placeholder routes in follow-on tickets; the legacy dashboard components remain in the repo
-// for the Runs re-skin to build on. AppShell owns the ToastProvider internally.
+// The Rhapsody Console (STUDIO-681) is the dashboard. This is the single §2.2.1 flip: slices 1–5
+// each landed DARK — shipping mountable, tested views while this file kept rendering the Podium
+// `AppShell` — and STUDIO-687's completeness audit found every gate clean (all 44 acceptance boxes
+// green, Settings at parity, the teams-off app coherent), so the root swaps here, once.
+//
+// The Podium components are NOT dead: the console embeds the shipped Settings tabs (General,
+// Projects, Tools, Logs, Updates) and the Onboarding wizard rather than re-implementing them, so
+// this swap changes the shell and the information architecture, not the editors underneath it.
+// ConsoleApp owns the capability gate, the first-run wizard and the desktop tray/shutdown
+// subscriptions the Podium shell used to own.
 export default function App() {
   if (useIsDemoRoute()) {
     return (
@@ -33,5 +39,5 @@ export default function App() {
       </React.Suspense>
     );
   }
-  return <AppShell />;
+  return <ConsoleApp />;
 }

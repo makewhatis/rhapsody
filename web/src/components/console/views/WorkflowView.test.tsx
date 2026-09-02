@@ -248,14 +248,9 @@ describe("the console's WORKFLOW.md editor (STUDIO-690)", () => {
 describe("source contracts", () => {
   const src = (rel: string) => readFileSync(path.resolve(__dirname, rel), "utf8");
 
-  // §2.2.1 — every slice lands DARK. The single flip of the App.tsx root to <ConsoleApp/> belongs
-  // to the final audit slice (§10 box 6.4), and this ticket is one of its preconditions, not the
-  // flip itself.
-  it("leaves App.tsx on the Podium dashboard (land-dark, §2.2.1)", () => {
-    const app = src("../../../App.tsx");
-    expect(app).not.toContain("ConsoleApp");
-    expect(app).toContain("<AppShell />");
-  });
+  // NOTE: the §2.2.1 "land-dark" guard that used to sit here — asserting App.tsx still rendered the
+  // Podium <AppShell /> — was retired by STUDIO-687's box-6.4 flip. The root is now pinned once, in
+  // ConsoleApp.test.tsx ("the flip — App.tsx renders the console").
 
   // The embedded Podium editor renders inside `.rh-console`, where `--accent` means the brand
   // amber rather than Podium's hover background. The embed scope hands the Podium meaning back;

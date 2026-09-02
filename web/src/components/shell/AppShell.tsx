@@ -5,6 +5,7 @@ import { Settings } from "@/components/settings/Settings";
 import { RunsView } from "@/components/runs/RunsView";
 import { Onboarding } from "@/components/onboarding/Onboarding";
 import { ToastProvider, useToast } from "./Toast";
+import { ShutdownOverlay } from "./ShutdownOverlay";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useStateQuery } from "@/hooks/useStateQuery";
 import { useUpdater } from "@/hooks/useUpdater";
@@ -14,7 +15,6 @@ import { teamsChip } from "@/lib/teams-model";
 import { conductorStatus, viewForStatus } from "@/lib/daemon-status";
 import { appVersion, hasBridge, onNavigate, onShuttingDown, openExternal, type VersionDTO } from "@/lib/bindings";
 import { stamp } from "@/lib/version-stamp";
-import { StatusDot } from "@/components/ui";
 
 // The centred, padded content container used by Settings + the onboarding wizard. The Jobs view
 // (P10-D3) opts OUT of it to render its instrument strip + footer as full-bleed bands.
@@ -280,28 +280,6 @@ function OnboardErrorBanner({ message, onDismiss }: { message: string; onDismiss
 
 // ShutdownOverlay — a full-window "Shutting down…" screen shown while the daemon stops on quit, so
 // the app reads as deliberately closing rather than frozen (the stop runs off the main thread).
-function ShutdownOverlay() {
-  return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 1000,
-        background: "var(--bg-app)",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: 12,
-      }}
-    >
-      <StatusDot color="var(--amber)" size={9} pulse />
-      <div style={{ fontSize: 15, fontWeight: 600, color: "var(--tx)" }}>Shutting down…</div>
-      <div style={{ fontSize: 12.5, color: "var(--tx-3)" }}>Stopping the daemon and finishing in-flight work.</div>
-    </div>
-  );
-}
-
 // VersionFooter — a dim build stamp pinned to the bottom of the window so it's always clear which
 // build is running (release version + git SHA + build time on hover).
 //

@@ -239,13 +239,9 @@ describe("console chrome", () => {
 describe("source contracts", () => {
   const src = (rel: string) => readFileSync(path.resolve(__dirname, rel), "utf8");
 
-  // §2.2.1 — every slice lands DARK. The single flip of the App.tsx root to <ConsoleApp/> is box
-  // 6.4's, and this ticket is one of its preconditions, not the flip itself.
-  it("leaves App.tsx on the Podium dashboard (land-dark, §2.2.1)", () => {
-    const app = src("../../../App.tsx");
-    expect(app).not.toContain("ConsoleApp");
-    expect(app).toContain("<AppShell />");
-  });
+  // NOTE: the §2.2.1 "land-dark" guard that used to sit here — asserting App.tsx still rendered the
+  // Podium <AppShell /> — was retired by STUDIO-687's box-6.4 flip. The root is now pinned once, in
+  // ConsoleApp.test.tsx ("the flip — App.tsx renders the console").
 
   // Parity is a property of the code: the views EMBED the shipped tabs. A future edit that swapped
   // an import for a hand-rolled panel would pass every behavioural test above only until it drifted

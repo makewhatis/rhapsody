@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AppShell,
   JobsIcon,
@@ -8,6 +8,8 @@ import {
   type NavItemSpec,
 } from "@/components/console";
 import { TeamsConsole } from "@/components/console/teams/TeamsConsole";
+import { ShutdownOverlay } from "@/components/shell/ShutdownOverlay";
+import { onNavigate, onShuttingDown } from "@/lib/bindings";
 import { useConsoleRoute } from "@/hooks/useConsoleRoute";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useIssueRuns } from "@/hooks/useHistory";
@@ -52,6 +54,20 @@ export function ConsoleApp() {
   // badge and the Updates view itself, so the two can never disagree. Without the Tauri bridge every
   // binding it calls is a no-op, so the daemon-served dashboard mounts it inert.
   const updater = useUpdater();
+  const [shuttingDown, setShuttingDown] = useState(false);
+
+  // The two desktop-host subscriptions the Podium shell owned before the §2.2.1 flip made this the
+  // root. Both are no-ops in a plain browser (no Tauri runtime), so the daemon-served dashboard is
+  // unaffected — but on the desktop they are shipped behaviour, and the flip is what would have
+  // stranded them.
+  //
+  // The macOS tray's "Open Dashboard" / "Settings…" items emit `tray:navigate`.
+  useEffect(
+    () => onNavigate((view) => navigate({ name: view === "settings" ? "settings" : "jobs", key: "" })),
+    [navigate],
+  );
+  // The app has begun quitting; the daemon stops off the main thread.
+  useEffect(() => onShuttingDown(() => setShuttingDown(true)), []);
 
   const items = useMemo<NavItemSpec[]>(
     () => [
@@ -73,27 +89,37 @@ export function ConsoleApp() {
   // makes, and the reason this pre-empts a deep link. Only ever true under the supervisor bridge:
   // a plain browser has no `getStatus`, and a null snapshot reads as "loading", not
   // "not-configured", so the daemon-served dashboard is untouched by this.
+  // `position: fixed` over everything, so it rides ALONGSIDE whichever surface is mounted rather
+  // than being duplicated inside each — a quit begun from the first-run wizard shows it too.
+  const overlay = shuttingDown ? <ShutdownOverlay /> : null;
+
   if (viewForStatus(daemon.status) === "not-configured") {
     return (
-      <FirstRunView
-        onConfigured={() => void daemon.refresh()}
-        onError={setOnboardErr}
-        error={onboardErr}
-        onDismissError={() => setOnboardErr("")}
-      />
+      <>
+        <FirstRunView
+          onConfigured={() => void daemon.refresh()}
+          onError={setOnboardErr}
+          error={onboardErr}
+          onDismissError={() => setOnboardErr("")}
+        />
+        {overlay}
+      </>
     );
   }
 
   return (
-    <AppShell
-      items={items}
-      active={consoleNavFor(route)}
-      onNavigate={(id) => go(id as ConsoleRouteName)}
-      foot={<RailFoot version={version.data?.version ?? ""} teamsEnabled={teamsEnabled === true} />}
-    >
-      <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
-      <ConsoleBody route={route} teamsEnabled={teamsEnabled} go={go} updater={updater} />
-    </AppShell>
+    <>
+      <AppShell
+        items={items}
+        active={consoleNavFor(route)}
+        onNavigate={(id) => go(id as ConsoleRouteName)}
+        foot={<RailFoot version={version.data?.version ?? ""} teamsEnabled={teamsEnabled === true} />}
+      >
+        <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
+        <ConsoleBody route={route} teamsEnabled={teamsEnabled} go={go} updater={updater} />
+      </AppShell>
+      {overlay}
+    </>
   );
 }
 

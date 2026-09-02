@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DaemonVersion } from "@/lib/api";
 import type { StatusDTO } from "@/lib/bindings";
@@ -12,14 +14,32 @@ import type { StatusDTO } from "@/lib/bindings";
 // what §2.2 promises is about the RENDERED rail — "absent from the DOM, not merely hidden" is
 // not a claim a pure function can make.
 
-const h = vi.hoisted(() => ({
-  fetchVersion: vi.fn(),
-  getStatus: vi.fn(),
-  credentialStatus: vi.fn(),
-  listLinearProjects: vi.fn(),
-  probeTools: vi.fn(),
-  writeInitialConfig: vi.fn(),
-}));
+const h = vi.hoisted(() => {
+  // The two tray/lifecycle event bindings are subscriptions, not calls: the real ones hand the
+  // Tauri listener back an unsubscribe. These stand in with the same contract so a test can emit
+  // the event the desktop host would, and so an unmount really does detach.
+  const navCbs = new Set<(view: string) => void>();
+  const downCbs = new Set<() => void>();
+  return {
+    fetchVersion: vi.fn(),
+    getStatus: vi.fn(),
+    credentialStatus: vi.fn(),
+    listLinearProjects: vi.fn(),
+    probeTools: vi.fn(),
+    writeInitialConfig: vi.fn(),
+    onNavigate: vi.fn((cb: (view: string) => void) => {
+      navCbs.add(cb);
+      return () => void navCbs.delete(cb);
+    }),
+    onShuttingDown: vi.fn((cb: () => void) => {
+      downCbs.add(cb);
+      return () => void downCbs.delete(cb);
+    }),
+    emitNavigate: (view: string) => navCbs.forEach((cb) => cb(view)),
+    emitShuttingDown: () => downCbs.forEach((cb) => cb()),
+    navCount: () => navCbs.size,
+  };
+});
 
 // The supervisor bridge. `getStatus` is the first-run gate's input (STUDIO-692); the four below
 // are the SHIPPED wizard's own data path, stood in for so the first-run flow can be driven to its
@@ -33,6 +53,8 @@ vi.mock("@/lib/bindings", async (orig) => {
     listLinearProjects: h.listLinearProjects,
     probeTools: h.probeTools,
     writeInitialConfig: h.writeInitialConfig,
+    onNavigate: h.onNavigate,
+    onShuttingDown: h.onShuttingDown,
   };
 });
 
@@ -455,5 +477,66 @@ describe("a partial first-run write survives the swap into the console", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+});
+
+// ---- The flip (§2.2.1, box 6.4) -----------------------------------------------------------------
+
+// Every slice 1–5 landed DARK: each shipped a source contract asserting `App.tsx` still rendered the
+// Podium `<AppShell />`. STUDIO-687's audit found all six gates clean, so this — the ONE flip §2.2.1
+// reserved for the final slice — inverts that contract. Those three per-slice guards are replaced by
+// this single authoritative one; there is only one root to pin.
+describe("the flip — App.tsx renders the console (§2.2.1, box 6.4)", () => {
+  const src = (rel: string) => readFileSync(path.resolve(__dirname, rel), "utf8");
+
+  it("mounts <ConsoleApp /> as the app root, not the Podium shell", () => {
+    const app = src("../../../App.tsx");
+    expect(app).toContain("<ConsoleApp />");
+    expect(app).not.toMatch(/<AppShell\s*\/>/);
+  });
+
+  // The verification-only primitive gallery is code-split precisely so it never ships in the main
+  // bundle. The flip changes which shell renders, not that guarantee.
+  it("keeps the #/demo gallery lazy so it stays out of the shipped bundle", () => {
+    const app = src("../../../App.tsx");
+    expect(app).toContain("React.lazy(");
+    expect(app).toContain("useIsDemoRoute");
+  });
+});
+
+// The two desktop behaviours the Podium shell owned that the flip would otherwise strand. They are
+// not Settings surfaces (§8.1) but they ARE shipped capabilities, and the flip is what would drop
+// them — so they move with the root rather than becoming a follow-up.
+describe("the desktop bridge survives the flip", () => {
+  it("routes the tray's Settings… item to Settings and Dashboard back to Jobs", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount();
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "teams", "memory", "settings"]));
+
+    act(() => h.emitNavigate("settings"));
+    await waitFor(() => expect(activeNavs()).toEqual(["settings"]));
+
+    act(() => h.emitNavigate("dashboard"));
+    await waitFor(() => expect(activeNavs()).toEqual(["jobs"]));
+  });
+
+  // The subscription must detach with the shell — a listener left behind would fire into an
+  // unmounted tree on the next tray click.
+  it("detaches the tray subscription on unmount", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    const view = mount();
+    await waitFor(() => expect(h.navCount()).toBe(1));
+    view.unmount();
+    expect(h.navCount()).toBe(0);
+  });
+
+  it("shows the shutdown overlay when the app begins quitting", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount();
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "teams", "memory", "settings"]));
+    expect(screen.queryByText("Shutting down…")).toBeNull();
+
+    act(() => h.emitShuttingDown());
+    expect(await screen.findByText("Shutting down…")).toBeTruthy();
   });
 });
