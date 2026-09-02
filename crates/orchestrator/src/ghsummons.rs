@@ -378,10 +378,6 @@ impl HeadAllowlist {
     pub fn allows(&self, slug: &str) -> bool {
         !self.slugs.is_empty() && self.slugs.contains(&slug.trim().to_ascii_lowercase())
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.slugs.is_empty()
-    }
 }
 
 /// Resolves the head SHA and merge state of a pull request named by NUMBER (STUDIO-710; design
@@ -433,6 +429,12 @@ pub trait PrStateSource: Send + Sync {
 /// error. [`PrLookup::Gone`] is a caller's instruction to stop watching a pull request forever, so
 /// a mis-classified rate limit or expired token would silently retire a live review, while a
 /// mis-classified 404 only costs one more poll on the next tick.
+///
+/// One ambiguity it cannot resolve, named rather than hidden: GitHub answers a repository the
+/// caller may not SEE with the same not-found as one that does not exist, so a token that loses
+/// access to a repository reads as [`PrLookup::Gone`] for every pull request in it. That is the
+/// right default — the alternative is erroring forever over a repository that really was deleted —
+/// but it is why a caller should say out loud which pull request it retired and why.
 fn is_gone_message(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     e.contains("could not resolve to a pullrequest")
@@ -509,6 +511,7 @@ impl PrStateSource for GH {
             .get("headRepository")
             .and_then(|r| r.get("nameWithOwner"))
             .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| {
                 if head_owner.is_empty() || head_name.is_empty() {
