@@ -25,7 +25,8 @@ const GATE: &str = "RHAPSODY_PARITY_E2E";
 
 /// Total budget for `/api/v1/state` to answer 200 through the apiproxy once the daemon is healthy.
 const STATE_POLL_TIMEOUT: Duration = Duration::from_secs(10);
-/// Cadence of that poll, mirroring the supervisor's own `/healthz` readiness cadence (250ms).
+/// Cadence of that poll — the same order as the supervisor's own 250ms `/healthz` readiness poll,
+/// short enough that the usual case (the snapshot lands almost immediately) costs one extra tick.
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[tokio::test]
@@ -172,10 +173,11 @@ async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
 ///
 /// `/healthz` answers as soon as the daemon's HTTP server is up, which can be BEFORE the
 /// orchestrator has published its first snapshot — `handle_state` then returns a transient 503
-/// `snapshot_unavailable` (its own `SNAPSHOT_TIMEOUT` elapsing), and a forward attempted in that
-/// same window can hiccup into a 502. A single unretried GET straight after `sup.start` catches
-/// exactly that window and fails a run that is not actually broken. So this polls the same way
-/// `sup.start` already polls `/healthz`.
+/// `snapshot_unavailable` (its own `SNAPSHOT_TIMEOUT` elapsing). A single unretried GET straight
+/// after `sup.start` catches exactly that window and fails a run that is not actually broken. So
+/// this polls the same way `sup.start` already polls `/healthz`. (A transient 502 from a failed
+/// forward is a separate matter — the daemon's server is demonstrably up by then — but retrying
+/// absorbs that too.)
 ///
 /// Retrying does NOT mask a real forward break: a `/state` that never reaches 200 within the bound
 /// still fails the test, reporting the last status and body it saw.
