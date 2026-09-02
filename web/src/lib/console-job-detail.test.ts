@@ -100,6 +100,47 @@ describe("buildJobSummary", () => {
     expect(buildJobSummary([run({ id: 1, outcome: "completed" })], { live: true, nowMs: NOW }).status).toBe("run");
   });
 
+  // STUDIO-706 — the detail header reads the TICKET's lifecycle, exactly as the worklist row
+  // does (STUDIO-702). Without it a merged ticket's header said "in review" forever while its
+  // own worklist row said "done": the same ticket, two answers, on two screens.
+  it("prefers the ticket's lifecycle over the run outcome", () => {
+    const merged = buildJobSummary([run({ id: 1 })], { lifecycle: "done", nowMs: NOW });
+    expect(merged.status).toBe("done");
+    expect(merged.statusLabel).toBe("done");
+
+    const inReview = buildJobSummary([run({ id: 1 })], { lifecycle: "in_review", nowMs: NOW });
+    expect(inReview.status).toBe("review");
+    expect(inReview.statusLabel).toBe("in review");
+  });
+
+  // The worklist's carve-outs are not re-derived here — they come from the one shared
+  // `consoleJobStatus`, so the two screens cannot drift. These pin that they still hold.
+  it("keeps the worklist's carve-outs: live outranks the ticket, an open ticket keeps blocked", () => {
+    // A mid-run handoff parks the ticket in a review state while the agent is still working.
+    expect(
+      buildJobSummary([run({ id: 1, outcome: "running", ended_at: "" })], {
+        live: true,
+        lifecycle: "in_review",
+        nowMs: NOW,
+      }).status,
+    ).toBe("run");
+    expect(buildJobSummary([], { live: true, lifecycle: "done", nowMs: NOW }).status).toBe("run");
+    // `failed` describes the RUN, and a human still has to act on it.
+    expect(
+      buildJobSummary([run({ id: 1, outcome: "failed" })], { lifecycle: "open", nowMs: NOW }).status,
+    ).toBe("blocked");
+    // What `open` does override is `completed -> review`.
+    expect(buildJobSummary([run({ id: 1 })], { lifecycle: "open", nowMs: NOW }).status).toBe("queued");
+  });
+
+  it("falls back to the run outcome when the daemon resolved no lifecycle", () => {
+    expect(buildJobSummary([run({ id: 1 })], { nowMs: NOW }).status).toBe("review");
+    expect(buildJobSummary([run({ id: 1 })], { lifecycle: "", nowMs: NOW }).status).toBe("review");
+    expect(
+      buildJobSummary([run({ id: 1 })], { lifecycle: "some_future_state", nowMs: NOW }).status,
+    ).toBe("review");
+  });
+
   it("survives a ticket with no runs at all", () => {
     const summary = buildJobSummary([], { nowMs: NOW });
     expect(summary.runs).toBe(0);
