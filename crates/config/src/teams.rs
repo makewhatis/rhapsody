@@ -223,6 +223,50 @@ impl Quorum {
     }
 }
 
+/// What kind of review a handoff triggers — the `review.mode` key
+/// (STUDIO-719, design `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`
+/// §15-d, §16).
+///
+/// One enum rather than a second boolean beside [`Quorum::enabled`], because
+/// the two paths review the same handoff and must never both fire: §14.2's
+/// "config cutover double-fire or silent flip" is exactly the bug where a
+/// handoff fans review TICKETS out *and* dispatches a ticketless review — two
+/// agent runs per head, twice the spend. An enum makes "both" unrepresentable
+/// at the one place an operator writes it down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReviewMode {
+    /// No review path of this subsystem's own — the DEFAULT, and what every
+    /// installation that predates the key gets. `quorum.enabled` still decides
+    /// the ticket fan-out exactly as it did before, so an upgrade changes
+    /// nothing (§15-d: `quorum.enabled` is not repurposed, so nothing flips
+    /// silently).
+    #[default]
+    #[serde(rename = "off")]
+    Off,
+    /// Review by fanning Linear review TICKETS out to teammates — today's
+    /// quorum, spelled explicitly. Behaviourally identical to [`Off`](Self::Off)
+    /// here: it is `quorum.enabled` that turns the fan-out on, and this only
+    /// records which of the two paths the installation has chosen.
+    #[serde(rename = "tickets")]
+    Tickets,
+    /// Review a PR directly, with no Linear ticket — the STUDIO-703 subsystem.
+    /// Guards the ticket fan-out OFF (see [`Teams::review_ticketless`]) so one
+    /// handoff fires exactly one review path.
+    #[serde(rename = "ticketless")]
+    Ticketless,
+}
+
+/// The `review:` block (STUDIO-719) — nested under `teams`, sibling to
+/// [`quorum`](Teams::quorum) and never a top-level key, which is what makes
+/// §16's "the whole subsystem is dormant unless `teams.enabled`" structural
+/// rather than remembered: there is no way to spell an active review mode
+/// outside Teams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Review {
+    #[serde(default)]
+    pub mode: ReviewMode,
+}
+
 /// The `memory:` block (§2.2). Carried as config in T1 — no backend is
 /// constructed, no endpoint is dialled, no bank directory is created. §2.4
 /// row 8: when Teams is off there is no code path here at all.
@@ -317,6 +361,11 @@ pub struct Teams {
     /// [`Quorum::default`], i.e. disabled — the whole point of the opt-in.
     #[serde(default)]
     pub quorum: Quorum,
+    /// The `review:` block (STUDIO-719, slice 7 of the §14.4 plan). An ABSENT
+    /// section is [`Review::default`], i.e. [`ReviewMode::Off`] — the state
+    /// every existing `teams.yaml` is already in.
+    #[serde(default)]
+    pub review: Review,
     #[serde(default)]
     pub roster: Vec<Identity>,
     /// **The one total byte budget** for the whole Teams turn-1 prepend
@@ -352,6 +401,7 @@ impl Default for Teams {
             manager: Manager::default(),
             memory: Memory::default(),
             quorum: Quorum::default(),
+            review: Review::default(),
             roster: Vec::new(),
             prompt_budget_bytes: DEFAULT_PROMPT_BUDGET_BYTES,
         }
@@ -366,6 +416,17 @@ impl Teams {
             .ok()
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_PROMPT_BUDGET_BYTES as usize)
+    }
+
+    /// Whether review runs on the TICKETLESS path: Teams on AND
+    /// `review.mode: ticketless` (§16's gate, and the reason the key is nested
+    /// under `teams` — `enabled: false` makes it structurally unreachable).
+    ///
+    /// The ONE spelling of that predicate, so the orchestrator's gate, the
+    /// quorum cutover and the daemon's decision to spawn the fan-out task can
+    /// never disagree about which review path an installation is on.
+    pub fn review_ticketless(&self) -> bool {
+        self.enabled && self.review.mode == ReviewMode::Ticketless
     }
 
     /// The configured `manager.timeout_ms` when it is too small for the model
@@ -511,6 +572,24 @@ impl Teams {
                 "manager.default_identity {:?} is not a roster entry",
                 self.manager.default_identity
             )));
+        }
+        // Mutual exclusion, §15-d: the two review paths read the same handoff,
+        // so an installation that asks for BOTH has asked for two agent runs
+        // per pushed head and a doubled bill. Rejected here rather than
+        // silently resolved by precedence, because either precedence would be a
+        // guess about which of two explicitly-written keys the operator meant.
+        // Like every other rule in this function it fires regardless of
+        // `enabled`, so the complaint arrives while the file is still being
+        // edited.
+        if self.quorum.enabled && self.review.mode == ReviewMode::Ticketless {
+            return Err(TeamsError::Invalid(
+                "quorum.enabled: true and review.mode: ticketless are mutually exclusive — they \
+                 are two review paths over the same handoff, and running both fans review tickets \
+                 out AND dispatches a ticketless review (two agent runs per head). Pick one: keep \
+                 `quorum.enabled: true` with `review.mode: tickets`, or set `quorum.enabled: \
+                 false` to move to `ticketless`"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -1168,6 +1247,184 @@ mod tests {
         }
     }
 
+    // ── review.mode (STUDIO-719, design §15-d/§16) ──────────────────────────
+
+    /// The cutover's whole safety property: `review.mode` is a NEW key and its
+    /// default is `off`, so every `teams.yaml` written before it existed —
+    /// including one with `quorum.enabled: true` — parses to exactly the
+    /// behaviour it had. An absent, null and empty `review:` block all mean off.
+    #[test]
+    fn review_mode_is_absent_means_off() {
+        for text in [
+            "enabled: true\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\nroster:\n  - name: alice\n",
+            "enabled: true\nreview: {}\nroster:\n  - name: alice\n",
+            // The pre-STUDIO-719 shape of an install that opted into the quorum.
+            "enabled: true\nquorum:\n  enabled: true\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert_eq!(t.review, Review::default(), "({text:?})");
+            assert_eq!(t.review.mode, ReviewMode::Off, "({text:?})");
+            assert!(
+                !t.review_ticketless(),
+                "an absent review section must not reach the ticketless path ({text:?})"
+            );
+            t.validate()
+                .unwrap_or_else(|e| panic!("must stay valid {text:?}: {e}"));
+        }
+        assert_eq!(Teams::disabled().review.mode, ReviewMode::Off);
+    }
+
+    /// All three spellings decode, and nothing else does: a typo must be a loud
+    /// parse error rather than a silent fall back to `off`, which would leave an
+    /// operator who asked for review with none and no complaint.
+    #[test]
+    fn review_mode_decodes_exactly_three_spellings() {
+        for (yaml, want) in [
+            ("review:\n  mode: off\n", ReviewMode::Off),
+            ("review:\n  mode: tickets\n", ReviewMode::Tickets),
+            ("review:\n  mode: ticketless\n", ReviewMode::Ticketless),
+        ] {
+            let t = Teams::parse(yaml).unwrap_or_else(|e| panic!("parse {yaml:?}: {e}"));
+            assert_eq!(t.review.mode, want, "({yaml:?})");
+        }
+        for yaml in [
+            "review:\n  mode: quorum\n",
+            "review:\n  mode: Ticketless\n",
+            "review:\n  mode: true\n",
+        ] {
+            let err = Teams::parse(yaml).expect_err("an unknown mode must not parse");
+            assert!(matches!(err, TeamsError::Parse(_)), "{yaml:?}: got {err}");
+        }
+    }
+
+    /// §16's gate, at the config layer: ticketless review is reachable ONLY with
+    /// Teams enabled AND `mode: ticketless`. Teams off is dormant for every mode,
+    /// which is the invariant the later slices inherit rather than re-check.
+    #[test]
+    fn review_ticketless_requires_teams_enabled_and_the_ticketless_mode() {
+        for (enabled, mode, want) in [
+            (true, ReviewMode::Ticketless, true),
+            (true, ReviewMode::Tickets, false),
+            (true, ReviewMode::Off, false),
+            (false, ReviewMode::Ticketless, false),
+            (false, ReviewMode::Tickets, false),
+            (false, ReviewMode::Off, false),
+        ] {
+            let t = Teams {
+                enabled,
+                review: Review { mode },
+                ..Teams::disabled()
+            };
+            assert_eq!(
+                t.review_ticketless(),
+                want,
+                "enabled={enabled} mode={mode:?}"
+            );
+        }
+    }
+
+    /// §15-d's mutual exclusion: the two review paths read the same handoff, so
+    /// asking for both is rejected outright — and, because `try_load` validates,
+    /// a daemon booting that file falls back to Teams OFF rather than to double
+    /// review. The complaint names both keys and a way out of it.
+    #[test]
+    fn quorum_enabled_with_ticketless_review_is_rejected() {
+        let both = "enabled: true\nquorum:\n  enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n";
+        let err = Teams::parse(both)
+            .expect("parses")
+            .validate()
+            .expect_err("both review paths at once must be rejected");
+        let TeamsError::Invalid(msg) = &err else {
+            panic!("expected Invalid, got {err}")
+        };
+        assert!(msg.contains("quorum.enabled"), "{msg}");
+        assert!(msg.contains("review.mode: ticketless"), "{msg}");
+        assert!(
+            msg.contains("mutually exclusive — they are two review paths"),
+            "the continued literal must render as one sentence: {msg}"
+        );
+        assert!(!msg.contains("  "), "leaked source indentation: {msg}");
+
+        // The same rule while the toggle is off, like every other rule here: the
+        // complaint arrives while the file is being edited, not after.
+        let disabled = both.replace("enabled: true\nquorum", "enabled: false\nquorum");
+        assert!(matches!(
+            Teams::parse(&disabled).expect("parses").validate(),
+            Err(TeamsError::Invalid(_))
+        ));
+
+        // And the boot path turns it into the off state rather than a crash.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams.yaml");
+        std::fs::write(&path, both).expect("write");
+        assert!(matches!(
+            Teams::try_load(&path),
+            Err(TeamsError::Invalid(_))
+        ));
+        assert_eq!(Teams::load(&path), Teams::disabled());
+    }
+
+    /// The other three combinations are legal, and the important one is the
+    /// first: `quorum.enabled: true` with `mode: tickets` is today's install,
+    /// spelled explicitly, and it must keep validating.
+    #[test]
+    fn every_other_quorum_and_review_combination_is_accepted() {
+        for (quorum, mode) in [
+            (true, ReviewMode::Tickets),
+            (true, ReviewMode::Off),
+            (false, ReviewMode::Ticketless),
+            (false, ReviewMode::Tickets),
+            (false, ReviewMode::Off),
+        ] {
+            let t = Teams {
+                enabled: true,
+                quorum: Quorum {
+                    enabled: quorum,
+                    ..Quorum::default()
+                },
+                review: Review { mode },
+                roster: vec![Identity {
+                    name: "alice".to_string(),
+                    ..Identity::default()
+                }],
+                ..Teams::disabled()
+            };
+            t.validate()
+                .unwrap_or_else(|e| panic!("quorum={quorum} mode={mode:?}: {e}"));
+        }
+    }
+
+    /// The Settings editor writes a `Teams` and the daemon boots the same one —
+    /// the round-trip property `save_creates_the_file_and_round_trips_through_load`
+    /// pins for the rest of the file, extended to the new block so a save can
+    /// never silently drop the mode an operator chose.
+    #[test]
+    fn review_mode_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams.yaml");
+        let teams = Teams {
+            enabled: true,
+            review: Review {
+                mode: ReviewMode::Ticketless,
+            },
+            roster: vec![Identity {
+                name: "alice".to_string(),
+                ..Identity::default()
+            }],
+            ..Teams::disabled()
+        };
+
+        Teams::save(&path, &teams).expect("save");
+        let yaml = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            yaml.contains("review:\n  mode: ticketless\n"),
+            "the canonical serialization must carry the block: {yaml}"
+        );
+        assert_eq!(Teams::load(&path), teams);
+        assert!(Teams::load(&path).review_ticketless());
+    }
+
     /// Unknown keys are ignored rather than fatal, matching `CapabilityDef`'s
     /// tolerance for partial entries: a `teams.yaml` written by a NEWER
     /// Rhapsody must not disable the feature on an older one.
@@ -1228,6 +1485,11 @@ mod tests {
             quorum: Quorum {
                 enabled: true,
                 reviewers: 3,
+            },
+            // STUDIO-719: `tickets` and not `ticketless`, because this config
+            // also enables the quorum and `validate` rejects that pair.
+            review: Review {
+                mode: ReviewMode::Tickets,
             },
             roster: vec![Identity {
                 name: "alice".to_string(),

@@ -845,10 +845,28 @@ impl Orchestrator {
 
     /// Whether the review quorum is on: Teams enabled AND `quorum.enabled`. Both, always — the
     /// quorum is opt-in ON TOP of an already opt-in feature (§0.12's cost control).
+    ///
+    /// **Minus the ticketless cutover** (STUDIO-719; ticketless-review design §14.2 "config
+    /// cutover double-fire", §15-d): the ticket fan-out and the ticketless review read the SAME
+    /// handoff, so an installation on the ticketless path must not also fan review tickets out —
+    /// that is two agent runs per pushed head and twice the bill.
+    /// [`Teams::validate`](rhapsody_config::teams::Teams::validate) already rejects the pairing
+    /// when the file loads, so this subtraction is unreachable from a boot-loaded config; it is
+    /// here because "exactly one review path fires" is a property of the daemon, not of the
+    /// loader, and a config assembled any other way (a test, a future API write) must obey it too.
     pub(crate) fn quorum_enabled(&self) -> bool {
         self.teams
             .as_ref()
             .is_some_and(|t| t.enabled && t.quorum.enabled)
+            && !self.review_ticketless_enabled()
+    }
+
+    /// Whether review runs on the TICKETLESS path: Teams enabled AND `review.mode: ticketless`
+    /// (STUDIO-719; design §16). The gate every later slice of the subsystem checks, and
+    /// deliberately the same shape as [`quorum_enabled`](Orchestrator::quorum_enabled) — Teams off
+    /// or absent is dormant, with no second way to spell it.
+    pub(crate) fn review_ticketless_enabled(&self) -> bool {
+        self.teams.as_ref().is_some_and(|t| t.review_ticketless())
     }
 
     /// Snapshots what the poller just observed, so a handoff arriving between ticks can choose
@@ -1067,7 +1085,7 @@ mod tests {
     use crate::ghsummons::OpenPrResult;
     use crate::testsupport::{TempDir, issue};
     use rhapsody_config::room::{Cursor, LocalRoom, RoomError};
-    use rhapsody_config::teams::{Identity, Quorum};
+    use rhapsody_config::teams::{Identity, Quorum, Review, ReviewMode};
     use rhapsody_core::LinkedPRRef;
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
@@ -2103,6 +2121,67 @@ mod tests {
             o.record_quorum_state([with_labels("iss-1", &["rhapsody:@alice"])].iter());
             assert!(o.quorum_load.is_empty(), "{teams:?}");
             assert!(o.quorum_facts.is_empty(), "{teams:?}");
+        }
+    }
+
+    // ── the ticketless cutover (STUDIO-719; design §14.2, §15-d, §16) ───────────────────────────
+
+    // §16's gate, at the daemon: ticketless review is reachable ONLY with Teams enabled AND
+    // `review.mode: ticketless`. Every other shape — Teams off, no Teams at all, another mode — is
+    // dormant, which is the invariant the rest of the subsystem inherits rather than re-checks.
+    #[test]
+    fn review_ticketless_enabled_needs_teams_on_and_the_ticketless_mode() {
+        let with = |enabled: bool, mode: ReviewMode| Teams {
+            enabled,
+            review: Review { mode },
+            roster: vec![ident("alice")],
+            ..Teams::disabled()
+        };
+        for (teams, want) in [
+            (Some(with(true, ReviewMode::Ticketless)), true),
+            (Some(with(true, ReviewMode::Tickets)), false),
+            (Some(with(true, ReviewMode::Off)), false),
+            (Some(with(false, ReviewMode::Ticketless)), false),
+            (Some(Teams::disabled()), false),
+            (None, false),
+        ] {
+            let mut o = Orchestrator::new("WORKFLOW.md");
+            o.teams = teams.clone();
+            assert_eq!(o.review_ticketless_enabled(), want, "{teams:?}");
+        }
+    }
+
+    // §14.2's "config cutover double-fire", at the hook site: with the ticketless path on, the
+    // handoff plans NO ticket fan-out even when `quorum.enabled` is somehow also true — one handoff
+    // fires exactly one review path. `off` and `tickets` are today's behaviour, unchanged.
+    #[test]
+    fn the_ticketless_mode_guards_the_ticket_fan_out_off() {
+        for (mode, want_plan) in [
+            (ReviewMode::Off, true),
+            (ReviewMode::Tickets, true),
+            (ReviewMode::Ticketless, false),
+        ] {
+            let mut teams = teams_quorum(&["alice", "bob"], 2);
+            teams.review = Review { mode };
+            let mut o = orch_with(teams);
+            let mut re = crate::orchestrator::RunningEntry::empty(Issue {
+                id: "iss-1".to_string(),
+                identifier: "MT-1".to_string(),
+                team_id: "team-1".to_string(),
+                ..Default::default()
+            });
+            re.identity = "alice".to_string();
+
+            assert_eq!(o.quorum_enabled(), want_plan, "mode={mode:?}");
+            assert_eq!(
+                o.plan_quorum(&re).is_some(),
+                want_plan,
+                "the ticket fan-out under mode={mode:?}"
+            );
+            // And the per-tick candidate sweep goes with it: under `ticketless` there is no
+            // fan-out to feed, so the pass is the same hard no-op it is with the quorum off.
+            o.record_quorum_state([with_labels("iss-1", &["rhapsody:@alice"])].iter());
+            assert_eq!(o.quorum_load.is_empty(), !want_plan, "mode={mode:?}");
         }
     }
 

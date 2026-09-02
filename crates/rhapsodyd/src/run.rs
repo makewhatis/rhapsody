@@ -822,8 +822,15 @@ fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> b
 /// Unlike [`spawn_triage`] this is NOT gated on `install_probe`: the quorum shells out to nothing,
 /// so a hermetic daemon test can carry the task safely. It is gated on the config alone, which is
 /// what makes "`quorum.enabled: false` spawns no task" a property rather than a promise.
+///
+/// **`review.mode: ticketless` spawns nothing either** (STUDIO-719; ticketless-review design
+/// §15-d), for the same reason the orchestrator's own `quorum_enabled` gate subtracts it: an
+/// installation on the ticketless path reviews a PR directly, so a ticket fan-out task there would
+/// be a second review of the same handoff. `Teams::validate` already rejects that pairing at load,
+/// so this cannot arise from a `teams.yaml`; it keeps the spawn decision agreeing with the gate it
+/// is a duplicate of rather than depending on the loader to have rejected the file.
 fn spawn_quorum(teams: &rhapsody_config::teams::Teams) -> bool {
-    teams.enabled && teams.quorum.enabled && !teams.roster.is_empty()
+    teams.enabled && teams.quorum.enabled && !teams.roster.is_empty() && !teams.review_ticketless()
 }
 
 /// The claude command, effective billing guard and tracker credential the Teams triage turn runs
@@ -1710,6 +1717,21 @@ mod tests {
         assert!(
             !spawn_quorum(&Teams::disabled()),
             "the shipped state must spawn no quorum task"
+        );
+
+        // STUDIO-719's cutover: on the ticketless path the fan-out task must not exist, so one
+        // handoff can only ever fire one review path. `off` (the default) and `tickets` are
+        // today's behaviour, decided by `quorum.enabled` alone.
+        use rhapsody_config::teams::{Review, ReviewMode};
+        let with_mode = |mode: ReviewMode| Teams {
+            review: Review { mode },
+            ..team(true, true, &["alice", "bob"])
+        };
+        assert!(spawn_quorum(&with_mode(ReviewMode::Off)));
+        assert!(spawn_quorum(&with_mode(ReviewMode::Tickets)));
+        assert!(
+            !spawn_quorum(&with_mode(ReviewMode::Ticketless)),
+            "the ticketless path must not also spawn the ticket fan-out"
         );
     }
 
