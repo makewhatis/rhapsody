@@ -1603,6 +1603,7 @@ mod tests {
             active: crate::testsupport::set_of(&["todo", "in progress"]),
             terminal: crate::testsupport::set_of(&["done"]),
             review: crate::testsupport::set_of(&["in review"]),
+            canceled: Default::default(),
         }
     }
 

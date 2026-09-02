@@ -19,7 +19,7 @@ the `Orchestrator` struct itself. Concretely:
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
   they never lock anything and must never be called from another task.
-- Four exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+- Five exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -40,9 +40,15 @@ the `Orchestrator` struct itself. Concretely:
     for the two mirrors that genuinely need loop-owned state (`running`, `mailboxes`,
     `RunningEntry::event_seq`). That round-trip is best-effort by construction — the post is
     already in the log — so a gone loop costs nothing.
+  - `lifecycle.rs`'s `LifecycleCache` (`Orchestrator::lifecycle: Arc<LifecycleCache>`,
+    STUDIO-702) — a `Mutex`-guarded TTL memo of each ticket's CURRENT tracker state, read and
+    written ENTIRELY on the HTTP task (it decorates `GET /api/v1/history/issues`). The control task
+    never touches it, so it is a seam only in the sense that the handle carries it; the lock is
+    never held across the tracker `.await`, and the state sets it classifies with are read through
+    the `reads.rs` cell above rather than from loop-owned `Effective`.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  four seams; if none fits, that's a real design decision — don't reach for a fifth ad hoc
+  five seams; if none fits, that's a real design decision — don't reach for a sixth ad hoc
   `Arc<Mutex<..>>` without updating this list.
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
