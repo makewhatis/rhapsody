@@ -184,6 +184,12 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         interval_secs = crate::prstate::PR_STATE_POLL_INTERVAL.as_secs(),
         "ticketless review watcher started (off-loop; the control task is never blocked on gh)"
     );
+    // Where this tick starts in the watch list. The list comes back in a STABLE order (owner, repo,
+    // number, reviewer) and `sweep_pr_states` asks about at most `MAX_PR_STATE_CALLS_PER_TICK` of
+    // it, so polling it from the front every tick would ask about the same first 20 pull requests
+    // forever and never once look at the 21st — the budget's "picked up next tick" promise is the
+    // CALLER's to keep, and this is where it is kept.
+    let mut cursor = 0usize;
     loop {
         tokio::select! {
             _ = ctx.cancelled() => return,
@@ -191,9 +197,15 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         }
         let prs = deps.sink.watched().await;
         if prs.is_empty() {
+            cursor = 0;
             continue;
         }
-        let sweep = sweep_pr_states(&ctx, &deps.teams, src.as_ref(), &deps.allow, &prs).await;
+        let start = cursor % prs.len();
+        let rotated: Vec<PrCoord> = prs[start..].iter().chain(&prs[..start]).cloned().collect();
+        // Advance by the budget, not by what actually answered: a failed lookup has had its turn,
+        // and holding the cursor back for it would starve everything behind it instead.
+        cursor = start.saturating_add(crate::prstate::MAX_PR_STATE_CALLS_PER_TICK);
+        let sweep = sweep_pr_states(&ctx, &deps.teams, src.as_ref(), &deps.allow, &rotated).await;
         if sweep.deferred > 0 || sweep.failed > 0 {
             tracing::debug!(
                 observed = sweep.observed.len(),
@@ -304,6 +316,22 @@ impl Orchestrator {
                 return report;
             }
         };
+        // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
+        // review is a full agent run on this machine, and twenty pull requests coming due in one
+        // tick would otherwise spawn twenty agents past a cap the operator set. Counted ONCE for
+        // the tick and spent down as reviews are dispatched, so it composes with the per-identity
+        // `max_concurrent` rather than replacing it. No config loaded ⇒ no budget: a dispatch could
+        // not resolve a project to route with in any case.
+        let mut slots = self
+            .eff
+            .as_ref()
+            .map(|eff| {
+                crate::concurrency::global_slots(
+                    eff.max_concurrent,
+                    i64::try_from(self.running.len()).unwrap_or(i64::MAX),
+                )
+            })
+            .unwrap_or(0);
         for obs in observed {
             match &obs.lookup {
                 // GitHub cannot resolve it any more: deleted, transferred, or never there. Nothing
@@ -324,7 +352,7 @@ impl Orchestrator {
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
                 PrLookup::Found(snap) => {
-                    self.service_review_pr(&rows, &obs.pr, &snap.head_sha, &mut report)
+                    self.service_review_pr(&rows, &obs.pr, &snap.head_sha, &mut slots, &mut report)
                 }
             }
         }
@@ -369,6 +397,7 @@ impl Orchestrator {
         rows: &[ReviewWatchRow],
         pr: &PrCoord,
         head: &str,
+        slots: &mut i64,
         report: &mut ReviewSweepReport,
     ) {
         if head.is_empty() {
@@ -392,6 +421,15 @@ impl Orchestrator {
             );
             let live = self.running.contains_key(&id) || self.claimed.contains(&id);
             if !review_round_due(row, head, live) {
+                continue;
+            }
+            if *slots <= 0 {
+                tracing::debug!(
+                    pr = %pr,
+                    "ticketless review: the daemon-wide concurrency budget is spent; this round is \
+                     re-considered next tick"
+                );
+                report.deferred += 1;
                 continue;
             }
             // The churn floor (§14.2). Checked per ROUND rather than per row so N reviewers of one
@@ -457,6 +495,7 @@ impl Orchestrator {
             match self.dispatch_review(run) {
                 ReviewDispatchOutcome::Dispatched => {
                     report.dispatched += 1;
+                    *slots -= 1;
                     if reassigned {
                         // The round moved to a substitute, so the incumbent's row leaves the watch
                         // set rather than staying beside theirs: it is the SAME required review,
@@ -1371,6 +1410,28 @@ mod tests {
         assert_eq!(o.review_watch_coords(), vec![coord(12), coord(13)]);
     }
 
+    /// The daemon-wide dispatch budget is honoured, not just each identity's. Twenty pull requests
+    /// coming due in one tick must not spawn twenty agents past a cap the operator set.
+    #[test]
+    fn the_daemon_wide_concurrency_cap_bounds_one_tick() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob", "carol", "dave"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 2;
+        for n in 12..16 {
+            introduce(&o, row(n, "bob"));
+        }
+
+        let report = o.handle_review_sweep(&[
+            open_at(12, HEAD_A),
+            open_at(13, HEAD_A),
+            open_at(14, HEAD_A),
+            open_at(15, HEAD_A),
+        ]);
+
+        assert_eq!(report.dispatched, 2, "the global cap must bound one tick");
+        assert_eq!(report.deferred, 2, "and the rest are deferred, not lost");
+        assert_eq!(dispatched.lock().expect("lock").len(), 2);
+    }
+
     // --- the off-loop task --------------------------------------------------------------------
 
     /// A sink recording what the task asked for and handed back.
@@ -1443,6 +1504,52 @@ mod tests {
             vec![coord(12), coord(13)],
             "exactly the coordinates the control task named, and no others"
         );
+    }
+
+    /// A watch set larger than the per-tick `gh` budget must not starve its tail. The list comes
+    /// back in a stable order and `sweep_pr_states` takes the first N of it, so polling from the
+    /// front every tick would ask about the same 20 pull requests forever — the budget's
+    /// "picked up next tick" promise is the caller's to keep.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_list_rotates_so_nothing_past_the_budget_starves() {
+        let budget = crate::prstate::MAX_PR_STATE_CALLS_PER_TICK;
+        let total = budget + 5;
+        let watched: Vec<PrCoord> = (0..total).map(|n| coord(n as i64 + 1)).collect();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let signal = CancelSignal::new();
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FakeSource)),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: Arc::new(FakeSink {
+                watched: watched.clone(),
+                seen: Arc::clone(&seen),
+                done: Arc::clone(&done),
+            }),
+        };
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        // Two ticks is enough to cover a list one budget-and-a-bit long.
+        tokio::time::sleep(crate::prstate::PR_STATE_POLL_INTERVAL * 3).await;
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        let ticks = seen.lock().expect("seen lock").clone();
+        assert!(
+            ticks.len() >= 2,
+            "expected at least two ticks, got {}",
+            ticks.len()
+        );
+        assert_eq!(
+            ticks[0].len(),
+            budget,
+            "the first tick spends the whole budget"
+        );
+        let covered: HashSet<PrCoord> = ticks.iter().flatten().map(|o| o.pr.clone()).collect();
+        for pr in &watched {
+            assert!(covered.contains(pr), "{pr} was never polled");
+        }
     }
 
     /// §16: with Teams off the task spawns no process at all — `sweep_pr_states` refuses — so it
