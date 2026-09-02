@@ -11,8 +11,10 @@
 //! serializes an empty [`Vec`] as `[]` (never `null`) intrinsically — the guarantee Go must hand-write
 //! a `MarshalJSON` for on every list envelope.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, SecondsFormat, Utc};
-use rhapsody_orchestrator::{EventRecord, RunningRow};
+use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow};
 use rhapsody_store::{DayRollup, DayTotals, EventHit, EventRow, RunSummary};
 use serde_json::{Value, json};
 
@@ -184,9 +186,34 @@ pub(crate) fn history_response(runs: &[RunSummary], next_offset: Option<i64>) ->
 /// a full run summary: the LATEST run of one issue. Same envelope shape as `history_response`, under
 /// a distinct key so a client can never mistake an issue-paged listing for a run-paged one.
 /// Rhapsody-only — Go has no issue-level listing.
-pub(crate) fn issue_runs_response(runs: &[RunSummary], next_offset: Option<i64>) -> Value {
+///
+/// Each entry additionally carries the TICKET's current lifecycle when `lifecycles` has an answer
+/// for its `issue_id` (STUDIO-702): `tracker_state`, the workflow-state name verbatim, and
+/// `lifecycle`, the normalized `open`/`in_review`/`done`/`canceled` the dashboard paints its status
+/// Pill from. Both are OMITTED rather than blanked when there is no answer, so "the daemon could not
+/// resolve this ticket" stays distinguishable from any state it could have resolved.
+///
+/// The decoration is applied HERE and not in [`run_summary_json`] deliberately: that renderer is
+/// byte-pinned to the Go daemon's `/api/v1/history` golden, and this listing is the Rhapsody-only
+/// endpoint that may grow fields.
+pub(crate) fn issue_runs_response(
+    runs: &[RunSummary],
+    next_offset: Option<i64>,
+    lifecycles: &HashMap<String, IssueLifecycleRow>,
+) -> Value {
+    let issues: Vec<Value> = runs
+        .iter()
+        .map(|r| {
+            let mut row = run_summary_json(r);
+            if let (Some(obj), Some(life)) = (row.as_object_mut(), lifecycles.get(&r.issue_id)) {
+                obj.insert("tracker_state".to_string(), json!(life.state));
+                obj.insert("lifecycle".to_string(), json!(life.lifecycle.as_str()));
+            }
+            row
+        })
+        .collect();
     json!({
-        "issues": Value::Array(runs.iter().map(run_summary_json).collect()),
+        "issues": Value::Array(issues),
         "next_offset": next_offset,
     })
 }
