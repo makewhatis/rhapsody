@@ -505,6 +505,28 @@ impl WorkerDeps {
             // Remember the freshest final result text; the HANDOFF: marker (if any) is on the last
             // completed turn, which is what the caller classifies against (INF-272).
             last_result = tr.result_text;
+            // Review-mode wind-down (STUDIO-716; design record
+            // `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md` §14.2, "wind-down: team_id is a
+            // red herring"). A review run's `pr:` key resolves to no tracker issue, so BOTH of the
+            // loop-ending mechanisms below are wrong for it: the auto-park's `move_issue_state`
+            // would be a guaranteed 404 on every review, and the per-turn refresh returns EMPTY,
+            // which keeps the synthetic state exactly as it was and lets the loop spin fresh turns
+            // until the whole budget is gone. The agent's OWN hand-off declaration is therefore the
+            // only completion signal a review has, and when it arrives there is nothing to move.
+            //
+            // `max_turns` stays the backstop for an agent that never declares — bounded, and the
+            // exit classifier records a review run completed rather than scheduling the
+            // continuation retry that would re-dispatch it forever (see `retry::on_review_exit`).
+            //
+            // `review` unset ⇒ this whole block is inert, i.e. byte-identical to a daemon built
+            // before review mode.
+            if self.review.is_some() {
+                if has_handoff_marker(&last_result) || turn >= self.max_turns {
+                    return (issue.state.clone(), last_result, None);
+                }
+                turn += 1;
+                continue;
+            }
             // Handoff auto-park (TRA-240 loop fix): when the agent declares a HANDOFF but the ticket
             // is still active, the daemon moves it to the configured review state on the agent's
             // behalf (dispatched agents have no Linear-write MCP) and ENDS the loop here — otherwise
@@ -1332,6 +1354,134 @@ mod tests {
             declared,
             "the agent declared HANDOFF, so the clean exit classifies completed"
         );
+    }
+
+    // STUDIO-716 (design record §14.2, "wind-down: team_id is a red herring"): a review run's
+    // `pr:` key resolves to no tracker issue, so the per-turn refresh returns EMPTY and the
+    // auto-park's `move_issue_state` would be a guaranteed 404. The agent's OWN hand-off
+    // declaration is the only completion signal it has, and the tracker is never consulted.
+    //
+    // The declaring turn is the THIRD of a 20-turn budget on purpose: an implementation that
+    // capped a review at one turn, and one that only ever wound down at `max_turns`, both fail
+    // this assertion.
+    #[tokio::test]
+    async fn review_run_winds_down_on_the_agents_own_declaration() {
+        let plain = |text: &str| agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: text.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ag = fake_agent(vec![
+            plain("read the diff"),
+            plain("still reading"),
+            plain("posted 2 findings\nHANDOFF: review-posted"),
+        ]);
+        // Every state this tracker could report is a fiction for a `pr:` key; a review run must not
+        // ask it anything at all.
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "In Progress")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "review it",
+            20,
+        );
+        d.review_handoff_state = Some("in review".to_string()); // configured, and still not used
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: "a".repeat(40),
+        });
+        let sess = ag
+            .start_session("", review_issue(), None)
+            .await
+            .expect("session");
+        let (last, result, err) = d
+            .run_turns(
+                sess.as_ref(),
+                "review it",
+                review_issue(),
+                None,
+                None,
+                &noop_event(),
+            )
+            .await;
+        assert!(err.is_none(), "expected a clean exit, got {err:?}");
+        assert_eq!(
+            sess.id(),
+            "thread-fake-3",
+            "the loop ends on the declaring turn — not at 1, not at max_turns"
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            0,
+            "a review run must not refresh a Linear state"
+        );
+        assert!(
+            tr.move_calls().is_empty(),
+            "a review run must not move a `pr:` key (a guaranteed 404)"
+        );
+        assert!(
+            has_handoff_marker(&result),
+            "the declaring turn's text is the freshest result"
+        );
+        assert_eq!(last, "", "a synthetic review issue carries no state");
+    }
+
+    // The inertness half of STUDIO-716: with `review` unset the loop is byte-identical — the
+    // hand-off auto-park still moves the ticket and the per-turn refresh still runs.
+    #[tokio::test]
+    async fn non_review_run_still_auto_parks_and_refreshes() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "done\nHANDOFF: in-review".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "In Progress")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            Arc::clone(&tr) as Arc<dyn Tracker>,
+            "do it",
+            20,
+        );
+        d.review_handoff_state = Some("in review".to_string());
+        // The dispatched issue must carry a team_id — Linear state resolution is team-scoped.
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..dispatched()
+        };
+        let sess = ag
+            .start_session("", iss.clone(), None)
+            .await
+            .expect("session");
+        let (last, _result, err) = d
+            .run_turns(sess.as_ref(), "do it", iss, None, None, &noop_event())
+            .await;
+        assert!(err.is_none(), "expected a clean exit, got {err:?}");
+        assert_eq!(
+            tr.move_calls().len(),
+            1,
+            "the auto-park still fires for a ticket run"
+        );
+        assert_eq!(last, "in review", "returned state reflects the park");
+    }
+
+    /// The synthetic issue a review run is dispatched with: a `pr:` key and NO state (STUDIO-715).
+    fn review_issue() -> Issue {
+        Issue {
+            id: "pr:makewhat/rhapsody#12@alice".to_string(),
+            identifier: "pr:makewhat/rhapsody#12@alice".to_string(),
+            title: "Review makewhat/rhapsody#12".to_string(),
+            ..Issue::default()
+        }
     }
 
     // Mirrors Go `TestWorkerStopsAtMaxTurns`: always active → only max_turns stops it.

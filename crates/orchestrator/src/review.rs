@@ -28,10 +28,13 @@
 use std::collections::HashMap;
 
 use rhapsody_core::Issue;
-use rhapsody_store::{REVIEW_STATUS_REQUESTED, ReviewWatchKey, ReviewWatchRow};
+use rhapsody_store::{
+    self as store, REVIEW_STATUS_APPROVED, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_REVIEWED,
+    ReviewWatchKey, ReviewWatchRow,
+};
 
-use crate::orchestrator::Orchestrator;
-use crate::retry::DispatchRoute;
+use crate::orchestrator::{Orchestrator, RunningEntry};
+use crate::retry::{DispatchRoute, EvWorkerExit};
 
 /// The prefix every review run's issue id/identifier carries. A tracker identifier is
 /// `TEAM-123`-shaped and can never begin with `pr:`, so the prefix alone distinguishes a review run
@@ -157,6 +160,24 @@ fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
 
+/// Canonicalizes a `rhapsody_review_watch.status` that a COMPLETED review round may be recorded
+/// with, or `None` for anything outside that closed domain (STUDIO-716).
+///
+/// [`Store::mark_review_completed`](rhapsody_store::Store::mark_review_completed) takes a plain
+/// string and cannot enforce the domain itself, so the WRITER does. Only the two CLOSED values
+/// qualify: [`REVIEW_STATUS_REVIEWED`] (findings posted) and [`REVIEW_STATUS_APPROVED`] (nothing
+/// found; re-review pauses at this head — design §15-c). [`REVIEW_STATUS_REQUESTED`] and
+/// `in_flight` describe a round that has NOT finished and `dropped` is the watcher's own terminal,
+/// so none of them is a completion — and a status the watcher cannot recognise is worse than no
+/// write at all, because its edge-trigger would then either re-review forever or never again.
+fn closed_review_status(status: &str) -> Option<&'static str> {
+    match status {
+        REVIEW_STATUS_REVIEWED => Some(REVIEW_STATUS_REVIEWED),
+        REVIEW_STATUS_APPROVED => Some(REVIEW_STATUS_APPROVED),
+        _ => None,
+    }
+}
+
 /// Why a review dispatch did or did not happen. Returned rather than logged-and-swallowed because
 /// slice 5's watcher has to distinguish "already in flight, come back next tick" from "this will
 /// never work", and because the F-DUP refusal is the property this slice's acceptance test asserts.
@@ -274,6 +295,74 @@ impl Orchestrator {
         })
     }
 
+    /// The exit path of a ticketless review run — what `classify_clean_exit` cannot be
+    /// (STUDIO-716, design §14.2 F4).
+    ///
+    /// A synthetic `pr:` issue carries no state, so both of the classifier's samples are empty,
+    /// `worker_left` and `snap_left` are both false, and EVERY clean review exit falls into its
+    /// first branch: `OUTCOME_CONTINUED`, keep the claim, `schedule_retry_for`. That re-dispatches
+    /// the same review a second later, and again, and again — permanently holding the reviewer's
+    /// slot. So the review path does its own bookkeeping and schedules no retry at all.
+    ///
+    /// That holds for a FAILED exit too. A review round is one-shot: re-arming one at a new head is
+    /// the watcher's edge-triggered decision (slice 5), and the retry queue could not re-dispatch a
+    /// `pr:` key regardless, since [`Orchestrator::dispatch_issue`] refuses a review key that
+    /// arrives without its coordinates — a backoff timer would only hold the claim until it fired.
+    pub(crate) fn on_review_exit(&mut self, re: &RunningEntry, run: &ReviewRun, e: &EvWorkerExit) {
+        self.completed.remove(&re.issue.id);
+        self.claimed.remove(&re.issue.id);
+        let (outcome, reason) = if e.failed {
+            // The watch row is deliberately left exactly where the dispatch put it (`in_flight` at
+            // its `requested_sha`): nobody read this head, so recording it as reviewed would be the
+            // F-SHA lost update by another route, and clearing the in-flight marker of a crashed
+            // review is the watcher's own recovery (design §14.1 F-DUP, "clear on crash").
+            let reason = if e.err_msg.is_empty() {
+                "worker failed"
+            } else {
+                e.err_msg.as_str()
+            };
+            (store::OUTCOME_FAILED, reason)
+        } else {
+            self.record_review_completed(run, REVIEW_STATUS_REVIEWED);
+            (store::OUTCOME_COMPLETED, "")
+        };
+        self.persist_end_run(re, outcome, reason);
+        // Drop the persisted `running` claim row `persist_start_run` wrote — on BOTH outcomes.
+        // A ticket run's failure path can leave its claim behind because the backoff retry it
+        // schedules immediately rewrites the row as `retry_queued`, which is what re-arms the timer
+        // across a restart; a review schedules nothing, so the row would simply outlive the daemon
+        // and greet boot recovery as a live claim on a key no tracker can resolve.
+        self.persist_complete(&re.issue.identifier);
+        self.persist_totals();
+    }
+
+    /// Records the head a finished review round ACTUALLY read into its watch-set row, with a
+    /// validated terminal `status` (STUDIO-716).
+    ///
+    /// The SHA is `run.head_sha` — the one pinned at DISPATCH and carried on the running entry ever
+    /// since. It is deliberately not a completion-time reading of where the pull request's head is
+    /// now: an author who pushes a fix mid-review would otherwise have that new head recorded as
+    /// reviewed, and those commits would then never be read by anyone (design §14.1 F-SHA).
+    ///
+    /// An out-of-domain `status` is refused rather than written; see [`closed_review_status`].
+    /// Best-effort like every other store write on this path — a failure is logged, never fatal.
+    pub(crate) fn record_review_completed(&self, run: &ReviewRun, status: &str) {
+        let Some(status) = closed_review_status(status) else {
+            tracing::error!(
+                review = %run.key(),
+                status = %status,
+                "refusing to record a review completion with an out-of-domain status"
+            );
+            return;
+        };
+        if let Err(e) = self
+            .store()
+            .mark_review_completed(&run.watch_key(), &run.head_sha, status)
+        {
+            tracing::warn!(review = %run.key(), err = %e, "recording the reviewed head failed");
+        }
+    }
+
     /// Removes a finished review run's worktree. Called from `on_worker_exit` for review runs only.
     ///
     /// A ticket's worktree is reclaimed by `reconcile`'s `TerminateCleanup` when the ticket reaches a
@@ -322,7 +411,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use rhapsody_config::teams::{Identity, Teams};
-    use rhapsody_store::{REVIEW_STATUS_IN_FLIGHT, Sqlite, StorePath};
+    use rhapsody_store::{
+        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, StorePath,
+    };
     use rhapsody_tracker::fake::Fake;
     use rhapsody_workspace::sanitize_key;
 
@@ -700,6 +791,161 @@ mod tests {
         assert!(!o.running.contains_key(&iss.id) && !o.claimed.contains(&iss.id));
     }
 
+    /// Hands a dispatched review its worker exit and returns the run row id it was recorded on.
+    fn exit_review(o: &mut Orchestrator, run: &ReviewRun, failed: bool, err_msg: &str) -> i64 {
+        let id = run.key();
+        let re = o.running.get(&id).expect("the review is running");
+        let (started_at, run_id) = (re.started_at, re.run_id);
+        o.on_worker_exit(crate::EvWorkerExit {
+            issue_id: id,
+            failed,
+            started_at,
+            err_msg: err_msg.to_string(),
+            // A synthetic `pr:` issue has no state, so BOTH of the classifier's samples are empty —
+            // the exact input that made every clean review exit an OUTCOME_CONTINUED.
+            last_state: String::new(),
+            declared_handoff: true,
+        });
+        run_id
+    }
+
+    /// F4, the acceptance criterion: a clean review exit is recorded COMPLETED and schedules no
+    /// continuation. `classify_clean_exit` would read the two empty state samples as "still active"
+    /// and re-dispatch the same review every second, forever, holding the reviewer's slot.
+    #[test]
+    fn a_clean_review_exit_records_completed_and_schedules_no_continuation() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+
+        let run_id = exit_review(&mut o, &run, false, "");
+
+        assert!(
+            o.retry_attempts.is_empty() && o.retry_timers.is_empty(),
+            "a review exit scheduled a continuation retry"
+        );
+        assert!(
+            !o.claimed.contains(&run.key()) && !o.completed.contains(&run.key()),
+            "the review key stayed claimed, so it can never be reviewed again"
+        );
+        assert!(!o.running.contains_key(&run.key()));
+        let row = o
+            .store()
+            .get_run(run_id)
+            .expect("read run row")
+            .expect("run row exists");
+        assert_eq!(row.outcome, rhapsody_store::OUTCOME_COMPLETED);
+    }
+
+    /// F-SHA: the SHA recorded as reviewed is the one PINNED AT CHECKOUT, carried on the running
+    /// entry — never a completion-time reading of where the pull request's head is now. Here the
+    /// watch set has already moved on to a newer head (the shape a mid-review push produces), and
+    /// the completion must still record the head the reviewer actually read.
+    #[test]
+    fn a_review_exit_records_the_pinned_head_not_the_newer_one() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+        // The author pushes while the review runs; the watcher observes the new head.
+        o.store()
+            .mark_review_requested(&run.watch_key(), HEAD_B)
+            .expect("observe the new head");
+
+        exit_review(&mut o, &run, false, "");
+
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("row exists");
+        assert_eq!(
+            row.last_reviewed_sha, HEAD_A,
+            "recording the live head marks commits reviewed that nobody read"
+        );
+        assert_eq!(row.status, REVIEW_STATUS_REVIEWED);
+        assert_eq!(
+            row.requested_sha, HEAD_B,
+            "the requested head is not the completion's to move"
+        );
+    }
+
+    /// The status domain is closed and the WRITER enforces it — `mark_review_completed` takes a
+    /// plain string and cannot (the STUDIO-711 review nit). A status the watcher cannot recognise
+    /// must not reach the row at all.
+    #[test]
+    fn an_out_of_domain_completion_status_is_refused() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+
+        for bad in ["", "in_flight", "requested", "dropped", "Reviewed", "done"] {
+            o.record_review_completed(&run, bad);
+            let row = o
+                .store()
+                .get_review_watch(&run.watch_key())
+                .expect("read watch row")
+                .expect("row exists");
+            assert_eq!(row.status, REVIEW_STATUS_IN_FLIGHT, "{bad} was written");
+            assert!(
+                row.last_reviewed_sha.is_empty(),
+                "{bad} moved the reviewed head"
+            );
+        }
+        // …and the two in-domain values are accepted.
+        for good in [REVIEW_STATUS_REVIEWED, REVIEW_STATUS_APPROVED] {
+            o.record_review_completed(&run, good);
+            let row = o
+                .store()
+                .get_review_watch(&run.watch_key())
+                .expect("read watch row")
+                .expect("row exists");
+            assert_eq!(row.status, good);
+            assert_eq!(row.last_reviewed_sha, HEAD_A);
+        }
+    }
+
+    /// A FAILED review run is recorded failed and, like a clean one, schedules no retry: a `pr:`
+    /// key can never be re-dispatched through the retry queue (`dispatch_issue` refuses a review
+    /// key with no coordinates), so a backoff timer would only hold the claim. Its watch row is
+    /// left where the dispatch put it — re-arming a crashed review is the watcher's call, and
+    /// recording an unread head as reviewed would be the F-SHA lost update by another route.
+    #[test]
+    fn a_failed_review_exit_records_failed_and_schedules_no_retry() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+
+        let run_id = exit_review(&mut o, &run, true, "claude startup failed");
+
+        assert!(
+            o.retry_attempts.is_empty() && o.retry_timers.is_empty(),
+            "a failed review scheduled a backoff retry that could never dispatch"
+        );
+        assert!(!o.claimed.contains(&run.key()));
+        let row = o
+            .store()
+            .get_run(run_id)
+            .expect("read run row")
+            .expect("run row exists");
+        assert_eq!(row.outcome, rhapsody_store::OUTCOME_FAILED);
+        assert_eq!(row.error, "claude startup failed");
+        assert!(
+            o.store()
+                .load_recovery()
+                .expect("load recovery")
+                .claims
+                .is_empty(),
+            "the persisted claim row outlives the run and greets boot recovery"
+        );
+        let watch = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("row exists");
+        assert_eq!(watch.status, REVIEW_STATUS_IN_FLIGHT);
+        assert!(watch.last_reviewed_sha.is_empty());
+    }
+
     /// Runs a git command in `dir` with a deterministic identity; panics on failure (test helper).
     fn git_run(dir: &str, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -743,10 +989,17 @@ mod tests {
     }
 
     /// Teardown, end to end and against a real worktree: a review run's exit removes the detached
-    /// worktree. Nothing else ever would — a `pr:` id reaches no terminal tracker state, so
-    /// `reconcile`'s TerminateCleanup never fires for it and the tree would leak once per review.
+    /// worktree, on a clean exit and on a failed one alike. Nothing else ever would — a `pr:` id
+    /// reaches no terminal tracker state, so `reconcile`'s TerminateCleanup never fires for it and
+    /// the tree would leak once per review.
     #[tokio::test]
     async fn a_review_run_exit_removes_its_detached_worktree() {
+        for failed in [false, true] {
+            review_exit_removes_the_worktree(failed).await;
+        }
+    }
+
+    async fn review_exit_removes_the_worktree(failed: bool) {
         let origin = TempDir::new();
         let head = origin_with_pr_head(&origin, 12);
         let root = TempDir::new();
@@ -786,7 +1039,7 @@ mod tests {
 
         o.on_worker_exit(crate::EvWorkerExit {
             issue_id: run.key(),
-            failed: false,
+            failed,
             started_at,
             err_msg: String::new(),
             last_state: String::new(),
@@ -798,8 +1051,109 @@ mod tests {
             .expect("teardown task finished");
         assert!(
             std::fs::metadata(&provisioned.path).is_err(),
-            "the review worktree leaked: {}",
+            "the review worktree leaked (failed={failed}): {}",
             provisioned.path
+        );
+    }
+
+    /// STUDIO-716: `POST /api/v1/runs/{id}/stop` on a review run removes its detached worktree too.
+    ///
+    /// Stop never reaches `on_worker_exit`'s teardown. `handle_stop_run` -> `terminate` removes the
+    /// entry and fires the cancellation, and the worker's later exit event then hits the
+    /// stale/absent guard and returns BEFORE the teardown — so a stopped review used to leak its
+    /// `pr_<owner>_<repo>_<n>_<reviewer>` tree permanently, with nothing left that could name it.
+    #[tokio::test]
+    async fn stopping_a_review_run_removes_its_detached_worktree() {
+        let origin = TempDir::new();
+        let head = origin_with_pr_head(&origin, 12);
+        let root = TempDir::new();
+        let ws = Arc::new(
+            rhapsody_workspace::Manager::new(rhapsody_workspace::Config {
+                root: root.path.clone(),
+                hooks: rhapsody_workspace::HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .expect("workspace manager"),
+        );
+        let (mut o, _d) = orch_with_review(true);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.projects[0].repo = origin.path.clone();
+            eff.projects[0].workspace = Arc::clone(&ws);
+        }
+        let signal = crate::control_loop::CancelSignal::new();
+        o.set_ctx(signal.wait());
+
+        let mut run = review_run("alice", &head);
+        run.repo_url = origin.path.clone();
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let provisioned = ws
+            .ensure_review_worktree(&run.repo_url, "rhapsody", &run.key(), 12, &head)
+            .await
+            .expect("provision review worktree");
+        assert!(std::fs::metadata(&provisioned.path).is_ok());
+        let run_id = o.running[&run.key()].run_id;
+
+        let plan = o.handle_stop_run(run_id);
+
+        assert!(plan.found, "the stop did not find the live review run");
+        tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())
+            .await
+            .expect("teardown task finished");
+        assert!(
+            std::fs::metadata(&provisioned.path).is_err(),
+            "a stopped review leaked its worktree: {}",
+            provisioned.path
+        );
+    }
+
+    /// The other half: stopping a TICKET run must not touch its workspace. `terminate` is shared
+    /// with `reconcile_stalled`, which retries the run straight back into that same tree — removing
+    /// it there would delete a stalled run's in-progress work.
+    #[tokio::test]
+    async fn stopping_a_ticket_run_leaves_its_workspace_alone() {
+        let root = TempDir::new();
+        let ws = Arc::new(
+            rhapsody_workspace::Manager::new(rhapsody_workspace::Config {
+                root: root.path.clone(),
+                hooks: rhapsody_workspace::HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .expect("workspace manager"),
+        );
+        let (mut o, _d) = orch_with_review(true);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.projects[0].workspace = Arc::clone(&ws);
+        }
+        let signal = crate::control_loop::CancelSignal::new();
+        o.set_ctx(signal.wait());
+        let legacy = ws
+            .create_for_issue("rhapsody", "STUDIO-1")
+            .await
+            .expect("legacy workspace");
+
+        let mut re = RunningEntry::empty(rhapsody_core::Issue {
+            id: "1".into(),
+            identifier: "STUDIO-1".into(),
+            title: "work".into(),
+            state: "In Progress".into(),
+            ..Default::default()
+        });
+        re.started_at = chrono::Utc::now();
+        re.project_slug = "rhapsody".to_string();
+        re.run_id = 77;
+        o.running.insert("1".to_string(), re);
+
+        assert!(o.handle_stop_run(77).found);
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())
+            .await
+            .expect("no teardown task should be outstanding");
+        assert!(
+            std::fs::metadata(&legacy.path).is_ok(),
+            "a stopped ticket run's workspace was torn down as if it were a review"
         );
     }
 

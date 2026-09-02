@@ -588,6 +588,14 @@ impl Orchestrator {
             self.refresh_prompt_file_warnings(inputs, checker);
         }
 
+        // A ticketless review run has no ticket, so `classify_clean_exit` cannot serve it: both of
+        // its state samples are empty, which reads as "still active" and schedules the continuation
+        // retry that re-dispatches the review forever (STUDIO-716, design §14.2 F4). Its own exit
+        // path does the bookkeeping instead — for a failed exit as well as a clean one.
+        if let Some(run) = re.review.as_ref() {
+            self.on_review_exit(&re, run, &e);
+            return;
+        }
         if !e.failed {
             // The two freshest state samples: the worker's per-turn refresh (e.last_state) and
             // reconcile's snapshot (re.issue.state). classify_clean_exit treats the ticket as having
