@@ -32,8 +32,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::claude::{
-    Config, TRACKER_ENV_VARS, append_me_env, billing_guard_enabled, billing_guard_ok, build_args,
-    classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars, split_command,
+    Config, TRACKER_ENV_VARS, append_me_env, append_review_env, billing_guard_enabled,
+    billing_guard_ok, build_args, classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars,
+    split_command,
 };
 use crate::{
     AgentError, EVENT_OPERATOR_MESSAGE, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
@@ -126,6 +127,7 @@ impl crate::Runner for Runner {
             transcript: Mutex::new(transcript),
             transcript_warned: AtomicBool::new(false),
             run_id: AtomicI64::new(0),
+            review_head: Mutex::new(String::new()),
         }))
     }
 }
@@ -158,6 +160,11 @@ struct ClaudeSession {
     ///
     /// Atomic rather than plain: `set_run_id` takes `&self`, and the value is read on every turn.
     run_id: AtomicI64,
+    /// The pull-request head SHA this session is REVIEWING, set once by the worker via
+    /// [`Session::set_review_head`] before the first turn; empty for every non-review run, which
+    /// emits no review env at all (STUDIO-715). Behind a `Mutex` for the same reason `thread_id`
+    /// is: the setter takes `&self` and the value is read on every turn.
+    review_head: Mutex<String>,
 }
 
 impl ClaudeSession {
@@ -165,6 +172,11 @@ impl ClaudeSession {
     /// never does) so the accessor stays panic-free under `-D warnings`.
     fn locked_thread_id(&self) -> std::sync::MutexGuard<'_, String> {
         self.thread_id.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Locks `review_head`, recovering the guard on poison, exactly as [`Self::locked_thread_id`] does.
+    fn locked_review_head(&self) -> std::sync::MutexGuard<'_, String> {
+        self.review_head.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Tees one raw stdout line (+ newline) to the transcript BEFORE classification so even
@@ -221,6 +233,13 @@ impl Session for ClaudeSession {
     /// against a zero id by [`append_me_env`], which omits the variable entirely for `0`.
     fn set_run_id(&self, id: i64) {
         self.run_id.store(id, Ordering::SeqCst);
+    }
+
+    /// Stores the review-mode head SHA (STUDIO-715). Guarded against an empty value by
+    /// [`append_review_env`], which emits nothing for it — so a non-review session's child env is
+    /// unchanged.
+    fn set_review_head(&self, sha: &str) {
+        *self.locked_review_head() = sha.to_string();
     }
 
     async fn stop(&self) -> Result<(), AgentError> {
@@ -286,6 +305,8 @@ impl Session for ClaudeSession {
             &self.issue.identifier,
             self.run_id.load(Ordering::SeqCst),
         );
+        // Review-mode only, and additive: empty (every non-review run) emits nothing (STUDIO-715).
+        let env = append_review_env(env, &self.locked_review_head());
         cmd.env_clear();
         for kv in &env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -1767,6 +1788,65 @@ mod tests {
         assert!(
             !env.contains_key("SYMPHONY_RUN_ID") && !env.contains_key("RHAPSODY_RUN_ID"),
             "an unset run id must emit no run-id env"
+        );
+    }
+
+    /// STUDIO-715 (design record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §14.1
+    /// F-SHA): a review run's head SHA is pinned ONCE, when its detached worktree is checked out,
+    /// and reaches the agent as `SYMPHONY_REVIEW_HEAD` so the reviewer reports on the commit it is
+    /// actually reading rather than re-asking GitHub for a head that may have moved since.
+    #[tokio::test]
+    async fn run_turn_emits_review_head_env_after_set_review_head() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "pr_o_r_7_alice");
+        let (_s, script) = env_dump_script();
+        let r = new_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("pr:o/r#7@alice", "pr:o/r#7@alice"), None)
+            .await
+            .expect("start session");
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        sess.set_review_head(head);
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "RunTurn err = {err:?}");
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert_eq!(
+            env.get("SYMPHONY_REVIEW_HEAD").map(String::as_str),
+            Some(head),
+            "SYMPHONY_REVIEW_HEAD must carry the pinned head"
+        );
+        assert_eq!(
+            env.get("RHAPSODY_REVIEW_HEAD").map(String::as_str),
+            Some(head),
+            "RHAPSODY_REVIEW_HEAD (STUDIO-603's twin spelling) must match"
+        );
+    }
+
+    /// The inertness half: every non-review run — which is every run this slice ships, since nothing
+    /// dispatches a review yet — emits no review env at all, so the agent child's environment is
+    /// byte-identical to one built before review mode existed.
+    #[tokio::test]
+    async fn run_turn_without_set_review_head_emits_no_review_env() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-NOREVIEW");
+        let (_s, script) = env_dump_script();
+        let r = new_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("r4", "MT-NOREVIEW"), None)
+            .await
+            .expect("start session");
+        // An empty pin is the same as never pinning: a non-review dispatch must not emit the var.
+        sess.set_review_head("");
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "RunTurn err = {err:?}");
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert!(
+            !env.contains_key("SYMPHONY_REVIEW_HEAD") && !env.contains_key("RHAPSODY_REVIEW_HEAD"),
+            "a non-review run must emit no review env"
         );
     }
 
