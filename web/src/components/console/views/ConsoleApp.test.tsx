@@ -234,3 +234,29 @@ describe("Settings' Workflow row (§8, STUDIO-690)", () => {
     expect(window.location.hash).toBe("#workflow");
   });
 });
+
+// STUDIO-687 §10 box 6.3 — every rail item must reach its real view.
+//
+// The audit found the Teams rail item landing on a "not built yet" placeholder: the §5 room
+// (TeamsConsole, sub-ticket 3) shipped fully built and tested, but nothing ever imported it, so
+// the route this shell had reserved for it still rendered sub-ticket 2's stub. Both halves were
+// green in isolation, which is exactly the silent 80%-shipped this box exists to catch. The
+// assertion is on the room's own furniture rather than the heading, because "Teams" is also the
+// stub's title — a heading test would have passed against the bug.
+describe("every rail destination is the real view (§10 box 6.3)", () => {
+  it("routes Teams to the room itself, not to a placeholder", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#teams");
+    expect(await screen.findByRole("heading", { level: 2, name: "The room" })).toBeTruthy();
+    expect(await screen.findByPlaceholderText(/Search the room/)).toBeTruthy();
+    expect(screen.queryByText(/is not built yet/)).toBeNull();
+  });
+
+  it("keeps the room's side cards routing on to manage and memory", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#teams");
+    fireEvent.click(await screen.findByText("Manage team →"));
+    await waitFor(() => expect(window.location.hash).toBe("#manage"));
+    expect(activeNavs()).toEqual(["teams"]);
+  });
+});

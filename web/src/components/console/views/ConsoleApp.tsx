@@ -7,6 +7,7 @@ import {
   TeamsIcon,
   type NavItemSpec,
 } from "@/components/console";
+import { TeamsConsole } from "@/components/console/teams/TeamsConsole";
 import { useConsoleRoute } from "@/hooks/useConsoleRoute";
 import { useIssueRuns } from "@/hooks/useHistory";
 import { useStateQuery } from "@/hooks/useStateQuery";
@@ -117,10 +118,10 @@ function ConsoleBody({
     case "workflow":
       return <WorkflowView onNavigate={(to) => go(to)} />;
     // teams / memory / manage are only ever reached with Teams ON — `useConsoleRoute` sends
-    // them to Jobs otherwise (§2.4). §6's memory page (STUDIO-685) and §7's manage form
-    // (STUDIO-686) are built; the room (§5) is sub-ticket 3 of STUDIO-681.
+    // them to Jobs otherwise (§2.4). All three views are built: §5's room (STUDIO-684), §6's
+    // memory page (STUDIO-685) and §7's manage form (STUDIO-686).
     case "teams":
-      return <Pending title="Teams" section="§5" subTicket={3} />;
+      return <TeamsConsole onNavigate={(to) => go(to)} />;
     case "memory":
       // "View run" has no run route of its own (§2.3) — a fact's run lives on its ticket's Job
       // detail, which is where the runs list already is.
@@ -130,26 +131,6 @@ function ConsoleBody({
     default:
       return <JobsView onOpenJob={(issue) => go("job", issue)} />;
   }
-}
-
-/**
- * A view this slice does not build, named by the SPEC section and sub-ticket that do. It cites
- * the epic rather than a specific issue id on purpose: the sub-ticket numbering is in the spec
- * and verifiable, whereas guessing at the issue key for a ticket this run cannot read would put
- * an unverified reference into shipped UI text.
- */
-function Pending({ title, section, subTicket }: { title: string; section: string; subTicket: number }) {
-  return (
-    <section>
-      <div className="head">
-        <h1>{title}</h1>
-      </div>
-      <p className="lead">
-        {section} of the dashboard redesign is sub-ticket {subTicket} of STUDIO-681, and is not
-        built yet. This slice (STUDIO-683) builds the shell, Jobs, Job detail and Settings.
-      </p>
-    </section>
-  );
 }
 
 /** The rail's foot: the daemon's live state, its build, and the capability flags (§2.1). */
