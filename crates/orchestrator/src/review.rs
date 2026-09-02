@@ -976,10 +976,17 @@ mod tests {
     }
 
     /// Teardown, end to end and against a real worktree: a review run's exit removes the detached
-    /// worktree. Nothing else ever would — a `pr:` id reaches no terminal tracker state, so
-    /// `reconcile`'s TerminateCleanup never fires for it and the tree would leak once per review.
+    /// worktree, on a clean exit and on a failed one alike. Nothing else ever would — a `pr:` id
+    /// reaches no terminal tracker state, so `reconcile`'s TerminateCleanup never fires for it and
+    /// the tree would leak once per review.
     #[tokio::test]
     async fn a_review_run_exit_removes_its_detached_worktree() {
+        for failed in [false, true] {
+            review_exit_removes_the_worktree(failed).await;
+        }
+    }
+
+    async fn review_exit_removes_the_worktree(failed: bool) {
         let origin = TempDir::new();
         let head = origin_with_pr_head(&origin, 12);
         let root = TempDir::new();
@@ -1019,7 +1026,7 @@ mod tests {
 
         o.on_worker_exit(crate::EvWorkerExit {
             issue_id: run.key(),
-            failed: false,
+            failed,
             started_at,
             err_msg: String::new(),
             last_state: String::new(),
@@ -1031,8 +1038,109 @@ mod tests {
             .expect("teardown task finished");
         assert!(
             std::fs::metadata(&provisioned.path).is_err(),
-            "the review worktree leaked: {}",
+            "the review worktree leaked (failed={failed}): {}",
             provisioned.path
+        );
+    }
+
+    /// STUDIO-716: `POST /api/v1/runs/{id}/stop` on a review run removes its detached worktree too.
+    ///
+    /// Stop never reaches `on_worker_exit`'s teardown. `handle_stop_run` -> `terminate` removes the
+    /// entry and fires the cancellation, and the worker's later exit event then hits the
+    /// stale/absent guard and returns BEFORE the teardown — so a stopped review used to leak its
+    /// `pr_<owner>_<repo>_<n>_<reviewer>` tree permanently, with nothing left that could name it.
+    #[tokio::test]
+    async fn stopping_a_review_run_removes_its_detached_worktree() {
+        let origin = TempDir::new();
+        let head = origin_with_pr_head(&origin, 12);
+        let root = TempDir::new();
+        let ws = Arc::new(
+            rhapsody_workspace::Manager::new(rhapsody_workspace::Config {
+                root: root.path.clone(),
+                hooks: rhapsody_workspace::HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .expect("workspace manager"),
+        );
+        let (mut o, _d) = orch_with_review(true);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.projects[0].repo = origin.path.clone();
+            eff.projects[0].workspace = Arc::clone(&ws);
+        }
+        let signal = crate::control_loop::CancelSignal::new();
+        o.set_ctx(signal.wait());
+
+        let mut run = review_run("alice", &head);
+        run.repo_url = origin.path.clone();
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let provisioned = ws
+            .ensure_review_worktree(&run.repo_url, "rhapsody", &run.key(), 12, &head)
+            .await
+            .expect("provision review worktree");
+        assert!(std::fs::metadata(&provisioned.path).is_ok());
+        let run_id = o.running[&run.key()].run_id;
+
+        let plan = o.handle_stop_run(run_id);
+
+        assert!(plan.found, "the stop did not find the live review run");
+        tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())
+            .await
+            .expect("teardown task finished");
+        assert!(
+            std::fs::metadata(&provisioned.path).is_err(),
+            "a stopped review leaked its worktree: {}",
+            provisioned.path
+        );
+    }
+
+    /// The other half: stopping a TICKET run must not touch its workspace. `terminate` is shared
+    /// with `reconcile_stalled`, which retries the run straight back into that same tree — removing
+    /// it there would delete a stalled run's in-progress work.
+    #[tokio::test]
+    async fn stopping_a_ticket_run_leaves_its_workspace_alone() {
+        let root = TempDir::new();
+        let ws = Arc::new(
+            rhapsody_workspace::Manager::new(rhapsody_workspace::Config {
+                root: root.path.clone(),
+                hooks: rhapsody_workspace::HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .expect("workspace manager"),
+        );
+        let (mut o, _d) = orch_with_review(true);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.projects[0].workspace = Arc::clone(&ws);
+        }
+        let signal = crate::control_loop::CancelSignal::new();
+        o.set_ctx(signal.wait());
+        let legacy = ws
+            .create_for_issue("rhapsody", "STUDIO-1")
+            .await
+            .expect("legacy workspace");
+
+        let mut re = RunningEntry::empty(rhapsody_core::Issue {
+            id: "1".into(),
+            identifier: "STUDIO-1".into(),
+            title: "work".into(),
+            state: "In Progress".into(),
+            ..Default::default()
+        });
+        re.started_at = chrono::Utc::now();
+        re.project_slug = "rhapsody".to_string();
+        re.run_id = 77;
+        o.running.insert("1".to_string(), re);
+
+        assert!(o.handle_stop_run(77).found);
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())
+            .await
+            .expect("no teardown task should be outstanding");
+        assert!(
+            std::fs::metadata(&legacy.path).is_ok(),
+            "a stopped ticket run's workspace was torn down as if it were a review"
         );
     }
 
