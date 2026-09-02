@@ -2,6 +2,7 @@
 //! server spawner, and `Snapshot` builders. The Rust analog of `server_test.go`'s `fakeProvider` +
 //! `testServer` + `sampleSnapshot` helpers, narrowed to the H1 surface.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,8 +14,8 @@ use rhapsody_config::workflow::Definition;
 use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
 use rhapsody_orchestrator::{
-    HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RetryRow, RunMessageResult,
-    RunningRow, Snapshot, StopResult, TokenCounts, Totals,
+    HandoffResult, Identity, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult, RetryRow,
+    RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
 };
 use rhapsody_store::Noop;
 
@@ -72,6 +73,12 @@ pub(crate) struct FakeProvider {
     /// The `teams.yaml` path `/api/v1/teams/config` reads and writes (STUDIO-652). Empty ⇒ the
     /// no-runtime-home answer a `--no-store` daemon gives.
     teams_config_path: String,
+    /// The canned ticket lifecycles the issue listing is decorated with (STUDIO-702), keyed by
+    /// tracker issue id. Empty ⇒ the trait default: no answer for anything, which is what a daemon
+    /// with no tracker yet reports. `issue_lifecycles_asked` records the ids the handler forwarded,
+    /// so a test can assert it asked about exactly the page it served.
+    issue_lifecycles: HashMap<String, IssueLifecycleRow>,
+    issue_lifecycles_asked: Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
@@ -108,6 +115,8 @@ impl FakeProvider {
             capabilities_registry: None,
             teams_memory: None,
             teams_config_path: String::new(),
+            issue_lifecycles: HashMap::new(),
+            issue_lifecycles_asked: Mutex::new(Vec::new()),
         }
     }
 
@@ -121,6 +130,24 @@ impl FakeProvider {
 
     /// Back the history endpoints with `store` (a real seeded [`rhapsody_store::Sqlite`] or a
     /// [`Noop`]). The Rust analog of Go's `&fakeProvider{hist: st}`.
+    /// Canned ticket lifecycles for the issue listing's `lifecycle`/`tracker_state` fields
+    /// (STUDIO-702), keyed by tracker issue id. Ids absent from `rows` get no answer.
+    pub(crate) fn with_issue_lifecycles(
+        mut self,
+        rows: HashMap<String, IssueLifecycleRow>,
+    ) -> Self {
+        self.issue_lifecycles = rows;
+        self
+    }
+
+    /// The issue ids the last `issue_lifecycles` call forwarded, in order.
+    pub(crate) fn issue_lifecycles_asked(&self) -> Vec<String> {
+        self.issue_lifecycles_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn with_history(mut self, store: Arc<dyn HistoryStore>) -> Self {
         self.history = store;
         self
@@ -246,6 +273,20 @@ impl StateProvider for FakeProvider {
             Some(message) => Err(SnapshotError::new(message.clone())),
             None => Ok(self.snap.clone()),
         }
+    }
+
+    async fn issue_lifecycles(&self, ids: &[String]) -> HashMap<String, IssueLifecycleRow> {
+        *self
+            .issue_lifecycles_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ids.to_vec();
+        ids.iter()
+            .filter_map(|id| {
+                self.issue_lifecycles
+                    .get(id)
+                    .map(|r| (id.clone(), r.clone()))
+            })
+            .collect()
     }
 
     fn history(&self) -> Arc<dyn HistoryStore> {

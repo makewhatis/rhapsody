@@ -120,6 +120,11 @@ pub struct DispatchStates {
     /// state that merely fails to be dispatchable, which would sweep Done, Canceled and Backlog
     /// tickets too.
     pub review: HashSet<String>,
+    /// The configured CANCELED states — a SUBSET of [`Self::terminal`], carried separately for the
+    /// same reason [`Self::review`] is: a reader that has to name a ticket's lifecycle for a human
+    /// (STUDIO-702) must tell "Done" from "Won't Do", and `terminal` alone folds the two together.
+    /// Not part of [`dispatchable_state`] — `terminal` already excludes every state in here.
+    pub canceled: HashSet<String>,
 }
 
 impl DispatchStates {

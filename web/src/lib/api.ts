@@ -149,12 +149,30 @@ export interface HistoryResponse {
   next_offset: number | null;
 }
 
+// IssueLifecycle is the daemon's normalized answer to "where is this TICKET in its tracker?"
+// (STUDIO-702) — deliberately not the raw workflow-state name, which varies per workspace.
+export type IssueLifecycle = "open" | "in_review" | "done" | "canceled";
+
+// IssueRun is one entry of the issue-level listing: that issue's LATEST run, plus the TICKET's
+// current lifecycle when the daemon could resolve one (STUDIO-702).
+//
+// Both extra fields are ABSENT — not blank — when it could not: no tracker configured yet, a failed
+// lookup, or an issue the tracker no longer knows. That is the whole point of the shape: "the daemon
+// has no answer" has to stay distinguishable from any answer it could have given, because a client
+// that cannot tell them apart has to guess, and guessing from the run outcome alone is the bug
+// STUDIO-702 exists to fix.
+export interface IssueRun extends RunSummary {
+  // The tracker's workflow-state NAME, verbatim (e.g. "In Review", "Won't Do").
+  tracker_state?: string;
+  lifecycle?: IssueLifecycle;
+}
+
 // IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —
 // that issue's LATEST run — paged by issue. The Jobs list reads this instead of grouping a
 // run-paged fetch, so an issue in a retry loop occupies one row rather than filling the page and
 // hiding every other issue. `next_offset` follows the same rule as HistoryResponse, counting issues.
 export interface IssueRunsResponse {
-  issues: RunSummary[];
+  issues: IssueRun[];
   next_offset: number | null;
 }
 

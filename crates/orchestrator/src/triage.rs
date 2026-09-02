@@ -2058,6 +2058,7 @@ mod tests {
             active: set_of(&["todo"]),
             terminal: set_of(&["done"]),
             review: set_of(&["in review"]),
+            canceled: Default::default(),
         }
     }
 
@@ -3554,6 +3555,7 @@ mod tests {
             active: set_of(&["todo", "in progress"]),
             terminal: set_of(&["done", "in progress"]),
             review: set_of(&["in review"]),
+            canceled: Default::default(),
         };
         let gate = crate::dispatch::EligibilityGate {
             active: &states.active,
@@ -3879,6 +3881,7 @@ mod tests {
                 active: set_of(&["todo"]),
                 terminal: set_of(&["done"]),
                 review: set_of(&[]),
+                canceled: Default::default(),
             },
         );
 
