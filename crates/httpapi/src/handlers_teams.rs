@@ -12,6 +12,7 @@
 //! | `GET /api/v1/teams/roster` | `teams_roster` |
 //! | `GET /api/v1/teams/recall` | `teams_recall {identity, query}` |
 //! | `POST /api/v1/teams/invalidate` | `teams_invalidate {identity, fact_id, reason}` |
+//! | `POST /api/v1/teams/reinstate` | `teams_reinstate {identity, fact_id}` (STUDIO-689) |
 //! | `POST /api/v1/runs/{id}/retain` | `teams_retain {content}` |
 //! | `GET /api/v1/teams/room` | `teams_room_read {limit?}` (STUDIO-650, T5) |
 //! | `POST /api/v1/teams/room` | the OPERATOR's own post — no MCP tool (STUDIO-661) |
@@ -65,13 +66,22 @@ use crate::server::StateProvider;
 /// what the surface is for (§5.1: a *constructed record, never a transcript*).
 const MAX_RETAIN_BODY: usize = 1 << 16;
 
-/// `GET /api/v1/teams/recall?identity=&query=`.
+/// `GET /api/v1/teams/recall?identity=&query=&state=`.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct RecallParams {
     #[serde(default)]
     identity: String,
     #[serde(default)]
     query: String,
+    /// Which record states the answer may contain: absent or `valid` (the default, and the only
+    /// thing an agent ever sees), `invalidated`, or `all` (STUDIO-689).
+    ///
+    /// Carried as a `String` and validated by the daemon rather than typed here, so an
+    /// unrecognised value answers in THIS crate's `{error, message}` envelope — the same reason
+    /// [`RoomParams::limit`] is a string. Unlike that one it is not lenient: a mistyped filter
+    /// served with the valid records would read as a bank nobody has ever corrected.
+    #[serde(default)]
+    state: String,
 }
 
 /// `GET /api/v1/teams/room?limit=` (STUDIO-650, T5).
@@ -104,6 +114,16 @@ struct InvalidateReq {
     fact_id: String,
     #[serde(default)]
     reason: String,
+}
+
+/// `POST /api/v1/teams/reinstate` body (STUDIO-689) — the invalidate's two identifying fields and
+/// **no `reason`**: a reinstate drops the stored one with the correction it explained.
+#[derive(Debug, Default, Deserialize)]
+struct ReinstateReq {
+    #[serde(default)]
+    identity: String,
+    #[serde(default)]
+    fact_id: String,
 }
 
 /// `POST /api/v1/runs/{id}/post` body (STUDIO-653, T6). No `from` and no
@@ -187,7 +207,10 @@ pub(crate) async fn handle_teams_recall(
     if let Some(resp) = require_get(&method) {
         return resp;
     }
-    match provider.teams_recall(&params.identity, &params.query).await {
+    match provider
+        .teams_recall(&params.identity, &params.query, &params.state)
+        .await
+    {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -285,6 +308,26 @@ pub(crate) async fn handle_teams_invalidate(
         .teams_invalidate(&req.identity, &req.fact_id, &req.reason)
         .await
     {
+        Ok(view) => write_json(StatusCode::OK, &view),
+        Err(e) => teams_error(&e),
+    }
+}
+
+/// `POST /api/v1/teams/reinstate` — §5.3's reversal (STUDIO-689): the record goes back into
+/// recall and the reason it was invalidated for is dropped with it.
+pub(crate) async fn handle_teams_reinstate(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    body: Bytes,
+) -> Response {
+    if let Some(resp) = require_post(&method, "use POST to reinstate a memory") {
+        return resp;
+    }
+    let req: ReinstateReq = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(err) => return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None),
+    };
+    match provider.teams_reinstate(&req.identity, &req.fact_id).await {
         Ok(view) => write_json(StatusCode::OK, &view),
         Err(e) => teams_error(&e),
     }
@@ -759,6 +802,10 @@ mod tests {
                 "/api/v1/teams/invalidate",
                 r#"{"identity":"a","fact_id":"b","reason":"c"}"#,
             ),
+            (
+                "/api/v1/teams/reinstate",
+                r#"{"identity":"a","fact_id":"b"}"#,
+            ),
             ("/api/v1/runs/7/retain", r#"{"content":"x"}"#),
             ("/api/v1/runs/7/post", r#"{"body":"x"}"#),
             // The human door is gated exactly like the agent-facing ones (STUDIO-661).
@@ -800,6 +847,117 @@ mod tests {
         assert_eq!(err_code(resp).await, "not_found");
     }
 
+    /// STUDIO-689: the reinstate route puts the record back, and the state filter
+    /// lists it in the meantime — the two reads the Memory page needs to make
+    /// invalidation reversible on screen rather than only on disk.
+    #[tokio::test]
+    async fn reinstate_and_the_state_filter_round_trip() {
+        let dir = TempDir::new();
+        let mem = teams_memory(&dir);
+        mem.bind_run(
+            7,
+            RunProvenance {
+                identity: "alice".to_string(),
+                ticket: "MT-9".to_string(),
+                workspace_dir: String::new(),
+            },
+        );
+        let url = spawn_with(Arc::clone(&mem)).await;
+        let retained = body_json(
+            post(
+                &format!("{url}/api/v1/runs/7/retain"),
+                r#"{"content":"the mirror lock is per-repo"}"#,
+            )
+            .await,
+        )
+        .await;
+        let fact_id = retained["id"].as_str().expect("a record id").to_string();
+        post(
+            &format!("{url}/api/v1/teams/invalidate"),
+            &format!(
+                r#"{{"identity":"alice","fact_id":"{fact_id}","reason":"the lock moved in MT-10"}}"#
+            ),
+        )
+        .await;
+
+        let browse = |state: &str| {
+            let url = format!("{url}/api/v1/teams/recall?identity=alice&query=&state={state}");
+            async move { body_json(reqwest::get(&url).await.expect("GET recall")).await }
+        };
+
+        // The default is unchanged — a corrected fact is gone from recall.
+        let valid = browse("").await;
+        assert_eq!(valid["state"], "valid");
+        assert!(
+            valid["facts"].as_array().expect("facts").is_empty(),
+            "{valid}"
+        );
+
+        // …but it is listable, with the reason, on a fresh load and not merely
+        // in the session that made the correction.
+        let corrections = browse("invalidated").await;
+        assert_eq!(corrections["state"], "invalidated");
+        assert_eq!(corrections["facts"].as_array().expect("facts").len(), 1);
+        assert_eq!(corrections["facts"][0]["id"], fact_id);
+        assert_eq!(corrections["facts"][0]["state"], "invalidated");
+        assert_eq!(corrections["facts"][0]["reason"], "the lock moved in MT-10");
+        assert_eq!(
+            browse("all").await["facts"]
+                .as_array()
+                .expect("facts")
+                .len(),
+            1
+        );
+
+        let reinstated = body_json(
+            post(
+                &format!("{url}/api/v1/teams/reinstate"),
+                &format!(r#"{{"identity":"alice","fact_id":"{fact_id}"}}"#),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(reinstated["reinstated"], true);
+        assert_eq!(reinstated["fact_id"], fact_id);
+
+        let back = browse("").await;
+        assert_eq!(back["facts"].as_array().expect("facts").len(), 1, "{back}");
+        assert_eq!(
+            back["facts"][0]["reason"], "",
+            "the reason goes with the correction it explained"
+        );
+    }
+
+    /// A mistyped state filter is a 400, never the valid records: an answer that
+    /// silently narrowed would read as a bank nobody has ever corrected.
+    #[tokio::test]
+    async fn an_unknown_state_filter_is_rejected() {
+        let dir = TempDir::new();
+        let url = spawn_with(teams_memory(&dir)).await;
+        let resp = reqwest::get(&format!(
+            "{url}/api/v1/teams/recall?identity=alice&state=Invalidated"
+        ))
+        .await
+        .expect("GET recall");
+        assert_eq!(resp.status(), 400);
+        assert_eq!(err_code(resp).await, "bad_request");
+    }
+
+    /// Reinstating a record that does not exist is a 404, the same way
+    /// invalidating one is — a caller can tell "wrong id" from "backend down".
+    #[tokio::test]
+    async fn reinstating_an_unknown_record_is_404() {
+        let dir = TempDir::new();
+        let url = spawn_with(teams_memory(&dir)).await;
+        let resp = post(
+            &format!("{url}/api/v1/teams/reinstate"),
+            r#"{"identity":"alice","fact_id":"20260101T000000Z-run-1"}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), 404);
+        assert_eq!(err_code(resp).await, "not_found");
+    }
+
     /// Every route rejects the wrong method with a 405 envelope rather than
     /// falling through to the SPA fallback — the convention every other route
     /// in this crate follows.
@@ -813,6 +971,7 @@ mod tests {
         }
         for path in [
             "/api/v1/teams/invalidate",
+            "/api/v1/teams/reinstate",
             "/api/v1/runs/7/retain",
             "/api/v1/runs/7/post",
         ] {

@@ -20,8 +20,8 @@ use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
 use rhapsody_orchestrator::teamsmemory::{
-    InvalidateView, PostView, RecallView, RetainView, RoomView, RosterView, TeamsMemory,
-    TeamsMemoryError, TeamsView,
+    InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
+    TeamsMemory, TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
     CancelWait, ControlHandle, HandoffResult, Identity, ReadsError, RefreshResult, ReloadError,
@@ -240,8 +240,9 @@ impl StateProvider for DaemonState {
         &self,
         identity: &str,
         query: &str,
+        state: &str,
     ) -> Result<RecallView, TeamsMemoryError> {
-        self.teams_memory()?.recall(identity, query).await
+        self.teams_memory()?.recall(identity, query, state).await
     }
 
     async fn teams_invalidate(
@@ -253,6 +254,15 @@ impl StateProvider for DaemonState {
         self.teams_memory()?
             .invalidate(identity, fact_id, reason)
             .await
+    }
+
+    /// §5.3's reversal (STUDIO-689) — the same bank, the same off-loop task, no `reason`.
+    async fn teams_reinstate(
+        &self,
+        identity: &str,
+        fact_id: &str,
+    ) -> Result<ReinstateView, TeamsMemoryError> {
+        self.teams_memory()?.reinstate(identity, fact_id).await
     }
 
     async fn teams_retain(

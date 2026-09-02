@@ -46,7 +46,7 @@
 
 use std::collections::HashMap;
 
-use rhapsody_config::memory::{Fact, LocalBank, MAX_SECTION_BYTES, Query};
+use rhapsody_config::memory::{Fact, LocalBank, MAX_SECTION_BYTES, Query, RecallState};
 use rhapsody_config::room::{CaughtUp, Cursor, Cursors, LocalRoom, Message};
 use rhapsody_config::teams::Teams;
 use rhapsody_core::Issue;
@@ -401,6 +401,9 @@ pub(crate) fn recall_query(teams: &Teams, iss: &Issue) -> Query {
         // "everything this teammate remembers" is not that. Spelled out rather than defaulted so
         // the turn-1 prompt's scoring is visibly unchanged by STUDIO-652's browse surface.
         browse: false,
+        // Valid records only, spelled out for the same reason (STUDIO-689): the operator UI can
+        // ask a bank for its corrections, and a model must never be handed one.
+        state: RecallState::Valid,
     }
 }
 
