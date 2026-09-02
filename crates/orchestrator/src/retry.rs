@@ -351,6 +351,20 @@ impl Orchestrator {
         // consumed the way a graphite stacking hint is. `None` for every ticket dispatch, which
         // leaves the rest of this function byte-identical to a daemon built before review mode.
         let review = self.pending_review.remove(&iss.id);
+        // A review key without its coordinates must never be dispatched. It would take the ordinary
+        // provisioning path — a `symphony/pr_owner_repo_n_reviewer` BRANCH worktree off the default
+        // branch, which is the one thing review mode exists to avoid — and the agent would review
+        // trunk while the watch set recorded the PR's head as read. `dispatch_review` is the only
+        // caller that can supply them, so this makes "a `pr:` id is dispatched as a review or not at
+        // all" structural rather than a property of who happens to call. Unreachable from any Go
+        // path: a tracker identifier can never carry the prefix, so parity is untouched.
+        if review.is_none() && crate::review::is_review_key(&iss.id) {
+            tracing::warn!(
+                issue_id = %iss.id,
+                "refusing to dispatch a review key with no review coordinates"
+            );
+            return;
+        }
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
         re.review = review.clone();

@@ -682,6 +682,24 @@ mod tests {
         assert!(entries[0].review.is_none());
     }
 
+    /// A `pr:` key that reaches `dispatch_issue` WITHOUT its coordinates — the shape a retry or any
+    /// future caller could produce — must not be dispatched at all. Dispatching it would take the
+    /// ordinary provisioning path and check out the default branch on a `symphony/pr_…` branch,
+    /// which is exactly the outcome review mode exists to prevent.
+    #[test]
+    fn a_review_key_without_coordinates_is_not_dispatched() {
+        let (mut o, dispatched) = orch_with_review(true);
+        let iss = review_run("alice", HEAD_A).synthetic_issue();
+
+        o.dispatch_issue(iss.clone(), None, None, String::new());
+
+        assert!(
+            dispatched.lock().expect("dispatched lock").is_empty(),
+            "a review key was dispatched as an ordinary ticket"
+        );
+        assert!(!o.running.contains_key(&iss.id) && !o.claimed.contains(&iss.id));
+    }
+
     /// Runs a git command in `dir` with a deterministic identity; panics on failure (test helper).
     fn git_run(dir: &str, args: &[&str]) {
         let out = std::process::Command::new("git")

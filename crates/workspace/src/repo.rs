@@ -658,16 +658,17 @@ impl Manager {
     ///    records the new one as reviewed. Reuse therefore hard-resets to `head_sha`.
     ///
     /// `head_sha` is the SHA pinned ONCE at dispatch and never re-queried (design §14.1 F-SHA), so
-    /// this method resolves nothing itself: it fetches the PR's own head ref
+    /// this method resolves nothing itself. It fetches the PR's own head ref
     /// (`refs/pull/<pr_number>/head`, which GitHub exposes for every PR and which reaches a head
-    /// commit that is on no branch of the base repo) into the mirror's remote-tracking namespace,
-    /// then requires `head_sha` to be present. The fetch lands OUTSIDE the remote-tracking namespace
-    /// (`refs/rhapsody/review/pr/<n>`) because [`Self::ensure_mirror`]'s pruning fetch of
-    /// `+refs/heads/*:refs/remotes/origin/*` would otherwise delete it on the very next round — a
-    /// PR head is on no branch, so `--prune` reads it as gone from the remote.
-    /// A head that advanced past `head_sha` is NOT followed;
-    /// a `head_sha` the fetch could not reach is an [`Error::ReviewCheckout`], never a silent
-    /// checkout of something else.
+    /// commit that is on no branch of the base repo) into `refs/rhapsody/review/pr/<n>`, then
+    /// requires `head_sha` to be present. That destination sits OUTSIDE the remote-tracking
+    /// namespace on purpose: [`Self::ensure_mirror`]'s pruning fetch of
+    /// `+refs/heads/*:refs/remotes/origin/*` would delete a ref parked under `refs/remotes/origin/`
+    /// on the very next round, because a PR head is on no branch and `--prune` therefore reads it as
+    /// gone from the remote.
+    ///
+    /// A head that advanced past `head_sha` is NOT followed, and a `head_sha` the fetch could not
+    /// reach is an [`Error::ReviewCheckout`] — never a silent checkout of something else.
     ///
     /// `head_sha` must be 7–64 hex digits and `pr_number` positive: both are interpolated into a git
     /// argument list, and restricting the SHA to hex means no value of it can name a ref or a flag.
