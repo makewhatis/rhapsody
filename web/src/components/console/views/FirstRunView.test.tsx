@@ -45,6 +45,7 @@ function mount(props: Partial<Parameters<typeof FirstRunView>[0]> = {}) {
       onError={props.onError ?? vi.fn()}
       error={props.error ?? ""}
       onDismissError={props.onDismissError ?? vi.fn()}
+      overlayTitlebar={props.overlayTitlebar}
     />,
   );
 }
@@ -118,6 +119,25 @@ describe("the setup chrome", () => {
     expect(document.querySelector("nav")).toBeNull();
   });
 
+  // STUDIO-701 — on the desktop this bar is the window's title bar as well as the brand lockup:
+  // macOS `titleBarStyle: "Overlay"` leaves no system bar to drag, and floats the traffic lights
+  // over its left end. It takes the reserve the way Podium's horizontal toolbar did.
+  it("becomes the window's title bar under an overlay title bar, and stays put without one", async () => {
+    const { unmount } = mount({ overlayTitlebar: true });
+    await screen.findByRole("progressbar", { name: "Onboarding progress" });
+    expect(document.querySelector(".rh-console.setup.overlay-titlebar")).not.toBeNull();
+    const head = document.querySelector("header.setuphead");
+    expect(head?.hasAttribute("data-tauri-drag-region")).toBe(true);
+    // The lockup is a CHILD of the drag region, and Tauri drags on the element the pointer is
+    // over — so the bar's own background drags while its contents keep their own hit-testing.
+    expect(head?.querySelector(".logo")).not.toBeNull();
+    unmount();
+
+    mount();
+    await screen.findByRole("progressbar", { name: "Onboarding progress" });
+    expect(document.querySelector(".overlay-titlebar")).toBeNull();
+  });
+
   it("renders the lifted failure as a dismissable alert", async () => {
     const onDismissError = vi.fn();
     mount({ error: "config saved, but the daemon could not start", onDismissError });
@@ -142,6 +162,20 @@ describe("source contracts", () => {
   // NOTE: the §2.2.1 "land-dark" guard that used to sit here — asserting App.tsx still rendered the
   // Podium <AppShell /> — was retired by STUDIO-687's box-6.4 flip. The root is now pinned once, in
   // ConsoleApp.test.tsx ("the flip — App.tsx renders the console").
+
+  // STUDIO-701 — same gap as `AppShell.test.tsx`'s: the setup bar's drag region is visible in the
+  // DOM, but the traffic-light reserve that stops the lights landing on the wordmark is a single
+  // CSS rule, and it is gated so a browser never sees it.
+  it("reserves the traffic lights' corner on the desktop, and only there", () => {
+    const css = src("../../../theme/console-firstrun.css");
+    const rule = /\.rh-console\.overlay-titlebar \.setuphead \{([^}]*)\}/.exec(css);
+    expect(rule).not.toBeNull();
+    // 78px is Podium `Toolbar.tsx`'s own reserve, copied rather than re-derived.
+    expect(rule?.[1]).toMatch(/padding-left:\s*78px/);
+    for (const line of css.split("\n")) {
+      if (/padding-left:\s*78px/.test(line)) expect(line).toContain(".overlay-titlebar");
+    }
+  });
 
   // §9 — "no invented endpoints". The wizard owns the whole first-run data path; this view adds
   // no request of its own, so it reaches neither the API layer nor `fetch`.

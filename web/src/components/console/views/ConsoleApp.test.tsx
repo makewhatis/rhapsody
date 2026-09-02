@@ -23,6 +23,7 @@ const h = vi.hoisted(() => {
   return {
     fetchVersion: vi.fn(),
     getStatus: vi.fn(),
+    hasOverlayTitlebar: vi.fn(() => false),
     credentialStatus: vi.fn(),
     listLinearProjects: vi.fn(),
     probeTools: vi.fn(),
@@ -49,6 +50,7 @@ vi.mock("@/lib/bindings", async (orig) => {
   return {
     ...actual,
     getStatus: h.getStatus,
+    hasOverlayTitlebar: h.hasOverlayTitlebar,
     credentialStatus: h.credentialStatus,
     listLinearProjects: h.listLinearProjects,
     probeTools: h.probeTools,
@@ -155,6 +157,8 @@ beforeEach(() => {
   // A plain browser has no supervisor bridge, so `getStatus` resolves null and the shell reads
   // "loading" — never "not-configured". That is the default every other test here runs under.
   h.getStatus.mockResolvedValue(null);
+  // A plain browser by default; the STUDIO-701 block below is the only one that flips it.
+  h.hasOverlayTitlebar.mockReturnValue(false);
   h.credentialStatus.mockResolvedValue({ has_token: true });
   h.listLinearProjects.mockResolvedValue([
     { id: "1", name: "Rhapsody", slug: "872639248532", team: "FND", color: "#10b981" },
@@ -538,5 +542,51 @@ describe("the desktop bridge survives the flip", () => {
 
     act(() => h.emitShuttingDown());
     expect(await screen.findByText("Shutting down…")).toBeTruthy();
+  });
+});
+
+// STUDIO-701 — the desktop window chrome the §2.2.1 flip dropped on the floor.
+//
+// The packaged app asks for macOS `titleBarStyle: "Overlay"`, so it has no system title bar to
+// move the window by and the native traffic lights float over the top-left of the web content —
+// straight onto the rail's logo. The shell decides once, from the host, and hands the answer to
+// whichever surface is mounted: the rail on a configured install, the setup bar on a fresh one.
+describe("desktop window chrome (STUDIO-701)", () => {
+  // The host predicate itself (bridge present AND macOS) is covered in bindings.test.ts; what is
+  // under test here is that the shell asks it and passes the answer down.
+  it("gives the rail a drag strip and the traffic-light inset in the desktop app", async () => {
+    h.hasOverlayTitlebar.mockReturnValue(true);
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(true));
+    mount();
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "teams", "memory", "settings"]));
+    expect(document.querySelector(".app.rh-console.overlay-titlebar")).not.toBeNull();
+    const drag = document.querySelector(".rail")?.firstElementChild;
+    expect(drag?.className).toBe("drag");
+    expect(drag?.hasAttribute("data-tauri-drag-region")).toBe(true);
+    // The lockup follows the strip, so the lights land on the strip and not on the mark.
+    expect(drag?.nextElementSibling?.classList.contains("logo")).toBe(true);
+  });
+
+  it("gives the first-run setup bar the same drag region and inset", async () => {
+    // A fresh install never sees the rail, and it is the FIRST window a desktop user gets: an
+    // un-draggable one with the lights sitting on the wordmark.
+    h.hasOverlayTitlebar.mockReturnValue(true);
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(false));
+    mount();
+    expect(await screen.findByRole("progressbar", { name: "Onboarding progress" })).toBeTruthy();
+    expect(document.querySelector(".rh-console.setup.overlay-titlebar")).not.toBeNull();
+    expect(document.querySelector("header.setuphead")?.hasAttribute("data-tauri-drag-region")).toBe(true);
+  });
+
+  it("leaves the daemon-served dashboard exactly as it was in a plain browser", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(true));
+    mount();
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "teams", "memory", "settings"]));
+    expect(document.querySelector(".overlay-titlebar")).toBeNull();
+    expect(document.querySelector("[data-tauri-drag-region]")).toBeNull();
+    expect(document.querySelector(".rail")?.firstElementChild?.classList.contains("logo")).toBe(true);
   });
 });
