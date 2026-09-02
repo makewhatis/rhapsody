@@ -1090,9 +1090,7 @@ impl Store for Sqlite {
         // truncated round read the requested head only partially, so advancing last_reviewed_sha
         // would record a partial review as a complete one.
         conn.execute(
-            &format!(
-                "UPDATE rhapsody_review_watch SET status = ?5 WHERE {REVIEW_WATCH_KEY_WHERE}"
-            ),
+            &format!("UPDATE rhapsody_review_watch SET status = ?5 WHERE {REVIEW_WATCH_KEY_WHERE}"),
             params![
                 key.owner,
                 key.repo,
@@ -3104,8 +3102,12 @@ mod tests {
     fn a_truncated_round_parks_the_row_without_advancing_either_sha() {
         let store = Sqlite::open(StorePath::InMemory).expect("open");
         let key = wkey("makewhat", "rhapsody", 84, "alice");
-        store.save_review_watch(introduced(key.clone())).expect("introduce");
-        store.mark_review_requested(&key, "aaa111").expect("dispatch");
+        store
+            .save_review_watch(introduced(key.clone()))
+            .expect("introduce");
+        store
+            .mark_review_requested(&key, "aaa111")
+            .expect("dispatch");
 
         store.mark_review_truncated(&key).expect("truncate");
 
@@ -3139,7 +3141,11 @@ mod tests {
             })
             .expect("introduce");
         assert_eq!(
-            store.get_review_watch(&key).expect("get").expect("row").author,
+            store
+                .get_review_watch(&key)
+                .expect("get")
+                .expect("row")
+                .author,
             "alice"
         );
 
@@ -3157,7 +3163,11 @@ mod tests {
             })
             .expect("re-introduce");
         assert_eq!(
-            store.get_review_watch(&key).expect("get").expect("row").author,
+            store
+                .get_review_watch(&key)
+                .expect("get")
+                .expect("row")
+                .author,
             "bob"
         );
     }
@@ -3175,7 +3185,8 @@ mod tests {
             for m in &MIGRATIONS[0..7] {
                 tx.execute_batch(m).expect("apply step");
             }
-            tx.execute_batch("PRAGMA user_version = 7").expect("stamp v7");
+            tx.execute_batch("PRAGMA user_version = 7")
+                .expect("stamp v7");
             tx.commit().expect("commit");
             conn.execute(
                 "INSERT INTO rhapsody_review_watch (owner, repo, number, reviewer) \

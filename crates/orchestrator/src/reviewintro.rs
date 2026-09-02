@@ -129,6 +129,10 @@ pub struct ReviewIntroRequest {
     pub head_branch: String,
     /// The teammates who would review it, author already excluded.
     pub reviewers: Vec<String>,
+    /// The teammate who authored the pull request — the run's own identity. Carried onto the watch
+    /// row so the watcher's reviewer substitution can keep excluding them long after this run has
+    /// ended (STUDIO-721).
+    pub author: String,
     /// The origin tag written onto the watch-set row.
     pub introduced_by: String,
 }
@@ -154,6 +158,8 @@ pub struct IntroducedPr {
     pub repo_url: String,
     /// One watch-set row is written per reviewer.
     pub reviewers: Vec<String>,
+    /// The pull request's author, recorded on every row this introduction writes (STUDIO-721).
+    pub author: String,
     /// The origin tag, e.g. `handoff:STUDIO-720`.
     pub introduced_by: String,
 }
@@ -286,6 +292,7 @@ pub async fn run_review_intro_task(
                 pr: pr.clone(),
                 repo_url: req.repo_url.clone(),
                 reviewers: req.reviewers.clone(),
+                author: req.author.clone(),
                 introduced_by: req.introduced_by.clone(),
             })
             .await;
@@ -425,6 +432,7 @@ impl Orchestrator {
             // network-free.
             head_branch: format!("symphony/{}", sanitize_key(&re.issue.identifier)),
             reviewers,
+            author: re.identity.clone(),
             introduced_by: format!("{REVIEW_ORIGIN_HANDOFF}:{}", re.issue.identifier),
         })
     }
@@ -474,6 +482,7 @@ impl Orchestrator {
                 continue;
             }
             let row = ReviewWatchRow {
+                author: pr.author.clone(),
                 key: ReviewWatchKey {
                     owner: pr.pr.owner.clone(),
                     repo: pr.pr.repo.clone(),
@@ -732,6 +741,7 @@ mod tests {
             pr: PrCoord::new(owner, repo, number),
             repo_url: format!("https://github.com/{owner}/{repo}.git"),
             reviewers: reviewers.iter().map(|r| r.to_string()).collect(),
+            author: "alice".to_string(),
             introduced_by: "handoff:STUDIO-720".to_string(),
         }
     }
@@ -1186,6 +1196,7 @@ mod tests {
             repo_url: REPO_URL.to_string(),
             head_branch: "symphony/STUDIO-720".to_string(),
             reviewers: vec!["bob".to_string()],
+            author: "alice".to_string(),
             introduced_by: "handoff:STUDIO-720".to_string(),
         }
     }

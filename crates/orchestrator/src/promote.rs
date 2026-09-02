@@ -666,6 +666,12 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.0.mark_review_completed(key, sha, status)
         }
+        fn mark_review_truncated(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<(), StoreError> {
+            self.0.mark_review_truncated(key)
+        }
         fn drop_review_watch(
             &self,
             key: &rhapsody_store::ReviewWatchKey,
