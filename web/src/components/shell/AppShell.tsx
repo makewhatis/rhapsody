@@ -278,8 +278,6 @@ function OnboardErrorBanner({ message, onDismiss }: { message: string; onDismiss
   );
 }
 
-// ShutdownOverlay — a full-window "Shutting down…" screen shown while the daemon stops on quit, so
-// the app reads as deliberately closing rather than frozen (the stop runs off the main thread).
 // VersionFooter — a dim build stamp pinned to the bottom of the window so it's always clear which
 // build is running (release version + git SHA + build time on hover).
 //

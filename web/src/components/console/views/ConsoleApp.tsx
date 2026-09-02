@@ -84,15 +84,15 @@ export function ConsoleApp() {
 
   const go = (name: ConsoleRouteName, key = "") => navigate({ name, key });
 
+  // `position: fixed` over everything, so it rides ALONGSIDE whichever surface is mounted rather
+  // than being duplicated inside each — a quit begun from the first-run wizard shows it too.
+  const overlay = shuttingDown ? <ShutdownOverlay /> : null;
+
   // First run (§8.1). No WORKFLOW.md means no config behind any rail destination, so the wizard
   // REPLACES the shell rather than sitting on a route inside it — the same trade the Podium shell
   // makes, and the reason this pre-empts a deep link. Only ever true under the supervisor bridge:
   // a plain browser has no `getStatus`, and a null snapshot reads as "loading", not
   // "not-configured", so the daemon-served dashboard is untouched by this.
-  // `position: fixed` over everything, so it rides ALONGSIDE whichever surface is mounted rather
-  // than being duplicated inside each — a quit begun from the first-run wizard shows it too.
-  const overlay = shuttingDown ? <ShutdownOverlay /> : null;
-
   if (viewForStatus(daemon.status) === "not-configured") {
     return (
       <>
