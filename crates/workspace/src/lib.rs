@@ -103,6 +103,17 @@ pub enum Error {
     /// Constructed by [`crate::gtguard`] (W3).
     #[error("gtguard: {0}")]
     Gtguard(String),
+    /// `review_checkout_failed` — the review-mode provisioning path
+    /// ([`Manager::ensure_review_worktree`]) could not put the worktree at the PINNED head SHA:
+    /// a malformed coordinate, a SHA the mirror does not have after fetching the PR head ref, or a
+    /// re-checkout that failed on reuse. NOT an `errors.go` sentinel — the frozen Go reference has
+    /// no review feature (design record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`).
+    ///
+    /// It is deliberately its own variant rather than a [`Error::WorktreeAdd`]: every one of these
+    /// means the checkout is NOT at the SHA the review was dispatched against, and serving a review
+    /// agent some other tree is the failure this whole path exists to prevent.
+    #[error("review_checkout_failed: {0}")]
+    ReviewCheckout(String),
 }
 
 /// Shared test scaffolding: the RAII [`testutil::TempDir`] (the port of Go's `t.TempDir()`), the
