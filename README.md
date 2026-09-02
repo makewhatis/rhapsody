@@ -540,6 +540,20 @@ longer readable by the Go daemon at ITS schema version — but the Go daemon's `
 runs steps at or above its own `user_version`, so a v8 database is left alone rather than corrupted,
 and running both daemons against one file was never supported in either direction.
 
+### A host boundary in the GitHub URL parsers (STUDIO-721)
+
+Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
+`https://evilgithub.com/attacker/evil` parses as `(attacker, evil)`. Rhapsody's `parse_repo` requires
+the match to BEGIN the host — the start of the string, the `//` of a scheme, or the `@` of `git@` —
+so a look-alike host, including a `sub.github.com` subdomain, does not parse at all. The room-post
+parser `extract_pr_urls` (Rhapsody-only, no Go counterpart) carries the same rule.
+
+The parsed pair is what the ticketless review subsystem compares a pull request's owner/repo against
+to decide whether it may check that pull request out and run an agent over its diff, and
+`extract_pr_urls` runs over attacker-controlled room text. A config naming a look-alike host would
+otherwise vouch for a repository on the real `github.com`. The behaviour differs from Go only for a
+URL whose host is not GitHub — a configuration that could never have cloned in either daemon.
+
 ### A third workspace shape and a review-only agent env var (STUDIO-715)
 
 The same ticketless PR-review subsystem needs to run an agent against a pull request rather than a

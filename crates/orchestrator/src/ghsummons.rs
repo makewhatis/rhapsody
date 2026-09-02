@@ -23,7 +23,7 @@ use rhapsody_core::compile_summon_matcher;
 /// `None` if the static pattern ever fails to compile (it cannot) — the no-panic idiom the sibling
 /// crates use for static patterns (`rhapsody_tracker`'s `PR_PARSE_RE`).
 static REPO_RE: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$").ok());
+    LazyLock::new(|| Regex::new(r"(?:^|[/@])github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$").ok());
 
 /// Matches an issue/PR number in a GitHub API `issue_url` / `pull_request_url`, capturing the digits
 /// (group 1). Mirrors Go `ghsummons.numRe` (`/(?:issues|pulls)/(\d+)`); `\d` is spelled `[0-9]` so
@@ -39,6 +39,16 @@ static NUM_RE: LazyLock<Option<Regex>> =
 ///   - `git@github.com:owner/repo.git`
 ///   - `https://github.com/owner/repo.git`
 ///   - `https://github.com/owner/repo`
+///
+/// **Host boundary (STUDIO-721, a documented divergence — see the README).** Go's pattern matches
+/// `github.com` as a bare SUBSTRING, so `https://evilgithub.com/attacker/evil` parses as
+/// `(attacker, evil)` and `https://github.com.evil.test/o/r` would too if it ended the right way.
+/// The leading `(?:^|[/@])` requires the match to BEGIN the host — the start of the string, the
+/// `//` of a scheme, or the `@` of `git@` — so a look-alike host, including a `sub.github.com`
+/// subdomain, does not parse at all. It matters because this pair is compared against a pull
+/// request's owner/repo to decide whether the ticketless review subsystem may check that pull
+/// request out and run an agent over it, and a config naming a look-alike host would otherwise
+/// vouch for a repository on the real `github.com`.
 pub fn parse_repo(repo_url: &str) -> Option<(String, String)> {
     let re = REPO_RE.as_ref()?;
     let caps = re.captures(repo_url)?;
@@ -680,6 +690,15 @@ mod tests {
             ("https://github.com/o/my.repo", Some(("o", "my.repo"))),
             ("https://gitlab.com/o/r", None),
             ("not a url", None),
+            // STUDIO-721: `github.com` must be the HOST, not a substring of one. Each of these
+            // parses as `(attacker, evil)` under a bare-substring match.
+            ("https://evilgithub.com/attacker/evil", None),
+            ("https://evilgithub.com/attacker/evil.git", None),
+            ("git@evilgithub.com:attacker/evil.git", None),
+            ("https://not-github.com/attacker/evil", None),
+            ("https://sub.github.com/attacker/evil", None),
+            ("ssh://git@github.com/o/r.git", Some(("o", "r"))),
+            ("github.com/o/r", Some(("o", "r"))),
         ];
         for (input, want) in cases {
             let want = want.map(|(o, r)| (o.to_string(), r.to_string()));

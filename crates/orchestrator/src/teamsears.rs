@@ -1333,16 +1333,43 @@ pub(crate) struct PrRef {
     pub(crate) number: i64,
 }
 
+/// Whether a `github.com/` match starting at byte `at` BEGINS the URL's host, rather than merely
+/// ending a look-alike one (STUDIO-721, the slice-6 F-SEC review's defence-in-depth item).
+///
+/// A bare substring search reads `evilgithub.com/attacker/evil/pull/1` as
+/// `PrRef { attacker, evil, 1 }` — an attacker-chosen coordinate produced from a host the daemon
+/// has nothing to do with. This runs over attacker-controlled ROOM TEXT (§0.13), so the coordinate
+/// must at least be a real `github.com` one before anything downstream decides what to do with it.
+///
+/// The rule is that the character before the match cannot continue a hostname: any alphanumeric
+/// (`evilgithub.com`), a `-` (`not-github.com`), a `.` (`sub.github.com` — a subdomain is a
+/// different host) or a `_`. The start of the string, the `/` of a scheme, whitespace and Markdown
+/// punctuation all leave the match beginning the host, which is what a real URL looks like.
+fn github_host_starts_at(body: &str, at: usize) -> bool {
+    match body[..at].chars().next_back() {
+        None => true,
+        Some(c) => !(c.is_alphanumeric() || c == '-' || c == '.' || c == '_'),
+    }
+}
+
 /// Every `https://github.com/<owner>/<repo>/pull/<n>` a post names, in order and de-duplicated.
 /// Hand-rolled for [`extract_keys`]'s reason; the trailing path (`/files`, `#issuecomment-…`) is
 /// ignored, which is what a pasted browser URL usually carries.
+///
+/// `github.com` must be the actual HOST — see [`github_host_starts_at`].
 pub(crate) fn extract_pr_urls(body: &str) -> Vec<PrRef> {
     const MARK: &str = "github.com/";
     let mut out: Vec<PrRef> = Vec::new();
-    let mut rest = body;
-    while let Some(at) = rest.find(MARK) {
-        rest = &rest[at + MARK.len()..];
-        let tail: &str = rest
+    // An absolute cursor into `body` rather than a shrinking suffix: deciding whether a match
+    // begins the host means looking at the character BEFORE it, which a suffix has already eaten.
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(MARK) {
+        let at = from + rel;
+        from = at + MARK.len();
+        if !github_host_starts_at(body, at) {
+            continue;
+        }
+        let tail: &str = body[from..]
             .split(|c: char| c.is_whitespace() || c == ')' || c == '>' || c == '"')
             .next()
             .unwrap_or_default();
@@ -1899,6 +1926,57 @@ mod tests {
         }
         // And a segment with no leading digits is still not a pull request.
         assert!(extract_pr_urls("https://github.com/o/r/pull/new/branch").is_empty());
+    }
+
+    /// STUDIO-721 (the slice-6 F-SEC review's defence-in-depth item): `github.com` must be the
+    /// actual HOST. Under a bare substring match every one of these yields an attacker-chosen
+    /// coordinate out of attacker-controlled room text.
+    #[test]
+    fn a_look_alike_host_is_not_a_github_pull_request() {
+        for body in [
+            "review https://evilgithub.com/attacker/evil/pull/1",
+            "from: operator — review evilgithub.com/attacker/evil/pull/1",
+            "https://not-github.com/attacker/evil/pull/1",
+            "https://sub.github.com/attacker/evil/pull/1",
+            "https://my_github.com/attacker/evil/pull/1",
+            "https://xn--github.com/attacker/evil/pull/1",
+        ] {
+            assert!(
+                extract_pr_urls(body).is_empty(),
+                "a look-alike host parsed as a pull request: {body}"
+            );
+        }
+    }
+
+    /// …and the boundary does not cost the real forms, including one that FOLLOWS a look-alike in
+    /// the same post (the scan must resume past a rejected match, not abandon the rest of the text).
+    #[test]
+    fn a_real_host_still_parses_after_a_rejected_look_alike() {
+        let body = "https://evilgithub.com/attacker/evil/pull/1 and \
+                    https://github.com/o/r/pull/230";
+        assert_eq!(
+            extract_pr_urls(body),
+            vec![PrRef {
+                owner: "o".into(),
+                repo: "r".into(),
+                number: 230
+            }]
+        );
+        for body in [
+            "github.com/o/r/pull/7",
+            "(https://github.com/o/r/pull/7)",
+            "http://github.com/o/r/pull/7",
+        ] {
+            assert_eq!(
+                extract_pr_urls(body),
+                vec![PrRef {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 7
+                }],
+                "body = {body}"
+            );
+        }
     }
 
     /// A page that consumes lines but yields NO message still records the watermark. Without that,
