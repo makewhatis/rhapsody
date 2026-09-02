@@ -46,6 +46,12 @@ const LIFECYCLE_BATCH: usize = 100;
 /// they had cached (usually nothing), which reads as "no answer" and falls back.
 const MAX_LIFECYCLE_REFRESH: usize = 200;
 
+/// The most answers the cache retains. A memo that only ever grows is a leak on a daemon that runs
+/// for months while an operator pages through history, so once the map passes this the expired
+/// entries are dropped, and if that is not enough the whole memo is. Discarding a memo is only ever
+/// a cost — the next read re-queries — so the crude bound is the right one here.
+const MAX_CACHE_ENTRIES: usize = 2_000;
+
 /// Where a ticket sits in its tracker's lifecycle, normalized across workspaces whose state NAMES
 /// differ. Derived from the configured state sets, never from Linear's own state `type`: the sets
 /// are what the daemon already schedules by, so this classification and the selection gate cannot
@@ -106,6 +112,18 @@ pub fn classify(state: &str, states: &DispatchStates) -> Option<IssueLifecycle> 
         return Some(IssueLifecycle::InReview);
     }
     Some(IssueLifecycle::Open)
+}
+
+/// Bounds the memo at [`MAX_CACHE_ENTRIES`]: expired entries go first, and if the map is still over
+/// the cap it is cleared. Called with the lock already held, right after a batch of inserts.
+fn prune(entries: &mut HashMap<String, Entry>, now: Instant) {
+    if entries.len() <= MAX_CACHE_ENTRIES {
+        return;
+    }
+    entries.retain(|_, e| now.duration_since(e.at) < LIFECYCLE_TTL);
+    if entries.len() > MAX_CACHE_ENTRIES {
+        entries.clear();
+    }
 }
 
 /// One cached answer. `row: None` records that the tracker did NOT return the id — a deleted or
@@ -173,10 +191,10 @@ impl LifecycleCache {
                         lifecycle,
                     })
                 });
-                match row.clone() {
+                match &row {
                     // A refreshed answer replaces whatever stale one `partition` handed back.
                     Some(row) => {
-                        out.insert(id.clone(), row);
+                        out.insert(id.clone(), row.clone());
                     }
                     // The tracker no longer knows this id: drop the stale answer rather than keep
                     // reporting a state nothing confirms.
@@ -186,6 +204,7 @@ impl LifecycleCache {
                 }
                 guard.insert(id.clone(), Entry { row, at: now });
             }
+            prune(&mut guard, now);
         }
         out
     }
@@ -539,6 +558,65 @@ mod tests {
         });
         let got = o.control().issue_lifecycles(&ids).await;
         assert_eq!(got["a"].lifecycle, IssueLifecycle::Done);
+    }
+
+    // The memo must not grow without bound on a daemon that runs for months.
+    #[test]
+    fn prune_drops_the_expired_first_and_only_then_gives_up() {
+        let row = IssueLifecycleRow {
+            state: "Done".into(),
+            lifecycle: IssueLifecycle::Done,
+        };
+        let t0 = Instant::now();
+        let now = t0 + LIFECYCLE_TTL * 2;
+
+        // Under the cap: nothing is touched, however stale.
+        let mut small: HashMap<String, Entry> = (0..8)
+            .map(|i| {
+                (
+                    format!("i{i}"),
+                    Entry {
+                        row: Some(row.clone()),
+                        at: t0,
+                    },
+                )
+            })
+            .collect();
+        prune(&mut small, now);
+        assert_eq!(small.len(), 8, "a small memo is left alone");
+
+        // Over the cap with expired entries to give up: they go, the fresh ones stay.
+        let mut mixed: HashMap<String, Entry> = (0..MAX_CACHE_ENTRIES + 10)
+            .map(|i| {
+                (
+                    format!("i{i}"),
+                    Entry {
+                        row: Some(row.clone()),
+                        at: if i < 20 { now } else { t0 },
+                    },
+                )
+            })
+            .collect();
+        prune(&mut mixed, now);
+        assert_eq!(mixed.len(), 20, "only the fresh entries survive");
+
+        // Over the cap and ALL fresh: the memo is discarded rather than grown.
+        let mut fresh: HashMap<String, Entry> = (0..MAX_CACHE_ENTRIES + 10)
+            .map(|i| {
+                (
+                    format!("i{i}"),
+                    Entry {
+                        row: Some(row.clone()),
+                        at: now,
+                    },
+                )
+            })
+            .collect();
+        prune(&mut fresh, now);
+        assert!(
+            fresh.is_empty(),
+            "an unprunable memo is dropped, never grown"
+        );
     }
 
     // The per-request ceiling: a caller asking about thousands of tickets provokes a bounded number
