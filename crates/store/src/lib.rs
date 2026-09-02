@@ -189,6 +189,72 @@ pub trait Store {
     /// Returns all messages for a run ordered by id ASC.
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError>;
 
+    // --- ticketless review watch set (STUDIO-703 / STUDIO-711) ---
+    // Additive Rhapsody-only surface with no Go counterpart: the frozen reference has no review
+    // feature, so this is new state rather than ported state (README "Divergences"). It is the
+    // restart-surviving home for the review watch set, at per-(PR, reviewer) granularity.
+    //
+    // The two SHA columns are the watcher's whole idempotency, so they are written by EXACTLY the
+    // two methods named for the moments the design pins them to, and by nothing else:
+    // [`Store::mark_review_requested`] at dispatch (F-DUP) and [`Store::mark_review_completed`] at
+    // completion (F-SHA). [`Store::save_review_watch`] deliberately cannot move them on an
+    // existing row.
+    //
+    // No dispatch or watcher logic lives here or calls these yet — this slice is the substrate
+    // only. Nothing writes a row unless the Teams-gated review path is active, so on a Teams-off
+    // daemon (the shipped default) the table simply stays empty.
+
+    /// Introduces a (PR, reviewer) pair into the watch set, or re-arms one that is already there.
+    ///
+    /// On a NEW row every field of `w` is stored verbatim. On an EXISTING row (same
+    /// [`ReviewWatchKey`]) only `introduced_by`, `status` and `open` are updated — `requested_sha`
+    /// and `last_reviewed_sha` are PRESERVED. That asymmetry is the point: re-introducing a PR
+    /// must never be able to forget which SHA was dispatched or reviewed, which is exactly how
+    /// F-DUP double-dispatches and F-SHA loses a pushed fix.
+    fn save_review_watch(&self, w: ReviewWatchRow) -> Result<(), StoreError>;
+
+    /// Records the head SHA a reviewer run was DISPATCHED against and moves the row to
+    /// [`REVIEW_STATUS_IN_FLIGHT`]. Never touches `last_reviewed_sha`.
+    ///
+    /// This is the edge-trigger the watcher gates on: without a persisted requested SHA the
+    /// re-review condition stays true on every tick between introduction and first completion
+    /// (design §14.1 F-DUP). A no-op when the row is absent.
+    fn mark_review_requested(
+        &self,
+        key: &ReviewWatchKey,
+        requested_sha: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Records the head SHA a completed review ACTUALLY read, with its terminal `status`
+    /// ([`REVIEW_STATUS_REVIEWED`] or [`REVIEW_STATUS_APPROVED`]). Never touches `requested_sha`.
+    ///
+    /// `reviewed_sha` must be the SHA pinned at checkout, NOT a completion-time re-query: a
+    /// re-query records a mid-review push as reviewed and that commit is then never read by
+    /// anyone (design §14.1 F-SHA). A no-op when the row is absent.
+    fn mark_review_completed(
+        &self,
+        key: &ReviewWatchKey,
+        reviewed_sha: &str,
+        status: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Drops one (PR, reviewer) row out of the watch set: clears `open` and parks `status` at
+    /// [`REVIEW_STATUS_DROPPED`]. The terminal for Slice 1's `MERGED` / `CLOSED` / gone states.
+    /// Both SHAs are left intact as the record of what was reviewed. Idempotent, and a no-op when
+    /// the row is absent.
+    fn drop_review_watch(&self, key: &ReviewWatchKey) -> Result<(), StoreError>;
+
+    /// Reads back one (PR, reviewer) row, or `Ok(None)` when the pair is not watched.
+    fn get_review_watch(&self, key: &ReviewWatchKey) -> Result<Option<ReviewWatchRow>, StoreError>;
+
+    /// The whole watch set in a deterministic order (owner, repo, number, reviewer) — the boot
+    /// snapshot restart recovery rebuilds from, the sibling of [`Store::load_recovery`].
+    ///
+    /// Returns EVERY row, including dropped and closed ones: which of them still deserve watching
+    /// is the watcher's rule (Slice 5), not the store's, and folding that filter in here would
+    /// hide a row that a later rule cares about.
+    fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

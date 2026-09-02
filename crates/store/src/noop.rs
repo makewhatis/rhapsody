@@ -112,6 +112,40 @@ impl Store for Noop {
         Ok(Vec::new())
     }
 
+    // Ticketless review watch set (STUDIO-711). With persistence off there is no watch set to
+    // survive a restart, so every write succeeds silently and the set reads back empty — the same
+    // guard-free contract every other method here keeps.
+    fn save_review_watch(&self, _w: ReviewWatchRow) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn mark_review_requested(
+        &self,
+        _key: &ReviewWatchKey,
+        _requested_sha: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn mark_review_completed(
+        &self,
+        _key: &ReviewWatchKey,
+        _reviewed_sha: &str,
+        _status: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn drop_review_watch(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn get_review_watch(
+        &self,
+        _key: &ReviewWatchKey,
+    ) -> Result<Option<ReviewWatchRow>, StoreError> {
+        Ok(None)
+    }
+    fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn prune(&self, _retention_days: i64) -> Result<(), StoreError> {
         Ok(())
     }

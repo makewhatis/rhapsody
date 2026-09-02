@@ -273,7 +273,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | --- | --- |
 | `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
-| `rhapsody.db` | no column, no table, no new row *kind* |
+| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
@@ -488,3 +488,47 @@ spent and neither can deliver it twice.
 Nothing else moves: the reopen *gate* (INF-448) is untouched, the turn-1 prompt is byte-identical
 (no template change), only the newest summons is delivered (the same contract as mid-run), and no
 config field, endpoint or golden is added or changed.
+
+### A schema table with no Go counterpart — `rhapsody_review_watch` (STUDIO-711)
+
+The ticketless PR-review subsystem (design STUDIO-703) watches each introduced pull request and
+tracks, per **(PR, reviewer)** pair, the head SHA a review was dispatched against and the head SHA a
+review actually read. That state is the whole of the watcher's idempotency and restart recovery: lose
+it and the loop either double-reviews a PR or silently drops a review across a restart. It therefore
+needs a durable home, and the Go v0.4.0 reference — which has no review feature at all — offers none.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **7** |
+| tables | `runs`, `events`, `retry_queue`, `claims`, `totals`, `run_messages` | the same 6, byte-identical, **plus** `rhapsody_review_watch` |
+
+One row per (PR, reviewer): repository owner/name, PR **number**, the reviewing teammate, the origin
+that introduced the PR, `requested_sha`, `last_reviewed_sha`, a five-value `status`
+(`requested` / `in_flight` / `reviewed` / `approved` / `dropped`) and an `open` flag. The reviewer is
+part of the primary key, not a column, because a single `last_reviewed_sha` per PR lets the first
+completer stamp the PR as reviewed and silently drops a second reviewer whose run crashed.
+
+**How the parity golden still gates the other six tables.** `harness/fixtures/schema.sql` is
+recaptured only from the real Go daemon (`make fixtures`), so it can never be made to contain a table
+that daemon cannot create; hand-editing it to add one would be drift laundering, and the alternative
+— overloading a `runs` column to carry a SHA — would surface a SHA everywhere the console renders a
+branch. Instead:
+
+- every Rhapsody-only schema object is **named with a `rhapsody_` prefix**, and
+- the golden comparison (`schema_matches_committed_golden`) excludes objects **by that prefix and
+  nothing else**.
+
+The exclusion is a name rule, not a loosened assertion. A Go-created object can never be named
+`rhapsody_*`, so all six ported tables stay gated byte-strictly, and a **new un-prefixed table still
+turns the golden red** — which is the correct outcome for anything that is a port of Go behaviour.
+`divergent_objects_are_gated_by_name_only` asserts exactly that: every live schema object is either
+byte-present in the committed golden or carries the prefix, and the divergent set is pinned to this
+one name. The mechanism is documented again at the top of `crates/store/src/sqlite.rs`.
+
+**Off is still off.** The table is created by the migration on every daemon, including one that has
+never enabled Teams, and on a Go-written database opened by Rhapsody. It is inert: the whole review
+subsystem is gated on `teams.enabled` (design §16), nothing outside that path writes a row, and an
+empty table changes no query, no endpoint and no payload. A database that Rhapsody has opened is no
+longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
+runs steps at or above its own `user_version`, so a v7 database is left alone rather than corrupted,
+and running both daemons against one file was never supported in either direction.

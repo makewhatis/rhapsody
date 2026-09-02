@@ -5,6 +5,27 @@
 //! contract — the schema golden asserts their stored form against `harness/fixtures/schema.sql`),
 //! and [`Sqlite::open`] applies the same pragmas and the same idempotent `user_version`
 //! migration loop. The `Store` trait, CRUD, queries, and retention land in S3.
+//!
+//! # The one divergent schema object, and how the golden still gates the rest (STUDIO-711)
+//!
+//! Migration step 7 (`rhapsody_review_watch`) has no Go counterpart: it is the ticketless
+//! PR-review watch set, a feature the frozen v0.4.0 reference does not have. That creates a
+//! problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
+//! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
+//! Go daemon cannot create — a naive new table would turn
+//! `schema_matches_committed_golden` permanently red with no honest way to fix it. Hand-editing
+//! the golden to add the table would be exactly the drift laundering the parity discipline exists
+//! to prevent.
+//!
+//! **The mechanism** (README, "Divergences"): every Rhapsody-only schema object is NAMED with the
+//! `rhapsody_` prefix, and the golden comparison excludes objects by that prefix and nothing else.
+//! The exclusion is therefore a name rule, not a loosened assertion — a Go table can never be
+//! named `rhapsody_*`, so the golden keeps gating all 6 ported tables byte-strictly, and a NEW
+//! table added without the prefix still turns it red. `divergent_objects_are_gated_by_name_only`
+//! asserts that property directly, and pins the divergent object set to exactly one name.
+//!
+//! A new schema object that is a PORT of Go behaviour must never take the prefix: it belongs in
+//! the golden, recaptured with `make fixtures`.
 
 use crate::*;
 use rusqlite::types::Value;
@@ -14,7 +35,10 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
-const SCHEMA_VERSION: i64 = 6;
+///
+/// Go v0.4.0 froze at 6. Step 7 is Rhapsody-only (the ticketless review watch set) and is the one
+/// documented reason this number is ahead of the reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 7;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -109,7 +133,68 @@ CREATE TABLE IF NOT EXISTS run_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_run_messages_run ON run_messages(run_id, id);
 "#,
+    // v6 -> v7: RHAPSODY-ONLY (no Go counterpart) — the ticketless PR-review watch set, one row
+    // per (PR, reviewer). Named with the `rhapsody_` prefix so the schema golden gates it out by
+    // name; see this module's doc comment and the README "Divergences" entry.
+    //
+    // The composite PRIMARY KEY *is* the per-(PR, reviewer) granularity, and its implicit
+    // auto-index carries no DDL of its own (`sqlite_master.sql IS NULL`), so no explicit index is
+    // added and nothing further reaches the golden comparison.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_review_watch (
+  owner             TEXT    NOT NULL,
+  repo              TEXT    NOT NULL,
+  number            INTEGER NOT NULL,
+  reviewer          TEXT    NOT NULL,
+  introduced_by     TEXT    NOT NULL DEFAULT '',
+  requested_sha     TEXT    NOT NULL DEFAULT '',
+  last_reviewed_sha TEXT    NOT NULL DEFAULT '',
+  status            TEXT    NOT NULL DEFAULT 'requested',
+  open              INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (owner, repo, number, reviewer)
+);
+"#,
 ];
+
+/// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
+/// object from the Go-recaptured schema golden (STUDIO-711). See this module's doc comment for why
+/// the exclusion is a name rule rather than a loosened assertion.
+#[cfg(test)]
+const DIVERGENT_OBJECT_PREFIX: &str = "rhapsody_";
+
+/// The `rhapsody_review_watch` columns, in DDL order — the single shared list for the watch-set
+/// queries, read POSITIONALLY by [`map_review_watch`] exactly as [`RUN_COLS`] is by
+/// `map_run_summary`.
+const REVIEW_WATCH_COLS: &str = "owner, repo, number, reviewer, introduced_by, requested_sha, \
+     last_reviewed_sha, status, open";
+
+/// The `WHERE` clause selecting exactly one (PR, reviewer) row, with `?1..?4` bound from a
+/// [`ReviewWatchKey`] by [`review_watch_key_params`]. Shared by every point read and write so no
+/// two of them can ever disagree about what "one row" means.
+const REVIEW_WATCH_KEY_WHERE: &str = "owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4";
+
+/// The four key columns as positional params `?1..?4` for [`REVIEW_WATCH_KEY_WHERE`].
+fn review_watch_key_params(key: &ReviewWatchKey) -> [&dyn rusqlite::ToSql; 4] {
+    [&key.owner, &key.repo, &key.number, &key.reviewer]
+}
+
+/// Scan one `rhapsody_review_watch` row selected with [`REVIEW_WATCH_COLS`] (positional, in DDL
+/// order). `open` reads the INTEGER 0/1 column as a bool, exactly like `runs.usage_estimated`.
+fn map_review_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewWatchRow> {
+    Ok(ReviewWatchRow {
+        key: ReviewWatchKey {
+            owner: row.get(0)?,
+            repo: row.get(1)?,
+            number: row.get(2)?,
+            reviewer: row.get(3)?,
+        },
+        introduced_by: row.get(4)?,
+        requested_sha: row.get(5)?,
+        last_reviewed_sha: row.get(6)?,
+        status: row.get(7)?,
+        open: row.get(8)?,
+    })
+}
 
 /// SQLite-backed durable history + recovery store (the parity port of Go's `sqliteStore`).
 ///
@@ -906,6 +991,130 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn save_review_watch(&self, w: ReviewWatchRow) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // On INSERT the row is stored verbatim. On CONFLICT only the origin/status/open triple is
+        // refreshed — the two SHA columns are deliberately absent from the DO UPDATE SET list, so
+        // re-introducing a watched PR structurally cannot forget which SHA was dispatched (F-DUP)
+        // or reviewed (F-SHA). They move only via mark_review_requested / mark_review_completed.
+        conn.execute(
+            "INSERT INTO rhapsody_review_watch
+               (owner, repo, number, reviewer, introduced_by, requested_sha, last_reviewed_sha, status, open)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(owner, repo, number, reviewer) DO UPDATE SET
+               introduced_by = excluded.introduced_by,
+               status        = excluded.status,
+               open          = excluded.open",
+            params![
+                w.key.owner,
+                w.key.repo,
+                w.key.number,
+                w.key.reviewer,
+                w.introduced_by,
+                w.requested_sha,
+                w.last_reviewed_sha,
+                w.status,
+                w.open,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn mark_review_requested(
+        &self,
+        key: &ReviewWatchKey,
+        requested_sha: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            &format!(
+                "UPDATE rhapsody_review_watch SET requested_sha = ?5, status = ?6 \
+                   WHERE {REVIEW_WATCH_KEY_WHERE}"
+            ),
+            params![
+                key.owner,
+                key.repo,
+                key.number,
+                key.reviewer,
+                requested_sha,
+                REVIEW_STATUS_IN_FLIGHT,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn mark_review_completed(
+        &self,
+        key: &ReviewWatchKey,
+        reviewed_sha: &str,
+        status: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            &format!(
+                "UPDATE rhapsody_review_watch SET last_reviewed_sha = ?5, status = ?6 \
+                   WHERE {REVIEW_WATCH_KEY_WHERE}"
+            ),
+            params![
+                key.owner,
+                key.repo,
+                key.number,
+                key.reviewer,
+                reviewed_sha,
+                status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn drop_review_watch(&self, key: &ReviewWatchKey) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // The row is kept, not deleted: both SHAs stay as the record of what was reviewed before
+        // the PR merged or closed.
+        conn.execute(
+            &format!(
+                "UPDATE rhapsody_review_watch SET status = ?5, open = 0 \
+                   WHERE {REVIEW_WATCH_KEY_WHERE}"
+            ),
+            params![
+                key.owner,
+                key.repo,
+                key.number,
+                key.reviewer,
+                REVIEW_STATUS_DROPPED,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_review_watch(&self, key: &ReviewWatchKey) -> Result<Option<ReviewWatchRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {REVIEW_WATCH_COLS} FROM rhapsody_review_watch \
+               WHERE {REVIEW_WATCH_KEY_WHERE}"
+        ))?;
+        // The composite PRIMARY KEY makes this at most one row; absent is Ok(None), not an error.
+        let mut rows = stmt.query_map(&review_watch_key_params(key)[..], map_review_watch)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {REVIEW_WATCH_COLS} FROM rhapsody_review_watch \
+               ORDER BY owner, repo, number, reviewer"
+        ))?;
+        let rows = stmt.query_map([], map_review_watch)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
         if retention_days <= 0 {
             return Ok(()); // 0 = keep forever
@@ -997,12 +1206,21 @@ mod tests {
     ///
     /// `IF NOT EXISTS` needs no stripping: SQLite already canonicalizes it out of the stored
     /// `sql`. `ORDER BY rowid` preserves creation order, exactly as the fixture was captured.
+    ///
+    /// A THIRD exclusion, `name NOT LIKE 'rhapsody_%'`, gates out the Rhapsody-only schema objects
+    /// that the Go daemon cannot create and therefore can never appear in a recaptured golden
+    /// (today: `rhapsody_review_watch`, STUDIO-711 — see this module's doc comment and the README
+    /// "Divergences" entry). It excludes by NAME only, so it cannot hide drift in any of the 6
+    /// ported tables: a Go table is never named `rhapsody_*`, and a new un-prefixed table still
+    /// turns this golden red. `divergent_objects_are_gated_by_name_only` asserts that property and
+    /// pins the excluded set to exactly the documented object.
     fn schema_dump(store: &Sqlite) -> String {
         let conn = store.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT sql FROM sqlite_master \
                  WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+                   AND name NOT LIKE 'rhapsody_%' \
                  ORDER BY rowid",
             )
             .expect("prepare schema query");
@@ -1064,7 +1282,10 @@ mod tests {
             .lock()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, SCHEMA_VERSION, "schema version must stay at 6");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "a Go-written database must migrate forward to the current schema version and stop"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -2753,5 +2974,417 @@ mod tests {
         assert_eq!(rev[1].kind, "text");
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // STUDIO-711 — ticketless review watch set (design STUDIO-703 §14.4 slice 2).
+    //
+    // No Go counterpart: the frozen reference has no review feature, so these assert a designed
+    // behavior rather than a captured one. The parity gate they must NOT weaken is
+    // `schema_matches_committed_golden` above — see `divergent_objects_are_gated_by_name_only`.
+    // -------------------------------------------------------------------------------------------
+
+    /// A watch-set key for `owner/repo#number` reviewed by `reviewer`.
+    fn wkey(owner: &str, repo: &str, number: i64, reviewer: &str) -> ReviewWatchKey {
+        ReviewWatchKey {
+            owner: owner.into(),
+            repo: repo.into(),
+            number,
+            reviewer: reviewer.into(),
+        }
+    }
+
+    /// A freshly-introduced row: requested by a handoff, nothing dispatched or reviewed yet.
+    fn introduced(key: ReviewWatchKey) -> ReviewWatchRow {
+        ReviewWatchRow {
+            key,
+            introduced_by: "handoff".into(),
+            requested_sha: String::new(),
+            last_reviewed_sha: String::new(),
+            status: REVIEW_STATUS_REQUESTED.into(),
+            open: true,
+        }
+    }
+
+    // The whole point of the slice: the watch set survives a daemon restart. Writing through a
+    // store on disk, dropping it, and re-opening the same file must return the identical set.
+    #[test]
+    fn watch_set_round_trips_across_a_restart() {
+        let scratch = scratch_dir();
+        let db = scratch.join("watch.db");
+
+        {
+            let store = Sqlite::open(StorePath::Disk(db.clone())).expect("open");
+            let alice = wkey("makewhat", "rhapsody", 84, "alice");
+            store
+                .save_review_watch(introduced(alice.clone()))
+                .expect("introduce");
+            store
+                .mark_review_requested(&alice, "aaa111")
+                .expect("dispatch");
+            store
+                .mark_review_completed(&alice, "aaa111", REVIEW_STATUS_REVIEWED)
+                .expect("complete");
+            // A second PR still only requested, to prove partial state survives too.
+            store
+                .save_review_watch(introduced(wkey("makewhat", "rhapsody", 85, "jimmy")))
+                .expect("introduce 2");
+        } // store dropped — the daemon "restarts" here
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        let set = store.load_review_watch().expect("recover watch set");
+        assert_eq!(set.len(), 2, "both rows must survive the restart");
+        assert_eq!(
+            set[0],
+            ReviewWatchRow {
+                key: wkey("makewhat", "rhapsody", 84, "alice"),
+                introduced_by: "handoff".into(),
+                requested_sha: "aaa111".into(),
+                last_reviewed_sha: "aaa111".into(),
+                status: REVIEW_STATUS_REVIEWED.into(),
+                open: true,
+            }
+        );
+        assert_eq!(set[1].key.number, 85);
+        assert_eq!(set[1].status, REVIEW_STATUS_REQUESTED);
+        assert_eq!(set[1].requested_sha, "", "nothing was dispatched for #85");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // Per-(PR, reviewer) granularity: two reviewers on ONE pull request are two independent rows,
+    // and one reviewer's progress can never stamp the other's (design §14.2, "N reviewers share
+    // one per-PR SHA" — the bug that silently ships a PR with a crashed reviewer's review missing).
+    #[test]
+    fn two_reviewers_on_one_pr_are_independent_rows() {
+        let store = open_mem();
+        let alice = wkey("makewhat", "rhapsody", 84, "alice");
+        let jimmy = wkey("makewhat", "rhapsody", 84, "jimmy");
+        store
+            .save_review_watch(introduced(alice.clone()))
+            .expect("introduce alice");
+        store
+            .save_review_watch(introduced(jimmy.clone()))
+            .expect("introduce jimmy");
+
+        // alice reviews the head; jimmy's run crashed before it started.
+        store
+            .mark_review_requested(&alice, "head1")
+            .expect("dispatch alice");
+        store
+            .mark_review_completed(&alice, "head1", REVIEW_STATUS_APPROVED)
+            .expect("complete alice");
+
+        let a = store
+            .get_review_watch(&alice)
+            .expect("get alice")
+            .expect("alice row");
+        let j = store
+            .get_review_watch(&jimmy)
+            .expect("get jimmy")
+            .expect("jimmy row");
+        assert_eq!(a.last_reviewed_sha, "head1");
+        assert_eq!(a.status, REVIEW_STATUS_APPROVED);
+        assert_eq!(
+            j.last_reviewed_sha, "",
+            "jimmy has reviewed nothing; alice's completion must not stamp his row"
+        );
+        assert_eq!(j.status, REVIEW_STATUS_REQUESTED);
+        assert_eq!(store.load_review_watch().expect("load").len(), 2);
+    }
+
+    // F-DUP: `requested_sha` is written at DISPATCH, before any review completes, and moves the
+    // row in-flight — that is what lets the watcher edge-trigger instead of re-dispatching onto a
+    // live worktree every tick.
+    #[test]
+    fn dispatch_records_the_requested_sha_and_goes_in_flight() {
+        let store = open_mem();
+        let key = wkey("makewhat", "rhapsody", 84, "alice");
+        store
+            .save_review_watch(introduced(key.clone()))
+            .expect("introduce");
+
+        store
+            .mark_review_requested(&key, "dispatched1")
+            .expect("dispatch");
+        let row = store.get_review_watch(&key).expect("get").expect("row");
+        assert_eq!(row.requested_sha, "dispatched1");
+        assert_eq!(row.status, REVIEW_STATUS_IN_FLIGHT);
+        assert_eq!(
+            row.last_reviewed_sha, "",
+            "dispatch must not touch the reviewed SHA — nothing has been read yet"
+        );
+    }
+
+    // F-SHA: completion records the SHA the reviewer was PINNED to, which may already be behind
+    // the live head. Recording it must not disturb `requested_sha`, so a head that advanced
+    // mid-review is still visibly un-reviewed.
+    #[test]
+    fn completion_records_the_pinned_sha_and_leaves_requested_alone() {
+        let store = open_mem();
+        let key = wkey("makewhat", "rhapsody", 84, "alice");
+        store
+            .save_review_watch(introduced(key.clone()))
+            .expect("introduce");
+        store
+            .mark_review_requested(&key, "pinned1")
+            .expect("dispatch");
+
+        store
+            .mark_review_completed(&key, "pinned1", REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+        let row = store.get_review_watch(&key).expect("get").expect("row");
+        assert_eq!(row.requested_sha, "pinned1");
+        assert_eq!(row.last_reviewed_sha, "pinned1");
+        assert_eq!(row.status, REVIEW_STATUS_REVIEWED);
+    }
+
+    // Re-introducing a PR that is already watched must not forget either SHA. A `save` that
+    // clobbered them would re-open F-DUP (a forgotten requested SHA re-dispatches onto a live
+    // worktree) and F-SHA (a forgotten reviewed SHA re-reviews what was already read).
+    #[test]
+    fn re_introduction_preserves_both_shas() {
+        let store = open_mem();
+        let key = wkey("makewhat", "rhapsody", 84, "alice");
+        store
+            .save_review_watch(introduced(key.clone()))
+            .expect("introduce");
+        store
+            .mark_review_requested(&key, "sha_req")
+            .expect("dispatch");
+        store
+            .mark_review_completed(&key, "sha_req", REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+
+        // The operator re-introduces the same PR with an all-empty row.
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                introduced_by: "operator".into(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+            })
+            .expect("re-introduce");
+
+        let row = store.get_review_watch(&key).expect("get").expect("row");
+        assert_eq!(
+            row.requested_sha, "sha_req",
+            "requested SHA must survive re-introduction"
+        );
+        assert_eq!(
+            row.last_reviewed_sha, "sha_req",
+            "reviewed SHA must survive re-introduction"
+        );
+        assert_eq!(row.introduced_by, "operator", "origin is refreshed");
+        assert_eq!(row.status, REVIEW_STATUS_REQUESTED, "status is re-armed");
+        assert_eq!(
+            store.load_review_watch().expect("load").len(),
+            1,
+            "still one row"
+        );
+    }
+
+    // Merge/close/gone (Slice 1's MERGED | CLOSED | Gone) clears `open` and parks the row at
+    // `dropped`, keeping both SHAs as the record of what was reviewed. Idempotent.
+    #[test]
+    fn drop_clears_open_and_keeps_the_reviewed_record() {
+        let store = open_mem();
+        let key = wkey("makewhat", "rhapsody", 84, "alice");
+        store
+            .save_review_watch(introduced(key.clone()))
+            .expect("introduce");
+        store.mark_review_requested(&key, "sha1").expect("dispatch");
+        store
+            .mark_review_completed(&key, "sha1", REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+
+        store.drop_review_watch(&key).expect("drop");
+        store
+            .drop_review_watch(&key)
+            .expect("drop again is idempotent");
+        let row = store.get_review_watch(&key).expect("get").expect("row");
+        assert!(!row.open);
+        assert_eq!(row.status, REVIEW_STATUS_DROPPED);
+        assert_eq!(
+            row.last_reviewed_sha, "sha1",
+            "the review record is kept, not erased"
+        );
+    }
+
+    // An absent row is `Ok(None)`, not an error — the watcher asks "is this pair watched?" and a
+    // "no" must be answerable without treating it as a failure. The mutating methods are likewise
+    // no-ops on an absent row rather than errors.
+    #[test]
+    fn absent_row_reads_none_and_writes_are_no_ops() {
+        let store = open_mem();
+        let key = wkey("makewhat", "rhapsody", 999, "nobody");
+        assert!(store.get_review_watch(&key).expect("get").is_none());
+        store
+            .mark_review_requested(&key, "x")
+            .expect("no-op dispatch");
+        store
+            .mark_review_completed(&key, "x", REVIEW_STATUS_REVIEWED)
+            .expect("no-op complete");
+        store.drop_review_watch(&key).expect("no-op drop");
+        assert!(store.get_review_watch(&key).expect("get").is_none());
+        assert!(store.load_review_watch().expect("load").is_empty());
+    }
+
+    // Recovery order is deterministic (owner, repo, number, reviewer) so a rebuilt watch set does
+    // not depend on insertion order.
+    #[test]
+    fn load_orders_by_pr_then_reviewer() {
+        let store = open_mem();
+        for k in [
+            wkey("zeta", "repo", 1, "alice"),
+            wkey("makewhat", "rhapsody", 84, "jimmy"),
+            wkey("makewhat", "rhapsody", 9, "alice"),
+            wkey("makewhat", "rhapsody", 84, "alice"),
+            wkey("makewhat", "other", 84, "alice"),
+        ] {
+            store.save_review_watch(introduced(k)).expect("introduce");
+        }
+        let got: Vec<(String, String, i64, String)> = store
+            .load_review_watch()
+            .expect("load")
+            .into_iter()
+            .map(|r| (r.key.owner, r.key.repo, r.key.number, r.key.reviewer))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("makewhat".into(), "other".into(), 84, "alice".into()),
+                ("makewhat".into(), "rhapsody".into(), 9, "alice".into()),
+                ("makewhat".into(), "rhapsody".into(), 84, "alice".into()),
+                ("makewhat".into(), "rhapsody".into(), 84, "jimmy".into()),
+                ("zeta".into(), "repo".into(), 1, "alice".into()),
+            ]
+        );
+    }
+
+    // Teams-gating (design §16): the table and its access path exist harmlessly on EVERY daemon.
+    // This slice ships no writer at all, so a Teams-off daemon — the shipped default — opens a
+    // store whose watch set is empty and stays empty.
+    #[test]
+    fn a_fresh_store_has_an_empty_watch_set() {
+        let store = open_mem();
+        assert!(store.load_review_watch().expect("load").is_empty());
+        // The table itself is present and queryable, not merely absent-and-forgiving.
+        let n: i64 = store
+            .lock()
+            .query_row("SELECT count(*) FROM rhapsody_review_watch", [], |row| {
+                row.get(0)
+            })
+            .expect("the table exists");
+        assert_eq!(n, 0);
+    }
+
+    // The rejected alternative was overloading a `runs` column to carry a SHA, which would surface
+    // a SHA everywhere the console renders a branch. Two halves: `runs` still has EXACTLY its
+    // v6 column set (no smuggled column), and exercising the whole watch-set API writes no run row.
+    #[test]
+    fn review_state_never_touches_the_runs_table() {
+        let store = open_mem();
+        let cols: Vec<String> = {
+            let conn = store.lock();
+            let mut stmt = conn
+                .prepare("SELECT name FROM pragma_table_info('runs')")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query");
+            rows.map(|c| c.expect("col")).collect()
+        };
+        assert_eq!(
+            cols,
+            vec![
+                "id",
+                "issue_id",
+                "issue_identifier",
+                "title",
+                "attempt",
+                "session_uuid",
+                "branch",
+                "started_at",
+                "ended_at",
+                "outcome",
+                "turns",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "error",
+                "transcript_path",
+                "project_slug",
+                "repo",
+                "usage_estimated",
+                "team_id",
+            ],
+            "the review watch set must add no column to `runs` — a SHA in `branch` would render \
+             as a branch in the console"
+        );
+
+        let key = wkey("makewhat", "rhapsody", 84, "alice");
+        store
+            .save_review_watch(introduced(key.clone()))
+            .expect("introduce");
+        store.mark_review_requested(&key, "sha1").expect("dispatch");
+        store
+            .mark_review_completed(&key, "sha1", REVIEW_STATUS_REVIEWED)
+            .expect("complete");
+        store.drop_review_watch(&key).expect("drop");
+
+        let runs: i64 = store
+            .lock()
+            .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
+            .expect("count runs");
+        assert_eq!(runs, 0, "the whole watch-set API must write no run row");
+    }
+
+    // THE GATE, asserted rather than assumed. `schema_dump` hides Rhapsody-only objects from the
+    // Go-recaptured golden by NAME PREFIX only (`rhapsody_`), because the golden is recapturable
+    // only from a Go daemon that has no review feature. This proves the exclusion is that narrow:
+    // every object in the live schema is either byte-present in the committed golden or carries
+    // the prefix, so a future un-prefixed table cannot slip past the golden.
+    #[test]
+    fn divergent_objects_are_gated_by_name_only() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open in-memory");
+        let golden = harness_fixtures::load("schema.sql");
+        let conn = store.lock();
+        // Only `sqlite_%` is dropped here — the SQLite-internal bookkeeping `schema_dump` already
+        // documents as not-application-schema. Every OTHER live object must justify itself below.
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master \
+                 WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+            )
+            .expect("prepare");
+        let objects: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        drop(stmt);
+        drop(conn);
+
+        let mut divergent = Vec::new();
+        for (name, sql) in &objects {
+            if golden.contains(&format!("{sql};\n")) {
+                continue; // a Go-owned object, byte-present in the golden
+            }
+            assert!(
+                name.starts_with(DIVERGENT_OBJECT_PREFIX),
+                "`{name}` is neither in the Go golden nor named `{DIVERGENT_OBJECT_PREFIX}*`: \
+                 either it is drift from the reference, or it is a Rhapsody-only object that must \
+                 be renamed to carry the prefix so the gate can see it"
+            );
+            divergent.push(name.clone());
+        }
+        assert_eq!(
+            divergent,
+            vec!["rhapsody_review_watch".to_string()],
+            "exactly one documented divergent object exists today (README `Divergences`)"
+        );
     }
 }

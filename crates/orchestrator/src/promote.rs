@@ -648,6 +648,39 @@ mod tests {
         fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError> {
             self.0.list_run_messages(run_id)
         }
+        fn save_review_watch(&self, w: rhapsody_store::ReviewWatchRow) -> Result<(), StoreError> {
+            self.0.save_review_watch(w)
+        }
+        fn mark_review_requested(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+            sha: &str,
+        ) -> Result<(), StoreError> {
+            self.0.mark_review_requested(key, sha)
+        }
+        fn mark_review_completed(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+            sha: &str,
+            status: &str,
+        ) -> Result<(), StoreError> {
+            self.0.mark_review_completed(key, sha, status)
+        }
+        fn drop_review_watch(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<(), StoreError> {
+            self.0.drop_review_watch(key)
+        }
+        fn get_review_watch(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<Option<rhapsody_store::ReviewWatchRow>, StoreError> {
+            self.0.get_review_watch(key)
+        }
+        fn load_review_watch(&self) -> Result<Vec<rhapsody_store::ReviewWatchRow>, StoreError> {
+            self.0.load_review_watch()
+        }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)
         }
