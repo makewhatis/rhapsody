@@ -10,7 +10,7 @@
 //! [`SummonSource`] trait. It mirrors the `SummonsSince` tests. The daemon-wiring phase (F1)
 //! constructs `GH::new(token, None)` as `o.gh_source`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -289,6 +289,277 @@ impl PrBranchSource for GH {
             .and_then(serde_json::Value::as_str)
             .filter(|b| !b.is_empty())
             .map(str::to_string))
+    }
+}
+
+/// Where a pull request stands, as GitHub's GraphQL `PullRequestState` reports it. Three values,
+/// not two: the watcher retires a MERGED pull request and a CLOSED one for different reasons and
+/// records them differently, and `mergedAt` alone cannot be trusted to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrStatus {
+    Open,
+    Merged,
+    Closed,
+}
+
+/// What one number-keyed lookup learned about a pull request the daemon is entitled to look at.
+///
+/// `head_sha` is the reason this type exists: it is the only thing that distinguishes "the author
+/// pushed fixes" from "nothing happened since the last poll", and no other `gh` helper in this
+/// module returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrSnapshot {
+    /// `headRefOid` — the exact commit at the head of the pull request.
+    pub head_sha: String,
+    pub status: PrStatus,
+    /// `mergedAt`, when GitHub states one it can parse. Informational: [`PrStatus::Merged`] is what
+    /// a caller acts on.
+    pub merged_at: Option<DateTime<Utc>>,
+    /// The head repository as `owner/repo` — the value the trust guard below accepted, kept so a
+    /// caller can name it in a log without asking GitHub a second time.
+    pub head_repo: String,
+}
+
+/// The outcome of a [`PrStateSource`] query, which is three-valued for a reason each case earns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrLookup {
+    /// GitHub answered, and the head repository is one this daemon may act on.
+    Found(PrSnapshot),
+    /// GitHub cannot resolve the pull request or its repository (a 404: deleted, transferred, or
+    /// never there), so there is nothing left to observe — distinct from [`PrStatus::Closed`],
+    /// which is a pull request that still exists and still has a head.
+    Gone,
+    /// The pull request exists but its head repository is neither the base nor allowlisted. A
+    /// deliberate non-answer: see [`PrStateSource`].
+    Untrusted,
+}
+
+/// The fallible result of a [`PrStateSource`] query. An `Err` is a lookup that could not be MADE —
+/// kept distinct from every [`PrLookup`] variant because those are answers and this is not, and
+/// because a caller must not retire a watched pull request on a network blip.
+pub type PrStateResult = Result<PrLookup, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The head repositories a pull request may come from besides the base repository itself, as
+/// lower-cased `owner/repo` slugs.
+///
+/// Empty by default and empty is the safe value: with no allowlist the only trusted head is the
+/// base repository's own owner, which is [`OpenPrSource`]'s and [`PrBranchSource`]'s existing rule.
+/// The set is passed per call rather than held on [`GH`] because the source is one shared object
+/// while the trust boundary belongs to the caller's configuration (design record §15-a: a PR
+/// coordinate is trusted because of where it came from, never because of what it says about
+/// itself).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeadAllowlist {
+    slugs: HashSet<String>,
+}
+
+impl HeadAllowlist {
+    /// The base repository and nothing else — the default trust boundary.
+    pub fn none() -> HeadAllowlist {
+        HeadAllowlist::default()
+    }
+
+    /// An allowlist over `owner/repo` slugs, folded to lower case so the comparison can be too.
+    pub fn from_slugs<I, S>(slugs: I) -> HeadAllowlist
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        HeadAllowlist {
+            slugs: slugs
+                .into_iter()
+                .map(|s| s.as_ref().trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Whether `slug` (an `owner/repo`) is explicitly allowed.
+    pub fn allows(&self, slug: &str) -> bool {
+        !self.slugs.is_empty() && self.slugs.contains(&slug.trim().to_ascii_lowercase())
+    }
+}
+
+/// Resolves the head SHA and merge state of a pull request named by NUMBER (STUDIO-710; design
+/// record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §14.2 and §14.4 slice 1).
+///
+/// **No Go counterpart** — Rhapsody Teams' ticketless PR review is a Rhapsody addition end to end,
+/// and this is its foundation. The two existing number/branch helpers answer neither question the
+/// review watcher asks: [`OpenPrSource::open_pr_for_branch`] returns a URL keyed by BRANCH, and
+/// [`PrBranchSource::head_branch_for_pr`] returns a branch NAME keyed by number. `headRefOid`
+/// appears nowhere. Re-review is triggered by the head ADVANCING past the SHA that was last
+/// reviewed, and a merged or closed pull request must be dropped from the watch set, so the
+/// watcher needs exactly `headRefOid` + `state` + `mergedAt`, per PR number, and nothing else.
+///
+/// **A head repository that is not the base's, and not allowlisted, is refused** — the security
+/// property the whole subsystem rests on (§14.1 F-SEC). What a later slice does with the answer is
+/// check out the head SHA and run an agent over its diff, so resolving a stranger's fork here
+/// would be arbitrary code execution driven by a pull request anyone can open against a public
+/// repository. The guard therefore lives inside the primitive, where it cannot be forgotten by a
+/// caller, and it fails closed: a head that cannot be SHOWN to be trusted (a deleted fork's `null`,
+/// an absent field) is [`PrLookup::Untrusted`] just like a stranger's.
+///
+/// The base side of that comparison is the OWNER the caller asked about, for the reason
+/// [`OpenPrSource::open_pr_for_branch`] gives at length: an owner match keeps a same-account fork
+/// inside the trust boundary and survives a repository rename, which a whole-slug match would not.
+/// The allowlist, being explicit operator configuration, is matched on the full slug instead.
+///
+/// Object-safe (a later slice holds it as `dyn PrStateSource` on its off-loop task), so it is
+/// declared via `async_trait`. Kept out of the other two traits for the reason they are kept apart:
+/// each answers one question, and a caller that needs two asks twice.
+#[async_trait]
+pub trait PrStateSource: Send + Sync {
+    async fn pr_state(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        allow: &HeadAllowlist,
+    ) -> PrStateResult;
+}
+
+/// The `gh` failure messages that mean "this pull request is not there", as opposed to "the lookup
+/// failed". `gh pr view` goes through GraphQL, which answers a missing PR and a missing repository
+/// with two different `Could not resolve to …` messages; a caller injecting a REST runner sees
+/// `HTTP 404` instead.
+///
+/// Matching on message text is not lovely, and it is what [`RunFn`] permits: the seam returns an
+/// opaque error and keeps neither the exit status nor the stderr stream separately. The classifier
+/// is therefore deliberately NARROW and fails closed — anything it does not recognise stays an
+/// error. [`PrLookup::Gone`] is a caller's instruction to stop watching a pull request forever, so
+/// a mis-classified rate limit or expired token would silently retire a live review, while a
+/// mis-classified 404 only costs one more poll on the next tick.
+///
+/// One ambiguity it cannot resolve, named rather than hidden: GitHub answers a repository the
+/// caller may not SEE with the same not-found as one that does not exist, so a token that loses
+/// access to a repository reads as [`PrLookup::Gone`] for every pull request in it. That is the
+/// right default — the alternative is erroring forever over a repository that really was deleted —
+/// but it is why a caller should say out loud which pull request it retired and why.
+fn is_gone_message(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("could not resolve to a pullrequest")
+        || e.contains("could not resolve to a repository")
+        || e.contains("http 404")
+}
+
+#[async_trait]
+impl PrStateSource for GH {
+    /// One bounded `gh pr view <number> --repo <owner>/<repo> --json
+    /// headRefOid,state,mergedAt,headRepository,headRepositoryOwner`.
+    ///
+    /// An empty owner or repo, or a non-positive number, is not an error and not a query: nothing
+    /// can ever be observed at a coordinate like that, so it answers [`PrLookup::Gone`] — the same
+    /// "there is nothing here to watch" a deleted pull request gets — without spawning `gh`. An
+    /// error would be worse, because a caller retries an error and this cannot improve.
+    ///
+    /// `headRefOid` and `state` have no safe default and a missing or unrecognised one is an error:
+    /// an empty head SHA compares unequal to every SHA, which would make the watcher re-review the
+    /// same pull request on every tick forever. `mergedAt` does have a safe default — `state`
+    /// already carries the decision — so an unparseable timestamp degrades to `None`.
+    async fn pr_state(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        allow: &HeadAllowlist,
+    ) -> PrStateResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Ok(PrLookup::Gone);
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let args = [
+            "pr",
+            "view",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--json",
+            "headRefOid,state,mergedAt,headRepository,headRepositoryOwner",
+        ];
+        let body = match (self.run)(&args) {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_gone_message(&msg) {
+                    return Ok(PrLookup::Gone);
+                }
+                return Err(format!("gh pr view {num} --repo {slug}: {msg}").into());
+            }
+        };
+        let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr view {num} --repo {slug}: {e}").into()
+            },
+        )?;
+
+        // The trust guard first: an untrusted head is a non-answer, so nothing else about the pull
+        // request is worth parsing or reporting.
+        let head_owner = pr
+            .get("headRepositoryOwner")
+            .and_then(|o| o.get("login"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let head_name = pr
+            .get("headRepository")
+            .and_then(|r| r.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        // `nameWithOwner` is what `gh` returns; the pair is the fallback for a caller that asked
+        // for fewer fields, and an empty owner leaves the slug empty rather than a bare `/repo`.
+        let head_repo = pr
+            .get("headRepository")
+            .and_then(|r| r.get("nameWithOwner"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if head_owner.is_empty() || head_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("{head_owner}/{head_name}")
+                }
+            });
+        let trusted = (!head_owner.is_empty() && head_owner.eq_ignore_ascii_case(owner))
+            || (!head_repo.is_empty() && allow.allows(&head_repo));
+        if !trusted {
+            return Ok(PrLookup::Untrusted);
+        }
+
+        let head_sha = pr
+            .get("headRefOid")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr view {num} --repo {slug}: no headRefOid in the answer").into()
+            })?
+            .to_string();
+        let raw_state = pr
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let status = match raw_state.to_ascii_uppercase().as_str() {
+            "OPEN" => PrStatus::Open,
+            "MERGED" => PrStatus::Merged,
+            "CLOSED" => PrStatus::Closed,
+            other => {
+                return Err(format!(
+                    "gh pr view {num} --repo {slug}: unrecognised state {other:?}"
+                )
+                .into());
+            }
+        };
+        let merged_at = pr
+            .get("mergedAt")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc));
+        Ok(PrLookup::Found(PrSnapshot {
+            head_sha,
+            status,
+            merged_at,
+            head_repo,
+        }))
     }
 }
 
@@ -919,6 +1190,319 @@ mod tests {
                 .expect("open_pr_for_branch")
                 .as_deref(),
             Some("https://github.com/MakeWhatIs/r/pull/64")
+        );
+    }
+
+    // ── pr_state (STUDIO-710, slice 1; design record §14.2, §15; no Go counterpart) ─────────────
+
+    /// The captured payload of a live open pull request (`gh pr view 86 --repo makewhatis/rhapsody
+    /// --json headRefOid,state,mergedAt,headRepository,headRepositoryOwner`, 2026-09-02), with the
+    /// owner renamed to the `o/r` the other tests use.
+    const PR_VIEW_OPEN: &str = r#"{
+        "headRefOid":"93db6e8ec3b7c54071eb031ebac3be71eee1008a",
+        "headRepository":{"id":"R_kgDOTcp16A","name":"r","nameWithOwner":"o/r"},
+        "headRepositoryOwner":{"id":"MDQ6VXNlcjczMDg0OA==","name":"David Johansen","login":"o"},
+        "mergedAt":null,
+        "state":"OPEN"
+    }"#;
+
+    /// The same capture for a merged pull request (`gh pr view 84`, same run).
+    const PR_VIEW_MERGED: &str = r#"{
+        "headRefOid":"df574d9a665c6987d7c72d65f052ff5422862bc3",
+        "headRepository":{"id":"R_kgDOTcp16A","name":"r","nameWithOwner":"o/r"},
+        "headRepositoryOwner":{"id":"MDQ6VXNlcjczMDg0OA==","name":"David Johansen","login":"o"},
+        "mergedAt":"2026-09-02T04:37:59Z",
+        "state":"MERGED"
+    }"#;
+
+    /// The happy path: one bounded `gh pr view`, and the three fields the watcher needs read out of
+    /// it. The argv is asserted in full because it IS the contract with GitHub — a dropped
+    /// `headRefOid` would leave the watcher unable to see a head advance at all.
+    #[tokio::test]
+    async fn pr_state_returns_the_head_sha_state_and_merged_at() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(PR_VIEW_OPEN, Arc::clone(&seen))),
+        );
+
+        let got = src
+            .pr_state("o", "r", 86, &HeadAllowlist::none())
+            .await
+            .expect("pr_state");
+
+        assert_eq!(
+            got,
+            PrLookup::Found(PrSnapshot {
+                head_sha: "93db6e8ec3b7c54071eb031ebac3be71eee1008a".to_string(),
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: "o/r".to_string(),
+            })
+        );
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec![
+                "pr view 86 --repo o/r --json \
+                 headRefOid,state,mergedAt,headRepository,headRepositoryOwner"
+                    .to_string()
+            ],
+        );
+    }
+
+    /// Merged and closed are DIFFERENT terminal states and the watcher records them differently, so
+    /// the one field that distinguishes them (`state`, which `gh` answers as the GraphQL enum) is
+    /// read rather than inferred from `mergedAt` being present.
+    #[tokio::test]
+    async fn pr_state_distinguishes_merged_from_closed() {
+        let merged = GH::new(
+            "@symphony",
+            Some(run_recording(
+                PR_VIEW_MERGED,
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        let got = merged
+            .pr_state("o", "r", 84, &HeadAllowlist::none())
+            .await
+            .expect("pr_state");
+        assert_eq!(
+            got,
+            PrLookup::Found(PrSnapshot {
+                head_sha: "df574d9a665c6987d7c72d65f052ff5422862bc3".to_string(),
+                status: PrStatus::Merged,
+                merged_at: Some(utc(2026, 9, 2, 4, 37, 59)),
+                head_repo: "o/r".to_string(),
+            })
+        );
+
+        let closed = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"headRefOid":"abc","state":"CLOSED","mergedAt":null,
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        assert_eq!(
+            closed
+                .pr_state("o", "r", 12, &HeadAllowlist::none())
+                .await
+                .expect("pr_state"),
+            PrLookup::Found(PrSnapshot {
+                head_sha: "abc".to_string(),
+                status: PrStatus::Closed,
+                merged_at: None,
+                head_repo: "o/r".to_string(),
+            }),
+            "a closed-unmerged PR must not be reported as merged"
+        );
+    }
+
+    /// A pull request (or repository) GitHub can no longer resolve is `Gone` — a distinct answer
+    /// from `Closed`, because the watcher retires a gone PR without ever learning a terminal state
+    /// for it. Both of `gh`'s GraphQL not-found messages count, and so does a REST `HTTP 404` for a
+    /// caller that injects one.
+    #[tokio::test]
+    async fn pr_state_maps_a_missing_pull_request_to_gone() {
+        for stderr in [
+            "gh pr view 999999 --repo o/r exited with exit status 1: GraphQL: Could not resolve \
+             to a PullRequest with the number of 999999. (repository.pullRequest)",
+            "GraphQL: Could not resolve to a Repository with the name 'o/r'. (repository)",
+            "gh: Not Found (HTTP 404)",
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(Box::new(move |_: &[&str]| Err(stderr.into()))),
+            );
+            assert_eq!(
+                src.pr_state("o", "r", 999_999, &HeadAllowlist::none())
+                    .await
+                    .expect("a not-found PR is an answer, not a failure"),
+                PrLookup::Gone,
+                "{stderr}"
+            );
+        }
+    }
+
+    /// Any OTHER failure stays an error. `Gone` means "stop watching this pull request", so
+    /// classifying a network blip or an expired token as gone would silently retire a live PR from
+    /// review — the lookup fails closed instead, and the caller retries on its own cadence.
+    #[tokio::test]
+    async fn pr_state_does_not_mistake_a_failed_lookup_for_gone() {
+        for stderr in [
+            "gh: not logged in to any GitHub hosts",
+            "dial tcp: lookup api.github.com: no such host",
+            "gh: API rate limit exceeded (HTTP 403)",
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(Box::new(move |_: &[&str]| Err(stderr.into()))),
+            );
+            assert!(
+                src.pr_state("o", "r", 86, &HeadAllowlist::none())
+                    .await
+                    .is_err(),
+                "{stderr} must not retire a watched PR"
+            );
+        }
+        let undecodable = GH::new(
+            "@symphony",
+            Some(run_recording("not json", Arc::new(Mutex::new(Vec::new())))),
+        );
+        assert!(
+            undecodable
+                .pr_state("o", "r", 86, &HeadAllowlist::none())
+                .await
+                .is_err()
+        );
+    }
+
+    /// A pull request whose head is a fork is `Untrusted` — never `Found`. The head SHA of a
+    /// stranger's branch is what a review run would check out and execute, so a head this daemon
+    /// cannot show is its own (a different owner, a deleted fork's `null`, or an absent field)
+    /// resolves to nothing reviewable.
+    #[tokio::test]
+    async fn pr_state_rejects_a_fork_or_off_allowlist_head() {
+        for body in [
+            r#"{"headRefOid":"abc","state":"OPEN","mergedAt":null,
+                 "headRepository":{"nameWithOwner":"stranger/r"},
+                 "headRepositoryOwner":{"login":"stranger"}}"#,
+            r#"{"headRefOid":"abc","state":"OPEN","mergedAt":null,
+                 "headRepository":null,"headRepositoryOwner":null}"#,
+            r#"{"headRefOid":"abc","state":"OPEN","mergedAt":null}"#,
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert_eq!(
+                src.pr_state("o", "r", 7, &HeadAllowlist::none())
+                    .await
+                    .expect("lookup"),
+                PrLookup::Untrusted,
+                "{body}"
+            );
+        }
+    }
+
+    /// The base repository is trusted without an allowlist, and an explicitly allowlisted head repo
+    /// is trusted too — that is the whole "base / an allowlisted repo" rule. Both comparisons are
+    /// case-insensitive, because GitHub logins are and the operator types the allowlist by hand.
+    #[tokio::test]
+    async fn pr_state_trusts_the_base_owner_and_an_allowlisted_head() {
+        let own = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"headRefOid":"abc","state":"OPEN","mergedAt":null,
+                     "headRepository":{"nameWithOwner":"O/R"},
+                     "headRepositoryOwner":{"login":"O"}}"#,
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        assert!(matches!(
+            own.pr_state("o", "r", 7, &HeadAllowlist::none())
+                .await
+                .expect("lookup"),
+            PrLookup::Found(_)
+        ));
+
+        let allowed = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"headRefOid":"abc","state":"OPEN","mergedAt":null,
+                     "headRepository":{"nameWithOwner":"Partner/Fork"},
+                     "headRepositoryOwner":{"login":"Partner"}}"#,
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        let allow = HeadAllowlist::from_slugs(["partner/fork"]);
+        assert!(
+            matches!(
+                allowed.pr_state("o", "r", 7, &allow).await.expect("lookup"),
+                PrLookup::Found(_)
+            ),
+            "an allowlisted head repo is trusted"
+        );
+        assert_eq!(
+            allowed
+                .pr_state("o", "r", 7, &HeadAllowlist::from_slugs(["partner/other"]))
+                .await
+                .expect("lookup"),
+            PrLookup::Untrusted,
+            "a DIFFERENT repo under an allowlisted owner is not allowlisted"
+        );
+    }
+
+    /// A head SHA is the one field with no safe default: without it the watcher cannot tell a head
+    /// advance from a re-poll. An answer missing it is a shape this code does not understand, so it
+    /// fails rather than reporting an empty SHA that would compare unequal to everything.
+    #[tokio::test]
+    async fn pr_state_without_a_head_sha_is_an_error() {
+        for body in [
+            r#"{"state":"OPEN","mergedAt":null,"headRepositoryOwner":{"login":"o"}}"#,
+            r#"{"headRefOid":"","state":"OPEN","headRepositoryOwner":{"login":"o"}}"#,
+            r#"{"headRefOid":"abc","state":"WAT","headRepositoryOwner":{"login":"o"}}"#,
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert!(
+                src.pr_state("o", "r", 7, &HeadAllowlist::none())
+                    .await
+                    .is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    /// An unparseable `mergedAt` is not fatal: `state` already carries the merged/closed decision
+    /// the watcher acts on, so the timestamp degrades to absent rather than failing a lookup that
+    /// otherwise answered everything asked of it.
+    #[tokio::test]
+    async fn pr_state_tolerates_an_unparseable_merged_at() {
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"headRefOid":"abc","state":"MERGED","mergedAt":"yesterday",
+                     "headRepositoryOwner":{"login":"o"},
+                     "headRepository":{"nameWithOwner":"o/r"}}"#,
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        assert_eq!(
+            src.pr_state("o", "r", 7, &HeadAllowlist::none())
+                .await
+                .expect("lookup"),
+            PrLookup::Found(PrSnapshot {
+                head_sha: "abc".to_string(),
+                status: PrStatus::Merged,
+                merged_at: None,
+                head_repo: "o/r".to_string(),
+            })
+        );
+    }
+
+    /// Nothing to ask ⇒ no `gh` process. A coordinate with no owner, no repo or no number can never
+    /// be observed at all, so it answers `Gone` — the same "stop watching this" a deleted pull
+    /// request gets — rather than an error the caller would retry forever.
+    #[tokio::test]
+    async fn pr_state_without_a_target_asks_nothing() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("{}", Arc::clone(&seen))));
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0), ("o", "r", -3)] {
+            assert_eq!(
+                src.pr_state(owner, repo, n, &HeadAllowlist::none())
+                    .await
+                    .expect("lookup"),
+                PrLookup::Gone
+            );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh call should have been made"
         );
     }
 }

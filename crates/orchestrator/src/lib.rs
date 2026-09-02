@@ -52,6 +52,7 @@ pub mod orchestrator;
 pub mod persist;
 pub mod preflight;
 pub mod promote;
+pub mod prstate;
 pub mod quorum;
 pub mod reads;
 pub mod reconcile;
