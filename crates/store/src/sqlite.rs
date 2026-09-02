@@ -18,7 +18,8 @@
 //! to prevent.
 //!
 //! **The mechanism** (README, "Divergences"): every Rhapsody-only schema object is NAMED with the
-//! `rhapsody_` prefix, and the golden comparison excludes objects by that prefix and nothing else.
+//! `rhapsody_` prefix, and the golden comparison excludes objects by that prefix and nothing else
+//! (matched literally — the `_` is `ESCAPE`d rather than left as a LIKE wildcard).
 //! The exclusion is therefore a name rule, not a loosened assertion — a Go table can never be
 //! named `rhapsody_*`, so the golden keeps gating all 6 ported tables byte-strictly, and a NEW
 //! table added without the prefix still turns it red. `divergent_objects_are_gated_by_name_only`
@@ -1207,20 +1208,25 @@ mod tests {
     /// `IF NOT EXISTS` needs no stripping: SQLite already canonicalizes it out of the stored
     /// `sql`. `ORDER BY rowid` preserves creation order, exactly as the fixture was captured.
     ///
-    /// A THIRD exclusion, `name NOT LIKE 'rhapsody_%'`, gates out the Rhapsody-only schema objects
+    /// A THIRD exclusion, `name NOT LIKE 'rhapsody\_%' ESCAPE '\'`, gates out the Rhapsody-only objects
     /// that the Go daemon cannot create and therefore can never appear in a recaptured golden
     /// (today: `rhapsody_review_watch`, STUDIO-711 — see this module's doc comment and the README
     /// "Divergences" entry). It excludes by NAME only, so it cannot hide drift in any of the 6
     /// ported tables: a Go table is never named `rhapsody_*`, and a new un-prefixed table still
     /// turns this golden red. `divergent_objects_are_gated_by_name_only` asserts that property and
     /// pins the excluded set to exactly the documented object.
+    ///
+    /// The `_` in the prefix is ESCAPEd: unescaped it is a LIKE single-character wildcard, which
+    /// would silently widen the exclusion to any `rhapsody?*` name. Escaped, the SQL is exactly
+    /// the `starts_with` rule the README states and `divergent_objects_are_gated_by_name_only`
+    /// asserts, so the two can never drift apart.
     fn schema_dump(store: &Sqlite) -> String {
         let conn = store.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT sql FROM sqlite_master \
                  WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
-                   AND name NOT LIKE 'rhapsody_%' \
+                   AND name NOT LIKE 'rhapsody\\_%' ESCAPE '\\' \
                  ORDER BY rowid",
             )
             .expect("prepare schema query");
@@ -3385,6 +3391,24 @@ mod tests {
             divergent,
             vec!["rhapsody_review_watch".to_string()],
             "exactly one documented divergent object exists today (README `Divergences`)"
+        );
+    }
+
+    // The gate excludes by the LITERAL prefix `rhapsody_`, not by a LIKE pattern in which `_` is a
+    // single-character wildcard. An unescaped `'rhapsody_%'` would also hide, say, `rhapsodyXfoo`,
+    // quietly widening the exclusion beyond the documented rule. A table that merely resembles the
+    // prefix must still reach the golden — and therefore still turn it red.
+    #[test]
+    fn the_gate_prefix_is_literal_not_a_like_wildcard() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open in-memory");
+        store
+            .lock()
+            .execute_batch("CREATE TABLE rhapsodyXfoo (a TEXT);")
+            .expect("create look-alike table");
+        assert!(
+            schema_dump(&store).contains("CREATE TABLE rhapsodyXfoo"),
+            "only the literal `rhapsody_` prefix is excluded; a look-alike must still be compared \
+             against the golden"
         );
     }
 }

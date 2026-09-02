@@ -516,7 +516,8 @@ branch. Instead:
 
 - every Rhapsody-only schema object is **named with a `rhapsody_` prefix**, and
 - the golden comparison (`schema_matches_committed_golden`) excludes objects **by that prefix and
-  nothing else**.
+  nothing else** — matched literally, with the `_` `ESCAPE`d so it is not a LIKE single-character
+  wildcard that would quietly hide `rhapsody?*` names too.
 
 The exclusion is a name rule, not a loosened assertion. A Go-created object can never be named
 `rhapsody_*`, so all six ported tables stay gated byte-strictly, and a **new un-prefixed table still
