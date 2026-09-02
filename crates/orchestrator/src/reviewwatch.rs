@@ -438,19 +438,7 @@ impl Orchestrator {
                 report.deferred += 1;
                 continue;
             };
-            if chosen != row.key.reviewer {
-                // The round was reassigned. The incumbent's row leaves the watch set rather than
-                // staying beside the substitute's: it is the same required review, and two rows
-                // would make the pull request owe two of them forever (`review_round_due` would go
-                // on answering true for the incumbent at every head).
-                tracing::info!(
-                    pr = %pr, from = %row.key.reviewer, to = %chosen,
-                    "ticketless review: the round was reassigned — the incumbent is at capacity"
-                );
-                if let Err(e) = self.store().drop_review_watch(&row.key) {
-                    tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
-                }
-            }
+            let reassigned = chosen != row.key.reviewer;
             let run = ReviewRun {
                 owner: row.key.owner.clone(),
                 repo: row.key.repo.clone(),
@@ -469,6 +457,24 @@ impl Orchestrator {
             match self.dispatch_review(run) {
                 ReviewDispatchOutcome::Dispatched => {
                     report.dispatched += 1;
+                    if reassigned {
+                        // The round moved to a substitute, so the incumbent's row leaves the watch
+                        // set rather than staying beside theirs: it is the SAME required review,
+                        // and two rows would make the pull request owe two of them forever —
+                        // `review_round_due` would go on answering true for the incumbent at every
+                        // head, for a reviewer nobody is waiting on.
+                        //
+                        // Retired only AFTER the dispatch succeeded. Doing it first would leave the
+                        // pull request with no row at all for this required review on any refusal,
+                        // and nothing would ever ask for it again.
+                        tracing::info!(
+                            pr = %pr, from = %row.key.reviewer,
+                            "ticketless review: the round was reassigned — the incumbent was at capacity"
+                        );
+                        if let Err(e) = self.store().drop_review_watch(&row.key) {
+                            tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
+                        }
+                    }
                     let counter = self.review_rounds.entry(churn_key(pr)).or_default();
                     *counter += 1;
                     if *counter == REVIEW_ROUNDS_PER_PR_CAP {
@@ -841,6 +847,26 @@ mod tests {
         assert!(o.running.contains_key(&review_key(OWNER, REPO, 12, "bob")));
     }
 
+    /// A review an operator STOPPED is not resurrected two minutes later. `stop_run` leaves the
+    /// key in `claimed` when the (impossible for a `pr:` key) tracker move fails, which is exactly
+    /// the "dead this session" suppression the edge trigger already reads — worth pinning, because
+    /// the watcher is the first thing in the daemon that would re-dispatch on its own initiative.
+    #[test]
+    fn an_operator_stopped_review_is_not_re_dispatched() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        let id = review_key(OWNER, REPO, 12, "bob");
+        o.running.remove(&id);
+        o.claimed.insert(id); // what `stop_run` + a failed finalize leave behind
+
+        for _ in 0..3 {
+            assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
+        }
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
     /// Acceptance: a `max_turns`-truncated round is re-reviewed AT THE SAME HEAD. Nothing but the
     /// status distinguishes it from a completed one — `last_reviewed_sha` was deliberately not
     /// advanced — so a SHA-only trigger would call the partial review sufficient forever.
@@ -948,13 +974,10 @@ mod tests {
             head_repo: format!("{OWNER}/{REPO}"),
         });
         let closed = PrLookup::Found(PrSnapshot {
+            head_sha: HEAD_A.to_string(),
             status: PrStatus::Closed,
-            ..PrSnapshot {
-                head_sha: HEAD_A.to_string(),
-                status: PrStatus::Closed,
-                merged_at: None,
-                head_repo: format!("{OWNER}/{REPO}"),
-            }
+            merged_at: None,
+            head_repo: format!("{OWNER}/{REPO}"),
         });
         for (n, lookup) in [
             (12, merged),
