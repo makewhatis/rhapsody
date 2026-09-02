@@ -19,10 +19,9 @@
 //! post says about it. Exactly two origins may introduce one (§15-a, §15-e):
 //!
 //! 1. **A teammate's handoff**, using the run's OWN resolved repository binding — `project_repo`,
-//!    falling back to the top-level `repo` — which is the same trusted value
-//!    [`plan_quorum`](Orchestrator::plan_quorum) has always used and which no room text can reach.
-//!    [`Orchestrator::plan_review_intro`] builds it at `handle_handoff_run`, the site the quorum
-//!    already hooks.
+//!    falling back to the top-level `repo` — which is the same trusted value the quorum's
+//!    `plan_quorum` has always used and which no room text can reach. `plan_review_intro` builds it
+//!    at `handle_handoff_run`, the site the quorum already hooks.
 //! 2. **An operator through the authenticated console** (slice 8), which arrives at the same
 //!    loop-side introduction handler through [`ControlHandle::introduce_review`].
 //!
@@ -66,7 +65,7 @@
 //!   first sender.
 //! * **Reviewer load is the quorum's, and under ticketless it is empty.** `quorum_load` is filled
 //!   by `record_quorum_state`, which short-circuits when the ticket fan-out is off — which
-//!   `ticketless` makes it. [`select_reviewers`] therefore ranks an all-zero load and picks
+//!   `ticketless` makes it. `select_reviewers` therefore ranks an all-zero load and picks
 //!   deterministically by roster order (author excluded), which is correct but not load-aware.
 //!   Making load count ticketless reviews is slice 5's named item ("review load counting"), and it
 //!   changes nothing observable until slice 5 dispatches from these rows.
@@ -113,9 +112,9 @@ pub const DEFAULT_REVIEWERS: usize = 1;
 ///
 /// Everything the decision needs is already in memory when this is built — the repository binding
 /// comes off the run, the branch name is the frozen `symphony/<key>` contract, the reviewers come
-/// from the roster — so [`Orchestrator::plan_review_intro`] touches no network, exactly as
-/// `plan_quorum` does not. What is missing is only the pull request's NUMBER, which is the one
-/// thing GitHub has to be asked for; that is the off-loop task's whole job.
+/// from the roster — so the planner touches no network, exactly as `plan_quorum` does not. What is
+/// missing is only the pull request's NUMBER, which is the one thing GitHub has to be asked for;
+/// that is the off-loop task's whole job.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewIntroRequest {
     /// The repository owner, parsed from [`repo_url`](Self::repo_url).
@@ -138,9 +137,14 @@ pub struct ReviewIntroRequest {
 /// control task.
 ///
 /// This is what an [`Event::ReviewIntroduce`] carries, and the console (slice 8) will build one
-/// directly. It is deliberately NOT trusted on arrival: [`Orchestrator::handle_review_introduce`]
+/// directly. It is deliberately NOT trusted on arrival: the loop-side `handle_review_introduce`
 /// re-checks every field, including the allowlist, because being an in-process type is not the same
 /// as being a validated one.
+///
+/// One field it cannot re-check is `open`: the row is written open, on the CALLER's fresh
+/// observation. The handoff path earns that — it reaches here only because
+/// [`OpenPrSource::open_pr_for_branch`] answered under `--state open` — and any future caller owes
+/// the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntroducedPr {
     /// Owner, repository and NUMBER — the coordinate `gh` and the watch set both key on.
@@ -286,6 +290,13 @@ pub async fn run_review_intro_task(
             })
             .await;
         match outcome {
+            // `Introduced(0)` is not a failure and not an introduction: every candidate row had a
+            // review already in flight, so the watch set already says what needs saying.
+            ReviewIntroOutcome::Introduced(0) => tracing::debug!(
+                pr = %pr,
+                "ticketless review: every reviewer of this pull request is already mid-review; its \
+                 watch rows were left as they are"
+            ),
             ReviewIntroOutcome::Introduced(n) => tracing::info!(
                 pr = %pr, rows = n, origin = %req.introduced_by,
                 "ticketless review: pull request introduced into the watch set"
@@ -599,19 +610,24 @@ impl ControlHandle {
     /// The wait is bounded by the daemon lifetime rather than by a timer, as
     /// [`handoff_run`](ControlHandle::handoff_run)'s is: nothing here is answering an agent's MCP
     /// call, so a busy tick should delay the introduction rather than turn it into a false failure.
+    ///
+    /// A gone or cancelled control task answers `Refused`, NOT `Dormant`: "the daemon is shutting
+    /// down" and "this installation has the subsystem off" are different facts, and the second is
+    /// the one an operator reads as "working as configured".
     pub async fn introduce_review(&self, pr: IntroducedPr) -> ReviewIntroOutcome {
+        const GONE: ReviewIntroOutcome = ReviewIntroOutcome::Refused("the control task is gone");
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .events
             .send(Event::ReviewIntroduce { pr, reply: tx })
             .is_err()
         {
-            return ReviewIntroOutcome::Dormant; // the loop is gone: nothing can be introduced.
+            return GONE;
         }
         let mut lifetime = self.ctx.clone();
         tokio::select! {
-            r = rx => r.unwrap_or(ReviewIntroOutcome::Dormant),
-            _ = lifetime.cancelled() => ReviewIntroOutcome::Dormant,
+            r = rx => r.unwrap_or(GONE),
+            _ = lifetime.cancelled() => GONE,
         }
     }
 
@@ -619,10 +635,9 @@ impl ControlHandle {
     /// how many (PR, reviewer) rows were re-armed.
     ///
     /// This is the design's in-process control Event standing in for the room post §14.1 F-SEC
-    /// rules out. It cannot introduce a pull request — see
-    /// [`handle_review_head_advanced`](Orchestrator::handle_review_head_advanced) — so an
-    /// observation about an unwatched coordinate is inert by construction rather than by the
-    /// caller's care.
+    /// rules out. It cannot introduce a pull request — the loop-side `handle_review_head_advanced`
+    /// only ever updates rows that already exist — so an observation about an unwatched coordinate
+    /// is inert by construction rather than by the caller's care.
     pub async fn review_head_advanced(&self, pr: PrCoord, head_sha: &str) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let ev = Event::ReviewHeadAdvanced {
