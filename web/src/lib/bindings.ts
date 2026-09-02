@@ -63,6 +63,20 @@ export function hasBridge(): boolean {
   return tauriAvailable();
 }
 
+// hasOverlayTitlebar reports whether the window has the macOS "Overlay" title bar the desktop app
+// asks for (`titleBarStyle: "Overlay"` in desktop/src-tauri/tauri.conf.json), which draws no system
+// title bar and instead floats the native traffic lights over the top-left of the web content. Only
+// then does the UI owe them an inset — and a `data-tauri-drag-region`, because with the system bar
+// gone there is nothing else left to move the window by.
+//
+// Both halves of the test matter. A plain browser (the daemon's served dashboard, `vite dev`, a
+// unit test) has real browser chrome, and on Windows/Linux Tauri ignores the setting and draws a
+// normal system title bar; in either host the reserve would be dead space.
+export function hasOverlayTitlebar(): boolean {
+  if (!tauriAvailable()) return false;
+  return typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
+}
+
 export async function getStatus(): Promise<StatusDTO | null> {
   if (!tauriAvailable()) return null;
   return invoke<StatusDTO>("status");

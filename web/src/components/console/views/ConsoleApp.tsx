@@ -9,7 +9,7 @@ import {
 } from "@/components/console";
 import { TeamsConsole } from "@/components/console/teams/TeamsConsole";
 import { ShutdownOverlay } from "@/components/shell/ShutdownOverlay";
-import { onNavigate, onShuttingDown } from "@/lib/bindings";
+import { hasOverlayTitlebar, onNavigate, onShuttingDown } from "@/lib/bindings";
 import { useConsoleRoute } from "@/hooks/useConsoleRoute";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useIssueRuns } from "@/hooks/useHistory";
@@ -55,6 +55,12 @@ export function ConsoleApp() {
   // binding it calls is a no-op, so the daemon-served dashboard mounts it inert.
   const updater = useUpdater();
   const [shuttingDown, setShuttingDown] = useState(false);
+  // The desktop window's chrome (STUDIO-701). A property of the HOST, not of state: under macOS
+  // `titleBarStyle: "Overlay"` there is no system title bar to move the window by and the native
+  // traffic lights float over the top-left of the web content, so whichever surface is mounted
+  // owes them a drag region and an inset. False in a plain browser, which is why the
+  // daemon-served dashboard is untouched by any of this.
+  const overlayTitlebar = hasOverlayTitlebar();
 
   // The two desktop-host subscriptions the Podium shell owned before the §2.2.1 flip made this the
   // root. Both are no-ops in a plain browser (no Tauri runtime), so the daemon-served dashboard is
@@ -101,6 +107,7 @@ export function ConsoleApp() {
           onError={setOnboardErr}
           error={onboardErr}
           onDismissError={() => setOnboardErr("")}
+          overlayTitlebar={overlayTitlebar}
         />
         {overlay}
       </>
@@ -114,6 +121,7 @@ export function ConsoleApp() {
         active={consoleNavFor(route)}
         onNavigate={(id) => go(id as ConsoleRouteName)}
         foot={<RailFoot version={version.data?.version ?? ""} teamsEnabled={teamsEnabled === true} />}
+        overlayTitlebar={overlayTitlebar}
       >
         <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
         <ConsoleBody route={route} teamsEnabled={teamsEnabled} go={go} updater={updater} />

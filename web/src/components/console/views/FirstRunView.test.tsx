@@ -45,6 +45,7 @@ function mount(props: Partial<Parameters<typeof FirstRunView>[0]> = {}) {
       onError={props.onError ?? vi.fn()}
       error={props.error ?? ""}
       onDismissError={props.onDismissError ?? vi.fn()}
+      overlayTitlebar={props.overlayTitlebar}
     />,
   );
 }
@@ -116,6 +117,25 @@ describe("the setup chrome", () => {
     expect(screen.getByText("Setup")).toBeTruthy();
     // There is nothing to navigate to before a config exists.
     expect(document.querySelector("nav")).toBeNull();
+  });
+
+  // STUDIO-701 — on the desktop this bar is the window's title bar as well as the brand lockup:
+  // macOS `titleBarStyle: "Overlay"` leaves no system bar to drag, and floats the traffic lights
+  // over its left end. It takes the reserve the way Podium's horizontal toolbar did.
+  it("becomes the window's title bar under an overlay title bar, and stays put without one", async () => {
+    const { unmount } = mount({ overlayTitlebar: true });
+    await screen.findByRole("progressbar", { name: "Onboarding progress" });
+    expect(document.querySelector(".rh-console.setup.overlay-titlebar")).not.toBeNull();
+    const head = document.querySelector("header.setuphead");
+    expect(head?.hasAttribute("data-tauri-drag-region")).toBe(true);
+    // The lockup is a CHILD of the drag region, and Tauri drags on the element the pointer is
+    // over — so the bar's own background drags while its contents keep their own hit-testing.
+    expect(head?.querySelector(".logo")).not.toBeNull();
+    unmount();
+
+    mount();
+    await screen.findByRole("progressbar", { name: "Onboarding progress" });
+    expect(document.querySelector(".overlay-titlebar")).toBeNull();
   });
 
   it("renders the lifted failure as a dismissable alert", async () => {

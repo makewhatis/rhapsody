@@ -84,6 +84,41 @@ describe("AppShell", () => {
     expect(onNavigate).toHaveBeenCalledWith("teams");
   });
 
+  // STUDIO-701 — the desktop window chrome the §2.2.1 flip dropped. The packaged app runs with
+  // macOS `titleBarStyle: "Overlay"`: no system title bar to drag by, and the native traffic
+  // lights floating over the top-left of the web content — which is exactly where the rail's
+  // logo sits.
+  describe("overlay title bar (desktop)", () => {
+    it("adds no window chrome by default, so the served dashboard is unchanged", () => {
+      const { container } = render(<AppShell items={rail(true)} active="jobs" />);
+      expect(container.firstElementChild?.classList.contains("overlay-titlebar")).toBe(false);
+      expect(container.querySelector("[data-tauri-drag-region]")).toBeNull();
+      expect(container.querySelector(".rail .drag")).toBeNull();
+    });
+
+    it("turns the rail's top into a drag strip above the logo when asked", () => {
+      const { container } = render(<AppShell items={rail(true)} active="jobs" overlayTitlebar />);
+      expect(container.firstElementChild?.classList.contains("overlay-titlebar")).toBe(true);
+      const drag = container.querySelector(".rail")?.firstElementChild;
+      expect(drag?.className).toBe("drag");
+      expect(drag?.hasAttribute("data-tauri-drag-region")).toBe(true);
+      // The inset IS the strip: the logo comes after it, so the lights never land on the mark.
+      expect(drag?.nextElementSibling?.classList.contains("logo")).toBe(true);
+    });
+
+    it("keeps the drag strip empty so no nav item or logo is swallowed by it", () => {
+      const { container } = render(<AppShell items={rail(true)} active="jobs" overlayTitlebar />);
+      // Tauri drags on the element the pointer is over, so anything INSIDE a drag region stays
+      // clickable — but an empty strip makes that structural rather than a thing to remember.
+      expect(container.querySelector(".rail .drag")?.childElementCount).toBe(0);
+      const dragRegions = container.querySelectorAll("[data-tauri-drag-region]");
+      expect(dragRegions.length).toBe(1);
+      for (const link of container.querySelectorAll("a")) {
+        expect(link.closest("[data-tauri-drag-region]")).toBeNull();
+      }
+    });
+  });
+
   it("renders the rail foot only when given one", () => {
     const { container, rerender } = render(<AppShell items={rail(true)} active="jobs" />);
     expect(container.querySelector(".rail .foot")).toBeNull();
