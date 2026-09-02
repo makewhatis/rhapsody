@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { RunSummary, TeamsOverview } from "@/lib/api";
+import type { IssueRun, TeamsOverview } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 import {
   CONSOLE_JOB_FILTERS,
@@ -9,6 +9,7 @@ import {
   consoleJobStatus,
   filterConsoleJobs,
   lastActivityByIssue,
+  lifecycleByIssue,
   mateStates,
   relativeSince,
   ticketAssignees,
@@ -35,7 +36,7 @@ function job(over: Partial<JobRow> & Pick<JobRow, "issue" | "status">): JobRow {
   } as JobRow;
 }
 
-function issueRow(over: Partial<RunSummary> & Pick<RunSummary, "issue_identifier">): RunSummary {
+function issueRow(over: Partial<IssueRun> & Pick<IssueRun, "issue_identifier">): IssueRun {
   return {
     id: 1,
     issue_id: "i",
@@ -56,7 +57,7 @@ function issueRow(over: Partial<RunSummary> & Pick<RunSummary, "issue_identifier
     error: "",
     transcript_path: "",
     ...over,
-  } as RunSummary;
+  } as IssueRun;
 }
 
 describe("consoleJobStatus", () => {
@@ -67,6 +68,37 @@ describe("consoleJobStatus", () => {
     expect(consoleJobStatus("failed")).toBe("blocked");
     expect(consoleJobStatus("waiting")).toBe("blocked");
     expect(consoleJobStatus("stopped")).toBe("queued");
+  });
+
+  // STUDIO-702 — the ticket's real state outranks the run outcome. Without it every completed run
+  // read as "in review" forever, however long ago the ticket merged.
+  it("prefers the ticket's lifecycle over the run outcome", () => {
+    expect(consoleJobStatus("completed", "done")).toBe("done");
+    expect(consoleJobStatus("completed", "canceled")).toBe("done");
+    expect(consoleJobStatus("completed", "in_review")).toBe("review");
+    // Reopened: the run finished but the ticket is open work again, so nothing awaits a reviewer.
+    expect(consoleJobStatus("completed", "open")).toBe("queued");
+    expect(consoleJobStatus("stopped", "done")).toBe("done");
+  });
+
+  // A live run outranks everything: a mid-run handoff parks the ticket in a review state while the
+  // agent is still working, and the worklist must keep saying "running".
+  it("keeps a live run running whatever the ticket says", () => {
+    expect(consoleJobStatus("running", "in_review")).toBe("run");
+    expect(consoleJobStatus("running", "done")).toBe("run");
+  });
+
+  // Failure is about the RUN, and a human still has to act on it.
+  it("keeps a failed or held run blocked while its ticket is open", () => {
+    expect(consoleJobStatus("failed", "open")).toBe("blocked");
+    expect(consoleJobStatus("waiting", "open")).toBe("blocked");
+  });
+
+  // No answer, or one this build does not know, falls back to exactly the old mapping.
+  it("falls back to the run outcome when the daemon has no answer", () => {
+    expect(consoleJobStatus("completed", undefined)).toBe("review");
+    expect(consoleJobStatus("completed", "")).toBe("review");
+    expect(consoleJobStatus("completed", "some_future_state")).toBe("review");
   });
 });
 
@@ -120,7 +152,83 @@ describe("lastActivityByIssue", () => {
   });
 });
 
+describe("lifecycleByIssue", () => {
+  it("keys each ticket's lifecycle and raw state by identifier, skipping rows with no answer", () => {
+    const got = lifecycleByIssue([
+      issueRow({ issue_identifier: "A", lifecycle: "done", tracker_state: "Done" }),
+      issueRow({ issue_identifier: "B" }),
+    ]);
+    expect(got.get("A")).toEqual({ lifecycle: "done", trackerState: "Done" });
+    expect(got.has("B")).toBe(false);
+  });
+
+  // The listing is one row per issue, but a duplicate must not let an older answer win.
+  it("keeps the first answer for a ticket", () => {
+    const got = lifecycleByIssue([
+      issueRow({ issue_identifier: "A", lifecycle: "done", tracker_state: "Done" }),
+      issueRow({ issue_identifier: "A", lifecycle: "open", tracker_state: "Todo" }),
+    ]);
+    expect(got.get("A")?.lifecycle).toBe("done");
+  });
+});
+
 describe("buildConsoleJobs", () => {
+  // STUDIO-702 — the acceptance case: a merged ticket reads "done", the "in review" count holds
+  // only work actually awaiting a reviewer, and the Done tab has something to show.
+  it("colours each row from the ticket's lifecycle, not from run history", () => {
+    const rows = buildConsoleJobs(
+      [
+        job({ issue: "MERGED", status: "completed" }),
+        job({ issue: "REVIEW", status: "completed" }),
+        job({ issue: "REOPENED", status: "completed" }),
+        job({ issue: "UNKNOWN", status: "completed" }),
+      ],
+      [
+        issueRow({ issue_identifier: "MERGED", lifecycle: "done", tracker_state: "Done" }),
+        issueRow({ issue_identifier: "REVIEW", lifecycle: "in_review", tracker_state: "In Review" }),
+        issueRow({ issue_identifier: "REOPENED", lifecycle: "open", tracker_state: "Todo" }),
+        issueRow({ issue_identifier: "UNKNOWN" }),
+      ],
+      undefined,
+      NOW,
+    );
+    const status = (issue: string) => rows.find((r) => r.issue === issue)?.status;
+    expect(status("MERGED")).toBe("done");
+    expect(status("REVIEW")).toBe("review");
+    expect(status("REOPENED")).toBe("queued");
+    // No answer => the old behaviour, unchanged.
+    expect(status("UNKNOWN")).toBe("review");
+    // Only REVIEW and the unresolved UNKNOWN count as awaiting a reviewer; MERGED no longer does.
+    expect(consoleJobCounts(rows)).toEqual({ running: 0, review: 2, queued: 1, blocked: 0 });
+  });
+
+  // The Done tab was permanently empty because `done` was unreachable — §3's filter Seg.
+  it("populates the Done filter", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "A", status: "completed" }), job({ issue: "B", status: "completed" })],
+      [
+        issueRow({ issue_identifier: "A", lifecycle: "done", tracker_state: "Done" }),
+        issueRow({ issue_identifier: "B", lifecycle: "in_review", tracker_state: "In Review" }),
+      ],
+      undefined,
+      NOW,
+    );
+    expect(filterConsoleJobs(rows, "done", "").map((r) => r.issue)).toEqual(["A"]);
+    expect(filterConsoleJobs(rows, "review", "").map((r) => r.issue)).toEqual(["B"]);
+  });
+
+  // The raw workflow-state name is the auditable ground truth behind the normalized bucket.
+  it("carries the tracker's own state name onto the row", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "A", status: "completed" }), job({ issue: "B", status: "completed" })],
+      [issueRow({ issue_identifier: "A", lifecycle: "canceled", tracker_state: "Won't Do" })],
+      undefined,
+      NOW,
+    );
+    expect(rows.find((r) => r.issue === "A")?.trackerState).toBe("Won't Do");
+    expect(rows.find((r) => r.issue === "B")?.trackerState).toBe("");
+  });
+
   // §10 box 2.6 — the Now-strip counts come from the issues data, not a hardcoded strip.
   it("counts running / in review / queued / blocked", () => {
     const rows = buildConsoleJobs(

@@ -218,6 +218,18 @@ run-paged fetch at any page size. An issue-grouped Jobs list built by grouping r
 in a retry loop consume the entire page — 90 failures hid 73 other issues — and header totals folded
 over a page report a sample as a total. Grouping and aggregation therefore happen in SQL.
 
+`GET /api/v1/history/issues` additionally carries two **optional** fields per entry, describing the
+TICKET rather than its run: `tracker_state` (the tracker's workflow-state name verbatim) and
+`lifecycle` (`open` / `in_review` / `done` / `canceled`, normalized against the configured
+`active_states` / `review_states` / `terminal_states` / `canceled_states`). Both are OMITTED when the
+daemon cannot resolve the ticket — no tracker loaded yet, a failed lookup, or an issue the tracker no
+longer knows — so "no answer" stays distinguishable from any state it could have reported. The
+lookup is a TTL-cached, best-effort `fetchIssueStatesByIDs` over exactly the ids a page returned; it
+adds no background polling, and it can never fail the listing. The run-paged `GET /api/v1/history`
+does NOT carry them and its `api/history.json` golden is untouched (STUDIO-702). Without this the
+dashboard had only a run OUTCOME to colour a ticket with, so every completed run read as "in review"
+for as long as the store kept it.
+
 The day boundary for `/history/summary` is **local, not UTC**: the caller sends its own local
 midnight as `since` (the dashboard does), and omitting it falls back to the daemon host's local
 midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would
