@@ -522,6 +522,20 @@ impl Orchestrator {
         if !self.review_ticketless_enabled() || head_sha.is_empty() {
             return 0;
         }
+        // The allowlist, re-checked HERE and not only at introduction (STUDIO-721, the slice-6
+        // F-SEC review's item (a)). Re-arming reads a STORED row, and the configuration can have
+        // moved since it was written: a project disabled or repointed by a hot reload leaves rows
+        // behind for a repository this daemon is no longer entitled to read, and re-arming one is
+        // the first step towards checking that repository out. Fails closed — the rows are left
+        // exactly as they are, and the watcher's own dispatch-side check refuses them too.
+        if !self.review_repo_is_configured(&pr.owner, &pr.repo) {
+            tracing::warn!(
+                pr = %pr,
+                "ticketless review: refusing to re-arm a review in a repository no configured \
+                 project owns"
+            );
+            return 0;
+        }
         let rows = match self.store().load_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
@@ -580,7 +594,7 @@ impl Orchestrator {
     /// `owner/repo` rather than on the URL text, so `git@github.com:o/r.git` and
     /// `https://github.com/o/r` are the same repository — which they are — and case-insensitively,
     /// because GitHub logins and repository names are.
-    fn review_repo_is_configured(&self, owner: &str, repo: &str) -> bool {
+    pub(crate) fn review_repo_is_configured(&self, owner: &str, repo: &str) -> bool {
         let Some(eff) = self.eff.as_ref() else {
             return false;
         };

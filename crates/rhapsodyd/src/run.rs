@@ -234,6 +234,13 @@ where
     // repository a `bypassPermissions` agent will check out, so on every other installation the
     // introduction is unrepresentable rather than merely skipped.
     let review_intro_rx = spawn_review_intro(&teams_cfg).then(|| o.open_review_intro_channel());
+    // --- ticketless review watcher (STUDIO-721, slice 5; design record §14.1, §14.4) ---
+    //
+    // The slice that makes reviews actually fire. It owns its own poll cadence and every `gh` call
+    // the re-review loop makes, and hands one tick's observations back to the control task, which
+    // owns every decision. Spawned on exactly `spawn_review_intro`'s condition: a watch set can
+    // only fill from the introduction path, so a daemon that cannot introduce has nothing to watch.
+    let spawn_watcher = spawn_review_intro(&teams_cfg);
 
     // --- the Teams work-assignment seam (STUDIO-669; design record
     // ~/.rhapsody/docs/STUDIO-668-multi-team.md §A) ---
@@ -575,6 +582,33 @@ where
         })
     });
 
+    // The watcher task. Its `PrStateSource` is the same `gh` seam the introduction task uses, and
+    // like it, the task holds no `Orchestrator`: a hung `gh` parks THIS task and the daemon keeps
+    // ticking.
+    let review_watch_task = spawn_watcher.then(|| {
+        let watch_ctx = shutdown.wait();
+        let deps = rhapsody_orchestrator::reviewwatch::ReviewWatchDeps {
+            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+                &resolved
+                    .as_ref()
+                    .map(|c| c.tracker.summon_token.clone())
+                    .unwrap_or_default(),
+                None,
+            ))),
+            // The base repository's own owner and nothing else — the default trust boundary. A
+            // fork's head is refused rather than reviewed (design §14.1 F-SEC); there is no config
+            // key to widen it, so widening is a code change a reviewer sees.
+            allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+            teams: teams_cfg.clone(),
+            sink: Arc::new(rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(
+                handle.clone(),
+            )),
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::reviewwatch::run_review_watch_task(watch_ctx, deps).await;
+        })
+    });
+
     // --- Rhapsody Teams memory prefetch (STUDIO-660, slice T8; design record §5, §5.4) ---
     //
     // The third off-loop Teams task, beside triage and the quorum, and spawned for exactly the same
@@ -631,6 +665,11 @@ where
     // The introduction task is cancelled by the same signal and checks it on both sides of its
     // receive, so the wait is bounded by whatever `gh` lookup is already in flight.
     if let Some(t) = review_intro_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // The watcher is cancelled by the same signal and checks it on both sides of its sleep as well
+    // as between `gh` calls, so the wait is bounded by one lookup already in flight.
+    if let Some(t) = review_watch_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // The prefetch task is cancelled by the same signal and checks it on both sides of its sleep as

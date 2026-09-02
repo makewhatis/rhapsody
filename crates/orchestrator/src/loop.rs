@@ -313,6 +313,23 @@ pub enum Event {
         head_sha: String,
         reply: oneshot::Sender<usize>,
     },
+    /// The coordinates the ticketless review watcher should ask GitHub about this tick (STUDIO-721,
+    /// slice 5; NEW beyond Go v0.4.0). A loop-confined READ of the watch set, so the watcher never
+    /// touches the store the control task is the single writer of.
+    ReviewWatchList {
+        reply: oneshot::Sender<Vec<crate::prstate::PrCoord>>,
+    },
+    /// One watcher tick's observations, for the control task to turn into drops, re-arms and review
+    /// dispatches (STUDIO-721; NEW beyond Go v0.4.0).
+    ///
+    /// The `gh` calls that produced them happened off-loop on
+    /// [`crate::reviewwatch::run_review_watch_task`]; every DECISION is here, because the edge
+    /// trigger reads `running`/`claimed` alongside the watch set and those two must be read
+    /// together or the F-DUP duplicate dispatch comes back through the gap.
+    ReviewSweep {
+        observed: Vec<crate::prstate::PrObservation>,
+        reply: oneshot::Sender<crate::reviewwatch::ReviewSweepReport>,
+    },
 }
 
 /// How long [`ControlHandle::record_teams_post`] waits for the control task to report back on a
@@ -565,6 +582,12 @@ impl Orchestrator {
                 reply,
             } => {
                 let _ = reply.send(self.handle_review_head_advanced(&pr, &head_sha));
+            }
+            Event::ReviewWatchList { reply } => {
+                let _ = reply.send(self.review_watch_coords());
+            }
+            Event::ReviewSweep { observed, reply } => {
+                let _ = reply.send(self.handle_review_sweep(&observed));
             }
         }
     }
