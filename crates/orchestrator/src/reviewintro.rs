@@ -83,7 +83,6 @@ use crate::control_loop::{CancelWait, Event};
 use crate::ghsummons::OpenPrSource;
 use crate::orchestrator::Orchestrator;
 use crate::prstate::PrCoord;
-use crate::quorum::select_reviewers;
 use crate::review::review_key;
 use crate::stop::ControlHandle;
 
@@ -97,15 +96,6 @@ pub const REVIEW_ORIGIN_HANDOFF: &str = "handoff";
 /// (slice 8). Defined here, beside its sibling, so the two spellings cannot drift apart; nothing
 /// writes it until the console surface exists.
 pub const REVIEW_ORIGIN_CONSOLE: &str = "console";
-
-/// How many reviewers ONE introduction picks — design decision C, "default 1 reviewer, configurable
-/// up" (§13.5, §15-f).
-///
-/// The configurable half is deliberately absent: `teams.review` carries exactly `mode` today
-/// (STUDIO-719), and adding a count key is a config change that belongs with the slice that reads
-/// it. The data model is already per-(PR, reviewer) — [`ReviewWatchKey`] carries the reviewer — so
-/// raising this later widens the fan without reshaping anything.
-pub const DEFAULT_REVIEWERS: usize = 1;
 
 /// One trusted introduction as the CONTROL TASK decided it: which repository, which branch to look
 /// for an open pull request on, and who would review it.
@@ -412,8 +402,16 @@ impl Orchestrator {
             return None;
         }
         let teams = self.teams.as_ref()?;
-        let mut reviewers = select_reviewers(teams, &re.identity, &self.quorum_load);
-        reviewers.truncate(DEFAULT_REVIEWERS);
+        // Ranked on LIVE runs, not `quorum_load` (STUDIO-721; design §14.2, "reviewer load blind to
+        // ticketless reviews"). `quorum_load` is filled by `record_quorum_state`, which returns
+        // early when the ticket fan-out is off — which `ticketless` makes it — so on this path it
+        // is ALWAYS empty and the ranking degenerates to roster order: every pull request
+        // introduced by every teammate names the same first teammate. `LoadSnapshot::from_running`
+        // counts what is actually in flight, review runs included (they are stamped with the
+        // reviewer's identity), so a second introduction in the same tick sees the first one.
+        let load = crate::teams::LoadSnapshot::from_running(&self.running);
+        let mut reviewers = crate::quorum::rank_reviewers(teams, &re.identity, load.counts());
+        reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() {
             tracing::warn!(
                 issue = %re.issue.identifier,
@@ -697,7 +695,10 @@ mod tests {
     fn teams_with(enabled: bool, mode: ReviewMode, names: &[&str]) -> Teams {
         Teams {
             enabled,
-            review: Review { mode },
+            review: Review {
+                mode,
+                ..Review::default()
+            },
             roster: names.iter().map(|n| ident(n)).collect(),
             ..Teams::disabled()
         }

@@ -961,6 +961,7 @@ mod tests {
         rhapsody_config::teams::Teams {
             review: rhapsody_config::teams::Review {
                 mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                ..rhapsody_config::teams::Review::default()
             },
             ..quorum_teams(names)
         }

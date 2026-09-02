@@ -1783,7 +1783,10 @@ mod tests {
         // today's behaviour, decided by `quorum.enabled` alone.
         use rhapsody_config::teams::{Review, ReviewMode};
         let with_mode = |mode: ReviewMode| Teams {
-            review: Review { mode },
+            review: Review {
+                mode,
+                ..Review::default()
+            },
             ..team(true, true, &["alice", "bob"])
         };
         assert!(spawn_quorum(&with_mode(ReviewMode::Off)));
@@ -1804,7 +1807,10 @@ mod tests {
 
         let team = |enabled: bool, mode: ReviewMode, names: &[&str]| Teams {
             enabled,
-            review: Review { mode },
+            review: Review {
+                mode,
+                ..Review::default()
+            },
             quorum: Quorum {
                 enabled: false,
                 reviewers: 2,

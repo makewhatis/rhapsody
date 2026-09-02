@@ -786,6 +786,23 @@ pub(crate) fn select_reviewers(
     author: &str,
     load: &HashMap<String, i64>,
 ) -> Vec<String> {
+    let mut picked = rank_reviewers(teams, author, load);
+    picked.truncate(teams.quorum.effective_reviewers());
+    picked
+}
+
+/// The whole roster minus `author`, least-loaded first with roster order as the tie-break — the
+/// ranking [`select_reviewers`] truncates to the quorum's count and the ticketless path truncates
+/// to its own (STUDIO-721).
+///
+/// Split out because the two review paths ask for different numbers of reviewers from the same
+/// order, and a second ranking function would be a second place for "never the author" and "ties
+/// break on roster order" to drift.
+pub(crate) fn rank_reviewers(
+    teams: &Teams,
+    author: &str,
+    load: &HashMap<String, i64>,
+) -> Vec<String> {
     let mut ranked: Vec<(i64, usize, &str)> = teams
         .roster
         .iter()
@@ -802,7 +819,6 @@ pub(crate) fn select_reviewers(
     ranked.sort_unstable();
     ranked
         .into_iter()
-        .take(teams.quorum.effective_reviewers())
         .map(|(_, _, name)| name.to_string())
         .collect()
 }
@@ -2133,7 +2149,10 @@ mod tests {
     fn review_ticketless_enabled_needs_teams_on_and_the_ticketless_mode() {
         let with = |enabled: bool, mode: ReviewMode| Teams {
             enabled,
-            review: Review { mode },
+            review: Review {
+                mode,
+                ..Review::default()
+            },
             roster: vec![ident("alice")],
             ..Teams::disabled()
         };
@@ -2162,7 +2181,10 @@ mod tests {
             (ReviewMode::Ticketless, false),
         ] {
             let mut teams = teams_quorum(&["alice", "bob"], 2);
-            teams.review = Review { mode };
+            teams.review = Review {
+                mode,
+                ..Review::default()
+            };
             let mut o = orch_with(teams);
             let mut re = crate::orchestrator::RunningEntry::empty(Issue {
                 id: "iss-1".to_string(),

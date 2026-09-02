@@ -201,6 +201,13 @@ impl LoadSnapshot {
     fn live(&self, name: &str) -> i64 {
         self.0.get(name).copied().unwrap_or(0)
     }
+
+    /// The raw per-identity counts, for the reviewer ranking in [`crate::quorum::rank_reviewers`]
+    /// — which is shared with the quorum's own `rhapsody:@` label load and therefore takes the map
+    /// rather than this wrapper (STUDIO-721).
+    pub(crate) fn counts(&self) -> &HashMap<String, i64> {
+        &self.0
+    }
 }
 
 /// Routes one already-selected, already-slotted issue to a teammate (§3.1).
@@ -356,7 +363,7 @@ fn best_by_label_overlap(teams: &Teams, iss: &Issue, load: &LoadSnapshot) -> Opt
 /// rather than a candidate. Capping either of those could only ever move an
 /// explicitly-assigned ticket to somebody else; it could never make the work
 /// wait, because there is no variant of [`Routed`] that can hold work.
-fn at_capacity(i: &Identity, load: &LoadSnapshot) -> bool {
+pub(crate) fn at_capacity(i: &Identity, load: &LoadSnapshot) -> bool {
     i.max_concurrent > 0 && load.live(&i.name) >= i.max_concurrent
 }
 

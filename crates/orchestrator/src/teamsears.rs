@@ -2961,6 +2961,7 @@ mod tests {
         Teams {
             review: rhapsody_config::teams::Review {
                 mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                ..rhapsody_config::teams::Review::default()
             },
             ..teams(names, mode)
         }
@@ -3055,7 +3056,10 @@ mod tests {
             let fx = Fixture::new(tracker_with_viewer());
             fx.operator_says("STUDIO-654 needs a review please");
             let t = Teams {
-                review: rhapsody_config::teams::Review { mode: review },
+                review: rhapsody_config::teams::Review {
+                    mode: review,
+                    ..rhapsody_config::teams::Review::default()
+                },
                 ..teams(&["alice", "jimmy"], ManagerMode::Labels)
             };
             let issues = vec![in_review("STUDIO-654")];
