@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   hasBridge,
+  hasOverlayTitlebar,
   getStatus,
   startDaemon,
   stopDaemon,
@@ -275,5 +276,39 @@ describe("bindings — Tauri host present", () => {
     }) => void;
     handler({ payload: { downloaded: 512, total: 2048 } });
     expect(last).toEqual({ downloaded: 512, total: 2048 });
+  });
+});
+
+// STUDIO-701 — the desktop window chrome predicate. `titleBarStyle: "Overlay"` in tauri.conf.json
+// is what floats the native traffic lights over the top-left of the web content, and macOS is the
+// only platform that honours it, so the shell owes an inset + a drag region in exactly that host.
+describe("hasOverlayTitlebar — the macOS overlay title bar", () => {
+  const realUA = navigator.userAgent;
+  const setUA = (ua: string) =>
+    Object.defineProperty(window.navigator, "userAgent", { value: ua, configurable: true });
+
+  afterEach(() => {
+    setUA(realUA);
+    setBridge(false);
+  });
+
+  it("is false in a plain browser, even on a Mac", () => {
+    setBridge(false);
+    setUA("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15");
+    expect(hasOverlayTitlebar()).toBe(false);
+  });
+
+  it("is true under the Tauri host on macOS", () => {
+    setBridge(true);
+    setUA("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15");
+    expect(hasOverlayTitlebar()).toBe(true);
+  });
+
+  it("is false under the Tauri host on a platform that draws its own title bar", () => {
+    setBridge(true);
+    setUA("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Safari/537.36");
+    expect(hasOverlayTitlebar()).toBe(false);
+    setUA("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36");
+    expect(hasOverlayTitlebar()).toBe(false);
   });
 });

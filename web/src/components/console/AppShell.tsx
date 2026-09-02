@@ -29,6 +29,13 @@ export interface AppShellProps {
   mark?: ReactNode;
   /** Rail foot — daemon status, port, version, capability flags. */
   foot?: ReactNode;
+  /**
+   * The window has the macOS "Overlay" title bar (STUDIO-701) — no system title bar, and the
+   * native traffic lights floating over the top-left of the web content. Turns the rail's top
+   * into the title bar: a drag strip that both moves the window and insets the logo below the
+   * lights. Off everywhere else, so the daemon-served dashboard renders exactly as before.
+   */
+  overlayTitlebar?: boolean;
   className?: string;
   children?: ReactNode;
 }
@@ -43,13 +50,21 @@ export function AppShell({
   brand = "rhapsodyd",
   mark = "R",
   foot,
+  overlayTitlebar = false,
   className,
   children,
 }: AppShellProps) {
   const visible = items.filter((item) => item.enabled !== false);
   return (
-    <div className={cn("app", "rh-console", className)}>
+    <div className={cn("app", "rh-console", overlayTitlebar && "overlay-titlebar", className)}>
       <aside className="rail">
+        {/* The window's title bar, in a shell that has no horizontal bar to put one in: a
+            full-bleed strip across the rail's top. It is EMPTY on purpose — Tauri drags on the
+            element the pointer is actually over, so a strip with no children can never swallow a
+            click meant for the logo or a nav item. Its height is also the inset that keeps the
+            logo clear of the traffic lights (console.css). Podium's toolbar made the same trade
+            horizontally: one `data-tauri-drag-region` bar with a 78px left reserve. */}
+        {overlayTitlebar ? <div className="drag" data-tauri-drag-region="" /> : null}
         <div className="logo">
           <span className="mk" aria-hidden="true">
             {mark}

@@ -2,6 +2,8 @@
 // STUDIO-681 §1.3 / §10 box 1.3 — AppShell and NavItem render from props with the states
 // the prototype shows: active, an optional count, a separator, and the capability gate
 // that §2.2 depends on (a disabled item is ABSENT, not greyed).
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { AppShell, type NavItemSpec } from "./AppShell";
@@ -84,11 +86,70 @@ describe("AppShell", () => {
     expect(onNavigate).toHaveBeenCalledWith("teams");
   });
 
+  // STUDIO-701 — the desktop window chrome the §2.2.1 flip dropped. The packaged app runs with
+  // macOS `titleBarStyle: "Overlay"`: no system title bar to drag by, and the native traffic
+  // lights floating over the top-left of the web content — which is exactly where the rail's
+  // logo sits.
+  describe("overlay title bar (desktop)", () => {
+    it("adds no window chrome by default, so the served dashboard is unchanged", () => {
+      const { container } = render(<AppShell items={rail(true)} active="jobs" />);
+      expect(container.firstElementChild?.classList.contains("overlay-titlebar")).toBe(false);
+      expect(container.querySelector("[data-tauri-drag-region]")).toBeNull();
+      expect(container.querySelector(".rail .drag")).toBeNull();
+    });
+
+    it("turns the rail's top into a drag strip above the logo when asked", () => {
+      const { container } = render(<AppShell items={rail(true)} active="jobs" overlayTitlebar />);
+      expect(container.firstElementChild?.classList.contains("overlay-titlebar")).toBe(true);
+      const drag = container.querySelector(".rail")?.firstElementChild;
+      expect(drag?.className).toBe("drag");
+      expect(drag?.hasAttribute("data-tauri-drag-region")).toBe(true);
+      // The inset IS the strip: the logo comes after it, so the lights never land on the mark.
+      expect(drag?.nextElementSibling?.classList.contains("logo")).toBe(true);
+    });
+
+    it("keeps the drag strip empty so no nav item or logo is swallowed by it", () => {
+      const { container } = render(<AppShell items={rail(true)} active="jobs" overlayTitlebar />);
+      // Tauri drags on the element the pointer is over, so anything INSIDE a drag region stays
+      // clickable — but an empty strip makes that structural rather than a thing to remember.
+      expect(container.querySelector(".rail .drag")?.childElementCount).toBe(0);
+      const dragRegions = container.querySelectorAll("[data-tauri-drag-region]");
+      expect(dragRegions.length).toBe(1);
+      for (const link of container.querySelectorAll("a")) {
+        expect(link.closest("[data-tauri-drag-region]")).toBeNull();
+      }
+    });
+  });
+
   it("renders the rail foot only when given one", () => {
     const { container, rerender } = render(<AppShell items={rail(true)} active="jobs" />);
     expect(container.querySelector(".rail .foot")).toBeNull();
     rerender(<AppShell items={rail(true)} active="jobs" foot={<span className="live">● live</span>} />);
     expect(container.querySelector(".rail .foot")?.textContent).toContain("live");
+  });
+});
+
+// Source contracts — the half of STUDIO-701 the DOM cannot see. The drag strip is an empty div;
+// everything that makes it a title bar (its height, and therefore the inset that keeps the logo
+// off the traffic lights) lives in CSS, so deleting that one rule would restore the collision with
+// every test above still green. Checked against the source, the `FirstRunView.test.tsx` precedent.
+describe("source contracts", () => {
+  const css = readFileSync(path.resolve(__dirname, "../../theme/console.css"), "utf8");
+
+  it("gives the drag strip a real height — the strip IS the traffic-light inset", () => {
+    const rule = /\.rh-console\.overlay-titlebar \.rail \.drag \{([^}]*)\}/.exec(css);
+    expect(rule).not.toBeNull();
+    const height = /height:\s*(\d+)px/.exec(rule?.[1] ?? "");
+    // The macOS title bar is 28px and the lights sit at ~y7-21, so anything under ~24 would put
+    // the mark back under them.
+    expect(Number(height?.[1] ?? 0)).toBeGreaterThanOrEqual(24);
+  });
+
+  it("scopes every chrome rule under .overlay-titlebar, so a browser sees none of it", () => {
+    // The gate is the whole reason the daemon-served dashboard keeps the prototype's spacing.
+    for (const line of css.split("\n")) {
+      if (line.includes(".drag")) expect(line).toContain(".overlay-titlebar");
+    }
   });
 });
 

@@ -20,6 +20,12 @@
    one part that does not come with it), plus the SETUP marker. */
 .rh-console .setuphead { display: flex; align-items: center; gap: 9px; padding: 13px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .rh-console .setuphead .caps { margin-left: auto; font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-4); }
+/* On the desktop (macOS `titleBarStyle: "Overlay"`, STUDIO-701) this bar IS the window's title
+   bar: the native traffic lights float over its left end, and the bar itself is the drag region.
+   Being horizontal, it takes the same 78px left reserve Podium's toolbar used, rather than the
+   rail's vertical strip. `.overlay-titlebar` is set only in that host, so a browser keeps the
+   20px pad. */
+.rh-console.overlay-titlebar .setuphead { padding-left: 78px; }
 
 /* The wizard's column (Podium's first run centres on ~560px; matched so the two hosts frame the
    same wizard the same way). */

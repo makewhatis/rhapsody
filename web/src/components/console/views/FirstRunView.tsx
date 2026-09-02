@@ -1,5 +1,6 @@
 import { Note } from "@/components/console";
 import { Onboarding } from "@/components/onboarding/Onboarding";
+import { cn } from "@/lib/utils";
 import "@/theme/console-firstrun.css";
 
 // FirstRun — the console's first-run screen (STUDIO-681 §8.1, built by STUDIO-692). It is what
@@ -25,15 +26,34 @@ export interface FirstRunViewProps {
   /** The lifted failure, rendered here while the wizard is still the whole screen. */
   error: string;
   onDismissError: () => void;
+  /**
+   * The window has the macOS "Overlay" title bar (STUDIO-701). The setup bar is the console's
+   * whole chrome on a fresh install, so on the desktop it is also the window's title bar: it
+   * reserves the traffic lights' corner and carries the drag region. See `AppShell`.
+   */
+  overlayTitlebar?: boolean;
 }
 
-export function FirstRunView({ onConfigured, onError, error, onDismissError }: FirstRunViewProps) {
+export function FirstRunView({
+  onConfigured,
+  onError,
+  error,
+  onDismissError,
+  overlayTitlebar = false,
+}: FirstRunViewProps) {
   return (
-    <div className="rh-console setup">
+    <div className={cn("rh-console", "setup", overlayTitlebar && "overlay-titlebar")}>
       {/* The rail's identity without the rail: there is nothing to navigate to yet, so the bar
           carries the rail's own `.logo` lockup and a SETUP marker, and nothing else (Podium's
           `SetupToolbar` makes the same trade). */}
-      <header className="setuphead">
+      {/* Unlike the rail, this bar IS horizontal, so it takes the traffic lights the way Podium's
+          toolbar did: the drag region is the bar itself, with a left reserve for the lights
+          (console-firstrun.css). The attribute is unconditional where the rail's strip is not,
+          and the difference is deliberate — the rail's is an ELEMENT, which would take layout
+          space in a browser that does not need it, while this is an attribute on a bar that
+          exists either way, inert without the Tauri host exactly as Podium's `Toolbar` leaves it.
+          The reserve is still gated, so a browser sees the bar it always saw. */}
+      <header className="setuphead" data-tauri-drag-region="">
         <span className="logo">
           <span className="mk" aria-hidden="true">
             R
