@@ -128,3 +128,30 @@ export function TelemetryRowGlyph(props: Glyph) {
     </Stroke>
   );
 }
+
+/** The Settings "Tools" row badge — the tool doctor's wrench (STUDIO-691, §8.1). */
+export function ToolsRowGlyph(props: Glyph) {
+  return (
+    <Stroke strokeWidth={1.5} {...props}>
+      <path d="M10.5 2a3.5 3.5 0 0 0-3.2 4.9L2.6 11.6a1.4 1.4 0 0 0 2 2l4.7-4.7A3.5 3.5 0 0 0 13.4 3.6l-2 2-1.5-1.5 2-2A3.5 3.5 0 0 0 10.5 2z" />
+    </Stroke>
+  );
+}
+
+/** The Settings "Logs" row badge — the log tail's lines (STUDIO-691, §8.1). */
+export function LogsRowGlyph(props: Glyph) {
+  return (
+    <Stroke strokeWidth={1.5} {...props}>
+      <path d="M2 3h12M2 6.5h8M2 10h12M2 13.5h6" />
+    </Stroke>
+  );
+}
+
+/** The Settings "Updates" row badge — the updater's download arrow (STUDIO-691, §8.1). */
+export function UpdatesRowGlyph(props: Glyph) {
+  return (
+    <Stroke strokeWidth={1.5} {...props}>
+      <path d="M8 2v8M5 7.5 8 10.5l3-3M2.5 13h11" />
+    </Stroke>
+  );
+}

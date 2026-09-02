@@ -268,3 +268,62 @@ describe("every rail destination is the real view (§10 box 6.3)", () => {
     expect(activeNavs()).toEqual(["memory"]);
   });
 });
+
+// STUDIO-691 — the §8.1 Settings-parity rows: Tools, Logs and Updates.
+//
+// The STUDIO-687 audit found all three unreachable from the console (gaps G4, G5, G3) while the
+// shipped Podium Settings nav has them, which blocks the §2.2.1 flip. These tests assert the same
+// thing box 6.3 asserts of the rail — that the row reaches the REAL surface, not a stub — and they
+// key off each shipped tab's own furniture rather than the heading, because a heading test would
+// pass against a re-implementation that lost the capability.
+describe("Settings' Tools/Logs/Updates rows (§8.1, STUDIO-691)", () => {
+  it("opens the tool doctor, which highlights Settings", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#settings");
+    fireEvent.click(await screen.findByRole("button", { name: "Open Tools" }));
+    await waitFor(() => expect(window.location.hash).toBe("#tools"));
+    expect(await screen.findByRole("button", { name: /Re-run preflight/ })).toBeTruthy();
+    expect(screen.getByText("Required CLIs")).toBeTruthy();
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  it("opens the live log stream, which highlights Settings", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#settings");
+    fireEvent.click(await screen.findByRole("button", { name: "Open Logs" }));
+    await waitFor(() => expect(window.location.hash).toBe("#logs"));
+    expect(await screen.findByRole("tablist", { name: "Log level filter" })).toBeTruthy();
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  it("opens the desktop updater, which highlights Settings", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#settings");
+    fireEvent.click(await screen.findByRole("button", { name: "Open Updates" }));
+    await waitFor(() => expect(window.location.hash).toBe("#updates"));
+    expect(await screen.findByRole("button", { name: /Check for updates/i })).toBeTruthy();
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  // Every one of the three is a solo-daemon surface — the tool doctor probes local CLIs, the log
+  // tail is the daemon's own process log, and the updater updates the app. Gating them on teams
+  // would strand a solo operator on Jobs, and Updates is the desktop app's whole update path.
+  it.each([
+    ["#tools", "Tools"],
+    ["#logs", "Logs"],
+    ["#updates", "Updates"],
+  ])("keeps %s reachable with teams off", async (hash, heading) => {
+    h.fetchVersion.mockResolvedValue(version(false));
+    mount(hash);
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(heading));
+    expect(window.location.hash).toBe(hash);
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  it.each(["#tools", "#logs", "#updates"])("returns to Settings from %s's breadcrumb", async (hash) => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount(hash);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    await waitFor(() => expect(window.location.hash).toBe("#settings"));
+  });
+});

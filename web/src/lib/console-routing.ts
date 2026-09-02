@@ -18,6 +18,9 @@ export const CONSOLE_ROUTES = [
   "manage",
   "settings",
   "workflow",
+  "tools",
+  "logs",
+  "updates",
 ] as const;
 
 export type ConsoleRouteName = (typeof CONSOLE_ROUTES)[number];
@@ -47,11 +50,18 @@ export const TEAMS_ONLY_ROUTES = ["teams", "memory", "manage"] as const satisfie
  * and `workflow` — the WORKFLOW.md editor the Settings "Workflow" row opens (STUDIO-690) — under
  * Settings. It is a route of its own rather than local state so the editor is deep-linkable and
  * the browser Back button returns to Settings, exactly as `manage` does for Teams.
+ *
+ * `tools`, `logs` and `updates` (STUDIO-691) are three more of the same shape: the Settings rows
+ * that open the tool doctor, the live log tail and the desktop updater (§8.1). None is teams-only
+ * — all three exist on a solo daemon — so `gateConsoleRoute` leaves them alone.
  */
 const NAV_PARENT: Partial<Record<ConsoleRouteName, ConsoleRouteName>> = {
   job: "jobs",
   manage: "teams",
   workflow: "settings",
+  tools: "settings",
+  logs: "settings",
+  updates: "settings",
 };
 
 function isRouteName(v: string): v is ConsoleRouteName {
