@@ -252,11 +252,19 @@ describe("every rail destination is the real view (§10 box 6.3)", () => {
     expect(screen.queryByText(/is not built yet/)).toBeNull();
   });
 
-  it("keeps the room's side cards routing on to manage and memory", async () => {
+  it("routes the room's Manage team → card on to manage, under the Teams nav", async () => {
     h.fetchVersion.mockResolvedValue(version(true));
     mount("#teams");
     fireEvent.click(await screen.findByText("Manage team →"));
     await waitFor(() => expect(window.location.hash).toBe("#manage"));
     expect(activeNavs()).toEqual(["teams"]);
+  });
+
+  it("routes the room's Open memory → card on to the Memory page", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#teams");
+    fireEvent.click(await screen.findByText("Open memory →"));
+    await waitFor(() => expect(window.location.hash).toBe("#memory"));
+    expect(activeNavs()).toEqual(["memory"]);
   });
 });
