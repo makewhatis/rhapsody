@@ -152,6 +152,19 @@ pub trait Session: Send + Sync {
     /// ignore it rather than to implement it.
     fn set_run_id(&self, _id: i64) {}
 
+    /// Records the pull-request head SHA a REVIEW run was dispatched against, so the backend can
+    /// expose it to the agent child as `SYMPHONY_REVIEW_HEAD`/`RHAPSODY_REVIEW_HEAD`.
+    ///
+    /// Rhapsody-only (no Go counterpart — the frozen reference has no review feature; design record
+    /// `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §14.1 F-SHA), and shaped exactly like
+    /// [`Session::set_run_id`]: `&self`, called once by the worker after `start_session` and before
+    /// the first turn, defaulted to a no-op, and empty means "not a review" and emits nothing.
+    ///
+    /// The value is the SHA pinned when the review worktree was checked out. It exists so the agent
+    /// reports on the commit it is actually looking at rather than re-asking GitHub for the head —
+    /// a re-query mid-review returns a SHA whose changes were never read.
+    fn set_review_head(&self, _sha: &str) {}
+
     /// Runs one turn with the given prompt, forwarding events to `on_event`. The returned
     /// `(TurnResult, Option<AgentError>)` mirrors Go's `(TurnResult, error)`: a `Some` error means
     /// the turn failed/timed out, and the `TurnResult` STILL carries the status (both are

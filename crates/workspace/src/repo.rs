@@ -11,9 +11,11 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::Error;
 use crate::Manager;
@@ -139,6 +141,14 @@ pub(crate) fn clear_stale_locks(git_dir: &str) -> std::io::Result<()> {
 /// [`Manager::prompt_file_in_repo`] never reports a false "missing" on a transient error.
 fn git_path_absent(cat_file_output: &str) -> bool {
     cat_file_output.to_lowercase().contains("does not exist")
+}
+
+/// Reports whether `s` is a plausible git commit SHA — 7 to 64 hex digits, the range that spans an
+/// abbreviated SHA-1 through a full SHA-256 object id. The review-mode checkout interpolates the
+/// value into a git argument list, so this is what makes it impossible for a head SHA to name a
+/// branch, a flag, or a revision expression rather than one commit.
+fn is_commit_sha(s: &str) -> bool {
+    (7..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 impl Manager {
@@ -469,33 +479,56 @@ impl Manager {
         // after_create hook so concurrent same-repo workers are not serialized across it.
         drop(guard.take());
 
-        // after_create is FATAL: roll back the brand-new worktree (remove --force + prune, with an
-        // rm -rf fallback) on failure.
-        if !self.hooks.after_create.is_empty()
-            && let Err(e) = self
-                .runner
-                .run_env(
-                    "after_create",
-                    &self.hooks.after_create,
-                    &path,
-                    Some(&self.hook_env(repo_url, project_slug, identifier)),
-                )
-                .await
-        {
-            // Re-acquire the mirror lock: the rollback mutates shared mirror admin state.
-            let _rollback_guard = lk.clone().lock_owned().await;
-            let (_out, rm_err) = self
-                .git(&mirror, &["worktree", "remove", "--force", &path])
-                .await;
-            if rm_err.is_some() {
-                // Force-remove the dir so a failed `git worktree remove` can't leave an orphan
-                // that the next ensure would reuse (silently skipping after_create).
-                let _ = remove_all(&path);
-            }
-            let _ = self.git(&mirror, &["worktree", "prune"]).await;
-            return Err(e);
-        }
+        self.after_create_or_roll_back(&lk, &mirror, &path, repo_url, project_slug, identifier)
+            .await?;
         Ok(ws)
+    }
+
+    /// Runs the FATAL `after_create` hook on a brand-new worktree and, on failure, rolls the
+    /// worktree back (`worktree remove --force` + `prune`, with an `rm -rf` fallback) before
+    /// returning the hook's error. A no-op when no `after_create` is configured.
+    ///
+    /// The caller MUST have released the mirror lock before calling (the hook is arbitrarily long
+    /// and touches only the unshared per-issue dir); `lk` is re-acquired here for the rollback,
+    /// which mutates shared mirror admin state. Extracted so the review-mode path
+    /// ([`Self::ensure_review_worktree`]) provisions with the same fatal-hook semantics as
+    /// [`Self::ensure_from_repo`] instead of a second copy that could drift from it.
+    async fn after_create_or_roll_back(
+        &self,
+        lk: &Arc<AsyncMutex<()>>,
+        mirror: &str,
+        path: &str,
+        repo_url: &str,
+        project_slug: &str,
+        identifier: &str,
+    ) -> Result<(), Error> {
+        if self.hooks.after_create.is_empty() {
+            return Ok(());
+        }
+        let Err(e) = self
+            .runner
+            .run_env(
+                "after_create",
+                &self.hooks.after_create,
+                path,
+                Some(&self.hook_env(repo_url, project_slug, identifier)),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        // Re-acquire the mirror lock: the rollback mutates shared mirror admin state.
+        let _rollback_guard = lk.clone().lock_owned().await;
+        let (_out, rm_err) = self
+            .git(mirror, &["worktree", "remove", "--force", path])
+            .await;
+        if rm_err.is_some() {
+            // Force-remove the dir so a failed `git worktree remove` can't leave an orphan
+            // that the next ensure would reuse (silently skipping after_create).
+            let _ = remove_all(path);
+        }
+        let _ = self.git(mirror, &["worktree", "prune"]).await;
+        Err(e)
     }
 
     /// The `workspace_mode:clone` provisioning entry point — the sibling of [`Self::ensure_from_repo`].
@@ -604,6 +637,168 @@ impl Manager {
             let _ = remove_all(&path);
             return Err(e);
         }
+        Ok(ws)
+    }
+
+    /// Review-mode provisioning: a DETACHED worktree pinned to one pull request's head SHA — the
+    /// third provisioning shape, alongside [`Self::ensure_from_repo`] (shared mirror + a fresh
+    /// `symphony/<key>` branch) and [`Self::ensure_clone_from_repo`] (a standalone clone, same
+    /// branch). Rhapsody-only: the frozen Go reference has no review feature (design record
+    /// `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §13.3 / §14.2).
+    ///
+    /// It differs from both existing paths in the two ways a review needs, and in nothing else —
+    /// the `<root>/<RepoKey(repo_url)>/<key>` path scheme, the per-repo mirror lock, the containment
+    /// checks and the fatal `after_create` hook are all shared:
+    ///
+    /// 1. **No branch.** `git worktree add --detach <path> <head_sha>` leaves HEAD detached, so a
+    ///    review never creates — and its agent can never push — a `symphony/<key>` branch.
+    /// 2. **Reuse RE-CHECKS-OUT instead of preserving WIP.** The same reviewer re-reviewing the same
+    ///    PR reuses the same sanitized key (design decision B), and the WIP-preserving reuse of the
+    ///    other two paths would then serve that reviewer the STALE previous head while the watch set
+    ///    records the new one as reviewed. Reuse therefore hard-resets to `head_sha`.
+    ///
+    /// `head_sha` is the SHA pinned ONCE at dispatch and never re-queried (design §14.1 F-SHA), so
+    /// this method resolves nothing itself. It fetches the PR's own head ref
+    /// (`refs/pull/<pr_number>/head`, which GitHub exposes for every PR and which reaches a head
+    /// commit that is on no branch of the base repo) into `refs/rhapsody/review/pr/<n>`, then
+    /// requires `head_sha` to be present. That destination sits OUTSIDE the remote-tracking
+    /// namespace on purpose: [`Self::ensure_mirror`]'s pruning fetch of
+    /// `+refs/heads/*:refs/remotes/origin/*` would delete a ref parked under `refs/remotes/origin/`
+    /// on the very next round, because a PR head is on no branch and `--prune` therefore reads it as
+    /// gone from the remote.
+    ///
+    /// A head that advanced past `head_sha` is NOT followed, and a `head_sha` the fetch could not
+    /// reach is an [`Error::ReviewCheckout`] — never a silent checkout of something else.
+    ///
+    /// `head_sha` must be 7–64 hex digits and `pr_number` positive: both are interpolated into a git
+    /// argument list, and restricting the SHA to hex means no value of it can name a ref or a flag.
+    /// An empty `repo_url` is rejected rather than delegating to the legacy hook-populated workspace
+    /// like the other two paths do — that workspace is an empty directory with no git objects, so
+    /// there is nothing there to check a pull request head out of.
+    pub async fn ensure_review_worktree(
+        &self,
+        repo_url: &str,
+        project_slug: &str,
+        identifier: &str,
+        pr_number: i64,
+        head_sha: &str,
+    ) -> Result<Workspace, Error> {
+        if repo_url.is_empty() {
+            return Err(Error::ReviewCheckout(
+                "review mode requires a repo URL: the legacy workspace has no git objects to check a PR head out of".to_string(),
+            ));
+        }
+        if pr_number <= 0 {
+            return Err(Error::ReviewCheckout(format!(
+                "pull-request number {pr_number} is not positive"
+            )));
+        }
+        if !is_commit_sha(head_sha) {
+            return Err(Error::ReviewCheckout(format!(
+                "head SHA {head_sha:?} is not 7-64 hex digits"
+            )));
+        }
+        let key = sanitize_key(identifier);
+        if key == MIRRORS_DIR_NAME {
+            return Err(Error::WorktreeOutsideRoot(format!(
+                "identifier {identifier:?} sanitizes to the reserved mirror dir {MIRRORS_DIR_NAME:?}"
+            )));
+        }
+        let repo_dir = join(&[&self.root, &repo_key(repo_url)]);
+        let path = join(&[&repo_dir, &key]);
+        ensure_within_root(&self.root, &path).map_err(|e| {
+            Error::WorktreeOutsideRoot(format!("unsafe worktree path {path:?}: {e}"))
+        })?;
+
+        let lk = self.repo_lock(repo_url);
+        let mut guard = Some(lk.clone().lock_owned().await);
+
+        let mirror = self.ensure_mirror(repo_url).await?;
+        // Fetch the PR's head ref. Tolerated on failure — the SHA may already be in the mirror from
+        // an earlier round, and the `cat-file` check below is the authoritative answer either way —
+        // so a transient GitHub blip cannot fail a review whose objects are already local.
+        let refspec = format!("+refs/pull/{pr_number}/head:refs/rhapsody/review/pr/{pr_number}");
+        let _ = self
+            .git(&mirror, &["fetch", "--force", "origin", &refspec])
+            .await;
+        // The pinned SHA must actually be here before anything is checked out. `--detach <sha>` on a
+        // missing object fails anyway, but only on the CREATE path: on reuse the checkout below is
+        // what would fail, after the old tree was already disturbed. Answer once, up front, for both.
+        let commit_ish = format!("{head_sha}^{{commit}}");
+        let (out, err) = self.git(&mirror, &["cat-file", "-e", &commit_ish]).await;
+        if err.is_some() {
+            return Err(Error::ReviewCheckout(format!(
+                "pinned head {head_sha} is not in the mirror after fetching refs/pull/{pr_number}/head: {}",
+                truncate_output(out.as_bytes())
+            )));
+        }
+
+        match std::fs::symlink_metadata(&path) {
+            Ok(fi) => {
+                if fi.file_type().is_symlink() {
+                    return Err(Error::WorkspaceSymlink(format!("{path:?} is a symlink")));
+                }
+                if !fi.is_dir() {
+                    return Err(Error::WorkspaceNotDir(format!(
+                        "{path:?} exists and is not a directory"
+                    )));
+                }
+                // REUSE: re-checkout onto the new head rather than preserving WIP. `--force`
+                // discards tracked modifications, `reset --hard` moves the index+tree to the pinned
+                // SHA, and `clean -fd` removes whatever the previous round left untracked (a
+                // findings scratch file, a stale source file the new head deletes). `-x` is
+                // deliberately NOT passed: ignored build output is not a stale VIEW of the head, and
+                // wiping it would make every re-review rebuild the world.
+                let (out, err) = self
+                    .git(&path, &["checkout", "--force", "--detach", head_sha])
+                    .await;
+                if err.is_some() {
+                    return Err(Error::ReviewCheckout(format!(
+                        "re-checkout of {head_sha} in {path:?}: {}",
+                        truncate_output(out.as_bytes())
+                    )));
+                }
+                let (out, err) = self.git(&path, &["reset", "--hard", head_sha]).await;
+                if err.is_some() {
+                    return Err(Error::ReviewCheckout(format!(
+                        "reset --hard {head_sha} in {path:?}: {}",
+                        truncate_output(out.as_bytes())
+                    )));
+                }
+                let _ = self.git(&path, &["clean", "-fd"]).await;
+                return Ok(Workspace {
+                    path,
+                    key,
+                    created_now: false,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // fall through to create
+            Err(e) => return Err(Error::WorkspaceStat(e.to_string())),
+        }
+
+        // CREATE: a detached worktree at the pinned SHA. No `-B <branch>`, so no ref is created.
+        let _ = clear_stale_locks(&mirror);
+        let _ = self.git(&mirror, &["worktree", "prune"]).await;
+        mkdir_all(&repo_dir).map_err(|e| Error::WorktreeAdd(format!("mkdir repo dir: {e}")))?;
+        let (out, err) = self
+            .git(&mirror, &["worktree", "add", "--detach", &path, head_sha])
+            .await;
+        if err.is_some() {
+            return Err(Error::WorktreeAdd(format!(
+                "worktree add --detach: {}",
+                truncate_output(out.as_bytes())
+            )));
+        }
+
+        let ws = Workspace {
+            path: path.clone(),
+            key: key.clone(),
+            created_now: true,
+        };
+        // Release the mirror lock before the (arbitrarily long) hook, exactly as ensure_from_repo does.
+        drop(guard.take());
+        self.after_create_or_roll_back(&lk, &mirror, &path, repo_url, project_slug, identifier)
+            .await?;
         Ok(ws)
     }
 
@@ -1721,5 +1916,237 @@ mod tests {
         // Path scheme sanity: it lived where PathFor reports, under root.
         assert_eq!(ws.path, m.path_for(&origin.path, "CL-9"));
         assert!(ws.path.starts_with(&root.path));
+    }
+
+    // --- review-mode provisioning (STUDIO-715) ----------------------------------------------
+    // No Go counterpart: the frozen reference has no review feature (design record
+    // `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`).
+
+    /// Publishes `refs/pull/<n>/head` in a local origin, pointing at a commit that is on NO branch —
+    /// the shape a real GitHub pull request head has, and the reason the review path fetches that ref
+    /// explicitly instead of relying on the mirror's `refs/heads/*` fetch. Returns the head SHA.
+    fn publish_pr_head(origin: &str, pr_number: i64, file: &str, body: &str) -> String {
+        git_run(origin, &["checkout", "-b", "pr-work"]);
+        std::fs::write(join(&[origin, file]), body).unwrap();
+        git_run(origin, &["add", file]);
+        git_run(origin, &["commit", "-m", "pr head"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(origin)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let refname = format!("refs/pull/{pr_number}/head");
+        git_run(origin, &["update-ref", &refname, &sha]);
+        // Leave the commit reachable ONLY from the pull ref.
+        git_run(origin, &["checkout", "main"]);
+        git_run(origin, &["branch", "-D", "pr-work"]);
+        sha
+    }
+
+    /// The core of the review checkout: detached HEAD at the PINNED SHA, no `symphony/<key>` branch,
+    /// and content from a commit the mirror's branch fetch could not have brought in.
+    #[tokio::test]
+    async fn ensure_review_worktree_detaches_at_the_pinned_sha_and_creates_no_branch() {
+        let origin = init_local_origin();
+        let head = publish_pr_head(&origin.path, 7, "PR_ONLY.txt", "from the pr head\n");
+        let (m, root) = repo_test_manager(HookScripts::default());
+
+        let ws = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@alice", 7, &head)
+            .await
+            .unwrap();
+
+        assert!(ws.created_now);
+        assert_eq!(ws.key, "pr_o_r_7_alice");
+        assert_eq!(
+            ws.path,
+            join(&[&root.path, &repo_key(&origin.path), "pr_o_r_7_alice"])
+        );
+        // The checkout is the PR head, not the default branch.
+        assert!(
+            std::fs::metadata(join(&[&ws.path, "PR_ONLY.txt"])).is_ok(),
+            "worktree is not at the PR head"
+        );
+        let (sha, err) = m.git(&ws.path, &["rev-parse", "HEAD"]).await;
+        assert!(err.is_none() && sha.trim() == head, "HEAD={sha:?}");
+        // Detached: no branch name, and specifically no symphony/<key> ref anywhere.
+        let (br, _) = m.git(&ws.path, &["symbolic-ref", "--quiet", "HEAD"]).await;
+        assert!(br.trim().is_empty(), "HEAD is attached to {br:?}");
+        let mirror = m.mirror_dir(&origin.path);
+        let (refs, _) = m
+            .git(&mirror, &["for-each-ref", "--format=%(refname)"])
+            .await;
+        assert!(
+            !refs.contains("symphony/"),
+            "review provisioning created a branch:\n{refs}"
+        );
+    }
+
+    /// Decision B: the same reviewer re-reviewing the same PR reuses the same sanitized key. The
+    /// WIP-preserving reuse of `ensure_from_repo` would serve the STALE first head; review-mode reuse
+    /// must re-check-out the NEW one.
+    #[tokio::test]
+    async fn ensure_review_worktree_reuse_recheckouts_the_new_head() {
+        let origin = init_local_origin();
+        let first = publish_pr_head(&origin.path, 7, "ROUND.txt", "round one\n");
+        let (m, _root) = repo_test_manager(HookScripts::default());
+
+        let ws = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@alice", 7, &first)
+            .await
+            .unwrap();
+        // The reviewer left something behind, and something else edited a tracked file.
+        std::fs::write(join(&[&ws.path, "ROUND.txt"]), "LOCAL EDIT\n").unwrap();
+        std::fs::write(join(&[&ws.path, "findings.md"]), "scratch\n").unwrap();
+
+        // The author pushed fixes: the PR head advances.
+        let second = publish_pr_head(&origin.path, 7, "ROUND.txt", "round two\n");
+        assert_ne!(first, second);
+
+        let ws2 = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@alice", 7, &second)
+            .await
+            .unwrap();
+
+        assert!(!ws2.created_now, "reuse must report created_now=false");
+        assert_eq!(ws2.path, ws.path, "decision B: same reviewer, same key");
+        let (sha, err) = m.git(&ws2.path, &["rev-parse", "HEAD"]).await;
+        assert!(
+            err.is_none() && sha.trim() == second,
+            "re-review served a stale checkout: HEAD={sha:?} want {second}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(join(&[&ws2.path, "ROUND.txt"])).unwrap(),
+            "round two\n",
+            "tracked WIP survived the hard reset"
+        );
+        assert!(
+            std::fs::metadata(join(&[&ws2.path, "findings.md"])).is_err(),
+            "untracked leftovers from the previous round survived"
+        );
+    }
+
+    /// Two reviewers on ONE pull request must get two worktrees. The `@reviewer` suffix is the only
+    /// thing keying them apart, so this pins that it survives sanitization.
+    #[tokio::test]
+    async fn ensure_review_worktree_two_reviewers_on_one_pr_do_not_collide() {
+        let origin = init_local_origin();
+        let head = publish_pr_head(&origin.path, 7, "PR_ONLY.txt", "shared head\n");
+        let (m, _root) = repo_test_manager(HookScripts::default());
+
+        let alice = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@alice", 7, &head)
+            .await
+            .unwrap();
+        let bob = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@bob", 7, &head)
+            .await
+            .unwrap();
+
+        assert_ne!(alice.key, bob.key);
+        assert_ne!(alice.path, bob.path, "two reviewers shared one worktree");
+        assert!(alice.created_now && bob.created_now);
+        // Both are live worktrees of the same mirror, at the same head.
+        for ws in [&alice, &bob] {
+            let (sha, err) = m.git(&ws.path, &["rev-parse", "HEAD"]).await;
+            assert!(err.is_none() && sha.trim() == head, "{}: {sha:?}", ws.key);
+        }
+    }
+
+    /// A pinned SHA the fetch cannot reach (a force-push that dropped it) is an error, never a
+    /// checkout of something else.
+    #[tokio::test]
+    async fn ensure_review_worktree_refuses_a_sha_the_mirror_cannot_reach() {
+        let origin = init_local_origin();
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+
+        let err = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@alice", 7, missing)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::ReviewCheckout(ref d) if d.contains(missing)),
+            "err={err:?}"
+        );
+        assert!(
+            std::fs::metadata(join(&[&m.root, &repo_key(&origin.path), "pr_o_r_7_alice"])).is_err(),
+            "a refused review left a worktree behind"
+        );
+    }
+
+    /// Every coordinate that reaches a git argument list is validated first: the SHA must be hex (so
+    /// it can never name a ref or a flag), the PR number positive, and the repo URL non-empty.
+    #[tokio::test]
+    async fn ensure_review_worktree_rejects_malformed_coordinates() {
+        let origin = init_local_origin();
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let good = "0123456789abcdef0123456789abcdef01234567";
+
+        for (repo, num, sha, what) in [
+            ("", 7, good, "empty repo URL"),
+            (origin.path.as_str(), 0, good, "non-positive PR number"),
+            (origin.path.as_str(), 7, "", "empty SHA"),
+            (origin.path.as_str(), 7, "main", "a ref name, not a SHA"),
+            (origin.path.as_str(), 7, "--upload-pack=evil", "a flag"),
+            (origin.path.as_str(), 7, "abc123", "too short to be a SHA"),
+        ] {
+            let err = m
+                .ensure_review_worktree(repo, "", "pr:o/r#7@alice", num, sha)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ReviewCheckout(_)),
+                "{what}: err={err:?}"
+            );
+        }
+    }
+
+    /// Teardown: a `pr:` id never reaches a terminal tracker state, so nothing else would ever
+    /// remove this worktree. `remove_worktree` is the same terminal used by every other path.
+    #[tokio::test]
+    async fn remove_worktree_removes_a_detached_review_worktree() {
+        let origin = init_local_origin();
+        let head = publish_pr_head(&origin.path, 7, "PR_ONLY.txt", "head\n");
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let ws = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@alice", 7, &head)
+            .await
+            .unwrap();
+
+        m.remove_worktree(&origin.path, "", "pr:o/r#7@alice")
+            .await
+            .unwrap();
+
+        assert!(
+            std::fs::metadata(&ws.path).is_err(),
+            "review worktree leaked"
+        );
+        let mirror = m.mirror_dir(&origin.path);
+        let (out, _) = m.git(&mirror, &["worktree", "list", "--porcelain"]).await;
+        assert!(!out.contains(&ws.path), "worktree admin not pruned:\n{out}");
+    }
+
+    /// The `after_create` hook is fatal on the review path too, and its rollback leaves no orphan
+    /// worktree for the next round to reuse (which would silently skip the hook).
+    #[tokio::test]
+    async fn ensure_review_worktree_after_create_failure_rolls_back() {
+        let origin = init_local_origin();
+        let head = publish_pr_head(&origin.path, 7, "PR_ONLY.txt", "head\n");
+        let (m, root) = repo_test_manager(after("exit 3"));
+
+        let err = m
+            .ensure_review_worktree(&origin.path, "", "pr:o/r#7@alice", 7, &head)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::HookFailed(_)), "err={err:?}");
+        let path = join(&[&root.path, &repo_key(&origin.path), "pr_o_r_7_alice"]);
+        assert!(
+            std::fs::metadata(&path).is_err(),
+            "failed after_create left the worktree behind"
+        );
     }
 }

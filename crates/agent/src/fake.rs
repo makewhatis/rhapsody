@@ -51,6 +51,10 @@ struct Recorded {
     /// id onto the session — the env the agent's `teams_post`/`teams_retain` resolve from
     /// (STUDIO-675).
     last_run_id: Option<i64>,
+    /// The review head SHA the most recent session was given via [`Session::set_review_head`], or
+    /// `None` when the caller never set one (every non-review run). Recorded so a test can assert
+    /// the worker pins the dispatched head onto the session exactly once (STUDIO-715).
+    last_review_head: Option<String>,
 }
 
 impl Fake {
@@ -83,6 +87,12 @@ impl Fake {
     /// caller never called it (STUDIO-675).
     pub fn last_run_id(&self) -> Option<i64> {
         self.lock().last_run_id
+    }
+
+    /// The review head SHA the most recent session was given via [`Session::set_review_head`];
+    /// `None` when the caller never called it (STUDIO-715).
+    pub fn last_review_head(&self) -> Option<String> {
+        self.lock().last_review_head.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Recorded> {
@@ -147,6 +157,13 @@ impl Session for FakeSession {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .last_run_id = Some(id);
+    }
+
+    fn set_review_head(&self, sha: &str) {
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_review_head = Some(sha.to_string());
     }
 
     async fn run_turn(

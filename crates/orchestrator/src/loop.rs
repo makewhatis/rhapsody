@@ -353,6 +353,9 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         pr_label: eff.pr_label.clone(),
         // Per-dispatch, like `stack_context` above: `spawn_worker` stamps the dispatched run's id.
         run_id: 0,
+        // Per-dispatch and review-only (STUDIO-715): `spawn_worker` stamps it, and `None` keeps the
+        // two existing provisioning paths exactly as they were.
+        review: None,
         // The review state a declared HANDOFF parks the ticket in (TRA-240). review_states is a
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
@@ -972,11 +975,15 @@ impl Orchestrator {
         teammate_section: String,
         run_id: i64,
         started_at: DateTime<Utc>,
+        review: Option<crate::review::ReviewCheckout>,
     ) {
         let Some(eff) = self.eff.as_ref() else {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
         let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug));
+        // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
+        // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
+        deps.review = review;
         deps.stack_context = stack_context;
         deps.capabilities_section = capabilities_section;
         deps.teammate_section = teammate_section;

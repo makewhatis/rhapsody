@@ -135,6 +135,22 @@ pub fn append_me_env(mut env: Vec<String>, issue: &str, run_id: i64) -> Vec<Stri
     env
 }
 
+/// Appends the review-mode env a ticketless review run needs: the pull-request head SHA pinned when
+/// its detached worktree was checked out. Empty (every non-review run) adds nothing, so a daemon
+/// that never dispatches a review produces a byte-identical child env.
+///
+/// Deliberately NOT folded into [`append_me_env`]: that function mirrors Go's `appendMeEnv`
+/// signature and value set, and the frozen reference has no review feature to mirror (design record
+/// `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`). Both spellings are emitted, as
+/// STUDIO-603 requires of every variable the daemon injects.
+pub fn append_review_env(mut env: Vec<String>, review_head: &str) -> Vec<String> {
+    if !review_head.is_empty() {
+        env.push(format!("SYMPHONY_REVIEW_HEAD={review_head}"));
+        env.push(format!("RHAPSODY_REVIEW_HEAD={review_head}"));
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
