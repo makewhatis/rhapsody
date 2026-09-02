@@ -72,6 +72,19 @@ pub struct HandoffPlan {
     /// the target state are all resolved before this struct exists — so the handoff itself never
     /// waits on the quorum and the quorum never reaches into loop-owned state.
     pub quorum: Option<crate::quorum::QuorumRequest>,
+    /// The ticketless review INTRODUCTION to fire once the review-state move SUCCEEDS (STUDIO-720,
+    /// slice 6; design record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §15-a). `None`
+    /// on every installation that has not opted into `review.mode: ticketless`, which is the
+    /// default.
+    ///
+    /// Mutually exclusive with [`quorum`](Self::quorum) by construction, not by convention: the two
+    /// gates subtract each other (`quorum_enabled` excludes the ticketless mode, and
+    /// `review_ticketless_enabled` requires it), so one handoff fires exactly one review path
+    /// (design §14.2, "config cutover double-fire").
+    ///
+    /// Decided HERE, on the control task, from the run's OWN resolved repository binding — the
+    /// trusted origin the whole security argument rests on (§14.1 F-SEC).
+    pub review: Option<crate::reviewintro::ReviewIntroRequest>,
 }
 
 impl Orchestrator {
@@ -99,6 +112,10 @@ impl Orchestrator {
             // chose it over "PR opened" (the PR exists mid-run, long before it is reviewable) or
             // "review posted" (that is the quorum's output, not its input).
             quorum: self.plan_quorum(re),
+            // The ticketless sibling of the line above, at the same moment and for the same
+            // reason. The two are mutually exclusive by their gates, so at most one of them is
+            // ever `Some` (STUDIO-720).
+            review: self.plan_review_intro(re),
         }
     }
 
@@ -193,6 +210,10 @@ impl ControlHandle {
         // already shutting down.
         if res.move_err.is_empty() {
             self.request_quorum(plan.quorum);
+            // The ticketless path's introduction, gated on the same landed move and for the same
+            // reason: a move the tracker refused is not a handoff, so it introduces no pull request
+            // into the watch set either (STUDIO-720).
+            self.request_review_intro(plan.review);
         }
         Ok(res)
     }
@@ -930,6 +951,190 @@ mod tests {
             "a failed move must not report moved_to"
         );
         env.signal.cancel();
+        let _ = task.await;
+    }
+
+    // ── ticketless review introduction (STUDIO-720, slice 6) ────────────────────────────────────
+
+    /// A ticketless `teams()` over `names`, with the ticket fan-out off.
+    fn ticketless_teams(names: &[&str]) -> rhapsody_config::teams::Teams {
+        rhapsody_config::teams::Teams {
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+            },
+            ..quorum_teams(names)
+        }
+    }
+
+    /// The acceptance path: an identity-worn handoff under `review.mode: ticketless` introduces
+    /// exactly the pull request of the RUN'S OWN repository binding — and it introduces it only
+    /// after the review-state move has landed, exactly as the ticket fan-out does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticketless_handoff_introduces_its_own_pull_request() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        let snapshot = [parent.clone()];
+
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        // The configured allowlist: the project whose repo the run is bound to.
+        if let Some(eff) = o.eff.as_mut() {
+            let mut p = crate::testsupport::empty_resolved_project("proj-a", Arc::clone(&tr) as _);
+            p.repo = "git@github.com:o/r.git".to_string();
+            eff.projects = vec![p];
+        }
+        o.teams = Some(ticketless_teams(&["alice", "bob", "carol"]));
+        let quorum_rx = o.open_quorum_channel();
+        let mut rx = o.open_review_intro_channel();
+        o.record_quorum_state(snapshot.iter());
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = "alice".to_string();
+            re.project_repo = "git@github.com:o/r.git".to_string();
+            re.project_slug = "proj-a".to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert_eq!(res.moved_to, "In Review", "the handoff itself is unchanged");
+
+        let req = rx.try_recv().expect("an introduction was requested");
+        assert_eq!(
+            (req.owner.as_str(), req.repo.as_str()),
+            ("o", "r"),
+            "parsed from the run's own project repo — never from anything anybody typed"
+        );
+        assert_eq!(req.repo_url, "git@github.com:o/r.git");
+        assert_eq!(req.head_branch, "symphony/MT-1");
+        assert_eq!(
+            req.reviewers,
+            vec!["bob".to_string()],
+            "one reviewer by default, and never the author"
+        );
+        assert_eq!(req.introduced_by, "handoff:MT-1");
+        // §14.2's "config cutover double-fire": one handoff fires exactly ONE review path.
+        assert!(
+            quorum_rx.is_empty(),
+            "the ticket fan-out must not fire on the ticketless path"
+        );
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
+    /// A handoff the tracker REFUSED has not happened, so it introduces nothing — the same gate the
+    /// fan-out is behind, and for the same reason: a ticket still sitting in an active state has an
+    /// author who is about to keep going.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_review_state_move_introduces_nothing() {
+        let mut fake = Fake::new();
+        fake.move_err = Some(TrackerError::Other("linear_move_rejected: nope".into()));
+        let tr = Arc::new(fake);
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        if let Some(eff) = o.eff.as_mut() {
+            let mut p = crate::testsupport::empty_resolved_project("proj-a", Arc::clone(&tr) as _);
+            p.repo = "git@github.com:o/r.git".to_string();
+            eff.projects = vec![p];
+        }
+        o.teams = Some(ticketless_teams(&["alice", "bob"]));
+        let mut rx = o.open_review_intro_channel();
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = "alice".to_string();
+            re.project_repo = "git@github.com:o/r.git".to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(!res.move_err.is_empty(), "the move failed");
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused handoff introduces nothing"
+        );
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
+    /// **F-SEC at the handoff.** A run bound to a repository no configured project owns introduces
+    /// nothing, so no coordinate outside the daemon's own configuration can ever reach the watch set
+    /// through this path either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_on_an_off_allowlist_repository_introduces_nothing() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        if let Some(eff) = o.eff.as_mut() {
+            let mut p = crate::testsupport::empty_resolved_project("proj-a", Arc::clone(&tr) as _);
+            p.repo = "git@github.com:o/r.git".to_string();
+            eff.projects = vec![p];
+        }
+        o.teams = Some(ticketless_teams(&["alice", "bob"]));
+        let mut rx = o.open_review_intro_channel();
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = "alice".to_string();
+            re.project_repo = "https://github.com/attacker/evil.git".to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(
+            rx.try_recv().is_err(),
+            "a repository no project owns is never introduced"
+        );
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
+    /// Off the ticketless path — including the default — a handoff introduces nothing at all, and
+    /// the ticket fan-out is exactly what it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_ticketless_handoff_introduces_nothing() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut quorum_rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
+            quorum_teams(&["alice", "bob", "carol"]),
+            parent,
+            "alice",
+            &snapshot,
+        );
+
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(
+            quorum_rx.try_recv().is_ok(),
+            "the ticket fan-out is unchanged"
+        );
+        assert!(
+            handle.review_intro.is_none(),
+            "a daemon off the ticketless path cannot even represent an introduction"
+        );
+
+        signal.cancel();
         let _ = task.await;
     }
 }

@@ -287,6 +287,32 @@ pub enum Event {
         wrapped: String,
         reply: oneshot::Sender<bool>,
     },
+    /// Introduce a pull request from a TRUSTED origin into the ticketless review watch set
+    /// (STUDIO-720, slice 6; NEW beyond Go v0.4.0). The `gh` lookup that resolved the pull-request
+    /// number happened off-loop, on [`crate::reviewintro::run_review_intro_task`] or (slice 8) the
+    /// console's HTTP task; only the watch-set write needs to be loop-confined, which is what keeps
+    /// that set single-writer alongside `dispatch_review`.
+    ///
+    /// The handler re-validates every field — including the configured-repository allowlist —
+    /// because being an in-process type is not the same as being a validated one (design §14.1
+    /// F-SEC).
+    ReviewIntroduce {
+        pr: crate::reviewintro::IntroducedPr,
+        reply: oneshot::Sender<crate::reviewintro::ReviewIntroOutcome>,
+    },
+    /// A WATCHED pull request's head advanced, so one more review round is armed (STUDIO-720; NEW
+    /// beyond Go v0.4.0).
+    ///
+    /// **This variant is the design's F-SEC fix.** §13.1 originally had the daemon re-post to the
+    /// room to trigger a re-review, which put the re-review loop's coordinate back into forgeable
+    /// text; §14.1 replaced it with an in-process control event, and this is it. It re-arms rows
+    /// that already exist and can introduce nothing, so an advance reported for a pull request
+    /// nobody introduced is inert. Its sender is slice 5's watcher.
+    ReviewHeadAdvanced {
+        pr: crate::prstate::PrCoord,
+        head_sha: String,
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 /// How long [`ControlHandle::record_teams_post`] waits for the control task to report back on a
@@ -529,6 +555,16 @@ impl Orchestrator {
                 reply,
             } => {
                 let _ = reply.send(self.handle_teams_relay(&identifier, &wrapped));
+            }
+            Event::ReviewIntroduce { pr, reply } => {
+                let _ = reply.send(self.handle_review_introduce(&pr));
+            }
+            Event::ReviewHeadAdvanced {
+                pr,
+                head_sha,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_review_head_advanced(&pr, &head_sha));
             }
         }
     }

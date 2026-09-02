@@ -120,6 +120,16 @@ pub struct ControlHandle {
     /// the control round-trip has already returned. Sending it back through the loop would put a
     /// tracker-write decision behind the current tick for no benefit.
     pub(crate) quorum: Option<tokio::sync::mpsc::UnboundedSender<crate::quorum::QuorumRequest>>,
+    /// The off-loop ticketless review INTRODUCTION task's inbox, cloned from
+    /// [`Orchestrator::review_intro_tx`](crate::orchestrator::Orchestrator) (STUDIO-720, slice 6).
+    /// `None` whenever the ticketless path is off — so on a default installation a handoff cannot
+    /// even represent an introduction, let alone perform one.
+    ///
+    /// It lives on the handle beside [`Self::quorum`] and for the same reason: introduction is
+    /// gated on the review-state move SUCCEEDING, and that move runs here, off-loop, after the
+    /// control round-trip has already returned.
+    pub(crate) review_intro:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::reviewintro::ReviewIntroRequest>>,
     /// The SAME `Arc`-shared lifecycle cache as
     /// [`Orchestrator::lifecycle`](crate::orchestrator::Orchestrator), so every HTTP task that asks
     /// what state a ticket is in shares one TTL window instead of each keeping its own
@@ -148,6 +158,7 @@ impl crate::orchestrator::Orchestrator {
             retention_loaded: std::sync::Arc::clone(&self.retention_loaded),
             teams_memory: self.teams_memory.as_ref().map(std::sync::Arc::clone),
             quorum: self.quorum_tx.clone(),
+            review_intro: self.review_intro_tx.clone(),
             lifecycle: std::sync::Arc::clone(&self.lifecycle),
         }
     }
