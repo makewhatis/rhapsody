@@ -120,6 +120,11 @@ pub struct ControlHandle {
     /// the control round-trip has already returned. Sending it back through the loop would put a
     /// tracker-write decision behind the current tick for no benefit.
     pub(crate) quorum: Option<tokio::sync::mpsc::UnboundedSender<crate::quorum::QuorumRequest>>,
+    /// The SAME `Arc`-shared lifecycle cache as
+    /// [`Orchestrator::lifecycle`](crate::orchestrator::Orchestrator), so every HTTP task that asks
+    /// what state a ticket is in shares one TTL window instead of each keeping its own
+    /// (STUDIO-702). Read-only with respect to the control task, which never touches it.
+    pub(crate) lifecycle: std::sync::Arc<crate::lifecycle::LifecycleCache>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -143,6 +148,7 @@ impl crate::orchestrator::Orchestrator {
             retention_loaded: std::sync::Arc::clone(&self.retention_loaded),
             teams_memory: self.teams_memory.as_ref().map(std::sync::Arc::clone),
             quorum: self.quorum_tx.clone(),
+            lifecycle: std::sync::Arc::clone(&self.lifecycle),
         }
     }
 }

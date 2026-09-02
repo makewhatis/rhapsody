@@ -44,6 +44,7 @@ pub mod ghenrich;
 pub mod ghsummons;
 pub mod handoff;
 pub mod issuelog;
+pub mod lifecycle;
 pub mod liveness;
 pub mod message;
 pub mod obslog;
@@ -90,6 +91,7 @@ pub use dispatch::DispatchStates;
 pub use dispatch::{eligible, sort_for_dispatch};
 pub use effective::{Effective, ResolvedProject, build_effective, build_effective_with_runner};
 pub use handoff::HandoffResult;
+pub use lifecycle::{IssueLifecycle, IssueLifecycleRow, LIFECYCLE_TTL};
 pub use message::RunMessageResult;
 pub use orchestrator::{EventRecord, Orchestrator, RetryEntry, RunningEntry, StackHint, Totals};
 pub use preflight::{

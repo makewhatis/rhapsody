@@ -82,9 +82,18 @@ pub(crate) async fn handle_issue_runs(
         Ok(runs) => runs,
         Err(_) => return store_error("issue listing query failed"),
     };
+    // The ticket lifecycles that turn a run OUTCOME into a real status (STUDIO-702). Asked for
+    // exactly the ids this page returned, and best-effort: an id with no answer is absent and the
+    // row renders as it did before the fields existed.
+    let ids: Vec<String> = runs.iter().map(|r| r.issue_id.clone()).collect();
+    let lifecycles = provider.issue_lifecycles(&ids).await;
     write_json(
         StatusCode::OK,
-        &issue_runs_response(&runs, next_offset(runs.len(), offset, effective_limit)),
+        &issue_runs_response(
+            &runs,
+            next_offset(runs.len(), offset, effective_limit),
+            &lifecycles,
+        ),
     )
 }
 
@@ -457,22 +466,25 @@ fn parse_non_neg_int(raw: &str, field: &str) -> Result<i64, Box<Response>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::{SUMMARY_RHYTHM_RUNS, local_day_start};
     use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
     use rhapsody_agent::LogEntry;
-    use rhapsody_orchestrator::{EventRecord, Snapshot, TokenCounts, Totals};
+    use rhapsody_orchestrator::{
+        EventRecord, IssueLifecycle, IssueLifecycleRow, Snapshot, TokenCounts, Totals,
+    };
     use rhapsody_store::{
         DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, RunEnd, RunProgress, RunStart, Sqlite,
         Store, StorePath,
     };
     use serde_json::{Value, json};
 
-    use crate::new_handler;
     use crate::testutil::{
         FakeProvider, empty_snapshot, epoch, fixed_instant, retry_row, running_row, spawn_router,
     };
+    use crate::{StateProvider, new_handler};
 
     // ---- helpers ----
 
@@ -492,6 +504,30 @@ mod tests {
         let id = store
             .start_run(RunStart {
                 issue_identifier: issue.into(),
+                started_at: started.into(),
+                ..Default::default()
+            })
+            .expect("start run");
+        store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: started.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end run");
+        id
+    }
+
+    /// Seed one completed run for a ticket with a real tracker `issue_id` — what the lifecycle
+    /// decoration keys off, and what [`seed_run_at`] (identifier-only) deliberately leaves blank.
+    fn seed_run_for(issue_id: &str, identifier: &str, started: &str, store: &Sqlite) -> i64 {
+        let id = store
+            .start_run(RunStart {
+                issue_id: issue_id.into(),
+                issue_identifier: identifier.into(),
                 started_at: started.into(),
                 ..Default::default()
             })
@@ -605,7 +641,12 @@ mod tests {
     }
 
     async fn spawn(provider: FakeProvider) -> String {
-        spawn_router(new_handler(Arc::new(provider), None)).await
+        spawn_arc(Arc::new(provider)).await
+    }
+
+    /// `spawn` for a provider a test also holds, so it can read back what the handler asked it.
+    async fn spawn_arc(provider: Arc<dyn StateProvider>) -> String {
+        spawn_router(new_handler(provider, None)).await
     }
 
     async fn get_json(url: &str) -> (reqwest::StatusCode, Value) {
@@ -821,6 +862,110 @@ mod tests {
             body["issues"].as_array().expect("issues").len(),
             0,
             "4 issues total"
+        );
+    }
+
+    // STUDIO-702 — the issue listing carries the TICKET's current lifecycle, so a completed run on
+    // a merged ticket stops reading as "in review" forever. Both fields are present, and the daemon
+    // is asked about exactly the ids it served.
+    #[tokio::test]
+    async fn issue_runs_carry_the_ticket_lifecycle() {
+        let store = mem_store();
+        seed_run_for("iss_done", "MT-1", "2026-08-01T00:00:00Z", &store);
+        seed_run_for("iss_review", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([
+                    (
+                        "iss_done".to_string(),
+                        IssueLifecycleRow {
+                            state: "Done".into(),
+                            lifecycle: IssueLifecycle::Done,
+                        },
+                    ),
+                    (
+                        "iss_review".to_string(),
+                        IssueLifecycleRow {
+                            state: "In Review".into(),
+                            lifecycle: IssueLifecycle::InReview,
+                        },
+                    ),
+                ])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let issues = body["issues"].as_array().expect("issues array");
+        let by_ident: std::collections::HashMap<&str, &Value> = issues
+            .iter()
+            .map(|r| (r["issue_identifier"].as_str().unwrap_or_default(), r))
+            .collect();
+        assert_eq!(by_ident["MT-1"]["lifecycle"], "done");
+        assert_eq!(by_ident["MT-1"]["tracker_state"], "Done");
+        assert_eq!(by_ident["MT-2"]["lifecycle"], "in_review");
+        assert_eq!(by_ident["MT-2"]["tracker_state"], "In Review");
+
+        let mut asked = provider.issue_lifecycles_asked();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec!["iss_done".to_string(), "iss_review".to_string()],
+            "the handler asks about exactly the page it served",
+        );
+    }
+
+    // STUDIO-702 — a ticket the daemon cannot resolve carries NEITHER field, so "no answer" stays
+    // distinguishable from any state it could have resolved and the client falls back cleanly.
+    #[tokio::test]
+    async fn issue_runs_omit_the_lifecycle_when_there_is_no_answer() {
+        let store = mem_store();
+        seed_run_for("iss_1", "MT-1", "2026-08-01T00:00:00Z", &store);
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let row = &body["issues"][0];
+        assert_eq!(row["issue_identifier"], "MT-1");
+        assert!(
+            row.get("lifecycle").is_none(),
+            "no answer => no field: {row}"
+        );
+        assert!(
+            row.get("tracker_state").is_none(),
+            "no answer => no field: {row}"
+        );
+    }
+
+    // STUDIO-702 — /history is byte-pinned to the Go daemon's golden and must NOT grow the fields
+    // the Rhapsody-only issue listing does.
+    #[tokio::test]
+    async fn run_history_never_carries_the_lifecycle_fields() {
+        let store = mem_store();
+        seed_run_for("iss_done", "MT-1", "2026-08-01T00:00:00Z", &store);
+        let base = spawn(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_done".to_string(),
+                    IssueLifecycleRow {
+                        state: "Done".into(),
+                        lifecycle: IssueLifecycle::Done,
+                    },
+                )])),
+        )
+        .await;
+
+        let (_s, body) = get_json(&format!("{base}/api/v1/history")).await;
+        let row = &body["runs"][0];
+        assert!(
+            row.get("lifecycle").is_none(),
+            "run paging stays Go-shaped: {row}"
+        );
+        assert!(
+            row.get("tracker_state").is_none(),
+            "run paging stays Go-shaped: {row}"
         );
     }
 

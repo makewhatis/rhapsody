@@ -24,8 +24,8 @@ use rhapsody_orchestrator::teamsmemory::{
     TeamsMemory, TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
-    CancelWait, ControlHandle, HandoffResult, Identity, ReadsError, RefreshResult, ReloadError,
-    ResumeResult, RunMessageResult, Snapshot, StopResult,
+    CancelWait, ControlHandle, HandoffResult, Identity, IssueLifecycleRow, ReadsError,
+    RefreshResult, ReloadError, ResumeResult, RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
     DayRollup, DayTotals, EventHit, EventQuery, EventRow, RunFilter, RunMessage, RunSummary, Store,
@@ -127,6 +127,16 @@ impl StateProvider for DaemonState {
 
     fn history(&self) -> Arc<dyn HistoryStore> {
         Arc::clone(&self.history)
+    }
+
+    async fn issue_lifecycles(
+        &self,
+        ids: &[String],
+    ) -> std::collections::HashMap<String, IssueLifecycleRow> {
+        // Off-loop and best-effort (STUDIO-702): the handle resolves what it can from its TTL cache
+        // and the reads cell's tracker, and answers nothing for the rest. Nothing here can fail the
+        // listing this decorates.
+        self.handle.issue_lifecycles(ids).await
     }
 
     fn run_transcript(&self, run_id: i64) -> Option<Vec<LogEntry>> {

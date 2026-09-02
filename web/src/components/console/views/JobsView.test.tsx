@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { RunSummary, StateResponse } from "@/lib/api";
+import type { IssueRun, StateResponse } from "@/lib/api";
 
 // STUDIO-681 §10, sub-ticket 2 — the Jobs worklist's acceptance boxes 2.6, 2.7 and 2.8,
 // driven through the real view against the endpoints §9 has: /api/v1/state for the live
@@ -34,7 +34,7 @@ vi.mock("@/lib/api", async (orig) => {
 
 const { JobsView } = await import("./JobsView");
 
-function run(over: Partial<RunSummary> & Pick<RunSummary, "issue_identifier" | "outcome">): RunSummary {
+function run(over: Partial<IssueRun> & Pick<IssueRun, "issue_identifier" | "outcome">): IssueRun {
   return {
     id: 1,
     issue_id: `id-${over.issue_identifier}`,
@@ -54,7 +54,7 @@ function run(over: Partial<RunSummary> & Pick<RunSummary, "issue_identifier" | "
     error: "",
     transcript_path: "",
     ...over,
-  } as RunSummary;
+  } as IssueRun;
 }
 
 const EMPTY_STATE: StateResponse = {
@@ -173,6 +173,60 @@ describe("the Now strip (§3)", () => {
     await waitFor(() => expect(screen.getByText("alice")).toBeTruthy());
     expect(screen.getByText("STUDIO-1")).toBeTruthy();
     expect(screen.getByText("idle")).toBeTruthy();
+  });
+});
+
+// STUDIO-702 — the daemon now reports each ticket's real lifecycle on the issue listing, and the
+// worklist colours itself from that rather than from a run outcome that never expires.
+describe("the ticket lifecycle (STUDIO-702)", () => {
+  async function mountLifecycleJobs() {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done", tracker_state: "Done" }),
+        run({ issue_identifier: "DROPPED", outcome: "completed", lifecycle: "canceled", tracker_state: "Won't Do" }),
+        run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review", tracker_state: "In Review" }),
+        run({ issue_identifier: "LEGACY", outcome: "completed" }),
+      ],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+  }
+
+  // The bug: two of these four tickets are terminal and used to be counted as awaiting review, for
+  // as long as the store kept their runs.
+  it("counts only work actually awaiting a reviewer", async () => {
+    await mountLifecycleJobs();
+    // REVIEW, plus LEGACY, which the daemon could not resolve and which falls back as before.
+    expect(stat("in review")).toBe("2");
+  });
+
+  // The Done tab was permanently empty: `done` was unreachable from run outcomes alone.
+  it("populates the Done filter with the terminal tickets", async () => {
+    await mountLifecycleJobs();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(rowKeys().sort()).toEqual(["DROPPED", "MERGED"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "In review" }));
+    await waitFor(() => expect(rowKeys().sort()).toEqual(["LEGACY", "REVIEW"]));
+  });
+
+  it("hovers the tracker's own state name behind the normalized Pill", async () => {
+    await mountLifecycleJobs();
+    const cellFor = (key: string) =>
+      [...document.querySelectorAll(".jtbl tbody tr")]
+        .find((tr) => tr.textContent?.includes(key))
+        ?.querySelectorAll("td")[2];
+    expect(cellFor("DROPPED")?.getAttribute("title")).toBe("Won't Do");
+    expect(cellFor("LEGACY")?.getAttribute("title")).toBeNull();
   });
 });
 

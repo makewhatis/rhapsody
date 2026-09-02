@@ -182,7 +182,9 @@ function JobsRow({
           </span>
         )}
       </td>
-      <td>
+      {/* The Pill shows the normalized status; the tracker's own state name is the ground truth
+          behind it, so it hovers (STUDIO-702). "" when the daemon had no answer for this ticket. */}
+      <td title={row.trackerState === "" ? undefined : row.trackerState}>
         <Pill variant={row.status}>
           {row.statusLabel}
           {row.subLabel === undefined ? "" : ` · ${row.subLabel}`}

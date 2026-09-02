@@ -537,6 +537,11 @@ pub struct Orchestrator {
     /// share it while the control task reads it in `project_statuses`. Mirrors Go's `warningsMu` +
     /// `projectWarnings` / `projectFileWarnings` + the two generation counters.
     pub(crate) warnings: Arc<WarningsState>,
+    /// The TTL cache of ticket lifecycle states behind `GET /api/v1/history/issues`'s lifecycle
+    /// fields (STUDIO-702). Purely a read-path memo — the control task never reads or writes it —
+    /// held here rather than on the handle alone so every clone of [`crate::ControlHandle`] shares
+    /// ONE freshness window. See `lifecycle.rs`.
+    pub(crate) lifecycle: Arc<crate::lifecycle::LifecycleCache>,
     /// Whether a store was injected via [`set_store`](Orchestrator::set_store) (Go `storeInjected`),
     /// short-circuiting `Run`'s disk-open path so tests / callers own the store lifecycle.
     pub(crate) store_injected: bool,
@@ -647,6 +652,7 @@ impl Orchestrator {
             retention_days: Arc::new(AtomicI64::new(DEFAULT_RETENTION_DAYS)),
             retention_loaded: Arc::new(AtomicBool::new(false)),
             warnings: Arc::new(WarningsState::default()),
+            lifecycle: Arc::new(crate::lifecycle::LifecycleCache::default()),
             store_injected: false,
             // BO-59: no credential probe by default → the preflight is a no-op and dispatch is
             // byte-identical to the pre-feature behavior. The daemon installs the real probe at startup.

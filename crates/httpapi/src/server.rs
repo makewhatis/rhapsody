@@ -16,8 +16,8 @@ use rhapsody_orchestrator::teamsmemory::{
     TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
-    HandoffResult, Identity, ReadsError, RefreshResult, ResumeResult, RunMessageResult, Snapshot,
-    StopResult,
+    HandoffResult, Identity, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
+    RunMessageResult, Snapshot, StopResult,
 };
 
 use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_version};
@@ -65,6 +65,22 @@ pub trait StateProvider: Send + Sync {
     /// 500). Mirrors Go `StateProvider.Store()`, narrowed to the read subset via [`HistoryStore`]
     /// (Go's `api.History()`).
     fn history(&self) -> Arc<dyn HistoryStore>;
+
+    /// The CURRENT tracker lifecycle state of each of `ids` (tracker issue ids), keyed by id —
+    /// what decorates `GET /api/v1/history/issues` with the `lifecycle`/`tracker_state` fields
+    /// (STUDIO-702). An id with no answer is simply ABSENT from the map, and the client then falls
+    /// back to deriving a status from the run outcome alone.
+    ///
+    /// Infallible on purpose: the listing it decorates has already succeeded by the time this is
+    /// called, so there is no failure a caller could act on — a missing tracker, a failed round-trip
+    /// and an unknown id are all "no answer". Rhapsody-only (no Go v0.4.0 counterpart); the default
+    /// answers nothing, which is exactly how the endpoint behaved before the fields existed.
+    async fn issue_lifecycles(
+        &self,
+        _ids: &[String],
+    ) -> std::collections::HashMap<String, IssueLifecycleRow> {
+        std::collections::HashMap::new()
+    }
 
     /// The humanized per-run transcript for a run id (the concrete `*.jsonl` recorded on the run row),
     /// feeding `GET /api/v1/runs/{id}/transcript`. `None` ⇒ no such run row (→ 404); `Some(entries)`

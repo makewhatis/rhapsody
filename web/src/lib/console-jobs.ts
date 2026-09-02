@@ -9,14 +9,14 @@
 // the two filters and the project list from them.
 //
 // DEPENDENCY (§9/§11): the spec maps this view to `GET /api/v1/issues`, which the daemon does
-// not serve. There is therefore no TRACKER state, no assignee and no PR link per ticket. What
-// is used instead, and what it costs:
-//   - Status  — derived from the daemon's own job status (`jobStatus`), not the Linear state.
-//               `done` consequently never occurs: nothing tells the dashboard a ticket merged.
+// not serve. There is therefore no assignee and no PR link per ticket. What is used instead,
+// and what it costs:
+//   - Status  — the TICKET's lifecycle when the daemon resolved one (STUDIO-702), else the
+//               daemon's own job status. See `consoleJobStatus`.
 //   - Assignee— resolved from the Teams roster's LIVE tickets (`GET /api/v1/teams`), so a
 //               finished run shows "—": no teammate identity is recorded on a stored run row.
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
-import type { RunSummary, TeamsOverview } from "@/lib/api";
+import type { IssueLifecycle, IssueRun, RunSummary, TeamsOverview } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 
 /** The five states the console's Pill paints (§1.3). */
@@ -43,20 +43,19 @@ export const CONSOLE_STATUS_LABELS: Record<ConsoleJobStatus, string> = {
 };
 
 /**
- * Maps the daemon's job status onto the console's vocabulary.
+ * Maps a run OUTCOME onto the console's vocabulary — the answer used when the daemon could not
+ * resolve the ticket's real state.
  *
- * `completed → review` is the pipeline's own rule, not a guess: a run that finishes cleanly
- * hands its ticket to the configured review state, so a completed run means "waiting on a
- * reviewer". `failed` and `waiting` both mean a human has to act, which is what `blocked`
- * says; `stopped` leaves the ticket idle awaiting its next dispatch, which is `queued`.
- *
- * `done` is unreachable from run outcomes alone — see this module's DEPENDENCY note.
+ * `completed → review` is the pipeline's own rule: a run that finishes cleanly hands its ticket
+ * to the configured review state, so a just-completed run means "waiting on a reviewer".
+ * `failed` and `waiting` both mean a human has to act, which is what `blocked` says; `stopped`
+ * leaves the ticket idle awaiting its next dispatch, which is `queued`.
  *
  * Takes a plain string rather than `JobStatusKey`: `JobRow.status` is typed as the wider
  * `StatusKey`, and narrowing it with a cast would hide exactly the case the default arm is
  * here to survive.
  */
-export function consoleJobStatus(status: string): ConsoleJobStatus {
+function fromRunOutcome(status: string): ConsoleJobStatus {
   switch (status) {
     case "running":
       return "run";
@@ -67,6 +66,39 @@ export function consoleJobStatus(status: string): ConsoleJobStatus {
       return "blocked";
     default:
       return "queued";
+  }
+}
+
+/**
+ * The row's status: the TICKET's lifecycle when the daemon resolved one, else the run outcome.
+ *
+ * The ticket's state is the truer signal and outranks the outcome, because an outcome never
+ * expires. Every completed run used to read "in review" for as long as the store kept it, so the
+ * count grew monotonically with history and `done` was unreachable — STUDIO-702.
+ *
+ * Two rules are not simply "lifecycle wins", and both are deliberate:
+ *   - A LIVE run outranks the ticket. A mid-run handoff parks the ticket in a review state while
+ *     the agent is still working, and the worklist must keep saying "running".
+ *   - An `open` ticket keeps a `failed`/`waiting` outcome's `blocked`. Those describe the RUN, and
+ *     a human still has to act on them; what `open` does override is `completed → review`, since a
+ *     ticket that went back to open work is not awaiting a reviewer.
+ *
+ * An absent or unrecognized `lifecycle` falls back to the outcome mapping unchanged, so a console
+ * talking to a daemon that predates the field behaves exactly as it did before.
+ */
+export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJobStatus {
+  const fromRun = fromRunOutcome(status);
+  if (fromRun === "run") return "run";
+  switch (lifecycle) {
+    case "done":
+    case "canceled":
+      return "done";
+    case "in_review":
+      return "review";
+    case "open":
+      return fromRun === "review" ? "queued" : fromRun;
+    default:
+      return fromRun;
   }
 }
 
@@ -83,6 +115,8 @@ export interface ConsoleJobRow {
   projectSlug: string;
   status: ConsoleJobStatus;
   statusLabel: string;
+  /** The tracker's own workflow-state name behind `status`, or "" when the daemon had no answer. */
+  trackerState: string;
   /** Teammate name, or "" when solo/unassigned (the table renders "—"). */
   assignee: string;
   /** PR reference, or "" when none is known. */
@@ -108,6 +142,34 @@ export function ticketAssignees(overview: TeamsOverview | undefined): Map<string
     }
   }
   return byTicket;
+}
+
+/** One ticket's resolved state: the normalized bucket plus the tracker's own name for it. */
+export interface TicketLifecycle {
+  lifecycle: IssueLifecycle;
+  trackerState: string;
+}
+
+/**
+ * Ticket key -> resolved lifecycle, from the issue-level listing's per-row fields (STUDIO-702).
+ *
+ * A row the daemon could not resolve carries neither field and is SKIPPED rather than mapped to a
+ * default — an absent key is what makes `consoleJobStatus` fall back to the run outcome, so a
+ * placeholder here would silently defeat the fallback. The listing is one row per issue, but the
+ * first answer wins if that ever stops being true.
+ */
+export function lifecycleByIssue(rows: readonly IssueRun[]): Map<string, TicketLifecycle> {
+  const byIssue = new Map<string, TicketLifecycle>();
+  for (const r of rows) {
+    if (r.issue_identifier === "" || r.lifecycle === undefined || byIssue.has(r.issue_identifier)) {
+      continue;
+    }
+    byIssue.set(r.issue_identifier, {
+      lifecycle: r.lifecycle,
+      trackerState: r.tracker_state ?? "",
+    });
+  }
+  return byIssue;
 }
 
 /**
@@ -165,15 +227,17 @@ export function consoleJobProjects(
 /** The §3 worklist rows, newest activity first with running tickets pinned to the top. */
 export function buildConsoleJobs(
   jobs: readonly JobRow[],
-  issueRows: readonly RunSummary[],
+  issueRows: readonly IssueRun[],
   overview: TeamsOverview | undefined,
   nowMs: number,
 ): ConsoleJobRow[] {
   const assignees = ticketAssignees(overview);
   const activity = lastActivityByIssue(issueRows);
+  const lifecycles = lifecycleByIssue(issueRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
-    const status = consoleJobStatus(job.status);
+    const ticket = lifecycles.get(job.issue);
+    const status = consoleJobStatus(job.status, ticket?.lifecycle);
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     return {
       key: job.key,
@@ -183,6 +247,7 @@ export function buildConsoleJobs(
       projectSlug: job.project,
       status,
       statusLabel: CONSOLE_STATUS_LABELS[status],
+      trackerState: ticket?.trackerState ?? "",
       assignee: assignees.get(job.issue) ?? "",
       pr: "",
       updated: relativeSince(updatedAtMs, nowMs),
