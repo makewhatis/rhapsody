@@ -1358,7 +1358,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("teams.yaml");
         std::fs::write(&path, both).expect("write");
-        assert!(matches!(Teams::try_load(&path), Err(TeamsError::Invalid(_))));
+        assert!(matches!(
+            Teams::try_load(&path),
+            Err(TeamsError::Invalid(_))
+        ));
         assert_eq!(Teams::load(&path), Teams::disabled());
     }
 
