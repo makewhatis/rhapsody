@@ -332,6 +332,7 @@ impl Orchestrator {
     pub(crate) fn terminate(&mut self, id: &str) -> Option<RunningEntry> {
         let re = self.running.remove(id)?;
         self.release_teams_run(&re);
+        re.cancel.cancel();
         // A review run's detached worktree is reclaimed at its EXIT, and a termination is the one
         // way a review ends without reaching that exit: the entry is already gone, so the worker's
         // later exit event returns at the stale/absent guard, before `on_worker_exit`'s teardown
@@ -339,10 +340,13 @@ impl Orchestrator {
         // terminal tracker state, so `TerminateCleanup` never fires for it either — so an operator
         // Stop used to leak it permanently. Review runs only: a stopped or stalled TICKET keeps its
         // workspace, which `reconcile_stalled` retries straight back into.
+        //
+        // AFTER the cancellation, never before: the removal is `git worktree remove --force` with an
+        // `rm -rf` fallback, so it must not be handed to the runtime while the agent's process group
+        // is still alive inside the tree it deletes.
         if let Some(run) = re.review.as_ref() {
             self.teardown_review_worktree(run, &re.project_slug);
         }
-        re.cancel.cancel();
         let dur = ((self.now)() - re.started_at)
             .num_nanoseconds()
             .unwrap_or(0) as f64
