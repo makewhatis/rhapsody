@@ -153,14 +153,17 @@ describe("the summary strip (§4)", () => {
     expect(kv("Status")).not.toContain("in review");
   });
 
+  // Deliberately a STOPPED run: a `completed` one already falls back to "in review", so this
+  // would pass with the lifecycle ignored entirely. The outcome alone says "queued" here, so
+  // only the ticket's own state can produce "in review".
   it("still says in review for a ticket that really is awaiting a reviewer", async () => {
     mountDetail(
-      [run({ id: 547 })],
+      [run({ id: 547, outcome: "stopped" })],
       vi.fn(),
       [issueRow({ issue_identifier: "STUDIO-654", lifecycle: "in_review", tracker_state: "In Review" })],
     );
-    await waitFor(() => expect(kv("Runs")).toBe("1"));
-    expect(kv("Status")).toContain("in review");
+    await waitFor(() => expect(kv("Status")).toContain("in review"));
+    expect(kv("Runs")).toBe("1");
   });
 
   // The listing is paged and carries no answer for a ticket the daemon could not resolve, so

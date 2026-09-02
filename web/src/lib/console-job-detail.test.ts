@@ -111,6 +111,14 @@ describe("buildJobSummary", () => {
     const inReview = buildJobSummary([run({ id: 1 })], { lifecycle: "in_review", nowMs: NOW });
     expect(inReview.status).toBe("review");
     expect(inReview.statusLabel).toBe("in review");
+
+    // Deliberately a STOPPED run: `completed` already falls back to "review", so a merged-only
+    // check would pass with the lifecycle ignored entirely. Here the outcome alone says "queued"
+    // and only the ticket's state can produce "review".
+    expect(
+      buildJobSummary([run({ id: 1, outcome: "stopped" })], { lifecycle: "in_review", nowMs: NOW })
+        .status,
+    ).toBe("review");
   });
 
   // The worklist's carve-outs are not re-derived here — they come from the one shared
