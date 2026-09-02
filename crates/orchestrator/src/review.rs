@@ -311,7 +311,7 @@ impl Orchestrator {
     pub(crate) fn on_review_exit(&mut self, re: &RunningEntry, run: &ReviewRun, e: &EvWorkerExit) {
         self.completed.remove(&re.issue.id);
         self.claimed.remove(&re.issue.id);
-        if e.failed {
+        let (outcome, reason) = if e.failed {
             // The watch row is deliberately left exactly where the dispatch put it (`in_flight` at
             // its `requested_sha`): nobody read this head, so recording it as reviewed would be the
             // F-SHA lost update by another route, and clearing the in-flight marker of a crashed
@@ -319,14 +319,19 @@ impl Orchestrator {
             let reason = if e.err_msg.is_empty() {
                 "worker failed"
             } else {
-                &e.err_msg
+                e.err_msg.as_str()
             };
-            self.persist_end_run(re, store::OUTCOME_FAILED, reason);
-            self.persist_totals();
-            return;
-        }
-        self.record_review_completed(run, REVIEW_STATUS_REVIEWED);
-        self.persist_end_run(re, store::OUTCOME_COMPLETED, "");
+            (store::OUTCOME_FAILED, reason)
+        } else {
+            self.record_review_completed(run, REVIEW_STATUS_REVIEWED);
+            (store::OUTCOME_COMPLETED, "")
+        };
+        self.persist_end_run(re, outcome, reason);
+        // Drop the persisted `running` claim row `persist_start_run` wrote — on BOTH outcomes.
+        // A ticket run's failure path can leave its claim behind because the backoff retry it
+        // schedules immediately rewrites the row as `retry_queued`, which is what re-arms the timer
+        // across a restart; a review schedules nothing, so the row would simply outlive the daemon
+        // and greet boot recovery as a live claim on a key no tracker can resolve.
         self.persist_complete(&re.issue.identifier);
         self.persist_totals();
     }
@@ -924,6 +929,14 @@ mod tests {
             .expect("run row exists");
         assert_eq!(row.outcome, rhapsody_store::OUTCOME_FAILED);
         assert_eq!(row.error, "claude startup failed");
+        assert!(
+            o.store()
+                .load_recovery()
+                .expect("load recovery")
+                .claims
+                .is_empty(),
+            "the persisted claim row outlives the run and greets boot recovery"
+        );
         let watch = o
             .store()
             .get_review_watch(&run.watch_key())
