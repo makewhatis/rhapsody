@@ -347,8 +347,13 @@ impl Orchestrator {
         // NB: `route` (the parameter) is the owning PROJECT's snapshot — an unrelated sense of the
         // word. `teams_dispatch` is named in full so the two cannot be conflated at a glance.
         let teams_dispatch = self.route_teams(&iss);
+        // Review-mode coordinates staged by `dispatch_review` for THIS dispatch (STUDIO-715),
+        // consumed the way a graphite stacking hint is. `None` for every ticket dispatch, which
+        // leaves the rest of this function byte-identical to a daemon built before review mode.
+        let review = self.pending_review.remove(&iss.id);
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
+        re.review = review.clone();
         re.started_at = (self.now)();
         re.retry_attempt = attempt_norm;
         re.stack_context = stack_context;
@@ -409,6 +414,7 @@ impl Orchestrator {
         let stack_context = re.stack_context.clone();
         let capabilities_section = re.capabilities_section.clone();
         let teammate_section = re.teammate_section.clone();
+        let review_checkout = review.as_ref().map(crate::review::ReviewRun::checkout);
         // Stamped by `persist_start_run` above; 0 when the store is off or the insert failed, which
         // the runner treats as "unknown" and emits no env for (STUDIO-675).
         let run_id = re.run_id;
@@ -433,6 +439,7 @@ impl Orchestrator {
                 teammate_section,
                 run_id,
                 started_at,
+                review_checkout,
             );
         }
     }
@@ -548,6 +555,11 @@ impl Orchestrator {
             return;
         };
         self.release_teams_run(&re);
+        // A review run's worktree has no other reclaimer: its `pr:` id reaches no terminal tracker
+        // state, so `reconcile`'s TerminateCleanup never fires for it (STUDIO-715, design §14.2).
+        if let Some(run) = &re.review {
+            self.teardown_review_worktree(run, &re.project_slug);
+        }
         let dur = ((self.now)() - re.started_at)
             .num_nanoseconds()
             .unwrap_or(0) as f64

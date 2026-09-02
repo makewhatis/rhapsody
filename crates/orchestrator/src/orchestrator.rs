@@ -149,6 +149,15 @@ pub struct RunningEntry {
     pub last_cpu_active_at: DateTime<Utc>,
 
     pub recent_events: Vec<EventRecord>,
+
+    /// The review coordinates when this run is a ticketless PR review rather than a ticket run
+    /// (STUDIO-715); `None` for every ticket dispatch, which is every dispatch this slice ships.
+    ///
+    /// Stamped by [`Orchestrator::dispatch_issue`] from `pending_review`, and read at exit to tear
+    /// the detached worktree down — a `pr:` id never reaches a terminal tracker state, so
+    /// `reconcile`'s cleanup never fires for one. `pub(crate)` like `cancel`: it is dispatch
+    /// machinery, not part of the entry's observable shape.
+    pub(crate) review: Option<crate::review::ReviewRun>,
 }
 
 impl RunningEntry {
@@ -172,6 +181,7 @@ impl RunningEntry {
             identity: String::new(),
             teammate_section: String::new(),
             last_delivered_summon_at: zero_time(),
+            review: None,
             thread_id: String::new(),
             session_id: String::new(),
             turn_count: 0,
@@ -426,6 +436,11 @@ pub struct Orchestrator {
     /// (written by `promote_unblocked`, consumed by `dispatch_issue`, both on the control task).
     /// INF-318 / INF-418.
     pub pending_stack: HashMap<String, StackHint>,
+    /// Review-run coordinates carried from [`Orchestrator::dispatch_review`] to the
+    /// `dispatch_issue` it makes (written and consumed on the control task, exactly as
+    /// `pending_stack` is). The worker spawn happens inside `dispatch_issue`, so the pinned head has
+    /// to be in place before the call rather than stamped on afterwards. STUDIO-715.
+    pub(crate) pending_review: crate::review::PendingReviews,
     /// Aggregate token + runtime accounting.
     pub totals: Totals,
 
@@ -631,6 +646,7 @@ impl Orchestrator {
             retry_attempts: HashMap::new(),
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
+            pending_review: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
             store: Arc::new(store::Noop),

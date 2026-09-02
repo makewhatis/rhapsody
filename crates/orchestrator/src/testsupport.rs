@@ -289,6 +289,7 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         started_at: epoch,
         retry_attempt: 0,
         cancel: crate::control_loop::CancelSignal::default(),
+        review: None,
         project_slug: project_slug.to_string(),
         project_group: project_group.to_string(),
         project_repo: String::new(),

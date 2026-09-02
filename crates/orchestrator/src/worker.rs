@@ -126,6 +126,14 @@ pub struct WorkerDeps {
     /// the ticket here on the agent's behalf and ends the turn loop. Post-parity divergence from Go
     /// (TRA-240): Go relied on the agent/merge moving the ticket, which the review-gated flow can't.
     pub review_handoff_state: Option<String>,
+    /// Review-mode provisioning (STUDIO-715; design record
+    /// `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`). `Some` makes this run a ticketless PR
+    /// review: the workspace is a DETACHED worktree pinned to the carried head SHA rather than a
+    /// fresh `symphony/<key>` branch, and the agent is told which SHA it is reading.
+    ///
+    /// `None` for every ticket dispatch — and, in this slice, for every dispatch, since nothing
+    /// triggers a review yet.
+    pub review: Option<crate::review::ReviewCheckout>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -281,9 +289,22 @@ pub async fn run_agent_attempt(
     on_event: &(dyn Fn(Event) + Send + Sync),
     on_transcript: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> (String, bool, Option<WorkerError>) {
+    // Review mode provisions a DETACHED worktree at the head SHA pinned at dispatch: a review reads
+    // one pull request's commit and creates no branch to push (STUDIO-715). Checked first because it
+    // overrides `workspace_mode` — a review is never a `symphony/<key>` checkout in either shape.
     // workspace_mode:clone provisions an independent clone (no cross-ticket checkout lock); anything
-    // else uses the shared-mirror worktree path. Both run the same downstream pipeline.
-    let ws = if deps.workspace_mode == WORKSPACE_MODE_CLONE {
+    // else uses the shared-mirror worktree path. All three run the same downstream pipeline.
+    let ws = if let Some(rev) = &deps.review {
+        deps.workspace
+            .ensure_review_worktree(
+                &deps.repo_url,
+                &deps.project_slug,
+                &issue.identifier,
+                rev.pr_number,
+                &rev.head_sha,
+            )
+            .await
+    } else if deps.workspace_mode == WORKSPACE_MODE_CLONE {
         deps.workspace
             .ensure_clone_from_repo(&deps.repo_url, &deps.project_slug, &issue.identifier)
             .await
@@ -394,6 +415,12 @@ pub async fn run_agent_attempt(
     // `StartSession`, before the first turn) so the agent child's env carries SYMPHONY_RUN_ID for
     // the injected MCP server's "me" default. A zero id is a no-op inside the setter's consumer.
     sess.set_run_id(deps.run_id);
+    // Pin the reviewed head into the agent's env (STUDIO-715, F-SHA): the SHA the worktree above was
+    // detached at, so the agent reports on the commit it is actually reading. A no-op for every
+    // non-review run, which sets nothing and emits nothing.
+    if let Some(rev) = &deps.review {
+        sess.set_review_head(&rev.head_sha);
+    }
 
     let (final_state, result_text, loop_err) = deps
         .run_turns(
@@ -587,6 +614,7 @@ mod tests {
             teammate_section: String::new(),
             pr_label: String::new(),
             review_handoff_state: None,
+            review: None,
             run_id: 0,
         }
     }
@@ -777,6 +805,108 @@ mod tests {
             ag.last_run_id(),
             Some(412),
             "the dispatch run id must reach the session"
+        );
+    }
+
+    /// STUDIO-715: `deps.review` makes the worker take the review provisioning path — a DETACHED
+    /// worktree at the pinned head, no `symphony/<key>` branch — and hand that same SHA to the agent
+    /// as its review head. Uses a real local origin, because the branch-vs-detached distinction only
+    /// exists in git.
+    #[tokio::test]
+    async fn worker_provisions_a_detached_review_worktree_and_pins_the_head() {
+        fn git_run(dir: &str, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hello\n").expect("write README");
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "initial"]);
+        git_run(&origin.path, &["commit", "--allow-empty", "-m", "pr head"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&origin.path)
+            .output()
+            .expect("rev-parse");
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        git_run(&origin.path, &["update-ref", "refs/pull/12/head", &head]);
+
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("pr:o/r#12@alice", "pr:o/r#12@alice", "Done")]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(Arc::clone(&ws), ag.clone(), tr, "p", 20);
+        d.repo_url = origin.path.clone();
+        d.project_slug = "rhapsody".to_string();
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: head.clone(),
+        });
+        let iss = issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress");
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, iss, None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+
+        assert_eq!(
+            ag.last_review_head(),
+            Some(head.clone()),
+            "the pinned head must reach the agent as its review head"
+        );
+        let path = ws.path_for(&origin.path, "pr:o/r#12@alice");
+        assert!(
+            std::fs::metadata(&path).is_ok(),
+            "no review worktree at {path}"
+        );
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .expect("rev-parse worktree");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            head,
+            "the review worktree is not at the pinned head"
+        );
+        let out = std::process::Command::new("git")
+            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .expect("symbolic-ref");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            "the review worktree is on a branch, not detached"
+        );
+        drop(root);
+    }
+
+    /// The inertness half: with `review` unset — every run this slice ships — the worker takes the
+    /// existing branch-based path and tells the agent no review head at all.
+    #[tokio::test]
+    async fn worker_without_review_takes_the_branch_path_and_pins_no_head() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert_eq!(
+            ag.last_review_head(),
+            None,
+            "a non-review run must not pin a review head"
         );
     }
 

@@ -533,3 +533,34 @@ empty table changes no query, no endpoint and no payload. A database that Rhapso
 longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
 runs steps at or above its own `user_version`, so a v7 database is left alone rather than corrupted,
 and running both daemons against one file was never supported in either direction.
+
+### A third workspace shape and a review-only agent env var (STUDIO-715)
+
+The same ticketless PR-review subsystem needs to run an agent against a pull request rather than a
+ticket. Go v0.4.0 provisions a workspace in exactly two shapes — a shared-mirror worktree and a
+standalone clone — and BOTH create a fresh `symphony/<key>` branch and, on reuse, preserve WIP and
+skip the checkout entirely. Neither can serve a review: a review reads one commit and pushes nothing,
+and the same reviewer re-reviewing the same pull request reuses the same key, so WIP-preserving reuse
+would hand them the STALE previous head while the watch set records the new one as reviewed.
+
+| Provisioning | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| shapes | `worktree` (shared mirror) and `clone` | the same two, unchanged, **plus** a review-mode detached worktree |
+| review-mode checkout | — | `git worktree add --detach <pinned head SHA>` — no branch is created |
+| review-mode reuse | — | hard-resets onto the new head instead of preserving WIP |
+| review-mode teardown | — | explicit, at run exit (a `pr:` id reaches no terminal tracker state, so `reconcile`'s cleanup never fires for it) |
+
+| Agent env | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| reviewed head SHA | — | `SYMPHONY_REVIEW_HEAD` + `RHAPSODY_REVIEW_HEAD` (both spellings, per STUDIO-603) |
+
+`SYMPHONY_REVIEW_HEAD` is additive and **review-only**: it is emitted only when the worker pins a
+head, which happens only on the review path, so every ticket run's child environment stays
+byte-identical to Go's. It carries the SHA the worktree was detached at — pinned once at checkout and
+never re-queried — so a review reports on the commit it actually read rather than on whatever the
+author pushed while it was reading.
+
+**Off is still off.** The review dispatch refuses before it touches the store, the running set or a
+worktree unless `teams.enabled`, and nothing outside that path can reach the new provisioning shape:
+`WorkerDeps.review` is `None` for every ticket dispatch, which is what leaves the two existing paths
+byte-identical.
