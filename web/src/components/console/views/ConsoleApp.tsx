@@ -12,12 +12,14 @@ import { useConsoleRoute } from "@/hooks/useConsoleRoute";
 import { useIssueRuns } from "@/hooks/useHistory";
 import { useStateQuery } from "@/hooks/useStateQuery";
 import { useReinstateFact, useVersionQuery } from "@/hooks/useTeams";
+import { useUpdater, type Updater } from "@/hooks/useUpdater";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
 import { ManageTeamView } from "./ManageTeamView";
 import { MemoryView } from "./MemoryView";
 import { SettingsView } from "./SettingsView";
+import { LogsView, ToolsView, UpdatesView } from "./SettingsTabView";
 import { WorkflowView } from "./WorkflowView";
 
 // The Rhapsody Console shell — STUDIO-681 §2, built by STUDIO-683. The persistent rail on every
@@ -36,6 +38,11 @@ export function ConsoleApp() {
   const teamsEnabled = version.data === undefined ? undefined : version.data.teams_enabled === true;
   const [route, navigate] = useConsoleRoute(teamsEnabled);
   const openJobs = useOpenJobCount();
+  // ONE updater instance, owned by the shell and shared — the hook's own contract (P11 U3), and the
+  // reason the Podium shell mounts it too. Here it feeds both the Settings "Updates" row's pending
+  // badge and the Updates view itself, so the two can never disagree. Without the Tauri bridge every
+  // binding it calls is a no-op, so the daemon-served dashboard mounts it inert.
+  const updater = useUpdater();
 
   const items = useMemo<NavItemSpec[]>(
     () => [
@@ -59,7 +66,7 @@ export function ConsoleApp() {
       onNavigate={(id) => go(id as ConsoleRouteName)}
       foot={<RailFoot version={version.data?.version ?? ""} teamsEnabled={teamsEnabled === true} />}
     >
-      <ConsoleBody route={route} teamsEnabled={teamsEnabled} go={go} />
+      <ConsoleBody route={route} teamsEnabled={teamsEnabled} go={go} updater={updater} />
     </AppShell>
   );
 }
@@ -88,10 +95,12 @@ function ConsoleBody({
   route,
   teamsEnabled,
   go,
+  updater,
 }: {
   route: ConsoleRoute;
   teamsEnabled: boolean | undefined;
   go: (name: ConsoleRouteName, key?: string) => void;
+  updater: Updater;
 }) {
   // A teams-only route reached before the capability is known renders nothing rather than
   // guessing: one frame of blank beats a placeholder for a view that may be about to redirect.
@@ -109,14 +118,25 @@ function ConsoleBody({
       return (
         <SettingsView
           teamsEnabled={teamsEnabled === true}
+          updater={updater}
           onManageTeam={() => go("manage")}
           onEditWorkflow={() => go("workflow")}
+          onOpen={(to) => go(to)}
         />
       );
     // The WORKFLOW.md editor the Settings "Workflow" row opens (§8, STUDIO-690). It is NOT
     // teams-gated: WORKFLOW.md is the solo daemon's config too.
     case "workflow":
       return <WorkflowView onNavigate={(to) => go(to)} />;
+    // The three Settings children of §8.1 (STUDIO-691), each embedding the shipped Podium tab the
+    // §2.2.1 flip would otherwise strand. Like `workflow`, none is teams-gated — the tool doctor,
+    // the log tail and the desktop updater all exist on a solo daemon.
+    case "tools":
+      return <ToolsView onNavigate={(to) => go(to)} />;
+    case "logs":
+      return <LogsView onNavigate={(to) => go(to)} />;
+    case "updates":
+      return <UpdatesView onNavigate={(to) => go(to)} updater={updater} />;
     // teams / memory / manage are only ever reached with Teams ON — `useConsoleRoute` sends
     // them to Jobs otherwise (§2.4). All three views are built: §5's room (STUDIO-684), §6's
     // memory page (STUDIO-685) and §7's manage form (STUDIO-686).
