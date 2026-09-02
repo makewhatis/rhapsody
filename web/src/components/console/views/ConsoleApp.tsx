@@ -17,6 +17,7 @@ import { JobsView } from "./JobsView";
 import { ManageTeamView } from "./ManageTeamView";
 import { MemoryView } from "./MemoryView";
 import { SettingsView } from "./SettingsView";
+import { WorkflowView } from "./WorkflowView";
 
 // The Rhapsody Console shell — STUDIO-681 §2, built by STUDIO-683. The persistent rail on every
 // view, the capability gate that decides what it contains, and the router that decides what the
@@ -104,7 +105,17 @@ function ConsoleBody({
     case "job":
       return <JobDetailView issue={route.key} onNavigate={(to) => go(to)} />;
     case "settings":
-      return <SettingsView teamsEnabled={teamsEnabled === true} onManageTeam={() => go("manage")} />;
+      return (
+        <SettingsView
+          teamsEnabled={teamsEnabled === true}
+          onManageTeam={() => go("manage")}
+          onEditWorkflow={() => go("workflow")}
+        />
+      );
+    // The WORKFLOW.md editor the Settings "Workflow" row opens (§8, STUDIO-690). It is NOT
+    // teams-gated: WORKFLOW.md is the solo daemon's config too.
+    case "workflow":
+      return <WorkflowView onNavigate={(to) => go(to)} />;
     // teams / memory / manage are only ever reached with Teams ON — `useConsoleRoute` sends
     // them to Jobs otherwise (§2.4). §6's memory page (STUDIO-685) and §7's manage form
     // (STUDIO-686) are built; the room (§5) is sub-ticket 3 of STUDIO-681.

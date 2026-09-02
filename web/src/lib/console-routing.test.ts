@@ -110,3 +110,24 @@ describe("sameConsoleRoute", () => {
     expect(sameConsoleRoute({ name: "jobs", key: "" }, { name: "teams", key: "" })).toBe(false);
   });
 });
+
+// STUDIO-690 — the WORKFLOW.md editor is a child of Settings (§8): its own route so it is
+// deep-linkable and Back-able, but it highlights Settings in the rail, and it is NOT a teams
+// surface (WORKFLOW.md is the solo daemon's config too, so the gate must leave it alone).
+describe("the workflow route (STUDIO-690)", () => {
+  it("parses and round-trips", () => {
+    expect(parseConsoleRoute("#workflow")).toEqual({ name: "workflow", key: "" });
+    expect(consoleRouteHash({ name: "workflow", key: "" })).toBe("#workflow");
+  });
+
+  it("highlights Settings", () => {
+    expect(consoleNavFor({ name: "workflow", key: "" })).toBe("settings");
+  });
+
+  it("stays reachable with teams off", () => {
+    expect(gateConsoleRoute({ name: "workflow", key: "" }, false)).toEqual({
+      name: "workflow",
+      key: "",
+    });
+  });
+});

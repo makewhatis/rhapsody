@@ -1,0 +1,32 @@
+/* ============================================================================
+   Rhapsody Console — the WORKFLOW.md editor (STUDIO-690; STUDIO-681 spec §8)
+
+   The page chrome the console contributes around the SHIPPED Podium config
+   editor: the section switcher row, the save indicator, and the scope that
+   hands the embedded editor back the two token names both palettes spell the
+   same way. Everything below is scoped under `.rh-console`, like every other
+   console stylesheet, and declares no colour of its own.
+   ============================================================================ */
+
+/* The switcher + save-state row above the embedded editor. */
+.rh-console .wfbar { display: flex; align-items: center; gap: 12px; margin: 0 0 16px; }
+.rh-console .wfbar .save { margin-left: auto; font-size: 11.5px; color: var(--ink-3); }
+.rh-console .wfbar .save.err { color: var(--bad); max-width: 420px; text-align: right; }
+.rh-console .wfbar .save.ok { color: var(--ok); }
+
+/* ---- the embedded Podium editor ----
+   The console palette and the Podium palette (`src/index.css`) spell three token names the same
+   way — see the SCOPE note in `theme/tokens.css`. Inside the embed the PODIUM meaning has to win,
+   because these are Podium components:
+
+     --accent  the one that matters. Podium's is a hover BACKGROUND; the console's is the brand
+               amber, so an outlined button would hover bright amber without this.
+     --line    both mean "hairline", but restoring it keeps the embed's borders matched to the
+               cards it is built from.
+
+   Both are restored from the Podium-only aliases they are declared as at `:root`, so no value is
+   duplicated here. The third name, `--ink`, is deliberately NOT restored: both palettes mean
+   "primary text" by it and the two values are the same colour with the console's cooler bias,
+   while Podium declares it as a literal — so restoring it would mean copying a hex out of
+   `index.css`, which is exactly the duplication §10 box 1.1 forbids. */
+.rh-console .wfembed { --accent: var(--bg-hover); --line: var(--hair-card); }

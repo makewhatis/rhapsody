@@ -53,6 +53,12 @@ vi.mock("@/lib/api", async (orig) => {
     fetchIssueHistory: vi.fn(async () => ({ issue_identifier: "", runs: [] })),
     fetchTeamsRoom: vi.fn(async () => ({ messages: [], skipped: [] })),
     fetchTeamsRecall: vi.fn(async () => ({ identity: "", facts: [], skipped: [] })),
+    // The Workflow editor's data path. These tests assert ROUTING, not editing (the editor
+    // itself is covered in WorkflowView.test.tsx), so a config-less payload is enough — the
+    // view then renders its "couldn't read WORKFLOW.md" state instead of reaching the network.
+    fetchTypedConfig: vi.fn(async () => ({ config: {}, prompt_body: "" })),
+    fetchLinearIdentity: vi.fn(async () => null),
+    fetchProjectStatuses: vi.fn(async () => []),
   };
 });
 
@@ -207,5 +213,24 @@ describe("Settings' Teams row (§8)", () => {
     fireEvent.click(await screen.findByText(/Manage team/));
     await waitFor(() => expect(window.location.hash).toBe("#manage"));
     expect(activeNavs()).toEqual(["teams"]);
+  });
+});
+
+// STUDIO-690 — the Settings "Workflow" row is the entrance to the WORKFLOW.md editor (§8).
+describe("Settings' Workflow row (§8, STUDIO-690)", () => {
+  it("opens the WORKFLOW.md editor, which highlights Settings", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#settings");
+    fireEvent.click(await screen.findByRole("button", { name: /Edit/ }));
+    await waitFor(() => expect(window.location.hash).toBe("#workflow"));
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Workflow"));
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  it("stays reachable with teams off — WORKFLOW.md is the solo daemon's config too", async () => {
+    h.fetchVersion.mockResolvedValue(version(false));
+    mount("#workflow");
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Workflow"));
+    expect(window.location.hash).toBe("#workflow");
   });
 });
