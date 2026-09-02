@@ -412,7 +412,13 @@ impl Orchestrator {
         report.armed += self.handle_review_head_advanced(pr, head);
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
-        for row in &mine {
+        // Who currently holds each of this pull request's required reviews, updated AS the loop
+        // reassigns. `mine` is the tick's opening snapshot, so reading peers off it directly would
+        // go stale the moment one row is reassigned: the next row would still see the retired
+        // reviewer as a peer and not see the substitute, and could hand that substitute a second
+        // required review of the same pull request.
+        let mut assigned: Vec<String> = mine.iter().map(|r| r.key.reviewer.clone()).collect();
+        for (idx, row) in mine.iter().enumerate() {
             let id = review_key(
                 &row.key.owner,
                 &row.key.repo,
@@ -449,10 +455,11 @@ impl Orchestrator {
             // in `running`, so the SECOND round of this tick sees the first one's load and picks
             // somebody else.
             let load = LoadSnapshot::from_running(&self.running);
-            let peers: HashSet<&str> = mine
+            let peers: HashSet<String> = assigned
                 .iter()
-                .map(|r| r.key.reviewer.as_str())
-                .filter(|name| *name != row.key.reviewer)
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .map(|(_, name)| name.clone())
                 .collect();
             let Some(chosen) = self.choose_review_reviewer(row, &peers, &load) else {
                 tracing::debug!(
@@ -477,6 +484,7 @@ impl Orchestrator {
                 continue;
             };
             let reassigned = chosen != row.key.reviewer;
+            let picked = chosen.clone();
             let run = ReviewRun {
                 owner: row.key.owner.clone(),
                 repo: row.key.repo.clone(),
@@ -496,6 +504,7 @@ impl Orchestrator {
                 ReviewDispatchOutcome::Dispatched => {
                     report.dispatched += 1;
                     *slots -= 1;
+                    assigned[idx] = picked;
                     if reassigned {
                         // The round moved to a substitute, so the incumbent's row leaves the watch
                         // set rather than staying beside theirs: it is the SAME required review,
@@ -550,7 +559,7 @@ impl Orchestrator {
     fn choose_review_reviewer(
         &self,
         row: &ReviewWatchRow,
-        peers: &HashSet<&str>,
+        peers: &HashSet<String>,
         load: &LoadSnapshot,
     ) -> Option<String> {
         let teams = self.teams.as_ref()?;
@@ -1329,6 +1338,57 @@ mod tests {
         let mut picked = reviewers_of(&dispatched);
         picked.sort();
         assert_eq!(picked, vec!["carol".to_string(), "dave".to_string()]);
+    }
+
+    /// Two rows of one pull request BOTH reassigned in the same tick must not land on the same
+    /// substitute. The tick's opening snapshot goes stale the moment the first row is reassigned —
+    /// it still names the retired reviewer as a peer and does not name the substitute — so the
+    /// second row would otherwise be handed a teammate who already holds one of this pull request's
+    /// required reviews.
+    #[test]
+    fn two_reassignments_in_one_tick_do_not_land_on_the_same_substitute() {
+        let (mut o, dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![
+                ident("alice", 0),
+                ident("bob", 1),
+                ident("dave", 1),
+                ident("carol", 0),
+                ident("erin", 0),
+            ],
+        ));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "dave"));
+        // Both incumbents are at their cap, so both rounds must be reassigned. `erin` carries a
+        // standing load so that `carol` STAYS the least-loaded candidate even after taking the
+        // first round — without which the live load snapshot alone would separate the two, and
+        // this test would pass on the stale peer set it exists to catch.
+        for (n, who) in [
+            ("iss-1", "bob"),
+            ("iss-2", "dave"),
+            ("iss-3", "erin"),
+            ("iss-4", "erin"),
+        ] {
+            let mut busy = RunningEntry::empty(rhapsody_core::Issue {
+                id: n.to_string(),
+                identifier: format!("STUDIO-{n}"),
+                ..Default::default()
+            });
+            busy.identity = who.to_string();
+            o.running.insert(n.to_string(), busy);
+        }
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 2);
+        let mut picked = reviewers_of(&dispatched);
+        picked.sort();
+        assert_eq!(
+            picked,
+            vec!["carol".to_string(), "erin".to_string()],
+            "one substitute must not take both of a pull request's required reviews"
+        );
     }
 
     // --- gating and the dispatch-side allowlist ----------------------------------------------
