@@ -308,24 +308,22 @@ describe("Settings' Tools/Logs/Updates rows (§8.1, STUDIO-691)", () => {
   // Every one of the three is a solo-daemon surface — the tool doctor probes local CLIs, the log
   // tail is the daemon's own process log, and the updater updates the app. Gating them on teams
   // would strand a solo operator on Jobs, and Updates is the desktop app's whole update path.
-  it.each(["#tools", "#logs", "#updates"])("keeps %s reachable with teams off", async (hash) => {
+  it.each([
+    ["#tools", "Tools"],
+    ["#logs", "Logs"],
+    ["#updates", "Updates"],
+  ])("keeps %s reachable with teams off", async (hash, heading) => {
     h.fetchVersion.mockResolvedValue(version(false));
     mount(hash);
-    await waitFor(() =>
-      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(hash.slice(1, 2).toUpperCase() + hash.slice(2)),
-    );
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(heading));
     expect(window.location.hash).toBe(hash);
     expect(activeNavs()).toEqual(["settings"]);
   });
 
-  it("returns to Settings from each breadcrumb", async () => {
+  it.each(["#tools", "#logs", "#updates"])("returns to Settings from %s's breadcrumb", async (hash) => {
     h.fetchVersion.mockResolvedValue(version(true));
-    for (const hash of ["#tools", "#logs", "#updates"]) {
-      window.location.hash = hash;
-      mount(hash);
-      fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
-      await waitFor(() => expect(window.location.hash).toBe("#settings"));
-      cleanup();
-    }
+    mount(hash);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    await waitFor(() => expect(window.location.hash).toBe("#settings"));
   });
 });
