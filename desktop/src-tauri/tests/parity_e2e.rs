@@ -23,6 +23,12 @@ use rhapsody_desktop::supervisor::{Options, State, Supervisor, resolve_binary, r
 
 const GATE: &str = "RHAPSODY_PARITY_E2E";
 
+/// Total budget for `/api/v1/state` to answer 200 through the apiproxy once the daemon is healthy.
+const STATE_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cadence of that poll — the same order as the supervisor's own 250ms `/healthz` readiness poll,
+/// short enough that the usual case (the snapshot lands almost immediately) costs one extra tick.
+const STATE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 #[tokio::test]
 async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
     if std::env::var_os(GATE).is_none() {
@@ -139,27 +145,10 @@ async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
         body.chars().take(200).collect::<String>()
     );
 
-    // Drive the app's apiproxy (same-origin `/api/*` forwarding) against the LIVE daemon.
-    let state = sup.status().state;
-    let proxy_url = sup.url();
-    let resp = apiproxy::handle(
-        ProxyRequest {
-            method: Method::GET,
-            path: "/api/v1/state".to_string(),
-            query: None,
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        },
-        &client,
-        |_| panic!("an /api/* request must not fall through to the asset handler"),
-        move || apiproxy::usable_base_url(state, &proxy_url),
-    )
-    .await;
-    assert_eq!(
-        resp.status,
-        StatusCode::OK,
-        "apiproxy did not forward /api/v1/state to the live daemon"
-    );
+    // Drive the app's apiproxy (same-origin `/api/*` forwarding) against the LIVE daemon, polled to
+    // a bound rather than asked once — see [`poll_proxy_state`] for why a single GET races the
+    // daemon's snapshot-ready window.
+    let resp = poll_proxy_state(&sup, &client).await;
     assert!(
         !resp.body.is_empty(),
         "apiproxy returned an empty /api/v1/state body"
@@ -177,6 +166,58 @@ async fn app_supervises_real_rhapsodyd_start_healthy_dashboard_stop() {
     eprintln!(
         "parity e2e OK: app supervised the packaged rhapsodyd start -> healthy -> dashboard -> stop"
     );
+}
+
+/// Drives the app's apiproxy at `GET /api/v1/state` until it forwards a 200 from the live daemon,
+/// bounded by [`STATE_POLL_TIMEOUT`], and returns that response.
+///
+/// `/healthz` answers as soon as the daemon's HTTP server is up, which can be BEFORE the
+/// orchestrator has published its first snapshot — `handle_state` then returns a transient 503
+/// `snapshot_unavailable` (its own `SNAPSHOT_TIMEOUT` elapsing). A single unretried GET straight
+/// after `sup.start` catches exactly that window and fails a run that is not actually broken. So
+/// this polls the same way `sup.start` already polls `/healthz`. (A transient 502 from a failed
+/// forward is a separate matter — the daemon's server is demonstrably up by then — but retrying
+/// absorbs that too.)
+///
+/// Retrying does NOT mask a real forward break: a `/state` that never reaches 200 within the bound
+/// still fails the test, reporting the last status and body it saw.
+///
+/// The daemon target is re-resolved from the supervisor on EVERY attempt, exactly as the proxy does
+/// in the running app (see `apiproxy::handle`) — the bound port is reassigned across a restart, so a
+/// target captured once before the loop could go stale mid-poll.
+async fn poll_proxy_state(sup: &Supervisor, client: &reqwest::Client) -> apiproxy::ProxyResponse {
+    let deadline = Instant::now() + STATE_POLL_TIMEOUT;
+    loop {
+        let state = sup.status().state;
+        let proxy_url = sup.url();
+        let resp = apiproxy::handle(
+            ProxyRequest {
+                method: Method::GET,
+                path: "/api/v1/state".to_string(),
+                query: None,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+            client,
+            |_| panic!("an /api/* request must not fall through to the asset handler"),
+            || apiproxy::usable_base_url(state, &proxy_url),
+        )
+        .await;
+        if resp.status == StatusCode::OK {
+            return resp;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "apiproxy did not forward /api/v1/state to the live daemon within \
+             {STATE_POLL_TIMEOUT:?}; last response: {} {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        );
+        tokio::time::sleep(STATE_POLL_INTERVAL).await;
+    }
 }
 
 /// The repo-root workspace: `CARGO_MANIFEST_DIR` is `desktop/src-tauri`, so it is two levels up.
