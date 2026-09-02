@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { DaemonVersion } from "@/lib/api";
+import type { StatusDTO } from "@/lib/bindings";
 
 // STUDIO-681 §10, sub-ticket 2 — the app shell's acceptance boxes 2.1-2.5 and 2.12.
 //
@@ -11,7 +12,29 @@ import type { DaemonVersion } from "@/lib/api";
 // what §2.2 promises is about the RENDERED rail — "absent from the DOM, not merely hidden" is
 // not a claim a pure function can make.
 
-const h = vi.hoisted(() => ({ fetchVersion: vi.fn() }));
+const h = vi.hoisted(() => ({
+  fetchVersion: vi.fn(),
+  getStatus: vi.fn(),
+  credentialStatus: vi.fn(),
+  listLinearProjects: vi.fn(),
+  probeTools: vi.fn(),
+  writeInitialConfig: vi.fn(),
+}));
+
+// The supervisor bridge. `getStatus` is the first-run gate's input (STUDIO-692); the four below
+// are the SHIPPED wizard's own data path, stood in for so the first-run flow can be driven to its
+// partial-write failure. Everything else stays the real binding.
+vi.mock("@/lib/bindings", async (orig) => {
+  const actual = await orig<typeof import("@/lib/bindings")>();
+  return {
+    ...actual,
+    getStatus: h.getStatus,
+    credentialStatus: h.credentialStatus,
+    listLinearProjects: h.listLinearProjects,
+    probeTools: h.probeTools,
+    writeInitialConfig: h.writeInitialConfig,
+  };
+});
 
 vi.mock("@/lib/api", async (orig) => {
   const actual = await orig<typeof import("@/lib/api")>();
@@ -92,8 +115,29 @@ function activeNavs(): string[] {
   );
 }
 
+function status(configured: boolean): StatusDTO {
+  return {
+    state: configured ? "running" : "stopped",
+    pid: configured ? 42 : 0,
+    restarts: 0,
+    last_err: "",
+    url: "http://127.0.0.1:8080",
+    healthy: configured,
+    agent_count: 0,
+    configured,
+  };
+}
+
 beforeEach(() => {
   window.history.replaceState(null, "", "/");
+  // A plain browser has no supervisor bridge, so `getStatus` resolves null and the shell reads
+  // "loading" — never "not-configured". That is the default every other test here runs under.
+  h.getStatus.mockResolvedValue(null);
+  h.credentialStatus.mockResolvedValue({ has_token: true });
+  h.listLinearProjects.mockResolvedValue([
+    { id: "1", name: "Rhapsody", slug: "872639248532", team: "FND", color: "#10b981" },
+  ]);
+  h.probeTools.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -266,5 +310,150 @@ describe("every rail destination is the real view (§10 box 6.3)", () => {
     fireEvent.click(await screen.findByText("Open memory →"));
     await waitFor(() => expect(window.location.hash).toBe("#memory"));
     expect(activeNavs()).toEqual(["memory"]);
+  });
+});
+
+// STUDIO-691 — the §8.1 Settings-parity rows: Tools, Logs and Updates.
+//
+// The STUDIO-687 audit found all three unreachable from the console (gaps G4, G5, G3) while the
+// shipped Podium Settings nav has them, which blocks the §2.2.1 flip. These tests assert the same
+// thing box 6.3 asserts of the rail — that the row reaches the REAL surface, not a stub — and they
+// key off each shipped tab's own furniture rather than the heading, because a heading test would
+// pass against a re-implementation that lost the capability.
+describe("Settings' Tools/Logs/Updates rows (§8.1, STUDIO-691)", () => {
+  it("opens the tool doctor, which highlights Settings", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#settings");
+    fireEvent.click(await screen.findByRole("button", { name: "Open Tools" }));
+    await waitFor(() => expect(window.location.hash).toBe("#tools"));
+    expect(await screen.findByRole("button", { name: /Re-run preflight/ })).toBeTruthy();
+    expect(screen.getByText("Required CLIs")).toBeTruthy();
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  it("opens the live log stream, which highlights Settings", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#settings");
+    fireEvent.click(await screen.findByRole("button", { name: "Open Logs" }));
+    await waitFor(() => expect(window.location.hash).toBe("#logs"));
+    expect(await screen.findByRole("tablist", { name: "Log level filter" })).toBeTruthy();
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  it("opens the desktop updater, which highlights Settings", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount("#settings");
+    fireEvent.click(await screen.findByRole("button", { name: "Open Updates" }));
+    await waitFor(() => expect(window.location.hash).toBe("#updates"));
+    expect(await screen.findByRole("button", { name: /Check for updates/i })).toBeTruthy();
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  // Every one of the three is a solo-daemon surface — the tool doctor probes local CLIs, the log
+  // tail is the daemon's own process log, and the updater updates the app. Gating them on teams
+  // would strand a solo operator on Jobs, and Updates is the desktop app's whole update path.
+  it.each([
+    ["#tools", "Tools"],
+    ["#logs", "Logs"],
+    ["#updates", "Updates"],
+  ])("keeps %s reachable with teams off", async (hash, heading) => {
+    h.fetchVersion.mockResolvedValue(version(false));
+    mount(hash);
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(heading));
+    expect(window.location.hash).toBe(hash);
+    expect(activeNavs()).toEqual(["settings"]);
+  });
+
+  it.each(["#tools", "#logs", "#updates"])("returns to Settings from %s's breadcrumb", async (hash) => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    mount(hash);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    await waitFor(() => expect(window.location.hash).toBe("#settings"));
+  });
+});
+
+// STUDIO-692 — first run (§8.1, STUDIO-687 audit G2).
+//
+// The Podium shell swaps its whole chrome for the Onboarding wizard when the supervisor reports
+// `configured: false`; a console that skipped this would flip live and hand a fresh install a
+// config-less shell with nothing behind any of its rows. So the gate belongs to the shell, above
+// the router: it pre-empts every route, including a deep link.
+describe("first run routes to onboarding (§8.1, audit G2)", () => {
+  it("shows the onboarding wizard when the daemon reports not-configured", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(false));
+    mount();
+    expect(await screen.findByRole("progressbar", { name: "Onboarding progress" })).toBeTruthy();
+    // The rail is gone with it — every destination on it needs the config that does not exist.
+    expect(document.querySelector("nav[aria-label='Primary']")).toBeNull();
+  });
+
+  it("renders the console normally when the daemon is configured", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(true));
+    mount();
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "teams", "memory", "settings"]));
+    expect(screen.queryByRole("progressbar", { name: "Onboarding progress" })).toBeNull();
+  });
+
+  it("renders the console normally with no supervisor bridge at all (a plain browser)", async () => {
+    h.fetchVersion.mockResolvedValue(version(false));
+    h.getStatus.mockResolvedValue(null);
+    mount();
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "settings"]));
+    expect(screen.queryByRole("progressbar", { name: "Onboarding progress" })).toBeNull();
+  });
+
+  it("pre-empts a deep link — a fresh install cannot use #settings either", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(false));
+    mount("#settings");
+    expect(await screen.findByRole("progressbar", { name: "Onboarding progress" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 1, name: "Settings" })).toBeNull();
+  });
+
+  it("swaps to the console once the wizard has seeded a config", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(false));
+    mount();
+    expect(await screen.findByRole("progressbar", { name: "Onboarding progress" })).toBeTruthy();
+    // The wizard's success path calls back into the shell, which re-reads status; the poll would
+    // reach the same place a beat later.
+    h.getStatus.mockResolvedValue(status(true));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "teams", "memory", "settings"]), {
+      timeout: 4000,
+    });
+    expect(screen.queryByRole("progressbar", { name: "Onboarding progress" })).toBeNull();
+  });
+});
+
+// The first-run failure the console must not lose: `writeInitialConfig` can write WORKFLOW.md and
+// THEN fail to start the daemon, so the very next status poll reports `configured: true` and the
+// shell swaps the wizard — and its inline alert — away. The message is held above that swap, in
+// the shell, or the operator is left in a console whose daemon is down with nothing said.
+describe("a partial first-run write survives the swap into the console", () => {
+  it("keeps the wizard's failure on screen after the config lands and the shell swaps", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(false));
+    h.writeInitialConfig.mockRejectedValue(new Error("config saved, but the daemon could not start"));
+    mount();
+
+    fireEvent.click(await screen.findByRole("radio", { name: "Rhapsody" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await screen.findByText(/STEP 3 OF 3/);
+    // The config lands; the daemon does not start. The poll will now see it as configured.
+    h.getStatus.mockResolvedValue(status(true));
+    fireEvent.click(screen.getByRole("button", { name: "Start playing" }));
+
+    // The shell swaps to the console...
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "teams", "memory", "settings"]), {
+      timeout: 4000,
+    });
+    // ...and the failure came with it.
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("config saved, but the daemon could not start");
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
 });

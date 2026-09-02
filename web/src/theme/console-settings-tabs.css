@@ -1,0 +1,31 @@
+/* ============================================================================
+   Rhapsody Console — the embedded Settings tabs (STUDIO-691; STUDIO-681 §8.1)
+
+   Tools, Logs and Updates are the SHIPPED Podium tab components rendered inside
+   the console shell, so the only thing this file contributes is the scope that
+   hands those components back the token names both palettes spell the same way.
+   Everything is scoped under `.rh-console`, like every other console
+   stylesheet, and declares no colour of its own.
+   ============================================================================ */
+
+/* ---- the embedded Podium tabs ----
+   Same restoration, same reasons, as `.wfembed` in `console-workflow.css` — see the SCOPE note in
+   `theme/tokens.css`. Inside the embed the PODIUM meaning of these names has to win, because these
+   are Podium components:
+
+     --accent  Podium's is a hover BACKGROUND; the console's is the brand amber, so the Tools tab's
+               ghost/subtle buttons and the Updates card's actions would hover bright amber without
+               this.
+     --line    both mean "hairline", but restoring it keeps the Updates card's borders matched to
+               the Podium card it is built from.
+
+   Both are restored from the Podium-only aliases they are declared as at `:root`, so no value is
+   duplicated here. `--ink` is deliberately NOT restored, for the reason `console-workflow.css`
+   gives: both palettes mean "primary text" by it, and restoring it would mean copying a hex out of
+   `index.css`.
+
+   This rule is a deliberate second declaration site rather than a shared class: folding it together
+   with `.wfembed` would mean editing a shipped slice's stylesheet and the source-contract test that
+   pins it. When the Podium layer retires and `tokens.css` is promoted to `:root` (see its SCOPE
+   note), BOTH rules go away together. */
+.rh-console .tabembed { --accent: var(--bg-hover); --line: var(--hair-card); }

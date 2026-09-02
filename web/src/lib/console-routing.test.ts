@@ -131,3 +131,30 @@ describe("the workflow route (STUDIO-690)", () => {
     });
   });
 });
+
+// STUDIO-691 — Tools, Logs and Updates are Settings children, exactly like `workflow` (§8.1). They
+// are the three surfaces the shipped Podium Settings has that the console did not, and the go-live
+// flip (§10 box 6.4) is blocked until they are reachable. None is a teams surface: the tool doctor,
+// the daemon log tail and the desktop updater all exist on a solo daemon.
+describe("the Settings tab routes (STUDIO-691)", () => {
+  const routes = ["tools", "logs", "updates"] as const;
+
+  it("parse and round-trip", () => {
+    for (const name of routes) {
+      expect(parseConsoleRoute(`#${name}`)).toEqual({ name, key: "" });
+      expect(consoleRouteHash({ name, key: "" })).toBe(`#${name}`);
+    }
+  });
+
+  it("highlight Settings", () => {
+    for (const name of routes) {
+      expect(consoleNavFor({ name, key: "" })).toBe("settings");
+    }
+  });
+
+  it("stay reachable with teams off", () => {
+    for (const name of routes) {
+      expect(gateConsoleRoute({ name, key: "" }, false)).toEqual({ name, key: "" });
+    }
+  });
+});
