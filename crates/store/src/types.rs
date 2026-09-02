@@ -262,3 +262,74 @@ pub struct RunMessage {
     pub status: String,
     pub delivered_turn: Option<i64>,
 }
+
+// --- ticketless review watch set (STUDIO-703 / STUDIO-711) -----------------------------------
+// Values for rhapsody_review_watch.status. NOT a Go port: the frozen reference has no review
+// feature at all (see the README "Divergences" entry). The set is closed and exhaustive — a row
+// is always in exactly one of these five states.
+
+/// The (PR, reviewer) pair is in the watch set and wants a review, but no reviewer run has been
+/// dispatched for the current head yet.
+pub const REVIEW_STATUS_REQUESTED: &str = "requested";
+/// A reviewer run has been dispatched against [`ReviewWatchRow::requested_sha`] and has not
+/// finished. This is the in-flight marker the F-DUP edge-trigger gates on (design §14.1).
+pub const REVIEW_STATUS_IN_FLIGHT: &str = "in_flight";
+/// The reviewer finished and posted findings; [`ReviewWatchRow::last_reviewed_sha`] holds the SHA
+/// they actually read. A later head advance re-arms the row.
+pub const REVIEW_STATUS_REVIEWED: &str = "reviewed";
+/// The reviewer finished and found nothing. Re-review pauses while the PR stays open at this SHA
+/// and a head advance re-arms exactly one more review (design §15-c, "approved-pauses").
+pub const REVIEW_STATUS_APPROVED: &str = "approved";
+/// The PR left the watch set — merged, closed, or gone. Terminal; paired with `open = false`.
+pub const REVIEW_STATUS_DROPPED: &str = "dropped";
+
+/// ReviewWatchKey identifies one watch-set row: a pull request and the ONE reviewer watching it.
+///
+/// Granularity is per-(PR, reviewer) on purpose. A single `last_reviewed_sha` per PR lets the first
+/// completer stamp the PR as reviewed-at-head and silently drops a second reviewer whose run
+/// crashed (design §14.2, "N reviewers share one per-PR SHA"), so the reviewer is part of the key
+/// rather than a column on a per-PR row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReviewWatchKey {
+    /// GitHub repository owner (the `owner` of `owner/repo#number`).
+    pub owner: String,
+    /// GitHub repository name.
+    pub repo: String,
+    /// Pull-request NUMBER — the stable, number-keyed coordinate Slice 1's `gh` primitive takes.
+    pub number: i64,
+    /// The reviewing teammate's Teams identity (the `rhapsody:@<name>` label's name).
+    pub reviewer: String,
+}
+
+/// ReviewWatchRow is one durable watch-set entry: a (PR, reviewer) pair, where it came from, the
+/// two head SHAs that make the watcher idempotent, and the PR's own liveness.
+///
+/// Both SHA columns hold a full head commit SHA — the same value Slice 1's number-keyed `gh`
+/// primitive returns as `headRefOid` — and they are written at two DIFFERENT moments by two
+/// dedicated methods; see [`crate::Store::mark_review_requested`] and
+/// [`crate::Store::mark_review_completed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewWatchRow {
+    /// The (PR, reviewer) identity of this row.
+    pub key: ReviewWatchKey,
+    /// Origin — how this PR entered the watch set (a handoff's own resolved `repo_url`, or an
+    /// operator introducing it through the authenticated console). A PR coordinate is NEVER
+    /// trusted from room text (design §14.1 F-SEC), so the origin is recorded, not inferred.
+    pub introduced_by: String,
+    /// The head SHA a reviewer run was DISPATCHED against, written at dispatch. Without it the
+    /// re-review condition is level-triggered and stays true every tick from introduction until
+    /// the first completion, re-dispatching onto a live worktree (design §14.1 F-DUP).
+    pub requested_sha: String,
+    /// The head SHA a completed review ACTUALLY read — the SHA pinned at checkout, never a
+    /// completion-time re-query, which would record fixes pushed mid-review as reviewed
+    /// (design §14.1 F-SHA). Empty until this reviewer has completed a round.
+    pub last_reviewed_sha: String,
+    /// One of the five `REVIEW_STATUS_*` values above.
+    pub status: String,
+    /// Whether the pull request is still OPEN. Mirrors Slice 1's PR state: its `OPEN` maps to
+    /// `true`; `MERGED`, `CLOSED` and gone (404) all map to `false`, which is the watcher's drop
+    /// condition. Kept a flag rather than the four-way state because the store's question is only
+    /// "is this still worth watching" — WHY it stopped being open is the watcher's, and it lands
+    /// on `status` as [`REVIEW_STATUS_DROPPED`].
+    pub open: bool,
+}
