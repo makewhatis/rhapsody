@@ -35,9 +35,13 @@
 /* ===== shell (§1.3 AppShell / NavItem) ===== */
 .app.rh-console { display: grid; grid-template-columns: 214px 1fr; min-height: 100vh; }
 .rh-console .rail { border-right: 1px solid var(--line); background: var(--panel); padding: 16px 12px; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 3px; }
-.rh-console .rail .logo { display: flex; align-items: center; gap: 9px; padding: 4px 8px 16px; }
-.rh-console .rail .logo b { font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
-.rh-console .rail .logo .mk { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(150deg, var(--accent), #b5643a); display: grid; place-items: center; color: #160c05; font-weight: 700; font-size: 13px; }
+/* The logo lockup. Not `.rail`-scoped: the first-run screen (console-firstrun.css) shows the same
+   mark and wordmark outside the rail, and duplicating the gradient's literal shades into a second
+   stylesheet is exactly the copy §10 box 1.1 forbids. Only the rail's own padding stays here. */
+.rh-console .logo { display: flex; align-items: center; gap: 9px; }
+.rh-console .rail .logo { padding: 4px 8px 16px; }
+.rh-console .logo b { font-weight: 700; font-size: 15px; letter-spacing: -.01em; }
+.rh-console .logo .mk { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(150deg, var(--accent), #b5643a); display: grid; place-items: center; color: #160c05; font-weight: 700; font-size: 13px; }
 .rh-console .nav a { display: flex; align-items: center; gap: 11px; padding: 8px 10px; border-radius: var(--r-sm); color: var(--ink-2); font-size: 13px; font-weight: 450; cursor: pointer; }
 .rh-console .nav a:hover { background: var(--panel-2); color: var(--ink); }
 .rh-console .nav a.active { background: var(--raise); color: var(--ink); font-weight: 600; }

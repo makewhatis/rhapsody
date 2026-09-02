@@ -31,13 +31,15 @@ export function FirstRunView({ onConfigured, onError, error, onDismissError }: F
   return (
     <div className="rh-console setup">
       {/* The rail's identity without the rail: there is nothing to navigate to yet, so the bar
-          carries the mark, the wordmark and a SETUP marker and nothing else (Podium's
+          carries the rail's own `.logo` lockup and a SETUP marker, and nothing else (Podium's
           `SetupToolbar` makes the same trade). */}
       <header className="setuphead">
-        <span className="mk" aria-hidden="true">
-          R
+        <span className="logo">
+          <span className="mk" aria-hidden="true">
+            R
+          </span>
+          <b>rhapsodyd</b>
         </span>
-        <b>rhapsodyd</b>
         <span className="caps">Setup</span>
       </header>
       <main className="setupwrap">
