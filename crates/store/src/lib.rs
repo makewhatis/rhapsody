@@ -238,6 +238,18 @@ pub trait Store {
         status: &str,
     ) -> Result<(), StoreError>;
 
+    /// Records that a reviewer run ENDED without finishing its round — it burned its whole turn
+    /// budget mid-review — by parking `status` at [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER
+    /// SHA column (STUDIO-721).
+    ///
+    /// Deliberately not a `mark_review_completed` with a third status: that method's contract is to
+    /// advance `last_reviewed_sha`, and advancing it here is precisely the bug — the head was read
+    /// only partially, so a watcher reading `last_reviewed_sha == head` would consider a partial
+    /// review sufficient and never look at that head again. Leaving both SHAs alone keeps the row
+    /// non-terminal, which is what re-arms the same head for another round. A no-op when the row is
+    /// absent.
+    fn mark_review_truncated(&self, key: &ReviewWatchKey) -> Result<(), StoreError>;
+
     /// Drops one (PR, reviewer) row out of the watch set: clears `open` and parks `status` at
     /// [`REVIEW_STATUS_DROPPED`]. The terminal for Slice 1's `MERGED` / `CLOSED` / gone states.
     /// Both SHAs are left intact as the record of what was reviewed. Idempotent, and a no-op when

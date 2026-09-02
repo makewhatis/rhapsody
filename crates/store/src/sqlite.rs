@@ -8,7 +8,8 @@
 //!
 //! # The one divergent schema object, and how the golden still gates the rest (STUDIO-711)
 //!
-//! Migration step 7 (`rhapsody_review_watch`) has no Go counterpart: it is the ticketless
+//! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column) have no Go
+//! counterpart: they are the ticketless
 //! PR-review watch set, a feature the frozen v0.4.0 reference does not have. That creates a
 //! problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
@@ -37,9 +38,10 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Step 7 is Rhapsody-only (the ticketless review watch set) and is the one
-/// documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 7;
+/// Go v0.4.0 froze at 6. Steps 7 and 8 are Rhapsody-only (the ticketless review watch set, then its
+/// `author` column) and are the one documented reason this number is ahead of the reference — see
+/// the module doc above.
+const SCHEMA_VERSION: i64 = 8;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -155,6 +157,16 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_watch (
   PRIMARY KEY (owner, repo, number, reviewer)
 );
 "#,
+    // v7 -> v8: the pull request's AUTHOR on each watch row (STUDIO-721). Rhapsody-only, on the
+    // Rhapsody-only table, so the golden gates it out by the same name rule.
+    //
+    // A separate step rather than an edit to the step above: step 7 already shipped, so a database
+    // that has run it is at `user_version = 7` and would never re-execute a changed CREATE TABLE.
+    // `ADD COLUMN` with a NOT NULL DEFAULT backfills every existing row with the empty string,
+    // which the reviewer-selection path reads as "author unknown" and fails closed on.
+    r#"
+ALTER TABLE rhapsody_review_watch ADD COLUMN author TEXT NOT NULL DEFAULT '';
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -166,8 +178,8 @@ const DIVERGENT_OBJECT_PREFIX: &str = "rhapsody_";
 /// The `rhapsody_review_watch` columns, in DDL order — the single shared list for the watch-set
 /// queries, read POSITIONALLY by [`map_review_watch`] exactly as [`RUN_COLS`] is by
 /// `map_run_summary`.
-const REVIEW_WATCH_COLS: &str = "owner, repo, number, reviewer, introduced_by, requested_sha, \
-     last_reviewed_sha, status, open";
+const REVIEW_WATCH_COLS: &str = "owner, repo, number, reviewer, author, introduced_by, \
+     requested_sha, last_reviewed_sha, status, open";
 
 /// The `WHERE` clause selecting exactly one (PR, reviewer) row, with `?1..?4` bound from a
 /// [`ReviewWatchKey`] by [`review_watch_key_params`]. Shared by every point read and write so no
@@ -189,11 +201,12 @@ fn map_review_watch(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewWatchRow>
             number: row.get(2)?,
             reviewer: row.get(3)?,
         },
-        introduced_by: row.get(4)?,
-        requested_sha: row.get(5)?,
-        last_reviewed_sha: row.get(6)?,
-        status: row.get(7)?,
-        open: row.get(8)?,
+        author: row.get(4)?,
+        introduced_by: row.get(5)?,
+        requested_sha: row.get(6)?,
+        last_reviewed_sha: row.get(7)?,
+        status: row.get(8)?,
+        open: row.get(9)?,
     })
 }
 
@@ -1000,9 +1013,10 @@ impl Store for Sqlite {
         // or reviewed (F-SHA). They move only via mark_review_requested / mark_review_completed.
         conn.execute(
             "INSERT INTO rhapsody_review_watch
-               (owner, repo, number, reviewer, introduced_by, requested_sha, last_reviewed_sha, status, open)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               (owner, repo, number, reviewer, author, introduced_by, requested_sha, last_reviewed_sha, status, open)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(owner, repo, number, reviewer) DO UPDATE SET
+               author        = excluded.author,
                introduced_by = excluded.introduced_by,
                status        = excluded.status,
                open          = excluded.open",
@@ -1011,6 +1025,7 @@ impl Store for Sqlite {
                 w.key.repo,
                 w.key.number,
                 w.key.reviewer,
+                w.author,
                 w.introduced_by,
                 w.requested_sha,
                 w.last_reviewed_sha,
@@ -1063,6 +1078,27 @@ impl Store for Sqlite {
                 key.reviewer,
                 reviewed_sha,
                 status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn mark_review_truncated(&self, key: &ReviewWatchKey) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // Only `status` moves: both SHA columns are absent from the SET list for the same reason
+        // they are absent from save_review_watch's DO UPDATE, and here the point is sharper — a
+        // truncated round read the requested head only partially, so advancing last_reviewed_sha
+        // would record a partial review as a complete one.
+        conn.execute(
+            &format!(
+                "UPDATE rhapsody_review_watch SET status = ?5 WHERE {REVIEW_WATCH_KEY_WHERE}"
+            ),
+            params![
+                key.owner,
+                key.repo,
+                key.number,
+                key.reviewer,
+                REVIEW_STATUS_TRUNCATED,
             ],
         )?;
         Ok(())
@@ -3004,6 +3040,7 @@ mod tests {
     fn introduced(key: ReviewWatchKey) -> ReviewWatchRow {
         ReviewWatchRow {
             key,
+            author: "alice".into(),
             introduced_by: "handoff".into(),
             requested_sha: String::new(),
             last_reviewed_sha: String::new(),
@@ -3044,6 +3081,7 @@ mod tests {
             set[0],
             ReviewWatchRow {
                 key: wkey("makewhat", "rhapsody", 84, "alice"),
+                author: "alice".into(),
                 introduced_by: "handoff".into(),
                 requested_sha: "aaa111".into(),
                 last_reviewed_sha: "aaa111".into(),
@@ -3054,6 +3092,113 @@ mod tests {
         assert_eq!(set[1].key.number, 85);
         assert_eq!(set[1].status, REVIEW_STATUS_REQUESTED);
         assert_eq!(set[1].requested_sha, "", "nothing was dispatched for #85");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // STUDIO-721: a reviewer run that burned its whole turn budget without finishing is recorded
+    // NON-terminally. `last_reviewed_sha` must NOT move — the head was read only partially, and a
+    // watcher that saw it advance would consider that partial read sufficient and never look at
+    // this head again (which is how an absent review ships as a completed one).
+    #[test]
+    fn a_truncated_round_parks_the_row_without_advancing_either_sha() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let key = wkey("makewhat", "rhapsody", 84, "alice");
+        store.save_review_watch(introduced(key.clone())).expect("introduce");
+        store.mark_review_requested(&key, "aaa111").expect("dispatch");
+
+        store.mark_review_truncated(&key).expect("truncate");
+
+        let row = store.get_review_watch(&key).expect("get").expect("row");
+        assert_eq!(row.status, REVIEW_STATUS_TRUNCATED);
+        assert_eq!(
+            row.requested_sha, "aaa111",
+            "the dispatched head is still the head that needs reviewing"
+        );
+        assert_eq!(
+            row.last_reviewed_sha, "",
+            "a truncated round read the head only partially, so nothing was reviewed at it"
+        );
+    }
+
+    // The author rides the row because nothing else in the daemon still knows it by the time a
+    // capped reviewer needs replacing: `runs` has no identity column.
+    #[test]
+    fn the_author_round_trips_and_survives_re_introduction() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let key = wkey("makewhat", "rhapsody", 84, "jimmy");
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                author: "alice".into(),
+                introduced_by: "handoff:STUDIO-721".into(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+            })
+            .expect("introduce");
+        assert_eq!(
+            store.get_review_watch(&key).expect("get").expect("row").author,
+            "alice"
+        );
+
+        // Re-introduction refreshes provenance (a different handoff may carry a different author),
+        // exactly as it refreshes `introduced_by`.
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                author: "bob".into(),
+                introduced_by: "console".into(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+            })
+            .expect("re-introduce");
+        assert_eq!(
+            store.get_review_watch(&key).expect("get").expect("row").author,
+            "bob"
+        );
+    }
+
+    // A database already at the shipped step-7 schema migrates forward to step 8 rather than
+    // re-running step 7 (which would not add the column) or failing: the ALTER backfills every
+    // existing row with the empty author the selection path fails closed on.
+    #[test]
+    fn a_v7_database_gains_the_author_column_with_an_empty_backfill() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v7.db");
+        {
+            let mut conn = Connection::open(&db).expect("open raw");
+            let tx = conn.transaction().expect("tx");
+            for m in &MIGRATIONS[0..7] {
+                tx.execute_batch(m).expect("apply step");
+            }
+            tx.execute_batch("PRAGMA user_version = 7").expect("stamp v7");
+            tx.commit().expect("commit");
+            conn.execute(
+                "INSERT INTO rhapsody_review_watch (owner, repo, number, reviewer) \
+                 VALUES ('makewhat', 'rhapsody', 84, 'alice')",
+                [],
+            )
+            .expect("insert legacy row");
+        }
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("migrate forward");
+        let version: i64 = store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let row = store
+            .get_review_watch(&wkey("makewhat", "rhapsody", 84, "alice"))
+            .expect("get")
+            .expect("the pre-existing row survives the migration");
+        assert_eq!(
+            row.author, "",
+            "a row written before the column existed has no author, and must read as unknown"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -3166,6 +3311,7 @@ mod tests {
         store
             .save_review_watch(ReviewWatchRow {
                 key: key.clone(),
+                author: "alice".into(),
                 introduced_by: "operator".into(),
                 requested_sha: String::new(),
                 last_reviewed_sha: String::new(),
