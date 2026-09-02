@@ -63,10 +63,23 @@ export interface JobSummary {
  * Builds the summary strip from a ticket's run history. `live` reports whether the ticket is
  * in the daemon's running snapshot — the one signal the history rows cannot carry, since a run
  * row is only written as the run progresses.
+ *
+ * `lifecycle` is the TICKET's own state (STUDIO-702), which the run rows this view is built
+ * from also cannot carry: `/api/v1/issues/<KEY>/history` serves runs, and only the issue-level
+ * listing decorates a ticket with its tracker state. The caller supplies it from there, and it
+ * is passed straight through to the worklist's own `consoleJobStatus` rather than being
+ * re-interpreted here — the header and the row must not be able to disagree (STUDIO-706).
+ * Absent, it falls back to the run outcome exactly as before.
  */
 export function buildJobSummary(
   runs: readonly RunSummary[],
-  opts: { live?: boolean; assignee?: string; pullRequest?: string; nowMs: number },
+  opts: {
+    live?: boolean;
+    assignee?: string;
+    pullRequest?: string;
+    lifecycle?: string;
+    nowMs: number;
+  },
 ): JobSummary {
   const ordered = runsNewestFirst(runs);
   const newest = ordered[0];
@@ -76,7 +89,7 @@ export function buildJobSummary(
   // entirely — a just-dispatched ticket would read "queued".
   const signals = ordered.map((r) => ({ outcome: r.outcome, live: false, queued: false }));
   if (opts.live ?? false) signals.unshift({ outcome: "running", live: true, queued: false });
-  const status = consoleJobStatus(jobStatus(signals));
+  const status = consoleJobStatus(jobStatus(signals), opts.lifecycle);
   const updatedAtMs = ordered.reduce(
     (max, r) => Math.max(max, parseMs(r.ended_at) || parseMs(r.started_at)),
     0,

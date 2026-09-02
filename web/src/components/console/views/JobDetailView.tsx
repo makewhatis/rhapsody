@@ -12,11 +12,12 @@ import {
 } from "@/components/console";
 import { teammateColor } from "@/theme/teammates";
 import { useIssueHistory, useTranscript } from "@/hooks/useRunDetail";
+import { useIssueRuns } from "@/hooks/useHistory";
 import { useNow } from "@/hooks/useNow";
 import { useStateQuery } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
 import { useTicketFacts } from "@/hooks/useTicketFacts";
-import { ticketAssignees } from "@/lib/console-jobs";
+import { lifecycleByIssue, ticketAssignees } from "@/lib/console-jobs";
 import {
   buildJobSummary,
   checksSummary,
@@ -61,11 +62,23 @@ export function JobDetailView({
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
 
+  // The ticket's own lifecycle (STUDIO-702). `/api/v1/issues/<KEY>/history` serves RUNS and
+  // carries no tracker state, so the header reads it from the issue-level listing the Jobs
+  // worklist already reads — the default filter, so this shares JobsView's query cache rather
+  // than adding a fetch when the operator arrives from the worklist. A deep link fetches it
+  // once. The listing is paged: a ticket that falls off the page resolves to `undefined`, and
+  // `buildJobSummary` then falls back to the run outcome exactly as it did before (STUDIO-706).
+  const issueRuns = useIssueRuns();
+  const lifecycle = useMemo(
+    () => lifecycleByIssue(issueRuns.data?.issues ?? []).get(issue)?.lifecycle,
+    [issueRuns.data, issue],
+  );
+
   const runs = useMemo(() => runsNewestFirst(history.data?.runs ?? []), [history.data]);
   const live = (state.data?.running ?? []).some((r) => r.issue_identifier === issue);
   const assignee = ticketAssignees(overview.data).get(issue) ?? "";
   const roster = (overview.data?.roster ?? []).map((m) => m.name);
-  const summary = buildJobSummary(runs, { live, assignee, nowMs });
+  const summary = buildJobSummary(runs, { live, assignee, lifecycle, nowMs });
 
   return (
     <section>

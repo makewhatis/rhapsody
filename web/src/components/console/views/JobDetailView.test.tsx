@@ -2,13 +2,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { RunSummary, StateResponse } from "@/lib/api";
+import type { IssueRun, RunSummary, StateResponse } from "@/lib/api";
 import type { PullRequestView } from "@/lib/console-job-detail";
 
 // STUDIO-681 §10, sub-ticket 2 — the Job-detail page's acceptance boxes 2.9, 2.10 and 2.11.
 
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
+  fetchIssueRuns: vi.fn(),
   fetchRunTranscript: vi.fn(),
   fetchState: vi.fn(),
   fetchTeamsOverview: vi.fn(),
@@ -21,6 +22,7 @@ vi.mock("@/lib/api", async (orig) => {
   return {
     ...actual,
     fetchIssueHistory: h.fetchIssueHistory,
+    fetchIssueRuns: h.fetchIssueRuns,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchState: h.fetchState,
     fetchTeamsOverview: h.fetchTeamsOverview,
@@ -71,8 +73,13 @@ function run(over: Partial<RunSummary> & Pick<RunSummary, "id">): RunSummary {
   } as RunSummary;
 }
 
-function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
+function issueRow(over: Partial<IssueRun> & Pick<IssueRun, "issue_identifier">): IssueRun {
+  return { ...run({ id: 1 }), ...over } as IssueRun;
+}
+
+function mountDetail(runs: RunSummary[], onNavigate = vi.fn(), issues: IssueRun[] = []) {
   h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs });
+  h.fetchIssueRuns.mockResolvedValue({ issues, next_offset: null });
   h.fetchState.mockResolvedValue(EMPTY_STATE);
   h.fetchTeamsOverview.mockResolvedValue({
     enabled: true,
@@ -131,6 +138,44 @@ describe("the summary strip (§4)", () => {
     await waitFor(() => expect(kv("Runs")).toBe("1"));
     expect(kv("Pull request")).toBe("—"); // no PR endpoint (§9/§11)
     expect(kv("Assignee")).toBe("—"); // no identity on a stored run row
+  });
+
+  // STUDIO-706 — the header used to derive its status from the run outcome alone, so a merged
+  // ticket read "in review" here while its own worklist row read "done" (STUDIO-702). Same
+  // ticket, two screens, two answers.
+  it("shows the ticket's lifecycle, so a merged ticket matches its worklist row", async () => {
+    mountDetail(
+      [run({ id: 547 })],
+      vi.fn(),
+      [issueRow({ issue_identifier: "STUDIO-654", lifecycle: "done", tracker_state: "Done" })],
+    );
+    await waitFor(() => expect(kv("Status")).toContain("done"));
+    expect(kv("Status")).not.toContain("in review");
+  });
+
+  // Deliberately a STOPPED run: a `completed` one already falls back to "in review", so this
+  // would pass with the lifecycle ignored entirely. The outcome alone says "queued" here, so
+  // only the ticket's own state can produce "in review".
+  it("still says in review for a ticket that really is awaiting a reviewer", async () => {
+    mountDetail(
+      [run({ id: 547, outcome: "stopped" })],
+      vi.fn(),
+      [issueRow({ issue_identifier: "STUDIO-654", lifecycle: "in_review", tracker_state: "In Review" })],
+    );
+    await waitFor(() => expect(kv("Status")).toContain("in review"));
+    expect(kv("Runs")).toBe("1");
+  });
+
+  // The listing is paged and carries no answer for a ticket the daemon could not resolve, so
+  // the header must degrade to exactly the old behaviour rather than to a guess.
+  it("falls back to the run outcome when the listing has no row for this ticket", async () => {
+    mountDetail(
+      [run({ id: 547 })],
+      vi.fn(),
+      [issueRow({ issue_identifier: "STUDIO-999", lifecycle: "done", tracker_state: "Done" })],
+    );
+    await waitFor(() => expect(kv("Runs")).toBe("1"));
+    expect(kv("Status")).toContain("in review");
   });
 
   it("navigates back to Jobs from the breadcrumb", async () => {
