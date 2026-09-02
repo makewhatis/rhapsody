@@ -824,8 +824,7 @@ fn spawn_triage(install_probe: bool, teams: &rhapsody_config::teams::Teams) -> b
 /// what makes "`quorum.enabled: false` spawns no task" a property rather than a promise.
 ///
 /// **`review.mode: ticketless` spawns nothing either** (STUDIO-719; ticketless-review design
-/// §15-d), for the same reason
-/// [`quorum_enabled`](rhapsody_orchestrator::Orchestrator::quorum_enabled) subtracts it: an
+/// §15-d), for the same reason the orchestrator's own `quorum_enabled` gate subtracts it: an
 /// installation on the ticketless path reviews a PR directly, so a ticket fan-out task there would
 /// be a second review of the same handoff. `Teams::validate` already rejects that pairing at load,
 /// so this cannot arise from a `teams.yaml`; it keeps the spawn decision agreeing with the gate it
