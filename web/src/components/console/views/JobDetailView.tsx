@@ -132,6 +132,12 @@ export function JobDetailView({
   // wired into this header — and into the spine's attribution — by slice 5.
   const assignee = ticketAssignees(overview.data).get(issue) ?? "";
   const roster = (overview.data?.roster ?? []).map((m) => m.name);
+  // The roster is a PREREQUISITE read, not just a list: a memory bank is per identity, so with no
+  // roster there is nobody to recall from and `useTicketFacts` fires nothing at all — settling as
+  // an honest, successful, empty answer. That is indistinguishable from "the overview is still in
+  // flight" and from "the overview 500'd", and the Memory tab would state "no facts were retained"
+  // about banks it never learned the names of. So its own load state travels with it.
+  const rosterRead = { isPending: overview.isPending, isError: overview.isError };
 
   return (
     <section>
@@ -161,6 +167,7 @@ export function JobDetailView({
           runs={runs}
           assignee={assignee}
           roster={roster}
+          rosterRead={rosterRead}
           teamsEnabled={teamsEnabled}
           onBack={() => onNavigate("jobs")}
           onSelectRun={setPinned}
@@ -177,6 +184,7 @@ function RunTrace({
   runs,
   assignee,
   roster,
+  rosterRead,
   teamsEnabled,
   onBack,
   onSelectRun,
@@ -186,6 +194,8 @@ function RunTrace({
   runs: readonly RunSummary[];
   assignee: string;
   roster: readonly string[];
+  /** How the roster's own fetch is going — the Memory tab's read depends on it. */
+  rosterRead: QueryState;
   teamsEnabled: boolean;
   onBack: () => void;
   onSelectRun: (id: number) => void;
@@ -316,6 +326,7 @@ function RunTrace({
                   run={live}
                   inFlight={inFlight}
                   roster={roster}
+                  rosterRead={rosterRead}
                   teamsEnabled={teamsEnabled}
                   draft={draft}
                   onDraft={setDraft}
@@ -1189,6 +1200,7 @@ function WatchPanel({
   run,
   inFlight,
   roster,
+  rosterRead,
   teamsEnabled,
   draft,
   onDraft,
@@ -1200,6 +1212,7 @@ function WatchPanel({
   run: RunSummary;
   inFlight: boolean;
   roster: readonly string[];
+  rosterRead: QueryState;
   teamsEnabled: boolean;
   draft: string;
   onDraft: (text: string) => void;
@@ -1218,7 +1231,12 @@ function WatchPanel({
           teamsEnabled={teamsEnabled}
           what="this ticket's runs retained no memory to show"
         >
-          <MemoryPanel issue={run.issue_identifier} roster={roster} onOpenMemory={onOpenMemory} />
+          <MemoryPanel
+            issue={run.issue_identifier}
+            roster={roster}
+            rosterRead={rosterRead}
+            onOpenMemory={onOpenMemory}
+          />
         </TeamsPanel>
       );
     case "messages":
@@ -1250,9 +1268,21 @@ function WatchPanel({
  * operator answers by sending the same message twice. A failure says so, and says it is a failure
  * to READ rather than an absence.
  */
-function emptyNote(query: { isPending: boolean; isError: boolean }, loading: string, none: string) {
+function emptyNote(query: QueryState, loading: string, none: string) {
   if (query.isError) return "This could not be read from the daemon — the request failed.";
   return query.isPending ? loading : none;
+}
+
+/** How far a read has got. The two flags react-query settles on, and the shape [`emptyNote`] asks
+ *  for — so a read composed of SEVERAL requests can report itself as one. */
+interface QueryState {
+  isPending: boolean;
+  isError: boolean;
+}
+
+/** Two reads as one: still loading if either is, failed if either did. */
+function bothReads(a: QueryState, b: QueryState): QueryState {
+  return { isPending: a.isPending || b.isPending, isError: a.isError || b.isError };
 }
 
 /**
@@ -1425,13 +1455,20 @@ function RoomPanel({ issue, roster }: { issue: string; roster: readonly string[]
 function MemoryPanel({
   issue,
   roster,
+  rosterRead,
   onOpenMemory,
 }: {
   issue: string;
   roster: readonly string[];
+  /** The roster fetch this recall depends on: with no roster there is no bank to read. */
+  rosterRead: QueryState;
   onOpenMemory: () => void;
 }) {
   const facts = useTicketFacts(roster, issue);
+  // The recall and the roster it was derived FROM, reported as the single read they are. Without
+  // this an unresolved or failed roster reads as a settled, empty, successful recall — which is
+  // the panel stating "no facts were retained" about banks it never learned the names of.
+  const read = bothReads(facts, rosterRead);
   return (
     <>
       <div className="memprev">
@@ -1448,7 +1485,7 @@ function MemoryPanel({
         ))}
         {facts.data.length === 0 ? (
           <div className="empty">
-            {emptyNote(facts, "Loading memory…", "No facts were retained from this ticket.")}
+            {emptyNote(read, "Loading memory…", "No facts were retained from this ticket.")}
           </div>
         ) : null}
       </div>

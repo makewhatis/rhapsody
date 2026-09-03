@@ -50,16 +50,29 @@ export const DEFAULT_WATCH_TAB: WatchTabId = "room";
  *
  * A post belongs when it REFERENCES the key — in `refs`, which is what proves it, or in the body,
  * which is how a teammate writes it in prose.
+ *
+ * The prose half is anchored on both sides, because a ticket key is a PREFIX of its own siblings:
+ * a bare `body.includes("STUDIO-74")` puts every post about STUDIO-740 through STUDIO-749 under a
+ * panel that says it is showing the posts referencing THIS ticket. [`reviewsForRun`] guards the
+ * same class on the origin tag, and this is the room's version of it. `-` is part of the boundary
+ * so `STUDIO-745` does not match inside `STUDIO-745-2`; the punctuation a teammate actually writes
+ * around a key (backticks, brackets, a full stop, a slash in a URL) still matches.
  */
 export function roomPostsFor(
   messages: readonly TeamsRoomMessage[],
   issue: string,
 ): TeamsRoomMessage[] {
   if (issue === "") return [];
+  const mention = new RegExp(`(?<![A-Za-z0-9-])${escapeRegExp(issue)}(?![A-Za-z0-9-])`);
   return messages
-    .filter((m) => (m.refs ?? []).includes(issue) || m.body.includes(issue))
+    .filter((m) => (m.refs ?? []).includes(issue) || mention.test(m.body))
     .slice()
     .reverse();
+}
+
+/** Every regex metacharacter neutralised — a tracker key is not guaranteed to carry none. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** The `pr:` prefix a ticketless review run's key carries (`crates/orchestrator/src/review.rs`). */

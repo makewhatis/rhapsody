@@ -102,6 +102,35 @@ describe("roomPostsFor", () => {
     expect(posts.map((p) => p.id)).toEqual(["f:3", "f:1"]);
   });
 
+  // A ticket key is a PREFIX of its own siblings, so an unanchored `body.includes` puts every
+  // STUDIO-740..749 post under STUDIO-74's panel. `reviewsForRun` guards the same class.
+  it("does not fold a longer ticket key into this one when matching prose", () => {
+    const posts = roomPostsFor(
+      [
+        post({ id: "f:1", body: "STUDIO-745 is up for review." }),
+        post({ id: "f:2", body: "STUDIO-7450 is unrelated." }),
+        post({ id: "f:3", body: "See STUDIO-745-2 for the follow-up." }),
+        post({ id: "f:4", body: "xSTUDIO-745 is not a key." }),
+      ],
+      "STUDIO-745",
+    );
+    expect(posts.map((p) => p.id)).toEqual(["f:1"]);
+  });
+
+  // The punctuation a teammate actually writes around a key still has to match.
+  it("still matches a key wrapped in the punctuation real prose uses", () => {
+    const bodies = ["`STUDIO-745`", "(STUDIO-745)", "STUDIO-745.", "[STUDIO-745]", "…/issue/STUDIO-745"];
+    for (const body of bodies) {
+      expect(roomPostsFor([post({ body })], "STUDIO-745"), body).toHaveLength(1);
+    }
+  });
+
+  // A `refs` entry is an EXACT match already, and proves the reference outright — it must not be
+  // subject to the prose rule at all.
+  it("trusts an exact refs entry whatever the body says", () => {
+    expect(roomPostsFor([post({ body: "no key here", refs: ["STUDIO-745"] })], "STUDIO-745")).toHaveLength(1);
+  });
+
   it("keeps nothing at all for a run with no ticket, rather than every post", () => {
     expect(roomPostsFor([post({ body: "anything" })], "")).toEqual([]);
   });

@@ -173,6 +173,11 @@ function detailOf(row: RunSummary, over: Partial<RunDetail> = {}): RunDetail {
   };
 }
 
+/** One roster row, as `/api/v1/teams` serves it. */
+function teammate(name: string) {
+  return { name, profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 0, tickets: ["STUDIO-654"] };
+}
+
 /** The client the last mount rendered under — how a test simulates a poll tick landing. */
 let client: QueryClient;
 
@@ -187,15 +192,15 @@ function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
     });
   }
   h.fetchState.mockResolvedValue(EMPTY_STATE);
-  h.fetchTeamsOverview.mockResolvedValue({
-    enabled: true,
-    manager_mode: "labels",
-    default_identity: "",
-    backend: "local",
-    roster: [
-      { name: "alice", profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 0, tickets: ["STUDIO-654"] },
-    ],
-  });
+  if (h.fetchTeamsOverview.getMockImplementation() === undefined) {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [teammate("alice")],
+    });
+  }
   h.fetchTeamsRoom.mockResolvedValue({ messages: [], skipped: [] });
   h.fetchTeamsRecall.mockResolvedValue({ identity: "alice", facts: [], skipped: [] });
   // Configured BEFORE mounting by a test that cares what they say; these are only the defaults.
@@ -267,6 +272,7 @@ afterEach(() => {
   h.fetchVersion.mockReset();
   h.fetchRunMessages.mockReset();
   h.fetchReviews.mockReset();
+  h.fetchTeamsOverview.mockReset();
   // The page geometry is defined on the live document, which outlives a render.
   const el = scroller() as unknown as Record<string, unknown>;
   delete el.scrollHeight;
@@ -1174,16 +1180,44 @@ describe("a failed read is never reported as an empty one", () => {
     expect(panel().textContent).not.toMatch(/No room posts reference/i);
   });
 
-  // One bank failing is enough: "no facts were retained" would otherwise be asserted about a
-  // teammate's memory the console could not read.
-  it("says the memory read failed when any one teammate's bank cannot be read", async () => {
+  // ONE bank failing is enough. The roster is deliberately TWO teammates with only bob's bank
+  // rejecting: on a one-member roster `some` and `every` are indistinguishable, so the obvious
+  // fixture would pass just as happily against the `every` the hook's own comment warns against.
+  it("says the memory read failed when any ONE teammate's bank cannot be read", async () => {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [teammate("alice"), teammate("bob")],
+    });
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     mountDetail([run({ id: 547 })]);
-    h.fetchTeamsRecall.mockRejectedValue(new Error("boom"));
+    // AFTER the mount: `mountDetail` installs its own recall default unconditionally, and the
+    // Memory panel is not mounted until its tab is opened below, so nothing has read it yet.
+    h.fetchTeamsRecall.mockImplementation(async (identity: string) => {
+      if (identity === "bob") throw new Error("boom");
+      return { identity, facts: [], skipped: [] };
+    });
     await settleTrace();
     await openTab("Memory");
     await waitFor(() => expect(panel().textContent).toContain("the request failed"));
     expect(panel().textContent).not.toMatch(/No facts were retained/i);
+  });
+
+  // The recall's own PREREQUISITE. With no roster there is nobody to recall from, so the fan-out
+  // fires nothing and settles as a successful empty read — while the console has in fact learned
+  // nothing at all about whose banks to look in.
+  it("does not claim an empty memory while the roster itself is unread", async () => {
+    h.fetchTeamsOverview.mockRejectedValue(new Error("boom"));
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Memory");
+    await waitFor(() => expect(panel().textContent).toContain("the request failed"));
+    expect(panel().textContent).not.toMatch(/No facts were retained/i);
+    // And it really did have no bank to ask — the claim would have been about nothing.
+    expect(h.fetchTeamsRecall).not.toHaveBeenCalled();
   });
 });
 
