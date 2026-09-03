@@ -146,19 +146,24 @@ export function traceSpark(phases: readonly TracePhase[], live: boolean): SparkS
 /**
  * The strip as one line of text — the cell's tooltip and its accessible name.
  *
- * It names what the run DID with exact counts, then what it never reached. The absent kinds are
- * what the empty slots only imply, and "never verified" is worth saying out loud; they are listed
- * as `none: …` rather than "no Verified" so the phrasing survives every title in the model's own
- * table (`other` is titled "Worked", and "no Worked" is not a sentence).
+ * It names what the run DID with exact counts, then the kinds it has not reached — which the empty
+ * slots only imply, and "it never tested" is worth saying out loud. They are listed as a `none: …`
+ * clause rather than "no Verified" so the phrasing survives every title in the model's own table
+ * (`other` is titled "Worked", and "no Worked" is not a sentence).
+ *
+ * A LIVE run gets `not yet:` instead. Nothing is settled while the run is still going, and the
+ * strip is explicitly a snapshot taken when the row was armed — telling a reader a run "reached
+ * none" of a kind it may be about to reach would be the one thing this module must not do.
  */
 export function sparkSummary(steps: readonly SparkStep[]): string {
   if (steps.length === 0) return "No trace";
+  const live = steps.some((step) => step.kind === "live");
   const did = steps.filter((step) => step.kind !== "live" && step.present);
   const absent = steps.filter((step) => step.kind !== "live" && !step.present);
   const parts = did.map((step) => `${step.label} ×${step.count}`);
-  if (steps.some((step) => step.kind === "live")) parts.push("Running now");
+  if (live) parts.push("Running now");
   const head = parts.join(" · ");
   if (absent.length === 0) return head;
-  const tail = `none: ${absent.map((step) => step.label).join(", ")}`;
+  const tail = `${live ? "not yet" : "none"}: ${absent.map((step) => step.label).join(", ")}`;
   return head === "" ? tail : `${head} — ${tail}`;
 }

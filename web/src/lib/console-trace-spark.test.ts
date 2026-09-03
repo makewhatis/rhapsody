@@ -199,6 +199,16 @@ describe("sparkSummary", () => {
     expect(sparkSummary([])).toBe("No trace");
   });
 
+  // Nothing is settled while a run is still going: a kind it has not reached YET is not a kind it
+  // reached none of, and the strip is only a snapshot taken when the row was armed.
+  it("says 'not yet' rather than 'none' while the run is still in flight", () => {
+    const twoKinds = buildTrace(FULL.slice(0, 4)).phases;
+    expect(sparkSummary(traceSpark(twoKinds, true))).toBe(
+      "Oriented ×1 · Implemented ×1 · Running now — not yet: Verified, Coordinated, Handed off, Worked",
+    );
+    expect(sparkSummary(traceSpark(twoKinds, false))).toContain("— none: Verified");
+  });
+
   it("does not count the playhead", () => {
     expect(sparkSummary(traceSpark([], true))).toBe("Running now");
   });
