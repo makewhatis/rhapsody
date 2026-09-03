@@ -42,10 +42,13 @@
 //!      [`Tracker::fetch_issue_labels_by_ids`], which answers for a MERGED ticket — the case the
 //!      whole decoration exists for.
 //!
-//! Both are silent about a ticket nobody was routed for: a solo (`rhapsody:solo`) or Teams-off run
-//! writes no `teams.route` row and carries no identity label, so it answers "" and the column keeps
-//! rendering "—". Nothing here consults the live roster, and nothing here can invent an assignee for
-//! a run that had none.
+//! Both are silent about a ticket nobody was routed for, which is what keeps the column's "—"
+//! honest: a solo (`rhapsody:solo`) or unrouted dispatch writes no `teams.route` row, and a Teams-off daemon
+//! writes neither that row nor the label — so the answer is "" and the column renders "—". (A
+//! Teams-off daemon CAN still meet an identity label, on a ticket routed before Teams was turned
+//! off. Naming that teammate is the true historical answer, which is the whole point, so the label
+//! is read wherever it is found.) Nothing here consults the live roster, and nothing here can invent
+//! an assignee for a run that had none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -306,6 +309,12 @@ impl LifecycleCache {
     /// Best-effort throughout, exactly like [`Self::resolve`]: a store error, an absent tracker or a
     /// failed round-trip leaves a ticket unanswered rather than propagating, because the listing
     /// this decorates has already succeeded and no caller could act on the failure.
+    ///
+    /// The store reads are synchronous and run on the calling HTTP task, as every other store read
+    /// on this layer does. They are bounded by the same [`MAX_LIFECYCLE_REFRESH`] cap and the same
+    /// TTL as the tracker refresh beside them — one full page of cold ids measures ~240ms against a
+    /// 300k-event store, well under the two network round trips the lifecycle decoration makes on
+    /// the same request, and once per TTL window rather than per read.
     pub async fn resolve_assignees(
         &self,
         keys: &[IssueKey],
@@ -345,10 +354,13 @@ impl LifecycleCache {
             // Caching the EMPTY name is deliberate: it is what stops a solo, unrouted or Teams-off
             // ticket being asked about again on every dashboard load.
             let name = answers.get(&key.id).cloned().unwrap_or_default();
-            match name.is_empty() {
-                true => out.remove(&key.id),
-                false => out.insert(key.id.clone(), name.clone()),
-            };
+            if name.is_empty() {
+                // A refresh that now answers "nobody" drops the stale answer rather than keep
+                // reporting an attribution nothing confirms — the rule `resolve` follows too.
+                out.remove(&key.id);
+            } else {
+                out.insert(key.id.clone(), name.clone());
+            }
             guard.insert(key.id.clone(), AssigneeEntry { name, at: now });
         }
         prune_assignees(&mut guard, now);
