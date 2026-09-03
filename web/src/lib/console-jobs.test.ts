@@ -511,8 +511,11 @@ describe("the Now strip's Needs you count", () => {
   // (2.4–255h old) and 154 are outcome-inferred (305–624h old, a project the tracker no longer
   // answers for). The two populations do not even overlap in age.
   it("is not a copy of the in-review pill, in either direction", () => {
-    const counts = consoleJobCounts(rows());
-    expect(counts.needsYou).toBeLessThan(counts.review + counts.blocked);
+    // The shape of the old bug was `needsYou >= review` BY CONSTRUCTION. So the pin is that a
+    // review row can now fail to need anybody: two rows read "in review" and only one wants a human.
+    const inReview = rows().filter((r) => r.status === "review");
+    expect(inReview).toHaveLength(2);
+    expect(inReview.filter((r) => r.needsYou).map((r) => r.issue)).toEqual(["REVIEW"]);
     const byIssue = new Map(rows().map((r) => [r.issue, r]));
     expect(byIssue.get("STALE")).toMatchObject({ status: "review", needsYou: false });
     expect(byIssue.get("FAILED")).toMatchObject({ status: "blocked", needsYou: true });
