@@ -231,14 +231,18 @@ dashboard had only a run OUTCOME to colour a ticket with, so every completed run
 for as long as the store kept it.
 
 `GET /api/v1/history/issues` carries a third optional field, `assignee` — the Rhapsody Teams
-teammate the ticket's newest run was dispatched under, so a job that has left "running" keeps naming
-who did it (STUDIO-735). It is resolved from two DURABLE records, in order: the run's own
-`teams.route` history row, and failing that the ticket's `rhapsody:@<name>` label (read by id, so it
-answers for a merged ticket). The field is OMITTED — never empty — for a ticket nobody was routed
-for, which is every ticket on a Teams-off daemon and every `rhapsody:solo` one. The lookup shares the
-lifecycle decoration's shape exactly: off the control loop, TTL-cached, best-effort, and unable to
-fail the listing. Before it, the console read the assignee from the LIVE Teams roster, so the column
-went blank the moment a run finished.
+teammate the run THIS ROW DISPLAYS was dispatched under, so a job that has left "running" keeps
+naming who did it (STUDIO-735). It is resolved from two records, in order: that run's own
+`teams.route` history row, and — only when that run's ledger is silent — the ticket's
+`rhapsody:@<name>` label (read by id, so it answers for a merged ticket). The scope is the run and
+never the ticket: a ticket routed to a teammate and later re-run solo, unrouted or with Teams off
+shows the re-run's answer, and a run that recorded `teams.unrouted` answers "nobody" outright rather
+than falling through to a label. The field is OMITTED — never empty — whenever the answer is nobody.
+A Teams-off daemon's rows always fall through to the label, so it can still name a teammate a ticket
+was routed to before Teams was turned off, at the cost of at most one label batch per TTL window.
+The lookup shares the lifecycle decoration's shape exactly: off the control loop, TTL-cached,
+best-effort, and unable to fail the listing. Before it, the console read the assignee from the LIVE
+Teams roster, so the column went blank the moment a run finished.
 
 The day boundary for `/history/summary` is **local, not UTC**: the caller sends its own local
 midnight as `since` (the dashboard does), and omitting it falls back to the daemon host's local

@@ -29,18 +29,27 @@
 //! Teams roster, which lists each teammate's currently-active tickets, so the moment a run finished
 //! its teammate's name vanished from the row and the historical "who did what" was lost.
 //!
-//! Two durable records answer it, in strict preference order:
+//! Two records answer it, in strict preference order, and they are NOT the same kind of fact:
 //!
 //!   1. **The DISPLAYED RUN's own routing decision** — the routing row that dispatch wrote into
-//!      that run's ledger (`crate::teams::EVENT_ROUTE` / `EVENT_UNROUTED`). It is a fact about the
-//!      RUN — this run wore this identity — so it is right even after a roster change, a re-label,
-//!      or a re-assignment, and it is local, needing no tracker at all.
+//!      that run's ledger (`crate::teams::EVENT_ROUTE` / `EVENT_UNROUTED`). This is the durable
+//!      who-did-what record the ticket asks for: a fact about the RUN — this run wore this identity
+//!      — so it is right even after a roster change, a re-label, or a re-assignment, and it is
+//!      local, needing no tracker at all.
 //!   2. **The `rhapsody:@<name>` label**, which IS the assignment (design record
-//!      `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.1). It answers where the events row
-//!      does not: `storage.retention_days` prunes run history long before a ticket stops being
-//!      interesting, and the label outlives the prune. Read with
+//!      `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.1). Read with
 //!      [`Tracker::fetch_issue_labels_by_ids`], which answers for a MERGED ticket — the case the
 //!      whole decoration exists for.
+//!
+//!      Be exact about what it contributes, because it is weaker than the first: it is who the
+//!      ticket is assigned to **today**, not who ran the run on screen. It is NOT a way to recover
+//!      a route row `storage.retention_days` deleted — `Store::prune` drops a run's events and the
+//!      run row itself in one transaction, so a ticket whose route row was pruned has no history
+//!      row left to decorate either. What it genuinely covers is a displayed run whose ledger is
+//!      silent: Teams was off when it dispatched, or its event batch never landed. Resolving two
+//!      identity labels by `min()` has the same caveat — deterministic, which is the property that
+//!      matters for a column that must not flicker, but the name it picks is not necessarily the
+//!      one who ran the work.
 //!
 //! **"The displayed run" is the precise scope, and the imprecise version was a bug.** The Jobs row
 //! shows the ticket's newest run (`Store::list_issue_runs`, `started_at DESC`), so the teammate
@@ -53,13 +62,23 @@
 //! event search ordered by `run_id`, the row by `started_at`.
 //!
 //! That scoping is what keeps the column's "—" honest, and it makes the two records asymmetric: a
-//! run that recorded `teams.unrouted` answers "nobody" and stops, because the run itself says so
-//! and a label added afterwards cannot rewrite it. Only a run with NO routing row falls through to
-//! the label — the retention prune deleted it, or Teams was off when it dispatched. (A Teams-off
-//! daemon CAN still meet an identity label, on a ticket routed before Teams was turned off. Naming
-//! that teammate is the true historical answer, which is the whole point, so the label is read
-//! wherever it is found.) Nothing here consults the live roster, and nothing here can invent an
-//! assignee for a run that had none.
+//! run that recorded `teams.unrouted` answers "nobody" and STOPS, because the run itself says so
+//! and a label added afterwards cannot rewrite it. Only a run whose ledger is silent falls through
+//! to the label.
+//!
+//! **What that costs a Teams-off daemon, stated rather than implied.** Teams off means every
+//! displayed run's ledger is silent, so every row falls through and one page costs at most one
+//! `fetch_issue_labels_by_ids` batch per [`LIFECYCLE_TTL`] window — a Linear round trip a Teams-off
+//! daemon did not make before this decoration existed. That is deliberate and not an oversight:
+//! a Teams-off daemon CAN still meet an identity label, on a ticket routed before Teams was turned
+//! off, and naming that teammate is the true historical answer, which is the whole point. Gating
+//! the read on `teams.enabled` would buy back the round trip at the price of the answer. Nothing
+//! polls in the background, so the cost is bounded by someone actually watching the Jobs list;
+//! a Teams-ON daemon now pays strictly LESS than it did before the run scoping, since an unrouted
+//! run answers locally instead of falling through.
+//!
+//! Nothing here consults the live roster, and nothing here can invent an assignee for a run that
+//! had none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -335,11 +354,19 @@ impl LifecycleCache {
     /// this decorates has already succeeded and no caller could act on the failure.
     ///
     /// The store reads are synchronous and run on the calling HTTP task, as every other store read
-    /// on this layer does. Each is one run-scoped `LIMIT 1` probe seeking `idx_events_run_seq`
-    /// (never [`rhapsody_store::Store::run_events`], which would pull a whole run's transcript-sized
-    /// ledger into memory for a single row), they are bounded by the same [`MAX_LIFECYCLE_REFRESH`]
-    /// cap and the same TTL as the tracker refresh beside them, and they happen once per TTL window
-    /// rather than per read.
+    /// on this layer does. **"Off-loop" here means off the control LOOP, not off its LOCK**:
+    /// `Sqlite` serializes every caller through one `Mutex<Connection>` that the control task also
+    /// takes to append events, and this refresh acquires it once per probe. Three things bound
+    /// that, and they are the reason it is acceptable rather than merely small:
+    ///
+    ///   * Each probe is a run-scoped `LIMIT 1` seek on `idx_events_run_seq` — NOT
+    ///     [`rhapsody_store::Store::run_events`], which returns a whole run's transcript-sized
+    ///     ledger to read one row, and not the ticket-scoped `events`⋈`runs` search it replaced,
+    ///     which sorted every event of every run of the ticket to return one.
+    ///   * A routed run costs ONE probe; only a run with no route row pays the second (unrouted)
+    ///     probe, so the lock is taken at most twice per stale key.
+    ///   * The whole refresh is capped at [`MAX_LIFECYCLE_REFRESH`] keys and happens once per TTL
+    ///     window, not once per read.
     pub async fn resolve_assignees(
         &self,
         keys: &[IssueKey],
@@ -372,10 +399,17 @@ impl LifecycleCache {
         // Then the label, for whatever is left — and `covered` grows by which of those the tracker
         // actually answered about, so a failed round-trip leaves its ids untouched instead of
         // caching "nobody" over an assignee the console already had.
-        if let Some(tracker) = tracker.filter(|_| !unanswered.is_empty()) {
-            let (labelled, asked) = label_identities(tracker.as_ref(), &unanswered).await;
-            answers.extend(labelled);
-            covered.extend(asked);
+        match tracker.filter(|_| !unanswered.is_empty()) {
+            Some(tracker) => {
+                let (labelled, asked) = label_identities(tracker.as_ref(), &unanswered).await;
+                answers.extend(labelled);
+                covered.extend(asked);
+            }
+            // No tracker to ask AT ALL — before the first config load — is not a failed round-trip,
+            // it is a complete answer for this window: nothing else could have spoken. Covering
+            // these ids is what caches it. Without this the whole store loop re-ran on every
+            // dashboard load until a config landed, which is exactly what the memo exists to stop.
+            None => covered.extend(unanswered.iter().map(|k| k.id.clone())),
         }
         let mut guard = self
             .assignees
@@ -1329,6 +1363,56 @@ mod tests {
             got.is_empty(),
             "the memo answered the previous run's question, not this one: {got:?}",
         );
+    }
+
+    // "Nobody" is cached even when there was no tracker to ask — before the first config load,
+    // there is nothing that could have answered, so "no answer" is the complete answer for the
+    // window rather than a gap to re-derive. Without this the store loop ran again on every
+    // dashboard load until a config landed.
+    #[tokio::test]
+    async fn the_negative_caches_even_with_no_tracker_to_ask() {
+        let ledger = Ledger::new();
+        let run = ledger.teams_off("MT-1");
+        let mut f = Fake::default();
+        f.by_id
+            .insert("a".into(), labelled("a", &["rhapsody:@alice"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let keys = [key("a", run)];
+        let store = ledger.store();
+        let t0 = Instant::now();
+
+        assert!(
+            cache
+                .resolve_assignees(&keys, &store, None, t0)
+                .await
+                .is_empty(),
+            "no ledger row and no tracker => no answer",
+        );
+
+        // A config lands inside the window. The cached negative stands for the rest of it — the
+        // TTL's ordinary contract — and costs no round trip.
+        let after = cache
+            .resolve_assignees(
+                &keys,
+                &store,
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                t0 + LIFECYCLE_TTL / 2,
+            )
+            .await;
+        assert!(after.is_empty(), "the negative is cached: {after:?}");
+        assert_eq!(tr.labels_by_id_calls(), 0, "and it costs no round trip");
+
+        let past = cache
+            .resolve_assignees(
+                &keys,
+                &store,
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                t0 + LIFECYCLE_TTL,
+            )
+            .await;
+        assert_eq!(past.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(tr.labels_by_id_calls(), 1, "past the TTL it asks");
     }
 
     // Two identity labels resolve deterministically, whatever order the tracker lists them in — a
