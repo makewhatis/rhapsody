@@ -1349,6 +1349,59 @@ mod tests {
         assert_eq!(Facts::default().render(MAX_FACTS_CHARS), "");
     }
 
+    /// **The cap is the CALLER's, and a block that does not fit is not rendered.**
+    ///
+    /// [`MAX_FACTS_CHARS`] is a ceiling, never the budget: the room prompt reserves its rules, its
+    /// roster, its closed ticket list and the whole post section first, and hands whatever is left.
+    /// A partial block would be finished off by the caller's own end-truncation, and what that
+    /// reaches first is the CLOSING FENCE — after which every record lands in the prompt as bare
+    /// instructions. So there is no partial block: it fits whole or it does not exist.
+    #[test]
+    fn a_block_that_does_not_fit_its_cap_is_not_rendered_at_all() {
+        let f = Facts {
+            asked: vec![Asked {
+                asked: "STUDIO-725".into(),
+                outcome: Some(Outcome {
+                    key: "STUDIO-725".into(),
+                    runs: Runs {
+                        facts: vec![run("STUDIO-725", "completed", "jimmy")],
+                        ..Runs::default()
+                    },
+                    ..Outcome::default()
+                }),
+            }],
+            ..Facts::default()
+        };
+        let whole = f.render(MAX_FACTS_CHARS);
+        assert!(!whole.is_empty(), "the block must render at the ceiling");
+        assert_eq!(
+            whole.matches(FENCE).count(),
+            2,
+            "the whole block opens and closes:\n{whole}"
+        );
+
+        assert_eq!(f.render(0), "", "no room at all ⇒ no block");
+        // A cap that fits the preamble and both fences but not one record. Rendering the frame
+        // around nothing would spend several hundred characters of the operator's own prompt
+        // budget to say nothing at all.
+        let frame_only = FACTS_PREAMBLE.chars().count() + (2 * FENCE.chars().count()) + 8;
+        assert_eq!(
+            f.render(frame_only),
+            "",
+            "a frame with no record in it is not a block"
+        );
+        // And every cap that DOES produce a block respects it — the property the caller's
+        // arithmetic stands on.
+        for cap in (0..=MAX_FACTS_CHARS).step_by(97) {
+            let out = f.render(cap);
+            assert!(
+                out.chars().count() <= cap,
+                "render({cap}) returned {} characters",
+                out.chars().count()
+            );
+        }
+    }
+
     // ── the gather itself ────────────────────────────────────────────────────────────────────────
 
     /// A bank that is DOWN degrades to "I could not read it", never to "the team remembers
