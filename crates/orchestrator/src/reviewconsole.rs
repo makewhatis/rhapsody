@@ -200,6 +200,16 @@ impl Orchestrator {
         // The allowlist, re-checked here for `handle_review_head_advanced`'s reason: re-arming a row
         // is the first step towards checking its repository out, and the configuration can have been
         // repointed or the project paused since the row was written. Fails closed.
+        //
+        // It is `review_repo_is_configured` and NOT the dispatch's own `review_repo_url`, and the
+        // two are not quite the same predicate: this one falls back to the top-level `cfg.repo` when
+        // `eff.projects` is empty, and that one searches `eff.projects` only. Where they diverged, a
+        // re-run would answer `Applied` and then defer on every tick forever — a permanently queued
+        // review. They cannot diverge today, because `build_effective` fills `projects` from
+        // `resolve_projects`, which synthesises an entry for the single-project case, so the
+        // empty-`projects` branch is unreachable outside tests. Named here rather than silently
+        // relied on: collapsing the two spellings of one allowlist is worth doing, and it belongs
+        // with the predicates themselves, which predate this control.
         if !self.review_repo_is_configured(&pr.owner, &pr.repo) {
             tracing::warn!(
                 pr = %pr,
