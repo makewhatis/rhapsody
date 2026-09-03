@@ -13,8 +13,13 @@
    ============================================================================ */
 
 /* `white-space: normal` is a reset, not a preference: a surface that wrapped raw
-   text in `pre-wrap` (`.fact .body`) would otherwise leak it into every block. */
-.rh-console .md { white-space: normal; }
+   text in `pre-wrap` (`.fact .body`) would otherwise leak it into every block.
+
+   `overflow-wrap: anywhere` is the same no-sideways-scroll rule as the code box,
+   for prose: agent text carries 200-character paths, URLs and hashes, and an
+   unbreakable token would otherwise push the page wider. It is inert inside the
+   code box, whose `white-space: pre` opts out of wrapping and scrolls instead. */
+.rh-console .md { white-space: normal; overflow-wrap: anywhere; }
 .rh-console .md > *:first-child { margin-top: 0; }
 .rh-console .md > *:last-child { margin-bottom: 0; }
 

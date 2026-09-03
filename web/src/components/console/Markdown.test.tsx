@@ -55,6 +55,8 @@ describe("Markdown", () => {
     expect(css).toMatch(/\.md pre\.mdpre\s*\{[^}]*overflow-x:\s*auto/);
     expect(css).toMatch(/\.md pre\.mdpre\s*\{[^}]*font-family:\s*var\(--mono\)/);
     expect(css).toMatch(/\.md pre\.mdpre\s*\{[^}]*max-width:\s*100%/);
+    // …and prose does not scroll the page either: an unbreakable 200-character path wraps.
+    expect(css).toMatch(/\.md\s*\{[^}]*overflow-wrap:\s*anywhere/);
   });
 
   it("keeps a code block's markdown literal", () => {
