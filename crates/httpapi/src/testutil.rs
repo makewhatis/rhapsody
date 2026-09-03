@@ -13,6 +13,8 @@ use rhapsody_agent::LogEntry;
 use rhapsody_config::workflow::Definition;
 use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
+use rhapsody_orchestrator::prstate::PrCoord;
+use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::{
     HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
     RetryRow, RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
@@ -84,6 +86,18 @@ pub(crate) struct FakeProvider {
     /// how a test sees that it passed the identifier along as well as the id.
     issue_assignees: HashMap<String, String>,
     issue_assignees_asked: Mutex<Vec<IssueKey>>,
+    /// The canned `GET /api/v1/reviews` view (STUDIO-722). Unset ⇒ the trait's default, which is a
+    /// DORMANT surface — exactly what a daemon with Teams off or the mode not `ticketless` serves.
+    reviews: Option<ReviewsView>,
+    /// Make `reviews()` fail with a store error — the read's only `Err` path (a broken watch set),
+    /// which is a 500 rather than a dormant surface.
+    reviews_err: Option<String>,
+    /// The canned outcome both review controls return, and the coordinates the last one was called
+    /// with, so a test can assert the handler forwarded what the body said (Go's `p.stopRunID`
+    /// pattern, for a struct rather than an id).
+    review_outcome: Option<ReviewControlOutcome>,
+    review_rerun_pr: Mutex<Option<PrCoord>>,
+    review_dismiss_pr: Mutex<Option<PrCoord>>,
 }
 
 impl FakeProvider {
@@ -124,6 +138,11 @@ impl FakeProvider {
             issue_lifecycles_asked: Mutex::new(Vec::new()),
             issue_assignees: HashMap::new(),
             issue_assignees_asked: Mutex::new(Vec::new()),
+            reviews: None,
+            reviews_err: None,
+            review_outcome: None,
+            review_rerun_pr: Mutex::new(None),
+            review_dismiss_pr: Mutex::new(None),
         }
     }
 
@@ -286,6 +305,40 @@ impl FakeProvider {
         self.teams_config_path = path.into();
         self
     }
+
+    /// Set the canned `GET /api/v1/reviews` view (STUDIO-722). Unset ⇒ the dormant surface.
+    pub(crate) fn with_reviews(mut self, view: ReviewsView) -> Self {
+        self.reviews = Some(view);
+        self
+    }
+
+    /// Make `GET /api/v1/reviews` fail with a store error (the 500 path).
+    pub(crate) fn with_reviews_error(mut self, message: &str) -> Self {
+        self.reviews_err = Some(message.to_string());
+        self
+    }
+
+    /// Set the canned outcome BOTH review controls return. Unset ⇒ the trait's `Dormant`.
+    pub(crate) fn with_review_outcome(mut self, outcome: ReviewControlOutcome) -> Self {
+        self.review_outcome = Some(outcome);
+        self
+    }
+
+    /// The coordinates the last `review_rerun` / `review_dismiss` was called with — how a test
+    /// asserts the handler forwarded the body's own owner/repo/number and nothing else.
+    pub(crate) fn review_rerun_pr(&self) -> Option<PrCoord> {
+        self.review_rerun_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn review_dismiss_pr(&self) -> Option<PrCoord> {
+        self.review_dismiss_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -433,6 +486,35 @@ impl StateProvider for FakeProvider {
 
     fn teams_config_path(&self) -> &str {
         &self.teams_config_path
+    }
+
+    async fn reviews(&self) -> Result<ReviewsView, rhapsody_store::StoreError> {
+        match &self.reviews_err {
+            Some(message) => Err(rhapsody_store::StoreError::Io(std::io::Error::other(
+                message.clone(),
+            ))),
+            None => Ok(self.reviews.clone().unwrap_or_default()),
+        }
+    }
+
+    async fn review_rerun(&self, pr: PrCoord) -> ReviewControlOutcome {
+        *self
+            .review_rerun_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pr);
+        self.review_outcome
+            .clone()
+            .unwrap_or(ReviewControlOutcome::Dormant)
+    }
+
+    async fn review_dismiss(&self, pr: PrCoord) -> ReviewControlOutcome {
+        *self
+            .review_dismiss_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pr);
+        self.review_outcome
+            .clone()
+            .unwrap_or(ReviewControlOutcome::Dormant)
     }
 
     async fn teams_recall(

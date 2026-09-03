@@ -1,0 +1,252 @@
+import { describe, expect, it } from "vitest";
+import type { ReviewJob } from "@/lib/api";
+import {
+  REVIEW_STATUSES,
+  dismissNotice,
+  isLive,
+  prLabel,
+  rerunNotice,
+  retiredCount,
+  reviewRow,
+  reviewRows,
+  reviewStats,
+  shortSha,
+} from "@/lib/reviews-model";
+
+// The pure half of the console's Reviews surface (STUDIO-722, slice 8). Everything here is asserted
+// against the daemon's REAL watch-set shape — the `REVIEW_STATUS_*` constants in
+// crates/store/src/types.rs and the `load_live_review_watch` predicate in crates/store/src/lib.rs —
+// because those are what the rendering rests on and a value added there is exactly the drift these
+// tests exist to catch.
+
+const HEAD_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HEAD_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+function job(over: Partial<ReviewJob> = {}): ReviewJob {
+  return {
+    owner: "makewhatis",
+    repo: "rhapsody",
+    number: 12,
+    reviewer: "bob",
+    author: "alice",
+    introduced_by: "handoff:STUDIO-720",
+    requested_sha: HEAD_A,
+    last_reviewed_sha: HEAD_A,
+    status: "reviewed",
+    open: true,
+    ...over,
+  };
+}
+
+describe("prLabel / shortSha", () => {
+  it("spells a pull request the way the daemon does", () => {
+    expect(prLabel(job())).toBe("makewhatis/rhapsody#12");
+  });
+
+  it("abbreviates a SHA to seven characters and leaves an absent one empty", () => {
+    expect(shortSha(HEAD_A)).toBe("aaaaaaa");
+    expect(shortSha("")).toBe("");
+  });
+});
+
+describe("isLive", () => {
+  // The daemon's own predicate: `open = 1 AND status != 'dropped'`. Both halves are load-bearing,
+  // and the second is the one a `open`-only check would get wrong — a retirement is a SOFT delete.
+  it("mirrors the daemon's live-watch predicate", () => {
+    expect(isLive(job({ open: true, status: "reviewed" }))).toBe(true);
+    expect(isLive(job({ open: true, status: "dropped" }))).toBe(false);
+    expect(isLive(job({ open: false, status: "reviewed" }))).toBe(false);
+    expect(isLive(job({ open: false, status: "dropped" }))).toBe(false);
+  });
+});
+
+describe("reviewRow", () => {
+  it("keys a row per (PR, reviewer), which is the watch set's own granularity", () => {
+    expect(reviewRow(job({ reviewer: "bob" })).key).toBe("makewhatis/rhapsody#12@bob");
+    expect(reviewRow(job({ reviewer: "carol" })).key).toBe("makewhatis/rhapsody#12@carol");
+  });
+
+  it("links to the pull request on GitHub", () => {
+    expect(reviewRow(job()).url).toBe("https://github.com/makewhatis/rhapsody/pull/12");
+  });
+
+  it("gives every status the daemon can store a pill and a label", () => {
+    for (const status of REVIEW_STATUSES) {
+      const row = reviewRow(job({ status }));
+      expect(row.label, status).not.toBe("");
+      expect(row.label, status).not.toBe(status);
+    }
+  });
+
+  /**
+   * A pull request dismissed WHILE a review of it was running comes back from the daemon as
+   * `open: false, status: "reviewed"`: `drop_review_watch` cleared `open` and parked the status at
+   * `dropped`, and then the finishing agent's `mark_review_completed` — whose contract is to write
+   * the status and never touch `open` — wrote `reviewed` back over it.
+   *
+   * The row is correctly out of every live read either way, so this is display only. But a
+   * "Reviewed" pill on a row the operator just dismissed says the click did not land. `open` is the
+   * column no completion can rewrite, and nothing in the daemon clears it except a drop, so it is
+   * the honest thing to read the label off.
+   */
+  it("labels a row the daemon closed as dropped, whatever status a late completion wrote", () => {
+    expect(reviewRow(job({ open: false, status: "reviewed" })).label).toBe("Dropped");
+    expect(reviewRow(job({ open: false, status: "approved" })).label).toBe("Dropped");
+    expect(reviewRow(job({ open: false, status: "in_flight" })).label).toBe("Dropped");
+    // The SHA the round did read is still the record of what was reviewed, so it stays.
+    expect(reviewRow(job({ open: false, status: "reviewed" })).reviewedShort).toBe("aaaaaaa");
+  });
+
+  it("leaves an OPEN row's own status alone", () => {
+    expect(reviewRow(job({ open: true, status: "reviewed" })).label).toBe("Reviewed");
+    expect(reviewRow(job({ open: true, status: "in_flight" })).label).toBe("Reviewing");
+  });
+
+  // A round that ran out of turns read the head only PARTLY, which is why the daemon deliberately
+  // does not advance `last_reviewed_sha` for it. Dressing it as a finished review is how a review
+  // that never happened ships as if it had.
+  it("does not present a truncated round as a finished one", () => {
+    const truncated = reviewRow(job({ status: "truncated", last_reviewed_sha: "" }));
+    const reviewed = reviewRow(job({ status: "reviewed" }));
+    expect(truncated.variant).not.toBe(reviewed.variant);
+    expect(truncated.reviewedShort).toBe("");
+  });
+
+  it("shows a status this build has never heard of rather than dropping the row", () => {
+    const row = reviewRow(job({ status: "quarantined" }));
+    expect(row.label).toBe("quarantined");
+    expect(row.live).toBe(true);
+  });
+
+  it("falls back to a label when the daemon sends an empty status", () => {
+    expect(reviewRow(job({ status: "" })).label).toBe("unknown");
+  });
+});
+
+describe("reviewRows", () => {
+  const jobs = [
+    job({ reviewer: "bob", status: "dropped", open: false }),
+    job({ reviewer: "carol", status: "in_flight", last_reviewed_sha: "" }),
+    job({ number: 13, reviewer: "dave", status: "requested" }),
+  ];
+
+  it("hides retired rows by default", () => {
+    expect(reviewRows(jobs, "active").map((r) => r.job.reviewer)).toEqual(["carol", "dave"]);
+  });
+
+  it("reveals them on demand, always below the live ones", () => {
+    expect(reviewRows(jobs, "all").map((r) => r.job.reviewer)).toEqual(["carol", "dave", "bob"]);
+  });
+
+  // Stability matters: the daemon orders by (owner, repo, number, reviewer), so two reviewers of
+  // one pull request arrive adjacent and must stay that way.
+  it("keeps the daemon's order within the live half", () => {
+    const two = [
+      job({ reviewer: "bob", status: "requested" }),
+      job({ reviewer: "carol", status: "in_flight" }),
+      job({ number: 13, reviewer: "bob", status: "requested" }),
+    ];
+    expect(reviewRows(two, "active").map((r) => `${r.pr}@${r.job.reviewer}`)).toEqual([
+      "makewhatis/rhapsody#12@bob",
+      "makewhatis/rhapsody#12@carol",
+      "makewhatis/rhapsody#13@bob",
+    ]);
+  });
+
+  it("is empty for an empty watch set", () => {
+    expect(reviewRows([], "all")).toEqual([]);
+  });
+});
+
+describe("retiredCount", () => {
+  it("counts what the reveal would add, so a set with none can retire the toggle", () => {
+    expect(retiredCount([job(), job({ reviewer: "carol" })])).toBe(0);
+    expect(retiredCount([job(), job({ reviewer: "carol", status: "dropped", open: false })])).toBe(
+      1,
+    );
+  });
+});
+
+describe("reviewStats", () => {
+  it("counts distinct pull requests, not rows", () => {
+    const stats = reviewStats([
+      job({ reviewer: "bob", status: "in_flight" }),
+      job({ reviewer: "carol", status: "in_flight" }),
+      job({ number: 13, reviewer: "bob", status: "requested" }),
+    ]);
+    expect(stats.pullRequests).toBe(2);
+    expect(stats.inFlight).toBe(2);
+    expect(stats.awaiting).toBe(1);
+  });
+
+  it("counts a truncated round as still awaiting one — because it is", () => {
+    expect(reviewStats([job({ status: "truncated", last_reviewed_sha: "" })]).awaiting).toBe(1);
+  });
+
+  it("ignores retired rows entirely", () => {
+    const stats = reviewStats([
+      job({ status: "dropped", open: false }),
+      job({ number: 13, reviewer: "carol", status: "reviewed", last_reviewed_sha: HEAD_B }),
+    ]);
+    expect(stats).toEqual({ pullRequests: 1, inFlight: 0, awaiting: 0 });
+  });
+});
+
+describe("rerunNotice", () => {
+  // The whole point of rendering the count: `rows: 0` is a 200 that changed NOTHING, and a control
+  // that answers a click with silence reads as broken.
+  it("distinguishes a re-armed review from a no-op on one already running", () => {
+    const armed = rerunNotice({ pr: "makewhatis/rhapsody#12", rows: 1 });
+    expect(armed.tone).toBe("info");
+    expect(armed.text).toContain("re-armed");
+
+    const noop = rerunNotice({ pr: "makewhatis/rhapsody#12", rows: 0 });
+    expect(noop.tone).toBe("warn");
+    expect(noop.text).toContain("already running");
+    expect(noop.text).toContain("nothing to re-arm");
+  });
+
+  it("names the pull request the daemon says it acted on, and counts reviewers", () => {
+    expect(rerunNotice({ pr: "makewhatis/rhapsody#12", rows: 1 }).text).toContain(
+      "makewhatis/rhapsody#12",
+    );
+    expect(rerunNotice({ pr: "o/r#1", rows: 1 }).text).toContain("1 reviewer ");
+    expect(rerunNotice({ pr: "o/r#1", rows: 2 }).text).toContain("2 reviewers ");
+  });
+});
+
+describe("dismissNotice", () => {
+  // A dismissal is irreversible from this console — `drop_review_watch` clears `open`, and both
+  // controls then exclude the row — so the notice has to say what the operator can no longer undo.
+  it("confirms the drop and says what re-introduces the pull request", () => {
+    const done = dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 2 }, false);
+    expect(done.tone).toBe("info");
+    expect(done.text).toContain("makewhatis/rhapsody#12");
+    expect(done.text).toContain("2 rows");
+    expect(done.text).toMatch(/hand-off/i);
+  });
+
+  it("does not claim a drop the daemon reports it did not make", () => {
+    const none = dismissNotice({ pr: "o/r#1", rows: 0 }, false);
+    expect(none.tone).toBe("warn");
+    expect(none.text).toContain("Nothing changed");
+  });
+
+  /**
+   * Dismissing does NOT stop a review that is already running: the daemon deliberately leaves it to
+   * finish, so an agent stays checked out on that pull request's head and still posts its findings.
+   * The row reading `Dropped` a moment later is exactly the picture that makes an operator think
+   * they cancelled it. Say what actually happened, and where the stop control really is.
+   */
+  it("warns that a dismissal did not stop the review that was already running", () => {
+    const running = dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 1 }, true);
+    expect(running.tone).toBe("warn");
+    expect(running.text).toMatch(/still running/i);
+    expect(running.text).toMatch(/does not stop it|did not stop it/i);
+
+    // Nothing was running, so there is nothing to warn about.
+    expect(dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 1 }, false).text).not.toMatch(
+      /still running/i,
+    );
+  });
+});
