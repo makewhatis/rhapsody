@@ -174,7 +174,7 @@ impl HindsightBackend {
     {
         for (identity, bank) in overrides {
             let (identity, bank) = (identity.into(), bank.into());
-            if !bank.is_empty() && crate::teams::is_label_safe(&bank) {
+            if crate::memory::bank_override_honoured(&bank) {
                 self.banks.insert(identity, bank);
             }
         }

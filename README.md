@@ -334,7 +334,10 @@ the *live instruction* channel to a running agent, and this door deliberately do
 Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
 because it works on a laptop with no cloud: append-only markdown records, one file per record, under
 `~/.rhapsody/teams/banks/<name>/`, in files a human can read and correct. The bank directory appears
-on the first retain and at no other time.
+on the first retain and at no other time. A roster entry may name its bank explicitly with `bank:`,
+but only a label-safe value is honoured — a bank id becomes a directory name — and anything else is
+dropped in favour of `<bank_prefix><name>`. `teams_roster` and `GET /api/v1/teams` report the id
+that was actually resolved, so the view always names the directory the daemon reads (STUDIO-729).
 
 **The team room** is an append-only log read at hydration, not a message bus: identities are durable
 state rather than processes, so nobody receives and everybody catches up. It is JSONL under
