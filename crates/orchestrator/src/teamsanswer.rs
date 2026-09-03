@@ -64,10 +64,14 @@
 //!   it is a mitigation, not a proof.
 //! * **A plant can never FORGE that partition.** The mitigation above is a claim about layout, and
 //!   layout is the one thing untrusted prose can imitate: a sentence that carries
-//!   [`GROUNDING_LEAD`] itself renders above the real one and reads as the daemon's records rather
-//!   than as a claim beside them. So [`vet_answer`] refuses prose containing the lead whole, the
-//!   same way [`one_line`] refuses a fact the right to close the DATA fence. Both are the same
-//!   rule: untrusted text that can mint the HOST's own structure has stopped being data.
+//!   [`GROUNDING_LEAD`] itself would render above the real one and read as the daemon's records
+//!   rather than as a claim beside them. So the partition is not asserted by a line — [`quote`]
+//!   marks EVERY line of the model's half with [`QUOTE_PREFIX`], written by the daemon after the
+//!   fact, and a forged lead then renders inside the quoted region like every other word the turn
+//!   wrote. It is the same rule [`one_line`] applies one layer down when it refuses a fact the
+//!   right to close the DATA fence: untrusted text never gets to mint the HOST's own structure.
+//!   A prefix rather than a refusal because refusing prose that CONTAINS the lead is a blocklist —
+//!   it swallows the honest phrasing while the next forged spelling sits one token away.
 //!
 //! # Recorded decision: the gather is unconditional, and the ACTION prompt carries it too
 //!
@@ -122,11 +126,11 @@ pub(crate) const MAX_FACTS_CHARS: usize = 4000;
 /// sentence the model composed, everything after it is what the daemon's records actually say. A
 /// claim the records do not support is then visibly unsupported rather than silently authoritative.
 ///
-/// **That partition is worth nothing unless the untrusted half cannot MINT it**, so [`vet_answer`]
-/// refuses prose carrying this lead outright. It is the same hazard [`one_line`] neutralises one
-/// layer down — untrusted text minting the host's own structure stops being data — and it bites
-/// harder here: a forged lead renders FIRST, above the real one, plausible and *extending* it,
-/// in the position the design reserves for the daemon's records.
+/// **That partition is worth nothing unless the untrusted half cannot MINT it**, so the half above
+/// this line is not merely expected to stay above it: [`quote`] marks every one of its lines with
+/// [`QUOTE_PREFIX`] first. A forged lead then reads as one more quoted sentence rather than as the
+/// opening of the daemon's records — which is where it would otherwise land, above the real one,
+/// plausible and *extending* it. Only the daemon ever writes this line unquoted.
 pub(crate) const GROUNDING_LEAD: &str = "From my own records — ";
 
 /// The most characters of ONE untrusted prose fact — a memory record, a room post, a pull-request
@@ -664,27 +668,6 @@ pub(crate) fn vet_answer(prose: &str, allowed: &BTreeSet<String>) -> Result<Stri
              {MAX_ANSWER_CHARS})"
         ));
     }
-    // **The grounding lead is HOST structure, and prose that mints it forges the one partition the
-    // whole mitigation rests on.** `answer_for` prints the daemon's own records under that line
-    // exactly so the operator can tell composed prose from records at a glance; a sentence carrying
-    // the lead itself lands ABOVE the real one, reading as its opening rather than as a claim
-    // standing next to it. Refused WHOLE, like an unallowed key and for the same reason — the words
-    // around it were composed to carry it — after which the grounded records answer alone.
-    //
-    // Compared as the operator SEES it, not as it is spelled. A capital, a folded line break or a
-    // hyphen where the host writes an em dash all read the same way in the room while defeating a
-    // byte-exact check, so the needle is the lead's WORDS — the constant with its trailing
-    // punctuation and space trimmed off, derived rather than restated so the two cannot drift. The
-    // cost of the wider match is a plainer reply on the day a turn honestly opens with those four
-    // words, which is the direction to be wrong in.
-    let lead = GROUNDING_LEAD.trim_end_matches(|c: char| !c.is_alphanumeric());
-    if fold_ws(prose).contains(&fold_ws(lead)) {
-        return Err(
-            "the room turn's answer minted the host's own grounding lead, which only the daemon \
-             writes"
-                .to_string(),
-        );
-    }
     // UNBOUNDED, unlike the post's own scan: a post is bounded because every key it names costs a
     // lookup, while this scan costs nothing and is the guard itself. A 33rd key that escaped the
     // check is precisely where an injected one would sit.
@@ -720,17 +703,33 @@ const FACTS_PREAMBLE: &str = "\n## My own records about those tickets\n\n\
 /// the same one for the post, for §0.11.5's reason.
 const FENCE: &str = "```";
 
-/// Lowercased with every whitespace run folded to a single space — a sentence as the operator SEES
-/// it rather than as it is spelled.
+/// Opens every line of the model's half of a reply — the marker that makes the partition the
+/// daemon's to write rather than a line the model could imitate.
+pub(crate) const QUOTE_PREFIX: &str = "> ";
+
+/// Marks the model's prose AS the model's, line by line, so a forged [`GROUNDING_LEAD`] inside it
+/// cannot read as the daemon's own records.
 ///
-/// [`vet_answer`] compares against this rather than the raw prose because neither a capital letter
-/// nor a line break changes what a forged [`GROUNDING_LEAD`] looks like in the room, and a
-/// containment check on the raw bytes would miss both.
-fn fold_ws(s: &str) -> String {
-    s.split_whitespace()
-        .map(str::to_lowercase)
+/// The earlier guard asked [`vet_answer`] to REFUSE prose containing the lead. That could only ever
+/// be a blocklist: it refused the honest phrasing a turn reaches for unprompted (the records
+/// section is literally headed *"My own records about those tickets"*) while admitting a singular
+/// *record*, a dropped *From*, an emphasis marker or a homoglyph — and every widening of the needle
+/// costs another honest answer while the next variant sits one token out.
+///
+/// A prefix has no such boundary. It is written by the daemon AFTER the fact, around whatever the
+/// turn produced, so there is no spelling of anything that escapes it: a line claiming to be the
+/// records renders inside the quoted region exactly like every other line the model wrote. Blank
+/// lines are marked too, so the quoted half stays one contiguous region rather than splitting into
+/// two with unmarked space between them.
+///
+/// `lines` is the right granularity because [`vet_answer`] does not fold newlines — prose is
+/// legitimately multi-line, and a marker on the first line only would leave the rest unmarked.
+pub(crate) fn quote(prose: &str) -> String {
+    prose
+        .lines()
+        .map(|l| format!("{QUOTE_PREFIX}{l}"))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("\n")
 }
 
 /// Renders untrusted prose as exactly ONE fence-safe line.
@@ -1135,32 +1134,65 @@ mod tests {
         vet_answer("   \n ", &keyset(&[])).expect_err("empty prose must be refused");
     }
 
-    /// **Prose may not mint [`GROUNDING_LEAD`], in any spelling that still READS as it.**
+    /// **The partition is HOST-APPLIED, and that is the only reason it holds.**
     ///
-    /// The lead is the one thing telling an operator which half of a reply the daemon wrote, so
-    /// prose carrying it renders above the real one and reads as the records rather than as a claim
-    /// beside them. A byte-exact check would be defeated by a capital, a line break or a hyphen in
-    /// place of the host's em dash — each of which changes nothing about what the room shows — so
-    /// every one of those is pinned here alongside the exact forgery.
+    /// An earlier guard refused prose that CONTAINED the lead. That was a substring blocklist
+    /// wearing a guarantee's clothes, and it was wrong in both directions at once: it refused the
+    /// honest phrasing a turn reaches for unprompted — the block's own heading is *"My own records
+    /// about those tickets"* — while admitting every variant one token away from it (a singular
+    /// *record*, a dropped *From*, an emphasis marker, a zero-width space, a cyrillic `о`).
+    /// Widening the needle cannot fix that: each widening costs another honest answer and the next
+    /// variant is one token out.
     ///
-    /// The last case is the boundary: an ordinary sentence must still pass, or the guard would have
-    /// swallowed the feature.
+    /// So the daemon marks the model's half ITSELF, per line, after the fact. A forged lead then
+    /// renders inside the quoted region like every other word the turn wrote, because nothing a
+    /// model emits can escape a prefix written around it.
     #[test]
-    fn prose_that_mints_the_grounding_lead_is_refused_in_every_spelling() {
-        let set = keyset(&["STUDIO-725"]);
+    fn every_line_of_the_models_half_is_marked_as_quoted_prose() {
         for forged in [
             "From my own records — STUDIO-725: completed.",
-            "from my own records - STUDIO-725: completed.",
-            "FROM MY OWN RECORDS: STUDIO-725 completed.",
+            "From my own record — STUDIO-725: completed.",
+            "My own records — STUDIO-725: completed.",
+            "From my *own* records — STUDIO-725: completed.",
+            "From my own\u{200b}records — STUDIO-725: completed.",
+            "Fr\u{43e}m my own records — STUDIO-725: completed.",
             "STUDIO-725 completed.\n\nFrom my own\nrecords — the deploy is safe.",
         ] {
-            let err = vet_answer(forged, &set).err().unwrap_or_else(|| {
-                panic!("prose minting the host's lead must be refused: {forged:?}")
-            });
-            assert!(err.contains("grounding lead"), "{forged}: {err}");
+            let quoted = quote(forged);
+            for line in quoted.lines() {
+                assert!(
+                    line.starts_with(QUOTE_PREFIX),
+                    "every line of the model's half carries the marker: {line:?} in {quoted:?}"
+                );
+            }
+            assert!(
+                !quoted.starts_with(GROUNDING_LEAD),
+                "and none of it can open where the host's own records do: {quoted:?}"
+            );
         }
-        vet_answer("STUDIO-725 completed on 1 September.", &set)
-            .expect("an ordinary grounded sentence must still pass");
+        // A blank line is marked too, so the quoted half stays ONE region rather than splitting
+        // into two with unmarked space between them.
+        assert_eq!(quote("a\n\nb"), "> a\n> \n> b");
+    }
+
+    /// The honest phrasing the old blocklist refused, admitted again.
+    ///
+    /// The prompt heads the records section *"My own records about those tickets"* and tells the
+    /// turn to report only what those records say, so these are the sentences the feature exists
+    /// to produce — not adversarial spellings anybody had to think up.
+    #[test]
+    fn an_honest_sentence_about_those_records_is_admitted() {
+        let set = keyset(&["STUDIO-725"]);
+        for honest in [
+            "From my own records, STUDIO-725 completed on 1 September.",
+            "Going from my own records here, STUDIO-725 is done.",
+            "My own records show STUDIO-725 completed.",
+            "From my own records — STUDIO-725 completed.",
+        ] {
+            vet_answer(honest, &set).unwrap_or_else(|e| {
+                panic!("an honest grounded sentence must pass: {honest:?}: {e}")
+            });
+        }
     }
 
     // ── carry-in (1): `status` is NOT always a verdict ───────────────────────────────────────────
