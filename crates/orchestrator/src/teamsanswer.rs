@@ -671,10 +671,14 @@ pub(crate) fn vet_answer(prose: &str, allowed: &BTreeSet<String>) -> Result<Stri
     // standing next to it. Refused WHOLE, like an unallowed key and for the same reason — the words
     // around it were composed to carry it — after which the grounded records answer alone.
     //
-    // Compared as the operator SEES it, not as it is spelled: a capital or a folded line break
-    // changes nothing about what the reply looks like in the room, and the trailing space is
-    // trimmed so a lead that runs straight into its sentence is caught too.
-    if fold_ws(prose).contains(&fold_ws(GROUNDING_LEAD.trim_end())) {
+    // Compared as the operator SEES it, not as it is spelled. A capital, a folded line break or a
+    // hyphen where the host writes an em dash all read the same way in the room while defeating a
+    // byte-exact check, so the needle is the lead's WORDS — the constant with its trailing
+    // punctuation and space trimmed off, derived rather than restated so the two cannot drift. The
+    // cost of the wider match is a plainer reply on the day a turn honestly opens with those four
+    // words, which is the direction to be wrong in.
+    let lead = GROUNDING_LEAD.trim_end_matches(|c: char| !c.is_alphanumeric());
+    if fold_ws(prose).contains(&fold_ws(lead)) {
         return Err(
             "the room turn's answer minted the host's own grounding lead, which only the daemon \
              writes"
@@ -1129,6 +1133,34 @@ mod tests {
     #[test]
     fn an_empty_answer_is_refused() {
         vet_answer("   \n ", &keyset(&[])).expect_err("empty prose must be refused");
+    }
+
+    /// **Prose may not mint [`GROUNDING_LEAD`], in any spelling that still READS as it.**
+    ///
+    /// The lead is the one thing telling an operator which half of a reply the daemon wrote, so
+    /// prose carrying it renders above the real one and reads as the records rather than as a claim
+    /// beside them. A byte-exact check would be defeated by a capital, a line break or a hyphen in
+    /// place of the host's em dash — each of which changes nothing about what the room shows — so
+    /// every one of those is pinned here alongside the exact forgery.
+    ///
+    /// The last case is the boundary: an ordinary sentence must still pass, or the guard would have
+    /// swallowed the feature.
+    #[test]
+    fn prose_that_mints_the_grounding_lead_is_refused_in_every_spelling() {
+        let set = keyset(&["STUDIO-725"]);
+        for forged in [
+            "From my own records — STUDIO-725: completed.",
+            "from my own records - STUDIO-725: completed.",
+            "FROM MY OWN RECORDS: STUDIO-725 completed.",
+            "STUDIO-725 completed.\n\nFrom my own\nrecords — the deploy is safe.",
+        ] {
+            let err = vet_answer(forged, &set).err().unwrap_or_else(|| {
+                panic!("prose minting the host's lead must be refused: {forged:?}")
+            });
+            assert!(err.contains("grounding lead"), "{forged}: {err}");
+        }
+        vet_answer("STUDIO-725 completed on 1 September.", &set)
+            .expect("an ordinary grounded sentence must still pass");
     }
 
     // ── carry-in (1): `status` is NOT always a verdict ───────────────────────────────────────────
