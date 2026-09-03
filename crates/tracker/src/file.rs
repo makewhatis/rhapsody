@@ -529,6 +529,30 @@ impl crate::Tracker for Tracker {
             .collect())
     }
 
+    /// Reloads the file and returns the `id`, `identifier` and (lowercased) `labels` of the issues
+    /// whose id is in `ids`, in any state (STUDIO-735). An empty slice returns an empty result
+    /// without reading the file, mirroring the Linear adapter.
+    async fn fetch_issue_labels_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _guard = self.lock();
+        let doc = self.load_locked()?;
+        let want: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        Ok(doc
+            .issues
+            .iter()
+            .filter(|j| want.contains(j.id.as_str()))
+            .map(to_core_issue)
+            .map(|iss| Issue {
+                id: iss.id,
+                identifier: iss.identifier,
+                labels: iss.labels,
+                ..Issue::default()
+            })
+            .collect())
+    }
+
     /// Reloads the file and returns issues whose state matches the Backlog state TYPE (resolved via
     /// the file's `state_types` map, defaulting to "Backlog" when the section is absent — mirroring
     /// `move_issue_to_type`). `blocked_by` edges are populated by [`to_core_issue`]. INF-318.

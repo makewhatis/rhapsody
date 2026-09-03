@@ -26,7 +26,7 @@ use rhapsody_orchestrator::teamsmemory::{
     TeamsMemory, TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
-    CancelWait, ControlHandle, HandoffResult, Identity, IssueLifecycleRow, ReadsError,
+    CancelWait, ControlHandle, HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError,
     RefreshResult, ReloadError, ResumeResult, RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
@@ -125,6 +125,16 @@ impl StateProvider for DaemonState {
         self.handle
             .snapshot()
             .ok_or_else(|| SnapshotError::new("daemon is not running"))
+    }
+
+    async fn issue_assignees(
+        &self,
+        keys: &[IssueKey],
+    ) -> std::collections::HashMap<String, String> {
+        // Off-loop and best-effort (STUDIO-735), exactly like the lifecycle decoration beside it:
+        // the handle answers from its TTL cache, the store's own routing ledger and the reads
+        // cell's tracker, and answers nothing for the rest.
+        self.handle.issue_assignees(keys).await
     }
 
     fn history(&self) -> Arc<dyn HistoryStore> {

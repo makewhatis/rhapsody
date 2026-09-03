@@ -41,11 +41,15 @@ the `Orchestrator` struct itself. Concretely:
     `RunningEntry::event_seq`). That round-trip is best-effort by construction — the post is
     already in the log — so a gone loop costs nothing.
   - `lifecycle.rs`'s `LifecycleCache` (`Orchestrator::lifecycle: Arc<LifecycleCache>`,
-    STUDIO-702) — a `Mutex`-guarded TTL memo of each ticket's CURRENT tracker state, read and
-    written ENTIRELY on the HTTP task (it decorates `GET /api/v1/history/issues`). The control task
-    never touches it, so it is a seam only in the sense that the handle carries it; the lock is
-    never held across the tracker `.await`, and the state sets it classifies with are read through
-    the `reads.rs` cell above rather than from loop-owned `Effective`.
+    STUDIO-702) — two `Mutex`-guarded TTL memos, of each ticket's CURRENT tracker state and of its
+    DURABLE assignee (STUDIO-735), read and written ENTIRELY on the HTTP task (they decorate
+    `GET /api/v1/history/issues`). The control task never touches them, so it is a seam only in the
+    sense that the handle carries it; neither lock is held across the tracker `.await`, and the
+    state sets it classifies with are read through the `reads.rs` cell above rather than from
+    loop-owned `Effective`. The assignee half also READS the store (the routing event a dispatch
+    wrote into the DISPLAYED RUN's ledger — always scoped by `run_id`, never searched ticket-wide,
+    because a ticket's runs can disagree about who ran them) — a read-only use of the same
+    `Arc<dyn Store>` the handle already carries, never a write.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
   five seams; if none fits, that's a real design decision — don't reach for a sixth ad hoc

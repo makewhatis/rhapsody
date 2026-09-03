@@ -199,6 +199,11 @@ pub struct EventQuery {
     pub issue: String,
     /// optional kind filter
     pub kind: String,
+    /// Optional run filter; `<=0` means every run. Narrows the search to ONE run's slice of the
+    /// ledger, which [`Store::run_events`] also does but unbounded — this keeps the `LIMIT` and the
+    /// `kind` filter, so a caller asking "did THIS run record a routing decision?" reads one indexed
+    /// row rather than the run's whole event history (STUDIO-735).
+    pub run: i64,
     /// <=0 => default
     pub limit: i64,
 }

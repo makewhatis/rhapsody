@@ -208,6 +208,23 @@ query ByIDs($ids: [ID!], $first: Int!) {
   }
 }"#;
 
+/// `queryIssueLabelsByIDs` — the LABELS of the given tracker ids, whatever state those issues are
+/// in. Rhapsody-only (no Go v0.4.0 counterpart), additive, and deliberately NOT a widening of
+/// [`QUERY_BY_IDS`]: that one is the reconciliation read the control loop runs every tick, and it
+/// must keep asking for exactly the four fields it asks for today.
+///
+/// It exists because the `rhapsody:@<name>` assignment label is the durable "who did this work"
+/// record, and the read that surfaces it must answer for a ticket that has already been merged —
+/// which rules out [`QUERY_OPEN_ISSUES_BY_LABELS`], whose whole filter is non-terminal states.
+/// Unpaginated for the same reason as [`QUERY_BY_IDS`]: the caller passes `first: len(ids)`.
+/// STUDIO-735.
+pub const QUERY_ISSUE_LABELS_BY_IDS: &str = r#"
+query IssueLabelsByIDs($ids: [ID!], $first: Int!) {
+  issues(first: $first, filter: { id: { in: $ids } }) {
+    nodes { id identifier labels { nodes { name } } }
+  }
+}"#;
+
 /// `queryTeamWorkflowStates` — all workflow states (id + name + type + position) for a team; the
 /// caller matches the target NAME case-insensitively client-side. `$teamID` is typed `ID!`.
 pub const QUERY_TEAM_WORKFLOW_STATES: &str = r#"

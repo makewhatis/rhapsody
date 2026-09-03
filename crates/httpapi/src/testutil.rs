@@ -16,8 +16,8 @@ use rhapsody_core::Project;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::{
-    HandoffResult, Identity, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult, RetryRow,
-    RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
+    HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
+    RetryRow, RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
 };
 use rhapsody_store::Noop;
 
@@ -81,6 +81,11 @@ pub(crate) struct FakeProvider {
     /// so a test can assert it asked about exactly the page it served.
     issue_lifecycles: HashMap<String, IssueLifecycleRow>,
     issue_lifecycles_asked: Mutex<Vec<String>>,
+    /// The canned durable assignees the issue listing is decorated with (STUDIO-735), keyed by
+    /// tracker issue id. `issue_assignees_asked` records the KEYS the handler forwarded, which is
+    /// how a test sees that it passed the identifier along as well as the id.
+    issue_assignees: HashMap<String, String>,
+    issue_assignees_asked: Mutex<Vec<IssueKey>>,
     /// The canned `GET /api/v1/reviews` view (STUDIO-722). Unset ⇒ the trait's default, which is a
     /// DORMANT surface — exactly what a daemon with Teams off or the mode not `ticketless` serves.
     reviews: Option<ReviewsView>,
@@ -131,6 +136,8 @@ impl FakeProvider {
             teams_config_path: String::new(),
             issue_lifecycles: HashMap::new(),
             issue_lifecycles_asked: Mutex::new(Vec::new()),
+            issue_assignees: HashMap::new(),
+            issue_assignees_asked: Mutex::new(Vec::new()),
             reviews: None,
             reviews_err: None,
             review_outcome: None,
@@ -157,6 +164,21 @@ impl FakeProvider {
     ) -> Self {
         self.issue_lifecycles = rows;
         self
+    }
+
+    /// Canned durable assignees for the issue listing's `assignee` field (STUDIO-735), keyed by
+    /// tracker issue id.
+    pub(crate) fn with_issue_assignees(mut self, rows: HashMap<String, String>) -> Self {
+        self.issue_assignees = rows;
+        self
+    }
+
+    /// The issue keys the last `issue_assignees` call forwarded, in order.
+    pub(crate) fn issue_assignees_asked(&self) -> Vec<IssueKey> {
+        self.issue_assignees_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The issue ids the last `issue_lifecycles` call forwarded, in order.
@@ -338,6 +360,20 @@ impl StateProvider for FakeProvider {
                 self.issue_lifecycles
                     .get(id)
                     .map(|r| (id.clone(), r.clone()))
+            })
+            .collect()
+    }
+
+    async fn issue_assignees(&self, keys: &[IssueKey]) -> HashMap<String, String> {
+        *self
+            .issue_assignees_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys.to_vec();
+        keys.iter()
+            .filter_map(|k| {
+                self.issue_assignees
+                    .get(&k.id)
+                    .map(|name| (k.id.clone(), name.clone()))
             })
             .collect()
     }

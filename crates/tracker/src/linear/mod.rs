@@ -59,6 +59,9 @@ impl crate::Tracker for Client {
     async fn fetch_issue_states_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
         by_ids::fetch_issue_states_by_ids(self, ids).await
     }
+    async fn fetch_issue_labels_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
+        by_ids::fetch_issue_labels_by_ids(self, ids).await
+    }
     async fn fetch_blocked_backlog_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         backlog::fetch_blocked_backlog_issues(self).await
     }

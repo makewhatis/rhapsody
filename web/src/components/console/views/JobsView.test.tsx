@@ -230,6 +230,42 @@ describe("the ticket lifecycle (STUDIO-702)", () => {
   });
 });
 
+// STUDIO-735 — the ASSIGNED column used to name a teammate only while the job was running, because
+// the live roster was the only place it looked. The daemon now reports a durable assignee per
+// history row, and the column keeps it for the whole life of the ticket.
+describe("the durable assignee (STUDIO-735)", () => {
+  const assignedCell = (key: string) =>
+    [...document.querySelectorAll(".jtbl tbody tr")]
+      .find((tr) => tr.textContent?.includes(key))
+      ?.querySelectorAll("td")[1]?.textContent;
+
+  it("keeps the teammate on a done or in-review job, and stays '—' for an unrouted one", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done", assignee: "alice" }),
+        run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review", assignee: "jimmy" }),
+        run({ issue_identifier: "SOLO", outcome: "completed", lifecycle: "done" }),
+      ],
+      next_offset: null,
+    });
+    // Nobody is live: every one of these rows would have rendered "—" before this ticket.
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    expect(assignedCell("MERGED")).toBe("alice");
+    expect(assignedCell("REVIEW")).toBe("jimmy");
+    expect(assignedCell("SOLO")).toBe("—");
+  });
+});
+
 describe("the filter bar and the table (§3)", () => {
   async function mountFourJobs() {
     h.fetchState.mockResolvedValue(EMPTY_STATE);

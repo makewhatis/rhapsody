@@ -11,6 +11,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
+use rhapsody_orchestrator::IssueKey;
 use rhapsody_store::{EventQuery, RunFilter, effective_run_limit};
 
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
@@ -82,17 +83,35 @@ pub(crate) async fn handle_issue_runs(
         Ok(runs) => runs,
         Err(_) => return store_error("issue listing query failed"),
     };
-    // The ticket lifecycles that turn a run OUTCOME into a real status (STUDIO-702). Asked for
-    // exactly the ids this page returned, and best-effort: an id with no answer is absent and the
-    // row renders as it did before the fields existed.
+    // The ticket lifecycles that turn a run OUTCOME into a real status (STUDIO-702), and the
+    // durable assignee that keeps a finished job attributed (STUDIO-735). Both are asked for
+    // exactly the rows this page returned, and both are best-effort: a row with no answer carries
+    // no field and renders as it did before the fields existed.
+    //
+    // The two are decorations of the same page but NOT one lookup: they resolve from different
+    // records and are cached separately, so a tracker that cannot say what state a ticket is in
+    // must not also erase who worked it.
     let ids: Vec<String> = runs.iter().map(|r| r.issue_id.clone()).collect();
-    let lifecycles = provider.issue_lifecycles(&ids).await;
+    let keys: Vec<IssueKey> = runs
+        .iter()
+        .map(|r| IssueKey {
+            id: r.issue_id.clone(),
+            // The run this row DISPLAYS. Attribution is that run's, not the ticket's: a ticket
+            // routed to a teammate and re-run solo must show the re-run's answer (STUDIO-735).
+            run_id: r.id,
+        })
+        .collect();
+    let (lifecycles, assignees) = tokio::join!(
+        provider.issue_lifecycles(&ids),
+        provider.issue_assignees(&keys)
+    );
     write_json(
         StatusCode::OK,
         &issue_runs_response(
             &runs,
             next_offset(runs.len(), offset, effective_limit),
             &lifecycles,
+            &assignees,
         ),
     )
 }
@@ -342,6 +361,9 @@ pub(crate) async fn handle_event_search(
         text: qget(&q, "q").to_string(),
         issue: qget(&q, "issue").to_string(),
         kind: qget(&q, "kind").to_string(),
+        // No `run` query parameter: the endpoint is the cross-run search Go's is, and per-run
+        // events already have `GET /api/v1/runs/{id}/events`.
+        run: 0,
         limit,
     };
     let hits = match provider.history().search_events(query) {
@@ -473,7 +495,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
     use rhapsody_agent::LogEntry;
     use rhapsody_orchestrator::{
-        EventRecord, IssueLifecycle, IssueLifecycleRow, Snapshot, TokenCounts, Totals,
+        EventRecord, IssueKey, IssueLifecycle, IssueLifecycleRow, Snapshot, TokenCounts, Totals,
     };
     use rhapsody_store::{
         DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, RunEnd, RunProgress, RunStart, Sqlite,
@@ -938,6 +960,96 @@ mod tests {
         );
     }
 
+    // STUDIO-735 — the issue listing carries the ticket's DURABLE assignee, so a job that has left
+    // "running" keeps naming the teammate who did it. A ticket nobody was routed for carries no
+    // field at all, which is what keeps the column's "—" honest.
+    #[tokio::test]
+    async fn issue_runs_carry_the_durable_assignee() {
+        let store = mem_store();
+        let done = seed_run_for("iss_done", "MT-1", "2026-08-01T00:00:00Z", &store);
+        let solo = seed_run_for("iss_solo", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_assignees(HashMap::from([
+                    ("iss_done".to_string(), "alice".to_string()),
+                    // The daemon's "nobody was routed for this one" answer.
+                    ("iss_solo".to_string(), String::new()),
+                ])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let issues = body["issues"].as_array().expect("issues array");
+        let by_ident: std::collections::HashMap<&str, &Value> = issues
+            .iter()
+            .map(|r| (r["issue_identifier"].as_str().unwrap_or_default(), r))
+            .collect();
+        assert_eq!(by_ident["MT-1"]["assignee"], "alice");
+        assert!(
+            by_ident["MT-2"].get("assignee").is_none(),
+            "nobody routed => no field, never an empty name: {}",
+            by_ident["MT-2"],
+        );
+
+        // Both halves of the key are forwarded: the tracker read goes by issue id, the daemon's own
+        // routing ledger by the id of the run this row DISPLAYS — the row's own run, so a re-run
+        // cannot be attributed to the teammate of the run before it (STUDIO-735 route-back).
+        let mut asked = provider.issue_assignees_asked();
+        asked.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            asked,
+            vec![
+                IssueKey {
+                    id: "iss_done".into(),
+                    run_id: done,
+                },
+                IssueKey {
+                    id: "iss_solo".into(),
+                    run_id: solo,
+                },
+            ],
+        );
+    }
+
+    // STUDIO-735 — a daemon that cannot resolve an assignee carries no field, so the console falls
+    // back to the live roster exactly as it did before the field existed.
+    #[tokio::test]
+    async fn issue_runs_omit_the_assignee_when_there_is_no_answer() {
+        let store = mem_store();
+        seed_run_for("iss_1", "MT-1", "2026-08-01T00:00:00Z", &store);
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let row = &body["issues"][0];
+        assert_eq!(row["issue_identifier"], "MT-1");
+        assert!(
+            row.get("assignee").is_none(),
+            "no answer => no field: {row}"
+        );
+    }
+
+    // STUDIO-735 — the two decorations are independent: a tracker that cannot say what state a
+    // ticket is in must not also erase who worked it, since the store alone can answer that.
+    #[tokio::test]
+    async fn an_unresolvable_lifecycle_still_carries_its_assignee() {
+        let store = mem_store();
+        seed_run_for("iss_1", "MT-1", "2026-08-01T00:00:00Z", &store);
+        let base = spawn(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_assignees(HashMap::from([("iss_1".to_string(), "alice".to_string())])),
+        )
+        .await;
+
+        let (_s, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        let row = &body["issues"][0];
+        assert_eq!(row["assignee"], "alice");
+        assert!(row.get("lifecycle").is_none(), "still no lifecycle: {row}");
+    }
+
     // STUDIO-702 — /history is byte-pinned to the Go daemon's golden and must NOT grow the fields
     // the Rhapsody-only issue listing does.
     #[tokio::test]
@@ -953,6 +1065,10 @@ mod tests {
                         state: "Done".into(),
                         lifecycle: IssueLifecycle::Done,
                     },
+                )]))
+                .with_issue_assignees(HashMap::from([(
+                    "iss_done".to_string(),
+                    "alice".to_string(),
                 )])),
         )
         .await;
@@ -965,6 +1081,10 @@ mod tests {
         );
         assert!(
             row.get("tracker_state").is_none(),
+            "run paging stays Go-shaped: {row}"
+        );
+        assert!(
+            row.get("assignee").is_none(),
             "run paging stays Go-shaped: {row}"
         );
     }

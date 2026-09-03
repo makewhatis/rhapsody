@@ -193,6 +193,13 @@ pub(crate) fn history_response(runs: &[RunSummary], next_offset: Option<i64>) ->
 /// Pill from. Both are OMITTED rather than blanked when there is no answer, so "the daemon could not
 /// resolve this ticket" stays distinguishable from any state it could have resolved.
 ///
+/// It carries `assignee` on the same terms when `assignees` names one (STUDIO-735): the teammate
+/// the ticket's newest run was dispatched under, which is what keeps a finished job attributed
+/// after its teammate has left the live roster. A ticket nobody was routed for — solo, unrouted, or
+/// a Teams-off daemon — carries NO field rather than an empty one, for the same reason: "nobody ran
+/// this as a teammate" and "the daemon has no answer" both fall back to the same client behaviour,
+/// and neither is a name.
+///
 /// The decoration is applied HERE and not in [`run_summary_json`] deliberately: that renderer is
 /// byte-pinned to the Go daemon's `/api/v1/history` golden, and this listing is the Rhapsody-only
 /// endpoint that may grow fields.
@@ -200,14 +207,21 @@ pub(crate) fn issue_runs_response(
     runs: &[RunSummary],
     next_offset: Option<i64>,
     lifecycles: &HashMap<String, IssueLifecycleRow>,
+    assignees: &HashMap<String, String>,
 ) -> Value {
     let issues: Vec<Value> = runs
         .iter()
         .map(|r| {
             let mut row = run_summary_json(r);
-            if let (Some(obj), Some(life)) = (row.as_object_mut(), lifecycles.get(&r.issue_id)) {
+            let Some(obj) = row.as_object_mut() else {
+                return row;
+            };
+            if let Some(life) = lifecycles.get(&r.issue_id) {
                 obj.insert("tracker_state".to_string(), json!(life.state));
                 obj.insert("lifecycle".to_string(), json!(life.lifecycle.as_str()));
+            }
+            if let Some(name) = assignees.get(&r.issue_id).filter(|n| !n.is_empty()) {
+                obj.insert("assignee".to_string(), json!(name));
             }
             row
         })
