@@ -1,5 +1,5 @@
-import type { PillVariant } from "@/components/console";
-import type { ReviewJob } from "@/lib/api";
+import type { NoteVariant, PillVariant } from "@/components/console";
+import type { ReviewActionResponse, ReviewJob } from "@/lib/api";
 
 // reviews-model — the pure logic behind the console's Reviews surface (STUDIO-722, slice 8 of the
 // design record `~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md`, §7, §15-e).
@@ -89,15 +89,30 @@ export function isLive(job: ReviewJob): boolean {
   return job.open && job.status !== "dropped";
 }
 
+/**
+ * How a row reads to an operator.
+ *
+ * `open` is consulted BEFORE the status, and that ordering is the point. A pull request dismissed
+ * while a review of it was running comes back as `open: false, status: "reviewed"`: the drop parked
+ * the status at `dropped`, and then the finishing agent's `mark_review_completed` — whose contract
+ * is to write the status and never touch `open` — wrote its own terminal back over it. The row is
+ * correctly out of every live read either way, so this is display only, but a "Reviewed" pill on a
+ * row the operator just dismissed reads as a click that did not land. `open` is the column no
+ * completion can rewrite and nothing but a drop ever clears, so it is the honest one to read.
+ */
+function rowLook(job: ReviewJob): { variant: PillVariant; label: string } {
+  if (!job.open) return STATUS_LOOK.dropped;
+  if (isStatus(job.status)) return STATUS_LOOK[job.status];
+  // A status this build has never heard of — the daemon grew one. Show it verbatim rather than
+  // guessing what it means or dropping the row: an unrenderable review is worse than an unfamiliar
+  // label.
+  return { variant: "queued", label: job.status || "unknown" };
+}
+
 /** One row, ready to render. */
 export function reviewRow(job: ReviewJob): ReviewRow {
   const pr = prLabel(job);
-  const look = isStatus(job.status)
-    ? STATUS_LOOK[job.status]
-    : // A status this build has never heard of — the daemon grew one. Show it verbatim rather than
-      // guessing what it means or dropping the row: an unrenderable review is worse than an
-      // unfamiliar label.
-      { variant: "queued" as PillVariant, label: job.status || "unknown" };
+  const look = rowLook(job);
   return {
     key: `${pr}@${job.reviewer}`,
     job,
@@ -142,5 +157,59 @@ export function reviewStats(jobs: readonly ReviewJob[]): {
     pullRequests: new Set(live.map(prLabel)).size,
     inFlight: live.filter((j) => j.status === "in_flight").length,
     awaiting: live.filter((j) => j.status === "requested" || j.status === "truncated").length,
+  };
+}
+
+/**
+ * What a completed control tells the operator.
+ *
+ * Both controls answer `200 {pr, rows}`, and `rows` is the whole difference between "the daemon did
+ * what you asked" and "the daemon accepted the click and changed nothing" — a re-run of a pull
+ * request whose reviews are all already in flight is exactly that second case. Discarding the count
+ * leaves the operator staring at an unchanged table with no way to tell the two apart, so the
+ * surface renders it.
+ */
+export interface ReviewNotice {
+  /** The `Note` variant that carries it: `info` for a change, `warn` for a no-op. */
+  tone: NoteVariant;
+  text: string;
+}
+
+/** "1 reviewer" / "2 reviewers", so the sentence reads. */
+function reviewers(n: number): string {
+  return `${n} ${n === 1 ? "reviewer" : "reviewers"}`;
+}
+
+/**
+ * The outcome of a re-run. `rows` counts the reviewers that now owe a round — one that was already
+ * `requested` counts too, because the operator's question is "will this be read again" and that is
+ * a yes. Zero means every reviewer of the pull request has a round IN FLIGHT: the daemon
+ * deliberately leaves those rows alone, since re-arming one would overwrite the `in_flight` marker
+ * the watcher's edge trigger reads and point a second agent at the first one's worktree.
+ */
+export function rerunNotice(res: ReviewActionResponse): ReviewNotice {
+  if (res.rows === 0) {
+    return {
+      tone: "warn",
+      text: `A review of ${res.pr} is already running — nothing to re-arm. It will report when it finishes.`,
+    };
+  }
+  return {
+    tone: "info",
+    text: `${res.pr} is re-armed — ${reviewers(res.rows)} will read the current head again.`,
+  };
+}
+
+/** The outcome of a dismissal, including the part of it the operator cannot take back. */
+export function dismissNotice(res: ReviewActionResponse): ReviewNotice {
+  if (res.rows === 0) {
+    return {
+      tone: "warn",
+      text: `Nothing changed — the daemon dropped no watch row of ${res.pr}.`,
+    };
+  }
+  return {
+    tone: "info",
+    text: `${res.pr} is out of the watch set — ${res.rows} ${res.rows === 1 ? "row" : "rows"} dropped. Only a new hand-off re-introduces it.`,
   };
 }

@@ -43,3 +43,24 @@
   white-space: nowrap;
   border: 0;
 }
+
+/* The armed dismissal. A dismissal cannot be undone from this console, so the control grows a
+   second click AND the sentence saying why — which means this one cell has to wrap, against the
+   nowrap the control column otherwise wants. Bounded so the warning cannot push the reading
+   columns off the card. */
+.rh-console .rtbl .rctl .rconfirm {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 260px;
+  white-space: normal;
+}
+.rh-console .rtbl .rctl .rconfirm .rwhy { color: var(--ink-4); font-size: 11.5px; line-height: 1.45; text-align: right; }
+/* `gap` already spaces these, so the column's own `.btn + .btn` margin is taken back. */
+.rh-console .rtbl .rctl .rconfirm .racts { display: inline-flex; align-items: center; gap: 8px; }
+.rh-console .rtbl .rctl .rconfirm .racts .btn + .btn { margin-left: 0; }
+
+/* The confirming button carries the destructive tint the console already uses for Memory's
+   Invalidate, rather than a colour of its own. */
+.rh-console .rtbl .rctl .rconfirm .btn.danger { color: var(--bad); border-color: var(--bad); }

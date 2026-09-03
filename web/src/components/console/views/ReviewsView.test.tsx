@@ -128,6 +128,7 @@ describe("the Reviews surface", () => {
     mount({ enabled: true, reviews: [job()] });
 
     fireEvent.click(await screen.findByLabelText("Dismiss makewhatis/rhapsody#12 from the watch set"));
+    fireEvent.click(screen.getByLabelText("Confirm dismissing makewhatis/rhapsody#12"));
 
     await waitFor(() => expect(h.postReviewDismiss).toHaveBeenCalledTimes(1));
     expect(h.postReviewDismiss.mock.calls[0][0]).toMatchObject({
@@ -136,6 +137,73 @@ describe("the Reviews surface", () => {
       number: 12,
     });
     expect(h.postReviewRerun).not.toHaveBeenCalled();
+  });
+
+  // A dismissal is the one control here nothing on this console can undo: `drop_review_watch`
+  // clears `open`, and BOTH controls then exclude the row — re-run reads only the live watch set —
+  // so the pull request comes back solely through a fresh author hand-off. One unguarded click is
+  // the wrong shape for that.
+  it("does not dismiss on the first click, and says what cannot be undone", async () => {
+    mount({ enabled: true, reviews: [job()] });
+
+    fireEvent.click(await screen.findByLabelText("Dismiss makewhatis/rhapsody#12 from the watch set"));
+
+    expect(h.postReviewDismiss).not.toHaveBeenCalled();
+    const warning = screen.getByRole("group", { name: "Dismiss makewhatis/rhapsody#12?" });
+    expect(warning.textContent).toMatch(/only a new hand-off/i);
+    expect(warning.textContent).toMatch(/re-introduces/i);
+  });
+
+  it("abandons a dismissal on cancel, leaving the row alone", async () => {
+    mount({ enabled: true, reviews: [job()] });
+
+    fireEvent.click(await screen.findByLabelText("Dismiss makewhatis/rhapsody#12 from the watch set"));
+    fireEvent.click(screen.getByLabelText("Cancel dismissing makewhatis/rhapsody#12"));
+
+    expect(h.postReviewDismiss).not.toHaveBeenCalled();
+    expect(screen.queryByRole("group")).toBeNull();
+    // The row is steerable again, not stuck mid-confirmation.
+    expect(screen.getByLabelText("Re-run the review of makewhatis/rhapsody#12")).toBeTruthy();
+  });
+
+  /**
+   * `rows` is the ONLY thing separating "re-armed" from "accepted and changed nothing": the daemon
+   * deliberately leaves an `in_flight` row alone, so a re-run of a pull request whose reviews are
+   * all running answers `200 {rows: 0}` and the table looks identical afterwards. Rendering the
+   * count is what stops that reading as a broken button.
+   */
+  it("says a re-run was a no-op rather than answering it with silence", async () => {
+    h.postReviewRerun.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 0 });
+    mount({ enabled: true, reviews: [job({ status: "in_flight" })] });
+
+    fireEvent.click(await screen.findByLabelText("Re-run the review of makewhatis/rhapsody#12"));
+
+    const status = await screen.findByRole("status");
+    expect(status.textContent).toContain("already running");
+    expect(status.textContent).toContain("nothing to re-arm");
+  });
+
+  it("says how many reviewers a re-run re-armed", async () => {
+    h.postReviewRerun.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 2 });
+    mount({ enabled: true, reviews: [job({ status: "approved" })] });
+
+    fireEvent.click(await screen.findByLabelText("Re-run the review of makewhatis/rhapsody#12"));
+
+    const status = await screen.findByRole("status");
+    expect(status.textContent).toContain("re-armed");
+    expect(status.textContent).toContain("2 reviewers");
+  });
+
+  it("confirms a dismissal landed, and how many rows it dropped", async () => {
+    h.postReviewDismiss.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 2 });
+    mount({ enabled: true, reviews: [job()] });
+
+    fireEvent.click(await screen.findByLabelText("Dismiss makewhatis/rhapsody#12 from the watch set"));
+    fireEvent.click(screen.getByLabelText("Confirm dismissing makewhatis/rhapsody#12"));
+
+    const status = await screen.findByRole("status");
+    expect(status.textContent).toContain("out of the watch set");
+    expect(status.textContent).toContain("2 rows");
   });
 
   // A retired row is history. Re-running it would put a merged, closed or already-dismissed pull
@@ -198,5 +266,26 @@ describe("the Reviews surface", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("no configured project owns the PR's repo");
+  });
+
+  /**
+   * A refusal must not outlive the click it belongs to. React Query holds a mutation's `error`
+   * until that SAME mutation next runs, so reading the banner straight off `rerun.error` left a
+   * refused re-run's warning standing over a later, successful dismissal — the operator is told the
+   * daemon refused something it in fact did.
+   */
+  it("clears a refusal when the next control succeeds", async () => {
+    h.postReviewRerun.mockRejectedValue(new Error("no configured project owns the PR's repo"));
+    h.postReviewDismiss.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 1 });
+    mount({ enabled: true, reviews: [job()] });
+
+    fireEvent.click(await screen.findByLabelText("Re-run the review of makewhatis/rhapsody#12"));
+    await screen.findByRole("alert");
+
+    fireEvent.click(screen.getByLabelText("Dismiss makewhatis/rhapsody#12 from the watch set"));
+    fireEvent.click(screen.getByLabelText("Confirm dismissing makewhatis/rhapsody#12"));
+
+    await screen.findByRole("status");
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

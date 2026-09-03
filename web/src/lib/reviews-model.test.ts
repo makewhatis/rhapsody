@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { ReviewJob } from "@/lib/api";
 import {
   REVIEW_STATUSES,
+  dismissNotice,
   isLive,
   prLabel,
+  rerunNotice,
   retiredCount,
   reviewRow,
   reviewRows,
@@ -74,6 +76,30 @@ describe("reviewRow", () => {
       expect(row.label, status).not.toBe("");
       expect(row.label, status).not.toBe(status);
     }
+  });
+
+  /**
+   * A pull request dismissed WHILE a review of it was running comes back from the daemon as
+   * `open: false, status: "reviewed"`: `drop_review_watch` cleared `open` and parked the status at
+   * `dropped`, and then the finishing agent's `mark_review_completed` — whose contract is to write
+   * the status and never touch `open` — wrote `reviewed` back over it.
+   *
+   * The row is correctly out of every live read either way, so this is display only. But a
+   * "Reviewed" pill on a row the operator just dismissed says the click did not land. `open` is the
+   * column no completion can rewrite, and nothing in the daemon clears it except a drop, so it is
+   * the honest thing to read the label off.
+   */
+  it("labels a row the daemon closed as dropped, whatever status a late completion wrote", () => {
+    expect(reviewRow(job({ open: false, status: "reviewed" })).label).toBe("Dropped");
+    expect(reviewRow(job({ open: false, status: "approved" })).label).toBe("Dropped");
+    expect(reviewRow(job({ open: false, status: "in_flight" })).label).toBe("Dropped");
+    // The SHA the round did read is still the record of what was reviewed, so it stays.
+    expect(reviewRow(job({ open: false, status: "reviewed" })).reviewedShort).toBe("aaaaaaa");
+  });
+
+  it("leaves an OPEN row's own status alone", () => {
+    expect(reviewRow(job({ open: true, status: "reviewed" })).label).toBe("Reviewed");
+    expect(reviewRow(job({ open: true, status: "in_flight" })).label).toBe("Reviewing");
   });
 
   // A round that ran out of turns read the head only PARTLY, which is why the daemon deliberately
@@ -163,5 +189,46 @@ describe("reviewStats", () => {
       job({ number: 13, reviewer: "carol", status: "reviewed", last_reviewed_sha: HEAD_B }),
     ]);
     expect(stats).toEqual({ pullRequests: 1, inFlight: 0, awaiting: 0 });
+  });
+});
+
+describe("rerunNotice", () => {
+  // The whole point of rendering the count: `rows: 0` is a 200 that changed NOTHING, and a control
+  // that answers a click with silence reads as broken.
+  it("distinguishes a re-armed review from a no-op on one already running", () => {
+    const armed = rerunNotice({ pr: "makewhatis/rhapsody#12", rows: 1 });
+    expect(armed.tone).toBe("info");
+    expect(armed.text).toContain("re-armed");
+
+    const noop = rerunNotice({ pr: "makewhatis/rhapsody#12", rows: 0 });
+    expect(noop.tone).toBe("warn");
+    expect(noop.text).toContain("already running");
+    expect(noop.text).toContain("nothing to re-arm");
+  });
+
+  it("names the pull request the daemon says it acted on, and counts reviewers", () => {
+    expect(rerunNotice({ pr: "makewhatis/rhapsody#12", rows: 1 }).text).toContain(
+      "makewhatis/rhapsody#12",
+    );
+    expect(rerunNotice({ pr: "o/r#1", rows: 1 }).text).toContain("1 reviewer ");
+    expect(rerunNotice({ pr: "o/r#1", rows: 2 }).text).toContain("2 reviewers ");
+  });
+});
+
+describe("dismissNotice", () => {
+  // A dismissal is irreversible from this console — `drop_review_watch` clears `open`, and both
+  // controls then exclude the row — so the notice has to say what the operator can no longer undo.
+  it("confirms the drop and says what re-introduces the pull request", () => {
+    const done = dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 2 });
+    expect(done.tone).toBe("info");
+    expect(done.text).toContain("makewhatis/rhapsody#12");
+    expect(done.text).toContain("2 rows");
+    expect(done.text).toMatch(/hand-off/i);
+  });
+
+  it("does not claim a drop the daemon reports it did not make", () => {
+    const none = dismissNotice({ pr: "o/r#1", rows: 0 });
+    expect(none.tone).toBe("warn");
+    expect(none.text).toContain("Nothing changed");
   });
 });

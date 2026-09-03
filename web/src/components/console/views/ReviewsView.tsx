@@ -14,10 +14,13 @@ import {
 import { useDismissReview, useReviews, useRerunReview } from "@/hooks/useReviews";
 import { errText } from "@/lib/teams-model";
 import {
+  dismissNotice,
+  rerunNotice,
   retiredCount,
   reviewRows,
   reviewStats,
   type ReviewFilter,
+  type ReviewNotice,
   type ReviewRow,
 } from "@/lib/reviews-model";
 import type { ReviewJob } from "@/lib/api";
@@ -55,6 +58,17 @@ export interface ReviewsViewProps {
   pollMs?: number;
 }
 
+/**
+ * What the last control did, and how loudly to say it.
+ *
+ * `role` is NOT derived from `tone`. A daemon refusal is an `alert` — something the operator asked
+ * for did not happen — while a re-run that was a no-op is a `status`: it is still an outcome, just
+ * a warned-about one. Screen readers treat the two differently, and so should this.
+ */
+interface WriteNotice extends ReviewNotice {
+  role: "alert" | "status";
+}
+
 export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
   // Mounted only from a Teams-ON route (`useConsoleRoute` sends `reviews` to Jobs otherwise), so
   // the query is safe to fire — the §16 gate's Teams half is already satisfied by being here.
@@ -62,6 +76,44 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
   const rerun = useRerunReview();
   const dismiss = useDismissReview();
   const [filter, setFilter] = React.useState<ReviewFilter>("active");
+  // The outcome of the last control, held HERE rather than read off `rerun.error` / `dismiss.error`.
+  // React Query keeps a mutation's error until that same mutation next runs, so reading the banner
+  // off the two errors left a refused re-run's warning standing over a later, successful dismissal.
+  // One slot, written by whichever control finished last, is the thing that actually matches what
+  // the operator just did.
+  const [notice, setNotice] = React.useState<WriteNotice | null>(null);
+  // The row whose dismissal is armed, if any — one at a time, so a second Dismiss click elsewhere
+  // moves the confirmation rather than leaving two rows looking half-pressed.
+  const [confirming, setConfirming] = React.useState<string | null>(null);
+
+  const refused = (e: unknown): WriteNotice => ({
+    role: "alert",
+    tone: "warn",
+    text: `The daemon refused that: ${errText(e)}`,
+  });
+
+  const onRerun = (job: ReviewJob) => {
+    setConfirming(null);
+    rerun.mutate(job, {
+      onSuccess: (res) => setNotice({ role: "status", ...rerunNotice(res) }),
+      onError: (e) => setNotice(refused(e)),
+    });
+  };
+
+  const onDismiss = (job: ReviewJob) => {
+    dismiss.mutate(job, {
+      // Disarmed on either outcome: the row is gone from the live list on success, and on a refusal
+      // the operator should re-read the warning before clicking a destructive control again.
+      onSuccess: (res) => {
+        setConfirming(null);
+        setNotice({ role: "status", ...dismissNotice(res) });
+      },
+      onError: (e) => {
+        setConfirming(null);
+        setNotice(refused(e));
+      },
+    });
+  };
 
   const enabled = reviews.data?.enabled === true;
   const jobs = React.useMemo(() => reviews.data?.reviews ?? [], [reviews.data]);
@@ -84,18 +136,13 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
     );
   }
 
-  // A failed write is reported above the table and left there: the row it concerns is still on
-  // screen, and clearing the message on the next 5s poll would take the explanation away before it
-  // had been read. Any later click replaces it.
-  const writeError = rerun.error ?? dismiss.error;
-
   return (
     <Page onNavigate={onNavigate}>
       <p className="lead">
         Every pull request the team is reviewing, one row per reviewer. Re-run asks for another
-        round of the current head; dismiss takes the pull request out of the watch set. Neither is
-        available from the team room — an operator control over what gets checked out belongs to
-        this console.
+        round of the current head; dismiss takes the pull request out of the watch set for good —
+        only a new hand-off puts it back. Neither control is available from the team room: an
+        operator control over what gets checked out belongs to this console.
       </p>
 
       <NowStrip>
@@ -123,9 +170,11 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
         </div>
       ) : null}
 
-      {writeError ? (
-        <div role="alert">
-          <Note variant="warn">The daemon refused that: {errText(writeError)}</Note>
+      {/* Left standing until the next control finishes: the row it concerns is still on screen, and
+          clearing it on the next 5s poll would take the explanation away before it had been read. */}
+      {notice ? (
+        <div role={notice.role}>
+          <Note variant={notice.tone}>{notice.text}</Note>
         </div>
       ) : null}
 
@@ -148,8 +197,11 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
                 key={row.key}
                 row={row}
                 busy={rerun.isPending || dismiss.isPending}
-                onRerun={(job) => rerun.mutate(job)}
-                onDismiss={(job) => dismiss.mutate(job)}
+                confirming={confirming === row.key}
+                onRerun={onRerun}
+                onArm={() => setConfirming(row.key)}
+                onDisarm={() => setConfirming(null)}
+                onDismiss={onDismiss}
               />
             ))}
           </tbody>
@@ -178,12 +230,19 @@ function emptyMessage(total: number, loading: boolean): string {
 function ReviewsRow({
   row,
   busy,
+  confirming,
   onRerun,
+  onArm,
+  onDisarm,
   onDismiss,
 }: {
   row: ReviewRow;
   busy: boolean;
+  /** Whether THIS row's dismissal is armed and awaiting a second, explicit click. */
+  confirming: boolean;
   onRerun: (job: ReviewJob) => void;
+  onArm: () => void;
+  onDisarm: () => void;
   onDismiss: (job: ReviewJob) => void;
 }) {
   return (
@@ -203,24 +262,56 @@ function ReviewsRow({
       <td>{row.reviewedShort === "" ? "—" : <Mono>{row.reviewedShort}</Mono>}</td>
       <td className="rctl">
         {row.live ? (
-          <>
-            <Button
-              variant="sec"
-              disabled={busy}
-              onClick={() => onRerun(row.job)}
-              aria-label={`Re-run the review of ${row.pr}`}
-            >
-              Re-run
-            </Button>
-            <Button
-              variant="link"
-              disabled={busy}
-              onClick={() => onDismiss(row.job)}
-              aria-label={`Dismiss ${row.pr} from the watch set`}
-            >
-              Dismiss
-            </Button>
-          </>
+          confirming ? (
+            // Armed. A dismissal is the one control on this console nothing on it can undo:
+            // `drop_review_watch` clears `open`, and BOTH controls then exclude the row — re-run
+            // reads only the LIVE watch set — so the pull request returns solely through a fresh
+            // author hand-off. That is worth a second click and a sentence saying so, following the
+            // arm-then-confirm shape Memory's Invalidate already uses.
+            <div className="rconfirm" role="group" aria-label={`Dismiss ${row.pr}?`}>
+              <span className="rwhy">
+                Dismiss removes {row.pr} from review — only a new hand-off re-introduces it.
+              </span>
+              <span className="racts">
+                <Button
+                  variant="link"
+                  disabled={busy}
+                  onClick={onDisarm}
+                  aria-label={`Cancel dismissing ${row.pr}`}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="sec"
+                  className="danger"
+                  disabled={busy}
+                  onClick={() => onDismiss(row.job)}
+                  aria-label={`Confirm dismissing ${row.pr}`}
+                >
+                  Dismiss
+                </Button>
+              </span>
+            </div>
+          ) : (
+            <>
+              <Button
+                variant="sec"
+                disabled={busy}
+                onClick={() => onRerun(row.job)}
+                aria-label={`Re-run the review of ${row.pr}`}
+              >
+                Re-run
+              </Button>
+              <Button
+                variant="link"
+                disabled={busy}
+                onClick={onArm}
+                aria-label={`Dismiss ${row.pr} from the watch set`}
+              >
+                Dismiss
+              </Button>
+            </>
+          )
         ) : (
           // A retired row has nothing to steer: re-running it would put a merged, closed or
           // already-dismissed pull request back into the dispatch path, which the daemon refuses
