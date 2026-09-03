@@ -1684,11 +1684,15 @@ pub(crate) fn build_room_prompt(
     s.push_str(&block.text);
     s.push_str(&tail);
     RoomPrompt {
-        // A formality whenever the head itself fits: both sections below it were sized against what
-        // it left, so there is nothing left to cut and every DATA fence closes by construction. It
-        // still bites when the HEAD ALONE exceeds the budget — a roster and ticket list larger than
-        // `MIN_PROMPT_BYTES` — and there the cut lands inside the rules themselves, which no
-        // ordering of the sections under them can fix.
+        // A formality whenever the head AND the post's own frame fit — `head + POST_PREAMBLE +
+        // POST_CLOSE`, not the head alone. Below that boundary both sections were sized against
+        // what the head left, so there is nothing to cut and every DATA fence closes by
+        // construction. At or above it the body has already clipped to zero (`saturating_sub`) and
+        // this cut lands inside the preamble or the rules, taking the operator's question with it:
+        // a roster and ticket list that big leaves no room for a post, which no ordering of the
+        // sections under them can fix. Pre-existing and byte-identical on `origin/main` — the
+        // boundary is recorded here rather than moved, because moving it means dropping the post
+        // section outright and that is a §9.3 decision, not a comment fix.
         text: truncate_chars(&s, budget),
         answers_for: block.shown,
     }
