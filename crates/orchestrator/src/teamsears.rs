@@ -109,7 +109,9 @@ use crate::ghsummons::{OpenPrSource, PrBranchSource};
 use crate::quorum::{QUORUM_REQUESTED_LABEL, QuorumRequest, review_description, review_title};
 use crate::reads::ProjectFacts;
 use crate::teams::IDENTITY_LABEL_PREFIX;
-use crate::teamsanswer::{Facts, GROUNDING_LEAD, quote, vet_answer};
+use crate::teamsanswer::{
+    Facts, GROUNDING_LEAD, answer_hint_chars, clip_bytes, quote, split_budget, vet_answer,
+};
 use crate::triage::{MANAGER_IDENTITY, TriageRequest, deterministic_assignment, validate_identity};
 
 /// Who the manager reads the room AS.
@@ -610,21 +612,35 @@ async fn act_on_post(
     let (targets, offered) = if keys.is_empty() {
         (Vec::new(), BTreeSet::new())
     } else {
-        plan_targets(teams, ears, cycle, post, &keys, &facts).await
+        // The dispositions the PROMPT is sized against, before any target is planned: every key the
+        // post named, plus the truncation notice if one is owed. It can only ever be at or above
+        // the count the reply actually carries (`validate_targets` drops targets, never adds them),
+        // so the budget the preamble states is at or below the one `answer_for` enforces — a turn
+        // that obeys the contract is never refused for exceeding a number it was never given.
+        let planned = keys.len() + usize::from(truncated);
+        plan_targets(teams, ears, cycle, post, &keys, &facts, planned).await
     };
+    // **Sized against the whole reply, not against this target.** Each answer gets its own share of
+    // the one `MAX_MESSAGE_BODY_BYTES` message they all have to fit inside, so N answers that each
+    // "fit" alone cannot collectively overrun and leave `compose_reply` to resolve it from the end
+    // — where the records sit.
     let answerable = Answerable {
         facts: &facts,
         offered,
+        budget: disposition_budget(targets.len().max(1) + usize::from(truncated)),
     };
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines: Vec<ReplyLine> = Vec::new();
     let mut refs: Vec<String> = vec![post.id.clone()];
     if targets.is_empty() {
-        lines.push(no_target_reply(&keys));
+        lines.push(ReplyLine::host(no_target_reply(&keys)));
     }
     for t in &targets {
         let done = execute(teams, ears, cycle, post, t, &answerable, report).await;
-        lines.push(done.line);
+        lines.push(ReplyLine {
+            text: done.line,
+            whole: done.whole,
+        });
         refs.extend(done.refs);
     }
     if truncated {
@@ -633,20 +649,12 @@ async fn act_on_post(
         // all. Claiming five answers when the reply above says none were found would be wrong in
         // exactly that case — and saying nothing about the rest is the silence this module exists
         // to fix.
-        lines.push(format!(
+        lines.push(ReplyLine::host(format!(
             "That post named more than {MAX_TARGETS_PER_POST} tickets; I only looked at the first \
              {MAX_TARGETS_PER_POST}. Post the rest separately."
-        ));
+        )));
     }
-    let body = if lines.len() == 1 {
-        lines.remove(0)
-    } else {
-        let mut s = String::from("Re your post:\n");
-        for l in &lines {
-            s.push_str(&format!("- {l}\n"));
-        }
-        s
-    };
+    let body = compose_reply(&lines);
     if let Err(e) = room.append(&Message::room(MANAGER_IDENTITY, Utc::now(), body).with_refs(refs))
     {
         // The reply IS the dedupe record, so losing it means this post is answered again next
@@ -657,6 +665,146 @@ async fn act_on_post(
             "teams manager could not post its reply; this post will be answered again"
         );
     }
+}
+
+/// One line of the reply, and whether the host may CLIP it to make it fit.
+///
+/// The distinction is not stylistic. An [`Intent::Answer`] line ends in the host's own records, and
+/// those end in [`join_bounded`](crate::teamsanswer)'s *"showing N of M records"* — budget it
+/// reserves at its widest before filling precisely so a grounding can never run out of room while
+/// saying what it dropped. A clip runs from the END, so clipping that line deletes the count first
+/// and then the records themselves: the silent truncation the reserve exists to replace,
+/// reintroduced one layer up by the caller. Both review gates reproduced exactly that. A host
+/// sentence has no such tail — half of it is only half a sentence.
+struct ReplyLine {
+    text: String,
+    /// `true` when the line may only be rendered ENTIRE or dropped entire.
+    whole: bool,
+}
+
+impl ReplyLine {
+    /// A sentence the HOST composed, short and self-contained.
+    fn host(text: impl Into<String>) -> ReplyLine {
+        ReplyLine {
+            text: text.into(),
+            whole: false,
+        }
+    }
+}
+
+/// The room's own render bound — what one reply has to fit inside, applied at READ time.
+const REPLY_CAP: usize = rhapsody_config::room::MAX_MESSAGE_BODY_BYTES;
+
+/// Opens an enumerating reply. Its bytes are reserved before anything is filled.
+const REPLY_HEAD: &str = "Re your post:\n";
+
+/// Marks one disposition inside an enumerating reply.
+const REPLY_BULLET: &str = "- ";
+
+/// What [`REPLY_BULLET`] plus the line ending cost, per disposition.
+const REPLY_BULLET_BYTES: usize = REPLY_BULLET.len() + "\n".len();
+
+/// The bytes an enumerating reply of `total` dispositions may spend on the dispositions themselves.
+///
+/// Shared with [`disposition_budget`] rather than restated there: a per-line budget derived from
+/// arithmetic that had drifted from [`compose_reply`]'s own would be a bound in name only.
+fn fill_budget(total: usize) -> usize {
+    let widest_tail = format!("- (showing {total} of {total}; ask me again for the rest.)\n");
+    REPLY_CAP.saturating_sub(REPLY_HEAD.len() + widest_tail.len())
+}
+
+/// The floor under one disposition's share, in BYTES.
+///
+/// **An equal split alone was the wrong shape at five targets**: every answer would have been
+/// sized down to a clipped stub and a count, so the operator got nothing usable about any of the
+/// five. §9.3's rule is to truncate deterministically and say so, and a reply that answers the
+/// first two keys properly and says *"showing 2 of 5; ask me again for the rest"* is that rule
+/// applied to dispositions — where the equal split applies it to bytes inside every disposition at
+/// once. So a share never falls below what one grounding plus one short sentence needs;
+/// [`compose_reply`] then drops whole dispositions the reply cannot afford and counts them out
+/// loud.
+const MIN_DISPOSITION_BYTES: usize = 250;
+
+/// The bytes ONE disposition may occupy and still compose WHOLE into a reply of `total` of them.
+///
+/// The budget is spent per REPLY, and this is what hands each disposition its own share of it. A
+/// single disposition gets the room's whole render bound, which is [`compose_reply`]'s own
+/// fast-path and keeps every single-target reply byte-identical to what the earlier slices pinned.
+fn disposition_budget(total: usize) -> usize {
+    if total <= 1 {
+        return REPLY_CAP;
+    }
+    (fill_budget(total) / total)
+        .saturating_sub(REPLY_BULLET_BYTES)
+        .max(MIN_DISPOSITION_BYTES)
+}
+
+/// Assembles the ONE reply a post earns, bounded so the ROOM never has to cut it.
+///
+/// §0.13's enumerating shape, with §9.3's truncation rule applied to the reply itself: every reader
+/// renders at most [`MAX_MESSAGE_BODY_BYTES`](rhapsody_config::room::MAX_MESSAGE_BODY_BYTES) of one
+/// message and drops the rest from the END with a bare `…`. That cut is silent, it is applied at
+/// READ time so nothing on the write path can see it, and what it reaches first is the last
+/// ticket's disposition — including, on an [`Intent::Answer`], the host's own records. So the host
+/// does the cutting instead: whole lines, in the post's own order, and it says how many it dropped.
+///
+/// **Whole lines, never a partial one.** Half a disposition is a sentence the manager did not
+/// write, and the reader cannot tell which half is missing — the same reason
+/// [`answer_for`] refuses prose whole rather than scrubbing it. [`ReplyLine::whole`] makes that
+/// absolute for the one line where a clip would delete a BOUND rather than merely a clause.
+///
+/// A reply whose lines all fit is byte-identical to what this composed before, which is every reply
+/// the earlier slices' tests assert on.
+///
+/// The dropped dispositions are not lost work: each one's action already happened and is idempotent
+/// per ticket, and the review tickets a filing created stay in the reply's `refs` whether or not
+/// their line survived.
+fn compose_reply(lines: &[ReplyLine]) -> String {
+    // ONE disposition answers in its own voice — the shape every single-target reply has had since
+    // slice 1, and the shape an answer's grounded records are sized against.
+    if let [only] = lines
+        && only.text.len() <= REPLY_CAP
+    {
+        return only.text.clone();
+    }
+    let total = lines.len();
+    // Reserved at its widest before the fill, so the count can never be the thing that did not fit.
+    let budget = fill_budget(total);
+
+    let mut body = String::new();
+    let mut shown = 0usize;
+    for l in lines {
+        let chunk = format!("{REPLY_BULLET}{}\n", l.text);
+        if body.len() + chunk.len() > budget {
+            break;
+        }
+        body.push_str(&chunk);
+        shown += 1;
+    }
+    if let (0, Some(first)) = (shown, lines.first())
+        && !first.whole
+    {
+        // **Reachable, and only for a HOST-authored line** — the earlier comment claimed the whole
+        // branch was unreachable and both review gates walked an answer into it. An answer is now
+        // sized against [`disposition_budget`] of THIS reply rather than of a reply it is the only
+        // line of, so it can never be the line that did not fit; and if one ever were, `whole`
+        // keeps the clip off it, because clipping runs from the end and the end of an answer is the
+        // grounding's own "showing N of M" — the silent truncation `join_bounded` reserves budget
+        // to prevent, reintroduced by its caller. A host sentence has no such tail, so half of one
+        // still beats a reply whose only content is a count of what it is not showing.
+        body = format!(
+            "{REPLY_BULLET}{}\n",
+            clip_bytes(&first.text, budget.saturating_sub(REPLY_BULLET_BYTES))
+        );
+    }
+    let mut s = String::from(REPLY_HEAD);
+    s.push_str(&body);
+    if shown < total {
+        s.push_str(&format!(
+            "- (showing {shown} of {total}; ask me again for the rest.)\n"
+        ));
+    }
+    s
 }
 
 /// Gathers what an [`Intent::Answer`] may be composed from, or nothing at all.
@@ -709,8 +857,15 @@ async fn gather_facts(
 /// reply asking for one. Never a guessed target."
 fn no_target_reply(keys: &[String]) -> String {
     if keys.is_empty() {
-        "I could not find a ticket in that. Name one by its key (e.g. STUDIO-654) or paste its \
-         pull request URL, and I will route it."
+        // **It answers a QUESTION as well as an instruction, because it cannot tell them apart.**
+        // A keyless post never reaches a model turn — `gather_facts` and `plan_targets` both return
+        // on an empty key list — so nothing has classified this one, and the routing-only wording
+        // this used to carry ("and I will route it") replied to a request for work when the
+        // operator had asked a question. §3.4's degradation is that a question naming nothing
+        // resolvable still gets told what would let it be answered, never silence.
+        "I could not find a ticket or a pull request in that, so I have no record to answer from. \
+         Name one by its key (e.g. STUDIO-654) or paste its pull request URL, and I will answer \
+         what I have or route it."
             .to_string()
     } else {
         format!(
@@ -766,12 +921,13 @@ async fn plan_targets(
     post: &Message,
     keys: &[String],
     facts: &Facts,
+    dispositions: usize,
 ) -> (Vec<Target>, BTreeSet<String>) {
     let floor = || keys.iter().map(|k| floor_target(cycle, k)).collect();
     if !cycle.model || teams.manager.mode != ManagerMode::LabelsModel {
         return (floor(), BTreeSet::new());
     }
-    let prompt = build_room_prompt(teams, cycle, post, keys, facts);
+    let prompt = build_room_prompt(teams, cycle, post, keys, facts, dispositions);
     let answers_for = prompt.answers_for;
     let req = TriageRequest {
         command: cycle.agent_command.to_string(),
@@ -884,6 +1040,8 @@ struct Done {
     /// The sentence this ticket earns in the reply. Never empty — every branch, including every
     /// refusal, says something.
     line: String,
+    /// Whether the reply may only carry this line ENTIRE — see [`ReplyLine::whole`].
+    whole: bool,
     /// Whether a WRITE actually happened. Tracked explicitly rather than inferred from `refs` so a
     /// counter can never drift from what the manager did.
     acted: bool,
@@ -896,8 +1054,17 @@ impl Done {
     fn say(line: impl Into<String>) -> Done {
         Done {
             line: line.into(),
+            whole: false,
             acted: false,
             refs: Vec::new(),
+        }
+    }
+
+    /// An [`Intent::Answer`]'s line, whose tail is the host's own records and their own bound.
+    fn grounded(line: impl Into<String>) -> Done {
+        Done {
+            whole: true,
+            ..Done::say(line)
         }
     }
 
@@ -905,6 +1072,7 @@ impl Done {
     fn acted(line: impl Into<String>, refs: Vec<String>) -> Done {
         Done {
             line: line.into(),
+            whole: false,
             acted: true,
             refs,
         }
@@ -922,6 +1090,10 @@ struct Answerable<'a> {
     facts: &'a Facts,
     /// [`RoomPrompt::answers_for`], carried down from the prompt that was actually sent.
     offered: BTreeSet<String>,
+    /// The bytes ONE answer may occupy in the reply all of this post's dispositions share
+    /// ([`disposition_budget`]) — never the room's whole render bound, which is the budget only
+    /// when this answer is the reply's only line.
+    budget: usize,
 }
 
 /// The lines ONE [`Intent::Answer`] target contributes — the model's own prose ON TOP OF the host's
@@ -947,7 +1119,13 @@ struct Answerable<'a> {
 /// way the post gets a line: an answer is never silence.
 fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
     let facts = answerable.facts;
-    let grounded = facts.grounded(&target.key);
+    // **The records get the WHOLE line budget on every path that answers from them alone.**
+    // Reserving room for prose that is not coming is the same mistake the reserve exists to fix,
+    // pointed the other way: it is budget the records never get to spend on a reply the prose was
+    // never going to reach. So this is the fallback everywhere below, re-rendered rather than
+    // reused, and it is what makes a refused answer carry MORE evidence than an accepted one — the
+    // right direction, since a refused answer is the one an operator has least reason to trust.
+    let alone = || facts.grounded(&target.key, answerable.budget);
     // **Nothing to compose from ⇒ nothing to compose.** Two different ways for that to be true, and
     // the gather alone tells only the first: a key this team's records said nothing about has no
     // second half to stand under the prose, and a key whose records the BUDGET dropped out of the
@@ -956,15 +1134,58 @@ fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
     // key: on a multi-key post the other keys' records rendering says nothing about this one.
     // Either way the host's own line answers on its own.
     if !answerable.offered.contains(&target.key) || !facts.resolved(&target.key) {
-        return grounded;
+        return alone();
     }
+    // **The two shares tile THIS answer's budget, and that budget is a share of the reply's.** The
+    // first cut of this slice sized both against the whole `MAX_MESSAGE_BODY_BYTES`, which is only
+    // this answer's budget when it is the reply's only line — see [`disposition_budget`].
+    let (records_cap, prose_cap) = split_budget(answerable.budget);
+    let grounded = facts.grounded(&target.key, records_cap);
     let allowed = facts.allowed_for(&target.key);
-    match vet_answer(&target.answer, &allowed) {
+    // **The records are reserved first and the prose gets the remainder** — §9.3's rule, one layer
+    // below the facts block. The room renders only `MAX_MESSAGE_BODY_BYTES` of any message and cuts
+    // the rest from the END, and the records are what sits at that end, so a prose budget fixed
+    // independently of them would decide how much evidence the operator gets to see. A heavy answer
+    // therefore buys a shorter sentence, never a missing record.
+    //
+    // The cap is `split_budget`'s share and NOT `budget − tail`: a grounding that came in under its
+    // reserve must not hand the difference to the prose, because it did that non-monotonically —
+    // records small enough to drop one freed budget the prose then passed on, so whether an
+    // operator got a model-authored sentence at all turned on how long some agent happened to make
+    // an outcome string. The share is fixed, so what the turn is told (`answer_hint_chars`, in the
+    // preamble) is what it is held to.
+    let tail = format!("\n\n{GROUNDING_LEAD}{grounded}");
+    match vet_answer(&target.answer, &allowed, prose_cap) {
         // Quoted by the HOST, line by line, so the partition below is one the model cannot mint:
         // a forged lead inside the prose renders inside the quoted region like every other word it
         // wrote. The marker is written around whatever came back, after the fact — there is no
         // spelling of anything that escapes a prefix.
-        Ok(prose) => format!("{}\n\n{GROUNDING_LEAD}{grounded}", quote(&prose)),
+        Ok(prose) => {
+            let quoted = quote(&prose);
+            // **Measured again on the COMPOSED pair, which is the only thing that proves the
+            // guarantee.** The budget above bounds the prose the turn wrote; `quote` then adds two
+            // bytes per LINE, so prose inside its own budget can still push the records past what a
+            // reader renders — and what a reader drops is the tail, which is the records. The prose
+            // is the half this reply can afford to lose, so it is the half that goes.
+            //
+            // `split_budget` reserves the marker's widest cost (`MAX_ANSWER_LINES` prefixes) and
+            // `vet_answer` refuses prose laid out over more lines than that, so this cannot fire on
+            // an accepted answer today. It stays because the reserve is arithmetic in one module
+            // and the marker is written in another: a check the guarantee does not depend on is
+            // cheap, and its absence is what let the first cut of this slice ship the overrun.
+            if quoted.len() + tail.len() <= answerable.budget {
+                format!("{quoted}{tail}")
+            } else {
+                tracing::warn!(
+                    key = %target.key,
+                    bytes = quoted.len() + tail.len(),
+                    "teams manager's room turn answered with prose that would have pushed the \
+                     host's own records out of what the room renders; answering from the records \
+                     alone"
+                );
+                alone()
+            }
+        }
         Err(why) => {
             tracing::warn!(
                 key = %target.key,
@@ -972,7 +1193,7 @@ fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
                 "teams manager refused its own room turn's answer prose and answered from the \
                  host's rendering of the same records instead"
             );
-            grounded
+            alone()
         }
     }
 }
@@ -996,7 +1217,7 @@ async fn execute(
     // scope guard is not this gate but `TeamScope`, applied inside the accessor to every row the
     // gather returned — see `teamsknow`'s module doc.
     if target.intent == Intent::Answer {
-        return Done::say(answer_for(target, answerable));
+        return Done::grounded(answer_for(target, answerable));
     }
     let Some(iss) = find_issue(cycle.issues, &target.key) else {
         return Done::say(format!(
@@ -1022,7 +1243,7 @@ async fn execute(
         // Answering it correctly here rather than with an `unreachable!()` keeps the no-panic rule
         // and means a refactor that ever moved that early return would degrade to the right
         // sentence instead of killing the triage task.
-        Intent::Answer => Done::say(answer_for(target, answerable)),
+        Intent::Answer => Done::grounded(answer_for(target, answerable)),
     };
     if done.acted {
         match target.intent {
@@ -1643,6 +1864,7 @@ pub(crate) fn build_room_prompt(
     post: &Message,
     keys: &[String],
     facts: &Facts,
+    dispositions: usize,
 ) -> RoomPrompt {
     // The SAME `manager.max_tokens` budget the assignment turn applies, for the same reason and by
     // the same reading of the key (`prompt_budget_chars`): one manager, one budget.
@@ -1678,7 +1900,14 @@ pub(crate) fn build_room_prompt(
     tail.push_str(POST_CLOSE);
 
     let cap = budget.saturating_sub(head.chars().count() + tail.chars().count());
-    let block = facts.render(cap);
+    // The prose budget the REPLY will hold the turn to, stated in the block's own preamble. Derived
+    // from the same `disposition_budget` the reply spends, so the contract the turn is given and
+    // the cap `answer_for` enforces are one number rather than two that drifted (both review gates'
+    // second blocker: a preamble asking for two sentences against an enforced ~104 bytes).
+    let block = facts.render(
+        cap,
+        answer_hint_chars(split_budget(disposition_budget(dispositions.max(1))).1),
+    );
     // A gather that did not fit is a gather the turn cannot answer from, so the prompt stops
     // OFFERING an answer — the same courtesy `room_prompt_head`'s `answering` flag pays a daemon
     // with no accessor, for the same reason. The re-composed header is strictly SHORTER than the
@@ -1982,7 +2211,9 @@ mod tests {
         keys: &[String],
         facts: &Facts,
     ) -> String {
-        build_room_prompt(teams, cycle, post, keys, facts).text
+        // One disposition per key, which is the shape a post that named no more than
+        // `MAX_TARGETS_PER_POST` tickets and needs no truncation notice earns.
+        build_room_prompt(teams, cycle, post, keys, facts, keys.len().max(1)).text
     }
 
     fn ident(name: &str) -> Identity {
@@ -4324,8 +4555,10 @@ mod tests {
         fx.operator_says("What were the results of STUDIO-725 and STUDIO-724?");
         let mut t = teams(&["alice"], ManagerMode::LabelsModel);
         // Enough for the block and the FIRST key's records, not enough for the second's — the
-        // premise, asserted on the real prompt below rather than assumed.
-        t.manager.max_tokens = 860;
+        // premise, asserted on the real prompt below rather than assumed. The number tracks the
+        // preamble's own length (it states the answer budget since STUDIO-732), so it moves when
+        // that text does; the assertions below are what actually pin the premise.
+        t.manager.max_tokens = 900;
         let issues = vec![in_review("STUDIO-654")];
         let owner = owner_of(&issues);
         let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
@@ -4880,5 +5113,617 @@ mod tests {
         .expect("parse");
         assert_eq!(got[0].intent, Intent::Answer);
         assert_eq!(got[0].answer, "MT-1's run completed.");
+    }
+
+    // ── slice 4 (STUDIO-732): bounds, degradation, dedupe ────────────────────────────────────────
+
+    /// **A burst of resolvable QUESTIONS is bounded by the same per-tick cap an action burst is,
+    /// and each answer costs at most one model turn** (§3.4's cost bound).
+    ///
+    /// The prompts are counted, not just the replies: §3.4 bounds the manager's MODEL budget, and a
+    /// pass that answered three posts while spending five turns would satisfy the reply cap and
+    /// none of the point.
+    #[tokio::test]
+    async fn a_burst_of_questions_never_exceeds_the_per_tick_cap() {
+        let fx = Fixture::new(tracker_with_viewer());
+        for n in 0..5 {
+            fx.operator_says(&format!("({n}) What was the result of STUDIO-725?"));
+        }
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        know.seed_run("STUDIO-725", "completed");
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        let arb = answering_with("STUDIO-725", "STUDIO-725's last run completed.");
+        let ears = fx.ears(arb.clone());
+        let c = cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k);
+
+        assert_eq!(
+            ears_pass(&t, fx.room.as_ref(), &ears, &c).await.answered,
+            MAX_POSTS_PER_TICK,
+            "the cap bounds questions exactly as it bounds actions"
+        );
+        assert_eq!(
+            arb.prompts().len(),
+            MAX_POSTS_PER_TICK,
+            "and it bounds the MODEL turns, which is the cost §3.4 is actually capping"
+        );
+        // The remainder is deferred, never dropped — the same drain the action backlog gets.
+        assert_eq!(ears_pass(&t, fx.room.as_ref(), &ears, &c).await.answered, 2);
+        assert_eq!(ears_pass(&t, fx.room.as_ref(), &ears, &c).await.answered, 0);
+        assert_eq!(arb.prompts().len(), 5, "one turn per post, and no more");
+        assert_eq!(fx.reply_bodies().len(), 5, "every question got its answer");
+    }
+
+    /// **The host's own records are never pushed out of the reply by the model's prose** — the bug
+    /// slice 4 exists to fix.
+    ///
+    /// Every reader renders at most `MAX_MESSAGE_BODY_BYTES` of a message and cuts the rest from
+    /// the END. The grounding sits at that end by design, so before this slice a long accepted
+    /// answer left the operator reading the model's sentence ALONE, with the evidence it was
+    /// supposed to be checkable against silently gone — defeating the whole containment
+    /// [`answer_for`] provides. Asserted on the READ-BACK body, because the write-side string is
+    /// not what anybody sees.
+    #[tokio::test]
+    async fn a_long_answer_never_displaces_the_records_it_stands_on() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What was the result of STUDIO-725?");
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        know.seed_run("STUDIO-725", "completed");
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        // The shape of a turn that has been steered: a keyless claim, padded long enough that the
+        // room's own cut would have swallowed everything after it — and deliberately INSIDE the
+        // 1200-character cap this slice replaced, so the assertion below fails against that older
+        // bound instead of being rescued by it. A test that passes because the prose was refused
+        // for length proves nothing about whether the records survive an ACCEPTED answer.
+        let prose = format!("The deploy is safe. {}", "and more words. ".repeat(48));
+        assert!(
+            prose.len() < 1200,
+            "the mutation this pins must reach the room"
+        );
+        let arb = answering_with("STUDIO-725", &prose);
+        let ears = fx.ears(arb.clone());
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k),
+        )
+        .await;
+
+        let bodies = fx.reply_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].contains("run: completed"),
+            "the host's own records must survive into what the room RENDERS: {bodies:?}"
+        );
+        assert!(
+            !bodies[0].ends_with('…'),
+            "and the room must never have had to cut the reply at all: {bodies:?}"
+        );
+    }
+
+    /// **A records overflow is counted out loud, never silently cut** (§9.3, one layer below the
+    /// facts block).
+    ///
+    /// The reply an operator reads is bounded by the HOST — most-relevant-first, with what it
+    /// dropped stated — instead of being handed to the room to truncate from the end with a bare
+    /// `…`, which is indistinguishable from an answer that simply had nothing more to say.
+    #[tokio::test]
+    async fn a_records_overflow_says_how_much_it_is_not_showing() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What was the result of STUDIO-725?");
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        // Five ended runs, each with an agent-written outcome long enough that the records cannot
+        // all fit one reply.
+        for _ in 0..5 {
+            know.seed_run("STUDIO-725", &format!("completed {}", "x".repeat(250)));
+        }
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        let arb = answering_with("STUDIO-725", "STUDIO-725 has run several times.");
+        let ears = fx.ears(arb.clone());
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k),
+        )
+        .await;
+
+        let bodies = fx.reply_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].contains(" of 6 records)"),
+            "the answer must say how many records it is standing on, and of how many: {bodies:?}"
+        );
+        assert!(
+            !bodies[0].ends_with('…'),
+            "and nothing may be left for the room to cut silently: {bodies:?}"
+        );
+    }
+
+    /// **A restart mid-answer re-reads and does NOT double-answer** (§0.13's act-then-persist plus
+    /// room-as-dedupe).
+    ///
+    /// The reply is written before the watermark is, so the crash window is exactly "answered, not
+    /// yet recorded as answered". Losing the cursor file models it: the pass re-reads the same post
+    /// and is stopped by its OWN reply, which is the only record of the answer that exists.
+    #[tokio::test]
+    async fn a_restart_between_the_answer_and_the_watermark_does_not_answer_twice() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What was the result of STUDIO-725?");
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        know.seed_run("STUDIO-725", "completed");
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        let arb = answering_with("STUDIO-725", "STUDIO-725's last run completed.");
+        let ears = fx.ears(arb.clone());
+        let c = cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k);
+
+        assert_eq!(ears_pass(&t, fx.room.as_ref(), &ears, &c).await.answered, 1);
+        assert_eq!(fx.reply_bodies().len(), 1);
+
+        // The crash: the answer is in the room, the watermark never reached disk.
+        std::fs::remove_file(fx.cursor_path()).expect("drop the watermark");
+
+        let report = ears_pass(&t, fx.room.as_ref(), &ears, &c).await;
+        assert_eq!(
+            report.answered, 0,
+            "the post is re-READ, and its own reply is what stops it being answered again"
+        );
+        assert_eq!(
+            fx.reply_bodies().len(),
+            1,
+            "exactly one answer survives the restart"
+        );
+        assert_eq!(
+            arb.prompts().len(),
+            1,
+            "and the re-read spends no second model turn"
+        );
+    }
+
+    /// **A question that resolves nothing is answered, never met with silence** (§3.4).
+    ///
+    /// A keyless post never reaches a model turn — `gather_facts` and `plan_targets` both return on
+    /// an empty key list — so this line is the whole answer, and it has to tell an operator who
+    /// ASKED something what would let it be answered. The off-team half of the degradation is
+    /// [`an_off_team_key_is_answered_with_the_one_no_record_wording`], which pins `NO_RECORD`.
+    #[tokio::test]
+    async fn a_keyless_question_degrades_to_asking_for_a_key_rather_than_silence() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("hey, what happened with the deploy yesterday?");
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        // Asked ⇒ the test fails: a keyless post must never cost a model turn.
+        let ears = fx.ears(FakeArbiter::never());
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k),
+        )
+        .await;
+
+        assert_eq!(report.answered, 1);
+        let bodies = fx.reply_bodies();
+        assert_eq!(bodies.len(), 1, "never silence");
+        assert!(
+            bodies[0].contains("no record to answer from")
+                && bodies[0].contains("pull request URL"),
+            "the degradation answers a QUESTION and says what would let it be answered: {bodies:?}"
+        );
+        assert_eq!(
+            (report.filed, report.assigned, report.relayed),
+            (0, 0, 0),
+            "and it writes nothing"
+        );
+    }
+
+    /// **A reply too long for what the room renders drops whole LINES and says how many** — never
+    /// half a disposition, and never the room's own silent `…`.
+    #[test]
+    fn a_reply_too_long_for_the_room_drops_whole_lines_and_says_so() {
+        let lines: Vec<ReplyLine> = (0..6)
+            .map(|n| ReplyLine::host(format!("STUDIO-{n}: {}", "z".repeat(150))))
+            .collect();
+        let body = compose_reply(&lines);
+        assert!(
+            body.len() <= rhapsody_config::room::MAX_MESSAGE_BODY_BYTES,
+            "the host must bound its own reply ({} bytes)",
+            body.len()
+        );
+        assert!(
+            body.contains(" of 6; ask me again for the rest.)"),
+            "{body}"
+        );
+        // Whole lines only: every rendered disposition is intact, so no reader is shown half a
+        // sentence the manager never finished.
+        for l in body.lines().filter(|l| l.starts_with("- STUDIO-")) {
+            assert!(
+                l.ends_with(&"z".repeat(150)),
+                "a disposition was cut mid-sentence: {l}"
+            );
+        }
+    }
+
+    /// One disposition that fits keeps its own voice — the shape every single-target reply has had
+    /// since slice 1, which the bound above must not rewrite into an enumeration.
+    #[test]
+    fn a_single_disposition_that_fits_is_still_posted_verbatim() {
+        assert_eq!(
+            compose_reply(&[ReplyLine::host("STUDIO-1: done.")]),
+            "STUDIO-1: done."
+        );
+    }
+
+    /// **A disposition that spends its WHOLE share still composes**, at every reply size — the
+    /// property the first cut of this slice did not have.
+    ///
+    /// `answer_for` sized itself against the room's whole render bound, which is this answer's
+    /// budget only when it is the reply's only line. `act_on_post` collects up to
+    /// [`MAX_TARGETS_PER_POST`] dispositions into one message, so N answers each "fitting" alone
+    /// left `compose_reply` to resolve the overrun — from the END, where an answer keeps its
+    /// records.
+    #[test]
+    fn a_disposition_that_spends_its_whole_share_still_composes() {
+        for total in 1..=MAX_TARGETS_PER_POST + 1 {
+            let lines: Vec<ReplyLine> = (0..total)
+                .map(|n| ReplyLine {
+                    text: format!("STUDIO-{n}: {}", "z".repeat(disposition_budget(total) - 12)),
+                    whole: true,
+                })
+                .collect();
+            let body = compose_reply(&lines);
+            assert!(
+                body.len() <= REPLY_CAP,
+                "{total} dispositions at their own share overran the room ({} bytes)",
+                body.len()
+            );
+            // Whichever survive, survive WHOLE — a clip runs from the end and the end of an answer
+            // is its records' own count.
+            for l in body.lines().filter(|l| l.starts_with("- STUDIO-")) {
+                assert!(
+                    l.ends_with('z'),
+                    "a disposition was cut mid-record at {total} lines: {l}"
+                );
+            }
+        }
+        // TWO is the case both review gates reproduced, and there both answers must survive rather
+        // than one being dropped for the other: the share is half the fill, exactly.
+        let two: Vec<ReplyLine> = (0..2)
+            .map(|n| ReplyLine {
+                text: format!("STUDIO-{n}: {}", "z".repeat(disposition_budget(2) - 12)),
+                whole: true,
+            })
+            .collect();
+        let body = compose_reply(&two);
+        assert!(
+            !body.contains("ask me again for the rest"),
+            "two answers at their share both fit; neither is dropped: {body}"
+        );
+    }
+
+    /// **A grounded line is dropped WHOLE, never clipped** — the `shown == 0` path, whose comment
+    /// used to claim it was unreachable while both review gates walked an answer into it.
+    ///
+    /// A clip runs from the END, and the end of an answer is
+    /// [`join_bounded`](crate::teamsanswer)'s *"showing N of M records"* — budget it reserves at its
+    /// widest before filling precisely so a grounding can never run out of room while saying what
+    /// it dropped. Clipping it deletes the count first and then the records: the silent truncation
+    /// the reserve exists to replace, reintroduced one layer up by the caller.
+    #[test]
+    fn a_grounded_line_is_dropped_whole_rather_than_clipped_from_its_records() {
+        let grounding = format!(
+            "STUDIO-1: run: completed {} (showing 2 of 4 records)",
+            "z".repeat(REPLY_CAP)
+        );
+        let body = compose_reply(&[
+            ReplyLine {
+                text: grounding,
+                whole: true,
+            },
+            ReplyLine::host(
+                "STUDIO-2: not found on any project this team works, so I did nothing.",
+            ),
+        ]);
+        assert!(
+            body.len() <= REPLY_CAP,
+            "the host still bounds its own reply ({} bytes)",
+            body.len()
+        );
+        assert!(
+            !body.contains("[\u{2026}]"),
+            "no half-record: an answer is rendered entire or not at all: {body}"
+        );
+        assert!(
+            body.contains("(showing 0 of 2; ask me again for the rest.)"),
+            "and the reply says so at ITS level instead: {body}"
+        );
+        // A HOST sentence has no such tail, so half of one still beats a reply whose only content
+        // is a count — the clip stays for exactly that case.
+        let host_only = compose_reply(&[
+            ReplyLine::host("z".repeat(REPLY_CAP)),
+            ReplyLine::host("STUDIO-2: done."),
+        ]);
+        assert!(
+            host_only.contains('\u{2026}'),
+            "a host sentence is still clipped in rather than dropped: {host_only}"
+        );
+    }
+
+    /// An arbiter that answers TWO `Answer` targets, each carrying its own prose.
+    fn answering_two(keys: [&str; 2], prose: &str) -> Arc<FakeArbiter> {
+        let (a, b, prose) = (keys[0].to_string(), keys[1].to_string(), prose.to_string());
+        FakeArbiter::answering(move || {
+            Ok([a.clone(), b.clone()]
+                .into_iter()
+                .map(|key| Target {
+                    key,
+                    intent: Intent::Answer,
+                    assignee: None,
+                    answer: prose.clone(),
+                })
+                .collect())
+        })
+    }
+
+    /// **TWO answered keys in one reply, end to end — and BOTH keep their own records and their own
+    /// count.**
+    ///
+    /// The case both review gates reproduced and the one nothing exercised: every other bound test
+    /// here is single-target end to end or a direct call on `compose_reply` with synthetic lines.
+    /// Sizing each answer against the room's whole render bound made two answers that each "fit"
+    /// collectively overrun, and `compose_reply` then cut the first one from the END — deleting
+    /// `(showing N of M records)`, the budget `join_bounded` reserves before it fills precisely so a
+    /// grounding can never run out of room while saying what it dropped.
+    #[tokio::test]
+    async fn two_answered_keys_each_keep_their_records_and_their_count() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What happened with STUDIO-725 and STUDIO-726?");
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        // Two ended runs each, the first with a long agent-written outcome — the shape that pushed
+        // the composed reply past the room's bound in jimmy's reproduction.
+        for key in ["STUDIO-725", "STUDIO-726"] {
+            know.seed_run(key, &format!("completed {}", "x".repeat(240)));
+            know.seed_run(key, "completed");
+        }
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        let ears = fx.ears(answering_two(
+            ["STUDIO-725", "STUDIO-726"],
+            "Both of those finished.",
+        ));
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k),
+        )
+        .await;
+
+        let bodies = fx.reply_bodies();
+        assert_eq!(bodies.len(), 1, "one reply for one post: {bodies:?}");
+        let body = &bodies[0];
+        assert!(
+            body.len() <= rhapsody_config::room::MAX_MESSAGE_BODY_BYTES,
+            "the reply must fit what a reader RENDERS ({} bytes): {body}",
+            body.len()
+        );
+        for key in ["STUDIO-725", "STUDIO-726"] {
+            assert!(
+                body.contains(key),
+                "both answered keys reach the room: {body}"
+            );
+        }
+        assert_eq!(
+            body.matches(" records)").count(),
+            2,
+            "each answer keeps its OWN count of what its records dropped — the bound the caller \
+             used to cut off the end: {body}"
+        );
+        assert!(
+            !body.contains("ask me again for the rest"),
+            "and neither disposition is dropped for the other: {body}"
+        );
+    }
+
+    /// **An answer that obeys the preamble survives, whatever the records happen to weigh.**
+    ///
+    /// jimmy's reproduction, pinned: the same prose, varying only the length of an agent-written
+    /// outcome string, was accepted at some paddings and thrown away at others — and NOT
+    /// monotonically, because a grounding big enough to lose a record handed the budget back. The
+    /// prose share is now fixed by [`split_budget`] and stated in the preamble, so neither is true.
+    ///
+    /// The fixture is exactly the budget the prompt names, because the suite's longest answer prose
+    /// was 78 bytes and nothing asserted a prompt-conforming answer survived at all.
+    #[tokio::test]
+    async fn an_answer_at_the_budget_the_prompt_states_survives_at_every_records_weight() {
+        let hint = answer_hint_chars(split_budget(rhapsody_config::room::MAX_MESSAGE_BODY_BYTES).1);
+        // A sentence padded with ordinary words to EXACTLY the stated budget, so what this pins is
+        // the contract's own number rather than some sentence that happened to be short enough.
+        let mut prose = String::from("STUDIO-725 ran twice and both of those runs completed");
+        while prose.chars().count() < hint - 1 {
+            prose.push_str(" and nothing about it was left open");
+        }
+        let prose: String = prose.chars().take(hint - 1).chain(['.']).collect();
+        assert_eq!(
+            prose.chars().count(),
+            hint,
+            "the fixture must sit AT the budget the preamble states, not under it"
+        );
+
+        // Swept FINELY, because the failure it rules out is non-monotonic: the old derived budget
+        // refused this prose in a narrow band of outcome lengths and admitted it on both sides of
+        // that band, since past the band the records overflowed, `join_bounded` dropped one and the
+        // budget came back. A coarse sweep steps straight over the window.
+        for pad in (0..=320).step_by(20) {
+            let fx = Fixture::new(tracker_with_viewer());
+            fx.operator_says("What was the result of STUDIO-725?");
+            let t = teams(&["alice"], ManagerMode::LabelsModel);
+            let issues = vec![in_review("STUDIO-654")];
+            let owner = owner_of(&issues);
+            let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+            let (st, f, load) = (states(), facts(), HashMap::new());
+            let know = Know::new(&["alice"], Box::new(NoneBackend));
+            know.seed_run("STUDIO-725", &format!("completed {}", "x".repeat(pad)));
+            know.seed_run("STUDIO-725", "completed");
+            let k = know.knowledge(&issues, fx.room.as_ref());
+            let arb = answering_with("STUDIO-725", &prose);
+            let ears = fx.ears(arb.clone());
+
+            ears_pass(
+                &t,
+                fx.room.as_ref(),
+                &ears,
+                &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k),
+            )
+            .await;
+
+            let bodies = fx.reply_bodies();
+            assert_eq!(bodies.len(), 1, "one reply at pad {pad}: {bodies:?}");
+            assert!(
+                bodies[0].contains(&prose),
+                "a prompt-conforming answer must survive at pad {pad}: {}",
+                bodies[0]
+            );
+            assert!(
+                bodies[0].len() <= rhapsody_config::room::MAX_MESSAGE_BODY_BYTES,
+                "and still fit what a reader renders at pad {pad} ({} bytes)",
+                bodies[0].len()
+            );
+            // The records are still under it: the whole point of bounding the prose.
+            assert!(
+                bodies[0].contains(crate::teamsanswer::GROUNDING_LEAD),
+                "the host's own records must stand beside it at pad {pad}: {}",
+                bodies[0]
+            );
+            // And the turn was TOLD the budget it was held to.
+            assert!(
+                arb.prompts()[0].contains(&format!("at most {hint} characters")),
+                "the preamble states the enforced budget at pad {pad}"
+            );
+        }
+    }
+
+    /// **A reply the prose never reaches gives the records the WHOLE line budget.**
+    ///
+    /// The reserve exists so the prose cannot delete the evidence; reserving room for prose that is
+    /// not coming is the same mistake pointed the other way — budget the records never get to spend
+    /// on a reply the prose was never going to reach. A refused answer therefore carries MORE
+    /// evidence than an accepted one, which is the right direction: it is the answer an operator
+    /// has least reason to trust.
+    #[test]
+    fn a_records_only_answer_spends_the_whole_line_budget_on_records() {
+        use crate::teamsanswer::{Asked, split_budget};
+        use crate::teamsknow::{Outcome, RunFact, Runs};
+
+        let facts = Facts {
+            asked: vec![Asked {
+                asked: "STUDIO-725".into(),
+                outcome: Some(Outcome {
+                    key: "STUDIO-725".into(),
+                    runs: Runs {
+                        facts: (0..6)
+                            .map(|n| RunFact {
+                                key: "STUDIO-725".into(),
+                                outcome: format!("completed {}", "x".repeat(60 + n)),
+                                ended_at: "2026-09-01T12:00:00Z".into(),
+                                ..RunFact::default()
+                            })
+                            .collect(),
+                        ..Runs::default()
+                    },
+                    ..Outcome::default()
+                }),
+            }],
+            ..Facts::default()
+        };
+        let target = Target {
+            key: "STUDIO-725".into(),
+            intent: Intent::Answer,
+            assignee: None,
+            // Names a ticket this team's records never resolved, so the vet refuses it WHOLE and
+            // the records answer alone — the ordinary refusal path, not a contrived one.
+            answer: "STUDIO-9 is what actually happened here.".into(),
+        };
+        let refused = answer_for(
+            &target,
+            &Answerable {
+                facts: &facts,
+                offered: ["STUDIO-725".to_string()].into_iter().collect(),
+                budget: REPLY_CAP,
+            },
+        );
+        assert!(
+            refused.len() <= REPLY_CAP,
+            "still bounded by what a reader renders ({} bytes)",
+            refused.len()
+        );
+        assert!(
+            !refused.contains("STUDIO-9"),
+            "the refusal is whole: {refused}"
+        );
+        // Strictly more evidence than the records' SHARE of the same budget would have held.
+        assert!(
+            refused.len() > split_budget(REPLY_CAP).0,
+            "a records-only reply must not be capped at the share reserved for a reply that also \
+             carries prose ({} bytes against a share of {}): {refused}",
+            refused.len(),
+            split_budget(REPLY_CAP).0
+        );
+        assert!(
+            refused.contains(" records)"),
+            "and what it still could not fit is counted out loud: {refused}"
+        );
+    }
+
+    /// **The §9.1 degradation wording survives the SMALLEST share a reply can hand out.**
+    ///
+    /// "Never silence" is an acceptance criterion, and every arm of `Facts::grounded` is now inside
+    /// a caller-supplied cap — which means the one sentence that says *"I have no record of that"*
+    /// is a sentence a bound could clip. `MIN_DISPOSITION_BYTES` is what stops it, so the property
+    /// is asserted rather than left to arithmetic nobody re-does.
+    #[test]
+    fn the_no_record_wording_survives_the_smallest_disposition_share() {
+        let smallest = disposition_budget(MAX_TARGETS_PER_POST + 1);
+        let facts = Facts::default();
+        for cap in [smallest, crate::teamsanswer::split_budget(smallest).0] {
+            assert_eq!(
+                facts.grounded("STUDIO-1", cap),
+                crate::teamsknow::NO_RECORD,
+                "the degradation line must never be the thing a bound cuts (cap {cap})"
+            );
+        }
     }
 }

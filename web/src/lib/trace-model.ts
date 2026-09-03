@@ -111,6 +111,15 @@ const PHASE_TITLES: Record<PhaseKind, string> = {
   other: "Worked",
 };
 
+/**
+ * A phase kind's plain-language title, for a caller that has a KIND but no phase to read it from —
+ * the Jobs sparkline's reserved slots (STUDIO-743), which name a kind the run never reached.
+ * The same table [`TracePhase.title`] is built from, so the two vocabularies cannot drift.
+ */
+export function phaseTitle(kind: PhaseKind): string {
+  return PHASE_TITLES[kind];
+}
+
 // --- Tool classification ---------------------------------------------------------------------
 
 /**

@@ -172,6 +172,9 @@
 .rh-console .stat .l { font-size: 10.5px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .06em; }
 .rh-console .stat.bad .n { color: var(--bad); }
 .rh-console .stat.acc .n { color: var(--accent); }
+/* The operator's own voice (STUDIO-743) — "Needs you" is work waiting on the human, not on the
+   daemon, so it takes the teal the console reserves for the operator rather than a status colour. */
+.rh-console .stat.op .n { color: var(--operator); }
 
 .rh-console .grid { display: grid; grid-template-columns: 1fr 336px; gap: 16px; align-items: start; }
 .rh-console .side { display: flex; flex-direction: column; gap: 16px; }

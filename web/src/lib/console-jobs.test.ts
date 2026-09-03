@@ -12,6 +12,7 @@ import {
   lastActivityByIssue,
   lifecycleByIssue,
   mateStates,
+  needsOperator,
   relativeSince,
   ticketAssignees,
 } from "./console-jobs";
@@ -200,7 +201,15 @@ describe("buildConsoleJobs", () => {
     // No answer => the old behaviour, unchanged.
     expect(status("UNKNOWN")).toBe("review");
     // Only REVIEW and the unresolved UNKNOWN count as awaiting a reviewer; MERGED no longer does.
-    expect(consoleJobCounts(rows)).toEqual({ running: 0, review: 2, queued: 1, blocked: 0 });
+    // Both are on the operator's list (STUDIO-743): the tracker answered for this payload, so the
+    // count is knowable, and a row parked in review awaits a person however it got there.
+    expect(consoleJobCounts(rows)).toEqual({
+      running: 0,
+      review: 2,
+      queued: 1,
+      blocked: 0,
+      needsYou: 2,
+    });
   });
 
   // The Done tab was permanently empty because `done` was unreachable — §3's filter Seg.
@@ -245,7 +254,17 @@ describe("buildConsoleJobs", () => {
       undefined,
       NOW,
     );
-    expect(consoleJobCounts(rows)).toEqual({ running: 1, review: 2, queued: 1, blocked: 2 });
+    // The four pills count rows the daemon definitely served, so they answer here. needsYou does
+    // not (STUDIO-743): no issue rows were passed at all, which is the shape a cold lifecycle cache
+    // serves, and B and C only read "in review" because a `completed` outcome was inferred into it.
+    // A number off that would be a guess dressed as a count, so the strip says "—" instead.
+    expect(consoleJobCounts(rows)).toEqual({
+      running: 1,
+      review: 2,
+      queued: 1,
+      blocked: 2,
+      needsYou: null,
+    });
   });
 
   it("pins running tickets first, then orders by newest activity", () => {
@@ -407,5 +426,163 @@ describe("filterConsoleJobs", () => {
     for (const f of CONSOLE_JOB_FILTERS) {
       expect(() => filterConsoleJobs(rows, f.id, "")).not.toThrow();
     }
+  });
+});
+
+// STUDIO-743 (design record §6) — the Now strip's fifth stat. "Needs you" is the operator's own
+// queue: the tickets whose next move is a HUMAN's rather than an agent's.
+describe("needsOperator", () => {
+  it("counts a ticket parked in review — a human's merge or verdict is the next move", () => {
+    expect(needsOperator("review", "completed")).toBe(true);
+  });
+
+  it("counts a failed run — a person has to decide what happens next", () => {
+    expect(needsOperator("blocked", "failed")).toBe(true);
+  });
+
+  // A held dependent is `blocked` too, but it is waiting on its PREDECESSOR, not on the operator —
+  // and that predecessor is itself a row in this worklist, counted there. Counting the dependent
+  // as well would bill the same human decision twice.
+  it("does not count a ticket held on an uncleared dependency", () => {
+    expect(needsOperator("blocked", "waiting")).toBe(false);
+  });
+
+  it("counts nothing the daemon is still driving or has finished with", () => {
+    expect(needsOperator("run", "running")).toBe(false);
+    expect(needsOperator("queued", "stopped")).toBe(false);
+    expect(needsOperator("done", "completed")).toBe(false);
+  });
+});
+
+describe("the Now strip's Needs you count", () => {
+  // A healthy tracker: the daemon answered a lifecycle for the tickets it knows, which is what
+  // makes the count knowable at all.
+  function rows() {
+    return buildConsoleJobs(
+      [
+        job({ issue: "LIVE", status: "running" }),
+        job({ issue: "REVIEW", status: "completed" }),
+        job({ issue: "MERGED", status: "completed" }),
+        job({ issue: "FAILED", status: "failed" }),
+        job({ issue: "HELD", status: "waiting" }),
+      ],
+      [
+        issueRow({ issue_identifier: "REVIEW", lifecycle: "in_review" }),
+        issueRow({ issue_identifier: "MERGED", lifecycle: "done" }),
+        issueRow({ issue_identifier: "LIVE", lifecycle: "open" }),
+      ],
+      undefined,
+      NOW,
+    );
+  }
+
+  it("marks each row that is waiting on the operator", () => {
+    const needs = rows()
+      .filter((r) => r.needsYou)
+      .map((r) => r.issue)
+      .sort();
+    expect(needs).toEqual(["FAILED", "REVIEW"]);
+  });
+
+  it("counts them alongside the four existing pills", () => {
+    expect(consoleJobCounts(rows())).toEqual({
+      running: 1,
+      review: 1,
+      queued: 0,
+      blocked: 2,
+      needsYou: 2,
+    });
+  });
+
+  // It is a count of a DIFFERENT set from the in-review tally: a failed run needs a human without
+  // reading "in review", and a held dependent is blocked without needing one. On a healthy tracker
+  // the review rows are all genuinely parked for a person, so the two numbers do sit close together
+  // — the failed runs are the difference — and that convergence is the honest answer rather than a
+  // defect. It is also why the strip paints only this one of them now (David, 2026-09-03): two
+  // pills reporting one question read as a duplicate. What this pins is the membership, in both
+  // directions, so neither number can quietly become the other.
+  it("is a different set from the in-review tally in both directions", () => {
+    const byIssue = new Map(rows().map((r) => [r.issue, r]));
+    expect(byIssue.get("FAILED")).toMatchObject({ status: "blocked", needsYou: true });
+    expect(byIssue.get("HELD")).toMatchObject({ status: "blocked", needsYou: false });
+    expect(byIssue.get("REVIEW")).toMatchObject({ status: "review", needsYou: true });
+    expect(byIssue.get("MERGED")).toMatchObject({ status: "done", needsYou: false });
+  });
+
+  // THE FAILURE DIRECTION, AND THE REASON THE COUNT IS NULLABLE. `issue_lifecycles` answers off a
+  // TTL cache and the tracker AT REQUEST TIME, so a cold cache or a failed Linear round-trip
+  // returns rows stripped of every `lifecycle` — this exact payload. `consoleJobStatus` then maps
+  // each `completed` outcome to "in review" by inference, so the review tally INFLATES at the same
+  // moment the daemon has the least idea what is true. A count of 0 there would be a claim that
+  // nothing awaits the operator, which is the one thing the console cannot know; `null` renders
+  // "—" instead. This is deliberately a property of the PAYLOAD, not of any single row.
+  it("reads unknown, never zero, when the payload resolved no lifecycle at all", () => {
+    const outage = buildConsoleJobs(
+      [
+        job({ issue: "REVIEW", status: "completed" }),
+        job({ issue: "MERGED", status: "completed" }),
+        job({ issue: "LIVE", status: "running" }),
+      ],
+      // Exactly what the endpoint serves on a cold cache: the runs are all still there, and not one
+      // of them carries a tracker answer.
+      [
+        issueRow({ issue_identifier: "REVIEW", lifecycle: undefined }),
+        issueRow({ issue_identifier: "MERGED", lifecycle: undefined }),
+      ],
+      undefined,
+      NOW,
+    );
+    // The inference has inflated the review tally — both finished runs read "in review" — which is
+    // precisely why the operator's own count must not answer off it.
+    expect(consoleJobCounts(outage)).toEqual({
+      running: 1,
+      review: 2,
+      queued: 0,
+      blocked: 0,
+      needsYou: null,
+    });
+  });
+
+  // The gate is "did the tracker answer for this payload", not "did it answer for this row" — a
+  // ticket the tracker does not know about does not make the whole count unknowable.
+  it("still counts when the tracker answered for only some of the page", () => {
+    const partial = buildConsoleJobs(
+      [job({ issue: "REVIEW", status: "completed" }), job({ issue: "UNKNOWN", status: "failed" })],
+      [issueRow({ issue_identifier: "REVIEW", lifecycle: "in_review" })],
+      undefined,
+      NOW,
+    );
+    expect(consoleJobCounts(partial).needsYou).toBe(2);
+  });
+
+  // An empty worklist is not an outage: there is genuinely nothing waiting on anybody, and "—"
+  // there would be a shrug where a fact is available.
+  it("reads zero, not unknown, for an empty worklist", () => {
+    expect(consoleJobCounts([])).toEqual({
+      running: 0,
+      review: 0,
+      queued: 0,
+      blocked: 0,
+      needsYou: 0,
+    });
+  });
+});
+
+// The sparkline needs the run it should preview, and whether that run is still going.
+describe("the row's run identity", () => {
+  it("carries the durable run id and the live flag through to the row", () => {
+    const rows = buildConsoleJobs(
+      [
+        job({ issue: "LIVE", status: "running", runId: 42 }),
+        job({ issue: "OFF", status: "completed", runId: 0 }),
+      ],
+      [],
+      undefined,
+      NOW,
+    );
+    const row = (issue: string) => rows.find((r) => r.issue === issue);
+    expect(row("LIVE")).toMatchObject({ runId: 42, live: true });
+    // Persistence off: no run to read a transcript from, and the row says so rather than guessing.
+    expect(row("OFF")).toMatchObject({ runId: 0, live: false });
   });
 });
