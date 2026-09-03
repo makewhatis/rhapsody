@@ -1968,6 +1968,11 @@ mod tests {
             "**github.com/o/r/pull/7**",
             "<https://github.com/o/r/pull/7>",
             "see: https://github.com/o/r/pull/7 — please review",
+            // Multi-byte whitespace: the token scan must not slice into the character. U+3000 is
+            // three bytes, U+00A0 two — both are `char::is_whitespace`.
+            "see\u{3000}https://github.com/o/r/pull/7",
+            "see\u{a0}https://github.com/o/r/pull/7",
+            "\u{2028}github.com/o/r/pull/7",
         ] {
             assert_eq!(
                 extract_pr_urls(body),

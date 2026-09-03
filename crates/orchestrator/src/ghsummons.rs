@@ -83,11 +83,11 @@ pub fn parse_repo(repo_url: &str) -> Option<(String, String)> {
 /// out of.
 pub(crate) fn github_host_begins_at(url: &str, at: usize) -> bool {
     let before = &url[..at];
-    // A URL cannot contain a space, so anything before the last one is surrounding prose.
-    let token = match before.rfind(char::is_whitespace) {
-        Some(i) => &before[i + 1..],
-        None => before,
-    };
+    // A URL cannot contain a space, so anything before the last one is surrounding prose. Split
+    // rather than slice past a `rfind`: whitespace is not always one byte (U+3000 is three), and
+    // `&before[i + 1..]` would land inside the character and panic — on room text an attacker
+    // writes.
+    let token = before.rsplit(char::is_whitespace).next().unwrap_or(before);
     // What wraps a pasted URL in a room post — Markdown emphasis, a bracket, a quote. Deliberately
     // excludes `-`, `.` and `_`, which CONTINUE a hostname and must keep rejecting.
     let token = token.trim_start_matches(['(', '<', '[', '{', '"', '\'', '`', '*']);
