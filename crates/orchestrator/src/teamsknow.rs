@@ -71,18 +71,38 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, RecallState, STATE_VALID};
 use rhapsody_config::room::{Cursor, Message, RoomError, RoomLog};
 use rhapsody_core::Issue;
-use rhapsody_store::{RunFilter, RunSummary, Store, StoreError};
+use rhapsody_store::{EventQuery, RunFilter, RunSummary, Store, StoreError};
 
-use crate::teams::IDENTITY_LABEL_PREFIX;
+use crate::teams::{EVENT_ROUTE, IDENTITY_LABEL_PREFIX};
+use crate::triage::route_event_identity;
 
 /// The most history rows one gather may pull, per project slug. §9.3's ANS-BUDGET-TRUNC bounds the
 /// GATHER as well as the prompt: a ticket in a retry loop has dozens of runs and an answer needs
 /// the newest few, so the cap is here rather than only at the render.
 pub const MAX_HISTORY_ROWS: i64 = 20;
 
+/// The most store rows one scoped gather may READ, per project slug, while trying to fill a page.
+///
+/// The store's `project` filter is an optimisation and never the guard (see the module docs), so
+/// its SQL `LIMIT` has to bound a **scan**, not the answer. Bounding the answer with it is a false
+/// NEGATIVE rather than a leak — a page fills with rows [`TeamScope::admits_run`] is about to drop
+/// and the team's own rows never reach it — and §9.3's ANS-BUDGET-TRUNC is explicit that a
+/// confidently wrong "I have no record of that" is the failure this design exists to fix. The
+/// gather therefore pages until it holds `limit` ADMITTED rows or has read this many.
+pub const MAX_SCAN_ROWS: i64 = 500;
+
+/// One page of that scan. Large enough that the ordinary case — a store whose rows are mostly this
+/// team's — is answered in a single query.
+const SCAN_PAGE_ROWS: i64 = 100;
+
 /// The most roster identities one [`Knowledge::recall_team`] may fan out over. A recall is a
 /// directory scan per identity, and the manager answers on the triage cycle's budget.
 pub const MAX_RECALL_IDENTITIES: usize = 8;
+
+/// How many `teams.route` rows one ticket's dispatch-identity lookup reads. A ticket accumulates
+/// one per routed dispatch; a hundred is far past any real ticket's retry count, and the query is
+/// filtered on the issue identifier — the same bound `triage`'s reconcile uses on the same rows.
+const MAX_ROUTE_ROWS: i64 = 100;
 
 /// The most room posts one gather may pull. [`RoomLog::read_since`] clamps to
 /// [`MAX_ROOM_WINDOW`](rhapsody_config::room::MAX_ROOM_WINDOW) on its own; this is the accessor's
@@ -134,9 +154,10 @@ pub struct RunFact {
     pub outcome: String,
     /// RFC3339, empty while the run is still going.
     pub ended_at: String,
-    /// The teammate who wore the ticket, from its `rhapsody:@<name>` label — empty when the ticket
-    /// is no longer in the cycle (the `runs` table has no identity column; the routing decision
-    /// lives in the label) or when the label names somebody off this team's roster.
+    /// The teammate this RUN was dispatched as, from its `teams.route` event — empty when the run
+    /// was never routed, when its events have been pruned, or when it names somebody off this
+    /// team's roster. **Per-run and historical, not the ticket's current assignee:** see
+    /// [`Knowledge::dispatch_identities`].
     pub identity: String,
 }
 
@@ -318,25 +339,62 @@ impl<'a> Knowledge<'a> {
     /// distinguishable "exists but not yours" is itself the leak.
     pub fn issue_runs(&self, identifier: &str, limit: i64) -> Result<Vec<RunFact>, KnowledgeError> {
         let limit = clamp_rows(limit);
-        let mut rows: Vec<RunSummary> = Vec::new();
-        for slug in &self.scope.projects {
-            rows.extend(self.store.issue_history(identifier, slug, limit)?);
-        }
-        Ok(self.project_rows(rows, limit))
+        let rows = self.scan(
+            &RunFilter {
+                issue: identifier.to_string(),
+                ..RunFilter::default()
+            },
+            limit,
+        )?;
+        self.project_rows(rows, limit)
     }
 
     /// This team's most recent runs, newest first, projected.
     pub fn recent_runs(&self, limit: i64) -> Result<Vec<RunFact>, KnowledgeError> {
         let limit = clamp_rows(limit);
-        let mut rows: Vec<RunSummary> = Vec::new();
+        let rows = self.scan(&RunFilter::default(), limit)?;
+        self.project_rows(rows, limit)
+    }
+
+    /// Reads `base` once per owned project slug, paging until `limit` rows have been ADMITTED by
+    /// the scope or [`MAX_SCAN_ROWS`] have been read, and returns the admitted rows.
+    ///
+    /// The paging is the point. `Store` applies its `LIMIT` in SQL, before this accessor sees a
+    /// row, and its `project` filter is weaker than [`TeamScope::admits_run`] in two shapes that
+    /// both occur: an empty slug is *no filter at all* to the store (`RunFilter::project`'s own
+    /// contract, and what a legacy `tracker:` config writes), and the `linear_teams` gate has no
+    /// SQL counterpart on any slug. A single capped query in either shape can return a full page
+    /// of rows that are all dropped, so the read has to keep asking rather than accept the page.
+    ///
+    /// [`Store::list_runs`] rather than [`Store::issue_history`] because only the former takes an
+    /// `offset`; with `RunFilter::issue` set it is the same query, plus the ability to page it.
+    fn scan(&self, base: &RunFilter, limit: i64) -> Result<Vec<RunSummary>, KnowledgeError> {
+        let mut kept: Vec<RunSummary> = Vec::new();
         for slug in &self.scope.projects {
-            rows.extend(self.store.list_runs(RunFilter {
-                project: slug.clone(),
-                limit,
-                ..RunFilter::default()
-            })?);
+            let mut admitted = 0usize;
+            let mut offset: i64 = 0;
+            while admitted < limit.max(0) as usize && offset < MAX_SCAN_ROWS {
+                let want = SCAN_PAGE_ROWS.min(MAX_SCAN_ROWS - offset);
+                let page = self.store.list_runs(RunFilter {
+                    project: slug.clone(),
+                    limit: want,
+                    offset,
+                    ..base.clone()
+                })?;
+                let read = page.len() as i64;
+                for row in page {
+                    if self.scope.admits_run(&row) {
+                        admitted += 1;
+                        kept.push(row);
+                    }
+                }
+                if read < want {
+                    break; // the store is exhausted, not the budget
+                }
+                offset += read;
+            }
         }
-        Ok(self.project_rows(rows, limit))
+        Ok(kept)
     }
 
     /// The cycle ticket with this identifier, projected. `None` for a key this team's own trackers
@@ -425,22 +483,80 @@ impl<'a> Knowledge<'a> {
     /// The drop is applied HERE, after the store answered, and not only through
     /// [`RunFilter::project`]: an empty slug means "no project filter" to the store, so a team that
     /// legitimately owns the empty slug (a legacy `tracker:` config) would otherwise be handed every
-    /// row on the box.
-    fn project_rows(&self, mut rows: Vec<RunSummary>, limit: i64) -> Vec<RunFact> {
+    /// row on the box. [`Knowledge::scan`] applies the same predicate while paging, so that the
+    /// page is FILLED with in-scope rows; this second application is what makes the guarantee hold
+    /// for any row that reaches the projection, however it got here.
+    fn project_rows(
+        &self,
+        mut rows: Vec<RunSummary>,
+        limit: i64,
+    ) -> Result<Vec<RunFact>, KnowledgeError> {
         rows.retain(|r| self.scope.admits_run(r));
         // The store orders by (started_at DESC, id DESC); one merged list of per-slug pages has to
         // be put back into that order, and `id` breaks a same-instant tie exactly as SQLite does.
         rows.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.id.cmp(&a.id)));
         rows.dedup_by_key(|r| r.id);
         rows.truncate(limit.max(0) as usize);
-        rows.iter()
+        // Resolved for the BOUNDED page only, so the lookup cost follows the answer's size.
+        let dispatched = self.dispatch_identities(&rows)?;
+        Ok(rows
+            .iter()
             .map(|r| RunFact {
                 key: r.issue_identifier.clone(),
                 outcome: r.outcome.clone(),
                 ended_at: r.ended_at.clone(),
-                identity: self.wearer(&r.issue_identifier),
+                identity: dispatched.get(&r.id).cloned().unwrap_or_default(),
             })
-            .collect()
+            .collect())
+    }
+
+    /// Which roster identity each of `rows` was DISPATCHED as, keyed by run id, from the
+    /// `teams.route` events row every routed dispatch writes ([`EVENT_ROUTE`]) — the same durable
+    /// ledger [`crate::triage::StoreIdentityHistory`] reconciles labels against, rather than a
+    /// second one.
+    ///
+    /// **Not the ticket's current `rhapsody:@` label.** A ticket reassigned since the run — a
+    /// re-review handed on, a manager reroute — would otherwise attribute every historical run to
+    /// whoever wears the label today, and in an unauthenticated room "jimmy ran it" when alice ran
+    /// it is a WRONG fact rather than a missing one, which an operator has no way to notice.
+    ///
+    /// A run reports EMPTY — "cannot tell", never a guess — when it was never routed, when its
+    /// events have been pruned, when its ticket has more than [`MAX_ROUTE_ROWS`] dispatches ahead
+    /// of it, or when the route names somebody off this team's roster (the same rule
+    /// [`Knowledge::wearer`] applies to a label, for the same §0.11.1 reason).
+    ///
+    /// One query per distinct ticket in the page rather than one per row, and only ever for rows
+    /// the scope has already admitted: the events search has no project filter of its own, so it is
+    /// never asked a question whose answer could be another team's.
+    fn dispatch_identities(
+        &self,
+        rows: &[RunSummary],
+    ) -> Result<HashMap<i64, String>, KnowledgeError> {
+        let keys: BTreeSet<&str> = rows
+            .iter()
+            .map(|r| r.issue_identifier.as_str())
+            .filter(|k| !k.is_empty())
+            .collect();
+        let mut out: HashMap<i64, String> = HashMap::new();
+        for key in keys {
+            let hits = self.store.search_events(EventQuery {
+                issue: key.to_string(),
+                kind: EVENT_ROUTE.to_string(),
+                limit: MAX_ROUTE_ROWS,
+                ..EventQuery::default()
+            })?;
+            // Ordered (run_id DESC, seq DESC), so the first row seen for a run is its LAST routing
+            // decision — the one it actually ran under if it was ever re-routed mid-run.
+            for hit in hits {
+                let Some(name) = route_event_identity(&hit.text) else {
+                    continue;
+                };
+                if self.scope.admits_identity(&name) {
+                    out.entry(hit.run_id).or_insert(name);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -468,7 +584,7 @@ mod tests {
     };
     use rhapsody_config::room::{LocalRoom, Message};
     use rhapsody_config::teams::{Identity, Memory as MemoryCfg, Teams};
-    use rhapsody_store::{Noop, RunEnd, RunStart, Sqlite, StorePath};
+    use rhapsody_store::{EventRow, Noop, RunEnd, RunStart, Sqlite, StorePath};
 
     use crate::teamsmemory::TeamsMemory;
     use crate::testsupport::TempDir;
@@ -518,6 +634,22 @@ mod tests {
             outcome,
             RunEnd::default(),
         )
+    }
+
+    /// Records that `run_id` was DISPATCHED as `identity` — the same `teams.route` row
+    /// `Orchestrator::route_teams` writes, in the same `identity=<name> reason=<why>` shape.
+    fn seed_route(st: &Sqlite, run_id: i64, identity: &str) {
+        st.append_events(
+            run_id,
+            &[EventRow {
+                seq: 1,
+                at: "2026-09-01T10:00:00Z".into(),
+                kind: EVENT_ROUTE.into(),
+                tool: String::new(),
+                text: format!("identity={identity} reason=label_overlap"),
+            }],
+        )
+        .expect("append route event");
     }
 
     fn banks(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -769,7 +901,7 @@ mod tests {
     #[test]
     fn the_projected_run_omits_error_transcript_session_and_repo() {
         let st = store();
-        seed(
+        let run = seed(
             &st,
             RunStart {
                 session_uuid: "5f2c-uuid".into(),
@@ -785,6 +917,7 @@ mod tests {
                 ..RunEnd::default()
             },
         );
+        seed_route(&st, run, "alice");
         let scope = scope_of(&["alpha"], &["alice"]);
         let none = NoneBackend;
         let issues = vec![issue_with("AAA-1", "Done", &["rhapsody:@alice"])];
@@ -835,6 +968,51 @@ mod tests {
             k.issue("BBB-9").is_none(),
             "an off-cycle key resolves to nothing"
         );
+    }
+
+    /// **A reassigned ticket does not rewrite its history (STUDIO-729 review).** `RunFact::identity`
+    /// is the run's recorded `teams.route` dispatch, so a ticket handed on after a run still
+    /// attributes that run to whoever actually ran it — and a run that was never routed says
+    /// nothing rather than borrowing today's label.
+    #[test]
+    fn a_run_is_attributed_to_who_dispatched_it_not_to_todays_label() {
+        let st = store();
+        let first = seed_ok(&st, "AAA-1", "alpha", "2026-09-01T10:00:00Z", "failed");
+        let second = seed_ok(&st, "AAA-1", "alpha", "2026-09-01T11:00:00Z", "completed");
+        seed_ok(&st, "AAA-2", "alpha", "2026-09-01T12:00:00Z", "completed");
+        seed_route(&st, first, "alice");
+        seed_route(&st, second, "jimmy");
+        // A route naming somebody this team does not own is not reported as a teammate either.
+        let foreign = seed_ok(&st, "AAA-3", "alpha", "2026-09-01T13:00:00Z", "completed");
+        seed_route(&st, foreign, "mallory");
+
+        // The ticket now wears jimmy's label; alice's run predates the hand-off.
+        let scope = scope_of(&["alpha"], &["alice", "jimmy"]);
+        let none = NoneBackend;
+        let issues = vec![issue_with("AAA-1", "In Review", &["rhapsody:@jimmy"])];
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
+
+        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs");
+        assert_eq!(
+            runs.iter()
+                .map(|r| (r.outcome.as_str(), r.identity.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("completed", "jimmy"), ("failed", "alice")],
+            "the current label overwrote a historical run's attribution"
+        );
+        // The ticket's CURRENT assignee is still the label — that is what a live ticket's
+        // `IssueFact` reports, and the two answer different questions.
+        assert_eq!(k.issue("AAA-1").expect("issue").identity, "jimmy");
+
+        let by_key = |key: &str| {
+            k.issue_runs(key, 0)
+                .expect("issue_runs")
+                .first()
+                .map(|r| r.identity.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(by_key("AAA-2"), "", "an unrouted run must not be attributed");
+        assert_eq!(by_key("AAA-3"), "", "an off-roster route must not be reported");
     }
 
     // --- §9.3 ANS-MEM-SCOPE ------------------------------------------------------------------
@@ -1267,6 +1445,71 @@ mod tests {
             MAX_HISTORY_ROWS
         );
         assert_eq!(k.issue_runs("AAA-1", 3).expect("issue_runs").len(), 3);
+    }
+
+    /// **The page must be FILLED from in-scope rows (STUDIO-729 review, BLOCKER 2).** The store
+    /// applies its `LIMIT` before this accessor can drop anything, so whenever the SQL filter is
+    /// weaker than [`TeamScope::admits_run`] a capped page arrives full of rows that are all
+    /// discarded — and a team that owns plenty of runs is told, confidently, that it owns none.
+    ///
+    /// Two shapes reach it, and the second is not a legacy edge: the empty slug means "no project
+    /// filter" to the store, and the `linear_teams` gate is invisible to SQL on an ordinary slug.
+    #[test]
+    fn a_capped_page_is_filled_from_in_scope_rows() {
+        // --- shape 1: the legacy empty slug, whose SQL filter is no filter at all.
+        let st = store();
+        for n in 0..MAX_HISTORY_ROWS {
+            seed_ok(&st, "LEG-1", "", &format!("2026-09-01T10:{n:02}:00Z"), "completed");
+        }
+        // …then MORE than a page of NEWER rows this team does not own, same identifier.
+        for n in 0..(MAX_HISTORY_ROWS + 5) {
+            seed_ok(&st, "LEG-1", "beta", &format!("2026-09-02T10:{n:02}:00Z"), "failed");
+        }
+        let scope = scope_of(&[""], &["alice"]);
+        let none = NoneBackend;
+        let issues: Vec<Issue> = Vec::new();
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
+
+        let runs = k.issue_runs("LEG-1", 0).expect("issue_runs");
+        assert_eq!(
+            runs.len() as i64,
+            MAX_HISTORY_ROWS,
+            "the page was truncated to off-team rows before the drop ran"
+        );
+        assert!(
+            runs.iter().all(|r| r.outcome == "completed"),
+            "an off-team row survived: {runs:?}"
+        );
+        let recent = k.recent_runs(0).expect("recent_runs");
+        assert_eq!(recent.len() as i64, MAX_HISTORY_ROWS, "{recent:?}");
+        assert!(recent.iter().all(|r| r.outcome == "completed"), "{recent:?}");
+
+        // --- shape 2: an ORDINARY slug, gated on a Linear team the SQL knows nothing about.
+        let st = store();
+        let seed_team = |key: &str, team: &str, started: &str, outcome: &str| {
+            seed(
+                &st,
+                RunStart {
+                    team_id: team.into(),
+                    ..run_start(key, "alpha", started)
+                },
+                outcome,
+                RunEnd::default(),
+            );
+        };
+        for n in 0..5 {
+            seed_team("AAA-1", "linear-a", &format!("2026-09-01T10:{n:02}:00Z"), "completed");
+        }
+        for n in 0..(MAX_HISTORY_ROWS + 5) {
+            seed_team("AAA-1", "linear-b", &format!("2026-09-02T10:{n:02}:00Z"), "failed");
+        }
+        let scope = scope_of(&["alpha"], &["alice"]).with_linear_teams(["linear-a"]);
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
+
+        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs");
+        assert_eq!(runs.len(), 5, "the Linear-team gate emptied a page it should have filled");
+        assert!(runs.iter().all(|r| r.outcome == "completed"), "{runs:?}");
+        assert_eq!(k.recent_runs(0).expect("recent_runs").len(), 5);
     }
 
     /// The room read is bounded and returns the posts oldest-first, and a room that was never
