@@ -867,6 +867,12 @@ impl Store for Sqlite {
             where_clauses.push("e.kind = ?");
             args.push(Value::Text(q.kind.clone()));
         }
+        if q.run > 0 {
+            // Seeks `idx_events_run_seq` directly, so a run-scoped probe costs one index lookup
+            // rather than a scan of every event the ticket ever produced (STUDIO-735).
+            where_clauses.push("e.run_id = ?");
+            args.push(Value::Integer(q.run));
+        }
         let limit = if q.limit <= 0 {
             DEFAULT_EVENT_LIMIT
         } else {
@@ -2322,6 +2328,65 @@ mod tests {
             .expect("kind filter");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, "event");
+    }
+
+    // Rhapsody-only (STUDIO-735): the `run` filter narrows a search to ONE run's slice of the
+    // ledger. Two runs of the SAME ticket must not answer for each other — that is the whole point,
+    // because a caller asking "what did this run record?" is holding a run id, not a ticket.
+    #[test]
+    fn search_events_scopes_to_one_run() {
+        let st = open_mem();
+        let run_of = |identity: &str| {
+            let id = st
+                .start_run(RunStart {
+                    issue_identifier: "MT-1".into(),
+                    ..Default::default()
+                })
+                .expect("start run");
+            st.append_events(
+                id,
+                &[EventRow {
+                    seq: 1,
+                    kind: "teams.route".into(),
+                    text: format!("identity={identity} reason=label"),
+                    ..Default::default()
+                }],
+            )
+            .expect("append route");
+            id
+        };
+        let first = run_of("alice");
+        let second = run_of("jimmy");
+
+        let hit = |run| {
+            st.search_events(EventQuery {
+                kind: "teams.route".into(),
+                run,
+                limit: 1,
+                ..Default::default()
+            })
+            .expect("run-scoped search")
+        };
+        assert_eq!(hit(first).len(), 1);
+        assert_eq!(hit(first)[0].text, "identity=alice reason=label");
+        assert_eq!(hit(second)[0].text, "identity=jimmy reason=label");
+        // A run that recorded nothing of that kind answers empty rather than borrowing its
+        // sibling's row.
+        assert!(
+            hit(second + 1).is_empty(),
+            "an unknown run id must match nothing"
+        );
+        // run <= 0 is "every run", so the existing unscoped callers are untouched.
+        assert_eq!(
+            st.search_events(EventQuery {
+                kind: "teams.route".into(),
+                run: 0,
+                ..Default::default()
+            })
+            .expect("unscoped search")
+            .len(),
+            2,
+        );
     }
 
     // Mirror TestMetricsRollup: per-day UTC buckets with completed/failed counts, token sums, and

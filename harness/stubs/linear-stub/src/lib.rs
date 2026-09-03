@@ -21,6 +21,8 @@
 //! - **`ByStates`** — minimal issue nodes (`id identifier title state`) for a project in `$states`.
 //!   Vars: `projectSlug`, `states`, `first`, `after`.
 //! - **`ByIDs`** — minimal issue nodes for the given tracker `$ids` (reconcile). Vars: `ids`, `first`.
+//! - **`IssueLabelsByIDs`** — `id identifier labels` for the given tracker `$ids`, in ANY state
+//!   (the console's durable assignee read). Vars: `ids`, `first`.
 //! - **`BranchByID`** — `id branchName attachments` for `$ids` (graphite stacking hint). Vars: `ids`, `first`.
 //! - **`Projects`** — workspace projects (`id name slugId color teams`). Vars: `first`, `after`.
 //!   Answered from `scenario.project` (a single project) + a synthesized team.
@@ -180,6 +182,7 @@ fn dispatch(st: &mut StubState, op: &str, vars: &Value) -> Result<Value, String>
             vars,
             minimal_node,
         ))),
+        "IssueLabelsByIDs" => Ok(issues_connection(nodes_matching_ids(st, vars, labels_node))),
         "BranchByID" => Ok(issues_connection(nodes_matching_ids(st, vars, branch_node))),
         "Projects" => Ok(projects_page(st)),
         "ProjectMilestones" => Ok(milestones_page()),
@@ -415,6 +418,16 @@ fn full_node(st: &StubState, i: &scenario::Issue) -> Value {
 /// The minimal node selection (`queryByStates`/`queryByIDs`): `id identifier title state{name}`.
 fn minimal_node(_st: &StubState, i: &scenario::Issue) -> Value {
     json!({ "id": i.id, "identifier": i.identifier, "title": i.title, "state": { "name": i.state } })
+}
+
+/// The `queryIssueLabelsByIDs` node: `id identifier labels` — no state filter, since the read
+/// exists precisely to answer for tickets that have already finished.
+fn labels_node(_st: &StubState, i: &scenario::Issue) -> Value {
+    json!({
+        "id": i.id,
+        "identifier": i.identifier,
+        "labels": { "nodes": i.labels.iter().map(|l| json!({ "name": l })).collect::<Vec<_>>() },
+    })
 }
 
 /// The `queryBranchByID` node: `id branchName attachments`.

@@ -165,6 +165,12 @@ export interface IssueRun extends RunSummary {
   // The tracker's workflow-state NAME, verbatim (e.g. "In Review", "Won't Do").
   tracker_state?: string;
   lifecycle?: IssueLifecycle;
+  // The Rhapsody Teams teammate this ticket's newest run was dispatched under (STUDIO-735) — the
+  // DURABLE record, so it still names her after the run has finished and she has dropped off the
+  // live roster. Absent, never empty, when nobody was routed: a solo ticket, a Teams-off daemon, or
+  // a daemon that simply could not resolve one. The client must therefore treat absence as "ask the
+  // live roster instead", not as "unassigned".
+  assignee?: string;
 }
 
 // IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —

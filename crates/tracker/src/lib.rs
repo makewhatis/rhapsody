@@ -133,6 +133,19 @@ pub trait Tracker: Any + Send + Sync {
     /// the given tracker IDs, used for reconciliation.
     async fn fetch_issue_states_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError>;
 
+    /// FetchIssueLabelsByIDs returns the LABELS of the given tracker IDs — `id`, `identifier` and
+    /// `labels` populated, every other field default — whatever state those issues are in. An
+    /// empty slice returns an empty result with no API call, mirroring
+    /// [`Tracker::fetch_issue_states_by_ids`]. Read-only. Rhapsody-only; STUDIO-735.
+    ///
+    /// It backs the console's durable per-ticket assignee: `rhapsody:@<name>` IS the assignment
+    /// (design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.1), so it is the
+    /// record of who worked a ticket that outlives the run. Answering for a MERGED ticket is the
+    /// whole requirement, which is why this is not
+    /// [`Tracker::fetch_open_issues_by_labels`] (non-terminal states only) and why it is a
+    /// separate read rather than more fields on the every-tick reconciliation query.
+    async fn fetch_issue_labels_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError>;
+
     /// FetchBlockedBacklogIssues returns FULLY-normalized Backlog-state issues (BlockedBy
     /// populated) for the configured project, assigned to the API key owner. It backs the DAG
     /// auto-promote pass (orchestrator.promoteUnblocked), which needs Backlog tickets WITH their

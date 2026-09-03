@@ -151,6 +151,16 @@ fn stub_gate_drives_full_read_surface_and_a_move() {
         assert_eq!(by_ids[0].id, "iss_1");
         assert_eq!(by_ids[0].state, "Todo");
 
+        // The labels read answers for the SAME ids, in any state, with labels instead of state.
+        let labels = c
+            .fetch_issue_labels_by_ids(&["iss_1".into()])
+            .await
+            .expect("fetch_issue_labels_by_ids");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].id, "iss_1");
+        assert_eq!(labels[0].identifier, "RHA-1");
+        assert!(labels[0].state.is_empty(), "the labels read carries no state");
+
         // ── blocked-backlog + branch hint: advisory, empty in this scenario ──────────────────
         assert!(
             c.fetch_blocked_backlog_issues()
