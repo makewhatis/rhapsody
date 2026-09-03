@@ -394,7 +394,16 @@ impl Orchestrator {
             self.record_review_truncated(run);
             (store::OUTCOME_COMPLETED, "")
         } else {
-            self.record_review_completed(run, declared_review_status(&e.last_state));
+            let status = declared_review_status(&e.last_state);
+            self.record_review_completed(run, status);
+            // The round is over and its verdict is known, which is the only moment the daemon can
+            // tell the author findings are waiting (STUDIO-723). Handed to the off-loop task and
+            // never waited on; the two branches above deliberately notify NOBODY — a crashed round
+            // read nothing, and a truncated one is re-armed at the same head rather than reported
+            // as a review the author should act on.
+            self.request_review_notify(
+                self.plan_review_notify(run, status == REVIEW_STATUS_APPROVED),
+            );
             (store::OUTCOME_COMPLETED, "")
         };
         self.persist_end_run(re, outcome, reason);
@@ -494,7 +503,7 @@ pub type PendingReviews = HashMap<String, ReviewRun>;
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rhapsody_config::teams::{Identity, Teams};
+    use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
     use rhapsody_store::{
         REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, StorePath,
     };
@@ -535,6 +544,12 @@ mod tests {
         o.eff = Some(eff);
         o.teams = Some(Teams {
             enabled: teams_enabled,
+            // These are ticketless-review tests, so the harness is on the ticketless path — which
+            // is also what arms the completion comment's own gate (STUDIO-723).
+            review: Review {
+                mode: ReviewMode::Ticketless,
+                ..Review::default()
+            },
             roster: vec![Identity {
                 name: "alice".to_string(),
                 profile: "swe".to_string(),
@@ -906,6 +921,88 @@ mod tests {
             declared_handoff,
         });
         run_id
+    }
+
+    /// Drains everything a review exit has queued for the notification task, as `(pr, approved)`
+    /// pairs. Reading the receiver directly is what makes "notified" a fact about the CHANNEL
+    /// rather than about a log line.
+    fn drain_notifications(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::reviewnotify::ReviewCompletion>,
+    ) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            out.push((c.to_string(), c.approved));
+        }
+        out
+    }
+
+    /// STUDIO-723, the acceptance wiring: a DECLARED review completion queues exactly one
+    /// author-facing comment, and its verdict decides whether that comment summons. A review that
+    /// left findings must re-engage the author — nothing else advances the head, so without this
+    /// the re-review loop has no second lap.
+    #[test]
+    fn a_declared_review_completion_queues_one_comment_carrying_its_verdict() {
+        for (verdict, approved) in [
+            (REVIEW_STATE_FINDINGS, false),
+            (REVIEW_STATE_APPROVED, true),
+        ] {
+            let (mut o, _d) = orch_with_review(true);
+            let mut rx = o.open_review_notify_channel();
+            let run = review_run("alice", HEAD_A);
+            o.dispatch_review(run.clone());
+            exit_review_as(&mut o, &run, false, "", true, verdict);
+
+            assert_eq!(
+                drain_notifications(&mut rx),
+                vec![("makewhatis/rhapsody#12".to_string(), approved)],
+                "verdict {verdict}"
+            );
+        }
+    }
+
+    /// The two exits that are NOT completions notify nobody. A crashed round read nothing, so there
+    /// are no findings to point the author at; a `max_turns` round is re-armed at the SAME head
+    /// (`record_review_truncated`), so telling the author to push fixes would ask them to advance
+    /// past a head nobody has finished reading.
+    #[test]
+    fn a_failed_or_truncated_review_notifies_nobody() {
+        for (failed, declared) in [(true, true), (false, false)] {
+            let (mut o, _d) = orch_with_review(true);
+            let mut rx = o.open_review_notify_channel();
+            let run = review_run("alice", HEAD_A);
+            o.dispatch_review(run.clone());
+            exit_review_as(
+                &mut o,
+                &run,
+                failed,
+                "boom",
+                declared,
+                REVIEW_STATE_FINDINGS,
+            );
+
+            assert!(
+                drain_notifications(&mut rx).is_empty(),
+                "failed={failed} declared_handoff={declared} must queue no comment"
+            );
+        }
+    }
+
+    /// §16, at the exit: a daemon that never opened the channel cannot represent a comment, so a
+    /// review exit on any other configuration posts nothing and still records the round normally.
+    #[test]
+    fn a_review_exit_without_a_notification_channel_still_records_the_round() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+        exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_FINDINGS);
+
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("the row exists");
+        assert_eq!(row.last_reviewed_sha, HEAD_A);
+        assert_eq!(row.status, REVIEW_STATUS_REVIEWED);
     }
 
     /// STUDIO-721, the slice-4 nit: an agent that burned its whole turn budget WITHOUT declaring it

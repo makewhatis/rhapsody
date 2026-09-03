@@ -590,3 +590,34 @@ author pushed while it was reading.
 worktree unless `teams.enabled`, and nothing outside that path can reach the new provisioning shape:
 `WorkerDeps.review` is `None` for every ticket dispatch, which is what leaves the two existing paths
 byte-identical.
+
+### The daemon posts a review-completion comment on a pull request (STUDIO-723)
+
+The ticketless review subsystem's last link. Go v0.4.0 only ever READS GitHub — two `gh api` calls
+per repo per tick for the summons enrichment — and every comment on a pull request is written by an
+agent. Rhapsody adds one write, `gh pr comment`, and it exists because re-engagement is narrow:
+`ghenrich::apply_github_summons` advances an author ticket's `latest_summon_at` only for a comment
+carrying the configured summon token as a *standalone* mention, on a pull request that ticket's
+`linked_prs` names. A review that posts findings without the token therefore leaves the author's
+ticket un-reopened with nothing anywhere reporting a problem — and under ticketless review the
+author's push is the only thing that advances the head the watcher re-reviews on, so the loop simply
+stops. Making the token the daemon's to guarantee rather than the review agent's to remember is what
+this entry buys.
+
+| GitHub usage | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| reads | `gh api` issues/pulls comments, per repo per tick | the same, unchanged |
+| writes | none | one `gh pr comment` per COMPLETED ticketless review round |
+
+**A tokenless completion is a documented no-op, not an accident.** An *approved* round posts a
+deliberately tokenless comment: approval pauses the re-review loop (design §15-c), so there is
+nothing to ask the author for and reopening their run would spend a dispatch on an empty
+instruction. A round that left *findings* posts a token-bearing one. Both are judged by the real
+matcher (`reviewnotify::summons_author`) rather than a substring test, and the task logs which way
+each comment went.
+
+**Off is still off.** The comment is planned only when `teams.enabled` and `review.mode:
+ticketless`, and the task that posts it is spawned on the same condition — so on every other
+installation a review exit cannot represent a comment, let alone post one. The failed and
+`max_turns`-truncated exits notify nobody either: nothing was read, or the same head is re-armed for
+another round.

@@ -424,6 +424,18 @@ pub struct Orchestrator {
     pub(crate) review_intro_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::reviewintro::ReviewIntroRequest>>,
 
+    /// The off-loop ticketless review NOTIFICATION task's inbox (STUDIO-723, slice 9). `None`
+    /// whenever the ticketless path is off or no task was spawned, in which case a review's exit
+    /// posts nothing — so a Teams-off daemon and one on the ticket fan-out cannot comment on a pull
+    /// request even by mistake.
+    ///
+    /// Unlike [`Self::review_intro_tx`] this one is never cloned onto a
+    /// [`ControlHandle`](crate::stop::ControlHandle): its only sender is
+    /// [`Orchestrator::on_review_exit`], which runs ON the control task, so the handle has no
+    /// business holding a second way to post a comment as the daemon.
+    pub(crate) review_notify_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::reviewnotify::ReviewCompletion>>,
+
     /// The **off-loop** Teams memory runtime (STUDIO-645, T4): the loaded config, the constructed
     /// backend, and the live run → identity binding a `teams_retain` is stamped from. Shared by
     /// `Arc` with the daemon's HTTP layer.
@@ -657,6 +669,7 @@ impl Orchestrator {
             quorum_facts: HashMap::new(),
             quorum_tx: None,
             review_intro_tx: None,
+            review_notify_tx: None,
             teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),

@@ -353,6 +353,78 @@ impl PrBranchSource for GH {
     }
 }
 
+/// The fallible result of a [`PrCommentSink`] post: nothing on success, an error when the comment
+/// could not be created. There is no third "nothing to do" case, unlike every read in this module:
+/// a caller that asked for a comment either got one or did not.
+pub type PrCommentResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// Posts one comment on a pull request (STUDIO-723, slice 9).
+///
+/// **No Go counterpart**, and the first `gh` seam in this module that WRITES. Every other one asks
+/// GitHub a question; this one is how the daemon's own review-completion signal reaches the pull
+/// request, where the existing summons enrichment ([`SummonSource`] → [`crate::ghenrich`]) can pick
+/// it up and re-engage the author. It is a separate trait rather than a method on [`SummonSource`]
+/// for [`OpenPrSource`]'s reason — that trait is a field-for-field port of a Go interface — and
+/// sharpened by the direction: a read seam handed to a task that only reads cannot post anything,
+/// and keeping the capability separate is what makes that checkable.
+///
+/// The body is composed by the HOST ([`crate::reviewnotify::re_engage_comment`]) and never by an
+/// agent, which is the same trust line [`crate::quorum::review_description`] draws.
+#[async_trait]
+pub trait PrCommentSink: Send + Sync {
+    async fn post_pr_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        body: &str,
+    ) -> PrCommentResult;
+}
+
+#[async_trait]
+impl PrCommentSink for GH {
+    /// One `gh pr comment <number> --repo <owner>/<repo> --body <body>`.
+    ///
+    /// Incomplete coordinates are an ERROR here, where the reads in this module answer `None` or
+    /// [`PrLookup::Gone`] and spawn nothing. The asymmetry is deliberate: a read at a coordinate
+    /// that cannot exist has a true answer ("nothing"), whereas being asked to post a comment
+    /// nobody can ever see is a caller bug, and the only place it can be noticed is here. An empty
+    /// body is refused for the same reason, and for one more — a comment with no text cannot carry
+    /// the summon token, so posting it would look like re-engagement while being the documented
+    /// no-op ([`crate::reviewnotify`]).
+    async fn post_pr_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        body: &str,
+    ) -> PrCommentResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Err(
+                format!("gh pr comment: incomplete coordinate {owner}/{repo}#{number}").into(),
+            );
+        }
+        if body.is_empty() {
+            return Err(format!("gh pr comment {owner}/{repo}#{number}: empty body").into());
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let args = [
+            "pr",
+            "comment",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--body",
+            body,
+        ];
+        (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("gh pr comment {num} --repo {slug}: {e}").into()
+        })?;
+        Ok(())
+    }
+}
+
 /// Where a pull request stands, as GitHub's GraphQL `PullRequestState` reports it. Three values,
 /// not two: the watcher retires a MERGED pull request and a CLOSED one for different reasons and
 /// records them differently, and `mergedAt` alone cannot be trusted to tell them apart.
