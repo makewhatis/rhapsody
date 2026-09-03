@@ -1,17 +1,22 @@
 import { describe, expect, it } from "vitest";
-import type { LogEntry, RunSummary } from "@/lib/api";
+import type { LogEntry, RunDetail, RunSummary } from "@/lib/api";
 import { buildResult, buildTrace } from "@/lib/trace-model";
 import {
   TRACE_FILTERS,
   cardLead,
+  failingStep,
   filterPhases,
   githubRepo,
   leadParagraph,
+  liveRunRow,
+  playheadPhase,
   phaseGlyph,
   prSearchUrl,
+  relayBatons,
   resultBanner,
   resultEyebrow,
   runBranch,
+  runTeammate,
   runVitals,
   ticketUrl,
 } from "@/lib/console-trace-view";
@@ -337,5 +342,171 @@ describe("leadParagraph — SAID collapses to its lead (§3C)", () => {
   it("returns the whole prose when it is a single paragraph", () => {
     expect(leadParagraph("  Just the one.  ")).toBe("Just the one.");
     expect(leadParagraph("")).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// STUDIO-744 — slice 3: the live playhead, the failed run's jump-to-failing-step, and the
+// attempt relay's baton (design record §3, §4, §9 slice 3).
+// ---------------------------------------------------------------------------------------------
+
+function detail(over: Partial<RunDetail> = {}): RunDetail {
+  return {
+    run_id: 1,
+    issue_id: "i",
+    issue_identifier: "STUDIO-742",
+    title: "Trace",
+    project: "",
+    repo: "",
+    attempt: 1,
+    outcome: "running",
+    live: true,
+    issue_state: "In Progress",
+    last_codex_event: "",
+    turn_count: 5,
+    input_tokens: 3,
+    output_tokens: 4,
+    total_tokens: 91_000,
+    usage_estimated: false,
+    started_at: "2026-09-03T10:00:00Z",
+    ended_at: "",
+    last_event_at: "2026-09-03T10:07:00Z",
+    error: "",
+    recent_events: [],
+    generated_at: "",
+    ...over,
+  };
+}
+
+describe("liveRunRow — the 2s run-detail poll over the issue-history row", () => {
+  it("takes the poll's fresher turns, tokens and outcome while the run is live", () => {
+    const merged = liveRunRow(
+      run({ id: 7, outcome: "running", turns: 1, ended_at: "" }),
+      detail({ run_id: 7 }),
+    );
+    expect(merged.turns).toBe(5);
+    expect(merged.total_tokens).toBe(91_000);
+    expect(merged.outcome).toBe("running");
+    // The identity fields stay the history row's — the poll is telemetry, not a re-identification.
+    expect(merged.issue_identifier).toBe("STUDIO-742");
+    expect(merged.id).toBe(7);
+  });
+
+  it("carries the terminal outcome the poll saw, which the cached history row cannot know", () => {
+    const merged = liveRunRow(
+      run({ id: 7, outcome: "running", ended_at: "" }),
+      detail({ run_id: 7, outcome: "failed", ended_at: "2026-09-03T10:09:00Z", error: "exit 101" }),
+    );
+    expect(merged.outcome).toBe("failed");
+    expect(merged.ended_at).toBe("2026-09-03T10:09:00Z");
+    expect(merged.error).toBe("exit 101");
+  });
+
+  it("leaves the row untouched when no detail has arrived, or when it is for another run", () => {
+    const row = run({ id: 7, outcome: "running", turns: 1 });
+    expect(liveRunRow(row, undefined)).toBe(row);
+    expect(liveRunRow(row, detail({ run_id: 8, turn_count: 99 }))).toBe(row);
+  });
+
+  it("never resurrects a finished row from a stale live snapshot", () => {
+    const row = run({ id: 7, outcome: "completed", ended_at: "2026-09-03T10:04:30Z" });
+    const merged = liveRunRow(row, detail({ run_id: 7, outcome: "running", ended_at: "" }));
+    expect(merged.outcome).toBe("completed");
+    expect(merged.ended_at).toBe("2026-09-03T10:04:30Z");
+  });
+});
+
+describe("playheadPhase — where a live run's spine sits", () => {
+  it("is the NEWEST phase, which is what a streaming run is writing into", () => {
+    const phases = buildTrace(TRANSCRIPT).phases;
+    expect(phases.length).toBeGreaterThan(1);
+    expect(playheadPhase(phases)?.id).toBe(phases[phases.length - 1].id);
+  });
+
+  it("is undefined for a transcript that has not arrived", () => {
+    expect(playheadPhase([])).toBeUndefined();
+  });
+});
+
+describe("failingStep — where 'jump to failing step' lands", () => {
+  it("names the first failed phase and the seq of its first failed call", () => {
+    const phases = buildTrace(TRANSCRIPT).phases;
+    const step = failingStep(phases);
+    const failed = phases.find((p) => p.failed);
+    expect(step).not.toBeNull();
+    expect(step?.phaseId).toBe(failed?.id);
+    expect(step?.cardSeq).toBe(6);
+  });
+
+  it("still names the phase when the failure is a phase-level one with no failing call", () => {
+    const phases = buildTrace([
+      entry({ seq: 1, kind: "tool_use", tool: "Read", text: "file_path=/a.ts" }),
+      entry({ seq: 2, kind: "tool_result", text: "ok" }),
+    ]).phases;
+    const marked = phases.map((p, i) => (i === 0 ? { ...p, failed: true } : p));
+    expect(failingStep(marked)).toEqual({ phaseId: marked[0].id, cardSeq: null });
+  });
+
+  it("is null when nothing failed", () => {
+    expect(failingStep(buildTrace([entry({ seq: 1, kind: "text", text: "fine" })]).phases)).toBeNull();
+    expect(failingStep([])).toBeNull();
+  });
+});
+
+describe("runTeammate — who a run was, from fields the daemon actually serves", () => {
+  it("reads a ticketless review run's reviewer out of its own `pr:` key", () => {
+    expect(
+      runTeammate(run({ issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" }), "alice"),
+    ).toBe("jimmy");
+  });
+
+  it("falls back to the ticket's durable assignee for a tracker run", () => {
+    expect(runTeammate(run({ issue_identifier: "STUDIO-744" }), "alice")).toBe("alice");
+  });
+
+  it("names nobody rather than guessing, when there is nobody to name", () => {
+    expect(runTeammate(run({ issue_identifier: "STUDIO-744" }), "")).toBe("");
+    expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1@" }), "")).toBe("");
+  });
+});
+
+describe("relayBatons — the handoff baton the attempt selector switches between", () => {
+  const older = run({ id: 522, started_at: "2026-09-03T08:00:00Z" });
+  const newer = run({ id: 547, started_at: "2026-09-03T10:00:00Z" });
+  const relay = [newer, older]; // newest-first, as `runsNewestFirst` orders it
+
+  it("hands the baton IN to a run that follows another, naming both teammates", () => {
+    const review = run({ id: 547, issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" });
+    const { incoming, outgoing } = relayBatons([review, older], review, "alice");
+    expect(incoming).toEqual({ from: "alice", to: "jimmy", text: "alice → jimmy" });
+    expect(outgoing).toBeNull();
+  });
+
+  it("hands the baton OUT of the run its successor picked up from", () => {
+    const review = run({ id: 547, issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" });
+    const { incoming, outgoing } = relayBatons([review, older], older, "alice");
+    expect(incoming).toBeNull();
+    expect(outgoing).toEqual({ from: "alice", to: "jimmy", text: "alice → jimmy" });
+  });
+
+  it("names the runs, not a teammate handing to herself, when one identity covers both", () => {
+    const { incoming } = relayBatons(relay, newer, "alice");
+    expect(incoming).toEqual({ from: "alice", to: "alice", text: "alice · run 522 → run 547" });
+  });
+
+  it("still marks the relay when no teammate resolves at all", () => {
+    const { incoming } = relayBatons(relay, newer, "");
+    expect(incoming).toEqual({ from: "", to: "", text: "run 522 → run 547" });
+  });
+
+  it("gives a ticket's only run no baton in either direction", () => {
+    expect(relayBatons([newer], newer, "alice")).toEqual({ incoming: null, outgoing: null });
+  });
+
+  it("gives a run the list does not contain no baton, rather than guessing a neighbour", () => {
+    expect(relayBatons(relay, run({ id: 999 }), "alice")).toEqual({
+      incoming: null,
+      outgoing: null,
+    });
   });
 });
