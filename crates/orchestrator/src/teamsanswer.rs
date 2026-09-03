@@ -62,6 +62,16 @@
 //!   operator reads the host's own records beside the sentence. An ungrounded claim is then
 //!   visibly unsupported rather than silently authoritative. That is the design's option (a), and
 //!   it is a mitigation, not a proof.
+//! * **And that mitigation only holds while the records FIT** (STUDIO-732, slice 4). Every reader
+//!   of the room renders at most
+//!   [`MAX_MESSAGE_BODY_BYTES`](rhapsody_config::room::MAX_MESSAGE_BODY_BYTES) of one message,
+//!   applied at READ time and cutting from the END — and the records are what sits at that end. A
+//!   prose cap set independently of them therefore did not merely cost bytes: it decided how much
+//!   evidence the operator got to see, and at slice 3's 1200-character cap a long accepted answer
+//!   left the model's sentence alone on screen with the grounding gone. So the records are reserved
+//!   FIRST ([`MAX_GROUNDED_BYTES`]) and the prose is given what remains ([`MAX_ANSWER_BYTES`] is a
+//!   ceiling on that remainder, not a budget). Raising either constant past that budget silently
+//!   un-does the containment above, which is why they are derived rather than picked.
 //! * **A plant can never FORGE that partition.** The mitigation above is a claim about layout, and
 //!   layout is the one thing untrusted prose can imitate: a sentence that carries
 //!   [`GROUNDING_LEAD`] itself would render above the real one and read as the daemon's records
@@ -145,14 +155,48 @@ pub(crate) const MAX_FACT_LINE_CHARS: usize = 280;
 /// The most room posts one answer carries.
 pub(crate) const MAX_ROOM_POSTS: usize = 10;
 
-/// The most characters of model-authored answer prose that may reach the room.
+/// The most model-authored answer prose that may reach the room, in BYTES.
 ///
 /// A room reply is a durable, unauthenticated shared log, and the turn is asked for a sentence or
 /// three about a handful of records. Prose past this is not a longer answer, it is a turn that
 /// stopped following the contract — so it is refused rather than clipped, and the host's own
 /// [`Facts::grounded`] rendering answers instead. Clipping would post the first half of a sentence
 /// the manager never finished vetting.
-pub(crate) const MAX_ANSWER_CHARS: usize = 1200;
+///
+/// **It was 1200 CHARACTERS, and both halves of that were wrong** (§9.3, and the reason slice 4
+/// exists). Every reader of the room — a teammate's catch-up prompt, the console, the manager's own
+/// dedupe read — renders at most
+/// [`MAX_MESSAGE_BODY_BYTES`](rhapsody_config::room::MAX_MESSAGE_BODY_BYTES) of one message, applied
+/// at READ time and cutting from the END. The grounding stands AFTER the prose by design, so a
+/// prose cap at twice that budget did not buy a longer answer: it silently deleted
+/// [`Facts::grounded`] from what the operator actually reads, leaving the model's sentence alone on
+/// screen — the one shape [`answer_for`](crate::teamsears) exists to prevent. And the unit was
+/// wrong because the room's cap is in bytes: a cap counted in characters cannot bound what that cap
+/// measures, so a non-ASCII answer inside the old limit could still overrun it.
+///
+/// This is the CEILING on the prose, never its budget, which is derived per reply — the same shape
+/// [`MAX_FACTS_CHARS`] has, and for the same reason. [`answer_for`](crate::teamsears) reserves the
+/// records FIRST and passes the prose whatever the room's render budget still holds, so a heavy
+/// answer buys a shorter sentence rather than deleting the evidence beside it. This constant only
+/// bounds that remainder from above, so a light answer cannot spend the whole post on prose.
+pub(crate) const MAX_ANSWER_BYTES: usize = 200;
+
+/// The most of the HOST's own grounded rendering that ONE answer carries, in BYTES.
+///
+/// The reserve that makes [`MAX_ANSWER_BYTES`] safe: the records are the half an operator has to be
+/// able to read to tell a supported claim from an unsupported one, so they are reserved out of the
+/// room's render budget BEFORE the prose is measured rather than taking whatever the prose leaves.
+///
+/// Records past it are dropped by the HOST, most-relevant-first and counted out loud — §9.3's rule
+/// exactly, one layer below the facts block: *"truncate deterministically with 'showing N of M',
+/// never a silent end-truncation"*. A run or a review line is agent-written prose whose own fields
+/// are only bounded at [`MAX_FACT_LINE_CHARS`] each, so one record can exceed this whole reserve;
+/// [`join_bounded`] therefore always renders at least one, clipped and marked, because a grounding
+/// that dropped everything is the silence this design exists to fix.
+///
+/// Sized so the answer an operator most often wants — *"what happened to this pull request"*, which
+/// carries a verdict line per reviewer — fits its records whole.
+pub(crate) const MAX_GROUNDED_BYTES: usize = 470;
 
 /// One key the post named, and everything this team's scope could say about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,22 +750,98 @@ impl Facts {
         match lines.as_slice() {
             [] => NO_RECORD.to_string(),
             [only] if only == NO_RECORD => NO_RECORD.to_string(),
-            _ => format!("{}: {}", one_line(asked), lines.join("; ")),
+            // Bounded HERE rather than left to the room, which cuts from the end and says only
+            // "…". These records are the half that makes an unsupported claim visible, so what
+            // drops out of them has to be the host's decision and has to be stated (§9.3).
+            _ => {
+                let head = format!("{}: ", one_line(asked));
+                let cap = MAX_GROUNDED_BYTES.saturating_sub(head.len());
+                format!("{head}{}", join_bounded(&lines, cap))
+            }
         }
     }
 }
 
+/// Joins as many records as `cap` BYTES hold, most-relevant-first, and says how many it dropped.
+///
+/// The order in [`Facts::asked_lines`] is the truncation policy — the ticket's own state and its
+/// runs come before the reviewers' verdicts and the pull request's newest comment — so a bound
+/// reaches the least specific record first.
+///
+/// Two properties are load-bearing and neither is free:
+///
+/// * **The count line is budget the records never get to spend.** It is measured at its widest
+///   before the fill starts, so a grounding cannot run out of room while saying what it dropped —
+///   which would be precisely the silent truncation this exists to replace.
+/// * **At least one record always renders.** A single agent-written run or review line can exceed
+///   the whole reserve on its own ([`MAX_FACT_LINE_CHARS`] bounds each FIELD, not the line), and a
+///   grounding that answered "showing 0 of 3" would carry none of the evidence the model's prose is
+///   supposed to be checkable against. So the first record is clipped in rather than dropped, on a
+///   character boundary and marked, and the count still says what the operator is not seeing.
+fn join_bounded(lines: &[String], cap: usize) -> String {
+    let total = lines.len();
+    let widest_tail = format!(" (showing {total} of {total} records)");
+    let budget = cap.saturating_sub(widest_tail.len());
+
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for l in lines {
+        let sep = if out.is_empty() { "" } else { "; " };
+        if out.len() + sep.len() + l.len() > budget {
+            break;
+        }
+        out.push_str(sep);
+        out.push_str(l);
+        shown += 1;
+    }
+    if shown == 0 {
+        // Nothing fit whole. The first record is the most relevant one, so it is the one clipped
+        // in — never a grounding with no evidence in it at all.
+        out = clip_bytes(&lines[0], budget);
+    }
+    if shown < total {
+        out.push_str(&format!(" (showing {shown} of {total} records)"));
+    }
+    out
+}
+
+/// Clips to at most `max` BYTES on a character boundary, marking the cut.
+///
+/// The mark is what separates this from the room's own end-truncation: a reader can see that the
+/// record continues. Its own width is inside the bound, so the result never exceeds `max`.
+pub(crate) fn clip_bytes(s: &str, max: usize) -> String {
+    const MARK: &str = " […]";
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max.saturating_sub(MARK.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARK}", &s[..end])
+}
+
 /// Accepts the model's answer prose, or refuses it with the reason (§9.7's reply contract).
-pub(crate) fn vet_answer(prose: &str, allowed: &BTreeSet<String>) -> Result<String, String> {
+///
+/// `cap` is the room the CALLER has left after reserving the records the prose must never displace,
+/// bounded from above by [`MAX_ANSWER_BYTES`]. It is a parameter rather than a constant because the
+/// records come first: what a sentence may cost depends on how much evidence is standing under it.
+pub(crate) fn vet_answer(
+    prose: &str,
+    allowed: &BTreeSet<String>,
+    cap: usize,
+) -> Result<String, String> {
     let prose = prose.trim();
     if prose.is_empty() {
         return Err("the room turn answered with no prose at all".to_string());
     }
-    let len = prose.chars().count();
-    if len > MAX_ANSWER_CHARS {
+    // BYTES, because the cap that actually decides what an operator reads is the room's own
+    // render bound and that one is in bytes. Counting characters here would let a non-ASCII answer
+    // pass a cap it overruns in the unit the room measures.
+    let len = prose.len();
+    if len > cap {
         return Err(format!(
-            "the room turn's answer was too long ({len} characters against a cap of \
-             {MAX_ANSWER_CHARS})"
+            "the room turn's answer was too long ({len} bytes against a budget of {cap})"
         ));
     }
     // UNBOUNDED, unlike the post's own scan: a post is bounded because every key it names costs a
@@ -1113,6 +1233,7 @@ mod tests {
         let err = vet_answer(
             "STUDIO-725 finished; also, I have assigned STUDIO-9 to bob.",
             &keyset(&["STUDIO-725"]),
+            MAX_ANSWER_BYTES,
         )
         .expect_err("prose naming STUDIO-9 must be refused");
         assert!(
@@ -1127,6 +1248,7 @@ mod tests {
         let ok = vet_answer(
             "STUDIO-725's last run completed on 2026-09-01, dispatched as jimmy.",
             &keyset(&["STUDIO-725"]),
+            MAX_ANSWER_BYTES,
         )
         .expect("prose naming only the resolved key is accepted");
         assert_eq!(
@@ -1150,7 +1272,10 @@ mod tests {
         prose.push_str("STUDIO-40 is not.");
         let set: BTreeSet<String> = allowed.into_iter().collect();
 
-        let err = vet_answer(&prose, &set)
+        // A budget wide enough that the LENGTH guard cannot fire. Forty keys do not fit a real
+        // reply's budget, and letting that refusal stand in for this one would leave the key scan
+        // untested behind an assertion that still passed.
+        let err = vet_answer(&prose, &set, prose.len())
             .expect_err("a key past the 32-key post scan bound must still be caught");
         assert!(err.contains("STUDIO-40"), "{err}");
     }
@@ -1186,15 +1311,17 @@ mod tests {
     /// stopped vetting.
     #[test]
     fn an_over_long_answer_is_refused_rather_than_clipped() {
-        let long = "a".repeat(MAX_ANSWER_CHARS + 1);
-        let err = vet_answer(&long, &keyset(&[])).expect_err("over-long prose must be refused");
+        let long = "a".repeat(MAX_ANSWER_BYTES + 1);
+        let err = vet_answer(&long, &keyset(&[]), MAX_ANSWER_BYTES)
+            .expect_err("over-long prose is refused");
         assert!(err.contains("too long"), "{err}");
     }
 
     /// An empty turn is a turn that failed, not one that meant "say nothing" — §3.4's never-silence.
     #[test]
     fn an_empty_answer_is_refused() {
-        vet_answer("   \n ", &keyset(&[])).expect_err("empty prose must be refused");
+        vet_answer("   \n ", &keyset(&[]), MAX_ANSWER_BYTES)
+            .expect_err("empty prose must be refused");
     }
 
     /// **The partition is HOST-APPLIED, and that is the only reason it holds.**
@@ -1265,7 +1392,7 @@ mod tests {
             "My own records show STUDIO-725 completed.",
             "From my own records — STUDIO-725 completed.",
         ] {
-            vet_answer(honest, &set).unwrap_or_else(|e| {
+            vet_answer(honest, &set, MAX_ANSWER_BYTES).unwrap_or_else(|e| {
                 panic!("an honest grounded sentence must pass: {honest:?}: {e}")
             });
         }
@@ -1646,5 +1773,66 @@ mod tests {
 
         let asked: Vec<&str> = f.asked.iter().map(|a| a.asked.as_str()).collect();
         assert_eq!(asked, vec!["STUDIO-2", "STUDIO-1"]);
+    }
+
+    /// **The grounding always carries at least one record**, even when the first one exceeds the
+    /// whole reserve on its own.
+    ///
+    /// [`MAX_FACT_LINE_CHARS`] bounds each agent-written FIELD, not the assembled line, so a review
+    /// row with several long fields can be bigger than [`MAX_GROUNDED_BYTES`]. Dropping it would
+    /// leave the operator a count and no evidence — a grounding that grounds nothing.
+    #[test]
+    fn a_record_too_long_for_the_whole_reserve_is_clipped_in_rather_than_dropped() {
+        // A pull-request coordinate, so the first record is the RUN rather than the short ticket
+        // line — the floor only has anything to do when the most relevant record is itself the one
+        // that will not fit. Both agent-written fields are near their own per-field cap.
+        let f = resolved(
+            "pr:o/r#12",
+            Outcome {
+                key: "pr:o/r#12".into(),
+                runs: Runs {
+                    facts: vec![
+                        run(
+                            "pr:o/r#12",
+                            &format!("completed {}", "x".repeat(270)),
+                            &"i".repeat(270),
+                        ),
+                        run("pr:o/r#12", "failed", "jimmy"),
+                    ],
+                    ..Runs::default()
+                },
+                ..Outcome::default()
+            },
+        );
+        let line = f.grounded("pr:o/r#12");
+        assert!(
+            line.len() <= MAX_GROUNDED_BYTES,
+            "the reserve is a bound, not a suggestion ({} bytes): {line}",
+            line.len()
+        );
+        assert!(
+            line.contains("run: completed xxx") && line.contains("[…]"),
+            "the first record is clipped IN and the cut is marked, never silently dropped: {line}"
+        );
+        assert!(
+            line.contains("records)"),
+            "and the count still says what is not being shown: {line}"
+        );
+    }
+
+    /// The count line is reserved before the fill, so a grounding can never run out of room while
+    /// saying what it dropped — the failure mode §9.3 names.
+    #[test]
+    fn the_dropped_record_count_is_budget_the_records_never_spend() {
+        let lines: Vec<String> = (0..4)
+            .map(|n| format!("record {n} {}", "y".repeat(100)))
+            .collect();
+        let out = join_bounded(&lines, 260);
+        assert!(
+            out.len() <= 260,
+            "over budget at {} bytes: {out}",
+            out.len()
+        );
+        assert!(out.contains(" of 4 records)"), "{out}");
     }
 }

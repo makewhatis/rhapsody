@@ -162,6 +162,12 @@ the `Orchestrator` struct itself. Concretely:
   of the model's half with `QUOTE_PREFIX` — written by the daemon after the fact, so a forged
   `GROUNDING_LEAD` renders inside the quoted region instead of above the real one (the same rule
   `one_line` applies to a fence-closing backtick run: untrusted text never mints host structure).
+  That containment also depends on the records actually FITTING (STUDIO-732): every reader renders
+  only `MAX_MESSAGE_BODY_BYTES` of a message and cuts from the END, where the grounding sits, so
+  `answer_for` reserves the records first (`MAX_GROUNDED_BYTES`) and derives the prose budget from
+  what is left (`MAX_ANSWER_BYTES` caps that remainder — it is a ceiling, not a budget). Raising
+  either constant, or reordering the two halves, silently deletes the evidence again; and every
+  bound here truncates out loud ("showing N of M"), never by handing the overflow to the room.
   Do not replace that prefix with a check that REFUSES prose containing the lead — that shape was
   tried and is a blocklist, refusing the honest phrasing the prompt's own heading invites while
   admitting a singular *record*, a dropped *From* or a homoglyph. `quote` splits on `['\n', '\r']`
