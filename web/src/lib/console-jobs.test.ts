@@ -7,6 +7,7 @@ import {
   consoleJobCounts,
   consoleJobProjects,
   consoleJobStatus,
+  durableAssignees,
   filterConsoleJobs,
   lastActivityByIssue,
   lifecycleByIssue,
@@ -261,6 +262,61 @@ describe("buildConsoleJobs", () => {
     expect(rows.map((r) => r.issue)).toEqual(["LIVE", "NEW", "OLD"]);
   });
 
+  // THE BUG (STUDIO-735): the ASSIGNED column showed a teammate only while the job was running,
+  // because the live roster is the only place the console looked. A done or in-review job now keeps
+  // the teammate the daemon recorded on its history row.
+  it("keeps the teammate on a job that has left running", () => {
+    const rows = buildConsoleJobs(
+      [
+        job({ issue: "DONE", status: "completed" }),
+        job({ issue: "REVIEW", status: "completed" }),
+      ],
+      [
+        issueRow({ issue_identifier: "DONE", lifecycle: "done", assignee: "alice" }),
+        issueRow({ issue_identifier: "REVIEW", lifecycle: "in_review", assignee: "jimmy" }),
+      ],
+      // Nobody is live: the roster that used to be the only source knows neither ticket.
+      undefined,
+      NOW,
+    );
+    expect(rows.find((r) => r.issue === "DONE")?.assignee).toBe("alice");
+    expect(rows.find((r) => r.issue === "REVIEW")?.assignee).toBe("jimmy");
+  });
+
+  // A run dispatched moments ago may not have a decorated history row yet, so the live roster stays
+  // the fallback — and the durable record outranks it when both answer.
+  it("falls back to the live roster only for a row with no durable assignee", () => {
+    const overview: TeamsOverview = {
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [
+        { name: "jimmy", profile: "p", labels: [], bank: "b", max_concurrent: 1, live_runs: 2, tickets: ["FRESH", "DONE"] },
+      ],
+    };
+    const rows = buildConsoleJobs(
+      [job({ issue: "FRESH", status: "running" }), job({ issue: "DONE", status: "completed" })],
+      [issueRow({ issue_identifier: "DONE", lifecycle: "done", assignee: "alice" })],
+      overview,
+      NOW,
+    );
+    expect(rows.find((r) => r.issue === "FRESH")?.assignee).toBe("jimmy");
+    expect(rows.find((r) => r.issue === "DONE")?.assignee).toBe("alice");
+  });
+
+  // A ticket nobody was routed for — solo, or a Teams-off daemon — stays "—" rather than borrowing
+  // a name from anywhere.
+  it("leaves a solo or Teams-off job unassigned", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "SOLO", status: "completed" })],
+      [issueRow({ issue_identifier: "SOLO", lifecycle: "done" })],
+      undefined,
+      NOW,
+    );
+    expect(rows[0].assignee).toBe("");
+  });
+
   it("attributes a live ticket to its teammate and leaves the rest unassigned", () => {
     const overview: TeamsOverview = {
       enabled: true,
@@ -289,6 +345,27 @@ describe("buildConsoleJobs", () => {
       NOW,
     );
     expect(rows[0].updated).toBe("6m ago");
+  });
+});
+
+describe("durableAssignees", () => {
+  it("reads the daemon's own assignee off each row and skips the rows without one", () => {
+    const by = durableAssignees([
+      issueRow({ issue_identifier: "A", assignee: "alice" }),
+      issueRow({ issue_identifier: "B" }),
+      issueRow({ issue_identifier: "" , assignee: "ghost" }),
+    ]);
+    expect(by.get("A")).toBe("alice");
+    expect(by.has("B")).toBe(false);
+    expect(by.has("")).toBe(false);
+  });
+
+  it("lets the first answer win when a ticket somehow has two rows", () => {
+    const by = durableAssignees([
+      issueRow({ issue_identifier: "A", assignee: "alice" }),
+      issueRow({ issue_identifier: "A", assignee: "jimmy" }),
+    ]);
+    expect(by.get("A")).toBe("alice");
   });
 });
 

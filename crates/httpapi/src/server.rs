@@ -11,14 +11,17 @@ use axum::handler::Handler;
 use axum::routing::any;
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
+use rhapsody_orchestrator::prstate::PrCoord;
+use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
     TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
-    HandoffResult, Identity, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
+    HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
     RunMessageResult, Snapshot, StopResult,
 };
+use rhapsody_store::StoreError;
 
 use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_version};
 use crate::handlers_config::{handle_capabilities, handle_config};
@@ -30,6 +33,7 @@ use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
+use crate::handlers_reviews::{handle_review_dismiss, handle_review_rerun, handle_reviews};
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
 use crate::handlers_teams::{
     handle_run_post, handle_run_retain, handle_teams, handle_teams_config, handle_teams_invalidate,
@@ -79,6 +83,26 @@ pub trait StateProvider: Send + Sync {
         &self,
         _ids: &[String],
     ) -> std::collections::HashMap<String, IssueLifecycleRow> {
+        std::collections::HashMap::new()
+    }
+
+    /// The DURABLE assignee of each of `keys`, keyed by tracker issue id — what decorates
+    /// `GET /api/v1/history/issues` with the `assignee` field (STUDIO-735). A ticket nobody was
+    /// routed for answers the empty string, and one with no answer at all is simply ABSENT; the
+    /// client then falls back to the live Teams roster, which can only name a RUNNING ticket.
+    ///
+    /// It takes the displayed RUN's id as well as the issue id because the two durable records are
+    /// keyed differently: the tracker's label read goes by opaque issue id, and the daemon's own
+    /// routing ledger by run — the run the row shows, so a re-run cannot inherit its predecessor's
+    /// teammate.
+    ///
+    /// Infallible for the same reason [`Self::issue_lifecycles`] is. Rhapsody-only (no Go v0.4.0
+    /// counterpart); the default answers nothing, which is exactly how the endpoint behaved before
+    /// the field existed.
+    async fn issue_assignees(
+        &self,
+        _keys: &[IssueKey],
+    ) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
     }
 
@@ -282,6 +306,31 @@ pub trait StateProvider: Send + Sync {
     ) -> Result<PostView, TeamsMemoryError> {
         Err(TeamsMemoryError::Disabled)
     }
+
+    // --- the ticketless review console (STUDIO-722, slice 8; design §7, §15-e, §16) ---
+    //
+    // The three default to a DORMANT subsystem rather than to an error, unlike the `teams_*`
+    // methods above: a provider that predates the review console — the parity fake, and anything
+    // embedding this crate for the Go-shaped API — behaves exactly as a daemon with the mode off,
+    // which is what an empty surface and a refused control mean.
+
+    /// The review watch set as `GET /api/v1/reviews` serves it: one row per (PR, reviewer), plus
+    /// whether the subsystem is awake at all. `Err` is a store failure, never "it is off" —
+    /// dormancy is `enabled: false` and an empty list (§16).
+    async fn reviews(&self) -> Result<ReviewsView, StoreError> {
+        Ok(ReviewsView::default())
+    }
+
+    /// `POST /api/v1/reviews/rerun` — the operator asking for one more review round of a WATCHED
+    /// pull request. §15-e's trusted lever, and the reason the room reader needs no `pr:` Intent.
+    async fn review_rerun(&self, _pr: PrCoord) -> ReviewControlOutcome {
+        ReviewControlOutcome::Dormant
+    }
+
+    /// `POST /api/v1/reviews/dismiss` — the operator taking a pull request out of the watch set.
+    async fn review_dismiss(&self, _pr: PrCoord) -> ReviewControlOutcome {
+        ReviewControlOutcome::Dormant
+    }
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -432,6 +481,13 @@ where
         // T5's bounded, read-only peek that advances no identity's cursor; POST is STUDIO-661's
         // human door, an operator post the daemon stamps `operator` on.
         .route("/api/v1/teams/room", any(handle_teams_room))
+        // The ticketless review console (STUDIO-722, slice 8; Rhapsody-only, no Go v0.4.0
+        // counterpart). One read and the two operator controls §15-e moves off the room and onto
+        // the authenticated console — see `handlers_reviews` for why that move is a security fix.
+        // Static paths, so `/api/v1/reviews` and its two children never contend.
+        .route("/api/v1/reviews", any(handle_reviews))
+        .route("/api/v1/reviews/rerun", any(handle_review_rerun))
+        .route("/api/v1/reviews/dismiss", any(handle_review_dismiss))
         // History + run-detail read API (H2). The multi-segment patterns (runs/{id}/events,
         // runs/{id}/transcript, issues/{id}/history) are more specific than runs/{id}; axum's matchit
         // dispatches them first regardless of registration order.

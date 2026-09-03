@@ -53,7 +53,7 @@ const FILTERS: readonly { value: RoomFilter; label: string }[] = [
 
 export interface TeamsConsoleProps {
   /** Route to another view — the roster and memory cards' links (§5, box 3.10). */
-  onNavigate: (route: "manage" | "memory") => void;
+  onNavigate: (route: "manage" | "memory" | "reviews") => void;
   /** Poll cadence for the roster and the room, matched to the daemon's own interval when known. */
   pollMs?: number;
   /** The clock the day dividers read "Today" from. Injected so the feed is testable. */
@@ -108,6 +108,12 @@ export function TeamsConsole({ onNavigate, pollMs, now }: TeamsConsoleProps) {
         <h1>Teams</h1>
         <TeamSwitcher count={roster.length} />
         <div className="spacer" />
+        {/* The way into the ticketless review watch set and its operator controls (STUDIO-722).
+            A link from here rather than a rail item of its own, because Reviews is a Teams child
+            like Manage team — see `NAV_PARENT` in lib/console-routing.ts. */}
+        <button type="button" className="link" onClick={() => onNavigate("reviews")}>
+          Reviews →
+        </button>
         <span className="build">
           {idle} idle · {stats.inReview} in review
         </span>

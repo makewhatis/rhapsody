@@ -330,6 +330,31 @@ pub enum Event {
         observed: Vec<crate::prstate::PrObservation>,
         reply: oneshot::Sender<crate::reviewwatch::ReviewSweepReport>,
     },
+    /// The authenticated console's read of the ticketless review watch set (STUDIO-722, slice 8;
+    /// NEW beyond Go v0.4.0). Loop-confined for [`Event::ReviewWatchList`]'s reason: the HTTP task
+    /// never reads the store the control task is the single writer of.
+    ReviewConsoleList {
+        reply:
+            oneshot::Sender<Result<crate::reviewconsole::ReviewsView, rhapsody_store::StoreError>>,
+    },
+    /// The operator asking, from the authenticated console, for one more review round of a WATCHED
+    /// pull request (STUDIO-722; NEW beyond Go v0.4.0).
+    ///
+    /// **This variant and [`Event::ReviewDismiss`] are §15-e.** §14.1's F-SEC finding took operator
+    /// control of reviews away from the room — a `pr:` coordinate in post text is forgeable, and
+    /// acting on one checks a repository out under `bypassPermissions` — and put it on the
+    /// authenticated console instead. These are that channel: in-process, from the loopback API,
+    /// with no new `pr:` Intent anywhere in the Linear-anchored room reader.
+    ReviewRerun {
+        pr: crate::prstate::PrCoord,
+        reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
+    },
+    /// The operator taking a pull request out of the watch set from the authenticated console
+    /// (STUDIO-722; NEW beyond Go v0.4.0). The same terminal a merge or a close reaches.
+    ReviewDismiss {
+        pr: crate::prstate::PrCoord,
+        reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
+    },
 }
 
 /// How long [`ControlHandle::record_teams_post`] waits for the control task to report back on a
@@ -588,6 +613,15 @@ impl Orchestrator {
             }
             Event::ReviewSweep { observed, reply } => {
                 let _ = reply.send(self.handle_review_sweep(&observed));
+            }
+            Event::ReviewConsoleList { reply } => {
+                let _ = reply.send(self.review_console_list());
+            }
+            Event::ReviewRerun { pr, reply } => {
+                let _ = reply.send(self.handle_review_rerun(&pr));
+            }
+            Event::ReviewDismiss { pr, reply } => {
+                let _ = reply.send(self.handle_review_dismiss(&pr));
             }
         }
     }

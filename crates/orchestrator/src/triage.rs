@@ -371,6 +371,7 @@ impl StoreIdentityHistory {
             text: String::new(),
             issue: String::new(),
             kind: crate::teams::EVENT_ROUTE.to_string(),
+            run: 0,
             limit: 1,
         };
         match self.store.search_events(q) {
@@ -392,6 +393,7 @@ impl IdentityHistory for StoreIdentityHistory {
             text: String::new(),
             issue: issue_identifier.to_string(),
             kind: crate::teams::EVENT_ROUTE.to_string(),
+            run: 0,
             limit: RECONCILE_HISTORY_LIMIT,
         };
         match self.store.search_events(q) {
@@ -472,7 +474,7 @@ impl IdentityHistory for StoreIdentityHistory {
 /// anywhere in the text: the `reason` is free prose that can and does quote model output, and a
 /// reason containing `identity=` must never be able to name who a run was. An empty name yields
 /// `None`, since no roster member can be called that (roster names are validated label-safe).
-fn route_event_identity(text: &str) -> Option<String> {
+pub(crate) fn route_event_identity(text: &str) -> Option<String> {
     let name = text.split_whitespace().next()?.strip_prefix("identity=")?;
     (!name.is_empty()).then(|| name.to_string())
 }

@@ -19,12 +19,14 @@ use rhapsody_core::Project;
 use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
+use rhapsody_orchestrator::prstate::PrCoord;
+use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
     TeamsMemory, TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
-    CancelWait, ControlHandle, HandoffResult, Identity, IssueLifecycleRow, ReadsError,
+    CancelWait, ControlHandle, HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError,
     RefreshResult, ReloadError, ResumeResult, RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
@@ -123,6 +125,16 @@ impl StateProvider for DaemonState {
         self.handle
             .snapshot()
             .ok_or_else(|| SnapshotError::new("daemon is not running"))
+    }
+
+    async fn issue_assignees(
+        &self,
+        keys: &[IssueKey],
+    ) -> std::collections::HashMap<String, String> {
+        // Off-loop and best-effort (STUDIO-735), exactly like the lifecycle decoration beside it:
+        // the handle answers from its TTL cache, the store's own routing ledger and the reads
+        // cell's tracker, and answers nothing for the rest.
+        self.handle.issue_assignees(keys).await
     }
 
     fn history(&self) -> Arc<dyn HistoryStore> {
@@ -234,6 +246,26 @@ impl StateProvider for DaemonState {
     /// (STUDIO-652). A field read on the shared config — no control-loop round-trip.
     fn teams_enabled(&self) -> bool {
         self.handle.teams_memory().is_some_and(|mem| mem.enabled())
+    }
+
+    // --- the ticketless review console (STUDIO-722, slice 8; design §7, §15-e) ---
+    //
+    // All three round-trip the control task rather than reading the store directly the way
+    // `HistoryView` does, and the reason is the watch set's single-writer property: the two
+    // controls read `running`/`claimed` alongside it to make the F-DUP in-flight decision, and only
+    // the control task owns those. The read follows them so the console cannot observe a watch set
+    // half-written by the tick it is racing.
+
+    async fn reviews(&self) -> Result<ReviewsView, StoreError> {
+        self.handle.list_reviews().await
+    }
+
+    async fn review_rerun(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.handle.rerun_review(pr).await
+    }
+
+    async fn review_dismiss(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.handle.dismiss_review(pr).await
     }
 
     fn teams_config_path(&self) -> &str {

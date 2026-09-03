@@ -230,6 +230,20 @@ does NOT carry them and its `api/history.json` golden is untouched (STUDIO-702).
 dashboard had only a run OUTCOME to colour a ticket with, so every completed run read as "in review"
 for as long as the store kept it.
 
+`GET /api/v1/history/issues` carries a third optional field, `assignee` — the Rhapsody Teams
+teammate the run THIS ROW DISPLAYS was dispatched under, so a job that has left "running" keeps
+naming who did it (STUDIO-735). It is resolved from two records, in order: that run's own
+`teams.route` history row, and — only when that run's ledger is silent — the ticket's
+`rhapsody:@<name>` label (read by id, so it answers for a merged ticket). The scope is the run and
+never the ticket: a ticket routed to a teammate and later re-run solo, unrouted or with Teams off
+shows the re-run's answer, and a run that recorded `teams.unrouted` answers "nobody" outright rather
+than falling through to a label. The field is OMITTED — never empty — whenever the answer is nobody.
+A Teams-off daemon's rows always fall through to the label, so it can still name a teammate a ticket
+was routed to before Teams was turned off, at the cost of at most one label batch per TTL window.
+The lookup shares the lifecycle decoration's shape exactly: off the control loop, TTL-cached,
+best-effort, and unable to fail the listing. Before it, the console read the assignee from the LIVE
+Teams roster, so the column went blank the moment a run finished.
+
 The day boundary for `/history/summary` is **local, not UTC**: the caller sends its own local
 midnight as `since` (the dashboard does), and omitting it falls back to the daemon host's local
 midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would
@@ -320,7 +334,10 @@ the *live instruction* channel to a running agent, and this door deliberately do
 Memory is a pluggable backend (`none` / `local`, with `hindsight` reserved). `local` is the default
 because it works on a laptop with no cloud: append-only markdown records, one file per record, under
 `~/.rhapsody/teams/banks/<name>/`, in files a human can read and correct. The bank directory appears
-on the first retain and at no other time.
+on the first retain and at no other time. A roster entry may name its bank explicitly with `bank:`,
+but only a label-safe value is honoured — a bank id becomes a directory name — and anything else is
+dropped in favour of `<bank_prefix><name>`. `teams_roster` and `GET /api/v1/teams` report the id
+that was actually resolved, so the view always names the directory the daemon reads (STUDIO-729).
 
 **The team room** is an append-only log read at hydration, not a message bus: identities are durable
 state rather than processes, so nobody receives and everybody catches up. It is JSONL under

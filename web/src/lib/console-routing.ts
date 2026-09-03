@@ -16,6 +16,7 @@ export const CONSOLE_ROUTES = [
   "teams",
   "memory",
   "manage",
+  "reviews",
   "settings",
   "workflow",
   "tools",
@@ -43,13 +44,23 @@ export const DEFAULT_CONSOLE_ROUTE: ConsoleRoute = { name: "jobs", key: "" };
  * sends the routes themselves back to Jobs, so a stale deep link cannot strand the operator on
  * a surface the daemon cannot serve.
  */
-export const TEAMS_ONLY_ROUTES = ["teams", "memory", "manage"] as const satisfies readonly ConsoleRouteName[];
+export const TEAMS_ONLY_ROUTES = [
+  "teams",
+  "memory",
+  "manage",
+  "reviews",
+] as const satisfies readonly ConsoleRouteName[];
 
 /**
  * Child route → the nav item that owns it (§2.3): `job` sits under Jobs, `manage` under Teams,
  * and `workflow` — the WORKFLOW.md editor the Settings "Workflow" row opens (STUDIO-690) — under
  * Settings. It is a route of its own rather than local state so the editor is deep-linkable and
  * the browser Back button returns to Settings, exactly as `manage` does for Teams.
+ *
+ * `reviews` (STUDIO-722) is the ticketless review watch set, opened from the Teams console the way
+ * `manage` is. It sits under Teams because a review is a thing the TEAM does, and it is teams-only
+ * for the same reason `manage` is — the whole review subsystem is dormant with Teams off (design
+ * §16), so the route has nothing to render.
  *
  * `tools`, `logs` and `updates` (STUDIO-691) are three more of the same shape: the Settings rows
  * that open the tool doctor, the live log tail and the desktop updater (§8.1). None is teams-only
@@ -58,6 +69,7 @@ export const TEAMS_ONLY_ROUTES = ["teams", "memory", "manage"] as const satisfie
 const NAV_PARENT: Partial<Record<ConsoleRouteName, ConsoleRouteName>> = {
   job: "jobs",
   manage: "teams",
+  reviews: "teams",
   workflow: "settings",
   tools: "settings",
   logs: "settings",
