@@ -87,6 +87,12 @@ use crate::teams::{LoadSnapshot, at_capacity};
 /// How many review ROUNDS one pull request may be given, ever, in one daemon lifetime — the floor
 /// against force-push churn (§14.2, "no approval terminal → unbounded re-review").
 ///
+/// A ROUND, not a dispatch. `review_rounds` counts dispatches, and one round costs one dispatch per
+/// required reviewer, so the check multiplies this by `teams.review.effective_reviewers()` before
+/// comparing (STUDIO-727). Comparing the raw counter would silently divide the budget by the
+/// reviewer count — at `reviewers: 8` a pull request would get its first round and never be
+/// re-reviewed again, with nothing above `debug!` to say so.
+///
 /// The edge trigger already bounds the RATE: a round cannot start while one is in flight, so a
 /// pull request costs at most one review per review's duration however fast its author pushes. What
 /// it does not bound is the TOTAL, and an author amending in a loop — a rebase chain, a CI-driven
@@ -276,7 +282,7 @@ impl Orchestrator {
         if !self.review_ticketless_enabled() {
             return Vec::new(); // §16
         }
-        let rows = match self.store().load_review_watch() {
+        let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(err = %e, "ticketless review: the watch set could not be read; nothing is polled this tick");
@@ -309,7 +315,7 @@ impl Orchestrator {
         if !self.review_ticketless_enabled() {
             return report; // §16
         }
-        let rows = match self.store().load_review_watch() {
+        let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(err = %e, "ticketless review: the watch set could not be read; this tick decides nothing");
@@ -362,6 +368,8 @@ impl Orchestrator {
     /// Drops every live row of one pull request out of the watch set and forgets its churn budget.
     /// Returns how many rows were dropped.
     fn retire_review_pr(&mut self, pr: &PrCoord, why: &str) -> usize {
+        // The FULL set on purpose, unlike the paths above: this predicate also catches a row that
+        // is closed but not yet dropped, which `load_live_review_watch` filters out.
         let rows = match self.store().load_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
@@ -411,6 +419,14 @@ impl Orchestrator {
         // once for the whole tick) is still sound to decide from.
         report.armed += self.handle_review_head_advanced(pr, head);
 
+        // How many dispatches one ROUND of this pull request costs — the unit the churn budget
+        // below has to be expressed in. Read from config rather than from `mine.len()`, which is
+        // the rows that happen to exist right now and would let a retired row shrink the budget.
+        let reviewers_per_round = self
+            .teams
+            .as_ref()
+            .map_or(1, |t| t.review.effective_reviewers().max(1));
+
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
         // reassigns. `mine` is the tick's opening snapshot, so reading peers off it directly would
@@ -438,12 +454,17 @@ impl Orchestrator {
                 report.deferred += 1;
                 continue;
             }
-            // The churn floor (§14.2). Checked per ROUND rather than per row so N reviewers of one
-            // pull request share one budget — the cost this bounds is agent runs, not rows.
-            let rounds = self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0);
-            if rounds >= REVIEW_ROUNDS_PER_PR_CAP {
+            // The churn floor (§14.2). Keyed per PULL REQUEST rather than per row so N reviewers of
+            // one pull request share one budget — the cost this bounds is agent runs, not rows.
+            //
+            // The counter is in dispatches and the cap is in rounds, so the budget is scaled by the
+            // required-reviewer count to make the two comparable (STUDIO-727). Without that, a
+            // two-reviewer config would get four rounds and an eight-reviewer config exactly one.
+            let dispatched = self.review_rounds.get(&churn_key(pr)).copied().unwrap_or(0);
+            let budget = REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round);
+            if dispatched >= budget {
                 tracing::debug!(
-                    pr = %pr, rounds,
+                    pr = %pr, dispatched, budget,
                     "ticketless review: the per-pull-request re-review cap is reached; no further \
                      round is dispatched until the daemon restarts or the pull request closes"
                 );
@@ -525,7 +546,7 @@ impl Orchestrator {
                     }
                     let counter = self.review_rounds.entry(churn_key(pr)).or_default();
                     *counter += 1;
-                    if *counter == REVIEW_ROUNDS_PER_PR_CAP {
+                    if *counter == REVIEW_ROUNDS_PER_PR_CAP.saturating_mul(reviewers_per_round) {
                         tracing::warn!(
                             pr = %pr, rounds = *counter,
                             "ticketless review: this pull request has now had its whole re-review \
@@ -596,9 +617,11 @@ impl Orchestrator {
     /// `dispatch_review`'s routing matches a project by that exact string: anything else would
     /// resolve the allowlist and then fail to route.
     ///
-    /// Only `projects` are searched, not the legacy top-level `repo`, for the same reason —
-    /// `review_route` can only route to a project, so accepting a top-level binding here would
-    /// promise a dispatch that the next line refuses.
+    /// Only `projects` are searched, and nothing is lost by that: `resolve_projects` synthesizes a
+    /// project even for a config with no `projects:` block, carrying the top-level `repo` and always
+    /// enabled, so a legacy single-project configuration resolves here like any other. An earlier
+    /// version of this comment claimed the legacy form could introduce a pull request but never
+    /// dispatch a review of it — it cannot happen, and no such gap exists (STUDIO-727).
     fn review_repo_url(&self, owner: &str, repo: &str) -> Option<String> {
         let eff = self.eff.as_ref()?;
         eff.projects
@@ -1261,6 +1284,34 @@ mod tests {
         );
         let over = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
         assert_eq!((over.dispatched, over.deferred), (0, 1));
+    }
+
+    /// …and the budget is counted in ROUNDS at every reviewer count, not in dispatches (STUDIO-727).
+    ///
+    /// The counter increments once per dispatch, and one round of a two-reviewer pull request costs
+    /// two. Comparing the raw counter against the cap would give this configuration four rounds
+    /// instead of eight — and an eight-reviewer one exactly one round, for the daemon's whole
+    /// lifetime, with nothing above `debug!` to say why re-reviews stopped.
+    #[test]
+    fn the_churn_budget_is_counted_in_rounds_at_every_reviewer_count() {
+        let mut teams = ticketless(&["alice", "bob", "carol"]);
+        teams.review.reviewers = 2;
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(12, "carol"));
+
+        for round in 0..(REVIEW_ROUNDS_PER_PR_CAP + 4) {
+            let head = format!("{round:040}");
+            o.handle_review_sweep(&[open_at(12, &head)]);
+            complete(&mut o, 12, "bob", &head);
+            complete(&mut o, 12, "carol", &head);
+        }
+
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            REVIEW_ROUNDS_PER_PR_CAP * 2,
+            "eight ROUNDS of two reviewers is sixteen dispatches, not eight"
+        );
     }
 
     /// The budget belongs to a pull request, not to the daemon: a second pull request gets its own,

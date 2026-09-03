@@ -687,6 +687,11 @@ mod tests {
         fn load_review_watch(&self) -> Result<Vec<rhapsody_store::ReviewWatchRow>, StoreError> {
             self.0.load_review_watch()
         }
+        fn load_live_review_watch(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ReviewWatchRow>, StoreError> {
+            self.0.load_live_review_watch()
+        }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)
         }

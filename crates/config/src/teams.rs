@@ -1443,8 +1443,6 @@ mod tests {
         }
     }
 
-    /// The Settings editor writes a `Teams` and the daemon boots the same one —
-    /// the round-trip property `save_creates_the_file_and_round_trips_through_load`
     /// STUDIO-721 (decision C): the ticketless path asks ONE teammate by default
     /// — not the quorum's two — and a nonsensical count clamps up to one rather
     /// than turning an enabled review mode into a silent no-op.
@@ -1477,6 +1475,8 @@ mod tests {
         assert_eq!(present.reviewers, 4);
     }
 
+    /// The Settings editor writes a `Teams` and the daemon boots the same one —
+    /// the round-trip property `save_creates_the_file_and_round_trips_through_load`
     /// pins for the rest of the file, extended to the new block so a save can
     /// never silently drop the mode an operator chose.
     #[test]

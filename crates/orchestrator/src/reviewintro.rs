@@ -536,7 +536,7 @@ impl Orchestrator {
             );
             return 0;
         }
-        let rows = match self.store().load_review_watch() {
+        let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(pr = %pr, err = %e, "ticketless review: the watch set could not be read; no re-review was armed");
@@ -560,6 +560,14 @@ impl Orchestrator {
             // are the edge-trigger's own record, and re-arming either is the level-triggered
             // duplicate dispatch §14.1 F-DUP describes.
             if head_sha == row.last_reviewed_sha || head_sha == row.requested_sha {
+                continue;
+            }
+            // Already waiting to be reviewed at no particular head — a freshly introduced row, on
+            // this pull request's first tick. Rewriting it to the status it already holds costs a
+            // store write per row per tick until the first dispatch, and would report `armed` for a
+            // pull request nobody has pushed to (STUDIO-727). `armed` answers "did the author
+            // push?", so a row that was never disarmed must not count.
+            if row.status == REVIEW_STATUS_REQUESTED && row.requested_sha.is_empty() {
                 continue;
             }
             let id = review_key(

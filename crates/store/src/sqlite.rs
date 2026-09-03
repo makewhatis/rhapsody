@@ -1150,6 +1150,21 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {REVIEW_WATCH_COLS} FROM rhapsody_review_watch \
+               WHERE open = 1 AND status <> 'dropped' \
+               ORDER BY owner, repo, number, reviewer"
+        ))?;
+        let rows = stmt.query_map([], map_review_watch)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
         if retention_days <= 0 {
             return Ok(()); // 0 = keep forever
@@ -3424,6 +3439,43 @@ mod tests {
                 ("makewhat".into(), "rhapsody".into(), 84, "jimmy".into()),
                 ("zeta".into(), "repo".into(), 1, "alice".into()),
             ]
+        );
+    }
+
+    /// The live-rows variant returns exactly what the watcher's hot paths filter to, and — the
+    /// point of it — a retired row stays out of every future load (STUDIO-727). Retirement is a
+    /// SOFT delete and `prune` never touches this table, so without the `WHERE` those rows are
+    /// deserialized on every tick forever.
+    #[test]
+    fn the_live_load_omits_retired_rows_that_the_full_load_still_returns() {
+        let store = open_mem();
+        let live = wkey("makewhat", "rhapsody", 9, "alice");
+        let retired = wkey("makewhat", "rhapsody", 84, "jimmy");
+        for k in [live.clone(), retired.clone()] {
+            store.save_review_watch(introduced(k)).expect("introduce");
+        }
+        // A closed-but-undropped row: not "live", and NOT what retirement keys on either.
+        let mut closed = introduced(wkey("makewhat", "rhapsody", 90, "alice"));
+        closed.open = false;
+        store.save_review_watch(closed).expect("close");
+
+        store.drop_review_watch(&retired).expect("retire");
+
+        let live_numbers: Vec<i64> = store
+            .load_live_review_watch()
+            .expect("live load")
+            .into_iter()
+            .map(|r| r.key.number)
+            .collect();
+        assert_eq!(
+            live_numbers,
+            vec![9],
+            "only the open, undropped row is live"
+        );
+        assert_eq!(
+            store.load_review_watch().expect("full load").len(),
+            3,
+            "the full load still sees the soft-deleted row — retirement reads it"
         );
     }
 

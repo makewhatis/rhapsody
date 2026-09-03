@@ -267,6 +267,17 @@ pub trait Store {
     /// hide a row that a later rule cares about.
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
 
+    /// Only the rows still worth watching: `open` and not `dropped`. The watcher's hot paths run
+    /// this once per tick and once per observation, and they all apply exactly this predicate the
+    /// moment they get the rows back — so applying it in SQL costs nothing and stops a retired row
+    /// being deserialized forever (STUDIO-727).
+    ///
+    /// It matters because a retirement is a SOFT delete: [`Store::drop_review_watch`] sets
+    /// `status = 'dropped', open = 0` and [`Store::prune`] never touches this table, so the dead
+    /// rows are permanent. Callers whose predicate is genuinely broader — retirement, which must
+    /// also see a closed-but-undropped row — still use [`Store::load_review_watch`].
+    fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
+
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).
     fn prune(&self, retention_days: i64) -> Result<(), StoreError>;

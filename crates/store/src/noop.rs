@@ -148,6 +148,9 @@ impl Store for Noop {
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
         Ok(Vec::new())
     }
+    fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+        Ok(Vec::new())
+    }
 
     fn prune(&self, _retention_days: i64) -> Result<(), StoreError> {
         Ok(())
