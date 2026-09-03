@@ -1,0 +1,75 @@
+/* ============================================================================
+   Rhapsody Console — rendered agent prose (STUDIO-739)
+
+   What `components/console/Markdown.tsx` paints: the transcript's bodies, the
+   room's posts and a retained fact. Scoped under `.rh-console` like every other
+   console sheet, and declaring only what the subset needs — the inline `code`
+   chip, the link colour and the type ramp all come from `console.css` and the
+   tokens.
+
+   The one rule that is not cosmetic: a fenced code block scrolls INSIDE its own
+   box (`overflow-x: auto` + `max-width: 100%`), so a wide traceback never makes
+   the page scroll sideways — STUDIO-681's discipline for wide content.
+   ============================================================================ */
+
+/* `white-space: normal` is a reset, not a preference: a surface that wrapped raw
+   text in `pre-wrap` (`.fact .body`) would otherwise leak it into every block.
+
+   `overflow-wrap: anywhere` is the same no-sideways-scroll rule as the code box,
+   for prose: agent text carries 200-character paths, URLs and hashes, and an
+   unbreakable token would otherwise push the page wider. It is inert inside the
+   code box, whose `white-space: pre` opts out of wrapping and scrolls instead. */
+.rh-console .md { white-space: normal; overflow-wrap: anywhere; }
+.rh-console .md > *:first-child { margin-top: 0; }
+.rh-console .md > *:last-child { margin-bottom: 0; }
+
+/* A hand-off's own line breaks and indentation are meaningful, so a paragraph
+   keeps both — `pre-wrap` here is what renders the leading whitespace the parser
+   preserves, so a retained fact's unfenced listing still lines up as it did under
+   `.fact .body` (memory.css) before this sheet existed. */
+.rh-console .md p { margin: 0 0 7px; white-space: pre-wrap; }
+.rh-console .md .mdlead { margin-bottom: 4px; }
+
+.rh-console .md .mdh { margin: 11px 0 5px; font-weight: 650; line-height: 1.35; color: var(--ink); letter-spacing: -.01em; }
+.rh-console .md .mdh1 { font-size: 1.18em; }
+.rh-console .md .mdh2 { font-size: 1.1em; }
+.rh-console .md .mdh3 { font-size: 1.04em; }
+.rh-console .md .mdh4,
+.rh-console .md .mdh5,
+.rh-console .md .mdh6 { font-size: 1em; color: var(--ink-2); }
+
+.rh-console .md ul,
+.rh-console .md ol { margin: 5px 0 7px; padding-left: 19px; }
+.rh-console .md li { margin: 2px 0; white-space: pre-wrap; }
+.rh-console .md li > ul,
+.rh-console .md li > ol { margin: 2px 0 0; }
+
+/* A `.mcard` preview sized its prose through `.mcard p`; the block carries it now. */
+.rh-console .mcard .md { font-size: 12.5px; color: var(--ink-2); }
+
+.rh-console .md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.rh-console .md a:hover { color: var(--ink); }
+
+.rh-console .md pre.mdpre {
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 7px 0;
+  padding: 9px 11px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: .92em;
+  line-height: 1.55;
+  color: var(--ink-2);
+  white-space: pre;
+}
+/* Inside the box the chip treatment `console.css` gives an inline `code` would
+   draw a second background on every line — the box already is the surface. */
+.rh-console .md pre.mdpre code.mdcode {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  color: inherit;
+}

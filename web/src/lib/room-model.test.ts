@@ -1,6 +1,8 @@
+import { parseMarkdown } from "@/lib/markdown";
 import { describe, expect, it } from "vitest";
 import type { TeamsRoomMessage } from "@/lib/api";
 import {
+  BODY_TRUNCATE_AT,
   DEFAULT_ROOM_WINDOW,
   MAX_ROOM_WINDOW,
   MIN_ASSIGN_RUN,
@@ -23,6 +25,11 @@ import {
 // reworded body is exactly the regression these tests exist to catch.
 
 const ROSTER = ["alice", "jimmy"];
+
+/** The text of every fenced block in a rendered half, in order. */
+function codeOf(source: string): string[] {
+  return parseMarkdown(source).flatMap((b) => (b.type === "code" ? [b.text] : []));
+}
 
 // Timestamps sit mid-UTC-day on purpose: the feed groups and prints in LOCAL time (the house style
 // of lib/format), so a fixture near midnight would land on a different calendar day depending on
@@ -307,6 +314,126 @@ describe("3.7 — a long body truncates with the rest kept for the expand", () =
     const { head, rest } = truncateBody(body);
     expect(head).toHaveLength(220);
     expect(head + rest).toBe(body);
+  });
+
+  // STUDIO-739 — both halves are rendered as markdown independently now. A cut inside a fence
+  // leaves the TAIL starting on the closing fence, which opens a new unterminated block and turns
+  // every remaining word of the post into monospace code. The repair closes the block on the head
+  // and reopens it on the tail, which is the only move that keeps the head inside its budget: a
+  // fenced block is arbitrarily long, so cutting to either of its boundaries is not bounded by
+  // anything. The budget below is `BODY_TRUNCATE_AT` plus the one fence line the repair adds.
+  it("closes a fenced block on the head and reopens it on the tail", () => {
+    const body = `Verification:\n\n\`\`\`sh\n${"cargo test --workspace\n".repeat(12)}\`\`\`\n\nAll green, wired into the transcript.`;
+    const { head, rest } = truncateBody(body);
+    expect(head.length).toBeLessThanOrEqual(BODY_TRUNCATE_AT + "```sh\n".length);
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["paragraph", "code"]);
+    // The prose after the block is still prose, and the tail's code is still code.
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+    // The preview is the block's opening lines — neither an empty box nor the whole block.
+    const [headCode, ...tailCode] = [...codeOf(head), ...codeOf(rest)];
+    expect(headCode).not.toBe("");
+    expect(headCode + tailCode.join("")).toBe("cargo test --workspace\n".repeat(12).slice(0, -1));
+  });
+
+  it("bounds the head when the body opens with a long fenced block", () => {
+    const body = `\`\`\`\n${"x".repeat(5000)}\n\`\`\`\nprose after the block.`;
+    const { head, rest } = truncateBody(body);
+    expect(head.length).toBeLessThanOrEqual(BODY_TRUNCATE_AT + 4);
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+  });
+
+  it("keeps the expand affordance when the block is never closed", () => {
+    const body = `\`\`\`\n${"y".repeat(600)}`;
+    const { head, rest } = truncateBody(body);
+    expect(head.length).toBeLessThanOrEqual(BODY_TRUNCATE_AT + 4);
+    // An unterminated block used to swallow the whole post into the head, leaving no `<details>`.
+    expect(rest).not.toBe("");
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code"]);
+  });
+
+  it("spends the budget on the block instead of stopping short of it", () => {
+    const body = `hi\n\`\`\`\n${"z".repeat(400)}\n\`\`\`\ntail`;
+    const { head } = truncateBody(body);
+    // Cutting back to the block's start left a three-character preview ("hi\n") here.
+    expect(head.length).toBeGreaterThanOrEqual(BODY_TRUNCATE_AT);
+  });
+
+  it("cuts before the fence when the cut lands inside the opening one", () => {
+    const body = `${"a".repeat(218)}\n\`\`\`rust\nfn main() {}\n\`\`\`\ntail`;
+    const { head, rest } = truncateBody(body);
+    // Half an opening fence is not a fence, so the whole block moves to the tail.
+    expect(head).toBe(`${"a".repeat(218)}\n`);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+  });
+
+  it("takes a closing fence into the head rather than splitting it in two", () => {
+    const body = `\`\`\`\n${"b".repeat(213)}\n\`\`\``;
+    const { head, rest } = truncateBody(body);
+    // Every content line already fits, so the three characters left are the fence itself.
+    expect(head).toBe(body);
+    expect(rest).toBe("");
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+  });
+
+  it("does not let the cut manufacture a closing fence on the tail", () => {
+    // The cut falls on the space inside `cat ```' — splitting there would open the tail on
+    // " ```", which IS a closing fence, so the reopened block would close empty and spill the
+    // rest of the code out as prose. Backing up to the line's start puts the line back together.
+    const body = `\`\`\`\n${"filler line\n".repeat(17)}cat \`\`\`\nmorecode\n\`\`\`\ntail`;
+    const { head, rest } = truncateBody(body);
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+    // Only the trailing marker run moves to the tail, not the whole line: backing up a line at a
+    // time can spend the entire preview budget on one long code line.
+    expect(codeOf(rest)[0]).toBe("t ```\nmorecode");
+    expect(head.length).toBeGreaterThan(BODY_TRUNCATE_AT - 8);
+  });
+
+  it("adds only the fence it needs and drops nothing else", () => {
+    const body = `lead in\n\n\`\`\`rust\n${"line of output\n".repeat(20)}\`\`\`\ntail`;
+    const { head, rest } = truncateBody(body);
+    expect(head.endsWith("\n```")).toBe(true);
+    expect(rest.startsWith("```rust\n")).toBe(true);
+    // Strip the two fences this split synthesized and the halves rejoin into the original body —
+    // an assertion the split can fail, unlike one written in terms of `head.length`.
+    expect(head.slice(0, -"\n```".length) + rest.slice("```rust\n".length)).toBe(body);
+  });
+
+  it("spends the budget on the code line rather than giving the whole line up", () => {
+    // The tail of this line IS a closing fence, so the cut has to back up; backing up to the
+    // line's START would leave a seven-character empty box as the preview of a 238-char body.
+    const body = `\`\`\`\n${"a".repeat(210)} \`\`\`\nmore\n\`\`\``;
+    const { head, rest } = truncateBody(body);
+    expect(head.length).toBeGreaterThanOrEqual(BODY_TRUNCATE_AT - 8);
+    expect(codeOf(head)[0]).toBe("a".repeat(209));
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code"]);
+  });
+
+  it("keeps the tail whole when the post opens with a fence line past the budget", () => {
+    // The opening line alone outruns the budget, so no cut buys a preview: a head ending inside a
+    // fence line is a truncated unterminated fence, which renders as an empty code box. The only
+    // thing left to protect is the TAIL, so this asserts through the PARSER rather than on string
+    // lengths — cutting mid-line instead inverts it, rendering the code as prose (the content
+    // lines lazily continue a paragraph) and the prose as code (the closing fence reopens a
+    // block), which is exactly what this split exists to prevent.
+    const body = `~~~ ${"opt ".repeat(60)}\ncode\n~~~\ntrailing prose`;
+    const { head, rest } = truncateBody(body);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+    expect(codeOf(rest)).toEqual(["code"]);
+    expect(head).toBe("");
+  });
+
+  it("previews a post that opens with an inline code span", () => {
+    // The parser read this post's opening inline code span as a fence, so the whole body became
+    // one unterminated code block starting at offset 0 — and the split cut to that start, leaving
+    // the feed with an empty preview of a post that was entirely readable prose before.
+    const body = `\`\`\`make lint\`\`\` was clean and the workspace built. ${"detail ".repeat(40)}`;
+    const { head, rest } = truncateBody(body);
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["paragraph"]);
+    expect(head.startsWith("```make lint``` was clean and the workspace built.")).toBe(true);
+    expect(rest).not.toBe("");
   });
 });
 
