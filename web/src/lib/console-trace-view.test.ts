@@ -468,6 +468,12 @@ describe("runTeammate — who a run was, from fields the daemon actually serves"
     expect(runTeammate(run({ issue_identifier: "STUDIO-744" }), "")).toBe("");
     expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1@" }), "")).toBe("");
   });
+
+  // The `@` is what makes the suffix a name. Without one there is no reviewer in the key, and
+  // slicing from a `lastIndexOf` of -1 would render the whole coordinate as a teammate.
+  it("names nobody for a `pr:` key carrying no reviewer at all", () => {
+    expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1" }), "alice")).toBe("");
+  });
 });
 
 describe("relayBatons — the handoff baton the attempt selector switches between", () => {

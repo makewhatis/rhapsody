@@ -423,7 +423,11 @@ const REVIEW_KEY_PREFIX = "pr:";
 export function runTeammate(run: RunSummary, assignee: string): string {
   const key = run.issue_identifier.trim();
   if (key.startsWith(REVIEW_KEY_PREFIX)) {
-    return key.slice(key.lastIndexOf("@") + 1).trim();
+    // The `@` is what makes the suffix a NAME. `is_review_key` only checks the prefix, so a `pr:`
+    // key that carries no reviewer is a shape this has to answer for — and `lastIndexOf` returning
+    // -1 would otherwise slice from 0 and render the whole coordinate as if it were a teammate.
+    const at = key.lastIndexOf("@");
+    return at < 0 ? "" : key.slice(at + 1).trim();
   }
   return assignee.trim();
 }
