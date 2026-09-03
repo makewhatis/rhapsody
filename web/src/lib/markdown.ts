@@ -61,6 +61,24 @@ export function safeHref(href: string): string | null {
 // --- blocks -------------------------------------------------------------------------------
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)/;
+
+/**
+ * The fence `line` opens, or `null` when it opens none.
+ *
+ * [`FENCE`] matches a PREFIX of the line, so on its own it reads `` ```make lint``` was clean ``
+ * as a block opening and swallows every following paragraph as code. CommonMark forbids a
+ * backtick anywhere in a BACKTICK fence's info string for precisely that reason — a paragraph
+ * that begins with an inline code span is prose. The rule is backtick-only: a tilde fence's info
+ * string may carry anything, so a `~~~` line is taken as written.
+ */
+function fenceOpen(line: string): RegExpExecArray | null {
+  const fence = FENCE.exec(line);
+  if (!fence) return null;
+  const marker = fence[1];
+  // The run is anchored to the line's start (past at most three spaces), so `indexOf` finds it.
+  if (marker[0] === "`" && line.slice(line.indexOf(marker) + marker.length).includes("`")) return null;
+  return fence;
+}
 const HEADING = /^ {0,3}(#{1,6})\s+(.*)$/;
 const BULLET = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 
@@ -85,7 +103,7 @@ export function parseMarkdown(source: string): MdBlock[] {
       continue;
     }
 
-    const fence = FENCE.exec(line);
+    const fence = fenceOpen(line);
     if (fence) {
       const marker = fence[1];
       const body: string[] = [];
@@ -128,7 +146,7 @@ export function parseMarkdown(source: string): MdBlock[] {
           }
           break;
         }
-        if (FENCE.test(lines[i]) || HEADING.test(lines[i]) || raw.length === 0) break;
+        if (fenceOpen(lines[i]) || HEADING.test(lines[i]) || raw.length === 0) break;
         // A lazy continuation belongs to the item above it.
         raw[raw.length - 1].text += `\n${lines[i].trim()}`;
         i += 1;
@@ -141,7 +159,7 @@ export function parseMarkdown(source: string): MdBlock[] {
     while (
       i < lines.length &&
       lines[i].trim() !== "" &&
-      !FENCE.test(lines[i]) &&
+      !fenceOpen(lines[i]) &&
       !HEADING.test(lines[i]) &&
       !BULLET.test(lines[i])
     ) {
@@ -202,7 +220,7 @@ export function fenceSpans(text: string): FenceSpan[] {
     const next = eol === -1 ? text.length : eol + 1;
     const line = text.slice(at, eol === -1 ? text.length : eol);
     if (open === null) {
-      const fence = FENCE.exec(line);
+      const fence = fenceOpen(line);
       if (fence) open = { start: at, body: next, marker: fence[1], info: fence[2] };
     } else if (isClosingFence(line, open.marker)) {
       spans.push({ ...open, end: next, close: at });

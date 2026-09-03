@@ -63,6 +63,21 @@ describe("parseMarkdown — blocks", () => {
     expect(one("~~~\n~~\nstill code\n~~~")).toEqual({ type: "code", lang: "", text: "~~\nstill code" });
   });
 
+  it("does not open a backtick fence on a line that carries further backticks", () => {
+    // CommonMark forbids a backtick anywhere in a BACKTICK fence's info string for exactly this
+    // reason: a paragraph that opens with an inline code span is prose, not a block opening.
+    // Without the rule every following block of the post is swallowed into one code block.
+    expect(parseMarkdown("```make lint``` was clean.\n\nSecond paragraph.").map((b) => b.type)).toEqual([
+      "paragraph",
+      "paragraph",
+    ]);
+  });
+
+  it("still opens a tilde fence on a line that carries backticks", () => {
+    // The info-string rule is backtick-only — a tilde fence may carry anything after its marker.
+    expect(one("~~~ `sh`\ncode\n~~~")).toEqual({ type: "code", lang: "", text: "code" });
+  });
+
   it("groups consecutive bullets into one list", () => {
     const block = one("- one\n* two\n+ three");
     expect(block.type).toBe("list");
