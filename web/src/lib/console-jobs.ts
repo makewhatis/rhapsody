@@ -13,8 +13,10 @@
 // and what it costs:
 //   - Status  — the TICKET's lifecycle when the daemon resolved one (STUDIO-702), else the
 //               daemon's own job status. See `consoleJobStatus`.
-//   - Assignee— resolved from the Teams roster's LIVE tickets (`GET /api/v1/teams`), so a
-//               finished run shows "—": no teammate identity is recorded on a stored run row.
+//   - Assignee— the DURABLE assignee the daemon resolves per history row (STUDIO-735), falling
+//               back to the Teams roster's LIVE tickets (`GET /api/v1/teams`) only for a row that
+//               has none — a run that started before its routing record landed. See
+//               `durableAssignees`.
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
 import type { IssueLifecycle, IssueRun, RunSummary, TeamsOverview } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
@@ -130,9 +132,9 @@ export interface ConsoleJobRow {
 }
 
 /**
- * Ticket key → teammate name, from the roster's LIVE tickets. Only a running ticket resolves:
- * a stored run row carries no teammate identity (`store::RunSummary` has none), so history
- * cannot be attributed after the fact.
+ * Ticket key → teammate name, from the roster's LIVE tickets. Only a RUNNING ticket resolves: the
+ * roster lists what each teammate is working on now, so a ticket drops out of it the moment its run
+ * ends. That is exactly why it is the fallback rather than the source — see `durableAssignees`.
  */
 export function ticketAssignees(overview: TeamsOverview | undefined): Map<string, string> {
   const byTicket = new Map<string, string>();
@@ -168,6 +170,25 @@ export function lifecycleByIssue(rows: readonly IssueRun[]): Map<string, TicketL
       lifecycle: r.lifecycle,
       trackerState: r.tracker_state ?? "",
     });
+  }
+  return byIssue;
+}
+
+/**
+ * Ticket key → teammate name, from the issue-level listing's own `assignee` field (STUDIO-735).
+ *
+ * This is the historical record — who the run was dispatched under — so unlike `ticketAssignees` it
+ * still answers once the job has moved to in review or done, which is the whole point. A row
+ * carrying no `assignee` is SKIPPED rather than mapped to "", so an absent key is what makes
+ * `buildConsoleJobs` consult the live roster; a placeholder here would defeat that fallback exactly
+ * as it would for `lifecycleByIssue`. The listing is one row per issue, but the first answer wins if
+ * that ever stops being true.
+ */
+export function durableAssignees(rows: readonly IssueRun[]): Map<string, string> {
+  const byIssue = new Map<string, string>();
+  for (const r of rows) {
+    if (r.issue_identifier === "" || !r.assignee || byIssue.has(r.issue_identifier)) continue;
+    byIssue.set(r.issue_identifier, r.assignee);
   }
   return byIssue;
 }
@@ -231,7 +252,8 @@ export function buildConsoleJobs(
   overview: TeamsOverview | undefined,
   nowMs: number,
 ): ConsoleJobRow[] {
-  const assignees = ticketAssignees(overview);
+  const durable = durableAssignees(issueRows);
+  const live = ticketAssignees(overview);
   const activity = lastActivityByIssue(issueRows);
   const lifecycles = lifecycleByIssue(issueRows);
 
@@ -248,7 +270,10 @@ export function buildConsoleJobs(
       status,
       statusLabel: CONSOLE_STATUS_LABELS[status],
       trackerState: ticket?.trackerState ?? "",
-      assignee: assignees.get(job.issue) ?? "",
+      // The durable record first: it is the only one that survives the run. The live roster is the
+      // fallback for the gap at the other end — a run dispatched moments ago, whose history row the
+      // daemon has not yet decorated.
+      assignee: durable.get(job.issue) ?? live.get(job.issue) ?? "",
       pr: "",
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
