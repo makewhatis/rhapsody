@@ -935,6 +935,12 @@ struct Answerable<'a> {
 /// claim the records do not carry sitting next to the records that do not carry it. §9.6's option A
 /// kept as the floor under §9.7's option B, which is the shape David picked.
 ///
+/// **And the partition between the two halves is the HOST's to write.** The model's half is quoted
+/// line by line by [`quote`](crate::teamsanswer::quote) before it is joined, so prose that mints
+/// the lead itself renders inside the quoted region rather than above the real one. Asking
+/// [`vet_answer`] to refuse prose CONTAINING the lead was the earlier shape and it could only be a
+/// blocklist — the honest phrasing refused, the next spelling admitted.
+///
 /// **A refusal is whole, never edited.** A sentence with an unallowed key scrubbed out of it is
 /// still a sentence the manager did not author, and the words around the hole were composed to
 /// carry it. So a failed vet drops the prose entirely and the grounded line answers alone. Either
@@ -944,9 +950,11 @@ fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
     let grounded = facts.grounded(&target.key);
     // **Nothing to compose from ⇒ nothing to compose.** Two different ways for that to be true, and
     // the gather alone tells only the first: a key this team's records said nothing about has no
-    // second half to stand under the prose, and a block the BUDGET dropped never reached the turn
-    // at all — so whatever it wrote about that key, it wrote from an empty prompt. Either way the
-    // host's own line answers on its own.
+    // second half to stand under the prose, and a key whose records the BUDGET dropped out of the
+    // block never reached the turn at all — so whatever it wrote about THAT key, it wrote from a
+    // prompt carrying nothing about it. Per key on both counts, because the block is dropped per
+    // key: on a multi-key post the other keys' records rendering says nothing about this one.
+    // Either way the host's own line answers on its own.
     if !answerable.offered.contains(&target.key) || !facts.resolved(&target.key) {
         return grounded;
     }
