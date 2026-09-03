@@ -736,6 +736,32 @@ mod tests {
         );
     }
 
+    /// The refund is a ROUND, and the counter is in DISPATCHES, so a config that requires two
+    /// reviewers gets two dispatches back — the same scaling `service_review_pr` applies to the cap
+    /// itself (STUDIO-727). Refunding a flat 1 there would give a two-reviewer config half a round
+    /// and leave the operator's click still deferred by the cap.
+    #[test]
+    fn a_rerun_refunds_a_round_scaled_by_the_required_reviewer_count() {
+        let mut teams = teams_with(true, ReviewMode::Ticketless);
+        teams.review.reviewers = 2;
+        let mut o = orch(teams);
+        watch(&mut o, "bob", REVIEW_STATUS_APPROVED, HEAD_A, HEAD_A);
+        watch(&mut o, "carol", REVIEW_STATUS_APPROVED, HEAD_A, HEAD_A);
+        let budget = REVIEW_ROUNDS_PER_PR_CAP * 2;
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), budget);
+
+        assert_eq!(
+            o.handle_review_rerun(&pr()),
+            ReviewControlOutcome::Applied(2)
+        );
+        assert_eq!(
+            o.review_rounds.get("makewhatis/rhapsody#12"),
+            Some(&(budget - 2)),
+            "one round of a two-reviewer config costs two dispatches, so two come back"
+        );
+    }
+
     /// The refund cannot go negative, and cannot become free budget: a pull request that has spent
     /// less than one round's worth comes back to zero, not below it.
     #[test]
