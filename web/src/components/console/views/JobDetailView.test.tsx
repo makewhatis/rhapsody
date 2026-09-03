@@ -1663,9 +1663,10 @@ describe("the ask dock (§6)", () => {
   // so an operator who asks inside its round trip is asking exactly here.
   it("never reports a question as past the window on a first read that predates it", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
-    // No read may settle before the question lands, so the first one is held open from the mount.
+    // No read may settle before the question lands, so the first one is held open. `mountDetail`
+    // installs its own room default as it renders, so this has to be armed after it and before the
+    // watch tabs mount — which the assertions below then hold it to.
     const reads: Array<(v: unknown) => void> = [];
-    h.fetchTeamsRoom.mockImplementation(() => new Promise((resolve) => reads.push(resolve)));
     mountDetail([run({ id: 547 })]);
     h.fetchTeamsRoom.mockImplementation(() => new Promise((resolve) => reads.push(resolve)));
     await settleTrace();
