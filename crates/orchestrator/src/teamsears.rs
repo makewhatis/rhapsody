@@ -893,6 +893,13 @@ impl Done {
 /// terse record rendering — the option David did not pick, kept as the floor under the one he did
 /// (§9.7). Either way the post gets a line: an answer is never silence.
 fn answer_for(target: &Target, facts: &Facts) -> String {
+    // **Nothing resolved ⇒ nothing to be grounded in.** The vet below bounds which tickets a
+    // sentence may NAME, and a sentence that names none — "the deploy is safe" — offers it nothing
+    // to bind. So the precondition is checked first: a key this team's records said nothing about
+    // gets the host's own line, whatever the turn wrote about it.
+    if !facts.resolved(&target.key) {
+        return facts.grounded(&target.key);
+    }
     let allowed = facts.allowed();
     match vet_answer(&target.answer, &allowed) {
         Ok(prose) => prose,
@@ -1576,31 +1583,65 @@ pub(crate) fn build_room_prompt(
     facts: &Facts,
 ) -> String {
     let mut s = String::with_capacity(1536);
+    // **The `answer` intent is offered only when there is something to answer FROM** — a gather
+    // happened. Advertising it otherwise would spend the manager's one turn on an outcome that can
+    // only degrade to "I have no record of that", which is a worse reply than the deterministic one
+    // it replaced. `answer_for` refuses the same case independently, so this is the courtesy and
+    // that is the guard.
+    let answering = !facts.is_empty();
+    // The header is COMPOSED rather than written out twice, once with the answer intent and once
+    // without. Prompt prose has no compiler: two copies of these rules would drift the first time
+    // somebody edited one of them, and the drift would be invisible until a turn behaved oddly in
+    // production. So the shared text exists once and the three answering-only inserts are the only
+    // difference — which is also what makes "the prompt is unchanged when there is nothing to
+    // answer from" a property a reader can check rather than a claim.
     s.push_str(
         "You are the engineering manager for a software team. A human operator posted a message in \
          the team room. Decide what the team should do about each ticket the post names.\n\n\
          Reply with a single JSON object and nothing else:\n\
          {\"targets\": [{\"ticket\": \"<one of the ticket keys listed below>\", \"intent\": \
-         \"review|assign|relay|ask|answer\", \"assignee\": \"<a roster name, or empty>\", \
-         \"answer\": \"<your answer in plain prose, for `answer` only>\"}]}\n\n\
+         \"review|assign|relay|ask",
+    );
+    if answering {
+        s.push_str("|answer");
+    }
+    s.push_str("\", \"assignee\": \"<a roster name, or empty>\"");
+    if answering {
+        s.push_str(", \"answer\": \"<your answer in plain prose, for `answer` only>\"");
+    }
+    s.push_str(
+        "}]}\n\n\
          The intents, and when each is right:\n\
          - `review` — the operator is asking for someone to review that ticket's pull request.\n\
          - `assign` — the operator is asking who will pick that ticket up.\n\
-         - `relay` — the operator is speaking TO whoever is working that ticket right now.\n\
-         - `answer` — the post ASKS you something about that ticket rather than telling you to do \
-         something with it. Put the answer in `answer`. It writes nothing: nobody is assigned, no \
-         review is filed and no message reaches anyone.\n\
-         - `ask` — you cannot tell, or the post asks for something none of the above covers.\n\n\
+         - `relay` — the operator is speaking TO whoever is working that ticket right now.\n",
+    );
+    if answering {
+        s.push_str(
+            "- `answer` — the post ASKS you something about that ticket rather than \
+             telling you to do something with it. Put the answer in `answer`. It writes nothing: \
+             nobody is assigned, no review is filed and no message reaches anyone.\n",
+        );
+    }
+    s.push_str(
+        "- `ask` — you cannot tell, or the post asks for something none of the above \
+         covers.\n\n\
          Rules you cannot break:\n\
-         - `ticket` MUST be copied exactly from the ticket list below. Never name any other ticket, \
-         and never invent one. A ticket that is not on that list will be discarded.\n\
-         - `assignee` MUST be a roster name copied exactly, or empty. Empty means \"you choose\", \
-         and is the right answer whenever the post does not name somebody.\n\
-         - `answer` MUST report only what the records section below says about that ticket. \
-         Write it the way you would say it out loud, in a sentence or two — but never state a \
-         state, a verdict, an outcome or a name that no record carries, and never fill a gap with \
-         a guess. If the records do not answer the question, say exactly that.\n\
-         - Answer for every ticket on the list, once each.\n\n\
+         - `ticket` MUST be copied exactly from the ticket list below. Never name any other \
+         ticket, and never invent one. A ticket that is not on that list will be discarded.\n\
+         - `assignee` MUST be a roster name copied exactly, or empty. Empty means \"you \
+         choose\", and is the right answer whenever the post does not name somebody.\n",
+    );
+    if answering {
+        s.push_str(
+            "- `answer` MUST report only what the records section below says about that \
+             ticket. Write it the way you would say it out loud, in a sentence or two — but never \
+             state a state, a verdict, an outcome or a name that no record carries, and never fill \
+             a gap with a guess. If the records do not answer the question, say exactly that.\n",
+        );
+    }
+    s.push_str(
+        "- Answer for every ticket on the list, once each.\n\n\
          ## Roster\n\n",
     );
     for i in &teams.roster {
@@ -3985,6 +4026,169 @@ mod tests {
         assert!(
             !p.contains("My own records"),
             "no gather ⇒ no section at all:\n{p}"
+        );
+    }
+
+    /// **A turn may not answer out of thin air.** With no accessor wired there is no gather, so
+    /// there is nothing for a sentence to be grounded IN — and keyless prose would sail through a
+    /// key-based vet and land in the room signed by the manager. The reply falls back to the host's
+    /// own wording instead.
+    #[tokio::test]
+    async fn an_answer_with_no_gather_behind_it_is_never_posted() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What was the result of STUDIO-654?");
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        // Prose that names NO ticket at all, so a key-based vet has nothing to catch.
+        let ears = fx.ears(answering_with("STUDIO-654", "The deploy is safe."));
+
+        // No `knowledge` on the cycle — the daemon-with-no-durable-store shape.
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle(&issues, &owner, &trackers, &st, &f, &load, true),
+        )
+        .await;
+
+        let bodies = fx.reply_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            !bodies[0].contains("deploy is safe"),
+            "ungrounded prose must never reach the room: {bodies:?}"
+        );
+    }
+
+    /// A key the operator named that resolves to NOTHING on this team is still echoed — it is the
+    /// operator's own word, and §9.1 pins one wording that cannot tell "off this team" from "never
+    /// heard of". What must not happen is a claim ABOUT it.
+    #[tokio::test]
+    async fn an_off_team_key_is_answered_with_the_one_no_record_wording() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What was the result of OTHER-42?");
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        // The run EXISTS — on another team's project, which this team's scope must not admit.
+        let id = know
+            .store
+            .start_run(RunStart {
+                issue_id: "id-OTHER-42".to_string(),
+                issue_identifier: "OTHER-42".to_string(),
+                started_at: "2026-09-01T10:00:00Z".to_string(),
+                project_slug: "someone-elses-project".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        know.store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: "failed".to_string(),
+                    ended_at: "2026-09-01T12:00:00Z".to_string(),
+                    ..RunEnd::default()
+                },
+            )
+            .expect("end run");
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        let ears = fx.ears(answering_with("OTHER-42", "OTHER-42 failed."));
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(&issues, &owner, &trackers, &st, &f, &load, true, &k),
+        )
+        .await;
+
+        let bodies = fx.reply_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            !bodies[0].contains("failed"),
+            "another team's outcome must never surface: {bodies:?}"
+        );
+        assert!(
+            bodies[0].contains("no record"),
+            "and the answer is the one pinned wording: {bodies:?}"
+        );
+    }
+
+    /// **The composed header leaks no source indentation.** Splitting the prompt into several
+    /// `push_str` calls put a literal at the START of four of them, and a leading run of spaces
+    /// there is NOT eaten by a `\`-continuation the way an inner one is — so the shipped prompt
+    /// grew nine-space-indented rules that read as a quoted block rather than as instructions.
+    /// Prompt prose has no compiler; this assertion is the compiler.
+    #[test]
+    fn the_room_prompt_ships_no_leaked_source_indentation() {
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = Vec::new();
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let c = cycle(&issues, &owner, &trackers, &st, &f, &load, true);
+        let post = Message::room(
+            OPERATOR_IDENTITY,
+            Utc::now(),
+            "what happened to STUDIO-654?",
+        );
+        let answering = Facts {
+            asked: vec![crate::teamsanswer::Asked {
+                asked: "STUDIO-654".into(),
+                outcome: Some(Default::default()),
+            }],
+            ..Facts::default()
+        };
+
+        for facts in [&answering, &Facts::default()] {
+            let p = build_room_prompt(&t, &c, &post, &["STUDIO-654".to_string()], facts);
+            for line in p.lines() {
+                assert!(
+                    !line.starts_with(' '),
+                    "a prompt line ships leading whitespace: {line:?}\n\nin:\n{p}"
+                );
+            }
+        }
+    }
+
+    /// **Nothing to answer from ⇒ the contract the manager always had.** The one line that names
+    /// every intent a room turn may choose is pinned verbatim, so a daemon with no accessor — and
+    /// `labels`-only, which never reaches this function at all — cannot acquire a fifth outcome by
+    /// accident.
+    #[test]
+    fn a_prompt_with_no_facts_offers_exactly_the_four_action_intents() {
+        let t = teams(&["alice"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = Vec::new();
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let c = cycle(&issues, &owner, &trackers, &st, &f, &load, true);
+        let post = Message::room(OPERATOR_IDENTITY, Utc::now(), "review STUDIO-654");
+
+        let p = build_room_prompt(
+            &t,
+            &c,
+            &post,
+            &["STUDIO-654".to_string()],
+            &Facts::default(),
+        );
+
+        assert!(
+            p.contains(
+                "{\"targets\": [{\"ticket\": \"<one of the ticket keys listed below>\", \
+                 \"intent\": \"review|assign|relay|ask\", \"assignee\": \"<a roster name, or \
+                 empty>\"}]}"
+            ),
+            "the pre-STUDIO-731 output contract, verbatim:\n{p}"
+        );
+        assert!(
+            !p.contains("`answer`"),
+            "an unusable intent must not be offered:\n{p}"
         );
     }
 

@@ -186,10 +186,20 @@ impl Facts {
     pub(crate) fn allowed(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for a in &self.asked {
+            // **Only a key that RESOLVED.** Naming a key is not the same as having a record of it:
+            // an identifier the operator typed that belongs to another team resolves to nothing
+            // here by construction, and prose asserting *"OTHER-42 failed"* about it would be a
+            // claim the team's own records never supported — indistinguishable, to the operator
+            // reading the room, from one they did. A key that resolved nothing is answered by
+            // [`NO_RECORD`] instead, which names no ticket at all, precisely so that "off this
+            // team" and "never heard of" cannot be told apart (§9.1).
+            let Some(o) = &a.outcome else { continue };
+            if o.degradation().is_some() {
+                continue;
+            }
             if !a.asked.is_empty() {
                 out.insert(a.asked.clone());
             }
-            let Some(o) = &a.outcome else { continue };
             if !o.key.is_empty() {
                 out.insert(o.key.clone());
             }
@@ -445,6 +455,28 @@ impl Facts {
             }
         }
         out
+    }
+
+    /// Whether this gather RESOLVED anything for `asked` — the precondition for letting a model
+    /// compose a sentence about it at all.
+    ///
+    /// [`vet_answer`] alone cannot stand in for this. It bounds which tickets prose may NAME, and
+    /// prose naming no ticket ("the deploy is safe") names nothing to bound — so without this check
+    /// a turn on a daemon with no accessor wired, whose gather is empty by construction, could post
+    /// any sentence at all over the manager's name.
+    pub(crate) fn resolved(&self, asked: &str) -> bool {
+        self.asked.iter().any(|a| {
+            a.asked == asked
+                && a.outcome
+                    .as_ref()
+                    .is_some_and(|o| o.degradation().is_none())
+        })
+    }
+
+    /// Whether the gather produced anything at all — `true` for the `labels`-only shape, for a
+    /// daemon with no durable store, and for every caller that wires no accessor.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.asked.is_empty() && self.memory.is_none() && self.room.is_none()
     }
 
     /// The HOST's own grounded rendering of one key's records — the reply when the model was not
