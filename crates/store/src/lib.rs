@@ -259,6 +259,27 @@ pub trait Store {
     /// Reads back one (PR, reviewer) row, or `Ok(None)` when the pair is not watched.
     fn get_review_watch(&self, key: &ReviewWatchKey) -> Result<Option<ReviewWatchRow>, StoreError>;
 
+    /// The same read for a coordinate whose CASE may not match what was written: `owner`, `repo`
+    /// and `reviewer` compare case-INSENSITIVELY, `number` exactly.
+    ///
+    /// It exists because the three key columns are plain `TEXT` with no `NOCASE` collation, so
+    /// [`Store::get_review_watch`] is a byte comparison — correct for the watcher, which only ever
+    /// looks a row up with the spelling it wrote, and wrong for a reader handed a coordinate a
+    /// PERSON typed. GitHub matches an owner and a repository case-insensitively, and a reviewer is
+    /// a roster identity, so `Acme/Rhapsody#12` and `acme/rhapsody#12` are the same pull request to
+    /// everyone except this table; a reader that could not see that would answer "no record" about
+    /// a pull request the team is actively reviewing.
+    ///
+    /// This is a read-only counterpart, deliberately NOT a change to the collation of the columns
+    /// themselves: the writers match on the primary key's binary collation, and making the read and
+    /// the write disagree about what one row is would be worse than the mis-cased read. The row
+    /// comes back with the spelling the STORE holds, which is the spelling every other key derived
+    /// from it must use. If case-variant duplicates of one coordinate exist — possible, because the
+    /// primary key does not collapse them — the (owner, repo, reviewer) order picks one
+    /// deterministically rather than reporting an arbitrary row.
+    fn find_review_watch(&self, key: &ReviewWatchKey)
+    -> Result<Option<ReviewWatchRow>, StoreError>;
+
     /// The whole watch set in a deterministic order (owner, repo, number, reviewer) — the boot
     /// snapshot restart recovery rebuilds from, the sibling of [`Store::load_recovery`].
     ///
