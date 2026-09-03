@@ -452,7 +452,9 @@ function ResultCardZone({
               — and its fallback is phrased as an assertion ("Completed without a written
               hand-off"), which would be a plainly WRONG one for most runs. It waits instead. */}
           {pending ? (
-            <div className="trskel" role="status" aria-label="Reading the transcript…" />
+            <div className="trskel" role="status">
+              <span className="vh">Loading transcript…</span>
+            </div>
           ) : (
             <>
               <h2>{result.headline}</h2>

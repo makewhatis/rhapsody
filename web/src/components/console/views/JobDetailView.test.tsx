@@ -556,7 +556,10 @@ describe("zone B — the Result card (§3B)", () => {
     const rc = document.querySelector(".trrc") as HTMLElement;
     expect(rc.querySelector("h2")).toBeNull();
     expect(rc.textContent).not.toContain("Completed without a written hand-off");
-    expect(rc.querySelector(".trskel")).toBeTruthy();
+    // A live region announces its CONTENT, so the placeholder carries text — an empty box with an
+    // aria-label announces nothing on most screen readers.
+    expect(rc.querySelector(".trskel")?.getAttribute("role")).toBe("status");
+    expect(rc.querySelector(".trskel")?.textContent).toBe("Loading transcript…");
     // Nor a tool count of 0, which would read as "this run called no tools".
     expect(rc.querySelector(".trreceipt")?.textContent).not.toContain("tools0");
     // The eyebrow and the vitals come off the RUN ROW, so they are known already.

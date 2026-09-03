@@ -292,7 +292,13 @@ export function cardLead(card: ResultCard): string {
   // prefix of it: a one-word lead of "A" prefixes "Absolutely everything changed." and shares
   // nothing with it.
   if (!clipped && /[.!?]$/.test(whole) && target.startsWith(`${whole} `)) return "";
-  const re = /(?<=[.!?])\s+/g;
+  // A line BREAK ends a sentence too. The corpus signs off on a bare URL constantly ("Done. Draft
+  // PR: https://…\n") and a URL carries no `.!?` to end on, so a sentence-only walk found no
+  // boundary at all and printed the H1 again underneath itself — 25 of the 446 recorded runs.
+  // Only for an UNCLIPPED headline, where the match is exact equality and the dropped prefix is
+  // therefore the headline and nothing else; under a clipped one a `startsWith` could match
+  // mid-sentence at a soft wrap and take the rest of that sentence with it.
+  const re = clipped ? /(?<=[.!?])\s+/g : /(?<=[.!?])\s+|\n/g;
   for (let n = 0, match = re.exec(lead); match !== null && n < LEAD_SENTENCE_SCAN; n += 1) {
     if (isHeadline(plainLead(lead.slice(0, match.index)))) return lead.slice(match.index).trim();
     match = re.exec(lead);

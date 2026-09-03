@@ -287,6 +287,14 @@ describe("cardLead — the Result card shows a lead only when the H1 does not al
     expect(card("", "Anything")).toBe("");
   });
 
+  // 25 of the 446 recorded runs signed off on a bare URL, which carries no sentence punctuation
+  // for the walk to end on, so the whole lead — headline included — printed under the H1.
+  it("ends the headline's sentence at a line break when it has no punctuation to end on", () => {
+    expect(card("Done. Draft PR: https://example.com/pull/5\n\nThe suite is green.", "Done. Draft PR: https://example.com/pull/5")).toBe(
+      "The suite is green.",
+    );
+  });
+
   // A CLIPPED headline is a prefix of the sentence it came from, so the whole lead trivially
   // starts with it — the answer-first card must still print everything past that sentence.
   // Measured over the 445 recorded runs, treating that prefix as "the H1 already said it" deleted
