@@ -181,7 +181,10 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
       {/* Left standing until the next control finishes: the row it concerns is still on screen, and
           clearing it on the next 5s poll would take the explanation away before it had been read. */}
       {notice ? (
-        <div role={notice.role}>
+        // Keyed by role: an `alert` and a `status` are different live regions, and mutating the
+        // attribute in place leaves assistive tech to decide whether that counts as a new
+        // announcement. A fresh node does not leave it to chance.
+        <div key={notice.role} role={notice.role}>
           <Note variant={notice.tone}>{notice.text}</Note>
         </div>
       ) : null}
