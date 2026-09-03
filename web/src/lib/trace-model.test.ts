@@ -501,13 +501,27 @@ describe("buildResult", () => {
     expect(card.lead).toBe("Wired the watcher.\n\nMore detail here.");
   });
 
+  // The headline names the ENDING, not the run's `error`: STUDIO-742's Result card renders that
+  // string in its own §3B banner for EVERY failed or stopped run — prose or no prose — so a
+  // headline that repeated it printed the same sentence twice in adjacent lines of one card.
   it("falls back to a sensible headline when the run wrote no prose", () => {
     seq = 0;
     const card = buildResult([ev("session started")], run({ outcome: "failed", error: "boom" }));
     expect(card.source).toBe("fallback");
-    expect(card.headline).not.toBe("");
-    expect(card.headline).toContain("boom");
+    expect(card.headline).toBe("The run failed before handing off.");
     expect(card.sections).toEqual([]);
+  });
+
+  it("names every other ending it can fall back to, and never returns an empty headline", () => {
+    seq = 0;
+    const only = [ev("session started")];
+    const headline = (outcome: string) =>
+      buildResult(only, run({ outcome, error: "boom" })).headline;
+    expect(headline("stopped")).toBe("Stopped before handing off.");
+    expect(headline("interrupted")).toBe("Interrupted before handing off.");
+    expect(headline("running")).toBe("Still running — no hand-off yet.");
+    expect(headline("completed")).toBe("Completed without a written hand-off.");
+    expect(headline("")).toBe("No hand-off recorded.");
   });
 
   it("falls back with no run at all", () => {
