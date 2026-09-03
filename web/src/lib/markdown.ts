@@ -269,6 +269,26 @@ const WORD = /[\p{L}\p{N}]/u;
 const LINK = /\[([^\]]*)\]\(([^()\s]*)\)/y;
 
 /**
+ * The plain text of one inline run — this module's own parse, flattened.
+ *
+ * For a caller that needs the prose WITHOUT markup and cannot render nodes: the trace model's
+ * Result-card headline is an H1 and must show no syntax. Going through the parser rather than a
+ * separate stripping pass is what keeps the two agreeing — notably on flanking, so an identifier
+ * like `symphony_run_status` reads the same in the heading as in the body rendered under it.
+ */
+export function inlineText(source: string): string {
+  return flattenInline(parseInline(source));
+}
+
+function flattenInline(nodes: readonly MdInline[]): string {
+  return nodes
+    .map((node) =>
+      node.type === "text" || node.type === "code" ? node.text : flattenInline(node.children),
+    )
+    .join("");
+}
+
+/**
  * Parses one run of inline text.
  *
  * `scanned` is what keeps this linear on a long body: a closer is rejected only for reasons

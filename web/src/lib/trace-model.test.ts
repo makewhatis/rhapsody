@@ -168,6 +168,28 @@ describe("toolPhaseKind", () => {
     expect(toolPhaseKind("Bash", "command=…")).toBe("other");
     expect(toolPhaseKind("Skill", "command=x")).toBe("other");
   });
+
+  // This module's contract is tolerating ARBITRARY agent output. A verb spelled like an
+  // `Object.prototype` member used to reach the runner table through the prototype chain and throw
+  // out of `buildTrace` entirely — a blank run-detail view, not one mis-titled phase.
+  it("does not read a command named after an Object.prototype member off the prototype chain", () => {
+    for (const cmd of [
+      "constructor",
+      "toString",
+      "valueOf",
+      "hasOwnProperty",
+      "__proto__",
+      "isPrototypeOf",
+      "propertyIsEnumerable",
+    ]) {
+      expect(toolPhaseKind("Bash", `command=${cmd} test`), cmd).toBe("other");
+      seq = 0;
+      expect(() =>
+        buildTrace([use("Bash", `command=${cmd} --help description=x`), res("(ok)")]),
+        cmd,
+      ).not.toThrow();
+    }
+  });
 });
 
 describe("buildTrace — phase grouping", () => {
@@ -206,6 +228,23 @@ describe("buildTrace — phase grouping", () => {
     const trace = buildTrace([use("Read", "file_path=a.rs"), res("10 lines")]);
     expect(trace.grouping).toBe("single");
     expect(trace.phases).toHaveLength(1);
+  });
+
+  // The common real shape: `humanize.rs` emits one `session started` and one `turn completed` per
+  // session, so the dividers are present and honoured but fall either side of the work. The label
+  // must say the dividers were used — slice 2 shows it to the operator as an honesty statement.
+  it("reports turn grouping when the dividers were honoured, even if they split nothing", () => {
+    seq = 0;
+    const trace = buildTrace([
+      ev("session started"),
+      use("Read", "file_path=a.rs"),
+      res("10 lines"),
+      use("Edit", "file_path=a.rs"),
+      res("(ok)"),
+      ev("turn completed"),
+    ]);
+    expect(trace.grouping).toBe("turns");
+    expect(trace.phases.map((p) => p.turn)).toEqual([0, 0]);
   });
 
   it("returns no phases for an empty transcript", () => {
@@ -314,6 +353,33 @@ describe("buildTrace — side effects", () => {
       res("(ok)"),
     ]);
     expect(trace.phases[0].effects).toEqual([{ kind: "edited", label: "edited 1 file" }]);
+  });
+
+  // A `Bash` card classified `implemented` NEVER carries a file_path, so treating it as a write
+  // whose path was clipped invents files outright: over the 435 real transcripts in
+  // ~/.rhapsody/logs, 1,759 of the 3,057 phases showing an `edited N files` chip drew part of that
+  // count from a non-edit tool — 2,448 files that were never written. No chip beats a false one.
+  it("never invents an edited file for a shell write", () => {
+    for (const command of [
+      "git push -u origin HEAD",
+      "git checkout -- internal/api/batch_handlers_create_test.go",
+      "cargo test --workspace 2>&1 | tee /tmp/wstest.log",
+      "mkdir -p target/out",
+    ]) {
+      seq = 0;
+      const phase = buildTrace([use("Bash", `command=${command}`), res("(ok)")]).phases[0];
+      expect(phase.effects, command).toEqual([]);
+      expect(phase.subtitle, command).not.toContain("edited");
+    }
+  });
+
+  // The other half of the same rule: a real edit tool whose file_path the humanizer clipped away
+  // still counts, so an unnamed write is never silently lost from the count.
+  it("still counts an edit whose file_path did not survive the humanizer", () => {
+    seq = 0;
+    const phase = buildTrace([use("Edit", "new_string=1 old_string=0"), res("(ok)")]).phases[0];
+    expect(phase.effects).toEqual([{ kind: "edited", label: "edited 1 file" }]);
+    expect(phase.subtitle).toBe("edited 1 file");
   });
 
   it("flags a failing result as an error chip", () => {
@@ -475,6 +541,35 @@ describe("buildResult", () => {
     seq = 0;
     const card = buildResult([say("Wired the watcher end to end.\n- first bullet\n- second")], run());
     expect(card.headline).toBe("Wired the watcher end to end.");
+  });
+
+  // `markdown.ts` renders the card BODY right under this H1 and gets the flanking rules right, so
+  // stripping emphasis with a plainer rule made the same identifier read two ways in one card.
+  it("leaves an intraword underscore alone while still stripping real emphasis", () => {
+    seq = 0;
+    expect(buildResult([say("Fixed `load_live_review_watch` so the sweep sees rows.")], run()).headline).toBe(
+      "Fixed load_live_review_watch so the sweep sees rows.",
+    );
+    seq = 0;
+    expect(buildResult([say("Bounded HINDSIGHT_API_RERANKER_MAX_CANDIDATES at last.")], run()).headline).toBe(
+      "Bounded HINDSIGHT_API_RERANKER_MAX_CANDIDATES at last.",
+    );
+    seq = 0;
+    expect(buildResult([say("Wired _both_ `teams_post` and `teams_retain` end to end.")], run()).headline).toBe(
+      "Wired both teams_post and teams_retain end to end.",
+    );
+  });
+
+  // The corpus writes the stub as its OWN paragraph, so growing within the opening paragraph never
+  // reached a second sentence: 6 of 435 real runs finished under the floor, two of them with an H1
+  // reading literally "Done." over a 2,500-char body.
+  it("grows a stub headline past the floor with the prose that follows it", () => {
+    seq = 0;
+    const card = buildResult(
+      [say("Done.\n\n## What shipped\n\nThe watch set is now steered from the console.")],
+      run(),
+    );
+    expect(card.headline).toBe("Done. The watch set is now steered from the console.");
   });
 
   it("skips a leading heading when looking for the headline", () => {

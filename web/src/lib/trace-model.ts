@@ -1,5 +1,5 @@
 import type { LogEntry, RunSummary } from "@/lib/api";
-import { fenceSpans } from "@/lib/markdown";
+import { fenceSpans, inlineText } from "@/lib/markdown";
 
 // trace-model — the pure model behind the console's "Trace" run detail (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §4; slice 1 of its §9 plan). It turns the flat
@@ -84,9 +84,14 @@ export interface TracePhase {
 
 /**
  * What actually drove the split, so the view can be honest about it:
- * `turns` — real `event` dividers; `clusters` — no usable dividers, grouped by tool cluster;
- * `single` — too little to group. Never "flat": even `single` is one phase, which is the
- * design record's floor of "never worse than today's flat list".
+ * `turns` — the stream carried `event` dividers and they were used as phase boundaries;
+ * `clusters` — no dividers at all, so the phases came from tool clustering alone;
+ * `single` — too little to group, whatever the markers said. Never "flat": even `single` is one
+ * phase, which is the design record's floor of "never worse than today's flat list".
+ *
+ * `turns` says the dividers were HONOURED, not that they split the run into several turns — the
+ * common real shape is one `session started` and one `turn completed` either side of the work,
+ * which is a divider that was read and used and happened to have nothing to separate.
  */
 export type TraceGrouping = "turns" | "clusters" | "single";
 
@@ -238,16 +243,21 @@ const READ_COMMANDS = new Set([
   "ps",
 ]);
 // Test/build runners → Verified, keyed on the SUBCOMMAND where the tool has one.
-const RUNNER_SUBCOMMANDS: Record<string, Set<string>> = {
-  cargo: new Set(["test", "build", "clippy", "fmt", "check", "bench", "nextest"]),
-  go: new Set(["test", "build", "vet"]),
-  npm: new Set(["test", "run"]),
-  pnpm: new Set(["test", "run", "build", "lint"]),
-  yarn: new Set(["test", "run", "build", "lint"]),
-  npx: new Set(["vitest", "jest", "tsc", "eslint", "playwright", "prettier"]),
-  bun: new Set(["test", "run"]),
-  deno: new Set(["test", "lint", "check"]),
-};
+//
+// A `Map`, not an object literal: the key here is an arbitrary command name parsed out of agent
+// output, and an object lookup answers `constructor`, `toString`, `__proto__` and the rest of
+// `Object.prototype` with something that is not a `Set` — which threw out of `buildTrace` and took
+// the whole run-detail view down rather than mis-titling one phase.
+const RUNNER_SUBCOMMANDS = new Map<string, Set<string>>([
+  ["cargo", new Set(["test", "build", "clippy", "fmt", "check", "bench", "nextest"])],
+  ["go", new Set(["test", "build", "vet"])],
+  ["npm", new Set(["test", "run"])],
+  ["pnpm", new Set(["test", "run", "build", "lint"])],
+  ["yarn", new Set(["test", "run", "build", "lint"])],
+  ["npx", new Set(["vitest", "jest", "tsc", "eslint", "playwright", "prettier"])],
+  ["bun", new Set(["test", "run"])],
+  ["deno", new Set(["test", "lint", "check"])],
+]);
 // Runners with no subcommand worth inspecting — the whole invocation is a check.
 const RUNNER_COMMANDS = new Set([
   "make",
@@ -397,7 +407,7 @@ function segmentKind(segment: string): PhaseKind | null {
   if (cmd === "gh") return GH_COORDINATE.has(flagless[1] ?? "") ? "coordinated" : "oriented";
   if (WRITE_COMMANDS.has(cmd)) return "implemented";
   if (RUNNER_COMMANDS.has(cmd)) return "verified";
-  const subs = RUNNER_SUBCOMMANDS[cmd];
+  const subs = RUNNER_SUBCOMMANDS.get(cmd);
   if (subs !== undefined) return subs.has(sub) ? "verified" : "oriented";
   if (READ_COMMANDS.has(cmd)) return "oriented";
   if (INFRA_TOOLS.has(cmd)) {
@@ -676,9 +686,8 @@ export function buildTrace(entries: readonly LogEntry[]): TraceModel {
   }
   close();
 
-  const turns = new Set(phases.map((phase) => phase.turn));
   const grouping: TraceGrouping =
-    turns.size > 1 ? "turns" : phases.length > 1 ? "clusters" : "single";
+    phases.length < 2 ? "single" : events.length > 0 ? "turns" : "clusters";
   return { phases, grouping, events };
 }
 
@@ -707,7 +716,12 @@ function finishPhase(open: OpenPhase): TracePhase {
  * The distinct files a phase's edit calls touched.
  *
  * A write whose `file_path` did not survive the humanizer's clipping still counts as one edit, so
- * an unnamed write is never silently lost from the count.
+ * an unnamed write is never silently lost from the count — but ONLY for a real edit tool. A `Bash`
+ * card classified `implemented` never carries a path (`git push`, `mkdir`, `tee test.log`), so
+ * counting it the same way does not recover a clipped name, it invents a file: over the 435 real
+ * transcripts in `~/.rhapsody/logs` that fabricated 2,448 files across 1,759 of the 3,057 phases
+ * showing this chip. A shell write is left out of the count entirely — the phase title still says
+ * Implemented, which is the acknowledged §5 cost of a fuzzy label, but the number stays true.
  */
 function editedFiles(did: readonly DidCard[]): string[] {
   const files = new Set<string>();
@@ -716,7 +730,7 @@ function editedFiles(did: readonly DidCard[]): string[] {
     if (card.kind !== "implemented") continue;
     const path = card.args.file_path ?? card.args.path ?? "";
     if (path !== "") files.add(path);
-    else unnamed += 1;
+    else if (EDIT_TOOLS.has(baseToolName(card.tool))) unnamed += 1;
   }
   return [...files, ...Array.from({ length: unnamed }, (_, i) => `#${i}`)];
 }
@@ -767,6 +781,9 @@ function phaseSubtitle(open: OpenPhase): string {
     }
     case "implemented": {
       const edited = editedFiles(did).length;
+      // Zero means the phase's writes were all shell commands, which name no file — show what ran
+      // instead of an "edited 0 files" that reads as a claim about the work.
+      if (edited === 0) return did[0].target;
       return `edited ${edited} ${plural(edited, "file")}`;
     }
     case "verified":
@@ -931,22 +948,38 @@ const MAX_HEADLINE = 160;
  * would throw that sentence away and fall through to the synthesized fallback.
  */
 function extractHeadline(source: string): string {
-  const collected: string[] = [];
+  // The opening paragraph, and the one after it. A paragraph ends at the first blank line, heading
+  // or list item — a bullet is a new thought, and running it onto the sentence makes an H1 out of
+  // two unrelated clauses. Blanks, headings, quotes and a fenced block's blanked remains are
+  // skipped between paragraphs, never joined into one.
+  const paragraphs: string[][] = [];
+  let current: string[] = [];
   for (const raw of maskFences(source).split("\n")) {
     const line = raw.trim();
-    const structural = /^#{1,6}\s/.test(line) || /^([-*+>]|\d+[.)])\s/.test(line);
-    if (collected.length === 0) {
-      // Skip blanks, headings, list items, quotes and a fenced block's blanked remains.
-      if (line !== "" && !structural) collected.push(line);
+    if (line === "" || /^#{1,6}\s/.test(line) || /^([-*+>]|\d+[.)])\s/.test(line)) {
+      if (current.length > 0) {
+        paragraphs.push(current);
+        current = [];
+        if (paragraphs.length === 2) break;
+      }
       continue;
     }
-    // The opening paragraph ends at the first blank line, heading or list item — a bullet is a
-    // new thought, and running it onto the sentence makes an H1 out of two unrelated clauses.
-    if (line === "" || structural) break;
-    collected.push(line);
+    current.push(line);
   }
-  const text = stripInlineMarkdown(collected.join(" "));
-  return text === "" ? "" : clip(growSentence(text), MAX_HEADLINE);
+  if (current.length > 0 && paragraphs.length < 2) paragraphs.push(current);
+
+  const text = paragraphs.length === 0 ? "" : stripInlineMarkdown(paragraphs[0].join(" "));
+  if (text === "") return "";
+  let headline = growSentence(text);
+  // `growSentence` can only reach a second sentence WITHIN the opening paragraph, and the corpus
+  // writes the stub as its own paragraph ("Done." on its own line, then a heading), so the floor
+  // was silently unmet for 6 of 435 real runs — two of them an H1 reading literally "Done." over a
+  // 2,500-char body. Still under it, the next paragraph's opening sentence comes along.
+  if (headline.length < MIN_HEADLINE && paragraphs.length > 1) {
+    const next = growSentence(stripInlineMarkdown(paragraphs[1].join(" ")));
+    if (next !== "") headline = `${headline} ${next}`;
+  }
+  return clip(headline, MAX_HEADLINE);
 }
 
 /**
@@ -963,14 +996,17 @@ function growSentence(text: string): string {
   return out.trim();
 }
 
-/** Removes the inline markdown a heading must not show: emphasis, code ticks, link syntax. */
+/**
+ * Removes the inline markdown a heading must not show: emphasis, code ticks, link syntax.
+ *
+ * Delegated to the STUDIO-739 renderer's own inline parse, which renders the card BODY directly
+ * under this H1 — a second, plainer stripping pass here made the same identifier read two ways in
+ * one card, because it took an underscore inside a word for emphasis
+ * (`load_live_review_watch` -> `loadlivereview_watch`, and backticks did not protect it). An image
+ * is spelled as its link first: a heading cannot show the image, but its alt text is prose.
+ */
 function stripInlineMarkdown(text: string): string {
-  return text
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1") // [label](href) -> label
-    .replace(/(\*\*\*|___)(.+?)\1/g, "$2")
-    .replace(/(\*\*|__)(.+?)\1/g, "$2")
-    .replace(/(\*|_)(.+?)\1/g, "$2")
-    .replace(/`+([^`]*)`+/g, "$1")
+  return inlineText(text.replace(/!\[/g, "["))
     .replace(/\s+/g, " ")
     .trim();
 }
