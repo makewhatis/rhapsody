@@ -403,6 +403,31 @@ describe("the Needs you count (§6)", () => {
     expect(stat("blocked")).toBe("2");
   });
 
+  // The OTHER side of the same distinction, and the one a careless `||` would silently break: a
+  // real, earned zero. The tracker answered and every ticket it named is finished, so nothing is
+  // waiting on the operator — and saying "0" there is a fact the strip should report, not a shrug.
+  it("says 0, not —, when the tracker answered and nothing is waiting", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ issue_identifier: "ONE", outcome: "completed", lifecycle: "done" }),
+        run({ issue_identifier: "TWO", outcome: "completed", lifecycle: "done" }),
+      ],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+
+    await waitFor(() => expect(stat("needs you")).toBe("0"));
+    expect(stat("in review")).toBe("0");
+  });
+
   // THE OUTAGE SHAPE, END TO END. `issue_lifecycles` answers per request off a TTL cache and the
   // tracker, so a cold cache or a failed Linear round-trip serves exactly this: the runs, none of
   // them decorated. Every `completed` outcome is then inferred into "in review", inflating that
