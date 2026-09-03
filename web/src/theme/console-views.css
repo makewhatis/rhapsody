@@ -80,6 +80,11 @@
 .rh-console .tline .tic { width: 13px; height: 13px; color: var(--ink-4); flex: none; position: relative; top: 2px; }
 .rh-console .tline.done { color: var(--ok); }
 .rh-console .tline.done .tic { color: var(--ok); }
+/* STUDIO-739 — an entry's body is rendered markdown, so the row gives it a column that may
+   shrink (`min-width: 0`); without it a wide code block would stretch the flex row instead of
+   scrolling inside its own box. The folded tool result keeps its quieter, indented treatment. */
+.rh-console .tline .tbody { min-width: 0; flex: 1; }
+.rh-console .tline .tres { margin-top: 3px; padding-left: 9px; border-left: 2px solid var(--line-soft); color: var(--ink-4); }
 .rh-console .tline .tt2 { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); margin-left: auto; flex: none; }
 .rh-console .tline code { font-size: 11px; }
 

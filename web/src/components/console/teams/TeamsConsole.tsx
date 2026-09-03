@@ -5,6 +5,7 @@ import {
   Chip,
   Grid,
   GridSide,
+  Markdown,
   Mate,
   NowMates,
   NowStats,
@@ -315,9 +316,10 @@ function MemoryPreview({ identity, onOpenMemory }: { identity: string; onOpenMem
                 {fact.run_id === "" ? null : <TicketChip variant="sha">run {fact.run_id}</TicketChip>}
                 <Timestamp>{formatDateTime(fact.at)}</Timestamp>
               </div>
-              {/* Untrusted content, same as a room post (design §0.11.5) — quoted, never asserted. */}
+              {/* Untrusted content, same as a room post (design §0.11.5) — quoted, never
+                  asserted, and rendered as markdown-shaped data (STUDIO-739). */}
               <blockquote>
-                <p>{fact.content}</p>
+                <Markdown source={fact.content} />
               </blockquote>
             </div>
           ))

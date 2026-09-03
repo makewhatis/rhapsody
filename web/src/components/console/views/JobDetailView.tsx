@@ -4,6 +4,7 @@ import {
   Card,
   Grid,
   GridSide,
+  Markdown,
   Mono,
   Pill,
   TeammateAvatar,
@@ -204,15 +205,21 @@ function RunExpansion({ run, identity }: { run: RunSummary; identity: string }) 
         <span>{meta.tokens}</span>
       </div>
       <div className="trace">
+        {/*
+          An entry's body is the agent's own prose — a hand-off, a self-review — and agents
+          write markdown, so it is rendered as markdown rather than printed verbatim
+          (STUDIO-739). `Markdown` emits elements, never HTML, so the text stays data.
+        */}
         {timeline.map((line) => (
           <div key={line.seq} className={line.kind === "done" ? "tline done" : "tline"}>
             <TimelineGlyph kind={line.kind} />
-            <span>
-              {line.tool === "" ? null : <code>{line.tool}</code>}
-              {line.tool === "" ? "" : " "}
-              {line.text}
-              {line.result === "" ? "" : ` — ${line.result}`}
-            </span>
+            <div className="tbody">
+              <Markdown
+                source={line.text}
+                lead={line.tool === "" ? undefined : <code>{line.tool}</code>}
+              />
+              {line.result === "" ? null : <Markdown className="tres" source={line.result} />}
+            </div>
           </div>
         ))}
         {timeline.length === 0 ? (
@@ -311,7 +318,7 @@ function RoomSliceCard({ issue, roster }: { issue: string; roster: readonly stri
               </span>
               <Timestamp>{clockTime(post.at)}</Timestamp>
             </div>
-            <p>{post.body}</p>
+            <Markdown source={post.body} />
           </div>
         ))}
         {posts.length === 0 ? (
@@ -371,7 +378,7 @@ function TicketMemoryCard({
               <TicketChip variant="sha">{fact.run_id === "" ? fact.id : `run ${fact.run_id}`}</TicketChip>
               <Timestamp>{fact.identity}</Timestamp>
             </div>
-            <p>{fact.content}</p>
+            <Markdown source={fact.content} />
           </div>
         ))}
         {facts.data.length === 0 ? (

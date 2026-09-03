@@ -6,6 +6,7 @@ export { NavItem, type NavItemProps } from "./NavItem";
 export { Button, type ButtonProps, type ButtonVariant } from "./Button";
 export { Card, type CardProps } from "./Card";
 export { Chip, type ChipProps } from "./Chip";
+export { Markdown, type MarkdownProps } from "./Markdown";
 export { Note, type NoteProps, type NoteVariant } from "./Note";
 export { PILL_COLORS, Pill, type PillProps, type PillVariant } from "./Pill";
 export { Seg, type SegOption, type SegProps } from "./Seg";

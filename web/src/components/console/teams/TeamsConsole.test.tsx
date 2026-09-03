@@ -231,6 +231,47 @@ describe("3.2 — events render typed by kind with the right rail, icon and labe
     expect(body.closest(".event")?.querySelector(".from")?.textContent).toBe("operator");
   });
 
+  // STUDIO-739 — a post is agent prose. It renders as markdown, and still only as data: an
+  // agent's `<script>` reaches the DOM as text, not as an element.
+  it("renders a post's markdown, and an injected tag as text", async () => {
+    renderConsole(
+      {},
+      {
+        room: {
+          messages: [
+            m({
+              id: `${day(0)}:md`,
+              from: "alice",
+              at: at(0, 3),
+              body: "Someone want to review the export PR?\n\n## Done\n\n- ran `make lint`\n- **all** green\n\n<script>window.__pwned = 1;</script>",
+            }),
+          ],
+          skipped: [],
+        },
+      },
+    );
+    await ready();
+    const body = document.querySelector(".event blockquote.body") as HTMLElement;
+    expect(body.querySelector("h4")?.textContent).toBe("Done");
+    expect(within(body).getByText("make lint").tagName).toBe("CODE");
+    expect(within(body).getByText("all").tagName).toBe("STRONG");
+    expect(body.querySelector("script")).toBeNull();
+    expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined();
+    expect(body.textContent).toContain("<script>");
+  });
+
+  it("renders a previewed fact's markdown body", async () => {
+    renderConsole();
+    h.fetchTeamsRecall.mockResolvedValue({
+      identity: "alice",
+      facts: [fact({ id: "md-1", at: at(0, 1), content: "Grep **DeepSeek** after any rebase." })],
+      skipped: [],
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".mcard strong")?.textContent).toBe("DeepSeek"),
+    );
+  });
+
   it("paints a rail per kind from the tokens, in the stylesheet", () => {
     const css = readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../theme/teams-console.css"),

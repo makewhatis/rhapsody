@@ -1,4 +1,4 @@
-import { TicketChip, Timestamp } from "@/components/console";
+import { Markdown, TicketChip, Timestamp } from "@/components/console";
 import { KindIcon } from "@/components/console/teams/icons";
 import { parseAssignment, truncateBody, type DaySection, type RoomEvent, type RoomGroup } from "@/lib/room-model";
 
@@ -76,13 +76,17 @@ function Event({ event }: { event: RoomEvent }) {
       {/*
         A room post is untrusted content that also reaches every teammate's prompt (design §0.11.5),
         so it renders as QUOTED, attributed data — never as text that could read as the app talking.
+        Teammates write that data in markdown, so `Markdown` renders it as elements (STUDIO-739);
+        it emits no HTML, which is what keeps "as data" true of a post that contains markup.
       */}
       <blockquote className="body">
-        {head}
+        <Markdown source={head} />
         {rest === "" ? null : (
           <details className="more">
             <summary>show full note</summary>
-            <div className="full">{rest}</div>
+            <div className="full">
+              <Markdown source={rest} />
+            </div>
           </details>
         )}
       </blockquote>

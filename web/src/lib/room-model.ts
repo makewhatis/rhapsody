@@ -1,4 +1,5 @@
 import type { TeamsRoomMessage } from "@/lib/api";
+import { fenceSpans, isClosingFence } from "@/lib/markdown";
 
 // room-model — the pure logic behind the Teams console's room (STUDIO-681 §5, built by
 // STUDIO-684): what kind of event a post is, which teammates it concerns, how a day of them
@@ -366,8 +367,56 @@ export function truncateBody(body: string, at: number = BODY_TRUNCATE_AT): { hea
   if (text.length <= at) return { head: text, rest: "" };
   // Break on the last space before the limit so the visible half never ends mid-word.
   const space = text.lastIndexOf(" ", at);
-  const cut = space > at / 2 ? space : at;
+  return fenceSafeSplit(text, space > at / 2 ? space : at);
+}
+
+/** The plain split: everything before the cut is shown, everything after it expands. */
+function plainSplit(text: string, cut: number): { head: string; rest: string } {
   return { head: text.slice(0, cut), rest: text.slice(cut).trim() };
+}
+
+/**
+ * The split, made safe for a cut that lands inside a fenced code block (STUDIO-739).
+ *
+ * Both halves are rendered as markdown INDEPENDENTLY, so a raw cut inside a fence leaves the tail
+ * starting on the closing fence — which opens a new unterminated block, turning every remaining
+ * word of the post into monospace code. A post that leads with its verification output produces
+ * exactly that.
+ *
+ * The repair CLOSES the block on the head and REOPENS it on the tail rather than moving the cut,
+ * because moving it to a block boundary is unbounded in both directions: forwards it drags a whole
+ * 5KB block into the collapsed feed (and, for an unterminated one, leaves no tail to expand at
+ * all), backwards it throws the preview away. Keeping the cut where it is holds the head to the
+ * budget plus the one fence line this adds, and keeps code rendering as code on both sides. Only a
+ * cut inside a fence LINE has to move — half a fence is not a fence — and both of those moves are
+ * bounded by that line.
+ */
+function fenceSafeSplit(text: string, cut: number): { head: string; rest: string } {
+  const fence = fenceSpans(text).find((f) => cut > f.start && cut < f.end);
+  if (!fence) return plainSplit(text, cut);
+  // Inside the OPENING fence line: no part of the block can be kept, so cut just before it. When
+  // the block OPENS the post that leaves no head at all — but no cut can do better there, because
+  // a head ending mid-fence-line is a truncated unterminated fence, which renders as an EMPTY code
+  // box and leaves the tail starting mid-info-string: the content lines then lazily continue as a
+  // paragraph and the CLOSING fence reopens as a block that swallows the trailing prose. Blank
+  // either way, so protect the tail.
+  if (cut < fence.body) return plainSplit(text, fence.start);
+  // Inside the CLOSING one: every content line is already in the head, so take the fence too.
+  if (cut >= fence.close) return plainSplit(text, fence.end);
+  // A cut inside a line can also MANUFACTURE a closing fence: split `cat ```' at its space and
+  // the tail opens on " ```", which closes the reopened block at once and spills the rest of the
+  // code out as prose. Backing up until the tail no longer reads as one fixes that, and backing
+  // up a CHARACTER at a time bounds the cost by the marker run rather than by the line: a single
+  // long code line whose tail is a marker run would otherwise cost the whole preview budget.
+  const eol = text.indexOf("\n", cut) === -1 ? text.length : text.indexOf("\n", cut);
+  const lineStart = text.lastIndexOf("\n", cut) + 1;
+  let at = cut;
+  while (at > lineStart && isClosingFence(text.slice(at, eol), fence.marker)) at -= 1;
+  const head = text.slice(0, at);
+  return {
+    head: `${head}${head.endsWith("\n") ? "" : "\n"}${fence.marker}`,
+    rest: `${fence.marker}${fence.info}\n${text.slice(at)}`.trimEnd(),
+  };
 }
 
 // --- the day pager ---

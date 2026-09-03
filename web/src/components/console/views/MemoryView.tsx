@@ -1,5 +1,6 @@
 import * as React from "react";
 import {
+  Markdown,
   NowStats,
   Note,
   Seg,
@@ -344,8 +345,14 @@ function FactCard({
         </span>
       </div>
 
-      {/* Untrusted content, same as a room post: rendered as text, never as markup. */}
-      <div className="body">{fact.content}</div>
+      {/*
+        Untrusted content, same as a room post: rendered as DATA, never as markup. It is also
+        agent prose, so `Markdown` gives it its headings, lists and code (STUDIO-739) — as
+        elements, which is why no markup an agent wrote can escape into the page.
+      */}
+      <div className="body">
+        <Markdown source={fact.content} />
+      </div>
 
       <div className="foot">
         <span className="prov">

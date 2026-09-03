@@ -219,6 +219,66 @@ describe("the runs list (§4)", () => {
     expect(h.fetchRunTranscript).toHaveBeenCalledWith(522);
   });
 
+  // STUDIO-739 — the transcript is where an operator reads an agent's prose, and agents write
+  // markdown. It renders as markdown, and an injection attempt in it renders as text.
+  it("renders a transcript entry's markdown instead of its raw syntax", async () => {
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 547,
+      generated_at: "",
+      entries: [
+        {
+          seq: 1,
+          kind: "text",
+          tool: "",
+          text: "## Verification\n\nRan **make lint** and:\n\n```sh\ncargo test --workspace\n```\n\n- clean\n- green",
+        },
+        { seq: 2, kind: "tool_use", tool: "Bash", text: "ran `make test`" },
+        { seq: 3, kind: "tool_result", tool: "", text: "**38** passed" },
+      ],
+    });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(document.querySelector(".trace h4")).toBeTruthy());
+    const trace = document.querySelector(".trace") as HTMLElement;
+    // `##` renders as an h4: a body sits inside a card whose own title is an h2.
+    expect(trace.querySelector("h4.mdh2")?.textContent).toBe("Verification");
+    expect(trace.querySelector("strong")?.textContent).toBe("make lint");
+    expect(trace.querySelector("pre.mdpre")?.textContent).toBe("cargo test --workspace");
+    expect([...trace.querySelectorAll("li")].map((li) => li.textContent)).toEqual([
+      "clean",
+      "green",
+    ]);
+    expect(trace.textContent).not.toContain("**");
+
+    // The tool chip still reads as one line with the call it labels, and the folded result
+    // renders as markdown of its own.
+    const call = [...trace.querySelectorAll("p")].find((p) => p.textContent?.includes("ran"));
+    expect(call?.querySelector("code")?.textContent).toBe("Bash");
+    expect(trace.querySelector(".tres strong")?.textContent).toBe("38");
+  });
+
+  it("renders an injection attempt in a transcript entry as text", async () => {
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 547,
+      generated_at: "",
+      entries: [
+        {
+          seq: 1,
+          kind: "text",
+          tool: "",
+          text: '<script>window.__pwned = 1;</script><img src=x onerror="window.__pwned = 1">',
+        },
+      ],
+    });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(document.querySelector(".trace p")).toBeTruthy());
+    expect(document.querySelector(".trace script")).toBeNull();
+    expect(document.querySelector(".trace img")).toBeNull();
+    expect((window as unknown as Record<string, unknown>).__pwned).toBeUndefined();
+    expect(document.querySelector(".trace")?.textContent).toContain("<script>");
+  });
+
   it("says so when a run recorded no transcript", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     mountDetail([run({ id: 547 })]);
@@ -279,6 +339,35 @@ describe("the pull-request card (§4)", () => {
 });
 
 describe("the side column's teams cards (§4)", () => {
+  // STUDIO-739 — the room slice and the ticket's memory carry the same agent prose the room and
+  // the memory page do, so they render it the same way.
+  it("renders the markdown in a room post and in a retained fact", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    mountDetail([run({ id: 1 })]);
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: [
+        { id: "f:1", from: "alice", to: "*", at: "2026-09-01T16:37:00Z", body: "STUDIO-654 is **up for review**.", refs: ["STUDIO-654"] },
+      ],
+      skipped: [],
+    });
+    h.fetchTeamsRecall.mockResolvedValue({
+      identity: "alice",
+      facts: [
+        { id: "1", identity: "alice", document_id: "", ticket: "STUDIO-654", commit_sha: "", pr: "", run_id: "547", at: "", state: "valid", reason: "", content: "Run `make fixtures` first." },
+      ],
+      skipped: [],
+    });
+
+    await waitFor(() => expect(document.querySelector(".mcard strong")).toBeTruthy());
+    expect(document.querySelector(".mcard strong")?.textContent).toBe("up for review");
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".mcard code")].map((c) => c.textContent)).toContain(
+        "make fixtures",
+      ),
+    );
+  });
+
+
   it("shows the room posts and memory facts that reference this ticket", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
     mountDetail([run({ id: 1 })]);

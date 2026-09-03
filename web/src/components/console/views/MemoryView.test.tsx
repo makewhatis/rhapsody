@@ -308,6 +308,32 @@ describe("Memory page", () => {
     expect(c.textContent).toContain("The config.go rebase hazard matters more than the fix.");
   });
 
+  // STUDIO-739 — a retained fact is agent prose, so its body renders as markdown.
+  it("4.4 — renders a fact's markdown body, and an injected tag as text", async () => {
+    seed();
+    h.fetchTeamsRecall.mockImplementation(async (identity: string) => ({
+      identity,
+      facts:
+        identity === "alice"
+          ? [
+              fact({
+                id: "a1",
+                identity: "alice",
+                content: "**Never** rebase onto `main`\n\n- it drops the worktree\n\n<script>window.__pwned = 1;</script>",
+              }),
+            ]
+          : [],
+      skipped: [],
+    }));
+    mount();
+    const c = await card("Never");
+    expect(within(c).getByText("Never").tagName).toBe("STRONG");
+    expect(within(c).getByText("main").tagName).toBe("CODE");
+    expect(c.querySelector("li")?.textContent).toBe("it drops the worktree");
+    expect(c.querySelector("script")).toBeNull();
+    expect(c.textContent).toContain("<script>");
+  });
+
   it("4.4 — View run routes to that fact's ticket", async () => {
     seed();
     const onNavigate = vi.fn();
