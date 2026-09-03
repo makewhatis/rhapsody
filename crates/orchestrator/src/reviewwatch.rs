@@ -267,7 +267,11 @@ pub(crate) fn review_round_due(row: &ReviewWatchRow, head: &str, in_flight_now: 
 
 /// The per-PR churn key: `owner/repo#number`, case-folded so two spellings of one repository cannot
 /// each get their own budget.
-fn churn_key(pr: &PrCoord) -> String {
+///
+/// `pub(crate)` for [`crate::reviewconsole`]: the operator's re-run and dismiss both retire a pull
+/// request's budget, and a second spelling of this key would give them a different one from the
+/// watcher's.
+pub(crate) fn churn_key(pr: &PrCoord) -> String {
     format!("{}/{}#{}", pr.owner, pr.repo, pr.number).to_ascii_lowercase()
 }
 

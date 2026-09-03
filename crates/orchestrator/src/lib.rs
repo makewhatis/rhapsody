@@ -61,6 +61,7 @@ pub mod recovery;
 pub mod reload;
 pub mod retry;
 pub mod review;
+pub mod reviewconsole;
 pub mod reviewintro;
 pub mod reviewwatch;
 pub mod select;
