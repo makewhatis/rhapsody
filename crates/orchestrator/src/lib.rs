@@ -63,6 +63,7 @@ pub mod retry;
 pub mod review;
 pub mod reviewconsole;
 pub mod reviewintro;
+pub mod reviewnotify;
 pub mod reviewwatch;
 pub mod select;
 pub mod snapshot;
