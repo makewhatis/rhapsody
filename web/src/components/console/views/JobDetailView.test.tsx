@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { LogEntry, RunSummary, StateResponse } from "@/lib/api";
+import type { LogEntry, RunDetail, RunSummary, StateResponse } from "@/lib/api";
 import type { PullRequestView } from "@/lib/console-job-detail";
 
 // STUDIO-742 — the "Trace" run detail's three zones (design record
@@ -15,7 +15,9 @@ import type { PullRequestView } from "@/lib/console-job-detail";
 
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
+  fetchRunDetail: vi.fn(),
   fetchRunTranscript: vi.fn(),
+  sendRunMessage: vi.fn(),
   fetchState: vi.fn(),
   fetchTeamsOverview: vi.fn(),
   fetchTeamsRoom: vi.fn(),
@@ -30,7 +32,9 @@ vi.mock("@/lib/api", async (orig) => {
   return {
     ...actual,
     fetchIssueHistory: h.fetchIssueHistory,
+    fetchRunDetail: h.fetchRunDetail,
     fetchRunTranscript: h.fetchRunTranscript,
+    sendRunMessage: h.sendRunMessage,
     fetchState: h.fetchState,
     fetchTeamsOverview: h.fetchTeamsOverview,
     fetchTeamsRoom: h.fetchTeamsRoom,
@@ -135,8 +139,52 @@ const COMPLETED: LogEntry[] = [
   entry({ seq: 12, kind: "event", text: "turn completed" }),
 ];
 
+/**
+ * The `GET /api/v1/runs/{id}` payload for a run row — the 2s poll the live header reads its
+ * telemetry from (STUDIO-744). Derived from the row so the default poll agrees with the history
+ * it decorates; a test about the poll DISAGREEING with the row overrides it.
+ */
+function detailOf(row: RunSummary, over: Partial<RunDetail> = {}): RunDetail {
+  return {
+    run_id: row.id,
+    issue_id: row.issue_id,
+    issue_identifier: row.issue_identifier,
+    title: row.title,
+    project: row.project_slug,
+    repo: row.repo,
+    attempt: row.attempt,
+    outcome: row.outcome,
+    live: row.outcome === "running",
+    issue_state: "",
+    last_codex_event: "",
+    turn_count: row.turns,
+    input_tokens: row.input_tokens,
+    output_tokens: row.output_tokens,
+    total_tokens: row.total_tokens,
+    usage_estimated: row.usage_estimated,
+    started_at: row.started_at,
+    ended_at: row.ended_at,
+    last_event_at: "",
+    error: row.error,
+    recent_events: [],
+    generated_at: "",
+    ...over,
+  };
+}
+
+/** The client the last mount rendered under — how a test simulates a poll tick landing. */
+let client: QueryClient;
+
 function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
   h.fetchIssueHistory.mockResolvedValue({ issue_identifier: "STUDIO-654", runs });
+  // A test that cares what the poll says configures it BEFORE mounting; this is only the default.
+  if (h.fetchRunDetail.getMockImplementation() === undefined) {
+    h.fetchRunDetail.mockImplementation(async (id: number) => {
+      const row = runs.find((r) => r.id === id);
+      if (row === undefined) throw new Error(`no run with id: ${id}`);
+      return detailOf(row);
+    });
+  }
   h.fetchState.mockResolvedValue(EMPTY_STATE);
   h.fetchTeamsOverview.mockResolvedValue({
     enabled: true,
@@ -158,6 +206,7 @@ function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
     workspace_url_key: "studio49",
   });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client = qc;
   render(
     <QueryClientProvider client={qc}>
       <JobDetailView issue="STUDIO-654" onNavigate={onNavigate} />
@@ -192,6 +241,15 @@ function action(name: string | RegExp): HTMLElement {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // `clearAllMocks` clears CALLS, not implementations, and `mountDetail`'s run-detail default is
+  // installed only when there is none — so without this a test that configured the poll would
+  // hand its answer to every test after it.
+  h.fetchRunDetail.mockReset();
+  // The page geometry is defined on the live document, which outlives a render.
+  const el = scroller() as unknown as Record<string, unknown>;
+  delete el.scrollHeight;
+  delete el.clientHeight;
+  scroller().scrollTop = 0;
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -945,5 +1003,613 @@ describe("wide content is contained (STUDIO-681's layout rule)", () => {
     const banner = rule(".rh-console .trrc .trbanner");
     expect(banner).toMatch(/overflow-x:\s*auto/);
     expect(rule(".rh-console .trrc .trbanner span")).toMatch(/overflow-wrap:\s*anywhere/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// STUDIO-744 — slice 3 of the Trace plan: the states the completed-run hero does not cover. A
+// live run (the playhead), a failed one (the jump to the failing step), and a ticket whose work
+// relayed across more than one run (the attempt selector's baton).
+// ---------------------------------------------------------------------------------------------
+
+/** A transcript still being written: it has oriented and edited, and has not verified yet. */
+const STREAMING: LogEntry[] = [
+  entry({ seq: 1, kind: "event", text: "session started" }),
+  entry({ seq: 2, kind: "tool_use", tool: "Read", text: "file_path=/repo/src/lib/api.ts" }),
+  entry({ seq: 3, kind: "tool_result", text: "export interface RunSummary {" }),
+  entry({ seq: 4, kind: "tool_use", tool: "Edit", text: "file_path=/repo/src/lib/api.ts" }),
+  entry({ seq: 5, kind: "tool_result", text: "The file has been updated." }),
+];
+
+/** The same transcript one poll later — a phase the spine has not seen before. */
+const STREAMED_ON: LogEntry[] = [
+  ...STREAMING,
+  entry({ seq: 6, kind: "tool_use", tool: "Bash", text: "command=cargo test --workspace" }),
+  entry({ seq: 7, kind: "tool_result", text: "test result: ok. 0 failed" }),
+];
+
+/** The spine step the inspector is showing. */
+function selectedStep(): string {
+  return document.querySelector('.trstep[aria-pressed="true"] .stt')?.textContent ?? "";
+}
+
+/** The step the playhead's `now` badge marks; "" when the spine marks none. */
+function nowStep(): string {
+  return document.querySelector(".trstep.now .stt")?.textContent ?? "";
+}
+
+/** The spine's grep field. */
+function grepField(): HTMLInputElement {
+  return screen.getByRole("searchbox", { name: /filter steps/i }) as HTMLInputElement;
+}
+
+/** Re-runs a polled query's fetcher, which is what a poll tick does. */
+async function poll(key: unknown[]) {
+  await act(async () => {
+    await client.invalidateQueries({ queryKey: key });
+  });
+}
+
+/** The page's own scroller, which is what the run detail scrolls. */
+function scroller(): HTMLElement {
+  return (document.scrollingElement ?? document.documentElement) as HTMLElement;
+}
+
+/**
+ * Gives the page a real geometry. jsdom lays nothing out, so every dimension is 0 and "at the
+ * bottom" is trivially true — the follow rules cannot be exercised without saying how tall the
+ * page is. `height` is a getter so a test can GROW the page the way a poll does.
+ */
+function sizePage(height: () => number, viewport = 800) {
+  const el = scroller();
+  Object.defineProperty(el, "scrollHeight", { get: height, configurable: true });
+  Object.defineProperty(el, "clientHeight", { value: viewport, configurable: true });
+}
+
+/** Puts the window where a scrolled-up operator has left it, and tells the view about it. */
+function scrollUp(distance: number) {
+  sizePage(() => 2000);
+  scroller().scrollTop = 2000 - 800 - distance;
+  fireEvent.scroll(window);
+}
+
+const LIVE = { id: 547, outcome: "running", ended_at: "" } as const;
+
+describe("the live run — the spine is a playhead (§3A/§3C)", () => {
+  it("opens on the NEWEST phase, the one a streaming run is writing into", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(spineTitles()).toEqual(["Oriented", "Implemented"]);
+    // A finished run opens on its FIRST step — you read a trace forwards. A live one does not.
+    expect(selectedStep()).toBe("Implemented");
+    expect(document.querySelector(".trstep.now")).toBeTruthy();
+  });
+
+  it("advances the playhead when the transcript poll brings a newer phase", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(selectedStep()).toBe("Implemented");
+
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(selectedStep()).toBe("Verified"));
+    expect(document.querySelector(".trinsp .trcard .tgt")?.textContent).toBe(
+      "cargo test --workspace",
+    );
+  });
+
+  it("offers no jump-to-latest on a live run whose transcript has not arrived", async () => {
+    // A run that has just started has no phase to track — and so nothing to have fallen behind.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(spineTitles()).toEqual([]);
+    expect(document.querySelector(".trlatest")).toBeNull();
+  });
+
+  it("marks the playhead over the RUN, not the filtered spine — the `now` badge cannot lie", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(spineTitles()).toEqual(["Oriented", "Implemented", "Verified"]);
+    expect(nowStep()).toBe("Verified");
+
+    // A grep that hides the phase the run is writing into marks NOTHING. The selection falls back
+    // to the newest step still visible — that is a choice of what to READ — but `now` is a claim
+    // about where the run IS, and it must not name a step the run has already left.
+    fireEvent.change(grepField(), { target: { value: "api.ts" } });
+    await waitFor(() => expect(spineTitles()).toEqual(["Oriented", "Implemented"]));
+    expect(nowStep()).toBe("");
+    expect(selectedStep()).toBe("Implemented");
+
+    // Nor is the page still FOLLOWING a head it is not showing: the chip is offered, and it
+    // clears the grep on its way back rather than scrolling to a spine the newest step is off.
+    const latest = document.querySelector(".trlatest") as HTMLElement;
+    expect(latest).toBeTruthy();
+    fireEvent.click(latest);
+    await waitFor(() => expect(nowStep()).toBe("Verified"));
+    expect(grepField().value).toBe("");
+    expect(selectedStep()).toBe("Verified");
+  });
+
+  it("holds still once the operator picks a step, and offers the way back to the playhead", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(document.querySelector(".trlatest")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Oriented/ }));
+    await waitFor(() => expect(selectedStep()).toBe("Oriented"));
+    // Reading an older step must not be yanked away by the next poll tick.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    expect(selectedStep()).toBe("Oriented");
+    const latest = document.querySelector(".trlatest") as HTMLElement;
+    expect(latest).toBeTruthy();
+
+    fireEvent.click(latest);
+    await waitFor(() => expect(selectedStep()).toBe("Verified"));
+    expect(document.querySelector(".trlatest")).toBeNull();
+  });
+
+  it("offers the same jump when the operator has scrolled up out of follow", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    scrollUp(600);
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
+    // Back within the follow threshold, and the chip has nothing to offer again.
+    scrollUp(0);
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeNull());
+  });
+
+  it("keeps a grep that is not hiding the playhead when the chip takes the page back", async () => {
+    // The chip is offered for two independent reasons, and only one of them is the filter's
+    // fault. Here the grep is showing the head perfectly well and the operator has simply
+    // scrolled up: taking the page back to the bottom is all that was asked for, and wiping what
+    // they typed on the way would be a loss they did not ask for at all.
+    sizePage(() => 2000);
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    fireEvent.change(grepField(), { target: { value: "cargo" } });
+    await waitFor(() => expect(spineTitles()).toEqual(["Verified"]));
+    expect(nowStep()).toBe("Verified"); // the head is on the spine, so the page is still following
+
+    scroller().scrollTop = 0;
+    fireEvent.scroll(window);
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
+    fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
+
+    await waitFor(() => expect(scroller().scrollTop).toBe(2000));
+    expect(grepField().value).toBe("cargo");
+    expect(spineTitles()).toEqual(["Verified"]);
+  });
+
+  it("keeps a live run pinned to the bottom as the stream appends to it", async () => {
+    let height = 1000;
+    sizePage(() => height);
+    scroller().scrollTop = 200; // pinned to the bottom of a 1000px page in an 800px viewport
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+
+    height = 1600; // the poll appended a step, and the page grew under the operator
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    // The view asks for the very bottom; a real engine clamps that to scrollHeight − clientHeight,
+    // and jsdom, which lays nothing out, records the request verbatim.
+    await waitFor(() => expect(scroller().scrollTop).toBe(1600));
+    expect(document.querySelector(".trlatest")).toBeNull();
+  });
+
+  it("follows a live run opened at the top of a tall page", async () => {
+    // The other side of the same rule, and the one an operator meets FIRST: nobody has scrolled
+    // yet, so the position at mount belongs to the view they came from, not to this run. Reading
+    // it as a choice is what used to open a live trace pinned to nothing and never follow again.
+    let height = 2000;
+    sizePage(() => height);
+    scroller().scrollTop = 0; // not the bottom of a 2000px page — and not the operator's doing
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+
+    height = 3000;
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(spineTitles()).toContain("Verified"));
+    expect(scroller().scrollTop).toBe(3000);
+  });
+
+  it("never drags a scrolled-up operator back down, however much the stream grows", async () => {
+    let height = 2000;
+    sizePage(() => height);
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    scroller().scrollTop = 0;
+    fireEvent.scroll(window);
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
+
+    height = 3000;
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    // Observed at the moment the GROWTH RENDER has actually happened — the appended step is on
+    // the spine, so the follow effect has already run against the taller page. Asserting straight
+    // after the poll instead proves only that the refetch had not landed yet, and passes whether
+    // or not the guard is there.
+    await waitFor(() => expect(spineTitles()).toContain("Verified"));
+    expect(scroller().scrollTop).toBe(0);
+    // And the chip is the way back: it re-takes the playhead AND the bottom of the page.
+    fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
+    await waitFor(() => expect(scroller().scrollTop).toBe(3000));
+  });
+
+  it("follows the stream again once the chip has taken the page back", async () => {
+    // The chip does not only move the page, it re-takes the pin: the NEXT growth has to follow.
+    // A browser would confirm the chip's own scroll with a scroll event, but a rule that only
+    // works because the engine volunteers one is a rule that does not work.
+    let height = 2000;
+    sizePage(() => height);
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    scroller().scrollTop = 0;
+    fireEvent.scroll(window);
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
+
+    fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
+    await waitFor(() => expect(scroller().scrollTop).toBe(2000));
+    // Nothing left to be behind, so nothing left to offer.
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeNull());
+
+    height = 3000;
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(spineTitles()).toContain("Verified"));
+    expect(scroller().scrollTop).toBe(3000);
+  });
+
+  it("never drags a scrolled-up operator down when a filtered-in phase flips follow back on", async () => {
+    // The other half of the same promise, and the half a detached scroll listener used to break:
+    // while the page is not following, the operator's position is still theirs. The page is tall
+    // only while the head is VISIBLE (the `now` badge is on the spine) — exactly when follow can
+    // be on — so the growth and the follow-flip land in ONE commit, the way a real poll does.
+    sizePage(() => (document.querySelector(".trstep.now") === null ? 2000 : 3000));
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+
+    // A grep for a step the run has not written yet hides every phase, the head included: the
+    // page stops following, and the chip is offered.
+    fireEvent.change(grepField(), { target: { value: "cargo" } });
+    await waitFor(() => expect(spineTitles()).toEqual([]));
+    expect(nowStep()).toBe("");
+    expect(document.querySelector(".trlatest")).toBeTruthy();
+
+    // The operator scrolls up to read. Nothing about follow being off makes this position less
+    // real, and the follow rule has to observe it.
+    scroller().scrollTop = 0;
+    fireEvent.scroll(window);
+
+    // The poll brings the phase the grep was looking for. It is the newest one, so it is BOTH
+    // visible and the head: follow flips back on and the page grows in the same commit.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(spineTitles()).toEqual(["Verified"]));
+    expect(nowStep()).toBe("Verified"); // follow really did flip back on
+
+    expect(scroller().scrollTop).toBe(0);
+    // Still where they left it, and the chip still says how to get back.
+    expect(document.querySelector(".trlatest")).toBeTruthy();
+  });
+
+  it("never offers a playhead or a jump on a run that has finished", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(selectedStep()).toBe("Oriented");
+    expect(document.querySelector(".trstep.now")).toBeNull();
+    scrollUp(600);
+    expect(document.querySelector(".trlatest")).toBeNull();
+  });
+
+  it("pulses the header while the run is streaming, and stops when it is not", async () => {
+    mountDetail([run(LIVE)]);
+    await waitFor(() => expect(document.querySelector(".trhd .trpulse")).toBeTruthy());
+    cleanup();
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(document.querySelector(".trhd")).toBeTruthy());
+    expect(document.querySelector(".trhd .trpulse")).toBeNull();
+  });
+
+  it("reads its live turns and tokens from the 2s run-detail poll, not the cached history row", async () => {
+    mountDetail([run({ ...LIVE, turns: 1, total_tokens: 1_000 })]);
+    await waitFor(() => expect(document.querySelector(".trvitals")?.textContent).toContain("1 turn"));
+
+    h.fetchRunDetail.mockImplementation(async (id: number) =>
+      detailOf(run({ ...LIVE, id }), { turn_count: 9, total_tokens: 91_000 }),
+    );
+    await poll(["run-detail", 547]);
+    await waitFor(() =>
+      expect(document.querySelector(".trvitals")?.textContent).toContain("9 turns"),
+    );
+    expect(document.querySelector(".trvitals")?.textContent).toContain("91.0k");
+  });
+
+  it("ends the run on the poll's terminal outcome, which the cached history row cannot see", async () => {
+    mountDetail([run(LIVE)]);
+    await waitFor(() => expect(action(/^stop$/i)).toBeTruthy());
+
+    h.fetchRunDetail.mockImplementation(async (id: number) =>
+      detailOf(run({ ...LIVE, id }), {
+        outcome: "failed",
+        ended_at: "2026-09-01T19:15:00Z",
+        error: "cargo test exited 101",
+      }),
+    );
+    await poll(["run-detail", 547]);
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.textContent).toContain("failed"),
+    );
+    expect(document.querySelector(".trbanner.fail")?.textContent).toContain("cargo test exited 101");
+    expect(
+      within(document.querySelector(".trhd .acts") as HTMLElement).queryByRole("button", {
+        name: /^stop$/i,
+      }),
+    ).toBeNull();
+  });
+});
+
+/**
+ * Waits long enough for a send that WAS started to reach the mocked endpoint.
+ *
+ * `send.mutate` hands the body to react-query, which calls the mutation fn on a later tick — so a
+ * synchronous `not.toHaveBeenCalled()` after a click proves only that the tick has not come round
+ * yet, and passes with the refusal deleted. `refuses to send an empty message at all` carries the
+ * positive control that this wait is long enough to be worth anything.
+ */
+async function flushSend() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+}
+
+describe("the live run — the Message composer (§3A)", () => {
+  it("sends an operator message to the running agent through the daemon's own endpoint", async () => {
+    h.sendRunMessage.mockResolvedValue({ id: 3, identifier: "STUDIO-654", status: "sent" });
+    mountDetail([run(LIVE)]);
+    await waitFor(() => expect(action(/^message/i)).toBeTruthy());
+    const button = action(/^message/i);
+    expect(button.querySelector(".dep")).toBeNull();
+    expect(button.getAttribute("aria-disabled")).toBeNull();
+
+    fireEvent.click(button);
+    const box = await screen.findByLabelText(/message the running agent/i);
+    fireEvent.change(box, { target: { value: "btw the branch moved" } });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() => expect(h.sendRunMessage).toHaveBeenCalledExactlyOnceWith(547, "btw the branch moved"));
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(""));
+  });
+
+  it("surfaces a refused message rather than swallowing it", async () => {
+    h.sendRunMessage.mockRejectedValue(new Error("too many pending operator messages for this run"));
+    mountDetail([run(LIVE)]);
+    await waitFor(() => expect(action(/^message/i)).toBeTruthy());
+    fireEvent.click(action(/^message/i));
+    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
+      target: { value: "hi" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() =>
+      expect(document.querySelector(".trmsg .acterr")?.textContent).toContain(
+        "too many pending operator messages",
+      ),
+    );
+  });
+
+  it("refuses to send an empty message at all", async () => {
+    h.sendRunMessage.mockResolvedValue({ id: 3, identifier: "STUDIO-654", status: "sent" });
+    mountDetail([run(LIVE)]);
+    await waitFor(() => expect(action(/^message/i)).toBeTruthy());
+    fireEvent.click(action(/^message/i));
+    const box = await screen.findByLabelText(/message the running agent/i);
+    fireEvent.change(box, { target: { value: "   " } });
+    // Both ways in. The button is the one a mouse takes; the textarea's Enter is the one that
+    // reaches `submit` even when the button is disabled, and so the one that pins the refusal.
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    fireEvent.keyDown(box, { key: "Enter" });
+    await flushSend();
+    expect(h.sendRunMessage).not.toHaveBeenCalled();
+
+    // The positive control for that flush, on the very same wait: whitespace is what was refused,
+    // not a send that simply had not reached the endpoint yet. (And Enter sends, trimmed.)
+    fireEvent.change(box, { target: { value: "  say something  " } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    await flushSend();
+    expect(h.sendRunMessage).toHaveBeenCalledExactlyOnceWith(547, "say something");
+  });
+
+  it("keeps a half-written message on screen when the run ends underneath it", async () => {
+    mountDetail([run(LIVE)]);
+    await waitFor(() => expect(action(/^message/i)).toBeTruthy());
+    // The header's action names the composer only while there is one to name — an `aria-controls`
+    // pointing at an id the document does not carry is a dangling reference, not a hint.
+    expect(action(/^message/i).getAttribute("aria-controls")).toBeNull();
+    fireEvent.click(action(/^message/i));
+    const box = (await screen.findByLabelText(/message the running agent/i)) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "btw the branch moved" } });
+    expect(action(/^message/i).getAttribute("aria-controls")).toBe("trmsg");
+
+    // The run ends mid-compose, which the 2s poll is what notices.
+    h.fetchRunDetail.mockImplementation(async (id: number) =>
+      detailOf(run({ ...LIVE, id }), { outcome: "completed", ended_at: "2026-09-01T19:15:00Z" }),
+    );
+    await poll(["run-detail", 547]);
+    await waitFor(() =>
+      expect(document.querySelector(".trmsg .acterr")?.textContent).toContain(
+        "there is no agent left to deliver this to",
+      ),
+    );
+    // Discarding what the operator typed is not this view's call to make; refusing to send it is.
+    expect(box.value).toBe("btw the branch moved");
+    const send = screen.getByRole("button", { name: /^send$/i }) as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    fireEvent.click(send);
+    // And `submit` refuses it too, which is what the textarea's Enter — never disabled — asks for.
+    fireEvent.keyDown(box, { key: "Enter" });
+    await flushSend();
+    expect(h.sendRunMessage).not.toHaveBeenCalled();
+    expect(box.value).toBe("btw the branch moved");
+  });
+
+  // A finished run has no agent to reach, so the endpoint is not a dependency — it is inapplicable.
+  it("names the dependency instead on a run that has already ended", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^message/i)).toBeTruthy());
+    expect(action(/^message/i).getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(action(/^message/i));
+    expect(screen.queryByLabelText(/message the running agent/i)).toBeNull();
+  });
+});
+
+describe("the failed run — jump to the failing step (§3B)", () => {
+  it("selects the failing phase and expands the tool result that failed", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547, outcome: "failed", error: "cargo test exited 101" })]);
+    await settleTrace();
+    expect(document.querySelector(".trbanner.fail")).toBeTruthy();
+    expect(selectedStep()).toBe("Oriented");
+
+    fireEvent.click(screen.getByRole("button", { name: /jump to failing step/i }));
+    await waitFor(() => expect(selectedStep()).toBe("Verified"));
+    const top = document.querySelector(".trcard.err .top") as HTMLElement;
+    expect(top.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector(".trcard.err .out")?.textContent).toContain("1 test failed");
+
+    // And it re-opens one the operator folded away — the jump is an instruction, not a default.
+    fireEvent.click(top);
+    expect(top.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(screen.getByRole("button", { name: /jump to failing step/i }));
+    await waitFor(() =>
+      expect(document.querySelector(".trcard.err .top")?.getAttribute("aria-expanded")).toBe("true"),
+    );
+  });
+
+  it("offers no jump when the failure left no failing step in the transcript", async () => {
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 547,
+      generated_at: "",
+      entries: [entry({ seq: 1, kind: "text", text: "Nothing ran." })],
+    });
+    mountDetail([run({ id: 547, outcome: "failed", error: "the worker crashed before dispatch" })]);
+    await settleTrace();
+    expect(document.querySelector(".trbanner.fail")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /jump to failing step/i })).toBeNull();
+  });
+
+  it("clears a filter that hides the failing phase — the jump is an instruction, not a wish", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547, outcome: "failed", error: "cargo test exited 101" })]);
+    await settleTrace();
+
+    // An operator who has been poking the chips on a failed run and then reads the banner: Edits
+    // hides the phase that actually failed, and `selected` discards a pick the filter hides.
+    fireEvent.click(screen.getByRole("button", { name: "Edits" }));
+    await waitFor(() => expect(spineTitles()).toEqual(["Implemented"]));
+
+    fireEvent.click(screen.getByRole("button", { name: /jump to failing step/i }));
+    await waitFor(() => expect(selectedStep()).toBe("Verified"));
+    // The failing call is on screen AND open — a jump that selects nothing the operator can see
+    // is the same no-op as one that selects nothing at all.
+    expect(document.querySelector(".trcard.err .top")?.getAttribute("aria-expanded")).toBe("true");
+    expect(spineTitles()).toEqual(["Oriented", "Implemented", "Verified", "Coordinated"]);
+
+    // The grep is the other half of the filter, and hides a phase just as completely.
+    fireEvent.change(grepField(), { target: { value: "export interface" } });
+    await waitFor(() => expect(spineTitles()).toEqual(["Oriented"]));
+    fireEvent.click(screen.getByRole("button", { name: /jump to failing step/i }));
+    await waitFor(() => expect(selectedStep()).toBe("Verified"));
+    expect(grepField().value).toBe("");
+    expect(document.querySelector(".trcard.err .top")?.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("keeps the jump out of a stopped run's amber banner, even when a step did fail", async () => {
+    // The COMPLETED transcript's `npm test` failed — an operator stopping a run while a test is
+    // red is not an exotic input, so the gate has to be the BANNER's tone and not merely whether
+    // the trace holds a failing step. §3B gives the jump to the failed banner alone ("Stopped ->
+    // amber reason + Resume"), and `.trbanner .jump` is tinted `--bad`, which an amber banner is
+    // not.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547, outcome: "stopped", error: "stopped by the operator" })]);
+    await settleTrace();
+    expect(document.querySelector(".trbanner.stop")).toBeTruthy();
+    // The failing step really is in this trace: the spine marks it red.
+    expect(document.querySelector(".trstep.err")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /jump to failing step/i })).toBeNull();
+    // What a stop offers instead.
+    expect(action(/^Resume$/)).toBeTruthy();
+  });
+});
+
+describe("the attempt relay — the handoff baton (§3C/§6)", () => {
+  const RELAY = [
+    run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+  ];
+
+  it("marks the baton into the attempt being read, and out of the one before it", async () => {
+    mountDetail(RELAY);
+    await settleTrace();
+    await waitFor(() =>
+      expect(document.querySelector(".trbaton.in")?.textContent).toContain("run 522 → run 547"),
+    );
+    expect(document.querySelector(".trbaton.out")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    await waitFor(() => expect(document.querySelector(".trbaton.out")).toBeTruthy());
+    expect(document.querySelector(".trbaton.out")?.textContent).toContain("run 522 → run 547");
+    expect(document.querySelector(".trbaton.in")).toBeNull();
+  });
+
+  // The console can name ONE teammate per ticket, not one per run, so today's relay reads as the
+  // run handoff it is rather than inventing a second name. See `runTeammate`.
+  it("carries the teammate it can name beside the relay", async () => {
+    mountDetail(RELAY);
+    await waitFor(() =>
+      expect(document.querySelector(".trbaton.in")?.textContent).toContain("alice · run 522"),
+    );
+  });
+
+  // NOT tested through the view: a baton naming two DIFFERENT teammates. Nothing the daemon
+  // serves can produce that payload — `/issues/{id}/history` matches `issue_identifier` exactly
+  // (`crates/store/src/sqlite.rs`), so every run in one selector shares a key, and one key
+  // resolves to one name. `relayBatons`' own unit tests pin the two-name branch, and slice 5's
+  // per-run identity is what will reach it. A view test over a history the store never writes
+  // would be green and prove nothing.
+
+  it("gives a ticket with a single run no baton in either direction", async () => {
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".trbaton")).toBeNull();
+  });
+
+  // The one run the console CAN attribute to a teammate per-run: a ticketless review carries its
+  // reviewer in its own key, and the header and the inspector must not disagree about who it was.
+  it("attributes a ticketless review run to the reviewer named in its own key", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([
+      run({
+        id: 547,
+        issue_id: "pr:makewhatis/rhapsody#12@jimmy",
+        issue_identifier: "pr:makewhatis/rhapsody#12@jimmy",
+        title: "Review makewhatis/rhapsody#12 at 9f1c0aa",
+      }),
+    ]);
+    await settleTrace();
+    expect(document.querySelector(".trhd .who2")?.textContent).toContain("jimmy");
+    expect(document.querySelector(".trinsp h4")?.textContent).toBe("Oriented — what jimmy did");
   });
 });
