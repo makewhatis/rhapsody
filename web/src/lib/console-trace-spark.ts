@@ -75,10 +75,10 @@ export const SPARK_KINDS: readonly PhaseKind[] = [
 /**
  * How heavily the run leaned on one kind — the visible cell's second dimension, from the count.
  *
- * `none` is the empty slot. The three live tiers are the corpus's own quartiles over the 453
- * recorded runs' per-kind counts (p25 = 1, median = 4, p75 = 9), so the boundaries are where the
- * real distribution splits rather than round numbers: one phase is `light`, a handful is `mid`, and
- * five or more — the top ~45% — is `heavy`.
+ * `none` is the empty slot. The two boundaries between the three live tiers are the corpus's own
+ * lower quartile and median over the 453 recorded runs' per-kind counts (p25 = 1, median = 4), so
+ * they fall where the real distribution splits rather than on round numbers: one phase is `light`,
+ * a handful is `mid`, and five or more — the top ~45% of lit slots — is `heavy`.
  */
 export type SparkWeight = "none" | "light" | "mid" | "heavy";
 

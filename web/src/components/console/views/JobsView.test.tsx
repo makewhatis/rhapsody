@@ -379,12 +379,9 @@ describe("the Needs you count (§6)", () => {
     h.fetchIssueRuns.mockResolvedValue({
       issues: [
         run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review" }),
-        // A finished run the tracker has no answer for. It reads "in review" off the outcome
-        // alone, which is an inference that never expires — so it is NOT the operator's to act on.
-        run({ issue_identifier: "STALE", outcome: "completed" }),
         run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done" }),
-        run({ issue_identifier: "FAILED", outcome: "failed" }),
-        run({ issue_identifier: "IDLE", outcome: "stopped" }),
+        run({ issue_identifier: "FAILED", outcome: "failed", lifecycle: "open" }),
+        run({ issue_identifier: "IDLE", outcome: "stopped", lifecycle: "open" }),
       ],
       next_offset: null,
     });
@@ -400,11 +397,38 @@ describe("the Needs you count (§6)", () => {
     // REVIEW is parked for a reviewer and FAILED needs a decision. MERGED is finished, IDLE is
     // the daemon's to redispatch, and HELD waits on REVIEW rather than on the operator.
     await waitFor(() => expect(stat("needs you")).toBe("2"));
-    // The stat is not a re-tint of its neighbours, and this pins it against BOTH of the pills it
-    // overlaps: two rows read "in review" and only one of them wants a human, two read "blocked"
-    // (HELD + FAILED) and only one of them does.
-    expect(stat("in review")).toBe("2");
+    // It is a count of a different set, not a re-tint of a neighbour: two rows read "blocked"
+    // (HELD + FAILED) and only one of them wants a human, while the single in-review row does.
+    expect(stat("in review")).toBe("1");
     expect(stat("blocked")).toBe("2");
+  });
+
+  // THE OUTAGE SHAPE, END TO END. `issue_lifecycles` answers per request off a TTL cache and the
+  // tracker, so a cold cache or a failed Linear round-trip serves exactly this: the runs, none of
+  // them decorated. Every `completed` outcome is then inferred into "in review", inflating that
+  // pill — so the operator's own count must refuse to answer rather than report the 0 it would
+  // otherwise compute. "—" says "I cannot tell"; a 0 would say "nothing is waiting on you", which
+  // is the one thing the console does not know at that moment.
+  it("says — rather than 0 when the tracker answered nothing for the page", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ issue_identifier: "ONE", outcome: "completed" }),
+        run({ issue_identifier: "TWO", outcome: "completed" }),
+      ],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+
+    await waitFor(() => expect(stat("in review")).toBe("2"));
+    expect(stat("needs you")).toBe("—");
   });
 });
 
@@ -527,6 +551,19 @@ describe("the row trace-sparkline (§6)", () => {
     expect(h.fetchRunTranscript).not.toHaveBeenCalled();
   });
 
+  // The two ways of resting on a row are independent, so neither may cancel the other: a keyboard
+  // user who has tabbed to a row and then brushes the pointer across it on the way somewhere else
+  // must still get the strip they asked for. Both signals have to be gone before the dwell clears.
+  it("keeps a focused row armed when the pointer merely crosses it", async () => {
+    await mountJobs();
+    fireEvent.focus(row("A-1"));
+    fireEvent.mouseEnter(row("A-1"));
+    fireEvent.mouseLeave(row("A-1"));
+    await waitFor(() =>
+      expect(lit("A-1")).toEqual([phaseGlyph("oriented"), phaseGlyph("implemented")]),
+    );
+  });
+
   // A pointer is not the only way through the table (§10 box 2.8 made the row focusable).
   it("draws the strip for a row reached from the keyboard", async () => {
     await mountJobs();
@@ -544,6 +581,53 @@ describe("the row trace-sparkline (§6)", () => {
     await waitFor(() =>
       expect(row("A-1").querySelector(".spark")?.textContent).toBe("—"),
     );
+  });
+
+  // THE SAME CONTRACT ON A LIVE ROW, which is the one an operator reads first — `buildConsoleJobs`
+  // pins running tickets to the top of the table. A live strip carries a playhead so the run reads
+  // as still going, and that glyph alone used to be enough to clear the "did I read anything"
+  // guard: a running row whose transcript FAILED to load still drew "▶ Running now", reporting a
+  // healthy shape for a read that never happened. A failure has to win over the playhead.
+  it("shows a dash on a LIVE row whose transcript cannot be read, not a playhead", async () => {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-LIVE-1",
+          issue_identifier: "LIVE-1",
+          title: "LIVE-1 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 9,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [run({ id: 9, issue_identifier: "LIVE-1", outcome: "" })],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    h.fetchRunTranscript.mockRejectedValue(new Error("nope"));
+    mount();
+
+    await waitFor(() => expect(row("LIVE-1")).toBeTruthy());
+    fireEvent.focus(row("LIVE-1"));
+    await waitFor(() => expect(row("LIVE-1").querySelector(".spark")?.textContent).toBe("—"));
+    expect(row("LIVE-1").textContent).not.toContain("▶");
   });
 
   // A held dependent is a synthetic row with no run behind it (`mergeJobs` gives it runId 0), so

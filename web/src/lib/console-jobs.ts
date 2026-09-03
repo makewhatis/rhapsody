@@ -106,42 +106,45 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
 
 /**
  * Whether this ticket is waiting on the OPERATOR — the "Needs you" count the design record's §6
- * adds to the Now strip. Derived from the state the worklist already holds; no new endpoint.
+ * adds to the Now strip. Derived from state the worklist already holds; no new endpoint.
  *
- * It is a strict SUBSET of the pills rather than a re-tint of one, and the narrowing is the whole
- * point. A row reads `review` for either of two reasons, and only one of them is a fact:
+ * WHAT IT CLAIMS, EXACTLY. A ticket parked in review awaits a person's verdict or merge, and a
+ * failed run awaits a person's decision about what happens next. That is the whole claim. On a
+ * healthy tracker it makes "needs you" and "in review" close neighbours — the failed runs are the
+ * difference — and that convergence is the honest answer rather than a defect: if the tracker says
+ * twelve tickets are parked for review, twelve tickets really are waiting on a human. What is NOT
+ * claimed is any sharper discrimination among them; the facts that would allow one are named at
+ * the bottom of this comment and none of them is served to this view.
  *
- *   - The TRACKER says the ticket is in a review state (`lifecycle === "in_review"`). That is a
- *     ticket parked for a person: `consoleJobStatus` lets a live run outrank the ticket, so one an
- *     agent is working right now reads `run` instead. Counted.
- *   - Nothing said so, and `fromRunOutcome` mapped a `completed` run to `review`. That is an
- *     INFERENCE, and an outcome never expires — the daemon answers no lifecycle for a ticket it
- *     cannot resolve (a deleted issue, another team, a tracker round-trip that failed), so what
- *     collects here is old finished work. NOT counted: measured against the live daemon's own
- *     356-issue listing, 154 of the 177 rows reading "in review" are this, none of them newer than
- *     305 hours, and counting them made "Needs you" a second rendering of the "in review" pill.
+ * `blocked` qualifies only when it is a FAILED run. The other thing that reads blocked is a held
+ * dependent (`runs-model`'s synthetic `waiting` row), and that one waits on its predecessor rather
+ * than on the operator. If the predecessor needs a human it is counted on its OWN row; counting
+ * the dependent too would bill one decision twice.
  *
- * `blocked` qualifies only when it is a FAILED run — a person has to decide what happens next. The
- * other thing that reads blocked is a held dependent (`runs-model`'s synthetic `waiting` row), and
- * that one is waiting on its predecessor rather than on the operator. If that predecessor needs a
- * human it is counted on its OWN row; counting the dependent as well would bill one decision twice.
+ * WHY IT DOES NOT SPLIT ON A LIFECYCLE'S PRESENCE, which is the mistake worth keeping written
+ * down. An earlier shape counted a review row only when `lifecycle === "in_review"` came back,
+ * reading an ABSENT lifecycle as "inferred from a stale outcome, so nobody is waiting". But
+ * `StateProvider::issue_lifecycles` (crates/httpapi/src/server.rs) answers off a TTL cache and the
+ * reads cell's tracker AT REQUEST TIME, and a missing tracker, a failed round-trip and an unknown
+ * id are all *no answer*. Absence is therefore a LIVENESS condition of the daemon, not a property
+ * of the ticket — the same ticket answers on a warm cache and does not answer on a cold one. The
+ * rows that split were simply uncached, and once they warmed the split became a silent no-op.
+ *
+ * That liveness question is real, but it belongs to the PAYLOAD rather than to a row, and
+ * [`consoleJobCounts`] is where it is answered.
  *
  * WHAT WOULD MAKE IT SHARPER, flagged rather than guessed at (§9/§11). "Needs you" ought to mean
- * "your merge is the next move", and the two facts that would say so are not served to this view:
- * no endpoint carries a ticket's PR or its checks (the PR column renders "—" for the same reason),
- * and no per-ticket record says whether a REVIEWER — human or agent — already has it. Until one
- * does, the tracker's own confirmation is the strongest available answer, and it is a fact rather
- * than a threshold guessed from a timestamp.
+ * "your merge is the next move", and the two facts that would say so are not served here: no
+ * endpoint carries a ticket's PR or its checks (the PR column renders "—" for the same reason),
+ * and no per-ticket record says whether a REVIEWER — human or agent — already holds it. A
+ * threshold guessed from a timestamp would look like a narrowing without being one, so until a
+ * supporting endpoint lands this stays the coarse claim it can actually defend.
  *
  * Takes the run status as a plain string for the reason `fromRunOutcome` does: `JobRow.status` is
  * the wider `StatusKey`, and narrowing it with a cast would hide the case this has to survive.
  */
-export function needsOperator(
-  status: ConsoleJobStatus,
-  runStatus: string,
-  lifecycle: IssueLifecycle | undefined,
-): boolean {
-  if (status === "review") return lifecycle === "in_review";
+export function needsOperator(status: ConsoleJobStatus, runStatus: string): boolean {
+  if (status === "review") return true;
   return status === "blocked" && runStatus !== "waiting";
 }
 
@@ -176,6 +179,14 @@ export interface ConsoleJobRow {
   subLabel?: string;
   /** Whether the ticket's next move is the OPERATOR's — the Now strip's "Needs you" (§6). */
   needsYou: boolean;
+  /**
+   * Whether the daemon actually answered a tracker lifecycle for this ticket on THIS request.
+   *
+   * Not a property of the ticket — `issue_lifecycles` resolves per request off a TTL cache, so
+   * this says only "the tracker spoke for this row just now". It exists so [`consoleJobCounts`]
+   * can tell a healthy payload from the stripped one a cold cache serves; see [`needsOperator`].
+   */
+  lifecycleResolved: boolean;
 }
 
 /**
@@ -327,7 +338,8 @@ export function buildConsoleJobs(
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
-      needsYou: needsOperator(status, job.status, ticket?.lifecycle),
+      needsYou: needsOperator(status, job.status),
+      lifecycleResolved: ticket !== undefined,
     };
   });
 
@@ -368,19 +380,41 @@ export interface ConsoleJobCounts {
   review: number;
   queued: number;
   blocked: number;
-  needsYou: number;
+  /**
+   * How many tickets are waiting on the operator, or `null` for "the console cannot tell" — which
+   * the Now strip renders as "—" rather than as a number.
+   *
+   * WHY THIS ONE STAT IS NULLABLE AND THE OTHER FOUR ARE NOT. The four above are counts of rows
+   * the daemon definitely served. This one is a claim about the OUTSIDE world — what a human still
+   * owes — and it is only answerable while the tracker is answering. When `issue_lifecycles`
+   * resolves nothing for the payload (a cold cache, a missing tracker, a Linear round-trip that
+   * failed), `consoleJobStatus` falls back to inferring "in review" from every `completed` outcome,
+   * so the review pill INFLATES at the exact moment the console knows least. Reporting a number
+   * derived from that would be at best a coincidence and at worst — measured on the live listing —
+   * "350 in review, 0 need you", the one stat whose job is to say what is waiting announcing that
+   * nothing is, precisely when it cannot see. A zero is a claim; "—" is the truth.
+   *
+   * The gate is all-or-nothing over the payload on purpose: the daemon resolves lifecycles for a
+   * request as a batch, so a page where NOT ONE row got an answer is the outage shape, while a
+   * page where some did is a healthy tracker that merely does not know every ticket. An empty
+   * worklist counts as knowable — nothing is waiting because there is nothing.
+   */
+  needsYou: number | null;
 }
 
 export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCounts {
-  const counts: ConsoleJobCounts = { running: 0, review: 0, queued: 0, blocked: 0, needsYou: 0 };
+  const counts = { running: 0, review: 0, queued: 0, blocked: 0 };
+  let needsYou = 0;
+  let heard = false;
   for (const row of rows) {
     if (row.status === "run") counts.running += 1;
     else if (row.status === "review") counts.review += 1;
     else if (row.status === "queued") counts.queued += 1;
     else if (row.status === "blocked") counts.blocked += 1;
-    if (row.needsYou) counts.needsYou += 1;
+    if (row.needsYou) needsYou += 1;
+    if (row.lifecycleResolved) heard = true;
   }
-  return counts;
+  return { ...counts, needsYou: heard || rows.length === 0 ? needsYou : null };
 }
 
 /** One teammate's live state in the Now strip (§3). */

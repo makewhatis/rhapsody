@@ -99,8 +99,10 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
           <Stat value={counts.queued} label="queued" />
           <Stat value={counts.blocked} label="blocked" tone="bad" />
           {/* The operator's own queue (STUDIO-743, design record §6). It cuts across the four
-              above rather than partitioning with them — see `needsOperator`. */}
-          <Stat value={counts.needsYou} label="needs you" tone="op" />
+              above rather than partitioning with them — see `needsOperator`. Unlike them it can be
+              UNANSWERABLE: when the daemon resolved no ticket lifecycle for this page, the count
+              says "—" rather than the 0 it would otherwise compute — see `ConsoleJobCounts`. */}
+          <Stat value={counts.needsYou ?? "—"} label="needs you" tone="op" />
         </NowStats>
       </NowStrip>
 
@@ -170,11 +172,20 @@ function JobsRow({
   // strip does not blink away when the operator moves on.
   const [armed, setArmed] = useState(false);
   const dwell = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Pointer and keyboard rest on a row independently, and either one counts as resting. Tracked
+  // separately so neither cancels the other — a row tabbed to and then brushed past by the pointer
+  // was still asked for, and losing it would strand the keyboard user the focus arm exists for.
+  const hovering = useRef(false);
+  const focused = useRef(false);
   const clearDwell = () => {
     if (dwell.current !== null) {
       clearTimeout(dwell.current);
       dwell.current = null;
     }
+  };
+  // Only once BOTH ways of resting have ended is the row genuinely being passed rather than read.
+  const release = () => {
+    if (!hovering.current && !focused.current) clearDwell();
   };
   const arm = () => {
     if (!armed && dwell.current === null) {
@@ -192,12 +203,24 @@ function JobsRow({
       role="link"
       aria-label={`${row.issue} ${row.title}`}
       onClick={() => onOpen(row.issue)}
-      onMouseEnter={arm}
-      onMouseLeave={clearDwell}
+      onMouseEnter={() => {
+        hovering.current = true;
+        arm();
+      }}
+      onMouseLeave={() => {
+        hovering.current = false;
+        release();
+      }}
       // Focus arms too, so the strip is reachable without a pointer — and behind the same dwell,
       // because tabbing to the tenth row passes through nine others exactly as a pointer does.
-      onFocus={arm}
-      onBlur={clearDwell}
+      onFocus={() => {
+        focused.current = true;
+        arm();
+      }}
+      onBlur={() => {
+        focused.current = false;
+        release();
+      }}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
@@ -274,10 +297,12 @@ function TraceSpark({ runId, live, armed }: { runId: number; live: boolean; arme
   if (!armed) return <SparkNote label="Trace — rest here to preview this run" text="···" />;
   if (transcript.isPending) return <SparkNote label="Reading the transcript…" text="···" busy />;
   // A transcript the daemon could not serve, and a run that logged nothing, are both "no shape to
-  // show" — never an invented one.
-  if (steps.length === 0) {
-    return <SparkNote label={transcript.isError ? "Transcript unavailable" : "No trace"} text="—" />;
-  }
+  // show" — never an invented one. The FAILURE is checked first and separately, because a live run
+  // is not empty even when nothing was read: `traceSpark([], true)` returns the playhead alone, so
+  // a length test would let a failed read draw "Running now" — a healthy-looking strip for a
+  // transcript that never arrived, on exactly the rows sorted to the top of the table.
+  if (transcript.isError) return <SparkNote label="Transcript unavailable" text="—" />;
+  if (steps.length === 0) return <SparkNote label="No trace" text="—" />;
 
   const summary = sparkSummary(steps);
   return (
