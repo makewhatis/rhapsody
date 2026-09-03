@@ -1603,6 +1603,97 @@ describe("the ask dock (§6)", () => {
     expect(document.querySelector(".askex .pending .link")?.textContent).toContain("Open the room");
   });
 
+  // `past-window` is a claim about a read that COULD have seen the question. The room query is
+  // warm on essentially every run detail — "room" is the default watch tab, and `useTeamsRoom`
+  // keeps the previous window on screen — so the dock joins a read whose newest data PREDATES the
+  // question it was just handed. Reading that as "the window has moved past your question" is the
+  // most misleading sentence this surface can produce, and it would fire on the ordinary path.
+  it("never reports a question posted a moment ago as past the read's window", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: [roomPost({ id: "f:1", from: "alice", body: "posted before the question" })],
+      skipped: [],
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(h.fetchTeamsRoom).toHaveBeenCalled());
+
+    // Hold the read the post triggers open, so the window between the question landing and the
+    // first read that could contain it is observable rather than a single frame.
+    let land: () => void = () => {};
+    h.fetchTeamsRoom.mockReturnValue(
+      new Promise((resolve) => {
+        land = () =>
+          resolve({
+            messages: [
+              roomPost({ id: "f:1", from: "alice", body: "posted before the question" }),
+              roomPost({ id: "f:9", body: "Why did this stop?" }),
+            ],
+            skipped: [],
+          });
+      }),
+    );
+    await ask("Why did this stop?", "f:9");
+
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain("reading it back"),
+    );
+    // Not a conclusion about the room, and not one about the manager either: nothing has looked.
+    const pending = document.querySelector(".askex .pending")?.textContent ?? "";
+    expect(pending).not.toContain("no longer reaches that question");
+    expect(pending).not.toContain("has not replied to it yet");
+
+    // And it is a state the read LEAVES — the first read that settles after the question decides.
+    await act(async () => {
+      land();
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "@manager has not replied to it yet",
+      ),
+    );
+  });
+
+  // The room log is append-only, so an answer that was read once cannot stop existing — but the
+  // read is a 50-post window over the WHOLE room, re-fetched every 5s with no memory. Let the room
+  // move on and the question falls out of it, which must not turn an answer already on screen into
+  // "it cannot tell whether @manager replied": that sentence would be false at the moment it is
+  // shown, and it is the exact disappearance this slice exists to remove.
+  it("keeps an answer it has already read when the room moves past the question", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:9", body: "Why did this stop?" }),
+      { ...MANAGER_ANSWER, refs: ["f:9"] },
+    ]);
+    await waitFor(() => expect(document.querySelector(".askex .mcard")).toBeTruthy());
+
+    // A full window of later posts scrolls the question out. They are shown as traffic on this
+    // ticket only so the Room tab's own feed can confirm the new window has landed; the bound is
+    // the read's 50 posts of the WHOLE room, and what pushes the question out of it is irrelevant.
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: Array.from({ length: ROOM_WATCH_WINDOW }, (_, i) =>
+        roomPost({ id: `f:${100 + i}`, from: "alice", body: "chatter", refs: ["STUDIO-654"] }),
+      ),
+      skipped: [],
+    });
+    await act(async () => {
+      await client.invalidateQueries();
+    });
+    // react-query notifies its observers on a macrotask, so the awaited refetch alone does not
+    // mean the dock has SEEN the new window. Wait until it has — otherwise this test would pass
+    // against a dock that drops the answer, simply by asserting before the drop.
+    await waitFor(() =>
+      expect(document.querySelector(".memprev")?.textContent).toContain("chatter"),
+    );
+
+    // The manager's post, still there, still the room's own record of it.
+    expect(document.querySelector(".askex .mcard")?.textContent).toContain("It stopped at the");
+    expect(document.querySelector(".askex .qb")?.textContent).toBe("Why did this stop?");
+    expect(document.querySelector(".askex .pending")).toBeNull();
+  });
+
   // `refs` is caller-supplied on every post but the manager's `from` is host-stamped, so matching
   // on refs alone would render a teammate's — or a forged line's — prose as the manager's answer.
   it("never renders a non-manager post that names the question as the answer", async () => {
@@ -1743,6 +1834,24 @@ describe("the ask dock (§6)", () => {
     await waitFor(() => expect(document.querySelector(".trraw")).toBeTruthy());
     expect(document.querySelector(".askdock")).toBeNull();
     expect(document.querySelector(".trwatch")).toBeNull();
+  });
+});
+
+// The exchange card sits directly on top of the dock and is drawn as one control with it, so the
+// two borders that meet have to agree about their corners.
+describe("the ask card and the dock read as one control (STUDIO-733)", () => {
+  const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+
+  it("squares the corners where the card meets the dock, and only there", () => {
+    // The card gives up its bottom corners and its bottom border to the dock below it…
+    expect(css).toContain(
+      ".rh-console .askex { border: 1px solid var(--line); border-bottom: 0; " +
+        "border-radius: var(--r) var(--r) 0 0;",
+    );
+    // …and the dock gives up its top corners, but only while a card is there to meet them.
+    expect(css).toContain(
+      ".rh-console .askex + .askdock { border-radius: 0 0 var(--r) var(--r); }",
+    );
   });
 });
 

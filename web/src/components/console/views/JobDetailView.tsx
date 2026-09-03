@@ -62,10 +62,11 @@ import {
   type TraceFilter,
 } from "@/lib/console-trace-view";
 import {
-  ASK_PAST_WINDOW_NOTE,
-  ASK_WAITING_NOTE,
+  ASK_READING_NOTE,
+  askNote,
   managerReply,
   type AskedQuestion,
+  type AskOutcome,
 } from "@/lib/console-ask";
 import {
   DEFAULT_WATCH_TAB,
@@ -89,7 +90,7 @@ import {
   type SaidBlock,
   type TracePhase,
 } from "@/lib/trace-model";
-import type { LogEntry, RunSummary, TeamsFact } from "@/lib/api";
+import type { LogEntry, RunSummary, TeamsFact, TeamsRoomMessage } from "@/lib/api";
 import "@/theme/console-trace.css";
 
 // Job detail — the "Trace" run detail (STUDIO-742), the three zones of the design record
@@ -1751,7 +1752,7 @@ function AskDock({
           something true in order to report something else. The two say different things in
           different places, and the error sits with the box that produced it. */}
       {asked === null ? null : (
-        <AskExchange asked={asked} roster={roster} onOpenRoom={onOpenRoom} />
+        <AskExchange key={asked.id} asked={asked} roster={roster} onOpenRoom={onOpenRoom} />
       )}
       <div className="askdock">
         <span className="g" aria-hidden="true">
@@ -1803,6 +1804,11 @@ function AskDock({
  * cannot show different rooms and an open Room tab costs no second request. It is gated on a
  * question having landed — with nothing asked there is nothing to look up, and a dock that polled
  * the room regardless would make every run detail a room reader.
+ *
+ * It is KEYED on that question's id, which is load-bearing rather than a list-rendering habit: one
+ * exchange is one question, so mounting is exactly the moment the question landed. Both pieces of
+ * state below are scoped to it by that alone — the read gate measures "settled since this mounted",
+ * and the answer it holds is discarded when the operator asks something else.
  */
 function AskExchange({
   asked,
@@ -1815,7 +1821,31 @@ function AskExchange({
 }) {
   const room = useTeamsRoom(true, ROOM_WATCH_WINDOW);
   const messages = useMemo(() => room.data?.messages ?? [], [room.data]);
-  const outcome = useMemo(() => managerReply(messages, asked), [messages, asked]);
+  // `isFetchedAfterMount` is this exchange's own read gate, and it is exact because it counts
+  // updates rather than comparing clocks: it is true once the shared room query has settled since
+  // THIS exchange mounted, which — the card being keyed on the question — is since the question
+  // landed. Until then the newest data on the key can only be a window from before it, and its
+  // silence about the question means nothing (see [`managerReply`]). It also flips on a settled
+  // FAILURE, which costs nothing here: a failed read is reported as one below, before any note
+  // this outcome could choose.
+  const outcome = useMemo(
+    () => managerReply(messages, asked, room.isFetchedAfterMount),
+    [messages, asked, room.isFetchedAfterMount],
+  );
+  // The answer, once any read has shown it. A room log is append-only, so a reply that existed
+  // cannot stop existing: an `answered` outcome is a fact about the ROOM, while `past-window` is
+  // only ever a fact about the READ. Holding the former means the 50-post whole-room window
+  // scrolling past the question cannot replace an answer already on screen with "it cannot tell
+  // whether @manager replied" — a sentence that would be false at the moment it was shown, and the
+  // same disappearance the card is keyed and kept mounted to prevent. `waiting` is deliberately NOT
+  // held: it is a claim about the read too, and once the read has moved on it stops being true.
+  const [answer, setAnswer] = useState<TeamsRoomMessage | null>(null);
+  useEffect(() => {
+    if (outcome.kind !== "answered") return;
+    const { reply } = outcome;
+    setAnswer((held) => (held?.id === reply.id ? held : reply));
+  }, [outcome]);
+  const shown: AskOutcome = answer === null ? outcome : { kind: "answered", reply: answer };
   return (
     <div className="askex">
       <div className="qq">
@@ -1829,17 +1859,17 @@ function AskExchange({
           announced when the wait starts and then goes silent at the one moment it should speak:
           the note is REPLACED by the card, and a region that has unmounted announces nothing. */}
       <div className="askans" role="status">
-        {outcome.kind === "answered" ? (
+        {shown.kind === "answered" ? (
           <div className="mcard">
             <div className="top">
               {/* The room's own colour for this identity — `@manager` is not on the roster
                   (`RESERVED_IDENTITIES` keeps it off), so this resolves to the unknown-teammate
                   colour. That is the point: the Room tab resolves it exactly the same way, and one
                   identity must not wear two colours across two views of one post. */}
-              <span className="who2" style={{ color: teammateColor(roster, outcome.reply.from) }}>
-                {outcome.reply.from}
+              <span className="who2" style={{ color: teammateColor(roster, shown.reply.from) }}>
+                {shown.reply.from}
               </span>
-              <Timestamp>{clockTime(outcome.reply.at)}</Timestamp>
+              <Timestamp>{clockTime(shown.reply.at)}</Timestamp>
             </div>
             {/* The room post itself, through the room's own renderer — the manager's prose arrives
                 quoted line by line and its records under `From my own records —`, and that layout
@@ -1847,17 +1877,13 @@ function AskExchange({
                 would make this a second answer wearing the first one's name. A body the room read
                 had to cut carries the `…` `truncate_bytes` leaves on it, so this surface is
                 exactly as honest about its own bound as the room is. */}
-            <Markdown source={outcome.reply.body} />
+            <Markdown source={shown.reply.body} />
           </div>
         ) : (
           <div className="pending">
             {/* Never "answering" or "still thinking": nothing tells this page the manager has even
                 read the question, and `past-window` cannot tell whether it replied at all. */}
-            {emptyNote(
-              room,
-              "Posted to the room — reading it back…",
-              outcome.kind === "waiting" ? ASK_WAITING_NOTE : ASK_PAST_WINDOW_NOTE,
-            )}{" "}
+            {emptyNote(room, ASK_READING_NOTE, askNote(shown))}{" "}
             <a
               className="link"
               href="#teams"

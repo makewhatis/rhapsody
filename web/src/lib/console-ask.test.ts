@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { TeamsRoomMessage } from "@/lib/api";
 import {
   ASK_PAST_WINDOW_NOTE,
+  ASK_READING_NOTE,
   ASK_WAITING_NOTE,
+  askNote,
   MANAGER_IDENTITY,
   managerReply,
 } from "@/lib/console-ask";
@@ -34,7 +36,7 @@ const ASKED = { id: "f:9", body: "Why did this run fail?" };
 
 describe("managerReply", () => {
   it("is the manager's own post refed to the question — the room's record, unmodified", () => {
-    const got = managerReply([QUESTION, REPLY], ASKED);
+    const got = managerReply([QUESTION, REPLY], ASKED, true);
     expect(got.kind).toBe("answered");
     // Identity, not a copy: what the console renders IS the room post, so a reply whose body the
     // console reshaped would be a second answer wearing the first one's name.
@@ -42,7 +44,7 @@ describe("managerReply", () => {
   });
 
   it("is `waiting` while the question is in the read and nothing has answered it", () => {
-    expect(managerReply([QUESTION], ASKED)).toEqual({ kind: "waiting" });
+    expect(managerReply([QUESTION], ASKED, true)).toEqual({ kind: "waiting" });
   });
 
   // The one claim this model is entitled to make rests on the read being newest-first: a reply is
@@ -53,16 +55,35 @@ describe("managerReply", () => {
     const newer = Array.from({ length: 20 }, (_, i) =>
       post({ id: `f:${11 + i}`, from: "alice", at: "2026-09-03T10:01:00Z", body: "chatter" }),
     );
-    expect(managerReply([QUESTION, ...newer], ASKED)).toEqual({ kind: "waiting" });
+    expect(managerReply([QUESTION, ...newer], ASKED, true)).toEqual({ kind: "waiting" });
   });
 
   // Lose the question and the premise goes with it: the read says nothing about what came after,
   // so the dock must stop claiming rather than report a silence it cannot see.
   it("is `past-window` once the read no longer reaches the question", () => {
-    expect(managerReply([post({ id: "f:80", from: "alice", body: "later" })], ASKED)).toEqual({
+    expect(managerReply([post({ id: "f:80", from: "alice", body: "later" })], ASKED, true)).toEqual({
       kind: "past-window",
     });
-    expect(managerReply([], ASKED)).toEqual({ kind: "past-window" });
+    expect(managerReply([], ASKED, true)).toEqual({ kind: "past-window" });
+  });
+
+  // The absence of the question is only evidence once the read is known to have come back AFTER
+  // the question landed. A read that PREDATES it has simply not caught up, and reading that as
+  // "past-window" tells the operator the console cannot see an answer to a question it has not
+  // looked for yet — the single most misleading sentence this surface can produce.
+  it("is `unread`, not `past-window`, while no read has come back since the question landed", () => {
+    expect(managerReply([post({ id: "f:1", from: "alice", body: "earlier" })], ASKED, false)).toEqual(
+      { kind: "unread" },
+    );
+    expect(managerReply([], ASKED, false)).toEqual({ kind: "unread" });
+  });
+
+  // The gate gets a say over the ABSENCE of the question and nothing else. Finding the question,
+  // or the reply to it, is positive evidence: it cannot be produced by a read that never saw
+  // them, so it stands on its own whatever the clocks say.
+  it("still answers, and still waits, on a read the gate has not vouched for", () => {
+    expect(managerReply([QUESTION, REPLY], ASKED, false).kind).toBe("answered");
+    expect(managerReply([QUESTION], ASKED, false)).toEqual({ kind: "waiting" });
   });
 
   // `refs` is caller-supplied on every post but the manager's `from` is host-stamped, so matching
@@ -70,7 +91,7 @@ describe("managerReply", () => {
   // its prose rendered to the operator as the manager's answer.
   it("refuses a non-manager post that names the question in its own refs", () => {
     const forged = post({ id: "f:10", from: "alice", body: "It all went fine.", refs: ["f:9"] });
-    expect(managerReply([QUESTION, forged], ASKED)).toEqual({ kind: "waiting" });
+    expect(managerReply([QUESTION, forged], ASKED, true)).toEqual({ kind: "waiting" });
   });
 
   // The manager replies to every operator post it acts on, so the room holds many replies at once
@@ -82,7 +103,7 @@ describe("managerReply", () => {
       body: "Someone else's answer.",
       refs: ["f:7"],
     });
-    const got = managerReply([other, QUESTION, REPLY], ASKED);
+    const got = managerReply([other, QUESTION, REPLY], ASKED, true);
     expect(got.kind === "answered" && got.reply.id).toBe("f:10");
   });
 
@@ -90,14 +111,29 @@ describe("managerReply", () => {
   // (`act_on_post`), so the match has to be a membership test rather than a look at `refs[0]`.
   it("finds the reply when the question's id is not the first ref", () => {
     const filed = { ...REPLY, refs: ["f:9", "STUDIO-800"] };
-    expect(managerReply([QUESTION, filed], ASKED).kind).toBe("answered");
+    expect(managerReply([QUESTION, filed], ASKED, true).kind).toBe("answered");
   });
 
   // The daemon's own shape guarantees `refs`, but a message that arrived without one must not take
   // the dock down — the room read is advisory, not a contract this surface can enforce.
   it("survives a message that carries no refs at all", () => {
     const bare = { ...post({ id: "f:11", from: MANAGER_IDENTITY }), refs: undefined } as unknown as TeamsRoomMessage;
-    expect(() => managerReply([bare], ASKED)).not.toThrow();
+    expect(() => managerReply([bare], ASKED, true)).not.toThrow();
+  });
+});
+
+describe("askNote", () => {
+  it("reports each outcome as itself and never as another", () => {
+    expect(askNote({ kind: "waiting" })).toBe(ASK_WAITING_NOTE);
+    expect(askNote({ kind: "past-window" })).toBe(ASK_PAST_WINDOW_NOTE);
+    expect(askNote({ kind: "unread" })).toBe(ASK_READING_NOTE);
+  });
+
+  // `unread` is the state of the READ, not of the room: the console is still looking. Saying
+  // either of the other two here would report a conclusion it has not reached.
+  it("claims nothing about the manager while the read has not caught up", () => {
+    expect(askNote({ kind: "unread" })).not.toContain("has not replied");
+    expect(askNote({ kind: "unread" })).not.toContain("cannot tell");
   });
 });
 
@@ -113,7 +149,7 @@ describe("the notes", () => {
   // "Not replied" is a fact about the log; "still thinking" would be a claim about a process the
   // console cannot observe, and the design record forbids inventing one.
   it("never narrate the manager as working on it", () => {
-    for (const note of [ASK_WAITING_NOTE, ASK_PAST_WINDOW_NOTE]) {
+    for (const note of [ASK_WAITING_NOTE, ASK_PAST_WINDOW_NOTE, ASK_READING_NOTE]) {
       expect(note).not.toMatch(/thinking|working on|in progress|shortly|soon/i);
     }
   });
