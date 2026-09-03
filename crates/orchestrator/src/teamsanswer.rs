@@ -155,6 +155,14 @@ pub(crate) const MAX_FACT_LINE_CHARS: usize = 280;
 /// The most room posts one answer carries.
 pub(crate) const MAX_ROOM_POSTS: usize = 10;
 
+/// The most of the asked-about identifier that labels a grounding, in BYTES.
+///
+/// Wide enough for any ticket key or `pr:<owner>/<repo>#<n>` coordinate a real post carries, and
+/// narrow enough that it cannot spend [`MAX_GROUNDED_BYTES`]. The label is echoed back from the
+/// post so the operator sees their own words, which also makes it untrusted text of unbounded
+/// length — a reserve a pasted URL could zero is not a reserve.
+pub(crate) const MAX_ASKED_LABEL_BYTES: usize = 80;
+
 /// The most model-authored answer prose that may reach the room, in BYTES.
 ///
 /// A room reply is a durable, unauthenticated shared log, and the turn is asked for a sentence or
@@ -754,7 +762,13 @@ impl Facts {
             // "…". These records are the half that makes an unsupported claim visible, so what
             // drops out of them has to be the host's decision and has to be stated (§9.3).
             _ => {
-                let head = format!("{}: ", one_line(asked));
+                // **The label is clipped, because it is untrusted and has no length contract.** It
+                // is the operator's own spelling of what they asked about, and for a pasted pull
+                // request `gather_facts` builds it as `pr:<owner>/<repo>#<n>` with the owner and
+                // repo taken VERBATIM out of the post body. A long one would eat the whole reserve
+                // below and leave the records a budget of zero — turning the bound this function
+                // documents into one a paste could switch off.
+                let head = format!("{}: ", clip_bytes(&one_line(asked), MAX_ASKED_LABEL_BYTES));
                 let cap = MAX_GROUNDED_BYTES.saturating_sub(head.len());
                 format!("{head}{}", join_bounded(&lines, cap))
             }
@@ -1834,5 +1848,40 @@ mod tests {
             out.len()
         );
         assert!(out.contains(" of 4 records)"), "{out}");
+    }
+
+    /// A grounding's LABEL cannot spend the records' reserve.
+    ///
+    /// It is echoed back from the post so the operator sees their own words, and for a pasted pull
+    /// request `gather_facts` builds it from `owner`/`repo` taken VERBATIM out of the body —
+    /// `extract_pr_urls` splits on whitespace and `/` and constrains no character class, so both
+    /// are arbitrary text. MULTI-BYTE on purpose: [`one_line`] already bounds the label at
+    /// [`MAX_FACT_LINE_CHARS`] *characters*, which is 280 bytes of ASCII but three times that in
+    /// CJK — so an ASCII label cannot reach this bug and a test written with one would pass against
+    /// the very shape it is meant to rule out.
+    #[test]
+    fn a_long_asked_label_cannot_zero_the_records_reserve() {
+        let asked = format!("pr:{}/{}#12", "文".repeat(150), "書".repeat(150));
+        let f = resolved(
+            &asked,
+            Outcome {
+                key: asked.clone(),
+                runs: Runs {
+                    facts: vec![run(&asked, "completed", "alice")],
+                    ..Runs::default()
+                },
+                ..Outcome::default()
+            },
+        );
+        let line = f.grounded(&asked);
+        assert!(
+            line.len() <= MAX_GROUNDED_BYTES,
+            "the reserve must hold against the label too ({} bytes): {line}",
+            line.len()
+        );
+        assert!(
+            line.contains("run: completed"),
+            "and the record itself must still be in it: {line}"
+        );
     }
 }
