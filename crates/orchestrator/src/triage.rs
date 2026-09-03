@@ -512,6 +512,46 @@ pub struct TriageTarget {
     /// The configured summon token, so a host-composed reviewer instruction names the token THIS
     /// installation re-engages on.
     pub summon_token: String,
+    /// One project slug per entry of [`Self::trackers`], **positionally** — the set this team owns,
+    /// and therefore the scope every store read the manager's answer stands on is filtered by
+    /// (STUDIO-731; design record §9.1).
+    ///
+    /// The slugs are dropped from `trackers` above because triage SWEEPS every project and does not
+    /// care which client a ticket came through; the answer path does care, because the store is one
+    /// per daemon and has no notion of a Rhapsody team at all. An EMPTY slug is legitimate here —
+    /// it is what a legacy `tracker:` config writes into `runs.project_slug` — and
+    /// [`TeamScope`](crate::teamsknow::TeamScope) admits it as a value rather than treating it as
+    /// "no filter", which is precisely the distinction the store's own `project` filter cannot make.
+    pub slugs: Vec<String>,
+}
+
+/// What the manager reads an answer out of (STUDIO-731, slice 3).
+///
+/// A bundle rather than four fields on [`TriageDeps`] for [`TriageDeps::ears`]'s reason: these
+/// arrive together or not at all, and a caller that had three of them would build a
+/// [`Knowledge`](crate::teamsknow::Knowledge) that quietly answers about the wrong thing.
+///
+/// **No config struct is in here, and that is §9.4 enforced by the type.** The Teams, Memory and
+/// tracker structs hold an `api_key`, an endpoint and tracker credentials; what this carries is an
+/// already-resolved bank map and two trait objects, none of which can spell one.
+pub struct KnowledgeDeps {
+    /// The daemon's own store. Armed only for a DURABLE one: a `Noop` answers every read
+    /// `Ok(empty)`, which on this path would tell the operator their team has no history rather
+    /// than that this daemon keeps none.
+    pub store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    /// The memory backend `TeamsMemory` was built with — the same one, so a `bank:` override is
+    /// honoured by the reader and the writer alike.
+    pub memory: Arc<dyn rhapsody_config::memory::MemoryBackend>,
+    /// The daemon-wide identity → RESOLVED bank id map, taken whole from
+    /// [`TeamsMemory::bank_ids`](crate::teamsmemory::TeamsMemory::bank_ids) rather than re-derived:
+    /// a second copy of the `<prefix><name>`-unless-overridden rule is how one reader honours an
+    /// override that another ignores, and comparing a RAW override against a RESOLVED bank id is
+    /// the shape of the cross-team read the scope exists to refuse.
+    pub banks: std::collections::HashMap<String, String>,
+    /// The `gh` pull-request comment source. `None` simply means an answer is composed from the
+    /// daemon's own stores; the leg is gated again inside the accessor, which spends it only for a
+    /// pull request this team's own watch set says it reviews.
+    pub pr_comments: Option<Arc<dyn crate::ghsummons::SummonSource>>,
 }
 
 /// Everything [`run_triage_schedule`] runs against. The absence of an `Orchestrator`, a control
@@ -573,6 +613,10 @@ pub struct TriageDeps<TF> {
     /// the manager's own model budget — and because §0.13 puts it "off-loop, on the manager's
     /// budget". A second task would duplicate the fetch and race this one for the same turn budget.
     pub ears: Option<Arc<crate::teamsears::Ears>>,
+    /// What the manager's [`Answer`](crate::teamsears::Intent::Answer) outcome reads from
+    /// (STUDIO-731). `None` leaves the manager the router it was before slice 3 — every prompt
+    /// byte-identical, `Answer` unreachable — which is what a daemon with no durable store gets.
+    pub knowledge: Option<KnowledgeDeps>,
 }
 
 /// What one cycle did — the input to the back-off decision, and the assertion surface for the
@@ -1042,6 +1086,35 @@ where
         // for the same reason (§0.12 chose the free in-memory count over a tracker read), and the
         // direction of the error is benign: under-counting a backlog can only spread reviews wider.
         let ears_load = tally_load(&deps.teams, &issues);
+        // The team's identity, reconstructed for THIS cycle (§9.1). It is rebuilt per cycle rather
+        // than captured at boot because the project set comes from the reload, and a scope built
+        // from a stale one would either hide a project the team now owns or admit one it no longer
+        // does. Both halves are cheap: two `BTreeSet`s over a handful of strings.
+        let scope = deps.knowledge.as_ref().map(|kd| {
+            crate::teamsknow::TeamScope::new(
+                target.slugs.iter().cloned(),
+                deps.teams.roster.iter().map(|i| i.name.clone()),
+                &kd.banks,
+            )
+        });
+        // Borrowed for the length of the pass and no longer — the accessor holds handles the caller
+        // already owns, and holding nothing means it cannot outlive the issue snapshot it reads.
+        let knowledge = match (deps.knowledge.as_ref(), scope.as_ref()) {
+            (Some(kd), Some(scope)) => {
+                let mut k = crate::teamsknow::Knowledge::new(
+                    scope,
+                    &issues,
+                    kd.store.as_ref(),
+                    kd.memory.as_ref(),
+                )
+                .with_room(room.as_ref());
+                if let Some(gh) = kd.pr_comments.as_deref() {
+                    k = k.with_pr_comments(gh);
+                }
+                Some(k)
+            }
+            _ => None,
+        };
         let cycle = crate::teamsears::EarsCycle {
             trackers: &trackers,
             owner: &owner,
@@ -1054,6 +1127,7 @@ where
             agent_command: &deps.agent_command,
             billing_guard: deps.billing_guard,
             tracker_api_key: &deps.tracker_api_key,
+            knowledge: knowledge.as_ref(),
         };
         let heard =
             crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
@@ -2182,6 +2256,7 @@ mod tests {
             history: None,
             reconcile_marker: None,
             ears: None,
+            knowledge: None,
         }
     }
 
@@ -2228,6 +2303,7 @@ mod tests {
             history: None,
             reconcile_marker: None,
             ears: None,
+            knowledge: None,
         }
     }
 
@@ -2555,6 +2631,7 @@ mod tests {
                         pr_repo: "r".to_string(),
                     }],
                     summon_token: "@symphony".to_string(),
+                    slugs: Vec::new(),
                 })
             },
             arbiter: FakeArbiter::answering(Vec::new()),
@@ -2571,6 +2648,7 @@ mod tests {
                 dir.child("manager.cursor"),
                 Arc::new(NamesBob) as Arc<dyn crate::teamsears::RoomArbiter>,
             ))),
+            knowledge: None,
         };
 
         triage_cycle(&CancelWait::default(), &d, true).await;
@@ -2601,8 +2679,157 @@ mod tests {
                 key: "MT-2".to_string(),
                 intent: crate::teamsears::Intent::Assign,
                 assignee: Some("bob".to_string()),
+                answer: String::new(),
             }])
         }
+    }
+
+    /// A room turn that answers a QUESTION about a ticket the cycle never fetched — the STUDIO-731
+    /// shape, and the one that proves the wiring rather than the module.
+    struct AnswersAboutMt9;
+
+    #[async_trait::async_trait]
+    impl crate::teamsears::RoomArbiter for AnswersAboutMt9 {
+        async fn resolve(
+            &self,
+            req: &TriageRequest,
+        ) -> Result<Vec<crate::teamsears::Target>, String> {
+            // The prompt it was handed must already carry the store's own record: the whole point
+            // of `TriageDeps::knowledge` is that the gather happens before the turn, not after it.
+            if !req.prompt.contains("run: completed") {
+                return Err(format!(
+                    "the facts block never reached the room turn: {}",
+                    req.prompt
+                ));
+            }
+            Ok(vec![crate::teamsears::Target {
+                key: "MT-9".to_string(),
+                intent: crate::teamsears::Intent::Answer,
+                assignee: None,
+                answer: "MT-9's last run completed.".to_string(),
+            }])
+        }
+    }
+
+    /// **The wiring, end to end through a real cycle.** `TriageDeps::knowledge` becomes a
+    /// team-scoped [`Knowledge`](crate::teamsknow::Knowledge) over the cycle's own issues, reaches
+    /// the room prompt as DATA, and comes back as one room reply that wrote nothing.
+    ///
+    /// MT-9 is deliberately NOT among the candidates: a terminal ticket has fallen out of the
+    /// fetch, which is exactly the shape that used to answer "not found on any project this team
+    /// works" and is why this slice exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cycle_hands_the_manager_a_team_scoped_accessor_to_answer_from() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        room.append(&Message::room(
+            rhapsody_config::room::OPERATOR_IDENTITY,
+            Utc::now(),
+            "What was the result of MT-9?",
+        ))
+        .expect("append");
+        let mut tr = Fake::new();
+        // The cycle fetches something else entirely.
+        tr.candidates = vec![labelled("MT-2", &["rust"])];
+        let tr = Arc::new(tr);
+        let tr_for_target = Arc::clone(&tr);
+
+        // A real store holding a run of MT-9 on the team's own project slug.
+        let store = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open store"),
+        );
+        let id = rhapsody_store::Store::start_run(
+            store.as_ref(),
+            rhapsody_store::RunStart {
+                issue_id: "id-MT-9".to_string(),
+                issue_identifier: "MT-9".to_string(),
+                title: "MT-9 title".to_string(),
+                started_at: "2026-09-01T10:00:00Z".to_string(),
+                project_slug: "proj".to_string(),
+                ..rhapsody_store::RunStart::default()
+            },
+        )
+        .expect("start run");
+        rhapsody_store::Store::end_run(
+            store.as_ref(),
+            id,
+            rhapsody_store::RunEnd {
+                outcome: "completed".to_string(),
+                ended_at: "2026-09-01T12:00:00Z".to_string(),
+                ..rhapsody_store::RunEnd::default()
+            },
+        )
+        .expect("end run");
+
+        let d = TriageDeps {
+            teams: Arc::new(teams_model(vec![ident("alice", &["rust"])])),
+            target: move || {
+                Some(TriageTarget {
+                    trackers: vec![Arc::clone(&tr_for_target) as Arc<dyn Tracker>],
+                    states: states(),
+                    facts: vec![ProjectFacts {
+                        create_state: "Todo".to_string(),
+                        pr_owner: "o".to_string(),
+                        pr_repo: "r".to_string(),
+                    }],
+                    summon_token: "@symphony".to_string(),
+                    slugs: vec!["proj".to_string()],
+                })
+            },
+            arbiter: FakeArbiter::answering(Vec::new()),
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            interval: Duration::from_millis(5),
+            max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            history: None,
+            reconcile_marker: None,
+            ears: Some(Arc::new(crate::teamsears::Ears::new(
+                dir.child("manager.cursor"),
+                Arc::new(AnswersAboutMt9) as Arc<dyn crate::teamsears::RoomArbiter>,
+            ))),
+            knowledge: Some(KnowledgeDeps {
+                store: Arc::clone(&store) as Arc<dyn rhapsody_store::Store + Send + Sync>,
+                memory: Arc::new(rhapsody_config::memory::NoneBackend),
+                banks: [("alice".to_string(), "agent-alice".to_string())]
+                    .into_iter()
+                    .collect(),
+                pr_comments: None,
+            }),
+        };
+
+        triage_cycle(&CancelWait::default(), &d, true).await;
+
+        let replies: Vec<String> = room
+            .read_forward("", &rhapsody_config::room::Cursor::default(), 100)
+            .expect("read")
+            .messages
+            .into_iter()
+            .filter(|m| m.from == MANAGER_IDENTITY)
+            .map(|m| m.body)
+            .collect();
+        assert!(
+            replies
+                .iter()
+                .any(|b| b.contains("MT-9's last run completed")),
+            "the manager must answer about a ticket the cycle never fetched: {replies:?}"
+        );
+        // Scoped to MT-9 deliberately: the same cycle's ASSIGNMENT pass legitimately labels the
+        // candidate it fetched (MT-2), and an assertion that swept both would be pinning triage's
+        // ordinary behaviour rather than this feature's. What must hold is that the ticket the
+        // manager ANSWERED about was not touched at all.
+        assert!(
+            !tr.add_label_calls().iter().any(|c| c.issue_id == "MT-9"),
+            "answering must not label the ticket it answered about: {:?}",
+            tr.add_label_calls()
+        );
+        assert!(
+            tr.create_issue_calls().is_empty(),
+            "answering must file nothing: {:?}",
+            tr.create_issue_calls()
+        );
     }
 
     // ── the durable room record (STUDIO-650, T5) ────────────────────────────────────────────────
@@ -3110,6 +3337,7 @@ mod tests {
             history: None,
             reconcile_marker: None,
             ears: None,
+            knowledge: None,
         };
         assert_eq!(
             triage_cycle(&CancelWait::default(), &d, true).await,
@@ -3710,6 +3938,7 @@ mod tests {
             history: Some(history),
             reconcile_marker: None,
             ears: None,
+            knowledge: None,
         }
     }
 
@@ -4468,6 +4697,7 @@ mod tests {
                     states: snap.states,
                     facts: snap.facts,
                     summon_token: snap.summon_token,
+                    slugs: Vec::new(),
                 })
             },
             arbiter: Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
@@ -4487,6 +4717,7 @@ mod tests {
             history: None,
             reconcile_marker: None,
             ears: None,
+            knowledge: None,
         };
         let signal = crate::control_loop::CancelSignal::new();
         let ctx = signal.wait();

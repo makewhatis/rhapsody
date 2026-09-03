@@ -9,9 +9,14 @@
 // model.
 //
 // DEPENDENCY (§9/§11): the PULL REQUEST has no daemon source and is NOT invented here — no
-// endpoint serves a PR number, its checks or its mergeability. The card below renders from a
-// `PullRequestView` a caller supplies; the app has no such caller yet and shows the dependency in
-// its place rather than fabricating a PR.
+// endpoint serves a PR number, its checks or its mergeability.
+//
+// DORMANT, deliberately: STUDIO-745 folded the §4 side cards into the run detail's watch-tabs
+// rail, and the Diff tab names that dependency now — so `PullRequestView`, `checksSummary` and
+// `mergeNote` below currently have NO consumer outside their own tests. They are kept rather than
+// deleted because slice 7 of the Trace plan (the run-branch diff endpoint plus a live Merge) is
+// what will supply the `PullRequestView` this was written for, and a Merge control cannot decide
+// anything without exactly these two rules. Delete them if that slice is ever dropped.
 import type { RunSummary } from "@/lib/api";
 import type { ConsoleJobStatus } from "@/lib/console-jobs";
 

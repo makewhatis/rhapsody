@@ -10,6 +10,11 @@
 //
 // All inherit `currentColor`, so `.chk.ok` and `.chk.bad` tint them with no extra props, exactly
 // as the prototype's CSS does.
+//
+// DORMANT since STUDIO-745: the CI-check glyphs (`TickGlyph`, `PendingGlyph`) drew the §4
+// pull-request card, which the watch-tabs rail's Diff tab replaced. They are kept with the model
+// they render (`lib/console-job-detail`'s `checksSummary`/`mergeNote`, which carries the same
+// note) for slice 7's live Merge. `CrossGlyph` is still drawn, by the Memory page.
 import type { ReactNode, SVGProps } from "react";
 
 type Glyph = Omit<SVGProps<SVGSVGElement>, "viewBox" | "children">;

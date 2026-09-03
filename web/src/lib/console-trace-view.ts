@@ -1,4 +1,4 @@
-import type { RunSummary } from "@/lib/api";
+import type { RunDetail, RunSummary } from "@/lib/api";
 import { formatTokens, runDuration } from "@/lib/format";
 import { fenceSpans, inlineText } from "@/lib/markdown";
 import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "@/lib/trace-model";
@@ -327,4 +327,162 @@ export function leadParagraph(source: string): string {
     match = re.exec(text);
   }
   return text;
+}
+
+// --- slice 3: the live playhead, the failed run's jump, and the attempt relay ----------------
+//
+// STUDIO-744. Three states the completed-run hero of slice 2 does not cover (design record §3,
+// §4, §9 slice 3): a run still streaming, a run that died, and a ticket whose work relayed across
+// more than one run.
+
+/** The one outcome that means "still going" (`crates/store/src/types.rs`'s `OUTCOME_RUNNING`). */
+export const OUTCOME_RUNNING = "running";
+
+/**
+ * The issue-history row with the 2s run-detail poll's fresher telemetry folded in.
+ *
+ * `GET /api/v1/issues/{id}/history` is fetched once and cached for 10s, which is the right cadence
+ * for the ATTEMPT LIST and the wrong one for the attempt being watched: a live run's turns, tokens
+ * and — the one that matters — its terminal outcome all move while the page is open. `GET
+ * /api/v1/runs/{id}` is the endpoint that already answers that at 2s, so the header reads the row
+ * for identity and the poll for telemetry rather than a second history fetch.
+ *
+ * Two guards, both about not asserting something the caller did not ask for. The detail must be
+ * THIS run's — react-query hands back the previous key's data for one render on a key change, and
+ * an overlay of run 522's turn count onto run 547 is a number nobody served. And only a row that
+ * is still RUNNING is overlaid at all: the live snapshot outlives the run by a poll interval or
+ * two (`run_detail_from_running` reports `outcome: running` for anything still in the map), and
+ * resurrecting a finished run would put the header back into Stop-and-streaming. `running` is
+ * also the only in-flight shape there is to admit — `start_run` inserts every row with
+ * `OUTCOME_RUNNING` (`crates/store/src/sqlite.rs`), so an ""-outcome row is not a run in progress.
+ */
+export function liveRunRow(row: RunSummary, detail: RunDetail | undefined): RunSummary {
+  if (detail === undefined || detail.run_id !== row.id) return row;
+  if (row.outcome !== OUTCOME_RUNNING) return row;
+  return {
+    ...row,
+    outcome: detail.outcome,
+    ended_at: detail.ended_at,
+    error: detail.error,
+    turns: detail.turn_count,
+    input_tokens: detail.input_tokens,
+    output_tokens: detail.output_tokens,
+    total_tokens: detail.total_tokens,
+    usage_estimated: detail.usage_estimated,
+  };
+}
+
+/**
+ * The phase the playhead sits on: the NEWEST, which is the one a streaming run is writing into.
+ *
+ * The spine is in transcript order, so this is simply the last — but it is named, because it is
+ * the whole difference between a live run and a finished one. A finished run opens on its first
+ * phase (you read a trace forwards); a live run opens on its last and moves with it.
+ */
+export function playheadPhase(phases: readonly TracePhase[]): TracePhase | undefined {
+  return phases.length === 0 ? undefined : phases[phases.length - 1];
+}
+
+/** Where the Result card's "jump to failing step →" lands (design record §3B). */
+export interface FailingStep {
+  phaseId: string;
+  /** The `seq` of the first failing call in that phase, to auto-expand; null when it has none. */
+  cardSeq: number | null;
+}
+
+/**
+ * The first failing step of a trace, or `null` when nothing failed.
+ *
+ * FIRST, not last: a failure cascades — a failed build fails the test run after it — and the step
+ * an operator has to read is the one that broke, not the last thing that noticed. The phase can be
+ * failed with no failing CALL (the model raises `failed` from an error side effect too), which is
+ * still a step worth jumping to; only the auto-expand has nothing to open.
+ */
+export function failingStep(phases: readonly TracePhase[]): FailingStep | null {
+  const phase = phases.find((p) => p.failed);
+  if (phase === undefined) return null;
+  return { phaseId: phase.id, cardSeq: phase.did.find((card) => card.failed)?.seq ?? null };
+}
+
+/** The `pr:` prefix every ticketless review run's key carries (`crates/orchestrator/src/review.rs`). */
+const REVIEW_KEY_PREFIX = "pr:";
+
+/**
+ * The teammate a run wore, as far as a SERVED field can say — "" when nothing can.
+ *
+ * Two sources, and deliberately no third. A ticketless review run's key IS
+ * `pr:owner/repo#<n>@<reviewer>` (`crates/orchestrator/src/review.rs`), so the reviewer's identity
+ * is carried by the run's own identifier and needs nothing else. Every other run falls back to the
+ * ticket's DURABLE assignee (STUDIO-735), which is per-TICKET rather than per-run.
+ *
+ * That fallback is the honest limit of this slice: `runs` has no identity column — the routing
+ * decision lives in a `teams.route` EVENT (`crates/store/src/types.rs` says so in as many words)
+ * — and the one endpoint that resolves it, `/api/v1/history/issues`, answers per issue and not per
+ * attempt. So two attempts of one ticket resolve to the same name today, and [`relayBatons`] says
+ * "run 522 → run 547" rather than inventing a second teammate. Slice 5 (STUDIO-746) wires the
+ * per-run identity in, and this is the only function it has to change.
+ */
+export function runTeammate(run: RunSummary, assignee: string): string {
+  const key = run.issue_identifier.trim();
+  if (key.startsWith(REVIEW_KEY_PREFIX)) {
+    // The `@` is what makes the suffix a NAME. `is_review_key` only checks the prefix, so a `pr:`
+    // key that carries no reviewer is a shape this has to answer for — and `lastIndexOf` returning
+    // -1 would otherwise slice from 0 and render the whole coordinate as if it were a teammate.
+    const at = key.lastIndexOf("@");
+    return at < 0 ? "" : key.slice(at + 1).trim();
+  }
+  return assignee.trim();
+}
+
+/** One handoff baton — the relay between two of a ticket's runs (design record §3C/§6). */
+export interface Baton {
+  /** The teammate who handed off; "" when none resolves. */
+  from: string;
+  /** The teammate who picked up; "" when none resolves. */
+  to: string;
+  /** What the spine row reads: "alice → jimmy", or the run relay when one identity covers both. */
+  text: string;
+}
+
+/** The batons either side of the attempt being read. */
+export interface RelayBatons {
+  /** Handed TO this run by the attempt before it; null when this is the ticket's first run. */
+  incoming: Baton | null;
+  /** Handed OUT of this run to the attempt after it; null when this is the newest. */
+  outgoing: Baton | null;
+}
+
+/**
+ * The relay markers the spine draws around one attempt.
+ *
+ * `runs` is newest-first, as `runsNewestFirst` orders the attempt selector, so a run's predecessor
+ * is the element AFTER it. A run the list does not contain gets no baton at all rather than a
+ * neighbour picked by position — the selector can hold a run the history has since re-paged out.
+ */
+export function relayBatons(
+  runs: readonly RunSummary[],
+  run: RunSummary,
+  assignee: string,
+): RelayBatons {
+  const at = runs.findIndex((r) => r.id === run.id);
+  if (at < 0) return { incoming: null, outgoing: null };
+  const previous = runs[at + 1];
+  const next = runs[at - 1];
+  return {
+    incoming: previous === undefined ? null : baton(previous, run, assignee),
+    outgoing: next === undefined ? null : baton(run, next, assignee),
+  };
+}
+
+function baton(from: RunSummary, to: RunSummary, assignee: string): Baton {
+  const who = runTeammate(from, assignee);
+  const took = runTeammate(to, assignee);
+  if (who !== "" && took !== "" && who !== took) {
+    return { from: who, to: took, text: `${who} → ${took}` };
+  }
+  // One identity, or none: naming it twice would read as a teammate handing to herself, which is
+  // not what happened — the ticket relayed across two RUNS. So the runs are what the row names.
+  const relay = `run ${from.id} → run ${to.id}`;
+  const only = who === "" ? took : who;
+  return { from: who, to: took, text: only === "" ? relay : `${only} · ${relay}` };
 }
