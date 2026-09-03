@@ -23,6 +23,7 @@ import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
 import { ManageTeamView } from "./ManageTeamView";
 import { MemoryView } from "./MemoryView";
+import { ReviewsView } from "./ReviewsView";
 import { SettingsView } from "./SettingsView";
 import { LogsView, ToolsView, UpdatesView } from "./SettingsTabView";
 import { WorkflowView } from "./WorkflowView";
@@ -166,7 +167,10 @@ function ConsoleBody({
   // guessing: one frame of blank beats a placeholder for a view that may be about to redirect.
   if (
     teamsEnabled === undefined &&
-    (route.name === "teams" || route.name === "memory" || route.name === "manage")
+    (route.name === "teams" ||
+      route.name === "memory" ||
+      route.name === "manage" ||
+      route.name === "reviews")
   ) {
     return null;
   }
@@ -208,6 +212,10 @@ function ConsoleBody({
       return <MemoryPage go={go} />;
     case "manage":
       return <ManageTeamView onNavigate={(to) => go(to)} />;
+    // The ticketless review watch set and its two operator controls (STUDIO-722, design §15-e).
+    // A Teams child like `manage`, and gated the same way.
+    case "reviews":
+      return <ReviewsView onNavigate={(to) => go(to)} />;
     default:
       return <JobsView onOpenJob={(issue) => go("job", issue)} />;
   }

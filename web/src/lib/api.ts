@@ -1122,6 +1122,78 @@ export async function postTeamsRoom(body: string, refs: string[] = []): Promise<
   return postJSON<TeamsRoomPost>("/api/v1/teams/room", { body, refs });
 }
 
+// --- ticketless review console (STUDIO-722, slice 8; Rhapsody-only, no Go v0.4.0 mirror) ---
+//
+// Unlike the `/api/v1/teams*` routes above, `GET /api/v1/reviews` ANSWERS on a daemon that has the
+// subsystem off — `{enabled: false, reviews: []}` — because it is the surface's own capability
+// probe: `DaemonVersion.teams_enabled` carries the Teams half of the §16 gate and nothing tells the
+// app the review MODE. It still must not be fetched with Teams off (see `useReviews`), for the same
+// reason nothing above is: an app on a Teams-off daemon makes no review requests at all.
+
+// ReviewJob is one (PR, reviewer) row of the daemon's watch set. The granularity is per-reviewer,
+// not per-PR: a single reviewed-SHA per pull request would let the first completer stamp it as
+// reviewed and silently drop a second reviewer whose run crashed.
+export interface ReviewJob {
+  owner: string;
+  repo: string;
+  number: number;
+  /** The teammate holding this review. */
+  reviewer: string;
+  /** The teammate whose hand-off produced the pull request; "" ⇒ unknown. */
+  author: string;
+  /** How the PR entered the watch set, e.g. `handoff:STUDIO-720`. */
+  introduced_by: string;
+  /** The head SHA a reviewer run was dispatched against; "" until one has been. */
+  requested_sha: string;
+  /** The head SHA a completed review actually read; "" until this reviewer finished a round. */
+  last_reviewed_sha: string;
+  /** `requested` | `in_flight` | `reviewed` | `approved` | `truncated` | `dropped`. */
+  status: string;
+  /** Whether the PR is still open. `false` is merged, closed, gone or dismissed. */
+  open: boolean;
+}
+
+// ReviewsResponse is GET /api/v1/reviews. `enabled: false` means Teams is off or the review mode
+// is not `ticketless` — the surface renders nothing and offers no control.
+export interface ReviewsResponse {
+  enabled: boolean;
+  reviews: ReviewJob[];
+}
+
+// ReviewActionResponse is the 200 body of either control: which PR was acted on, and how many
+// watch-set rows changed. `rows: 0` is a success, not an error — every row already had a review in
+// flight.
+export interface ReviewActionResponse {
+  pr: string;
+  rows: number;
+}
+
+export async function fetchReviews(): Promise<ReviewsResponse> {
+  const r = await getJSON<ReviewsResponse>("/api/v1/reviews");
+  r.reviews ??= [];
+  return r;
+}
+
+// postReviewRerun asks the daemon for one more review round of a WATCHED pull request. It is the
+// TRUSTED operator lever (design §15-e): the daemon re-validates the coordinate — including the
+// watched-repo allowlist — and can only ever re-arm a row that already exists, so this cannot
+// introduce a pull request into the watch set.
+export async function postReviewRerun(job: ReviewJob): Promise<ReviewActionResponse> {
+  return postJSON<ReviewActionResponse>("/api/v1/reviews/rerun", prBody(job));
+}
+
+// postReviewDismiss drops a pull request out of the watch set — the same terminal a merge or a
+// close reaches. A soft delete: the row stays listed as `dropped`, carrying what was reviewed.
+export async function postReviewDismiss(job: ReviewJob): Promise<ReviewActionResponse> {
+  return postJSON<ReviewActionResponse>("/api/v1/reviews/dismiss", prBody(job));
+}
+
+// Both controls act on the PULL REQUEST, so the body carries the coordinate and NOT the reviewer:
+// a two-reviewer round is one round, and re-running half of it is not a thing to offer.
+function prBody(job: ReviewJob) {
+  return { owner: job.owner, repo: job.repo, number: job.number };
+}
+
 export async function fetchTeamsConfig(): Promise<TeamsConfigView> {
   return getJSON<TeamsConfigView>("/api/v1/teams/config");
 }

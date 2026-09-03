@@ -267,7 +267,11 @@ pub(crate) fn review_round_due(row: &ReviewWatchRow, head: &str, in_flight_now: 
 
 /// The per-PR churn key: `owner/repo#number`, case-folded so two spellings of one repository cannot
 /// each get their own budget.
-fn churn_key(pr: &PrCoord) -> String {
+///
+/// `pub(crate)` for [`crate::reviewconsole`]: the operator's re-run and dismiss both retire a pull
+/// request's budget, and a second spelling of this key would give them a different one from the
+/// watcher's.
+pub(crate) fn churn_key(pr: &PrCoord) -> String {
     format!("{}/{}#{}", pr.owner, pr.repo, pr.number).to_ascii_lowercase()
 }
 
@@ -712,6 +716,7 @@ mod tests {
     const REPO: &str = "rhapsody";
     const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HEAD_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
     fn ident(name: &str, max_concurrent: i64) -> Identity {
         Identity {
@@ -1312,6 +1317,106 @@ mod tests {
             REVIEW_ROUNDS_PER_PR_CAP * 2,
             "eight ROUNDS of two reviewers is sixteen dispatches, not eight"
         );
+    }
+
+    /// **The console's re-run reaches a real dispatch, through a SPENT churn budget** (STUDIO-722).
+    ///
+    /// This is the end-to-end half of slice 8's "re-run enqueues an in-process re-review": the
+    /// operator's lever exists precisely for a pull request the daemon has stopped reviewing, and
+    /// the two states that stop it are "approved at the current head" and "out of budget". A re-run
+    /// that only re-armed the row would accept the click, defer on the cap, and never review — a
+    /// button that silently does nothing, which is worse than one that is not there.
+    #[test]
+    fn an_operator_rerun_dispatches_a_pull_request_the_churn_cap_had_stopped() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        // Burn the whole budget: one round per head, each completed so the next is due.
+        for round in 0..REVIEW_ROUNDS_PER_PR_CAP {
+            let head = format!("{round:040}");
+            o.handle_review_sweep(&[open_at(12, &head)]);
+            complete(&mut o, 12, "bob", &head);
+        }
+        let spent = dispatched.lock().expect("lock").len();
+        assert_eq!(spent, REVIEW_ROUNDS_PER_PR_CAP);
+
+        // The cap now refuses even a genuine push — which is what it is for.
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 0);
+        assert_eq!(dispatched.lock().expect("lock").len(), spent);
+
+        // The operator overrides it from the authenticated console.
+        assert_eq!(
+            o.handle_review_rerun(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched,
+            1,
+            "the re-run must reach a dispatch, not merely a re-armed row"
+        );
+        assert_eq!(dispatched.lock().expect("lock").len(), spent + 1);
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    /// **A re-run buys exactly the re-read it asked for, and not a fresh budget** (STUDIO-722).
+    ///
+    /// The cap (§14.2) is the floor under a force-push loop, so an operator clicking through it must
+    /// not reset it: clearing the counter outright would hand an already-runaway pull request eight
+    /// more UNATTENDED rounds, which is the very cost the cap exists to bound. Refunding one round
+    /// gives the operator the read they asked for and leaves the cap holding the line behind them.
+    #[test]
+    fn an_operator_rerun_refunds_one_round_and_not_the_whole_budget() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        for round in 0..REVIEW_ROUNDS_PER_PR_CAP {
+            let head = format!("{round:040}");
+            o.handle_review_sweep(&[open_at(12, &head)]);
+            complete(&mut o, 12, "bob", &head);
+        }
+        let spent = dispatched.lock().expect("lock").len();
+
+        // One re-run, one round.
+        assert_eq!(
+            o.handle_review_rerun(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+        complete(&mut o, 12, "bob", HEAD_B);
+        assert_eq!(dispatched.lock().expect("lock").len(), spent + 1);
+
+        // And then the cap is holding again: the NEXT push is deferred exactly as it was before the
+        // operator intervened, rather than running free for another whole budget.
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_C)]).dispatched,
+            0,
+            "a re-run must not reset the churn budget, only refund the round it spent"
+        );
+        assert_eq!(dispatched.lock().expect("lock").len(), spent + 1);
+    }
+
+    /// The other half: a dismissal stops the watcher dead. The pull request is still open and its
+    /// head still moves, and neither fact brings it back — the row left the watch set.
+    #[test]
+    fn an_operator_dismissal_stops_the_watcher_dispatching_that_pull_request() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(13, "bob"));
+
+        assert_eq!(
+            o.handle_review_dismiss(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+
+        assert!(
+            !o.review_watch_coords().contains(&coord(12)),
+            "a dismissed pull request is not even polled"
+        );
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
+        assert!(dispatched.lock().expect("lock").is_empty());
+
+        // Its neighbour is untouched: dismissal is per pull request, not a global stop.
+        assert_eq!(o.handle_review_sweep(&[open_at(13, HEAD_A)]).dispatched, 1);
     }
 
     /// The budget belongs to a pull request, not to the daemon: a second pull request gets its own,
