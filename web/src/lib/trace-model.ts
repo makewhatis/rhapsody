@@ -1021,15 +1021,16 @@ function clip(text: string, max: number): string {
 /**
  * The headline for a run that wrote no usable prose — a crash, a stop, or a run still going. The
  * acceptance is that this is never empty: an empty Result card would read as "nothing happened".
+ *
+ * It names the ENDING and not the run's `error` string, which has its own home: the Result card's
+ * §3B banner renders that string for every failed or stopped run, whether or not there was prose,
+ * so repeating it here printed the same sentence twice in adjacent lines of the same card.
  */
 function fallbackHeadline(run?: RunSummary): string {
   if (run === undefined) return "No hand-off recorded.";
-  const error = run.error.trim();
   switch (run.outcome) {
     case "failed":
-      return error === ""
-        ? "The run failed before handing off."
-        : `The run failed — ${clip(error, MAX_HEADLINE)}`;
+      return "The run failed before handing off.";
     case "running":
     case "continued":
       return "Still running — no hand-off yet.";

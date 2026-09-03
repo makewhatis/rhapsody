@@ -40,13 +40,54 @@ export interface RunVitals {
 }
 
 export function runVitals(run: RunSummary, phases: readonly TracePhase[]): RunVitals {
+  const branch = runBranch(run);
   return {
     duration: runDuration(run.started_at, run.ended_at),
     turns: `${run.turns} ${run.turns === 1 ? "turn" : "turns"}`,
     tokens: `${run.usage_estimated ? "~" : ""}${formatTokens(run.total_tokens)}`,
-    branch: run.branch.trim() === "" ? DASH : run.branch,
+    branch: branch === "" ? DASH : branch,
     tools: phases.reduce((n, phase) => n + phase.did.length, 0),
   };
+}
+
+/**
+ * The workspace key a ticket identifier gets — the JS mirror of the daemon's `sanitize_key`
+ * (`crates/workspace/src/sanitize.rs`): every scalar outside `[A-Za-z0-9._-]` becomes one `_`, and
+ * a result that would name the workspace root or its parent becomes `_`.
+ *
+ * A Linear identifier ("STUDIO-742") passes through untouched, so this only ever matters for a
+ * tracker whose keys are not; approximating it with the raw identifier would name a branch the
+ * daemon never creates.
+ */
+function workspaceKey(identifier: string): string {
+  const key = [...identifier].map((c) => (/[A-Za-z0-9._-]/.test(c) ? c : "_")).join("");
+  return key === "" || key === "." || key === ".." ? "_" : key;
+}
+
+/**
+ * The run's workspace branch: the row's own `branch` when the daemon served one, else the name the
+ * daemon's branch naming DETERMINES for this ticket.
+ *
+ * `runs.branch` is empty on every row the store has ever written — `persist_start_run`
+ * (`crates/orchestrator/src/persist.rs`) leaves it at its default "for Phase 4" and is the column's
+ * only writer — so reading it alone leaves this vital, and the PR search built on it, permanently
+ * blank. The fallback is a fact rather than a guess: `Repo::ensure_from_repo` and
+ * `Repo::ensure_clone_from_repo` (`crates/workspace/src/repo.rs`) both name the branch
+ * `symphony/{sanitize_key(identifier)}`, and that prefix is a frozen cross-process contract the
+ * README's Divergences puts explicitly out of scope for renaming.
+ *
+ * The one run this does NOT describe is a review run, which gets a detached worktree and creates no
+ * branch of its own (`crates/workspace/src/repo.rs`) — but the branch it reviews is the same
+ * `symphony/<key>`, so the name still points at the work, and what is built from it below is a
+ * SEARCH, which answers "no such branch" honestly rather than 404ing.
+ */
+export function runBranch(run: RunSummary): string {
+  const served = run.branch.trim();
+  if (served !== "") return served;
+  const identifier = run.issue_identifier.trim();
+  // No ticket, no branch: the daemon would name this workspace `_`, and searching for
+  // `symphony/_` finds nothing anyone was looking for.
+  return identifier === "" ? "" : `symphony/${workspaceKey(identifier)}`;
 }
 
 /**
@@ -129,6 +170,29 @@ export function resultEyebrow(run: RunSummary, source: ResultCard["source"]): Re
   }
 }
 
+/** The Result card's failure banner: the run's own `error` string, with the tone §3B gives it. */
+export interface ResultBanner {
+  /** "Error" for a failure, "Reason" for an operator stop — what the string in front of you IS. */
+  label: string;
+  tone: Extract<ResultTone, "fail" | "stop">;
+  text: string;
+}
+
+/**
+ * The banner the Result card shows above its headline, or `null` when the run recorded no error.
+ *
+ * Design record §3B: "Failed -> red banner + error; Stopped -> amber reason". This is deliberately
+ * INDEPENDENT of whether the run wrote a hand-off: a run that hands off and then fails keeps its
+ * prose headline, and the error is the whole reason an operator opened the view. The eyebrow says
+ * THAT it ended badly; only this says why.
+ */
+export function resultBanner(run: RunSummary): ResultBanner | null {
+  const text = run.error.trim();
+  if (text === "") return null;
+  const stopped = run.outcome === "stopped" || run.outcome === "interrupted";
+  return { label: stopped ? "Reason" : "Error", tone: stopped ? "stop" : "fail", text };
+}
+
 /**
  * "owner/name" for a GitHub remote, "" for anything else.
  *
@@ -148,12 +212,13 @@ export function githubRepo(repo: string): string {
 /**
  * Where "View PR" goes. No daemon endpoint serves a PR number (design record §5), so the link is a
  * head-branch SEARCH on the run's own remote — it resolves to this branch's pull request without
- * the console ever asserting one exists. "" when either half is missing, and the action then names
- * its dependency instead of offering a link that would 404.
+ * the console ever asserting one exists. A search is also what makes [`runBranch`]'s fallback safe:
+ * a branch that turns out not to exist returns an empty result page, never a wrong pull request.
+ * "" only when the remote is not a GitHub one, and the action then names that dependency.
  */
 export function prSearchUrl(run: RunSummary): string {
   const repo = githubRepo(run.repo);
-  const branch = run.branch.trim();
+  const branch = runBranch(run);
   if (repo === "" || branch === "") return "";
   return `https://github.com/${repo}/pulls?q=${encodeURIComponent(`is:pr head:${branch}`)}`;
 }
@@ -181,20 +246,48 @@ export function phaseGlyph(kind: PhaseKind): string {
   return PHASE_GLYPHS[kind];
 }
 
+/** The lead's plain text, through the SAME inline parse the headline was stripped with. */
+function plainLead(source: string): string {
+  return inlineText(source.replace(/!\[/g, "["))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** How many sentence boundaries of a lead are worth testing against the headline. */
+const LEAD_SENTENCE_SCAN = 8;
+
 /**
  * The markdown the Result card should print under its H1, or "" when the H1 already says it.
  *
- * The slice-1 model derives the headline FROM the lead, so printing both verbatim shows the run's
- * opening sentence twice — the common shape, since a hand-off usually opens with one line and then
- * goes straight to `## What changed`. The comparison strips the lead's inline markdown through the
- * STUDIO-739 renderer's own parse, which is the same pass the headline went through, so a lead of
- * `Photo attachment **shipped**.` is recognised as the headline it produced.
+ * The slice-1 model GROWS the headline out of the lead's opening sentences, so the two are equal
+ * only when the lead is exactly one sentence long. The far commoner real shape is "the headline,
+ * and then more" — measured over the 441 recorded runs, requiring whole-lead equality left 184 of
+ * them (41.7%) printing their own H1 again immediately under it. So the sentence PREFIX that
+ * produced the headline is dropped and the rest kept, and a lead the headline already contains
+ * whole is dropped entirely.
+ *
+ * Both comparisons run the lead through the STUDIO-739 renderer's own inline parse — the same pass
+ * the headline went through — so a lead of `Photo attachment **shipped**.` is recognised as the
+ * headline it produced. A headline the model CLIPPED ends in an ellipsis and is matched as a
+ * prefix, since the sentence behind it is longer than the H1 that showed it.
  */
 export function cardLead(card: ResultCard): string {
   const lead = card.lead.trim();
   if (lead === "") return "";
-  const plain = inlineText(lead.replace(/!\[/g, "[")).replace(/\s+/g, " ").trim();
-  return plain === card.headline ? "" : lead;
+  const clipped = card.headline.endsWith("…");
+  const target = clipped ? card.headline.slice(0, -1).trimEnd() : card.headline;
+  const isHeadline = (text: string) => (clipped ? text.startsWith(target) : text === target);
+  const whole = plainLead(lead);
+  if (isHeadline(whole)) return "";
+  // The headline can also be GROWN past the lead — the model reaches into the next paragraph when
+  // the opening sentence is a bare "Done." — in which case the H1 already carries the whole lead.
+  if (!clipped && target.startsWith(whole)) return "";
+  const re = /(?<=[.!?])\s+/g;
+  for (let n = 0, match = re.exec(lead); match !== null && n < LEAD_SENTENCE_SCAN; n += 1) {
+    if (isHeadline(plainLead(lead.slice(0, match.index)))) return lead.slice(match.index).trim();
+    match = re.exec(lead);
+  }
+  return lead;
 }
 
 /**

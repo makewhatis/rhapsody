@@ -1,19 +1,17 @@
 import { describe, expect, it } from "vitest";
-import type { LogEntry, RunSummary } from "@/lib/api";
+import type { RunSummary } from "@/lib/api";
 import {
-  buildJobSummary,
   checksSummary,
   clockTime,
   mergeNote,
-  runDescription,
-  runMeta,
   runOutcomePill,
   runsNewestFirst,
-  transcriptTimeline,
   type PullRequestView,
 } from "./console-job-detail";
 
-const NOW = Date.parse("2026-09-01T20:00:00Z");
+// STUDIO-742 removed the §4 summary strip, run `.rmeta` line, run one-liner and flat transcript
+// timeline along with the view that showed them; their tests went with them. What the "Trace"
+// zones still consume from this module is covered below.
 
 function run(over: Partial<RunSummary> & Pick<RunSummary, "id">): RunSummary {
   return {
@@ -65,55 +63,6 @@ describe("clockTime", () => {
   });
 });
 
-describe("buildJobSummary", () => {
-  // §10 box 2.9 — the summary strip's fields come from /issues/<key>/history.
-  it("derives every strip field from the run rows", () => {
-    const summary = buildJobSummary(
-      [
-        run({ id: 522, started_at: "2026-08-30T20:21:00Z", ended_at: "2026-08-30T20:45:00Z" }),
-        run({ id: 547, branch: "symphony/STUDIO-654", ended_at: "2026-09-01T19:15:00Z" }),
-      ],
-      { assignee: "alice", nowMs: NOW },
-    );
-    expect(summary).toMatchObject({
-      status: "review",
-      statusLabel: "in review",
-      assignee: "alice",
-      branch: "symphony/STUDIO-654",
-      runs: 2,
-      title: "Attach a photo in chat",
-      project: "tally",
-    });
-    expect(summary.updated).toBe("45m ago");
-  });
-
-  it("reads the live snapshot as running and a failed newest run as blocked", () => {
-    expect(buildJobSummary([run({ id: 1, outcome: "running", ended_at: "" })], { live: true, nowMs: NOW }).status).toBe("run");
-    expect(buildJobSummary([run({ id: 1, outcome: "failed" })], { nowMs: NOW }).status).toBe("blocked");
-  });
-
-  it("reads a live ticket as running even before its run row is persisted", () => {
-    // A just-dispatched ticket has no history yet. Losing the live signal here would show it
-    // as "queued" — the daemon idle on work it is actively running.
-    expect(buildJobSummary([], { live: true, nowMs: NOW }).status).toBe("run");
-    // …and a live ticket whose newest stored row is an older completed run is still running.
-    expect(buildJobSummary([run({ id: 1, outcome: "completed" })], { live: true, nowMs: NOW }).status).toBe("run");
-  });
-
-  it("survives a ticket with no runs at all", () => {
-    const summary = buildJobSummary([], { nowMs: NOW });
-    expect(summary.runs).toBe(0);
-    expect(summary.branch).toBe("—");
-    expect(summary.updated).toBe("—");
-  });
-
-  it("shows no pull request when no caller supplies one", () => {
-    // The daemon serves none (see the module's DEPENDENCY note) — the field must stay empty
-    // rather than fabricate a number.
-    expect(buildJobSummary([run({ id: 1 })], { nowMs: NOW }).pullRequest).toBe("");
-  });
-});
-
 describe("runOutcomePill", () => {
   it("keeps a run's own outcome distinct from the ticket's status", () => {
     expect(runOutcomePill("running")).toBe("run");
@@ -123,71 +72,6 @@ describe("runOutcomePill", () => {
     expect(runOutcomePill("stopped")).toBe("queued");
     expect(runOutcomePill("interrupted")).toBe("queued");
     expect(runOutcomePill("")).toBe("queued");
-  });
-});
-
-describe("runMeta / runDescription", () => {
-  it("renders the run's window, duration, turns and tokens", () => {
-    const meta = runMeta(run({ id: 547, turns: 1 }), "alice");
-    expect(meta.identity).toBe("alice");
-    expect(meta.window).toMatch(/^\d{2}:\d{2} → \d{2}:\d{2}$/);
-    expect(meta.duration).toBe("4m 0s");
-    expect(meta.turns).toBe("1 turn");
-    expect(meta.tokens).toBe("38.0k tokens");
-  });
-
-  it("leaves a running run's window open-ended and marks an estimated total", () => {
-    const meta = runMeta(run({ id: 1, ended_at: "", turns: 3, usage_estimated: true }));
-    expect(meta.window).toMatch(/^\d{2}:\d{2} →$/);
-    expect(meta.turns).toBe("3 turns");
-    expect(meta.tokens).toBe("~38.0k tokens");
-  });
-
-  it("describes a run by its error when it failed, else by its outcome", () => {
-    expect(runDescription(run({ id: 1, outcome: "failed", error: "turn_timeout" }))).toBe("turn_timeout");
-    expect(runDescription(run({ id: 1 }))).toBe("completed");
-  });
-});
-
-describe("transcriptTimeline", () => {
-  const entries: LogEntry[] = [
-    { seq: 1, kind: "event", tool: "", text: "session started" },
-    { seq: 2, kind: "thinking", tool: "", text: "recalled 2 facts from bank" },
-    { seq: 3, kind: "tool_use", tool: "Bash", text: "git rebase origin/master" },
-    { seq: 4, kind: "tool_result", tool: "", text: "6 conflicts, resolved" },
-    { seq: 5, kind: "tool_use", tool: "teams_post", text: "handed off" },
-    { seq: 6, kind: "tool_use", tool: "teams_retain", text: "2 facts" },
-    { seq: 7, kind: "event", tool: "", text: "turn completed" },
-  ];
-
-  // §10 box 2.10 — expanding a run shows its transcript timeline.
-  it("types each line and folds a tool result onto the call that produced it", () => {
-    const timeline = transcriptTimeline(entries);
-    expect(timeline.map((t) => t.kind)).toEqual(["turn", "note", "tool", "post", "retain", "done"]);
-    expect(timeline[2]).toMatchObject({ tool: "Bash", result: "6 conflicts, resolved" });
-    expect(timeline[3].tool).toBe("teams_post");
-  });
-
-  it("keeps an orphaned result as its own line rather than dropping it", () => {
-    const timeline = transcriptTimeline([{ seq: 1, kind: "tool_result", tool: "", text: "output" }]);
-    expect(timeline).toEqual([{ seq: 1, kind: "note", text: "output", tool: "", result: "" }]);
-  });
-
-  it("does not fold a second result onto an already-folded call", () => {
-    const timeline = transcriptTimeline([
-      { seq: 1, kind: "tool_use", tool: "Bash", text: "ls" },
-      { seq: 2, kind: "tool_result", tool: "", text: "first" },
-      { seq: 3, kind: "tool_result", tool: "", text: "second" },
-    ]);
-    // The first result folds (adding no line); the second has nowhere to go and becomes a note.
-    expect(timeline).toHaveLength(2);
-    expect(timeline[0]).toMatchObject({ kind: "tool", tool: "Bash", result: "first" });
-    expect(timeline[1]).toMatchObject({ kind: "note", text: "second" });
-  });
-
-  it("renders an unrecognised event line rather than hiding it", () => {
-    const timeline = transcriptTimeline([{ seq: 1, kind: "event", tool: "", text: "something new" }]);
-    expect(timeline).toEqual([{ seq: 1, kind: "turn", text: "something new", tool: "", result: "" }]);
   });
 });
 

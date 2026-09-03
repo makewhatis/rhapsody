@@ -1,4 +1,12 @@
-import { useMemo, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import {
   Button,
   Card,
@@ -26,6 +34,7 @@ import {
   runsNewestFirst,
   type PullRequestView,
 } from "@/lib/console-job-detail";
+import { formatDateTime } from "@/lib/format";
 import {
   TRACE_FILTERS,
   TRACE_FILTER_LABELS,
@@ -34,6 +43,7 @@ import {
   leadParagraph,
   phaseGlyph,
   prSearchUrl,
+  resultBanner,
   resultEyebrow,
   runVitals,
   ticketUrl,
@@ -163,10 +173,21 @@ function RunTrace({
   const result = useMemo(() => buildResult(entries, run), [entries, run]);
   const vitals = runVitals(run, trace.phases);
   const [raw, setRaw] = useState(false);
+  const headerRef = useRef<HTMLDivElement | null>(null);
+  const headerHeight = useStickyHeaderHeight(headerRef);
 
   return (
-    <>
+    // The spine sticks BELOW the header, whose height is not a constant: the action cluster and
+    // the attempt selector wrap onto a second row on a narrow window, and a spine pinned to a
+    // hardcoded offset then slides underneath it. The measurement is published as a custom
+    // property so the offset stays in the stylesheet, and the CSS keeps a fallback for the render
+    // before the first measurement — and for any environment without a `ResizeObserver`.
+    <div
+      className="trrun"
+      style={headerHeight === 0 ? undefined : ({ "--trhd-h": `${headerHeight}px` } as CSSProperties)}
+    >
       <TraceHeader
+        ref={headerRef}
         run={run}
         runs={runs}
         assignee={assignee}
@@ -194,7 +215,12 @@ function RunTrace({
         <RawTranscript entries={entries} pending={transcript.isPending} />
       ) : (
         <>
-          <ResultCardZone run={run} result={result} vitals={vitals} />
+          <ResultCardZone
+            run={run}
+            result={result}
+            vitals={vitals}
+            pending={transcript.isPending}
+          />
           <TraceSplit
             key={run.id}
             phases={trace.phases}
@@ -203,13 +229,34 @@ function RunTrace({
           />
         </>
       )}
-    </>
+    </div>
   );
+}
+
+/**
+ * The rendered height of the sticky header, or 0 before it can be measured.
+ *
+ * `ResizeObserver` is the only thing that sees the header REFLOW — its cluster wraps on a window
+ * resize, on a font swap, and when a lifecycle action's error text appears — and it is absent in
+ * jsdom and in older engines, so its absence degrades to the stylesheet's own fallback offset
+ * rather than throwing.
+ */
+function useStickyHeaderHeight(ref: RefObject<HTMLDivElement | null>): number {
+  const [height, setHeight] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (el === null || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setHeight(el.offsetHeight));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref]);
+  return height;
 }
 
 // --- (A) the sticky header -----------------------------------------------------------------
 
 function TraceHeader({
+  ref,
   run,
   runs,
   assignee,
@@ -218,6 +265,7 @@ function TraceHeader({
   onBack,
   onSelectRun,
 }: {
+  ref: RefObject<HTMLDivElement | null>;
   run: RunSummary;
   runs: readonly RunSummary[];
   assignee: string;
@@ -228,7 +276,7 @@ function TraceHeader({
 }) {
   const workspaceURLKey = useLinearIdentity().data?.workspace_url_key ?? "";
   return (
-    <div className="trhd">
+    <div className="trhd" ref={ref}>
       <button type="button" className="back" aria-label="Back to Jobs" onClick={onBack}>
         ‹
       </button>
@@ -246,11 +294,25 @@ function TraceHeader({
         {run.outcome === "" ? "unknown" : run.outcome}
       </Pill>
       {/* The attempt selector. Slice 3 turns this into the implement→review relay, with the
-          hand-off baton and each attempt's own teammate; here it only picks which run to read. */}
+          hand-off baton and each attempt's own teammate; here it only picks which run to read.
+
+          Labelled by RUN ID, not by `attempt`: the daemon only increments `attempt` on the retry
+          path, so a ticket re-summoned or re-dispatched records every one of its runs as attempt
+          0 — 432 of the 441 rows the store has ever written — and an "attempt 0" label repeated
+          five times names none of them. The run id is the daemon's own handle on a run and is
+          always distinct. The attempt and the start time are real data too, so they ride along
+          in the tooltip rather than being dropped. */}
       <Seg
         className="trattempts"
         aria-label="Attempt"
-        options={runs.map((r) => ({ value: String(r.id), label: `attempt ${r.attempt}` }))}
+        options={runs.map((r) => ({
+          value: String(r.id),
+          label: (
+            <span title={`attempt ${r.attempt} · started ${formatDateTime(r.started_at)}`}>
+              run {r.id}
+            </span>
+          ),
+        }))}
         value={String(run.id)}
         onChange={(v) => onSelectRun(Number(v))}
       />
@@ -316,9 +378,10 @@ function HeaderActions({ run, ticketHref }: { run: RunSummary; ticketHref: strin
         </a>
       )}
       {/* No endpoint serves a PR number (design record §5), so this is a head-branch search on
-          the run's own remote — it finds the branch's PR without the console asserting one. */}
+          the run's own remote — it finds the branch's PR without the console asserting one. The
+          branch it searches for comes from `runBranch`, since the daemon writes none. */}
       {prHref === "" ? (
-        <DepButton title="No daemon pull-request endpoint, and this run's remote is not a GitHub one to search.">
+        <DepButton title="No daemon pull-request endpoint, and this run's remote is not on github.com, so there is nothing to search.">
           View PR
         </DepButton>
       ) : (
@@ -360,12 +423,15 @@ function ResultCardZone({
   run,
   result,
   vitals,
+  pending,
 }: {
   run: RunSummary;
   result: ResultCard;
   vitals: RunVitals;
+  pending: boolean;
 }) {
   const eyebrow = resultEyebrow(run, result.source);
+  const banner = resultBanner(run);
   const lead = cardLead(result);
   return (
     <div className={eyebrow.tone === "done" ? "trrc" : `trrc ${eyebrow.tone}`}>
@@ -373,17 +439,35 @@ function ResultCardZone({
       <div className="in">
         <div className="body">
           <div className="eyebrow">{eyebrow.text}</div>
-          <h2>{result.headline}</h2>
-          {lead === "" ? null : <Markdown source={lead} />}
-          {result.sections.map((section, i) => (
-            <div className="sect" key={`${i}:${section.heading}`}>
-              <div className="lab">{section.label}</div>
-              {/* The author's OWN heading beside the model's label: the label is this console's
-                  reading of it, and the operator can see what was actually written. */}
-              <div className="head">{section.heading}</div>
-              <Markdown source={section.body} />
+          {/* §3B's failed/stopped banner. It comes off the RUN ROW, not the transcript, so it is
+              the one thing this card can state before the transcript arrives — and the one thing
+              it must not drop when a run hands off and only then dies. */}
+          {banner === null ? null : (
+            <div className={`trbanner ${banner.tone}`}>
+              <b>{banner.label}</b>
+              <span>{banner.text}</span>
             </div>
-          ))}
+          )}
+          {/* The headline is read out of the transcript, so until it loads this card has no answer
+              — and its fallback is phrased as an assertion ("Completed without a written
+              hand-off"), which would be a plainly WRONG one for most runs. It waits instead. */}
+          {pending ? (
+            <div className="trskel" role="status" aria-label="Reading the transcript…" />
+          ) : (
+            <>
+              <h2>{result.headline}</h2>
+              {lead === "" ? null : <Markdown source={lead} />}
+              {result.sections.map((section, i) => (
+                <div className="sect" key={`${i}:${section.heading}`}>
+                  <div className="lab">{section.label}</div>
+                  {/* The author's OWN heading beside the model's label: the label is this
+                      console's reading of it, and the operator can see what was written. */}
+                  <div className="head">{section.heading}</div>
+                  <Markdown source={section.body} />
+                </div>
+              ))}
+            </>
+          )}
         </div>
         <div className="trreceipt">
           <div className="rv">
@@ -400,7 +484,9 @@ function ResultCardZone({
           </div>
           <div className="rv">
             <b>tools</b>
-            {vitals.tools}
+            {/* Unlike the three above it, this one is counted from the transcript — a bare 0
+                while that is still loading would read as "this run called no tools". */}
+            {pending ? "—" : vitals.tools}
           </div>
         </div>
       </div>
@@ -580,10 +666,13 @@ function CallCard({ card }: { card: DidCard }) {
 function Said({ said, who }: { said: readonly SaidBlock[]; who: string }) {
   const [expanded, setExpanded] = useState(false);
   const [reasoning, setReasoning] = useState(false);
+  // Trimmed, because the lead below is: comparing the two decides whether there is more to show,
+  // and a block with trailing whitespace would otherwise offer a "Show more" that reveals none.
   const prose = said
     .filter((block) => block.kind === "text")
     .map((block) => block.text)
-    .join("\n\n");
+    .join("\n\n")
+    .trim();
   const thinking = said
     .filter((block) => block.kind === "thinking")
     .map((block) => block.text)

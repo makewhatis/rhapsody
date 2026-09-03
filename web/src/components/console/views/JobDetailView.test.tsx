@@ -59,14 +59,23 @@ const EMPTY_STATE: StateResponse = {
   blocked: [],
 };
 
+/**
+ * A run row shaped like the ones the daemon actually writes.
+ *
+ * `branch` is EMPTY and `attempt` is 0 deliberately, not for brevity: `persist_start_run` is the
+ * only writer of `runs.branch` and leaves it at its default, and `attempt` only increments on the
+ * retry path — 441 of 441 recorded rows carry no branch and 432 of them are attempt 0. A fixture
+ * with both fields populated is what let a dead "View PR" and an undifferentiated attempt selector
+ * pass a green suite. A test about a row that DOES carry them overrides them explicitly.
+ */
 function run(over: Partial<RunSummary> & Pick<RunSummary, "id">): RunSummary {
   return {
     issue_id: "i",
     issue_identifier: "STUDIO-654",
     title: "Attach a photo in chat",
-    attempt: 1,
+    attempt: 0,
     session_uuid: "s",
-    branch: "symphony/STUDIO-654",
+    branch: "",
     project_slug: "tally",
     repo: "git@github.com:makewhatis/rhapsody.git",
     started_at: "2026-09-01T19:11:00Z",
@@ -201,13 +210,29 @@ describe("zone A — the sticky header (§3A)", () => {
 
   // Acceptance — "Vitals derive from RunSummary".
   it("derives every vital from the run row: duration, turns, tokens, branch", async () => {
-    mountDetail([run({ id: 547, turns: 3, started_at: "2026-09-01T19:11:00Z", ended_at: "2026-09-01T19:15:30Z" })]);
+    mountDetail([
+      run({
+        id: 547,
+        turns: 3,
+        branch: "symphony/STUDIO-654",
+        started_at: "2026-09-01T19:11:00Z",
+        ended_at: "2026-09-01T19:15:30Z",
+      }),
+    ]);
     await waitFor(() => expect(document.querySelector(".trvitals")).toBeTruthy());
     const vitals = document.querySelector(".trvitals")?.textContent ?? "";
     expect(vitals).toContain("4m 30s");
     expect(vitals).toContain("3 turns");
     expect(vitals).toContain("38.0k");
     expect(vitals).toContain("symphony/STUDIO-654");
+  });
+
+  // Every real row leaves `branch` empty, so reading it alone made this vital a permanent dash.
+  it("names the ticket's own branch on a row the daemon left branchless — the real shape", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() =>
+      expect(document.querySelector(".trvitals")?.textContent).toContain("symphony/STUDIO-654"),
+    );
   });
 
   it("marks an estimated token total rather than presenting it as authoritative", async () => {
@@ -221,20 +246,27 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(onNavigate).toHaveBeenCalledExactlyOnceWith("jobs");
   });
 
-  it("selects the newest run, and offers the older attempts alongside it", async () => {
+  // The daemon increments `attempt` only on the retry path, so a re-summoned ticket records every
+  // one of its runs as attempt 0 — 432 of 441 real rows. Labelling by attempt gave a five-run
+  // ticket five identical buttons; the run id is the daemon's own handle and is always distinct.
+  it("tells the attempts apart by run id, on rows that all record the same attempt", async () => {
     mountDetail([
-      run({ id: 522, attempt: 1, started_at: "2026-08-30T20:21:00Z" }),
-      run({ id: 547, attempt: 3, started_at: "2026-09-01T19:11:00Z" }),
-      run({ id: 545, attempt: 2, started_at: "2026-09-01T16:54:00Z" }),
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+      run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
     ]);
     await waitFor(() => expect(document.querySelectorAll(".trattempts button")).toHaveLength(3));
     expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual([
-      "attempt 3",
-      "attempt 2",
-      "attempt 1",
+      "run 547",
+      "run 545",
+      "run 522",
     ]);
+    // The attempt and the start time are real data too — they ride along in the tooltip.
+    expect(document.querySelector(".trattempts button span")?.getAttribute("title")).toContain(
+      "attempt 0 · started ",
+    );
     // Newest first AND newest selected — its transcript is the one fetched.
-    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe("attempt 3");
+    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe("run 547");
     await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547));
   });
 
@@ -245,16 +277,44 @@ describe("zone A — the sticky header (§3A)", () => {
       entries: [entry({ seq: 1, kind: "tool_use", tool: "Bash", text: `command=echo run ${id}` })],
     }));
     mountDetail([
-      run({ id: 547, attempt: 2, started_at: "2026-09-01T19:11:00Z" }),
-      run({ id: 522, attempt: 1, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
     ]);
     await waitFor(() => expect(screen.getByText(/echo run 547/)).toBeTruthy());
     expect(screen.queryByText(/echo run 522/)).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "attempt 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
     await waitFor(() => expect(screen.getByText(/echo run 522/)).toBeTruthy());
     expect(h.fetchRunTranscript).toHaveBeenCalledWith(522);
     expect(screen.queryByText(/echo run 547/)).toBeNull();
+  });
+
+  // The stylesheet's offset is a fallback; the real one is measured, because the header's own
+  // height changes when its cluster wraps. jsdom ships no `ResizeObserver`, so the hook must also
+  // survive its absence — which is the state every other test in this file exercises.
+  it("publishes the header's measured height for the spine to stick below", async () => {
+    const observers: (() => void)[] = [];
+    class FakeResizeObserver {
+      constructor(private readonly cb: () => void) {}
+      observe() {
+        observers.push(this.cb);
+      }
+      disconnect() {}
+      unobserve() {}
+    }
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    try {
+      mountDetail([run({ id: 547 })]);
+      await waitFor(() => expect(document.querySelector(".trhd")).toBeTruthy());
+      const header = document.querySelector(".trhd") as HTMLElement;
+      Object.defineProperty(header, "offsetHeight", { value: 96, configurable: true });
+      observers.forEach((fire) => fire());
+      await waitFor(() =>
+        expect((document.querySelector(".trrun") as HTMLElement).style.getPropertyValue("--trhd-h")).toBe("96px"),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("survives a ticket with no recorded runs", async () => {
@@ -274,6 +334,8 @@ describe("zone A — the header's actions are real or dependency-named, never fa
   });
 
   // Acceptance — "View PR / Merge render as dependency-named (not dead), never fake."
+  // The row here is the real shape — `branch: ""` — so this is the ONLY path that ever fires in
+  // production. Searching the row's own branch was dead code: no row has ever carried one.
   it("resolves View PR through a head-branch search, never a fabricated PR number", async () => {
     mountDetail([run({ id: 547 })]);
     await waitFor(() => expect(action(/view pr/i)).toBeTruthy());
@@ -291,7 +353,10 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     expect(within(acts).queryByRole("link", { name: /view pr/i })).toBeNull();
     const dep = within(acts).getByRole("button", { name: /view pr/i });
     expect(dep.querySelector(".dep")?.textContent).toBe("dep");
+    // The tooltip must name what is ACTUALLY missing. Blaming the remote on a run whose remote is
+    // plainly github.com sends the operator to check the wrong thing.
     expect(dep.getAttribute("title")).toMatch(/no.*pull-request endpoint/i);
+    expect(dep.getAttribute("title")).toMatch(/not on github\.com/i);
   });
 
   it("names Merge's missing endpoint instead of offering a button that cannot merge", async () => {
@@ -426,6 +491,84 @@ describe("zone B — the Result card (§3B)", () => {
     expect(receipt).toContain("4"); // Read, Edit, Bash, teams_post
   });
 
+  // §3B — "Failed -> red banner + error; Stopped -> amber reason + Resume."
+  // The fixture is the one the old suite lacked: a run that HANDED OFF and only then died. Its
+  // prose headline is intact, so a card that surfaces the error only when there is no prose drops
+  // it exactly here — on the runs an operator opens this view to understand.
+  it("shows a failed run's error even when it wrote a full hand-off first", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([
+      run({ id: 547, outcome: "failed", error: "agent exited 1: turn timeout after 900s" }),
+    ]);
+    await settleTrace();
+    const rc = document.querySelector(".trrc") as HTMLElement;
+    // The hand-off is still the headline — the run did write one.
+    expect(rc.querySelector("h2")?.textContent).toBe("Photo attachment shipped.");
+    const banner = rc.querySelector(".trbanner") as HTMLElement;
+    expect(banner.className).toContain("fail");
+    expect(banner.querySelector("b")?.textContent).toBe("Error");
+    expect(banner.textContent).toContain("agent exited 1: turn timeout after 900s");
+  });
+
+  it("shows a stopped run's reason as an amber banner, beside the Resume that acts on it", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547, outcome: "stopped", error: "operator stopped the run" })]);
+    await settleTrace();
+    const banner = document.querySelector(".trrc .trbanner") as HTMLElement;
+    expect(banner.className).toContain("stop");
+    expect(banner.querySelector("b")?.textContent).toBe("Reason");
+    expect(banner.textContent).toContain("operator stopped the run");
+    expect(action(/resume/i)).toBeTruthy();
+  });
+
+  it("shows a failed run's error when it wrote no prose at all, without repeating it", async () => {
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 547,
+      generated_at: "",
+      entries: [entry({ seq: 1, kind: "tool_use", tool: "Bash", text: "command=npm test" })],
+    });
+    mountDetail([run({ id: 547, outcome: "failed", error: "agent exited 1" })]);
+    await settleTrace();
+    const rc = document.querySelector(".trrc") as HTMLElement;
+    expect(rc.querySelector(".trbanner")?.textContent).toContain("agent exited 1");
+    // Once, not twice: the headline names the ending and leaves the string to the banner.
+    expect(rc.querySelector("h2")?.textContent).toBe("The run failed before handing off.");
+  });
+
+  it("shows no banner at all for a run that recorded no error", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".trrc .trbanner")).toBeNull();
+  });
+
+  // §2 puts the answer in this zone — "most runs are understood here in ~15s". Asserting the
+  // wrong answer for the first frame and swapping it is worse than admitting it is not known.
+  it("states nothing about the outcome until the transcript it reads has arrived", async () => {
+    let release = (): void => {};
+    h.fetchRunTranscript.mockReturnValue(
+      new Promise((resolve) => {
+        release = () => resolve({ run_id: 547, generated_at: "", entries: COMPLETED });
+      }),
+    );
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(document.querySelector(".trrc")).toBeTruthy());
+    const rc = document.querySelector(".trrc") as HTMLElement;
+    expect(rc.querySelector("h2")).toBeNull();
+    expect(rc.textContent).not.toContain("Completed without a written hand-off");
+    expect(rc.querySelector(".trskel")).toBeTruthy();
+    // Nor a tool count of 0, which would read as "this run called no tools".
+    expect(rc.querySelector(".trreceipt")?.textContent).not.toContain("tools0");
+    // The eyebrow and the vitals come off the RUN ROW, so they are known already.
+    expect(rc.querySelector(".eyebrow")?.textContent).toBe("done");
+
+    release();
+    await waitFor(() =>
+      expect(document.querySelector(".trrc h2")?.textContent).toBe("Photo attachment shipped."),
+    );
+    expect(document.querySelector(".trrc .trskel")).toBeNull();
+  });
+
   it("synthesizes a headline rather than showing an empty card when a run wrote no prose", async () => {
     h.fetchRunTranscript.mockResolvedValue({
       run_id: 547,
@@ -518,6 +661,16 @@ describe("zone C — The Split (§3C)", () => {
     await waitFor(() =>
       expect(said.querySelector(".prose")?.textContent).toBe("Lead paragraph.Second paragraph.Third."),
     );
+  });
+
+  it("offers no Show more when the whole prose IS the lead, trailing whitespace and all", async () => {
+    await mountSplit([
+      entry({ seq: 1, kind: "text", text: "One paragraph, and nothing after it.\n\n  \n" }),
+      entry({ seq: 2, kind: "tool_use", tool: "Read", text: "file_path=/a.ts" }),
+    ]);
+    const said = document.querySelector(".trinsp .trsaid") as HTMLElement;
+    expect(said.querySelector(".prose")?.textContent).toBe("One paragraph, and nothing after it.");
+    expect(within(said).queryByRole("button", { name: /show more/i })).toBeNull();
   });
 
   it("says so when the selected phase made no tool calls at all", async () => {
@@ -775,5 +928,19 @@ describe("wide content is contained (STUDIO-681's layout rule)", () => {
 
   it("hardcodes no color the token set already names", () => {
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
+  });
+
+  // The header wraps: `flex-wrap: wrap` over an attempt selector, a vitals strip and six actions
+  // is taller than one row on a narrow window, and a spine pinned to a literal offset then slides
+  // underneath it. The offset is a custom property the view measures and publishes.
+  it("sticks the spine below the header's MEASURED height, not a hardcoded one", () => {
+    expect(rule(".rh-console .trhd")).toMatch(/flex-wrap:\s*wrap/);
+    expect(rule(".rh-console .trspine")).toMatch(/top:\s*var\(--trhd-h,\s*\d+px\)/);
+  });
+
+  it("wraps and scrolls a failure banner, which can carry one very long line", () => {
+    const banner = rule(".rh-console .trrc .trbanner");
+    expect(banner).toMatch(/overflow-x:\s*auto/);
+    expect(rule(".rh-console .trrc .trbanner span")).toMatch(/overflow-wrap:\s*anywhere/);
   });
 });

@@ -9,7 +9,9 @@ import {
   leadParagraph,
   phaseGlyph,
   prSearchUrl,
+  resultBanner,
   resultEyebrow,
+  runBranch,
   runVitals,
   ticketUrl,
 } from "@/lib/console-trace-view";
@@ -78,8 +80,59 @@ describe("runVitals — the header's mono strip derives from RunSummary (§3A)",
     expect(runVitals(run({ ended_at: "", outcome: "running" }), []).duration).toBe("—");
   });
 
-  it("shows a dash for a run row that carries no branch", () => {
-    expect(runVitals(run({ branch: "" }), []).branch).toBe("—");
+  // The daemon writes NO branch on any run row — `persist_start_run` leaves the column at its
+  // default and is its only writer — so reading the row alone made this vital a permanent dash.
+  it("names the branch the daemon's own naming gives the ticket when the row carries none", () => {
+    expect(runVitals(run({ branch: "" }), []).branch).toBe("symphony/STUDIO-742");
+  });
+
+  it("shows a dash only when there is no ticket to derive a branch from either", () => {
+    expect(runVitals(run({ branch: "", issue_identifier: "" }), []).branch).toBe("—");
+  });
+});
+
+describe("runBranch — the workspace branch, served or derived (§3A)", () => {
+  it("prefers the row's own branch whenever the daemon served one", () => {
+    expect(runBranch(run({ branch: "symphony/OTHER-1" }))).toBe("symphony/OTHER-1");
+    expect(runBranch(run({ branch: "  symphony/OTHER-1  " }))).toBe("symphony/OTHER-1");
+  });
+
+  it("derives `symphony/<KEY>` — the frozen branch-naming contract — when it did not", () => {
+    expect(runBranch(run({ branch: "", issue_identifier: "STUDIO-742" }))).toBe("symphony/STUDIO-742");
+  });
+
+  // The daemon derives the branch from `sanitize_key(identifier)`, not the raw identifier: a key
+  // with a character outside `[A-Za-z0-9._-]` names a DIFFERENT branch than the ticket spells.
+  it("sanitizes the key exactly as the daemon does, so the name is one it really creates", () => {
+    expect(runBranch(run({ branch: "", issue_identifier: "team/issue 1" }))).toBe("symphony/team_issue_1");
+    expect(runBranch(run({ branch: "", issue_identifier: "abc.def_ghi-1" }))).toBe("symphony/abc.def_ghi-1");
+    expect(runBranch(run({ branch: "", issue_identifier: "." }))).toBe("symphony/_");
+  });
+
+  it("derives nothing at all rather than a bare prefix when the row names no ticket", () => {
+    expect(runBranch(run({ branch: "", issue_identifier: "" }))).toBe("");
+    expect(runBranch(run({ branch: "", issue_identifier: "   " }))).toBe("");
+  });
+});
+
+describe("resultBanner — the Result card says WHY a run ended badly (§3B)", () => {
+  it("carries a failed run's error, red, whether or not it also wrote a hand-off", () => {
+    const banner = resultBanner(run({ outcome: "failed", error: "agent exited 1: turn timeout" }));
+    expect(banner).toEqual({ label: "Error", tone: "fail", text: "agent exited 1: turn timeout" });
+  });
+
+  it("carries a stopped run's reason, amber", () => {
+    expect(resultBanner(run({ outcome: "stopped", error: "operator stopped the run" }))).toEqual({
+      label: "Reason",
+      tone: "stop",
+      text: "operator stopped the run",
+    });
+    expect(resultBanner(run({ outcome: "interrupted", error: "daemon restarted" }))?.tone).toBe("stop");
+  });
+
+  it("has no banner for a run that recorded no error", () => {
+    expect(resultBanner(run())).toBeNull();
+    expect(resultBanner(run({ outcome: "failed", error: "   " }))).toBeNull();
   });
 });
 
@@ -163,9 +216,18 @@ describe("the header's links are real or absent — never a fabricated PR (§5 d
     );
   });
 
-  it("offers no PR link at all when the branch or the remote is missing", () => {
-    expect(prSearchUrl(run({ branch: "" }))).toBe("");
+  // The head-branch search would otherwise be dead code: no run row the daemon has ever written
+  // carries a branch, so the ONLY path that ever fires in production is the derived one.
+  it("searches the derived head branch on a row whose branch the daemon left empty", () => {
+    expect(prSearchUrl(run({ branch: "" }))).toBe(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-742",
+    );
+  });
+
+  it("offers no PR link at all when there is no branch to search or no remote to search it on", () => {
+    expect(prSearchUrl(run({ branch: "", issue_identifier: "" }))).toBe("");
     expect(prSearchUrl(run({ repo: "" }))).toBe("");
+    expect(prSearchUrl(run({ repo: "git@gitlab.example:acme/app.git" }))).toBe("");
   });
 
   it("builds the ticket deep link from the connected workspace, or not at all", () => {
@@ -193,12 +255,25 @@ describe("cardLead — the Result card shows a lead only when the H1 does not al
     expect(card("Photo attachment **shipped**.", "Photo attachment shipped.")).toBe("");
   });
 
-  it("keeps a lead that carries more than its opening sentence", () => {
-    expect(card("Done. And here is why.", "Done. And here is why. More.")).toBe(
-      "Done. And here is why.",
+  // Measured over the 441 recorded runs: requiring whole-lead equality left 184 (41.7%) printing
+  // their own H1 again directly under it, because the model GROWS the headline out of the lead.
+  it("drops only the sentence the headline was grown from, keeping the rest of the lead", () => {
+    expect(card("Postgres is up on 5433. Running the full suite next.", "Postgres is up on 5433.")).toBe(
+      "Running the full suite next.",
     );
-    expect(card("Shipped it.\n\nDetail follows.", "Shipped it.")).toBe(
-      "Shipped it.\n\nDetail follows.",
+    expect(card("Shipped it.\n\nDetail follows.", "Shipped it.")).toBe("Detail follows.");
+    expect(
+      card("**Wired** the watcher. It polls every 2s.", "Wired the watcher."),
+    ).toBe("It polls every 2s.");
+  });
+
+  it("drops a lead the headline reached PAST — the H1 already carries all of it", () => {
+    expect(card("Done. And here is why.", "Done. And here is why. More.")).toBe("");
+  });
+
+  it("keeps a lead whose opening sentence is not the one the headline was grown from", () => {
+    expect(card("A first line. A second.", "Something else entirely.")).toBe(
+      "A first line. A second.",
     );
   });
 
