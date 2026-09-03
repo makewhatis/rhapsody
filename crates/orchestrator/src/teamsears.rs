@@ -1333,30 +1333,14 @@ pub(crate) struct PrRef {
     pub(crate) number: i64,
 }
 
-/// Whether a `github.com/` match starting at byte `at` BEGINS the URL's host, rather than merely
-/// ending a look-alike one (STUDIO-721, the slice-6 F-SEC review's defence-in-depth item).
-///
-/// A bare substring search reads `evilgithub.com/attacker/evil/pull/1` as
-/// `PrRef { attacker, evil, 1 }` — an attacker-chosen coordinate produced from a host the daemon
-/// has nothing to do with. This runs over attacker-controlled ROOM TEXT (§0.13), so the coordinate
-/// must at least be a real `github.com` one before anything downstream decides what to do with it.
-///
-/// The rule is that the character before the match cannot continue a hostname: any alphanumeric
-/// (`evilgithub.com`), a `-` (`not-github.com`), a `.` (`sub.github.com` — a subdomain is a
-/// different host) or a `_`. The start of the string, the `/` of a scheme, whitespace and Markdown
-/// punctuation all leave the match beginning the host, which is what a real URL looks like.
-fn github_host_starts_at(body: &str, at: usize) -> bool {
-    match body[..at].chars().next_back() {
-        None => true,
-        Some(c) => !(c.is_alphanumeric() || c == '-' || c == '.' || c == '_'),
-    }
-}
-
 /// Every `https://github.com/<owner>/<repo>/pull/<n>` a post names, in order and de-duplicated.
 /// Hand-rolled for [`extract_keys`]'s reason; the trailing path (`/files`, `#issuecomment-…`) is
 /// ignored, which is what a pasted browser URL usually carries.
 ///
-/// `github.com` must be the actual HOST — see [`github_host_starts_at`].
+/// `github.com` must be the actual HOST, not a look-alike one and not a path segment spelling it —
+/// see [`crate::ghsummons::github_host_begins_at`], which this shares with the remote-URL parser so
+/// the two cannot drift. It matters most HERE: this runs over attacker-controlled ROOM TEXT
+/// (§0.13), where §14.1 F-SEC says a coordinate must not be taken on trust.
 pub(crate) fn extract_pr_urls(body: &str) -> Vec<PrRef> {
     const MARK: &str = "github.com/";
     let mut out: Vec<PrRef> = Vec::new();
@@ -1366,7 +1350,7 @@ pub(crate) fn extract_pr_urls(body: &str) -> Vec<PrRef> {
     while let Some(rel) = body[from..].find(MARK) {
         let at = from + rel;
         from = at + MARK.len();
-        if !github_host_starts_at(body, at) {
+        if !crate::ghsummons::github_host_begins_at(body, at) {
             continue;
         }
         let tail: &str = body[from..]
@@ -1940,6 +1924,17 @@ mod tests {
             "https://sub.github.com/attacker/evil/pull/1",
             "https://my_github.com/attacker/evil/pull/1",
             "https://xn--github.com/attacker/evil/pull/1",
+            // …and the PATH-segment forms (STUDIO-727): a single `/` before the match is what a
+            // path looks like, not what an authority looks like, and the daemon's own host does
+            // not appear in these at all.
+            "https://evil.test/github.com/attacker/evil/pull/1",
+            "https://evil.test//github.com/attacker/evil/pull/1",
+            "https://evil.test/x/github.com/attacker/evil/pull/1",
+            "https://evil.test/redirect?to=github.com/attacker/evil/pull/1",
+            "https://evil.test/x#github.com/attacker/evil/pull/1",
+            // Userinfo is the one thing allowed in front of the host, so it must not become a way
+            // back in from a PATH: the `@` here follows a `/`, which already ended the authority.
+            "https://evil.test/x@github.com/attacker/evil/pull/1",
         ] {
             assert!(
                 extract_pr_urls(body).is_empty(),
@@ -1966,6 +1961,13 @@ mod tests {
             "github.com/o/r/pull/7",
             "(https://github.com/o/r/pull/7)",
             "http://github.com/o/r/pull/7",
+            // …and the real forms the positional check must not cost: a scheme-relative URL, real
+            // userinfo, and the Markdown a room post wraps a pasted link in.
+            "//github.com/o/r/pull/7",
+            "https://user@github.com/o/r/pull/7",
+            "**github.com/o/r/pull/7**",
+            "<https://github.com/o/r/pull/7>",
+            "see: https://github.com/o/r/pull/7 — please review",
         ] {
             assert_eq!(
                 extract_pr_urls(body),

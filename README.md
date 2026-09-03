@@ -543,10 +543,16 @@ and running both daemons against one file was never supported in either directio
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
 Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
-`https://evilgithub.com/attacker/evil` parses as `(attacker, evil)`. Rhapsody's `parse_repo` requires
-the match to BEGIN the host — the start of the string, the `//` of a scheme, or the `@` of `git@` —
-so a look-alike host, including a `sub.github.com` subdomain, does not parse at all. The room-post
-parser `extract_pr_urls` (Rhapsody-only, no Go counterpart) carries the same rule.
+`https://evilgithub.com/attacker/evil` parses as `(attacker, evil)` — and so does
+`https://evil.test/github.com/attacker/evil`, in which GitHub is not the host at all. Rhapsody
+requires the match to BEGIN the URL's **authority**: it takes the whitespace-delimited token the
+match sits in, finds where that token's authority starts (after `://`, after a leading `//`, or at
+the start for a bare `github.com/o/r`), and accepts only when nothing but userinfo stands between
+that point and the match. So a look-alike host (`evilgithub.com`, `not-github.com`, the
+`sub.github.com` subdomain) is refused, and so is every URL component that merely spells the host —
+a path segment, a query value, a fragment. One rule, `ghsummons::github_host_begins_at`, is shared
+by `parse_repo` and by the room-post parser `extract_pr_urls` (Rhapsody-only, no Go counterpart), so
+the two cannot drift apart.
 
 The parsed pair is what the ticketless review subsystem compares a pull request's owner/repo against
 to decide whether it may check that pull request out and run an agent over its diff, and

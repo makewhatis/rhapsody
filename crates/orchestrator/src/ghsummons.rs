@@ -19,11 +19,14 @@ use regex::Regex;
 use rhapsody_core::compile_summon_matcher;
 
 /// Matches an ssh or https GitHub remote URL, capturing `owner` (group 1) and `repo` (group 2).
-/// Mirrors Go `ghsummons.repoRe` (`github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$`). Compiled once;
+/// Mirrors Go `ghsummons.repoRe` (`github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$`) exactly — the host
+/// boundary is NOT expressed here, because it needs two characters of context and this crate's
+/// regex engine has no lookbehind; [`github_host_begins_at`] applies it to the match position
+/// instead. Compiled once;
 /// `None` if the static pattern ever fails to compile (it cannot) — the no-panic idiom the sibling
 /// crates use for static patterns (`rhapsody_tracker`'s `PR_PARSE_RE`).
 static REPO_RE: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"(?:^|[/@])github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$").ok());
+    LazyLock::new(|| Regex::new(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?/?$").ok());
 
 /// Matches an issue/PR number in a GitHub API `issue_url` / `pull_request_url`, capturing the digits
 /// (group 1). Mirrors Go `ghsummons.numRe` (`/(?:issues|pulls)/(\d+)`); `\d` is spelled `[0-9]` so
@@ -42,17 +45,60 @@ static NUM_RE: LazyLock<Option<Regex>> =
 ///
 /// **Host boundary (STUDIO-721, a documented divergence — see the README).** Go's pattern matches
 /// `github.com` as a bare SUBSTRING, so `https://evilgithub.com/attacker/evil` parses as
-/// `(attacker, evil)` and `https://github.com.evil.test/o/r` would too if it ended the right way.
-/// The leading `(?:^|[/@])` requires the match to BEGIN the host — the start of the string, the
-/// `//` of a scheme, or the `@` of `git@` — so a look-alike host, including a `sub.github.com`
-/// subdomain, does not parse at all. It matters because this pair is compared against a pull
-/// request's owner/repo to decide whether the ticketless review subsystem may check that pull
-/// request out and run an agent over it, and a config naming a look-alike host would otherwise
-/// vouch for a repository on the real `github.com`.
+/// `(attacker, evil)`, and so does `https://evil.test/github.com/attacker/evil`, where the daemon's
+/// own host does not appear at all. [`github_host_begins_at`] requires the match to BEGIN the
+/// authority — the start of the string, the `//` of a scheme, or the `@` of userinfo — so neither a
+/// look-alike host (including a `sub.github.com` subdomain) nor a path segment spelling
+/// `github.com` parses. It matters because this pair is compared against a pull request's
+/// owner/repo to decide whether the ticketless review subsystem may check that pull request out and
+/// run an agent over it, and a config naming either form would otherwise vouch for a repository on
+/// the real `github.com`.
 pub fn parse_repo(repo_url: &str) -> Option<(String, String)> {
     let re = REPO_RE.as_ref()?;
     let caps = re.captures(repo_url)?;
+    // Fail closed on the leftmost match rather than hunting for a later one that would pass: a URL
+    // spelling `github.com` twice is not a remote anybody meant to configure.
+    if !github_host_begins_at(repo_url, caps.get(0)?.start()) {
+        return None;
+    }
     Some((caps[1].to_string(), caps[2].to_string()))
+}
+
+/// Whether the `github.com` at byte offset `at` in `url` BEGINS the URL's authority — the host
+/// itself, rather than a look-alike host that merely ENDS with it (`evilgithub.com`) or some other
+/// URL component that merely spells it (`https://evil.test/github.com/…`, `?redirect=github.com/…`).
+/// STUDIO-721; the components half is STUDIO-727.
+///
+/// Looking at the character before the match is not enough, which is the whole subtlety. It rejects
+/// what CONTINUES a hostname and so leaves `/` allowed — and `/` is exactly what precedes
+/// `github.com/` when it is a PATH segment, handing back the attacker's own coordinate on the real
+/// host. Nor is `//` enough: `https://evil.test//github.com/…` is still a path.
+///
+/// So the rule is positional rather than characterwise. Take the whitespace-delimited token the
+/// match sits in (a URL contains no space, so nothing earlier is part of it), strip the Markdown
+/// and prose punctuation a pasted URL is wrapped in, and locate where its authority begins — after
+/// `://`, after a leading `//`, or at the very start for a bare `github.com/o/r`. The match begins
+/// the host exactly when nothing but userinfo stands between that point and it: no `/`, `?` or `#`,
+/// because each of those ENDS the authority and starts a component this daemon must not read a host
+/// out of.
+pub(crate) fn github_host_begins_at(url: &str, at: usize) -> bool {
+    let before = &url[..at];
+    // A URL cannot contain a space, so anything before the last one is surrounding prose.
+    let token = match before.rfind(char::is_whitespace) {
+        Some(i) => &before[i + 1..],
+        None => before,
+    };
+    // What wraps a pasted URL in a room post — Markdown emphasis, a bracket, a quote. Deliberately
+    // excludes `-`, `.` and `_`, which CONTINUE a hostname and must keep rejecting.
+    let token = token.trim_start_matches(['(', '<', '[', '{', '"', '\'', '`', '*']);
+    let authority = match token.find("://") {
+        Some(i) => &token[i + 3..],
+        None => token.strip_prefix("//").unwrap_or(token),
+    };
+    // Empty ⇒ the match sits exactly at the authority's first byte. Otherwise only userinfo may
+    // stand in front of it, and userinfo is by definition free of the delimiters that end an
+    // authority — which is what rejects `https://evil.test/x@github.com/…`.
+    authority.is_empty() || (authority.ends_with('@') && !authority.contains(['/', '?', '#']))
 }
 
 /// The newest summons on a PR: the comment time and its body. The body rides along so a mid-run
@@ -695,6 +741,15 @@ mod tests {
             ("https://evilgithub.com/attacker/evil", None),
             ("https://evilgithub.com/attacker/evil.git", None),
             ("git@evilgithub.com:attacker/evil.git", None),
+            // The PATH-segment forms (STUDIO-727). A remote configured like this vouches for the
+            // real `github.com/attacker/evil` if the boundary only rejects what CONTINUES a host.
+            ("https://evil.test/github.com/attacker/evil", None),
+            ("https://evil.test/github.com/attacker/evil.git", None),
+            ("https://evil.test//github.com/attacker/evil", None),
+            ("https://evil.test/x/github.com/attacker/evil", None),
+            ("https://evil.test/x@github.com/attacker/evil", None),
+            // Real userinfo, which the same rule must keep admitting (`ssh://git@…` below too).
+            ("https://user@github.com/o/r.git", Some(("o", "r"))),
             ("https://not-github.com/attacker/evil", None),
             ("https://sub.github.com/attacker/evil", None),
             ("ssh://git@github.com/o/r.git", Some(("o", "r"))),
