@@ -168,7 +168,8 @@ pub struct TeamScope {
     /// In-team identity → its bank id. An identity absent from the caller's map is absent here too,
     /// and so can never be recalled from: an unresolvable bank is not a readable one.
     banks: BTreeMap<String, String>,
-    /// Bank ids claimed by an identity OUTSIDE this team, or by more than one identity anywhere.
+    /// Bank ids claimed by an identity OUTSIDE this team — the ones a `bank:` override must not be
+    /// allowed to reach.
     foreign_banks: BTreeSet<String>,
     /// Linear team UUIDs (`RunSummary::team_id`) this team's work may come from. **Empty is the
     /// normal case and means "do not gate on it"** — `team_id` is the LINEAR team, orthogonal to the
@@ -181,10 +182,12 @@ pub struct TeamScope {
 impl TeamScope {
     /// The scope for the team owning `projects`, whose roster is `identities`.
     ///
-    /// `banks` is the daemon-wide identity → bank-id map. Every identity in it that is NOT in
-    /// `identities` is a foreign claimant, and any bank id claimed twice is foreign to everyone: a
-    /// collision means the map cannot say whose records a read would return, and an accessor that
-    /// cannot say must not read.
+    /// `banks` is the daemon-wide identity → bank-id map, and every identity in it that is NOT in
+    /// `identities` is a **foreign claimant** whose bank this team may not read.
+    ///
+    /// A bank two identities of the SAME team share is not foreign and is not refused: §9.3's rule
+    /// is about crossing a team boundary, and identities partition along team lines (STUDIO-668
+    /// §B.3), so a deliberately shared team bank is inside the partition it names.
     pub fn new<P, I>(projects: P, identities: I, banks: &HashMap<String, String>) -> TeamScope
     where
         P: IntoIterator,
@@ -195,11 +198,6 @@ impl TeamScope {
         let projects: BTreeSet<String> = projects.into_iter().map(Into::into).collect();
         let identities: BTreeSet<String> = identities.into_iter().map(Into::into).collect();
 
-        let mut claims: BTreeMap<String, usize> = BTreeMap::new();
-        for bank in banks.values() {
-            *claims.entry(bank.clone()).or_default() += 1;
-        }
-
         let mut mine: BTreeMap<String, String> = BTreeMap::new();
         let mut foreign: BTreeSet<String> = BTreeSet::new();
         for (identity, bank) in banks {
@@ -207,11 +205,6 @@ impl TeamScope {
                 mine.insert(identity.clone(), bank.clone());
             } else {
                 foreign.insert(bank.clone());
-            }
-        }
-        for (bank, n) in claims {
-            if n > 1 {
-                foreign.insert(bank);
             }
         }
 
@@ -260,7 +253,7 @@ impl TeamScope {
     }
 
     /// Whether `identity`'s bank may be read: it must be on the roster, must resolve to a bank at
-    /// all, and that bank must be claimed by nobody else.
+    /// all, and that bank must not also be claimed by an identity outside this team.
     pub fn admits_bank(&self, identity: &str) -> bool {
         match self.banks.get(identity) {
             Some(bank) => !self.foreign_banks.contains(bank),
@@ -394,13 +387,20 @@ impl<'a> Knowledge<'a> {
         let Some(room) = self.room else {
             return Ok(Vec::new());
         };
-        let limit = limit.clamp(1, MAX_ROOM_FACTS);
+        // Zero is the caller asking for the default, never for one post: that is what
+        // `RoomLog::read_since` itself does with a non-positive window, and what `clamp_rows` does
+        // with a non-positive row limit. A `clamp(1, _)` here would quietly disagree with both.
+        let limit = if limit == 0 {
+            MAX_ROOM_FACTS
+        } else {
+            limit.min(MAX_ROOM_FACTS)
+        };
         Ok(room.read_since("", &Cursor::default(), limit)?.messages)
     }
 
     /// The roster identity wearing `key`'s ticket, or empty. Off-roster labels read as empty for
-    /// [`identity_label_holder`](crate::teamsears)'s reason: §0.11.1 leaves a label the manager did
-    /// not author alone, and that includes not reporting it as a teammate.
+    /// the reason [`crate::teamsears`] refuses to act on them: §0.11.1 leaves a label the manager
+    /// did not author alone, and that includes not reporting its name as a teammate.
     fn wearer(&self, key: &str) -> String {
         self.issues
             .iter()
@@ -993,6 +993,45 @@ mod tests {
         );
     }
 
+    /// Two identities of the SAME team may share one bank: the refusal is about crossing a team
+    /// boundary, not about sharing.
+    #[tokio::test]
+    async fn recall_allows_a_bank_two_teammates_share() {
+        let dir = TempDir::new();
+        let bank = LocalBank::new(dir.child(DEFAULT_BANKS_SUBDIR), "agent-")
+            .with_bank_overrides([("alice", "shared"), ("bob", "shared")]);
+        bank.retain(&Record {
+            identity: "bob".into(),
+            document_id: "run-9".into(),
+            at: now(),
+            content: "a teammate's note".into(),
+            ..Record::default()
+        })
+        .expect("retain");
+
+        let daemon = banks(&[("alice", "shared"), ("bob", "shared")]);
+        let scope = TeamScope::new(["alpha"], ["alice", "bob"], &daemon);
+        let st = store();
+        let issues: Vec<Issue> = Vec::new();
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &bank);
+
+        assert!(scope.admits_bank("alice"));
+        assert_eq!(
+            k.recall(
+                "alice",
+                &Query {
+                    browse: true,
+                    ..Query::default()
+                }
+            )
+            .await
+            .expect("recall")
+            .len(),
+            1,
+            "a bank shared inside one team is not a cross-team read"
+        );
+    }
+
     /// An identity with no resolvable bank cannot be recalled from — an unresolvable bank is not a
     /// readable one.
     #[tokio::test]
@@ -1171,6 +1210,11 @@ mod tests {
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none).with_room(&room);
         assert_eq!(k.room(1_000).expect("room").len(), MAX_ROOM_FACTS);
         assert_eq!(k.room(3).expect("room").len(), 3);
+        assert_eq!(
+            k.room(0).expect("room").len(),
+            MAX_ROOM_FACTS,
+            "zero is the default window, not a window of one"
+        );
     }
 
     /// Teams off / storage off / memory off: every read is an empty answer, none is an error, and
