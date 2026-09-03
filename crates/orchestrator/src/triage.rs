@@ -1054,6 +1054,7 @@ where
             agent_command: &deps.agent_command,
             billing_guard: deps.billing_guard,
             tracker_api_key: &deps.tracker_api_key,
+            knowledge: None,
         };
         let heard =
             crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
@@ -2601,6 +2602,7 @@ mod tests {
                 key: "MT-2".to_string(),
                 intent: crate::teamsears::Intent::Assign,
                 assignee: Some("bob".to_string()),
+                answer: String::new(),
             }])
         }
     }
