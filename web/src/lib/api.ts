@@ -501,6 +501,13 @@ const RUN_IDENTITY_LIMIT = 100;
  * a teammate, `teams.unrouted` says "nobody" definitively, and a run in neither has no record at
  * all. Both are needed for the run detail to tell the last two apart. `lib/run-identity` folds the
  * combined hits into the per-run map; this only fetches them.
+ *
+ * All-or-nothing on purpose, rather than the `allSettled` that reads as the obvious robustness
+ * fix. Losing the unrouted half while keeping the routed half does not degrade the answer, it
+ * CORRUPTS it: a run that recorded "nobody" would come back as a run with no record, which is the
+ * one state that falls through to the live roster — so a solo run would silently acquire whichever
+ * teammate holds the ticket right now. No answer is a documented fallback; half an answer is a
+ * fabrication.
  */
 export async function fetchRunIdentityEvents(issue: string): Promise<EventHit[]> {
   const search = async (kind: string): Promise<EventHit[]> => {

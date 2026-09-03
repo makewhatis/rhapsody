@@ -139,6 +139,12 @@ export function JobDetailView({
   // beside the attempt list because it answers the same question that list does, and because it is
   // the whole ticket's answer: the baton needs the NEIGHBOURING attempt's teammate, not only the
   // one being read.
+  //
+  // Deliberately NOT gated on `teamsEnabled`, unlike every other Teams read on this page. That
+  // flag is the daemon's CURRENT one, and these rows were written when the runs happened: a
+  // daemon that ran a team and has since been switched to Teams-off still holds every one of
+  // them, so gating would blank the attribution on exactly the history this slice exists to keep.
+  // The cost of being wrong the other way is two sub-millisecond searches answering "no rows".
   const identityEvents = useRunIdentityEvents(issue);
   const identities = useMemo(() => runIdentities(identityEvents.data ?? []), [identityEvents.data]);
 
@@ -1028,7 +1034,7 @@ function SpineStep({
           {signed ? (
             <span className="stwho">
               <TeammateAvatar color={teammateColor(roster, who)} size={6} />
-              {who}
+              <span className="n">{who}</span>
             </span>
           ) : null}
         </span>
