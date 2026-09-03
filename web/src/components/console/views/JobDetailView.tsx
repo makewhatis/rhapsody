@@ -1,10 +1,8 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import {
   Button,
   Card,
   Chip,
-  Grid,
-  GridSide,
   Markdown,
   Mono,
   Pill,
@@ -129,15 +127,15 @@ export function JobDetailView({
         />
       )}
 
-      <Grid>
+      {/* The §4 context cards the three zones did not replace. They become the inspector's
+          watch-tabs rail in slice 4; until then they keep their own row under the trace. */}
+      <div className="trctx">
         <PullRequestCard pr={null} />
-        <GridSide>
-          {teamsEnabled ? <RoomSliceCard issue={issue} roster={roster} /> : null}
-          {teamsEnabled ? (
-            <TicketMemoryCard issue={issue} roster={roster} onOpenMemory={() => onNavigate("memory")} />
-          ) : null}
-        </GridSide>
-      </Grid>
+        {teamsEnabled ? <RoomSliceCard issue={issue} roster={roster} /> : null}
+        {teamsEnabled ? (
+          <TicketMemoryCard issue={issue} roster={roster} onOpenMemory={() => onNavigate("memory")} />
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -277,8 +275,22 @@ function HeaderActions({ run, ticketHref }: { run: RunSummary; ticketHref: strin
   const stop = useStopRun(run.id);
   const resume = useResumeRun(run.id);
   const prHref = prSearchUrl(run);
+  // The console has no toast surface, so a lifecycle action reports here or nowhere. Both halves
+  // matter: the request can fail, and it can succeed while the ticket MOVE fails — a run killed
+  // whose ticket stayed put is something the operator has to finish by hand.
+  const problem =
+    stop.error?.message ??
+    resume.error?.message ??
+    stop.data?.move_error ??
+    resume.data?.move_error ??
+    "";
   return (
     <div className="acts">
+      {problem === "" ? null : (
+        <span className="acterr" role="status">
+          {problem}
+        </span>
+      )}
       {run.outcome === "running" ? (
         <Button variant="sec" onClick={() => stop.mutate()} disabled={stop.isPending}>
           Stop
@@ -325,9 +337,17 @@ function HeaderActions({ run, ticketHref }: { run: RunSummary; ticketHref: strin
  * An action whose surface does not exist yet. It names the dependency in its own tooltip rather
  * than being a dead control or, worse, one that pretends to act (design record §5/§6).
  */
-function DepButton({ title, children }: { title: string; children: React.ReactNode }) {
+function DepButton({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <button type="button" className="btn sec" disabled title={title}>
+    <button
+      type="button"
+      className="btn sec dependency"
+      // NOT the `disabled` attribute: a disabled button fires no mouse events, so the tooltip
+      // that names the dependency would never open and the control would be merely dead.
+      aria-disabled="true"
+      title={title}
+      onClick={(e) => e.preventDefault()}
+    >
       {children}
       <span className="dep">dep</span>
     </button>
@@ -501,7 +521,8 @@ function Inspector({ phase, assignee }: { phase: TracePhase; assignee: string })
       {phase.did.length === 0 ? <div className="empty">No tool calls in this step.</div> : null}
       {/* A result with no call to fold onto — a truncated transcript. Surfaced, never dropped. */}
       {phase.orphanResults.map((text, i) => (
-        <div className="trcard" key={`orphan:${i}`}>
+        <div className="trcard orphan" key={`orphan:${i}`}>
+          <div className="reslab">result with no matching call</div>
           <div className="out">
             <pre tabIndex={0}>{text}</pre>
           </div>

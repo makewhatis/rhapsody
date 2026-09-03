@@ -300,7 +300,11 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     const merge = action(/^merge/i);
     expect(merge.querySelector(".dep")?.textContent).toBe("dep");
     expect(merge.getAttribute("title")).toMatch(/run-branch diff/i);
-    expect((merge as HTMLButtonElement).disabled).toBe(true);
+    // Inert, but NOT the `disabled` attribute: a disabled button fires no mouse events, so the
+    // tooltip that names the dependency would never open — the control would be dead, not named.
+    expect(merge.getAttribute("aria-disabled")).toBe("true");
+    expect((merge as HTMLButtonElement).disabled).toBe(false);
+    expect(merge.getAttribute("href")).toBeNull();
   });
 
   it("offers Stop only while the run is live, and Resume only once it has stopped", async () => {
@@ -308,6 +312,26 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     await waitFor(() => expect(action(/resume/i)).toBeTruthy());
     expect((action(/resume/i) as HTMLButtonElement).disabled).toBe(false);
     expect(within(document.querySelector(".trhd .acts") as HTMLElement).queryByRole("button", { name: /^stop$/i })).toBeNull();
+  });
+
+  it("surfaces a failed Stop instead of swallowing it — the console has no toast", async () => {
+    h.stopRun.mockRejectedValue(new Error("agent already exited"));
+    mountDetail([run({ id: 547, outcome: "running", ended_at: "" })]);
+    await waitFor(() => expect(action(/^stop$/i)).toBeTruthy());
+    fireEvent.click(action(/^stop$/i));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .acterr")?.textContent).toBe("agent already exited"),
+    );
+  });
+
+  it("surfaces a Stop that killed the agent but could not move the ticket", async () => {
+    h.stopRun.mockResolvedValue({ identifier: "STUDIO-654", move_error: "Backlog state missing" });
+    mountDetail([run({ id: 547, outcome: "running", ended_at: "" })]);
+    await waitFor(() => expect(action(/^stop$/i)).toBeTruthy());
+    fireEvent.click(action(/^stop$/i));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .acterr")?.textContent).toBe("Backlog state missing"),
+    );
   });
 
   it("stops a running run through the daemon's own endpoint", async () => {
