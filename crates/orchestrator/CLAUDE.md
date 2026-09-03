@@ -162,6 +162,23 @@ the `Orchestrator` struct itself. Concretely:
   of the model's half with `QUOTE_PREFIX` — written by the daemon after the fact, so a forged
   `GROUNDING_LEAD` renders inside the quoted region instead of above the real one (the same rule
   `one_line` applies to a fence-closing backtick run: untrusted text never mints host structure).
+  That containment also depends on the records actually FITTING (STUDIO-732): every reader renders
+  only `MAX_MESSAGE_BODY_BYTES` of a message and cuts from the END, where the grounding sits.
+  **Three rules keep that true and each one exists because its absence shipped.** (1) The budget is
+  spent per REPLY, not per target: `act_on_post` composes up to `MAX_TARGETS_PER_POST` dispositions
+  into ONE message, so `answer_for` is handed `disposition_budget(..)` — its own share — and never
+  the room's whole bound. Sizing each answer against the whole bound let N answers each "fit" and
+  collectively overrun, and `compose_reply` then resolved it from the end, deleting the grounding's
+  own "showing N of M". (2) `compose_reply` never CLIPS a line whose tail is a grounding
+  (`ReplyLine::whole`); it drops it entire and says so at the reply level, because a clip runs from
+  the end and the end of an answer is the bound `join_bounded` reserves budget for. (3) The four
+  shares — `MAX_GROUNDED_BYTES`, `MAX_ANSWER_BYTES`, the partition and `quote`'s marker — TILE
+  `MAX_MESSAGE_BODY_BYTES` exactly (`split_budget`), and the facts preamble STATES the prose share
+  it enforces (`answer_hint_chars`). A prose budget derived from what the records happened to weigh
+  refused the answer the prompt asked for, non-monotonically, on a `warn!` nobody reads. So changing
+  either ceiling changes the other by construction, and changing the prompt's ask without changing
+  the number is a defect, not a wording tweak. Every bound here truncates out loud ("showing N of
+  M"), never by handing the overflow to the room — on EVERY branch, degradation sentences included.
   Do not replace that prefix with a check that REFUSES prose containing the lead — that shape was
   tried and is a blocklist, refusing the honest phrasing the prompt's own heading invites while
   admitting a singular *record*, a dropped *From* or a homoglyph. `quote` splits on `['\n', '\r']`
