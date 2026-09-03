@@ -394,17 +394,22 @@ function plainSplit(text: string, cut: number): { head: string; rest: string } {
 function fenceSafeSplit(text: string, cut: number): { head: string; rest: string } {
   const fence = fenceSpans(text).find((f) => cut > f.start && cut < f.end);
   if (!fence) return plainSplit(text, cut);
-  // Inside the OPENING fence line: no part of the block can be kept, so cut just before it.
-  if (cut < fence.body) return plainSplit(text, fence.start);
+  // Inside the OPENING fence line: no part of the block can be kept, so cut just before it —
+  // except when the block OPENS the post, where cutting before it leaves no head at all. There
+  // the plain cut is the only bounded answer: keeping the opening line whole would grow the head
+  // by a line that is itself unbounded, and the preview it buys is an empty box either way.
+  if (cut < fence.body) return plainSplit(text, fence.start > 0 ? fence.start : cut);
   // Inside the CLOSING one: every content line is already in the head, so take the fence too.
   if (cut >= fence.close) return plainSplit(text, fence.end);
   // A cut inside a line can also MANUFACTURE a closing fence: split `cat ```' at its space and
   // the tail opens on " ```", which closes the reopened block at once and spills the rest of the
-  // code out as prose. Backing up to that line's start puts the line back together.
-  const eol = text.indexOf("\n", cut);
-  const at = isClosingFence(text.slice(cut, eol === -1 ? text.length : eol), fence.marker)
-    ? text.lastIndexOf("\n", cut) + 1
-    : cut;
+  // code out as prose. Backing up until the tail no longer reads as one fixes that, and backing
+  // up a CHARACTER at a time bounds the cost by the marker run rather than by the line: a single
+  // long code line whose tail is a marker run would otherwise cost the whole preview budget.
+  const eol = text.indexOf("\n", cut) === -1 ? text.length : text.indexOf("\n", cut);
+  const lineStart = text.lastIndexOf("\n", cut) + 1;
+  let at = cut;
+  while (at > lineStart && isClosingFence(text.slice(at, eol), fence.marker)) at -= 1;
   const head = text.slice(0, at);
   return {
     head: `${head}${head.endsWith("\n") ? "" : "\n"}${fence.marker}`,
