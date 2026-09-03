@@ -1078,16 +1078,22 @@ describe("a bounded read never states an unbounded absence", () => {
     expect(panel().textContent).not.toContain("No post in the room mentions this ticket.");
   });
 
-  it("states the plain absence only when the whole room fitted inside the window", async () => {
+  // A short read is not a whole-room read either — the daemon's 32-file day cap can truncate it
+  // without the count ever reaching the window — so this panel names no number AND claims nothing.
+  it("claims neither the window nor the whole room when the read fell short", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
     mountDetail([run({ id: 1 })]);
     h.fetchTeamsRoom.mockResolvedValue({ messages: otherPosts(3), skipped: [] });
     await settleTrace();
 
     await waitFor(() =>
-      expect(panel().textContent).toContain("No post in the room mentions this ticket."),
+      expect(panel().textContent).toContain(
+        "No post in the room's recent history mentions this ticket.",
+      ),
     );
+    // Not the window sentence either — this read never reached the window.
     expect(panel().textContent).not.toContain("most recent");
+    expect(panel().textContent).not.toContain("No post in the room mentions this ticket.");
   });
 
   // The escape the sentence owes the operator: the window is the console's, not the room's.

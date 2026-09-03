@@ -83,20 +83,27 @@ export const ROOM_WATCH_WINDOW = 50;
 /**
  * What the Room tab may state when no post it read mentions this ticket.
  *
- * The room is read newest-first and bounded, THEN filtered to the ticket, so an empty panel has
- * two quite different causes and only one of them is "the room is silent about this ticket". When
- * the read came back full, everything older than the window went unfetched, and a bare "no room
- * posts reference this ticket" is a claim about posts the console never saw — the same defect as
+ * The room is read newest-first and bounded, THEN filtered to the ticket, so an empty panel is
+ * never on its own evidence that the room is silent about this ticket — a bare "no room posts
+ * reference this ticket" is a claim about posts the console never saw, the same defect as
  * reporting a pending or failed read as an empty one, arriving on the read that SUCCEEDS.
  *
- * `read` is how many posts came back, which separates the two cases without a total the endpoint
- * does not serve: short of the window means the whole room fitted inside it and the plain absence
- * is true; at the window — or, defensively, past it — the sentence names what was read instead.
+ * NEITHER branch may claim the whole room, because `read_since` is bounded TWICE and the console
+ * can only see one of the bounds. `read` reaching the window proves the MESSAGE cap bit, and that
+ * much the sentence names outright. Falling short of it proves nothing: the log is day-partitioned
+ * and `MAX_ROOM_FILE_SCAN = 32` drops the oldest days before any message is counted
+ * (`crates/config/src/room.rs`), so an older room that has been sparse lately returns fewer than
+ * the window with whole days left unscanned. Nothing in `TeamsRoomResponse` distinguishes that
+ * from a room that fitted — so the short-read sentence is completeness-AGNOSTIC, true under either
+ * cap, and both branches lean on the panel's "Open the room →" escape for the rest.
+ *
+ * Naming the console's ACTUAL coverage needs a truncation signal the daemon does not serve yet;
+ * that is STUDIO-759's, not this rail's.
  */
 export function roomEmptyNote(read: number): string {
   return read >= ROOM_WATCH_WINDOW
     ? `No post in the room's most recent ${ROOM_WATCH_WINDOW} mentions this ticket.`
-    : "No post in the room mentions this ticket.";
+    : "No post in the room's recent history mentions this ticket.";
 }
 
 /**

@@ -261,16 +261,28 @@ describe("the absence a bounded read is entitled to state", () => {
     expect(note).not.toMatch(/^No post in the room mentions/);
   });
 
-  it("states the plain absence only when the whole room fitted in the window", () => {
-    expect(roomEmptyNote(ROOM_WATCH_WINDOW - 1)).toBe("No post in the room mentions this ticket.");
+  // A read SHORT of the window is not a read of the whole room either: `read_since` also drops
+  // day-files past `MAX_ROOM_FILE_SCAN = 32`, so an old, lately-sparse room returns fewer than 50
+  // with older days unscanned. The console cannot tell the two apart, so it claims neither.
+  it("never claims the whole room on a read that fell short of the window", () => {
+    const note = roomEmptyNote(ROOM_WATCH_WINDOW - 1);
+    expect(note).not.toMatch(/in the room mentions/);
+    expect(note).toContain("this ticket");
+  });
+
+  it("says the same completeness-agnostic thing for every short read, empty included", () => {
+    expect(roomEmptyNote(0)).toBe(roomEmptyNote(ROOM_WATCH_WINDOW - 1));
+    expect(roomEmptyNote(0)).not.toMatch(/in the room mentions/);
   });
 
   it("treats a read that somehow overran the window as bounded too", () => {
     expect(roomEmptyNote(ROOM_WATCH_WINDOW + 1)).toBe(roomEmptyNote(ROOM_WATCH_WINDOW));
   });
 
-  it("never lets an empty room read as a window-bounded one", () => {
-    expect(roomEmptyNote(0)).toBe("No post in the room mentions this ticket.");
+  // The two branches still SAY different things: the full read has earned the right to name the
+  // number it read, and collapsing them would lose that.
+  it("still distinguishes the full read from the short one", () => {
+    expect(roomEmptyNote(ROOM_WATCH_WINDOW)).not.toBe(roomEmptyNote(ROOM_WATCH_WINDOW - 1));
   });
 
   // Recall carries no bound in its response and the console cannot set one, so there is no read
