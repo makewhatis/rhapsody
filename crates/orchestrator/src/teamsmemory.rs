@@ -508,6 +508,17 @@ impl TeamsMemory {
     /// [`TeamScope`](crate::teamsknow::TeamScope) is that caller: it compares bank
     /// ids for a cross-team collision, and a map reporting the raw override made
     /// that comparison miss the collision entirely (STUDIO-729).
+    /// The backend this runtime was built with — the SAME handle, never a second one.
+    ///
+    /// Exposed for the manager's answer path (STUDIO-731), which needs to read the identical bank a
+    /// `teams_retain` writes to: a second backend assembled from the same config would re-derive
+    /// the `bank:` override rule, and [`TeamsMemory::new`]'s own comment records what happened the
+    /// last time two readers derived it apart (STUDIO-729). Read-only by use, not by type — the
+    /// trait is the whole `MemoryBackend` — so the caller owns keeping it a read.
+    pub fn backend(&self) -> Arc<dyn MemoryBackend> {
+        Arc::clone(&self.backend)
+    }
+
     pub fn bank_ids(&self) -> &HashMap<String, String> {
         &self.bank_ids
     }

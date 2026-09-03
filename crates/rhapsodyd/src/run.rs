@@ -154,6 +154,10 @@ where
     // `memory.backend: hindsight` with a usable endpoint. Carried out of the Teams block so the
     // task can be spawned beside triage and the quorum, where every other Teams task lives.
     let mut teams_prefetch: Option<PrefetchWiring> = None;
+    // The shared `TeamsMemory` the manager's answer path reads its bank map and its backend out of
+    // (STUDIO-731). Carried out of the Teams block for `teams_prefetch`'s reason — the triage task
+    // is spawned well below, by which point `o` has moved into the control task.
+    let mut teams_knowledge: Option<Arc<rhapsody_orchestrator::teamsmemory::TeamsMemory>> = None;
     // **THE** room handle for this process (STUDIO-678, §0.13). Built once, here, and handed to
     // every appender: the dispatch-path catch-up, the HTTP post surface, triage, the quorum and the
     // manager's replies. See the sharing note where the off-loop tasks take their clones.
@@ -200,6 +204,11 @@ where
             .map(|dir| Arc::new(rhapsody_config::room::LocalRoom::new(dir)));
         teams_prefetch =
             install_teams_memory(&mut o, &teams_cfg, resolved.as_ref(), &flags, &teams_room);
+        // Captured HERE, before `o` moves into the control task, and captured rather than rebuilt:
+        // the manager's answer path (STUDIO-731) must read the identical backend and the identical
+        // resolved bank map that a `teams_retain` writes through, or a `bank:` override ends up
+        // honoured by one side and ignored by the other (STUDIO-729's own bug).
+        teams_knowledge = o.teams_memory.as_ref().map(Arc::clone);
     }
     // Install the production dispatch credential-liveness probe (BO-59): before each dispatch the
     // control loop probes `claude -p 'reply with exactly: OK'` through the SAME scrubbed environment the
@@ -397,7 +406,18 @@ where
         let triage_ctx = shutdown.wait();
         let triage_handle = handle.clone();
         let ears_handle = handle.clone();
+        let knowledge_handle = handle.clone();
         let (command, billing_guard, tracker_api_key) = triage_agent_env(resolved.as_ref());
+        // ONE `gh` for both of the task's GitHub directions, built here rather than inside the
+        // `ears` closure so the manager's answer path can share it: it holds a summon token and
+        // nothing else, and a second handle would be a second place for that token to be read.
+        let ears_gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            &resolved
+                .as_ref()
+                .map(|c| c.tracker.summon_token.clone())
+                .unwrap_or_default(),
+            None,
+        ));
         let deps = rhapsody_orchestrator::TriageDeps {
             teams: Arc::new(teams_cfg.clone()),
             // Read lazily each cycle, exactly as the prune scheduler reads its store handle: the
@@ -422,6 +442,10 @@ where
                     // is bound to (STUDIO-677 keeps those beside them for the WRITERS — the quorum
                     // picks exactly one project to create through). `facts` below stays
                     // positionally aligned with the clients that survive this map.
+                    // Positionally aligned with `trackers` below, and taken from the SAME snapshot
+                    // in the SAME order — the manager's answer scope (STUDIO-731) is exactly the
+                    // set of projects this cycle swept, so it cannot drift from what triage saw.
+                    slugs: snap.trackers.iter().map(|p| p.slug.clone()).collect(),
                     trackers: snap.trackers.into_iter().map(|p| p.tracker).collect(),
                     states: snap.states,
                     facts: snap.facts,
@@ -460,6 +484,37 @@ where
                         .unwrap_or(30),
                 )) as Arc<dyn rhapsody_orchestrator::IdentityHistory>
             }),
+            // --- what the manager's `Answer` outcome reads from (STUDIO-731, slice 3) ---
+            //
+            // Armed only when there is a DURABLE store AND a `TeamsMemory` to take the backend and
+            // the resolved bank map from. Both halves are load-bearing:
+            //
+            // * A `Noop` store answers every read `Ok(empty)` and never `Err`, so a daemon that
+            //   keeps no history would tell the operator their TEAM has none — a confident,
+            //   durable, wrong sentence in a shared room, which is the exact failure mode this
+            //   whole design exists to prevent. `history` above is armed on the same condition for
+            //   a sibling reason.
+            // * The bank map has to be the one `TeamsMemory` resolved, never a second derivation
+            //   of the same rule (STUDIO-729).
+            //
+            // `None` is a complete, supported configuration: the manager stays the router it was
+            // before this slice, every prompt byte-identical and `Answer` unreachable.
+            knowledge: teams_knowledge
+                .as_ref()
+                .filter(|_| durable_store)
+                .map(|mem| {
+                    rhapsody_orchestrator::KnowledgeDeps {
+                        store: knowledge_handle.store(),
+                        memory: mem.backend(),
+                        banks: mem.bank_ids().clone(),
+                        // The one leg of the gather that leaves the daemon. It is gated AGAIN inside
+                        // the accessor — spent only for a pull request this team's own watch set says
+                        // one of its own reviewers is watching — so handing it over here is not the
+                        // authorization, only the capability.
+                        pr_comments: Some(Arc::clone(&ears_gh)
+                            as Arc<dyn rhapsody_orchestrator::ghsummons::SummonSource>),
+                    }
+                }),
             // Where a completed sweep is recorded, so "one-time" outlives this process.
             reconcile_marker: resolve_teams_reconcile_path(
                 resolved.as_ref(),
@@ -482,13 +537,7 @@ where
             // Linear carries no attachments).
             ears: resolve_teams_ears_cursor_path(resolved.as_ref(), &flags.db, flags.no_store).map(
                 |cursor| {
-                    let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
-                        &resolved
-                            .as_ref()
-                            .map(|c| c.tracker.summon_token.clone())
-                            .unwrap_or_default(),
-                        None,
-                    ));
+                    let gh = Arc::clone(&ears_gh);
                     Arc::new(
                         rhapsody_orchestrator::teamsears::Ears::new(
                             cursor,
