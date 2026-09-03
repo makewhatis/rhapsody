@@ -118,3 +118,20 @@
 .rh-console .setrow .tx b { font-size: 13.5px; }
 .rh-console .setrow .tx p { margin: 2px 0 0; color: var(--ink-3); font-size: 12px; }
 .rh-console .setrow .rt { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+
+/* ===== §6 (STUDIO-743) the worklist's trace sparkline =====
+   The same phase glyphs the run-detail spine draws (`.trstep .g`), shrunk to a table cell so the
+   glance view and the deep view speak one vocabulary. */
+.rh-console .spark { display: inline-flex; gap: 3px; align-items: center; }
+.rh-console .spark.idle { font-family: var(--mono); font-size: 12px; color: var(--ink-4); letter-spacing: .08em; }
+.rh-console .spark .gly { width: 19px; height: 19px; border-radius: 5px; display: grid; place-items: center; font-size: 11px; background: var(--panel-2); border: 1px solid var(--line); color: var(--ink-3); }
+.rh-console .spark .gly.now { color: var(--operator); border-color: var(--operator); background: var(--operator-soft); }
+/* STUDIO-743 — the strip is a CHECKLIST: a kind the run never reached keeps its column as an empty,
+   dashed slot, and a kind it did reach is weighted by how much of it there was. */
+.rh-console .spark .gly.off { color: var(--ink-4); background: none; border-style: dashed; opacity: .5; }
+.rh-console .spark .gly.wt-light { color: var(--ink-3); }
+.rh-console .spark .gly.wt-mid { color: var(--ink-2); }
+/* The ink ramp (--ink-4 > -3 > -2 > --ink) is what carries the weight; `heavy` brightens the border
+   too, and deliberately does NOT touch the background — --panel is DARKER than the base --panel-2
+   on this palette, so filling it would read as inset rather than as emphasis. */
+.rh-console .spark .gly.wt-heavy { color: var(--ink); border-color: var(--ink-4); font-weight: 700; }

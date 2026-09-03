@@ -104,12 +104,68 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
   }
 }
 
+/**
+ * Whether this ticket is waiting on the OPERATOR — the "Needs you" count the design record's §6
+ * adds to the Now strip. Derived from state the worklist already holds; no new endpoint.
+ *
+ * WHAT IT CLAIMS, EXACTLY. A ticket parked in review awaits a person's verdict or merge, and a
+ * failed run awaits a person's decision about what happens next. That is the whole claim, and it
+ * is deliberately coarse: what is NOT claimed is any sharper discrimination among them, because
+ * the facts that would allow one are named at the bottom of this comment and none of them is
+ * served to this view.
+ *
+ * That coarseness is why the strip now carries this and nothing beside it. On a healthy tracker
+ * the set is very nearly the in-review set — the failed runs are the whole difference — and when
+ * BOTH were painted, the honest answer looked like a bug: the same number, twice, two pills apart
+ * in different colours (16/16 on the live default page, 27/27 over all 358 rows). The convergence
+ * itself is not the defect, and narrowing it to manufacture a difference was tried and withdrawn
+ * twice; if the tracker says twelve tickets are parked for review, twelve tickets really are
+ * waiting on a human, and the console should say that ONCE. So per David's 2026-09-03 decision
+ * the in-review pill is gone and this is the home's single human-attention flag — it is the
+ * in-review-that-needs-you, widened by the failures that need one without reading in-review.
+ *
+ * `blocked` qualifies only when it is a FAILED run. The other thing that reads blocked is a held
+ * dependent (`runs-model`'s synthetic `waiting` row), and that one waits on its predecessor rather
+ * than on the operator. If the predecessor needs a human it is counted on its OWN row; counting
+ * the dependent too would bill one decision twice.
+ *
+ * WHY IT DOES NOT SPLIT ON A LIFECYCLE'S PRESENCE, which is the mistake worth keeping written
+ * down. An earlier shape counted a review row only when `lifecycle === "in_review"` came back,
+ * reading an ABSENT lifecycle as "inferred from a stale outcome, so nobody is waiting". But
+ * `StateProvider::issue_lifecycles` (crates/httpapi/src/server.rs) answers off a TTL cache and the
+ * reads cell's tracker AT REQUEST TIME, and a missing tracker, a failed round-trip and an unknown
+ * id are all *no answer*. Absence is therefore a LIVENESS condition of the daemon, not a property
+ * of the ticket — the same ticket answers on a warm cache and does not answer on a cold one. The
+ * rows that split were simply uncached, and once they warmed the split became a silent no-op.
+ *
+ * That liveness question is real, but it belongs to the PAYLOAD rather than to a row, and
+ * [`consoleJobCounts`] is where it is answered.
+ *
+ * WHAT WOULD MAKE IT SHARPER, flagged rather than guessed at (§9/§11). "Needs you" ought to mean
+ * "your merge is the next move", and the two facts that would say so are not served here: no
+ * endpoint carries a ticket's PR or its checks (the PR column renders "—" for the same reason),
+ * and no per-ticket record says whether a REVIEWER — human or agent — already holds it. A
+ * threshold guessed from a timestamp would look like a narrowing without being one, so until a
+ * supporting endpoint lands this stays the coarse claim it can actually defend.
+ *
+ * Takes the run status as a plain string for the reason `fromRunOutcome` does: `JobRow.status` is
+ * the wider `StatusKey`, and narrowing it with a cast would hide the case this has to survive.
+ */
+export function needsOperator(status: ConsoleJobStatus, runStatus: string): boolean {
+  if (status === "review") return true;
+  return status === "blocked" && runStatus !== "waiting";
+}
+
 /** One row of the §3 worklist, fully derived so the table stays presentational. */
 export interface ConsoleJobRow {
   /** Stable React key. */
   key: string;
   /** Ticket key — also the `job/:key` route target (§10 box 2.8). */
   issue: string;
+  /** The run the row's trace-sparkline previews; 0 when persistence is off (there is none). */
+  runId: number;
+  /** True while this ticket's newest run is genuinely in flight — the sparkline's playhead. */
+  live: boolean;
   title: string;
   /** Project display name, or "—" when the daemon runs single-project. */
   project: string;
@@ -129,6 +185,16 @@ export interface ConsoleJobRow {
   updatedAtMs: number;
   /** Held/failed detail, e.g. "waiting on STUDIO-1 · In Progress". */
   subLabel?: string;
+  /** Whether the ticket's next move is the OPERATOR's — the Now strip's "Needs you" (§6). */
+  needsYou: boolean;
+  /**
+   * Whether the daemon actually answered a tracker lifecycle for this ticket on THIS request.
+   *
+   * Not a property of the ticket — `issue_lifecycles` resolves per request off a TTL cache, so
+   * this says only "the tracker spoke for this row just now". It exists so [`consoleJobCounts`]
+   * can tell a healthy payload from the stripped one a cold cache serves; see [`needsOperator`].
+   */
+  lifecycleResolved: boolean;
 }
 
 /**
@@ -264,6 +330,8 @@ export function buildConsoleJobs(
     return {
       key: job.key,
       issue: job.issue,
+      runId: job.runId,
+      live: job.live,
       title: job.title,
       project: job.projectShort,
       projectSlug: job.project,
@@ -278,6 +346,8 @@ export function buildConsoleJobs(
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
+      needsYou: needsOperator(status, job.status),
+      lifecycleResolved: ticket !== undefined,
     };
   });
 
@@ -307,23 +377,67 @@ export function filterConsoleJobs(
   );
 }
 
-/** The four Now-strip stat pills of §3 (§10 box 2.6). */
+/**
+ * The per-status tally behind the Now strip, plus the "Needs you" the design record's §6 adds.
+ *
+ * `needsYou` deliberately CUTS ACROSS the other four rather than partitioning with them — see
+ * [`needsOperator`] — so the five numbers do not sum to the row count and are not meant to.
+ *
+ * WHAT THE STRIP ACTUALLY PAINTS IS FOUR OF THESE FIVE. §3 gave the strip a "running / in review /
+ * queued / blocked" row of pills and §6 added "Needs you" beside them, which put the operator's
+ * question on the strip TWICE: measured over the live listing the two agreed exactly — 16 and 16
+ * on the default page, 27 and 27 over all 358 rows, with neither difference set holding a single
+ * ticket. David's 2026-09-03 decision is that the strip asks it ONCE, so `JobsView` no longer
+ * renders an in-review pill and "Needs you" is the home's single human-attention flag.
+ *
+ * `review` survives HERE because this is the model rather than the strip: it is the honest count
+ * of rows reading in-review, it is what STUDIO-702's regression pins (terminal tickets stopped
+ * being billed as awaiting a reviewer), and the Seg still filters the table to exactly that set.
+ * What was dropped is the second pill, not the number.
+ */
 export interface ConsoleJobCounts {
   running: number;
+  /** Rows reading in-review. Still counted, no longer painted — see the note above. */
   review: number;
   queued: number;
   blocked: number;
+  /**
+   * How many tickets are waiting on the operator, or `null` for "the console cannot tell" — which
+   * the Now strip renders as "—" rather than as a number.
+   *
+   * WHY THIS ONE STAT IS NULLABLE AND THE OTHER FOUR ARE NOT. The four above are counts of rows
+   * the daemon definitely served. This one is a claim about the OUTSIDE world — what a human still
+   * owes — and it is only answerable while the tracker is answering. When `issue_lifecycles`
+   * resolves nothing for the payload (a cold cache, a missing tracker, a Linear round-trip that
+   * failed), `consoleJobStatus` falls back to inferring "in review" from every `completed` outcome,
+   * so `review` INFLATES at the exact moment the console knows least — measured on the live
+   * listing, 27 rows became 353. A count taken over those inferred rows would be a number the
+   * console invented, and the earlier shape that discounted them instead announced "0 need you",
+   * which is the one thing it could not know just then. A number either way is a claim; "—" is the
+   * truth. This matters more now that it is the strip's ONLY human-attention flag: there is no
+   * neighbouring pill left whose obvious inflation would hint that the tracker had gone quiet.
+   *
+   * The gate is all-or-nothing over the payload on purpose: the daemon resolves lifecycles for a
+   * request as a batch, so a page where NOT ONE row got an answer is the outage shape, while a
+   * page where some did is a healthy tracker that merely does not know every ticket. An empty
+   * worklist counts as knowable — nothing is waiting because there is nothing.
+   */
+  needsYou: number | null;
 }
 
 export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCounts {
-  const counts: ConsoleJobCounts = { running: 0, review: 0, queued: 0, blocked: 0 };
+  const counts = { running: 0, review: 0, queued: 0, blocked: 0 };
+  let needsYou = 0;
+  let heard = false;
   for (const row of rows) {
     if (row.status === "run") counts.running += 1;
     else if (row.status === "review") counts.review += 1;
     else if (row.status === "queued") counts.queued += 1;
     else if (row.status === "blocked") counts.blocked += 1;
+    if (row.needsYou) needsYou += 1;
+    if (row.lifecycleResolved) heard = true;
   }
-  return counts;
+  return { ...counts, needsYou: heard || rows.length === 0 ? needsYou : null };
 }
 
 /** One teammate's live state in the Now strip (§3). */

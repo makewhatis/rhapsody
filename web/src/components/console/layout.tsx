@@ -76,8 +76,9 @@ export function Mate({ name, task, running = false, className }: MateProps) {
 export interface StatProps {
   value: ReactNode;
   label: ReactNode;
-  /** `acc` tints the number amber (in review), `bad` red (blocked, quorum failures). */
-  tone?: "acc" | "bad";
+  /** `acc` tints the number amber (in review), `bad` red (blocked, quorum failures), `op` the
+      operator teal (work waiting on the human — STUDIO-743's "Needs you"). */
+  tone?: "acc" | "bad" | "op";
   className?: string;
 }
 
