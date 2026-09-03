@@ -3,8 +3,10 @@ import { useQuery } from "@tanstack/react-query";
 import {
   fetchIssueHistory,
   fetchRunDetail,
+  fetchRunIdentityEvents,
   fetchRunMessages,
   fetchRunTranscript,
+  type EventHit,
   type IssueHistoryResponse,
   type RunDetail,
   type RunMessage,
@@ -92,6 +94,24 @@ export function useIssueHistory(identifier: string, enabled = true) {
   return useQuery<IssueHistoryResponse>({
     queryKey: ["issue-history", identifier],
     queryFn: () => fetchIssueHistory(identifier),
+    enabled: enabled && identifier !== "",
+    staleTime: 10_000,
+    refetchOnWindowFocus: false,
+  });
+}
+
+// useRunIdentityEvents fetches one ticket's durable routing rows (STUDIO-746) — the per-run
+// record of who each attempt was dispatched as, which is what keeps a FINISHED run attributed
+// once its teammate has dropped off the live roster.
+//
+// It rides the attempt list's own cadence (`useIssueHistory`, 10s) rather than the run poll's,
+// because it answers the same question that list does: which runs exist and whose they were. A
+// routing row is written once at dispatch and never rewritten, so nothing here has to keep up
+// with a run in flight — only with a ticket that gains one.
+export function useRunIdentityEvents(identifier: string, enabled = true) {
+  return useQuery<EventHit[]>({
+    queryKey: ["run-identities", identifier],
+    queryFn: () => fetchRunIdentityEvents(identifier),
     enabled: enabled && identifier !== "",
     staleTime: 10_000,
     refetchOnWindowFocus: false,

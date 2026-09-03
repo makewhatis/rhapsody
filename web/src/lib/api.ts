@@ -481,6 +481,40 @@ export async function searchEvents(q: string, limit = 100): Promise<EventSearchR
   return r;
 }
 
+/** The `events` kind a ROUTED dispatch writes (`crate::teams::EVENT_ROUTE`). */
+export const ROUTE_EVENT_KIND = "teams.route";
+
+/** The `events` kind a dispatch that routed to NOBODY writes (`crate::teams::EVENT_UNROUTED`). */
+export const UNROUTED_EVENT_KIND = "teams.unrouted";
+
+// How many routing rows one ticket's identity lookup asks for, per kind. A dispatch writes exactly
+// ONE routing row (`crate::teams::EVENT_ROUTE` / `EVENT_UNROUTED`), so this is a per-RUN bound, not
+// a per-event one — and it comfortably covers `/issues/{id}/history`, whose own default window is
+// the 50 newest runs of the ticket (`DEFAULT_RUN_LIMIT`, crates/store/src/sqlite.rs). A run the
+// window misses resolves to no record, which the caller already handles.
+const RUN_IDENTITY_LIMIT = 100;
+
+/**
+ * One ticket's DURABLE routing rows — who each of its runs was dispatched as (STUDIO-746).
+ *
+ * Two searches because `kind` is an exact match and the answer is a tri-state: `teams.route` names
+ * a teammate, `teams.unrouted` says "nobody" definitively, and a run in neither has no record at
+ * all. Both are needed for the run detail to tell the last two apart. `lib/run-identity` folds the
+ * combined hits into the per-run map; this only fetches them.
+ */
+export async function fetchRunIdentityEvents(issue: string): Promise<EventHit[]> {
+  const search = async (kind: string): Promise<EventHit[]> => {
+    const p = new URLSearchParams({ issue, kind, limit: String(RUN_IDENTITY_LIMIT) });
+    const r = await getJSON<EventSearchResponse>(`/api/v1/events?${p.toString()}`);
+    return r.hits ?? [];
+  };
+  const [routed, unrouted] = await Promise.all([
+    search(ROUTE_EVENT_KIND),
+    search(UNROUTED_EVENT_KIND),
+  ]);
+  return [...routed, ...unrouted];
+}
+
 export async function fetchMetrics(days = 30): Promise<MetricsResponse> {
   const r = await getJSON<MetricsResponse>(`/api/v1/metrics?days=${days}`);
   r.days ??= [];
