@@ -349,14 +349,16 @@ export const OUTCOME_RUNNING = "running";
  *
  * Two guards, both about not asserting something the caller did not ask for. The detail must be
  * THIS run's — react-query hands back the previous key's data for one render on a key change, and
- * an overlay of run 522's turn count onto run 547 is a number nobody served. And a row that has
- * already ENDED is returned untouched: the live snapshot outlives the run by a poll interval or
+ * an overlay of run 522's turn count onto run 547 is a number nobody served. And only a row that
+ * is still RUNNING is overlaid at all: the live snapshot outlives the run by a poll interval or
  * two (`run_detail_from_running` reports `outcome: running` for anything still in the map), and
- * resurrecting a finished run would put the header back into Stop-and-streaming.
+ * resurrecting a finished run would put the header back into Stop-and-streaming. `running` is
+ * also the only in-flight shape there is to admit — `start_run` inserts every row with
+ * `OUTCOME_RUNNING` (`crates/store/src/sqlite.rs`), so an ""-outcome row is not a run in progress.
  */
 export function liveRunRow(row: RunSummary, detail: RunDetail | undefined): RunSummary {
   if (detail === undefined || detail.run_id !== row.id) return row;
-  if (row.outcome !== "" && row.outcome !== OUTCOME_RUNNING) return row;
+  if (row.outcome !== OUTCOME_RUNNING) return row;
   return {
     ...row,
     outcome: detail.outcome,

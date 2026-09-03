@@ -1033,6 +1033,16 @@ function selectedStep(): string {
   return document.querySelector('.trstep[aria-pressed="true"] .stt')?.textContent ?? "";
 }
 
+/** The step the playhead's `now` badge marks; "" when the spine marks none. */
+function nowStep(): string {
+  return document.querySelector(".trstep.now .stt")?.textContent ?? "";
+}
+
+/** The spine's grep field. */
+function grepField(): HTMLInputElement {
+  return screen.getByRole("searchbox", { name: /filter steps/i }) as HTMLInputElement;
+}
+
 /** Re-runs a polled query's fetcher, which is what a poll tick does. */
 async function poll(key: unknown[]) {
   await act(async () => {
@@ -1088,6 +1098,40 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     expect(document.querySelector(".trinsp .trcard .tgt")?.textContent).toBe(
       "cargo test --workspace",
     );
+  });
+
+  it("offers no jump-to-latest on a live run whose transcript has not arrived", async () => {
+    // A run that has just started has no phase to track — and so nothing to have fallen behind.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(spineTitles()).toEqual([]);
+    expect(document.querySelector(".trlatest")).toBeNull();
+  });
+
+  it("marks the playhead over the RUN, not the filtered spine — the `now` badge cannot lie", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(spineTitles()).toEqual(["Oriented", "Implemented", "Verified"]);
+    expect(nowStep()).toBe("Verified");
+
+    // A grep that hides the phase the run is writing into marks NOTHING. The selection falls back
+    // to the newest step still visible — that is a choice of what to READ — but `now` is a claim
+    // about where the run IS, and it must not name a step the run has already left.
+    fireEvent.change(grepField(), { target: { value: "api.ts" } });
+    await waitFor(() => expect(spineTitles()).toEqual(["Oriented", "Implemented"]));
+    expect(nowStep()).toBe("");
+    expect(selectedStep()).toBe("Implemented");
+
+    // Nor is the page still FOLLOWING a head it is not showing: the chip is offered, and it
+    // clears the grep on its way back rather than scrolling to a spine the newest step is off.
+    const latest = document.querySelector(".trlatest") as HTMLElement;
+    expect(latest).toBeTruthy();
+    fireEvent.click(latest);
+    await waitFor(() => expect(nowStep()).toBe("Verified"));
+    expect(grepField().value).toBe("");
+    expect(selectedStep()).toBe("Verified");
   });
 
   it("holds still once the operator picks a step, and offers the way back to the playhead", async () => {
@@ -1151,6 +1195,11 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     height = 3000;
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
     await poll(["run-transcript", 547]);
+    // Observed at the moment the GROWTH RENDER has actually happened — the appended step is on
+    // the spine, so the follow effect has already run against the taller page. Asserting straight
+    // after the poll instead proves only that the refetch had not landed yet, and passes whether
+    // or not the guard is there.
+    await waitFor(() => expect(spineTitles()).toContain("Verified"));
     expect(scroller().scrollTop).toBe(0);
     // And the chip is the way back: it re-takes the playhead AND the bottom of the page.
     fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
@@ -1258,6 +1307,33 @@ describe("the live run — the Message composer (§3A)", () => {
     expect(h.sendRunMessage).not.toHaveBeenCalled();
   });
 
+  it("keeps a half-written message on screen when the run ends underneath it", async () => {
+    mountDetail([run(LIVE)]);
+    await waitFor(() => expect(action(/^message/i)).toBeTruthy());
+    // The header's action names the composer only while there is one to name — an `aria-controls`
+    // pointing at an id the document does not carry is a dangling reference, not a hint.
+    expect(action(/^message/i).getAttribute("aria-controls")).toBeNull();
+    fireEvent.click(action(/^message/i));
+    const box = (await screen.findByLabelText(/message the running agent/i)) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "btw the branch moved" } });
+    expect(action(/^message/i).getAttribute("aria-controls")).toBe("trmsg");
+
+    // The run ends mid-compose, which the 2s poll is what notices.
+    h.fetchRunDetail.mockImplementation(async (id: number) =>
+      detailOf(run({ ...LIVE, id }), { outcome: "completed", ended_at: "2026-09-01T19:15:00Z" }),
+    );
+    await poll(["run-detail", 547]);
+    await waitFor(() =>
+      expect(document.querySelector(".trmsg .acterr")?.textContent).toContain(
+        "there is no agent left to deliver this to",
+      ),
+    );
+    // Discarding what the operator typed is not this view's call to make; refusing to send it is.
+    expect(box.value).toBe("btw the branch moved");
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    expect(h.sendRunMessage).not.toHaveBeenCalled();
+  });
+
   // A finished run has no agent to reach, so the endpoint is not a dependency — it is inapplicable.
   it("names the dependency instead on a run that has already ended", async () => {
     mountDetail([run({ id: 547 })]);
@@ -1303,16 +1379,47 @@ describe("the failed run — jump to the failing step (§3B)", () => {
     expect(screen.queryByRole("button", { name: /jump to failing step/i })).toBeNull();
   });
 
-  it("keeps the jump out of a stopped run's amber banner when nothing failed", async () => {
-    h.fetchRunTranscript.mockResolvedValue({
-      run_id: 547,
-      generated_at: "",
-      entries: STREAMING,
-    });
+  it("clears a filter that hides the failing phase — the jump is an instruction, not a wish", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547, outcome: "failed", error: "cargo test exited 101" })]);
+    await settleTrace();
+
+    // An operator who has been poking the chips on a failed run and then reads the banner: Edits
+    // hides the phase that actually failed, and `selected` discards a pick the filter hides.
+    fireEvent.click(screen.getByRole("button", { name: "Edits" }));
+    await waitFor(() => expect(spineTitles()).toEqual(["Implemented"]));
+
+    fireEvent.click(screen.getByRole("button", { name: /jump to failing step/i }));
+    await waitFor(() => expect(selectedStep()).toBe("Verified"));
+    // The failing call is on screen AND open — a jump that selects nothing the operator can see
+    // is the same no-op as one that selects nothing at all.
+    expect(document.querySelector(".trcard.err .top")?.getAttribute("aria-expanded")).toBe("true");
+    expect(spineTitles()).toEqual(["Oriented", "Implemented", "Verified", "Coordinated"]);
+
+    // The grep is the other half of the filter, and hides a phase just as completely.
+    fireEvent.change(grepField(), { target: { value: "export interface" } });
+    await waitFor(() => expect(spineTitles()).toEqual(["Oriented"]));
+    fireEvent.click(screen.getByRole("button", { name: /jump to failing step/i }));
+    await waitFor(() => expect(selectedStep()).toBe("Verified"));
+    expect(grepField().value).toBe("");
+    expect(document.querySelector(".trcard.err .top")?.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("keeps the jump out of a stopped run's amber banner, even when a step did fail", async () => {
+    // The COMPLETED transcript's `npm test` failed — an operator stopping a run while a test is
+    // red is not an exotic input, so the gate has to be the BANNER's tone and not merely whether
+    // the trace holds a failing step. §3B gives the jump to the failed banner alone ("Stopped ->
+    // amber reason + Resume"), and `.trbanner .jump` is tinted `--bad`, which an amber banner is
+    // not.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
     mountDetail([run({ id: 547, outcome: "stopped", error: "stopped by the operator" })]);
     await settleTrace();
     expect(document.querySelector(".trbanner.stop")).toBeTruthy();
+    // The failing step really is in this trace: the spine marks it red.
+    expect(document.querySelector(".trstep.err")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /jump to failing step/i })).toBeNull();
+    // What a stop offers instead.
+    expect(action(/^Resume$/)).toBeTruthy();
   });
 });
 

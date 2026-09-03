@@ -239,12 +239,13 @@ function RunTrace({
         onCompose={() => setComposing(!composing)}
       />
 
-      {/* The operator's own line into a running agent (`POST /api/v1/runs/{id}/message`). It is
-          live-only because a finished run has no agent to reach — the endpoint is not a missing
-          dependency there, it is inapplicable, so the action names one instead. The MESSAGE LIST,
-          with its sent→delivered chips, is slice 4's watch-tab. */}
-      {inFlight && composing ? (
-        <MessageComposer runId={run.id} onClose={() => setComposing(false)} />
+      {/* The operator's own line into a running agent (`POST /api/v1/runs/{id}/message`). Only a
+          LIVE run can be reached — a finished one has no agent left, so the header's action names
+          that instead of offering a send that cannot land — but a composer already open when the
+          run ends stays open, rather than taking a half-written instruction down with it. The
+          MESSAGE LIST, with its sent→delivered chips, is slice 4's watch-tab. */}
+      {composing ? (
+        <MessageComposer runId={run.id} live={inFlight} onClose={() => setComposing(false)} />
       ) : null}
 
       <div className="trmode">
@@ -458,7 +459,9 @@ function HeaderActions({
         <Button
           variant="sec"
           aria-expanded={composing}
-          aria-controls={MESSAGE_COMPOSER_ID}
+          // Named only while the composer is actually mounted: `aria-controls` pointing at an id
+          // that is not in the document is a dangling reference, not a hint.
+          aria-controls={composing ? MESSAGE_COMPOSER_ID : undefined}
           onClick={onCompose}
         >
           Message
@@ -517,6 +520,9 @@ function DepButton({ title, children }: { title: string; children: ReactNode }) 
   );
 }
 
+/** The composer's element id, so the header's Message action can name what it expands. */
+const MESSAGE_COMPOSER_ID = "trmsg";
+
 /**
  * The operator's line into a running agent (`POST /api/v1/runs/{id}/message`, INF-250).
  *
@@ -525,19 +531,29 @@ function DepButton({ title, children }: { title: string; children: ReactNode }) 
  * slice plan splits these tickets to avoid. What this owns is the send and its outcome: the
  * console has no toast surface, so a refusal (the daemon caps pending messages per run) reports
  * here or nowhere.
+ *
+ * It stays mounted when the run ends underneath it (`live` goes false) instead of unmounting with
+ * whatever was typed in it: the send is impossible then and says so, but silently discarding an
+ * operator's half-written instruction is not this component's call to make.
  */
-/** The composer's element id, so the header's Message action can name what it expands. */
-const MESSAGE_COMPOSER_ID = "trmsg";
-
-function MessageComposer({ runId, onClose }: { runId: number; onClose: () => void }) {
+function MessageComposer({
+  runId,
+  live,
+  onClose,
+}: {
+  runId: number;
+  live: boolean;
+  onClose: () => void;
+}) {
   const send = useSendRunMessage(runId);
   const [text, setText] = useState("");
   const [problem, setProblem] = useState("");
   const submit = () => {
     const body = text.trim();
     // An empty send is not an error to report — it is nothing to say. The daemon would reject it
-    // anyway, and spending a request to be told so is worse than not making one.
-    if (body === "" || send.isPending) return;
+    // anyway, and spending a request to be told so is worse than not making one. Nor is there
+    // anything to send to once the run has ended.
+    if (!live || body === "" || send.isPending) return;
     setProblem("");
     send.mutate(body, {
       onSuccess: () => setText(""),
@@ -564,12 +580,17 @@ function MessageComposer({ runId, onClose }: { runId: number; onClose: () => voi
         }}
       />
       <div className="row">
+        {live ? null : (
+          <span className="acterr" role="status">
+            This run has ended — there is no agent left to deliver this to.
+          </span>
+        )}
         {problem === "" ? null : (
           <span className="acterr" role="status">
             {problem}
           </span>
         )}
-        <Button onClick={submit} disabled={send.isPending}>
+        <Button onClick={submit} disabled={!live || send.isPending}>
           Send
         </Button>
         <Button variant="sec" onClick={onClose}>
@@ -612,10 +633,13 @@ function ResultCardZone({
             <div className={`trbanner ${banner.tone}`}>
               <b>{banner.label}</b>
               <span>{banner.text}</span>
-              {/* §3B's "jump to failing step". Offered only when the TRACE actually holds a failed
-                  step: a run that died before it ran anything has an error and nothing to jump to,
-                  and a control that selects nothing is worse than one that is not there. */}
-              {onJumpToFailure === null ? null : (
+              {/* §3B's "jump to failing step", which that section assigns to the FAILED banner
+                  alone ("Stopped -> amber reason + Resume"). Two conditions, for two different
+                  reasons: an operator stop is not a failure to jump into even when the transcript
+                  holds a red step, and a run that died before it ran anything has an error with
+                  nothing to jump to — a control that selects nothing is worse than one that is
+                  not there. */}
+              {banner.tone !== "fail" || onJumpToFailure === null ? null : (
                 <button type="button" className="jump" onClick={onJumpToFailure}>
                   jump to failing step →
                 </button>
@@ -694,26 +718,47 @@ function TraceSplit({
   const [picked, setPicked] = useState<string | null>(null);
 
   const visible = useMemo(() => filterPhases(phases, filter, query), [phases, filter, query]);
-  const playhead = playheadPhase(visible);
+  // The playhead is a claim about where the RUN is, so it is computed over every phase and NOT
+  // over the filtered spine: a grep that hides the newest step would otherwise move the `now`
+  // marker back onto a step the run has already left, and the badge would be reporting the
+  // filter rather than the run.
+  const playhead = playheadPhase(phases);
+  // What the spine actually MARKS. When the run's newest phase is filtered out, nothing is
+  // marked — an honest silence, rather than `now` on the newest phase that happens to be left.
+  const playing = live && visible.some((phase) => phase.id === playhead?.id) ? playhead : undefined;
   // The pick is a PREFERENCE, not the selection: a filter that hides the picked phase moves the
   // inspector onto the first phase still visible rather than emptying it, and restoring the
   // filter brings the pick back.
   //
   // What the fallback IS, though, depends on the run. A finished trace is read forwards, from its
   // first step. A live one is read at its head: with nothing picked the inspector sits on the
-  // newest phase, so the next poll that appends one carries the selection with it — that is the
-  // playhead, and it costs no timer of its own.
-  const selected = visible.find((phase) => phase.id === picked) ?? (live ? playhead : visible[0]);
+  // newest VISIBLE phase, so the next poll that appends one carries the selection with it — that
+  // is the playhead, and it costs no timer of its own.
+  const selected =
+    visible.find((phase) => phase.id === picked) ??
+    (live ? playheadPhase(visible) : visible[0]);
 
   // A jump aims at a phase and, when it has one, a call to open. `picked` is SET rather than the
   // selection forced, so the operator can move on from where the jump landed.
   const target = jump?.step ?? null;
   const nonce = jump?.nonce ?? 0;
+  // The jump is an INSTRUCTION, and a chip or grep the operator left active is free to ignore a
+  // preference: `selected` above discards a `picked` phase the filter hides, so the failing card
+  // would never render, the auto-expand would have nothing to fire on, and the banner's only
+  // control would be a silent no-op. So the jump CLEARS the filter on its way in, which is the
+  // one thing that guarantees its target is on the spine when it lands.
   useEffect(() => {
-    if (jump !== null) setPicked(jump.step.phaseId);
+    if (jump === null) return;
+    setPicked(jump.step.phaseId);
+    setFilter("all");
+    setQuery("");
   }, [jump]);
 
-  const following = live && (picked === null || picked === playhead?.id);
+  // Following means the inspector is tracking the run's head — so a run whose newest phase the
+  // filter has HIDDEN is not following it, however little is picked. A run with no phases yet is
+  // still following: there is nothing to track, and nothing to have fallen behind either.
+  const headHidden = playhead !== undefined && playing === undefined;
+  const following = live && !headHidden && (picked === null || picked === playhead?.id);
   const atBottom = useFollowScroll(following);
   const behind = live && (!following || !atBottom);
 
@@ -743,7 +788,7 @@ function TraceSplit({
             key={phase.id}
             phase={phase}
             selected={phase.id === selected?.id}
-            playing={live && phase.id === playhead?.id}
+            playing={phase.id === playing?.id}
             onSelect={() => setPicked(phase.id)}
           />
         ))}
@@ -774,6 +819,11 @@ function TraceSplit({
           className="trlatest"
           onClick={() => {
             setPicked(null);
+            // Same reason as the jump above: a playhead the filter hides cannot be returned to,
+            // so the way back to "latest" clears the filter rather than scrolling to a spine
+            // the newest step is not on.
+            setFilter("all");
+            setQuery("");
             scrollToBottom();
           }}
         >

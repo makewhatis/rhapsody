@@ -414,6 +414,13 @@ describe("liveRunRow — the 2s run-detail poll over the issue-history row", () 
     expect(merged.outcome).toBe("completed");
     expect(merged.ended_at).toBe("2026-09-03T10:04:30Z");
   });
+
+  it("overlays a RUNNING row and nothing else — the only in-flight shape the store writes", () => {
+    // `start_run` inserts every row with `OUTCOME_RUNNING` (`crates/store/src/sqlite.rs`),
+    // so an ""-outcome row is not a run in progress and has no live telemetry to take.
+    const row = run({ id: 7, outcome: "", ended_at: "" });
+    expect(liveRunRow(row, detail({ run_id: 7, turn_count: 99 }))).toBe(row);
+  });
 });
 
 describe("playheadPhase — where a live run's spine sits", () => {
