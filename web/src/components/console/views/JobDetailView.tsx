@@ -909,12 +909,9 @@ function useFollowScroll(active: boolean): FollowScroll {
   useEffect(() => {
     const el = pageScroller();
     if (el === null) return;
-    if (active && pinned.current && el.scrollHeight > height.current) {
-      scrollToBottom();
-      // Where the page now is. A browser confirms it with a scroll event, jsdom never does, and
-      // the next growth must not be decided on a reading that predates this scroll.
-      pinned.current = true;
-    }
+    // No reading is written back here: this branch only runs when the page was ALREADY pinned,
+    // and it leaves it pinned.
+    if (active && pinned.current && el.scrollHeight > height.current) scrollToBottom();
     height.current = el.scrollHeight;
   });
 
