@@ -32,6 +32,12 @@
 .rh-console .trhd .idw { min-width: 0; }
 .rh-console .trhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
 .rh-console .trhd h1 { margin: 0; font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
+/* The assignee slot while the durable routing search is still in flight: the space is held, so the
+   header does not reflow when the name lands, but nothing is claimed — see the slot's own comment.
+   Sized off `.who2`'s avatar-plus-name so the swap costs no jump. */
+.rh-console .trhd .whoskel { display: inline-block; font-size: 12.5px; width: 9ch; height: 12px; border-radius: 5px; background: var(--line); opacity: .55; }
+/* A live region announces its CONTENT, so the placeholder carries text an aria-label would not. */
+.rh-console .trhd .whoskel .vh { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .rh-console .trvitals { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-4); display: flex; gap: 14px; flex-wrap: wrap; }
 .rh-console .trvitals b { color: var(--ink-2); font-weight: 500; }
 .rh-console .trhd .acts { display: flex; gap: 7px; flex-wrap: wrap; }
@@ -105,7 +111,16 @@
 .rh-console .trstep .g { flex: 0 0 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; font-size: 13px; background: var(--panel-2); border: 1px solid var(--line); color: var(--ink-2); }
 .rh-console .trstep.err .g { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
 .rh-console .trstep .txt { min-width: 0; }
-.rh-console .trstep .stt { font-weight: 600; font-size: 13px; display: block; }
+.rh-console .trstep .sthd { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.rh-console .trstep .stt { font-weight: 600; font-size: 13px; flex: 0 0 auto; }
+/* Who a state-changing step was (STUDIO-746, design record §6). Quieter than the title: it says
+   whose the post or the hand-off was, it is not the name of the step. */
+/* The title wins the row and the name yields: the spine is ~264px, so a long identity ellipsises
+   rather than pushing the step's own title out of it. The truncation sits on the inner `.n` and
+   not on `.stwho`, because `text-overflow` does not apply to a flex container's anonymous item —
+   set here it would clip the name with no ellipsis and no warning. */
+.rh-console .trstep .stwho { display: inline-flex; align-items: center; gap: 5px; min-width: 0; font-size: 11px; color: var(--ink-4); font-weight: 500; }
+.rh-console .trstep .stwho .n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rh-console .trstep .ssub { font-size: 11px; color: var(--ink-4); font-family: var(--mono); display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rh-console .trstep .fx { display: flex; gap: 5px; margin-top: 5px; flex-wrap: wrap; }
 .rh-console .fxchip { font-size: 10px; color: var(--ink-4); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font-family: var(--mono); }

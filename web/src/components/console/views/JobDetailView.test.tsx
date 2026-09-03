@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
   fetchRunDetail: vi.fn(),
   fetchRunTranscript: vi.fn(),
+  fetchRunIdentityEvents: vi.fn(),
   sendRunMessage: vi.fn(),
   fetchRunMessages: vi.fn(),
   fetchState: vi.fn(),
@@ -38,6 +39,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchIssueHistory: h.fetchIssueHistory,
     fetchRunDetail: h.fetchRunDetail,
     fetchRunTranscript: h.fetchRunTranscript,
+    fetchRunIdentityEvents: h.fetchRunIdentityEvents,
     sendRunMessage: h.sendRunMessage,
     fetchRunMessages: h.fetchRunMessages,
     fetchState: h.fetchState,
@@ -202,6 +204,12 @@ function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
       roster: [teammate("alice")],
     });
   }
+  // No routing rows by default: the run detail then falls back to the live roster, which is what
+  // every pre-STUDIO-746 expectation in this file was written against. A test about the DURABLE
+  // record configures it before mounting.
+  if (h.fetchRunIdentityEvents.getMockImplementation() === undefined) {
+    h.fetchRunIdentityEvents.mockResolvedValue([]);
+  }
   h.fetchTeamsRoom.mockResolvedValue({ messages: [], skipped: [] });
   h.fetchTeamsRecall.mockResolvedValue({ identity: "alice", facts: [], skipped: [] });
   // Configured BEFORE mounting by a test that cares what they say; these are only the defaults.
@@ -274,6 +282,7 @@ afterEach(() => {
   h.fetchRunMessages.mockReset();
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
+  h.fetchRunIdentityEvents.mockReset();
   // The page geometry is defined on the live document, which outlives a render.
   const el = scroller() as unknown as Record<string, unknown>;
   delete el.scrollHeight;
@@ -2137,8 +2146,9 @@ describe("the attempt relay — the handoff baton (§3C/§6)", () => {
     expect(document.querySelector(".trbaton.in")).toBeNull();
   });
 
-  // The console can name ONE teammate per ticket, not one per run, so today's relay reads as the
-  // run handoff it is rather than inventing a second name. See `runTeammate`.
+  // With no routing row recorded for either attempt both fall back to the ticket's ONE live name,
+  // so the relay reads as the run handoff it is rather than inventing a second name. The two-name
+  // branch is reached from the per-run record — see the STUDIO-746 block below.
   it("carries the teammate it can name beside the relay", async () => {
     mountDetail(RELAY);
     await waitFor(() =>
@@ -2146,12 +2156,10 @@ describe("the attempt relay — the handoff baton (§3C/§6)", () => {
     );
   });
 
-  // NOT tested through the view: a baton naming two DIFFERENT teammates. Nothing the daemon
-  // serves can produce that payload — `/issues/{id}/history` matches `issue_identifier` exactly
-  // (`crates/store/src/sqlite.rs`), so every run in one selector shares a key, and one key
-  // resolves to one name. `relayBatons`' own unit tests pin the two-name branch, and slice 5's
-  // per-run identity is what will reach it. A view test over a history the store never writes
-  // would be green and prove nothing.
+  // A baton naming two DIFFERENT teammates IS reachable since STUDIO-746 — the routing rows are
+  // per RUN, so two attempts of one ticket can carry two names even though they share a key. That
+  // case is tested through the view in the STUDIO-746 block below, over a payload the daemon
+  // really serves.
 
   it("gives a ticket with a single run no baton in either direction", async () => {
     mountDetail([run({ id: 547 })]);
@@ -2174,5 +2182,216 @@ describe("the attempt relay — the handoff baton (§3C/§6)", () => {
     await settleTrace();
     expect(document.querySelector(".trhd .who2")?.textContent).toContain("jimmy");
     expect(document.querySelector(".trinsp h4")?.textContent).toBe("Oriented — what jimmy did");
+  });
+});
+
+describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => {
+  /** One routing row, as `GET /api/v1/events?kind=teams.route` serves it. */
+  function routed(run_id: number, identity: string) {
+    return {
+      run_id,
+      issue_identifier: "STUDIO-654",
+      seq: 1,
+      at: "2026-09-01T19:11:00Z",
+      kind: "teams.route",
+      tool: "",
+      text: `identity=${identity} reason=label`,
+    };
+  }
+
+  /** A dispatch that routed to NOBODY — a solo or unmatched run. (A Teams-OFF dispatch writes no
+      row at all, so it is "no record" and falls through to the live roster; see `run-identity`.) */
+  function unrouted(run_id: number, reason: string) {
+    return { ...routed(run_id, "x"), kind: "teams.unrouted", text: `reason=${reason}` };
+  }
+
+  /** The live roster with NOBODY on this ticket — a finished job, off every teammate's list. */
+  function rosterWithoutTheTicket(...names: string[]) {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: names.map((name) => ({ ...teammate(name), tickets: [] })),
+    });
+  }
+
+  // The acceptance the slice exists for: the live roster drops a ticket the moment its run ends,
+  // so before this the header of every finished job read "—".
+  it("keeps a COMPLETED run's assignee, from the run's own dispatch record", async () => {
+    rosterWithoutTheTicket("alice");
+    h.fetchRunIdentityEvents.mockResolvedValue([routed(547, "alice")]);
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    await settleTrace();
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .who2")?.textContent).toContain("alice"),
+    );
+    expect(document.querySelector(".trhd .who2")?.textContent).not.toContain("—");
+    // The inspector reads from the same resolution, so the two can never disagree.
+    expect(document.querySelector(".trinsp h4")?.textContent).toContain("what alice did");
+  });
+
+  // The durable record is about THIS run; the live roster is about the ticket. When they disagree
+  // the run's own record is the one that was true when it ran.
+  it("prefers the run's own record over a live roster naming somebody else", async () => {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [teammate("jimmy")], // jimmy holds STUDIO-654 right now
+    });
+    h.fetchRunIdentityEvents.mockResolvedValue([routed(547, "alice")]);
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .who2")?.textContent).toContain("alice"),
+    );
+  });
+
+  it("degrades to the live roster for a legacy run with no routing row at all", async () => {
+    h.fetchRunIdentityEvents.mockResolvedValue([]);
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .who2")?.textContent).toContain("alice"),
+    );
+  });
+
+  it("shows a dash, not an empty slot, when nothing can name the run at all", async () => {
+    rosterWithoutTheTicket("alice");
+    h.fetchRunIdentityEvents.mockResolvedValue([]);
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(document.querySelector(".trhd .who2")?.textContent).toBe("—"));
+  });
+
+  // The tri-state: a run whose ledger says it routed to nobody is not a run whose teammate is
+  // merely unknown, so the live roster must not answer for it.
+  it("names nobody for a run recorded as unrouted, even while the roster holds the ticket", async () => {
+    h.fetchRunIdentityEvents.mockResolvedValue([unrouted(547, "solo")]);
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(document.querySelector(".trhd .who2")?.textContent).toBe("—"));
+  });
+
+  // §3C/§6: "a handoff renders as a baton so a multi-agent ticket reads as a relay". Slice 3 could
+  // only say "run 522 → run 547" — one ticket resolved to one name. The per-run record is what
+  // reaches the two-name branch, and switching attempt moves the header with it.
+  it("reads an implement→review relay as two teammates, in the baton and the header", async () => {
+    rosterWithoutTheTicket("alice", "jimmy");
+    h.fetchRunIdentityEvents.mockResolvedValue([routed(547, "jimmy"), routed(522, "alice")]);
+    mountDetail([
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+    ]);
+    await settleTrace();
+    await waitFor(() =>
+      expect(document.querySelector(".trbaton.in")?.textContent).toContain("alice → jimmy"),
+    );
+    expect(document.querySelector(".trhd .who2")?.textContent).toContain("jimmy");
+
+    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    await waitFor(() =>
+      expect(document.querySelector(".trbaton.out")?.textContent).toContain("alice → jimmy"),
+    );
+    expect(document.querySelector(".trhd .who2")?.textContent).toContain("alice");
+  });
+
+  /** The live roster WITH the ticket — a re-dispatch holds it now, whoever ran the old attempt. */
+  function rosterHoldingTheTicket(name: string) {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [teammate(name)],
+    });
+  }
+
+  // The live-roster fallback belongs to ONE state — "this ticket has no routing row for the run".
+  // Reading it off an empty map also handed it "the search has not answered yet", which let the
+  // header confidently name whoever holds the ticket RIGHT NOW for a run whose own ledger says
+  // nobody, and then flip to "—". So the fallback waits for the search to settle.
+  it("holds the assignee slot while the routing search is in flight, rather than naming the live teammate", async () => {
+    let release: () => void = () => {};
+    h.fetchRunIdentityEvents.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve([unrouted(547, "solo")]);
+        }),
+    );
+    rosterHoldingTheTicket("jimmy"); // jimmy holds STUDIO-654 now; run 547 was not his
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    await settleTrace();
+
+    // The slot is KEPT — an omitted element reads as a layout that forgot to render it — but it
+    // states nothing, exactly as the Result card's headline waits rather than asserting a wrong one.
+    const held = document.querySelector(".trhd .whoskel");
+    expect(held?.getAttribute("role")).toBe("status");
+    expect(held?.textContent).toBe("Resolving who ran this…");
+    expect(document.querySelector(".trhd .who2")).toBeNull();
+    expect(document.querySelector(".trhd")?.textContent).not.toContain("jimmy");
+
+    release();
+    await waitFor(() => expect(document.querySelector(".trhd .who2")?.textContent).toBe("—"));
+    expect(document.querySelector(".trhd .whoskel")).toBeNull();
+  });
+
+  // The in-flight window is transient; this one is not. After react-query gives up, a failed
+  // search read off an empty map IS the fabrication permanently — "no answer" is not "no record".
+  it("names nobody rather than the live teammate when the routing search fails outright", async () => {
+    h.fetchRunIdentityEvents.mockRejectedValue(new Error("boom"));
+    rosterHoldingTheTicket("jimmy");
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    await settleTrace();
+    await waitFor(() => expect(document.querySelector(".trhd .who2")?.textContent).toBe("—"));
+    expect(document.querySelector(".trhd")?.textContent).not.toContain("jimmy");
+    // A failed read is not a pending one: the slot settles on "—" rather than holding forever.
+    expect(document.querySelector(".trhd .whoskel")).toBeNull();
+  });
+
+  // §6: "persistent assignee (735) on the header AND every post/handoff step". A room post or a
+  // hand-off is a state change the TEAM sees, so the spine says whose it was.
+  it("attributes the spine's post and hand-off steps to the run's teammate", async () => {
+    rosterWithoutTheTicket("alice");
+    h.fetchRunIdentityEvents.mockResolvedValue([routed(547, "alice")]);
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 547,
+      generated_at: "",
+      entries: [
+        entry({ seq: 1, kind: "tool_use", tool: "Read", text: "file_path=/repo/a.ts" }),
+        entry({ seq: 2, kind: "tool_result", text: "ok" }),
+        entry({ seq: 3, kind: "tool_use", tool: "mcp__symphony__teams_post", text: "body=done" }),
+        entry({ seq: 4, kind: "tool_result", text: "posted" }),
+        entry({ seq: 5, kind: "tool_use", tool: "mcp__symphony__symphony_handoff", text: "" }),
+        entry({ seq: 6, kind: "tool_result", text: "moved to In Review" }),
+      ],
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(spineTitles()).toContain("Coordinated"));
+    const attributed = [...document.querySelectorAll(".trstep")]
+      .filter((el) => el.querySelector(".stwho") !== null)
+      .map((el) => el.querySelector(".stt")?.textContent);
+    expect(attributed).toEqual(["Coordinated", "Handed off"]);
+    // Reading and editing are the agent's own work, not a state change the team sees.
+    expect(spineTitles()).toContain("Oriented");
+    for (const el of document.querySelectorAll(".trstep")) {
+      if (el.querySelector(".stt")?.textContent === "Oriented") {
+        expect(el.querySelector(".stwho")).toBeNull();
+      }
+    }
+    expect(document.querySelector(".trstep .stwho")?.textContent).toContain("alice");
+  });
+
+  it("leaves a post step unattributed rather than unsigned-guessing, when nobody resolves", async () => {
+    rosterWithoutTheTicket("alice");
+    h.fetchRunIdentityEvents.mockResolvedValue([]);
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(spineTitles()).toContain("Coordinated"));
+    expect(document.querySelector(".trstep .stwho")).toBeNull();
   });
 });
