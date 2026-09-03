@@ -418,7 +418,7 @@ impl LocalBank {
     {
         for (identity, bank) in overrides {
             let (identity, bank) = (identity.into(), bank.into());
-            if !bank.is_empty() && crate::teams::is_label_safe(&bank) {
+            if bank_override_honoured(&bank) {
                 self.banks.insert(identity, bank);
             }
         }
@@ -692,6 +692,41 @@ pub fn bank_id_for(
     match overrides.get(identity) {
         Some(bank) => bank.clone(),
         None => format!("{bank_prefix}{identity}"),
+    }
+}
+
+/// Whether a roster `bank:` override is HONOURED by a backend, or dropped in
+/// favour of `<bank_prefix><name>`.
+///
+/// A bank id becomes a directory name under
+/// [`LocalBank::bank_dir`] and a URL path segment under
+/// [`HindsightBackend`](crate::hindsight::HindsightBackend), so it can no more
+/// carry a separator than an identity can. The predicate lives here, once,
+/// because both `with_bank_overrides` implementations AND every caller that must
+/// *reason* about a bank id have to reach the same answer — a second copy is
+/// exactly how an override ends up honoured by one reader and ignored by another.
+pub fn bank_override_honoured(bank: &str) -> bool {
+    !bank.is_empty() && crate::teams::is_label_safe(bank)
+}
+
+/// The bank id a backend will ACTUALLY read for `identity`, given the roster's
+/// RAW `bank:` value: the override when [`bank_override_honoured`] accepts it,
+/// else `<bank_prefix><name>`.
+///
+/// [`bank_id_for`] answers the same question from a map that has ALREADY been
+/// filtered by [`LocalBank::with_bank_overrides`]; this answers it from the
+/// UNFILTERED roster, which is what a caller outside this crate holds.
+///
+/// The distinction is load-bearing and was a live cross-team leak (STUDIO-729):
+/// copying `Identity::bank` verbatim makes a non-label-safe override look like a
+/// bank id no other identity claims, while the backend has quietly dropped it and
+/// is reading `<bank_prefix><name>` — which a second identity's label-safe
+/// override may name. Resolve through this and the two agree by construction.
+pub fn resolve_bank_id(bank_prefix: &str, raw_bank: &str, identity: &str) -> String {
+    if bank_override_honoured(raw_bank) {
+        raw_bank.to_string()
+    } else {
+        format!("{bank_prefix}{identity}")
     }
 }
 
@@ -1511,6 +1546,37 @@ mod tests {
                 .ends_with("agent-alice"),
             "an unsafe override must fall back, never escape the root"
         );
+    }
+
+    /// [`resolve_bank_id`] answers from the RAW roster exactly what the backend
+    /// answers from its filtered map. The two disagreeing was a cross-team leak
+    /// (STUDIO-729): a caller that must reason about a bank id — the team-scope
+    /// guard in `rhapsody-orchestrator` — compared against a string the backend
+    /// had already dropped, while a second identity's label-safe override named
+    /// the fallback it silently reads instead.
+    #[test]
+    fn resolve_bank_id_agrees_with_the_backend_for_every_override_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = [
+            ("alice", ""),             // no override -> <prefix><name>
+            ("bob", "shared-rust"),    // label-safe   -> honoured
+            ("carol", "../../escape"), // separator    -> dropped
+            ("dave", "Not/Safe"),      // uppercase    -> dropped
+            ("erin", "-leading"),      // leading dash -> dropped
+        ];
+        let b = LocalBank::new(dir.path().join(DEFAULT_BANKS_SUBDIR), "agent-")
+            .with_bank_overrides(raw);
+        for (identity, bank) in raw {
+            assert_eq!(
+                resolve_bank_id("agent-", bank, identity),
+                b.bank_id(identity),
+                "resolve_bank_id disagreed with the backend for {identity:?} / {bank:?}"
+            );
+        }
+        // And the one that matters: a dropped override resolves onto the fallback
+        // another identity may legitimately claim, so the collision is VISIBLE.
+        assert_eq!(resolve_bank_id("agent-", "Not/Safe", "dave"), "agent-dave");
+        assert_eq!(resolve_bank_id("agent-", "agent-dave", "mallory"), "agent-dave");
     }
 
     /// A record id is the filename with ONE `.md` stripped. `trim_end_matches`

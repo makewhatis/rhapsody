@@ -50,7 +50,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rhapsody_config::memory::{Fact, MemoryBackend, MemoryError, Query, RecallState, Record};
+use rhapsody_config::memory::{
+    Fact, MemoryBackend, MemoryError, Query, RecallState, Record, resolve_bank_id,
+};
 use rhapsody_config::room::{
     AUDIENCE_ROOM, Cursor, Message, OPERATOR_IDENTITY, RoomError, RoomLog,
 };
@@ -297,16 +299,18 @@ impl TeamsMemory {
     /// Creates nothing: with `backend: none` (or Teams off) the backend is a
     /// no-op and the filesystem is never touched.
     pub fn new(teams: Arc<Teams>, backend: Arc<dyn MemoryBackend>) -> Self {
+        // Resolved through the backend's OWN rule rather than re-derived: a `bank:` override that
+        // is not label-safe is DROPPED by `with_bank_overrides`, so copying it verbatim reported a
+        // bank id no backend ever opens — the roster view lied, and the team-scope guard built on
+        // this map compared against a string instead of the directory being read (STUDIO-729).
         let bank_ids = teams
             .roster
             .iter()
             .map(|i| {
-                let bank = if i.bank.is_empty() {
-                    format!("{}{}", teams.memory.bank_prefix, i.name)
-                } else {
-                    i.bank.clone()
-                };
-                (i.name.clone(), bank)
+                (
+                    i.name.clone(),
+                    resolve_bank_id(&teams.memory.bank_prefix, &i.bank, &i.name),
+                )
             })
             .collect();
         Self {
@@ -489,6 +493,13 @@ impl TeamsMemory {
 
     /// The identity → bank-id map the backend was built with, so the composition
     /// root can hand the SAME resolution to `LocalBank::with_bank_overrides`.
+    ///
+    /// Resolved through [`resolve_bank_id`], so every value is a bank id the
+    /// backend will actually open — a non-label-safe `bank:` override reads as
+    /// the `<prefix><name>` the backend falls back to, never as the raw string.
+    /// [`TeamScope`](crate::teamsknow::TeamScope) compares bank ids for a
+    /// cross-team collision, and a map that reported the raw override made that
+    /// comparison miss the collision entirely (STUDIO-729).
     pub fn bank_ids(&self) -> &HashMap<String, String> {
         &self.bank_ids
     }

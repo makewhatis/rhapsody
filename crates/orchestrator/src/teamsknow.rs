@@ -158,9 +158,14 @@ pub struct IssueFact {
 /// identity → bank-id map ([`TeamsMemory::bank_ids`](crate::teamsmemory::TeamsMemory::bank_ids)).
 ///
 /// The bank map is taken whole rather than derived here for the reason
-/// [`bank_id_for`](rhapsody_config::memory::bank_id_for) exists: a second copy of the
+/// [`resolve_bank_id`](rhapsody_config::memory::resolve_bank_id) exists: a second copy of the
 /// `<prefix><name>`-unless-overridden rule is exactly how the roster's override ends up honoured by
-/// one reader and ignored by another. It must be the same resolution the backend was built with.
+/// one reader and ignored by another. It must be the same resolution the backend was built with —
+/// [`TeamsMemory::bank_ids`](crate::teamsmemory::TeamsMemory::bank_ids) is, and a map assembled any
+/// other way must resolve each override through `resolve_bank_id` before it reaches here. Comparing
+/// a RAW override against another identity's resolved bank id is the shape of the cross-team read
+/// this scope exists to refuse: the backend drops a non-label-safe override and silently reads
+/// `<prefix><name>`, so the collision is invisible until it is resolved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TeamScope {
     projects: BTreeSet<String>,
@@ -465,6 +470,7 @@ mod tests {
     use rhapsody_config::teams::{Identity, Memory as MemoryCfg, Teams};
     use rhapsody_store::{Noop, RunEnd, RunStart, Sqlite, StorePath};
 
+    use crate::teamsmemory::TeamsMemory;
     use crate::testsupport::TempDir;
 
     /// The api_key / endpoint a leak test looks for. Deliberately distinctive.
@@ -990,6 +996,80 @@ mod tests {
             .expect("recall")
             .len(),
             1
+        );
+    }
+
+    /// **The dropped-override leak (STUDIO-729 review, BLOCKER 1).** A roster `bank:` that is not
+    /// label-safe is DROPPED by the backend, which then reads `<prefix><name>` instead — so a guard
+    /// reasoning about the raw override reasons about a string no backend ever opens. Give a
+    /// FOREIGN identity a label-safe override naming exactly that fallback and the two teams share
+    /// one directory while the raw map shows no collision at all.
+    ///
+    /// The scope is built from [`TeamsMemory::bank_ids`] — the real producer, not a hand-made map —
+    /// because the failure WAS the producer disagreeing with the backend.
+    #[tokio::test]
+    async fn recall_refuses_a_bank_reached_through_a_dropped_override() {
+        let dir = TempDir::new();
+        let bank = Arc::new(
+            LocalBank::new(dir.child(DEFAULT_BANKS_SUBDIR), "agent-")
+                // Not label-safe -> dropped -> alice actually reads `agent-alice`.
+                // Label-safe -> honoured -> mallory actually reads `agent-alice` too.
+                .with_bank_overrides([("alice", "Not/Safe"), ("mallory", "agent-alice")]),
+        );
+        bank.retain(&Record {
+            identity: "mallory".into(),
+            document_id: "run-9".into(),
+            at: now(),
+            content: "team B's private note".into(),
+            ..Record::default()
+        })
+        .expect("retain");
+
+        let teams = Arc::new(Teams {
+            enabled: true,
+            roster: vec![
+                Identity {
+                    name: "alice".into(),
+                    bank: "Not/Safe".into(),
+                    ..Identity::default()
+                },
+                Identity {
+                    name: "mallory".into(),
+                    bank: "agent-alice".into(),
+                    ..Identity::default()
+                },
+            ],
+            ..Teams::disabled()
+        });
+        let runtime = TeamsMemory::new(teams, bank.clone());
+        assert_eq!(
+            runtime.bank_ids().get("alice").map(String::as_str),
+            Some("agent-alice"),
+            "the daemon-wide map must report the bank the BACKEND reads, not the raw override"
+        );
+
+        let scope = TeamScope::new(["alpha"], ["alice"], runtime.bank_ids());
+        let st = store();
+        let issues: Vec<Issue> = Vec::new();
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), bank.as_ref());
+
+        assert!(
+            !scope.admits_bank("alice"),
+            "a dropped override let an in-team identity reach a foreign claimant's bank"
+        );
+        let facts = k
+            .recall(
+                "alice",
+                &Query {
+                    browse: true,
+                    ..Query::default()
+                },
+            )
+            .await
+            .expect("recall");
+        assert!(
+            facts.is_empty(),
+            "recall crossed into another team's bank through a dropped override: {facts:?}"
         );
     }
 
