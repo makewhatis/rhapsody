@@ -1669,6 +1669,53 @@ describe("the ask dock (§6)", () => {
     );
   });
 
+  // A refusal belongs to the question being sent NOW. An answer that already landed is still
+  // true, and dropping it off the screen to report a later failure would cost the operator
+  // something real in exchange for something the error line says on its own.
+  it("keeps an answered exchange when a LATER question is refused", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:9", body: "Why did this stop?" }),
+      { ...MANAGER_ANSWER, refs: ["f:9"] },
+    ]);
+    await waitFor(() => expect(document.querySelector(".askex .mcard")).toBeTruthy());
+
+    h.postTeamsRoom.mockRejectedValue(new Error("teams_disabled"));
+    fireEvent.change(screen.getByLabelText(/ask about this run/i), { target: { value: "again?" } });
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+
+    await waitFor(() =>
+      expect(document.querySelector(".askdock .acterr")?.textContent).toContain("teams_disabled"),
+    );
+    // The answered exchange is still the first question's, and still its answer.
+    expect(document.querySelector(".askex .qb")?.textContent).toBe("Why did this stop?");
+    expect(document.querySelector(".askex .mcard")?.textContent).toContain("It stopped at the");
+  });
+
+  // The announcement that matters is the ANSWER arriving, and the pending note is REPLACED by the
+  // card — so a live region scoped to the note would go silent at the one moment it should speak.
+  it("announces the answer, not only the wait", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [roomPost({ id: "f:9", body: "Why did this stop?" })]);
+    const live = () => document.querySelector(".askex [role='status']") as HTMLElement;
+    await waitFor(() => expect(live()?.textContent).toContain("has not replied to it yet"));
+
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: [roomPost({ id: "f:9", body: "Why did this stop?" }), { ...MANAGER_ANSWER, refs: ["f:9"] }],
+      skipped: [],
+    });
+    await act(async () => {
+      await client.invalidateQueries();
+    });
+    // The SAME region now carries the answer, so it is announced rather than silently swapped in.
+    await waitFor(() => expect(live()?.textContent).toContain("It stopped at the"));
+    expect(live().querySelector(".mcard")).toBeTruthy();
+  });
+
   // With nothing asked there is nothing to look up, so the dock is not a room reader.
   it("reads the room only once a question has landed", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });

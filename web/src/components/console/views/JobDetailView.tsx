@@ -1745,6 +1745,11 @@ function AskDock({
   };
   return (
     <div className="askwrap">
+      {/* Not gated on `problem`, unlike the receipt it replaces. A refusal here belongs to the
+          question being sent NOW; the card is about one that already landed, and dropping a real
+          answer off the screen because a later attempt was refused would lose the operator
+          something true in order to report something else. The two say different things in
+          different places, and the error sits with the box that produced it. */}
       {asked === null ? null : (
         <AskExchange asked={asked} roster={roster} onOpenRoom={onOpenRoom} />
       )}
@@ -1819,41 +1824,53 @@ function AskExchange({
             rendering it as markdown would show something other than what went into the room. */}
         <span className="qb">{asked.body}</span>
       </div>
-      {outcome.kind === "answered" ? (
-        <div className="mcard">
-          <div className="top">
-            <span className="who2" style={{ color: teammateColor(roster, outcome.reply.from) }}>
-              {outcome.reply.from}
-            </span>
-            <Timestamp>{clockTime(outcome.reply.at)}</Timestamp>
+      {/* The live region wraps BOTH branches rather than sitting on the pending note, because the
+          announcement that matters is the ANSWER arriving. A `role="status"` on the note alone is
+          announced when the wait starts and then goes silent at the one moment it should speak:
+          the note is REPLACED by the card, and a region that has unmounted announces nothing. */}
+      <div className="askans" role="status">
+        {outcome.kind === "answered" ? (
+          <div className="mcard">
+            <div className="top">
+              {/* The room's own colour for this identity — `@manager` is not on the roster
+                  (`RESERVED_IDENTITIES` keeps it off), so this resolves to the unknown-teammate
+                  colour. That is the point: the Room tab resolves it exactly the same way, and one
+                  identity must not wear two colours across two views of one post. */}
+              <span className="who2" style={{ color: teammateColor(roster, outcome.reply.from) }}>
+                {outcome.reply.from}
+              </span>
+              <Timestamp>{clockTime(outcome.reply.at)}</Timestamp>
+            </div>
+            {/* The room post itself, through the room's own renderer — the manager's prose arrives
+                quoted line by line and its records under `From my own records —`, and that layout
+                is what tells the operator which half the daemon vouches for. Reshaping it here
+                would make this a second answer wearing the first one's name. A body the room read
+                had to cut carries the `…` `truncate_bytes` leaves on it, so this surface is
+                exactly as honest about its own bound as the room is. */}
+            <Markdown source={outcome.reply.body} />
           </div>
-          {/* The room post itself, through the room's own renderer — the manager's prose arrives
-              quoted line by line and its records under `From my own records —`, and that layout is
-              what tells the operator which half the daemon vouches for. Reshaping it here would
-              make this a second answer wearing the first one's name. */}
-          <Markdown source={outcome.reply.body} />
-        </div>
-      ) : (
-        <div className="pending" role="status">
-          {/* Never "answering" or "still thinking": nothing tells this page the manager has even
-              read the question, and `past-window` cannot tell whether it replied at all. */}
-          {emptyNote(
-            room,
-            "Posted to the room — reading it back…",
-            outcome.kind === "waiting" ? ASK_WAITING_NOTE : ASK_PAST_WINDOW_NOTE,
-          )}{" "}
-          <a
-            className="link"
-            href="#teams"
-            onClick={(e) => {
-              e.preventDefault();
-              onOpenRoom();
-            }}
-          >
-            Open the room →
-          </a>
-        </div>
-      )}
+        ) : (
+          <div className="pending">
+            {/* Never "answering" or "still thinking": nothing tells this page the manager has even
+                read the question, and `past-window` cannot tell whether it replied at all. */}
+            {emptyNote(
+              room,
+              "Posted to the room — reading it back…",
+              outcome.kind === "waiting" ? ASK_WAITING_NOTE : ASK_PAST_WINDOW_NOTE,
+            )}{" "}
+            <a
+              className="link"
+              href="#teams"
+              onClick={(e) => {
+                e.preventDefault();
+                onOpenRoom();
+              }}
+            >
+              Open the room →
+            </a>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
