@@ -105,7 +105,11 @@
 .rh-console .trstep .g { flex: 0 0 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; font-size: 13px; background: var(--panel-2); border: 1px solid var(--line); color: var(--ink-2); }
 .rh-console .trstep.err .g { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
 .rh-console .trstep .txt { min-width: 0; }
-.rh-console .trstep .stt { font-weight: 600; font-size: 13px; display: block; }
+.rh-console .trstep .sthd { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.rh-console .trstep .stt { font-weight: 600; font-size: 13px; }
+/* Who a state-changing step was (STUDIO-746, design record §6). Quieter than the title: it says
+   whose the post or the hand-off was, it is not the name of the step. */
+.rh-console .trstep .stwho { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--ink-4); font-weight: 500; white-space: nowrap; }
 .rh-console .trstep .ssub { font-size: 11px; color: var(--ink-4); font-family: var(--mono); display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rh-console .trstep .fx { display: flex; gap: 5px; margin-top: 5px; flex-wrap: wrap; }
 .rh-console .fxchip { font-size: 10px; color: var(--ink-4); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font-family: var(--mono); }
