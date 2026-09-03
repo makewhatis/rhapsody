@@ -188,7 +188,9 @@ function buildList(raw: readonly RawItem[]): MdList {
 
 const ESCAPABLE = /[\\`*_[\]()#+\-.!>~|]/;
 const WORD = /[\p{L}\p{N}]/u;
-const LINK = /^\[([^\]]*)\]\(([^()\s]*)\)/;
+// Sticky, not anchored: `exec` starts at `lastIndex`, so a candidate is tried in place instead of
+// against a fresh `source.slice(i)` copy at every `[`.
+const LINK = /\[([^\]]*)\]\(([^()\s]*)\)/y;
 
 /**
  * Parses one run of inline text.
@@ -201,6 +203,8 @@ const LINK = /^\[([^\]]*)\]\(([^()\s]*)\)/;
  */
 function parseInline(source: string): MdInline[] {
   const scanned = new Map<string, number>();
+  // No `[` below this offset can open a link — see the bail-out at the `[` branch.
+  let linkDead = 0;
   const out: MdInline[] = [];
   let text = "";
   const flush = () => {
@@ -230,8 +234,16 @@ function parseInline(source: string): MdInline[] {
       }
     }
 
-    if (ch === "[") {
-      const link = LINK.exec(source.slice(i));
+    if (ch === "[" && i >= linkDead) {
+      LINK.lastIndex = i;
+      const link = LINK.exec(source);
+      if (!link) {
+        // The candidate failed at the first `]` after `i`. Every `[` before that `]` finds the
+        // SAME `]` and fails on the same character, so none of them is worth trying — without
+        // this each one re-scans the tail, and 32KB of `[` took 356ms.
+        const close = source.indexOf("]", i);
+        linkDead = close === -1 ? source.length : close;
+      }
       if (link) {
         const href = safeHref(link[2]);
         if (href !== null) {

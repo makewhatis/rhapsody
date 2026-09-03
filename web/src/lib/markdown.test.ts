@@ -231,6 +231,26 @@ describe("parseMarkdown — long input", () => {
     expect(Date.now() - started).toBeLessThan(1000);
   });
 
+  it("does not degrade on brackets that never close", () => {
+    // The link scan had the same quadratic shape: an anchored regex re-scanning the tail from
+    // every `[` looking for a `]` that is far away or absent. 32KB of `[` took 356ms.
+    for (const src of ["[".repeat(32_000), "[".repeat(32_000) + "]"]) {
+      const started = Date.now();
+      parseMarkdown(src);
+      expect(Date.now() - started, `${src.length} bytes`).toBeLessThan(1000);
+    }
+  });
+
+  it("still finds a link after a bracket run that opened none", () => {
+    // The bail-out must not outlive the `]` it was derived from.
+    expect(parseMarkdown("[a] [b] [c](https://example.com)")[0]).toMatchObject({
+      children: [
+        { type: "text", text: "[a] [b] " },
+        { type: "link", href: "https://example.com" },
+      ],
+    });
+  });
+
   it("stays linear on a big transcript body", () => {
     const src = Array.from({ length: 2000 }, (_, i) => `- item ${i} with **bold** and \`code\``).join(
       "\n",
