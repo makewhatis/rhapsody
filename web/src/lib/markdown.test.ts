@@ -33,11 +33,13 @@ describe("parseMarkdown — blocks", () => {
     expect(one("#nospace").type).toBe("paragraph");
   });
 
-  it("keeps a paragraph's own line breaks and drops each line's indent", () => {
-    const block = one("first line\n   second line");
+  it("keeps a paragraph's own line breaks and its indentation", () => {
+    // Indentation is content here, not layout: an unfenced `tree` listing or a pasted traceback
+    // in a retained fact was shown with its leading spaces before this parser existed.
+    const block = one("first line\n   second line  ");
     expect(block).toMatchObject({ type: "paragraph" });
     expect(inlineText(block.type === "paragraph" ? block.children : [])).toBe(
-      "first line\nsecond line",
+      "first line\n   second line",
     );
   });
 

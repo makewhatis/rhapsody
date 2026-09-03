@@ -145,7 +145,11 @@ export function parseMarkdown(source: string): MdBlock[] {
       !HEADING.test(lines[i]) &&
       !BULLET.test(lines[i])
     ) {
-      paragraph.push(lines[i].trim());
+      // Trailing blanks only. A paragraph keeps its LEADING whitespace for the same reason it
+      // keeps its line breaks (`.md p` is `pre-wrap`): the console shows what the agent wrote,
+      // and a retained fact's `tree` listing, aligned columns or unfenced traceback were shown
+      // with their indentation before this file existed (`.fact .body`, memory.css).
+      paragraph.push(lines[i].replace(/\s+$/, ""));
       i += 1;
     }
     blocks.push({ type: "paragraph", children: parseInline(paragraph.join("\n")) });

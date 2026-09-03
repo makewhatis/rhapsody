@@ -23,7 +23,10 @@
 .rh-console .md > *:first-child { margin-top: 0; }
 .rh-console .md > *:last-child { margin-bottom: 0; }
 
-/* A hand-off's own line breaks are meaningful, so a paragraph keeps them. */
+/* A hand-off's own line breaks and indentation are meaningful, so a paragraph
+   keeps both — `pre-wrap` here is what renders the leading whitespace the parser
+   preserves, so a retained fact's unfenced listing still lines up as it did under
+   `.fact .body` (memory.css) before this sheet existed. */
 .rh-console .md p { margin: 0 0 7px; white-space: pre-wrap; }
 .rh-console .md .mdlead { margin-bottom: 4px; }
 
