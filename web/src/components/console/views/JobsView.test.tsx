@@ -40,9 +40,14 @@ vi.mock("@/lib/api", async (orig) => {
 
 const { JobsView } = await import("./JobsView");
 
+// Each history row gets a DISTINCT id unless the caller pins one. `mergeJobs` keys a history row
+// `hist-${id}`, so a shared id is a duplicate React key: the list renders correctly on first paint
+// and then drops and reorders rows on any re-render — a filter click, for instance.
+let nextRunId = 100;
+
 function run(over: Partial<IssueRun> & Pick<IssueRun, "issue_identifier" | "outcome">): IssueRun {
   return {
-    id: 1,
+    id: (nextRunId += 1),
     issue_id: `id-${over.issue_identifier}`,
     title: `${over.issue_identifier} title`,
     attempt: 1,
@@ -91,6 +96,13 @@ function stat(label: string): string {
   return cell?.querySelector(".n")?.textContent ?? "";
 }
 
+/** Every Now-strip stat label, in render order. */
+function statLabels(): string[] {
+  return [...document.querySelectorAll(".stat")].map(
+    (el) => el.querySelector(".l")?.textContent ?? "",
+  );
+}
+
 /** The ticket key of each visible table row, in order. */
 function rowKeys(): string[] {
   return [...document.querySelectorAll(".jtbl tbody tr")].map(
@@ -104,8 +116,11 @@ afterEach(() => {
 });
 
 describe("the Now strip (§3)", () => {
-  // Box 2.6
-  it("counts running / in review / queued / blocked from the issues data", async () => {
+  // Box 2.6 — originally running / in review / queued / blocked. The "in review" PILL was dropped
+  // by David's 2026-09-03 decision on STUDIO-743: it and "Needs you" reported the same number two
+  // pills apart, and the strip should ask the operator's question once. The in-review COUNT is not
+  // gone from the home — the Seg still filters to exactly those rows, asserted below.
+  it("counts running / queued / blocked from the issues data", async () => {
     h.fetchState.mockResolvedValue({
       ...EMPTY_STATE,
       running: [
@@ -138,11 +153,14 @@ describe("the Now strip (§3)", () => {
       ],
     });
     h.fetchIssueRuns.mockResolvedValue({
+      // Decorated with the lifecycles a healthy daemon serves (STUDIO-702). Each one agrees with
+      // what the outcome alone already inferred, so the four statuses are unchanged — but the page
+      // is now the answered one, which is what lets "Needs you" report a number at all.
       issues: [
-        run({ issue_identifier: "B", outcome: "completed" }),
-        run({ issue_identifier: "C", outcome: "completed" }),
-        run({ issue_identifier: "E", outcome: "stopped" }),
-        run({ issue_identifier: "F", outcome: "failed" }),
+        run({ issue_identifier: "B", outcome: "completed", lifecycle: "in_review" }),
+        run({ issue_identifier: "C", outcome: "completed", lifecycle: "in_review" }),
+        run({ issue_identifier: "E", outcome: "stopped", lifecycle: "open" }),
+        run({ issue_identifier: "F", outcome: "failed", lifecycle: "open" }),
       ],
       next_offset: null,
     });
@@ -156,9 +174,17 @@ describe("the Now strip (§3)", () => {
     mount();
 
     await waitFor(() => expect(stat("running")).toBe("1"));
-    expect(stat("in review")).toBe("2"); // B, C — a clean run hands its ticket to review
     expect(stat("queued")).toBe("1"); // E
     expect(stat("blocked")).toBe("2"); // D (held) + F (failed)
+
+    // The strip's shape itself, pinned: FOUR stats, and exactly one of them is the human-attention
+    // flag. This reds if a second pill reporting the same set is ever put back beside it.
+    expect(statLabels()).toEqual(["running", "queued", "blocked", "needs you"]);
+    // B, C — a clean run hands its ticket to review — plus F, whose failure needs a decision.
+    expect(stat("needs you")).toBe("3");
+    // And the in-review rows are still one click away, which is why the pill is not missed.
+    fireEvent.click(screen.getByRole("button", { name: "In review" }));
+    await waitFor(() => expect(rowKeys().sort()).toEqual(["B", "C"]));
   });
 
   it("shows each teammate's live state", async () => {
@@ -208,11 +234,13 @@ describe("the ticket lifecycle (STUDIO-702)", () => {
   }
 
   // The bug: two of these four tickets are terminal and used to be counted as awaiting review, for
-  // as long as the store kept their runs.
+  // as long as the store kept their runs. The claim outlived the pill that carried it — STUDIO-743
+  // dropped the in-review stat — so it is asserted on the one the operator now reads.
   it("counts only work actually awaiting a reviewer", async () => {
     await mountLifecycleJobs();
     // REVIEW, plus LEGACY, which the daemon could not resolve and which falls back as before.
-    expect(stat("in review")).toBe("2");
+    // MERGED and DROPPED are terminal and must not be billed to anybody.
+    expect(stat("needs you")).toBe("2");
   });
 
   // The Done tab was permanently empty: `done` was unreachable from run outcomes alone.
@@ -374,6 +402,14 @@ describe("the Needs you count (§6)", () => {
           blocker_state: "In Review",
           mode: "dag",
         },
+        {
+          issue_identifier: "HELD2",
+          title: "HELD2 title",
+          project: "rhapsody",
+          blocker_identifier: "REVIEW",
+          blocker_state: "In Review",
+          mode: "dag",
+        },
       ],
     });
     h.fetchIssueRuns.mockResolvedValue({
@@ -395,12 +431,14 @@ describe("the Needs you count (§6)", () => {
     mount();
 
     // REVIEW is parked for a reviewer and FAILED needs a decision. MERGED is finished, IDLE is
-    // the daemon's to redispatch, and HELD waits on REVIEW rather than on the operator.
+    // the daemon's to redispatch, and the two HELD rows wait on REVIEW rather than on the operator.
     await waitFor(() => expect(stat("needs you")).toBe("2"));
-    // It is a count of a different set, not a re-tint of a neighbour: two rows read "blocked"
-    // (HELD + FAILED) and only one of them wants a human, while the single in-review row does.
-    expect(stat("in review")).toBe("1");
-    expect(stat("blocked")).toBe("2");
+    // It is a count of a different set from every pill still beside it, and the fixture keeps the
+    // numbers apart so a coincidence cannot pass for agreement: three rows read "blocked" and only
+    // one of them wants a human, while the in-review row wants one without reading blocked at all.
+    expect(stat("blocked")).toBe("3");
+    expect(stat("running")).toBe("0");
+    expect(stat("queued")).toBe("1");
   });
 
   // The OTHER side of the same distinction, and the one a careless `||` would silently break: a
@@ -424,17 +462,19 @@ describe("the Needs you count (§6)", () => {
     });
     mount();
 
-    await waitFor(() => expect(stat("needs you")).toBe("0"));
-    expect(stat("in review")).toBe("0");
+    await waitFor(() => expect(rowKeys()).toHaveLength(2));
+    expect(stat("needs you")).toBe("0");
   });
 
   // THE OUTAGE SHAPE, END TO END. `issue_lifecycles` answers per request off a TTL cache and the
   // tracker, so a cold cache or a failed Linear round-trip serves exactly this: the runs, none of
-  // them decorated. Every `completed` outcome is then inferred into "in review", inflating that
-  // pill — so the operator's own count must refuse to answer rather than report the 0 it would
-  // otherwise compute. "—" says "I cannot tell"; a 0 would say "nothing is waiting on you", which
-  // is the one thing the console does not know at that moment.
-  it("says — rather than 0 when the tracker answered nothing for the page", async () => {
+  // them decorated. Every `completed` outcome is then inferred into "in review", so each row below
+  // reads in-review without one word from the tracker — and any count taken over those rows would
+  // be a number the console invented. It refuses instead: "—" says "I cannot tell", where both the
+  // numbers on offer would be claims. (Counting the inferred rows gives 2; the earlier shape that
+  // discounted an undecorated row gave 0 — "nothing is waiting on you", which is the one thing the
+  // console cannot know at that moment. The assertion reds on either.)
+  it("says — rather than a number when the tracker answered nothing for the page", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
     h.fetchIssueRuns.mockResolvedValue({
       issues: [
@@ -452,7 +492,11 @@ describe("the Needs you count (§6)", () => {
     });
     mount();
 
-    await waitFor(() => expect(stat("in review")).toBe("2"));
+    // Both rows landed and both were inferred into in-review — the outage shape, not an empty page.
+    await waitFor(() => expect(rowKeys()).toHaveLength(2));
+    fireEvent.click(screen.getByRole("button", { name: "In review" }));
+    await waitFor(() => expect(rowKeys().sort()).toEqual(["ONE", "TWO"]));
+
     expect(stat("needs you")).toBe("—");
   });
 });

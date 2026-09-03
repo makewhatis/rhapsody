@@ -95,13 +95,19 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
         </NowMates>
         <NowStats>
           <Stat value={counts.running} label="running" />
-          <Stat value={counts.review} label="in review" tone="acc" />
           <Stat value={counts.queued} label="queued" />
           <Stat value={counts.blocked} label="blocked" tone="bad" />
-          {/* The operator's own queue (STUDIO-743, design record §6). It cuts across the four
-              above rather than partitioning with them — see `needsOperator`. Unlike them it can be
-              UNANSWERABLE: when the daemon resolved no ticket lifecycle for this page, the count
-              says "—" rather than the 0 it would otherwise compute — see `ConsoleJobCounts`. */}
+          {/* The operator's own queue (STUDIO-743, design record §6), and the strip's ONLY
+              human-attention flag. §3 originally painted an "in review" stat here too; David's
+              2026-09-03 decision dropped it, because the two reported the same set two pills
+              apart — a duplicate in a different colour rather than a second fact. "Needs you"
+              IS the in-review-that-needs-you, widened by the failed runs that also want a
+              person, so it cuts across the three above rather than partitioning with them (see
+              `needsOperator`). The in-review rows themselves are still one click away on the Seg
+              below, which is where a count of them belongs if one is ever wanted again.
+
+              Unlike the three it can also be UNANSWERABLE: when the daemon resolved no ticket
+              lifecycle for this page, it says "—" rather than a number — see `ConsoleJobCounts`. */}
           <Stat value={counts.needsYou ?? "—"} label="needs you" tone="op" />
         </NowStats>
       </NowStrip>

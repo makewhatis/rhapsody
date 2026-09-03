@@ -109,12 +109,20 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
  * adds to the Now strip. Derived from state the worklist already holds; no new endpoint.
  *
  * WHAT IT CLAIMS, EXACTLY. A ticket parked in review awaits a person's verdict or merge, and a
- * failed run awaits a person's decision about what happens next. That is the whole claim. On a
- * healthy tracker it makes "needs you" and "in review" close neighbours — the failed runs are the
- * difference — and that convergence is the honest answer rather than a defect: if the tracker says
- * twelve tickets are parked for review, twelve tickets really are waiting on a human. What is NOT
- * claimed is any sharper discrimination among them; the facts that would allow one are named at
- * the bottom of this comment and none of them is served to this view.
+ * failed run awaits a person's decision about what happens next. That is the whole claim, and it
+ * is deliberately coarse: what is NOT claimed is any sharper discrimination among them, because
+ * the facts that would allow one are named at the bottom of this comment and none of them is
+ * served to this view.
+ *
+ * That coarseness is why the strip now carries this and nothing beside it. On a healthy tracker
+ * the set is very nearly the in-review set — the failed runs are the whole difference — and when
+ * BOTH were painted, the honest answer looked like a bug: the same number, twice, two pills apart
+ * in different colours (16/16 on the live default page, 24/24 over all 357 rows). The convergence
+ * itself is not the defect, and narrowing it to manufacture a difference was tried and withdrawn
+ * twice; if the tracker says twelve tickets are parked for review, twelve tickets really are
+ * waiting on a human, and the console should say that ONCE. So per David's 2026-09-03 decision
+ * the in-review pill is gone and this is the home's single human-attention flag — it is the
+ * in-review-that-needs-you, widened by the failures that need one without reading in-review.
  *
  * `blocked` qualifies only when it is a FAILED run. The other thing that reads blocked is a held
  * dependent (`runs-model`'s synthetic `waiting` row), and that one waits on its predecessor rather
@@ -370,13 +378,26 @@ export function filterConsoleJobs(
 }
 
 /**
- * The Now-strip stat pills: §3's original four, plus the "Needs you" the design record's §6 adds.
+ * The per-status tally behind the Now strip, plus the "Needs you" the design record's §6 adds.
  *
  * `needsYou` deliberately CUTS ACROSS the other four rather than partitioning with them — see
  * [`needsOperator`] — so the five numbers do not sum to the row count and are not meant to.
+ *
+ * WHAT THE STRIP ACTUALLY PAINTS IS FOUR OF THESE FIVE. §3 gave the strip a "running / in review /
+ * queued / blocked" row of pills and §6 added "Needs you" beside them, which put the operator's
+ * question on the strip TWICE: measured over the live listing the two agreed exactly — 16 and 16
+ * on the default page, 24 and 24 over all 357 rows, with neither difference set holding a single
+ * ticket. David's 2026-09-03 decision is that the strip asks it ONCE, so `JobsView` no longer
+ * renders an in-review pill and "Needs you" is the home's single human-attention flag.
+ *
+ * `review` survives HERE because this is the model rather than the strip: it is the honest count
+ * of rows reading in-review, it is what STUDIO-702's regression pins (terminal tickets stopped
+ * being billed as awaiting a reviewer), and the Seg still filters the table to exactly that set.
+ * What was dropped is the second pill, not the number.
  */
 export interface ConsoleJobCounts {
   running: number;
+  /** Rows reading in-review. Still counted, no longer painted — see the note above. */
   review: number;
   queued: number;
   blocked: number;
@@ -389,10 +410,12 @@ export interface ConsoleJobCounts {
    * owes — and it is only answerable while the tracker is answering. When `issue_lifecycles`
    * resolves nothing for the payload (a cold cache, a missing tracker, a Linear round-trip that
    * failed), `consoleJobStatus` falls back to inferring "in review" from every `completed` outcome,
-   * so the review pill INFLATES at the exact moment the console knows least. Reporting a number
-   * derived from that would be at best a coincidence and at worst — measured on the live listing —
-   * "350 in review, 0 need you", the one stat whose job is to say what is waiting announcing that
-   * nothing is, precisely when it cannot see. A zero is a claim; "—" is the truth.
+   * so `review` INFLATES at the exact moment the console knows least — measured on the live
+   * listing, 27 rows became 353. A count taken over those inferred rows would be a number the
+   * console invented, and the earlier shape that discounted them instead announced "0 need you",
+   * which is the one thing it could not know just then. A number either way is a claim; "—" is the
+   * truth. This matters more now that it is the strip's ONLY human-attention flag: there is no
+   * neighbouring pill left whose obvious inflation would hint that the tracker had gone quiet.
    *
    * The gate is all-or-nothing over the payload on purpose: the daemon resolves lifecycles for a
    * request as a batch, so a page where NOT ONE row got an answer is the outage shape, while a

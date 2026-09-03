@@ -494,12 +494,14 @@ describe("the Now strip's Needs you count", () => {
     });
   });
 
-  // It is a count of a DIFFERENT set, not a re-tint of the in-review pill: a failed run needs a
-  // human without reading "in review", and a held dependent is blocked without needing one. On a
-  // healthy tracker the review rows are all genuinely parked for a person, so the two numbers do
-  // sit close together — the failed runs are the difference, and that convergence is the honest
-  // answer rather than a defect. What this pins is that neither number is derived from the other.
-  it("is a different set from the in-review pill in both directions", () => {
+  // It is a count of a DIFFERENT set from the in-review tally: a failed run needs a human without
+  // reading "in review", and a held dependent is blocked without needing one. On a healthy tracker
+  // the review rows are all genuinely parked for a person, so the two numbers do sit close together
+  // — the failed runs are the difference — and that convergence is the honest answer rather than a
+  // defect. It is also why the strip paints only this one of them now (David, 2026-09-03): two
+  // pills reporting one question read as a duplicate. What this pins is the membership, in both
+  // directions, so neither number can quietly become the other.
+  it("is a different set from the in-review tally in both directions", () => {
     const byIssue = new Map(rows().map((r) => [r.issue, r]));
     expect(byIssue.get("FAILED")).toMatchObject({ status: "blocked", needsYou: true });
     expect(byIssue.get("HELD")).toMatchObject({ status: "blocked", needsYou: false });
@@ -510,7 +512,7 @@ describe("the Now strip's Needs you count", () => {
   // THE FAILURE DIRECTION, AND THE REASON THE COUNT IS NULLABLE. `issue_lifecycles` answers off a
   // TTL cache and the tracker AT REQUEST TIME, so a cold cache or a failed Linear round-trip
   // returns rows stripped of every `lifecycle` — this exact payload. `consoleJobStatus` then maps
-  // each `completed` outcome to "in review" by inference, so the review pill INFLATES at the same
+  // each `completed` outcome to "in review" by inference, so the review tally INFLATES at the same
   // moment the daemon has the least idea what is true. A count of 0 there would be a claim that
   // nothing awaits the operator, which is the one thing the console cannot know; `null` renders
   // "—" instead. This is deliberately a property of the PAYLOAD, not of any single row.
@@ -530,7 +532,7 @@ describe("the Now strip's Needs you count", () => {
       undefined,
       NOW,
     );
-    // The inference has inflated the review pill — both finished runs read "in review" — which is
+    // The inference has inflated the review tally — both finished runs read "in review" — which is
     // precisely why the operator's own count must not answer off it.
     expect(consoleJobCounts(outage)).toEqual({
       running: 1,
