@@ -62,6 +62,12 @@ import {
   type TraceFilter,
 } from "@/lib/console-trace-view";
 import {
+  ASK_PAST_WINDOW_NOTE,
+  ASK_WAITING_NOTE,
+  managerReply,
+  type AskedQuestion,
+} from "@/lib/console-ask";
+import {
   DEFAULT_WATCH_TAB,
   MEMORY_EMPTY_NOTE,
   ROOM_WATCH_WINDOW,
@@ -352,7 +358,15 @@ function RunTrace({
               NOT with the bare run id, which is the Split's own key among these same siblings. Two
               siblings sharing a key is a collision React resolves by dropping one of them, which
               left the previous attempt's Split mounted after a switch. */}
-          {teamsEnabled ? <AskDock key={`ask:${run.id}`} run={live} who={who} /> : null}
+          {teamsEnabled ? (
+            <AskDock
+              key={`ask:${run.id}`}
+              run={live}
+              who={who}
+              roster={roster}
+              onOpenRoom={onOpenRoom}
+            />
+          ) : null}
         </>
       )}
     </div>
@@ -1682,22 +1696,38 @@ function MessagesPanel({
 }
 
 /**
- * "Ask about this run" (design record §6, §8) — a room post, refed to the run.
+ * "Ask about this run" (design record §6, §8) — a room post, refed to the run, and the manager's
+ * reply to it read back inline (STUDIO-733, `~/.rhapsody/docs/answering-manager-design.md` §9.5
+ * slice 5).
  *
- * The design record is explicit about what this is TODAY and what it becomes: "ship as a room post
- * refed to the run now; upgrade to the answering-manager Answer path when it lands". Nothing serves
- * an answer yet — there is no answer route on `/api/v1` — so the dock does the real thing it can
- * do, posts the question into the team room where a manager and every teammate will read it, and
- * says so in its own words rather than implying a reply is coming back to this page.
+ * The design record for the dock said "ship as a room post refed to the run now; upgrade to the
+ * answering-manager Answer path when it lands". It has landed (STUDIO-729→732), and this is that
+ * upgrade — but NOT in the shape the phrase suggests. There is still no answer route on `/api/v1`
+ * and this slice adds none: the manager answers ONCE, in the room, and the console reads that one
+ * post back. Everything the operator sees here is the room's own record, so the room stays the
+ * single log and the console is a window onto it rather than a second answer engine.
  *
  * `refs` carries the ticket AND the run (`askRefs`), which is what makes it a question about this
- * attempt rather than about the ticket in general.
+ * attempt rather than about the ticket in general — and the id the daemon echoes back for the post
+ * is what [`managerReply`] then matches the manager's reply on.
  */
-function AskDock({ run, who }: { run: RunSummary; who: string }) {
+function AskDock({
+  run,
+  who,
+  roster,
+  onOpenRoom,
+}: {
+  run: RunSummary;
+  who: string;
+  roster: readonly string[];
+  onOpenRoom: () => void;
+}) {
   const post = usePostToRoom();
   const [question, setQuestion] = useState("");
   const [problem, setProblem] = useState("");
-  const [asked, setAsked] = useState(false);
+  // The question that LANDED, as the daemon echoed it back — never the text in the box. It is what
+  // the exchange below names and what its reply is matched on, so the two can never disagree.
+  const [asked, setAsked] = useState<AskedQuestion | null>(null);
   const submit = () => {
     const body = question.trim();
     if (body === "" || post.isPending) return;
@@ -1705,57 +1735,125 @@ function AskDock({ run, who }: { run: RunSummary; who: string }) {
     post.mutate(
       { body, refs: askRefs(run) },
       {
-        onSuccess: () => {
+        onSuccess: (echo) => {
           setQuestion("");
-          setAsked(true);
+          setAsked({ id: echo.id, body });
         },
         onError: (err) => setProblem(err.message),
       },
     );
   };
   return (
-    <div className="askdock">
-      <span className="g" aria-hidden="true">
-        ✦
-      </span>
-      <input
-        className="q"
-        aria-label="Ask about this run"
-        placeholder={
-          who === ""
-            ? "Ask the team about this run — it posts to the room…"
-            : `Ask the team about ${who}'s run — it posts to the room…`
-        }
-        value={question}
-        disabled={post.isPending}
-        onChange={(e) => {
-          setQuestion(e.target.value);
-          // The receipt is about the question that LANDED. The moment the operator starts writing
-          // the next one, a lingering "Posted to the room" is a claim about text nobody has sent.
-          setAsked(false);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-            e.preventDefault();
-            submit();
-          }
-        }}
-      />
-      {problem === "" ? null : (
-        <span className="acterr" role="status">
-          {problem}
-        </span>
+    <div className="askwrap">
+      {asked === null ? null : (
+        <AskExchange asked={asked} roster={roster} onOpenRoom={onOpenRoom} />
       )}
-      {/* Said only after a post actually landed, and never as "answered": the room is where the
-          question went, and no endpoint brings a reply back to this page yet. */}
-      {problem === "" && asked ? (
-        <span className="posted" role="status">
-          Posted to the room
+      <div className="askdock">
+        <span className="g" aria-hidden="true">
+          ✦
         </span>
-      ) : null}
-      <Button onClick={submit} disabled={post.isPending}>
-        Ask
-      </Button>
+        <input
+          className="q"
+          aria-label="Ask about this run"
+          placeholder={
+            who === ""
+              ? "Ask the team about this run — it posts to the room…"
+              : `Ask the team about ${who}'s run — it posts to the room…`
+          }
+          value={question}
+          disabled={post.isPending}
+          onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+        {problem === "" ? null : (
+          <span className="acterr" role="status">
+            {problem}
+          </span>
+        )}
+        <Button onClick={submit} disabled={post.isPending}>
+          Ask
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One question the dock posted, and what the room says about it — "you asked X / @manager answered
+ * Y", against the one room post the manager wrote.
+ *
+ * It survives the operator typing the next question, which the bare "Posted to the room" receipt it
+ * replaces deliberately did not. That receipt named no subject, so a lingering one read as a claim
+ * about the text now in the box and had to be cleared on the first keystroke. This card quotes the
+ * question that LANDED, so it cannot be misread that way — and it must not vanish, because an
+ * answer that disappeared the moment the operator started writing a follow-up would be an answer
+ * they had to go to the room to read after all, which is the whole thing this slice removes.
+ *
+ * The read is the Room tab's own: same endpoint, same window, one react-query key, so the two
+ * cannot show different rooms and an open Room tab costs no second request. It is gated on a
+ * question having landed — with nothing asked there is nothing to look up, and a dock that polled
+ * the room regardless would make every run detail a room reader.
+ */
+function AskExchange({
+  asked,
+  roster,
+  onOpenRoom,
+}: {
+  asked: AskedQuestion;
+  roster: readonly string[];
+  onOpenRoom: () => void;
+}) {
+  const room = useTeamsRoom(true, ROOM_WATCH_WINDOW);
+  const messages = useMemo(() => room.data?.messages ?? [], [room.data]);
+  const outcome = useMemo(() => managerReply(messages, asked), [messages, asked]);
+  return (
+    <div className="askex">
+      <div className="qq">
+        <span className="lbl">You asked</span>
+        {/* The operator's own words, as text: this half is a receipt for what was sent, and
+            rendering it as markdown would show something other than what went into the room. */}
+        <span className="qb">{asked.body}</span>
+      </div>
+      {outcome.kind === "answered" ? (
+        <div className="mcard">
+          <div className="top">
+            <span className="who2" style={{ color: teammateColor(roster, outcome.reply.from) }}>
+              {outcome.reply.from}
+            </span>
+            <Timestamp>{clockTime(outcome.reply.at)}</Timestamp>
+          </div>
+          {/* The room post itself, through the room's own renderer — the manager's prose arrives
+              quoted line by line and its records under `From my own records —`, and that layout is
+              what tells the operator which half the daemon vouches for. Reshaping it here would
+              make this a second answer wearing the first one's name. */}
+          <Markdown source={outcome.reply.body} />
+        </div>
+      ) : (
+        <div className="pending" role="status">
+          {/* Never "answering" or "still thinking": nothing tells this page the manager has even
+              read the question, and `past-window` cannot tell whether it replied at all. */}
+          {emptyNote(
+            room,
+            "Posted to the room — reading it back…",
+            outcome.kind === "waiting" ? ASK_WAITING_NOTE : ASK_PAST_WINDOW_NOTE,
+          )}{" "}
+          <a
+            className="link"
+            href="#teams"
+            onClick={(e) => {
+              e.preventDefault();
+              onOpenRoom();
+            }}
+          >
+            Open the room →
+          </a>
+        </div>
+      )}
     </div>
   );
 }
