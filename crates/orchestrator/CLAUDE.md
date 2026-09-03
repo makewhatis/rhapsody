@@ -151,8 +151,14 @@ the `Orchestrator` struct itself. Concretely:
   room prompt carries, and the vet that refuses model prose naming a ticket the team's own records
   never resolved. Everything it renders is attacker-influenceable (design §9.2: agent memory, room
   JSONL, GitHub comments), so nothing there is "the daemon's own trusted context" — treat any change
-  that widens what reaches the block, or that trusts a fact inside it, as a security change. It is
-  fed by `teamsknow.rs`'s accessor through `TriageDeps::knowledge`, which is `None` for a daemon
+  that widens what reaches the block, or that trusts a fact inside it, as a security change. **Be
+  exact about what the fencing buys**, because the vet is key-scoped and nothing inspects what a
+  sentence MEANS: a plant can never mint an action and can never make the manager name an unresolved
+  ticket, but a keyless planted sentence ("the deploy is safe") CAN reach a reply if the turn obeys
+  it. The containment for that is `answer_for` rendering `Facts::grounded` under every accepted
+  prose, so the host's own records are always beside the sentence — don't remove it, and don't
+  restate the old claim that a planted line "is never obeyed". It is fed by `teamsknow.rs`'s
+  accessor through `TriageDeps::knowledge`, which is `None` for a daemon
   with no durable store; that `None` is what keeps every teams-off and `labels`-only prompt
   byte-identical, so don't make it a `Noop` store instead.
 - **Cross-cutting constants**: `backoff.rs` (retry-cadence math), `telemetry_attrs.rs` (the
