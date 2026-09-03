@@ -151,27 +151,35 @@ pub fn re_engage_comment(c: &ReviewCompletion) -> String {
         ..
     } = c;
     let head = short_sha(head_sha);
+    // `ReviewRun::author` documents empty as "unknown", and while the selection path fails closed on
+    // it, this template must not render `": read the review comments"` if one ever arrives. The
+    // address degrades to a role rather than to a blank.
+    let who = if author.is_empty() {
+        "The author"
+    } else {
+        author.as_str()
+    };
     if c.approved {
         return format!(
             "**{reviewer}** reviewed this pull request at `{head}` and found nothing to raise.\n\
              \n\
-             No changes are requested, so {author} is not being asked for anything and this \
-             comment deliberately does not summon them. Pushing to this branch arms one more \
-             review of the new commits.\n\
+             No changes are requested, so nothing is being asked of {who} and this comment \
+             deliberately carries no summon. Pushing to this branch arms one more review of the \
+             new commits.\n\
              \n\
-             Reviewed, not merged — {author} owns the merge.\n"
+             Reviewed, not merged — {who} owns the merge.\n"
         );
     }
     let token = &c.summon_token;
     format!(
         "{token} **{reviewer}** reviewed this pull request at `{head}` and left findings on it.\n\
          \n\
-         {author}: read the review comments on this pull request, then push your fixes to this \
+         {who}: read the review comments on this pull request, then push your fixes to this \
          branch. Pushing is the whole of it — the daemon watches this pull request's head and arms \
          a fresh review of whatever lands, so there is no re-review to request and nobody to \
          notify.\n\
          \n\
-         Reviewed, not merged — {author} owns the merge.\n"
+         Reviewed, not merged — {who} owns the merge.\n"
     )
 }
 
@@ -502,6 +510,38 @@ mod tests {
         assert!(!summons_author("nothing here", "@symphony"));
         // The brand spellings are synonyms, exactly as the Linear path treats them.
         assert!(summons_author("@rhapsody please look", "@symphony"));
+    }
+
+    /// An unknown author renders as a role, never as a blank. `ReviewRun::author` documents empty as
+    /// "unknown", and a body opening `": read the review comments"` would look like a bug in the one
+    /// place a human reads the daemon's own words.
+    #[test]
+    fn an_unknown_author_is_addressed_by_role() {
+        for approved in [true, false] {
+            let mut c = completion(approved, "@symphony");
+            c.author.clear();
+            let body = re_engage_comment(&c);
+            assert!(
+                !body.contains("\n: ") && !body.contains("—  owns"),
+                "an empty author must never render as a blank address: {body}"
+            );
+            assert!(body.contains("The author"), "{body}");
+        }
+    }
+
+    /// The one shape in which an APPROVED comment can summon after all, named rather than hidden: a
+    /// summon token that is a bare word this template happens to use ("reviewed"). The
+    /// configuration is already degenerate daemon-wide — every Linear comment saying "reviewed"
+    /// would summon too — so the comment is still posted (a review's record belongs on the pull
+    /// request), and `run_review_notify_task` logs the disagreement at error rather than letting a
+    /// silent extra re-engagement happen.
+    #[test]
+    fn a_bare_word_token_can_make_an_approval_summon_and_that_is_reported() {
+        let c = completion(true, "reviewed");
+        assert!(
+            summons_author(&re_engage_comment(&c), "reviewed"),
+            "the guard in the task exists because this case is reachable, not hypothetical"
+        );
     }
 
     // ── the off-loop task ────────────────────────────────────────────────────────────────────────
