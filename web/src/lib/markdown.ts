@@ -162,37 +162,52 @@ function isClosingFence(line: string, marker: string): boolean {
   return close.test(line);
 }
 
+/** One fenced code block, located and described well enough to be split in half — [`fenceSpans`]. */
+export interface FenceSpan {
+  /** `[start, end)` in the text: the opening fence line through the closing one. */
+  start: number;
+  end: number;
+  /** The first offset of the block's CONTENT — just past the opening fence's own line. */
+  body: number;
+  /** Where the closing fence line starts; `end` when the block is unterminated. */
+  close: number;
+  /** The opening run of backticks or tildes, and the info string after it (`rust`, or ""). */
+  marker: string;
+  info: string;
+}
+
 /**
- * The `[start, end)` offset of every fenced code block in `text`, in order.
+ * Every fenced code block in `text`, in order.
  *
  * For callers that CUT a body before parsing it (the room feed truncates a long post). A cut
  * inside a fence is not a cosmetic problem: the head is left with an unterminated fence, which is
  * harmless, but the tail then STARTS with the closing fence — which opens a new unterminated one,
- * so every remaining word of the post renders as code. An unterminated block ends at the text's
- * end, matching how [`parseMarkdown`] closes one.
+ * so every remaining word of the post renders as code. `marker`/`info` are what such a caller
+ * needs to CLOSE the block on the head and REOPEN it on the tail, which keeps code as code on both
+ * sides without moving the cut; `body`/`close` mark the range where that repair is possible at
+ * all, since a cut inside either fence line itself has to move to the block's edge instead. An
+ * unterminated block ends at the text's end, matching how [`parseMarkdown`] closes one.
  */
-export function fenceSpans(text: string): { start: number; end: number }[] {
-  const spans: { start: number; end: number }[] = [];
-  let start = -1;
-  let marker = "";
+export function fenceSpans(text: string): FenceSpan[] {
+  const spans: FenceSpan[] = [];
+  let open: { start: number; body: number; marker: string; info: string } | null = null;
   let at = 0;
   while (at <= text.length) {
     const eol = text.indexOf("\n", at);
+    const next = eol === -1 ? text.length : eol + 1;
     const line = text.slice(at, eol === -1 ? text.length : eol);
-    if (start === -1) {
+    if (open === null) {
       const fence = FENCE.exec(line);
-      if (fence) {
-        start = at;
-        marker = fence[1];
-      }
-    } else if (isClosingFence(line, marker)) {
-      spans.push({ start, end: eol === -1 ? text.length : eol + 1 });
-      start = -1;
+      if (fence) open = { start: at, body: next, marker: fence[1], info: fence[2] };
+    } else if (isClosingFence(line, open.marker)) {
+      spans.push({ ...open, end: next, close: at });
+      open = null;
     }
     if (eol === -1) break;
-    at = eol + 1;
+    at = next;
   }
-  if (start !== -1) spans.push({ start, end: text.length });
+  // An unterminated block has no closing line, so it "closes" where the text does.
+  if (open !== null) spans.push({ ...open, end: text.length, close: text.length });
   return spans;
 }
 

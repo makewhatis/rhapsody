@@ -367,24 +367,41 @@ export function truncateBody(body: string, at: number = BODY_TRUNCATE_AT): { hea
   if (text.length <= at) return { head: text, rest: "" };
   // Break on the last space before the limit so the visible half never ends mid-word.
   const space = text.lastIndexOf(" ", at);
-  const cut = fenceSafeCut(text, space > at / 2 ? space : at);
+  return fenceSafeSplit(text, space > at / 2 ? space : at);
+}
+
+/** The plain split: everything before the cut is shown, everything after it expands. */
+function plainSplit(text: string, cut: number): { head: string; rest: string } {
   return { head: text.slice(0, cut), rest: text.slice(cut).trim() };
 }
 
 /**
- * The same cut, moved clear of any fenced code block (STUDIO-739).
+ * The split, made safe for a cut that lands inside a fenced code block (STUDIO-739).
  *
- * Both halves are rendered as markdown INDEPENDENTLY, so a cut inside a fence leaves the tail
+ * Both halves are rendered as markdown INDEPENDENTLY, so a raw cut inside a fence leaves the tail
  * starting on the closing fence — which opens a new unterminated block, turning every remaining
  * word of the post into monospace code. A post that leads with its verification output produces
- * exactly that. Cut before the block instead, so the fence stays whole on one side; when the
- * block starts at the very top there is no head to keep, so take the whole block into it.
+ * exactly that.
+ *
+ * The repair CLOSES the block on the head and REOPENS it on the tail rather than moving the cut,
+ * because moving it to a block boundary is unbounded in both directions: forwards it drags a whole
+ * 5KB block into the collapsed feed (and, for an unterminated one, leaves no tail to expand at
+ * all), backwards it throws the preview away. Keeping the cut where it is holds the head to the
+ * budget plus the one fence line this adds, and keeps code rendering as code on both sides. Only a
+ * cut inside a fence LINE has to move — half a fence is not a fence — and both of those moves are
+ * bounded by that line.
  */
-function fenceSafeCut(text: string, cut: number): number {
-  for (const { start, end } of fenceSpans(text)) {
-    if (cut > start && cut < end) return start > 0 ? start : end;
-  }
-  return cut;
+function fenceSafeSplit(text: string, cut: number): { head: string; rest: string } {
+  const fence = fenceSpans(text).find((f) => cut > f.start && cut < f.end);
+  if (!fence) return plainSplit(text, cut);
+  // Inside the OPENING fence line: no part of the block can be kept, so cut just before it.
+  if (cut < fence.body) return plainSplit(text, fence.start);
+  // Inside the CLOSING one: every content line is already in the head, so take the fence too.
+  if (cut >= fence.close) return plainSplit(text, fence.end);
+  return {
+    head: `${text.slice(0, cut)}\n${fence.marker}`,
+    rest: `${fence.marker}${fence.info}\n${text.slice(cut)}`.trimEnd(),
+  };
 }
 
 // --- the day pager ---

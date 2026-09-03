@@ -2,6 +2,7 @@ import { parseMarkdown } from "@/lib/markdown";
 import { describe, expect, it } from "vitest";
 import type { TeamsRoomMessage } from "@/lib/api";
 import {
+  BODY_TRUNCATE_AT,
   DEFAULT_ROOM_WINDOW,
   MAX_ROOM_WINDOW,
   MIN_ASSIGN_RUN,
@@ -24,6 +25,11 @@ import {
 // reworded body is exactly the regression these tests exist to catch.
 
 const ROSTER = ["alice", "jimmy"];
+
+/** The text of every fenced block in a rendered half, in order. */
+function codeOf(source: string): string[] {
+  return parseMarkdown(source).flatMap((b) => (b.type === "code" ? [b.text] : []));
+}
 
 // Timestamps sit mid-UTC-day on purpose: the feed groups and prints in LOCAL time (the house style
 // of lib/format), so a fixture near midnight would land on a different calendar day depending on
@@ -312,34 +318,73 @@ describe("3.7 — a long body truncates with the rest kept for the expand", () =
 
   // STUDIO-739 — both halves are rendered as markdown independently now. A cut inside a fence
   // leaves the TAIL starting on the closing fence, which opens a new unterminated block and turns
-  // every remaining word of the post into monospace code.
-  it("never cuts inside a fenced code block", () => {
-    const body = `Verification:\n\n\`\`\`\n${"cargo test --workspace\n".repeat(12)}\`\`\`\n\nAll green, wired into the transcript.`;
+  // every remaining word of the post into monospace code. The repair closes the block on the head
+  // and reopens it on the tail, which is the only move that keeps the head inside its budget: a
+  // fenced block is arbitrarily long, so cutting to either of its boundaries is not bounded by
+  // anything. The budget below is `BODY_TRUNCATE_AT` plus the one fence line the repair adds.
+  it("closes a fenced block on the head and reopens it on the tail", () => {
+    const body = `Verification:\n\n\`\`\`sh\n${"cargo test --workspace\n".repeat(12)}\`\`\`\n\nAll green, wired into the transcript.`;
     const { head, rest } = truncateBody(body);
-    expect(head).toBe("Verification:\n\n");
-    expect(rest.startsWith("```")).toBe(true);
-    for (const half of [head, rest]) {
-      expect(parseMarkdown(half).filter((b) => b.type === "code")).toHaveLength(
-        half === head ? 0 : 1,
-      );
-    }
-    // The prose after the block is prose on both sides of the split.
-    expect(parseMarkdown(rest).at(-1)).toMatchObject({ type: "paragraph" });
+    expect(head.length).toBeLessThanOrEqual(BODY_TRUNCATE_AT + "```sh\n".length);
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["paragraph", "code"]);
+    // The prose after the block is still prose, and the tail's code is still code.
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+    // The preview is the block's opening lines — neither an empty box nor the whole block.
+    const [headCode, ...tailCode] = [...codeOf(head), ...codeOf(rest)];
+    expect(headCode).not.toBe("");
+    expect(headCode + tailCode.join("")).toBe("cargo test --workspace\n".repeat(12).slice(0, -1));
   });
 
-  it("keeps a block whole when the body opens with one", () => {
-    const body = `\`\`\`\n${"cargo test --workspace\n".repeat(12)}\`\`\`\n\nThat is the run.`;
+  it("bounds the head when the body opens with a long fenced block", () => {
+    const body = `\`\`\`\n${"x".repeat(5000)}\n\`\`\`\nprose after the block.`;
     const { head, rest } = truncateBody(body);
+    expect(head.length).toBeLessThanOrEqual(BODY_TRUNCATE_AT + 4);
     expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
-    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["paragraph"]);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
   });
 
-  it("keeps every character across a fence-aware split", () => {
-    const body = `lead in\n\n\`\`\`\n${"line of output\n".repeat(20)}\`\`\`\ntail`;
+  it("keeps the expand affordance when the block is never closed", () => {
+    const body = `\`\`\`\n${"y".repeat(600)}`;
     const { head, rest } = truncateBody(body);
-    expect(head + rest).toBe(body.slice(0, head.length) + body.slice(head.length).trim());
-    expect(body.startsWith(head)).toBe(true);
-    expect(body.endsWith(rest)).toBe(true);
+    expect(head.length).toBeLessThanOrEqual(BODY_TRUNCATE_AT + 4);
+    // An unterminated block used to swallow the whole post into the head, leaving no `<details>`.
+    expect(rest).not.toBe("");
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code"]);
+  });
+
+  it("spends the budget on the block instead of stopping short of it", () => {
+    const body = `hi\n\`\`\`\n${"z".repeat(400)}\n\`\`\`\ntail`;
+    const { head } = truncateBody(body);
+    // Cutting back to the block's start left a three-character preview ("hi\n") here.
+    expect(head.length).toBeGreaterThanOrEqual(BODY_TRUNCATE_AT);
+  });
+
+  it("cuts before the fence when the cut lands inside the opening one", () => {
+    const body = `${"a".repeat(218)}\n\`\`\`rust\nfn main() {}\n\`\`\`\ntail`;
+    const { head, rest } = truncateBody(body);
+    // Half an opening fence is not a fence, so the whole block moves to the tail.
+    expect(head).toBe(`${"a".repeat(218)}\n`);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+  });
+
+  it("takes a closing fence into the head rather than splitting it in two", () => {
+    const body = `\`\`\`\n${"b".repeat(213)}\n\`\`\``;
+    const { head, rest } = truncateBody(body);
+    // Every content line already fits, so the three characters left are the fence itself.
+    expect(head).toBe(body);
+    expect(rest).toBe("");
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+  });
+
+  it("adds only the fence it needs and drops nothing else", () => {
+    const body = `lead in\n\n\`\`\`rust\n${"line of output\n".repeat(20)}\`\`\`\ntail`;
+    const { head, rest } = truncateBody(body);
+    expect(head.endsWith("\n```")).toBe(true);
+    expect(rest.startsWith("```rust\n")).toBe(true);
+    // Strip the two fences this split synthesized and the halves rejoin into the original body —
+    // an assertion the split can fail, unlike one written in terms of `head.length`.
+    expect(head.slice(0, -"\n```".length) + rest.slice("```rust\n".length)).toBe(body);
   });
 });
 
