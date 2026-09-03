@@ -281,7 +281,10 @@ export function cardLead(card: ResultCard): string {
   if (isHeadline(whole)) return "";
   // The headline can also be GROWN past the lead — the model reaches into the next paragraph when
   // the opening sentence is a bare "Done." — in which case the H1 already carries the whole lead.
-  if (!clipped && target.startsWith(whole)) return "";
+  // The lead must be a whole SENTENCE the headline then continues past, not merely a string
+  // prefix of it: a one-word lead of "A" prefixes "Absolutely everything changed." and shares
+  // nothing with it.
+  if (!clipped && /[.!?]$/.test(whole) && target.startsWith(`${whole} `)) return "";
   const re = /(?<=[.!?])\s+/g;
   for (let n = 0, match = re.exec(lead); match !== null && n < LEAD_SENTENCE_SCAN; n += 1) {
     if (isHeadline(plainLead(lead.slice(0, match.index)))) return lead.slice(match.index).trim();

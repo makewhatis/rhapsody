@@ -271,6 +271,12 @@ describe("cardLead — the Result card shows a lead only when the H1 does not al
     expect(card("Done. And here is why.", "Done. And here is why. More.")).toBe("");
   });
 
+  // A whole SENTENCE the headline continues past, not merely a string prefix of it.
+  it("keeps a lead that only happens to spell the start of the headline", () => {
+    expect(card("A", "Absolutely everything changed.")).toBe("A");
+    expect(card("Wired", "Wired the watcher end to end.")).toBe("Wired");
+  });
+
   it("keeps a lead whose opening sentence is not the one the headline was grown from", () => {
     expect(card("A first line. A second.", "Something else entirely.")).toBe(
       "A first line. A second.",
