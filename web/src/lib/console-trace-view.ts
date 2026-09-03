@@ -408,21 +408,33 @@ export function failingStep(phases: readonly TracePhase[]): FailingStep | null {
 const REVIEW_KEY_PREFIX = "pr:";
 
 /**
- * The teammate a run wore, as far as a SERVED field can say — "" when nothing can.
+ * The teammate a run wore — "" when nothing can name one.
  *
- * Two sources, and deliberately no third. A ticketless review run's key IS
- * `pr:owner/repo#<n>@<reviewer>` (`crates/orchestrator/src/review.rs`), so the reviewer's identity
- * is carried by the run's own identifier and needs nothing else. Every other run falls back to the
- * ticket's DURABLE assignee (STUDIO-735), which is per-TICKET rather than per-run.
+ * Three sources, in the order of how much they can be trusted about THIS run.
  *
- * That fallback is the honest limit of this slice: `runs` has no identity column — the routing
- * decision lives in a `teams.route` EVENT (`crates/store/src/types.rs` says so in as many words)
- * — and the one endpoint that resolves it, `/api/v1/history/issues`, answers per issue and not per
- * attempt. So two attempts of one ticket resolve to the same name today, and [`relayBatons`] says
- * "run 522 → run 547" rather than inventing a second teammate. Slice 5 (STUDIO-746) wires the
- * per-run identity in, and this is the only function it has to change.
+ * A ticketless review run's key IS `pr:owner/repo#<n>@<reviewer>`
+ * (`crates/orchestrator/src/review.rs`), so the reviewer's identity is carried by the run's own
+ * identifier and needs nothing fetched at all.
+ *
+ * Otherwise the run's DURABLE dispatch record answers (STUDIO-746, `lib/run-identity`): the
+ * routing row its own ledger carries. It is per-RUN and it survives the run, which is what keeps a
+ * finished attempt attributed after its teammate has dropped off the live roster — and what lets
+ * two attempts of one ticket name two different teammates. Its tri-state is honoured here: a run
+ * recorded as UNROUTED resolves to "" and stops, because "the run said it had nobody" is an
+ * answer, and letting the fallback overwrite it is how a solo run acquires a teammate it never had.
+ *
+ * Only a run with NO routing row at all — a legacy row, a pruned ledger, a store written before
+ * Teams — reaches `assignee`, the live roster's per-TICKET name. That is the same durable-first,
+ * live-as-the-gap-filler order the Jobs worklist already uses (`buildConsoleJobs`), and it carries
+ * the same caveat: the live roster knows a ticket, not an attempt, so on an unrecorded old attempt
+ * of a ticket that is running right now it names today's teammate. It is the fallback the ticket
+ * asks for and it is only ever reached where there is no record to prefer.
  */
-export function runTeammate(run: RunSummary, assignee: string): string {
+export function runTeammate(
+  run: RunSummary,
+  identities: ReadonlyMap<number, string>,
+  assignee: string,
+): string {
   const key = run.issue_identifier.trim();
   if (key.startsWith(REVIEW_KEY_PREFIX)) {
     // The `@` is what makes the suffix a NAME. `is_review_key` only checks the prefix, so a `pr:`
@@ -431,6 +443,8 @@ export function runTeammate(run: RunSummary, assignee: string): string {
     const at = key.lastIndexOf("@");
     return at < 0 ? "" : key.slice(at + 1).trim();
   }
+  const recorded = identities.get(run.id);
+  if (recorded !== undefined) return recorded;
   return assignee.trim();
 }
 
@@ -458,10 +472,14 @@ export interface RelayBatons {
  * `runs` is newest-first, as `runsNewestFirst` orders the attempt selector, so a run's predecessor
  * is the element AFTER it. A run the list does not contain gets no baton at all rather than a
  * neighbour picked by position — the selector can hold a run the history has since re-paged out.
+ *
+ * Both sides resolve through [`runTeammate`], so a two-name baton is drawn from what each run's own
+ * dispatch recorded (STUDIO-746) rather than from one name stretched across both.
  */
 export function relayBatons(
   runs: readonly RunSummary[],
   run: RunSummary,
+  identities: ReadonlyMap<number, string>,
   assignee: string,
 ): RelayBatons {
   const at = runs.findIndex((r) => r.id === run.id);
@@ -469,14 +487,19 @@ export function relayBatons(
   const previous = runs[at + 1];
   const next = runs[at - 1];
   return {
-    incoming: previous === undefined ? null : baton(previous, run, assignee),
-    outgoing: next === undefined ? null : baton(run, next, assignee),
+    incoming: previous === undefined ? null : baton(previous, run, identities, assignee),
+    outgoing: next === undefined ? null : baton(run, next, identities, assignee),
   };
 }
 
-function baton(from: RunSummary, to: RunSummary, assignee: string): Baton {
-  const who = runTeammate(from, assignee);
-  const took = runTeammate(to, assignee);
+function baton(
+  from: RunSummary,
+  to: RunSummary,
+  identities: ReadonlyMap<number, string>,
+  assignee: string,
+): Baton {
+  const who = runTeammate(from, identities, assignee);
+  const took = runTeammate(to, identities, assignee);
   if (who !== "" && took !== "" && who !== took) {
     return { from: who, to: took, text: `${who} → ${took}` };
   }
