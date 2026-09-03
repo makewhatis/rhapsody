@@ -355,7 +355,13 @@ impl Facts {
             return vec![d.to_string()];
         }
         let mut out = Vec::new();
+        // A pull-request coordinate has no tracker state to be missing, and could never have been
+        // in the cycle's fetch — so it gets no ticket line at all rather than an honest-sounding
+        // one about a ticket that does not exist. Decided by the accessor's OWN parser, so the two
+        // cannot disagree about what names a pull request.
+        let names_a_pr = crate::teamsknow::parse_pr_ref(&a.asked).is_some();
         match &o.issue {
+            _ if names_a_pr => {}
             Some(i) => out.push(format!(
                 "ticket: state `{}`, titled \"{}\", worn by {}",
                 one_line(&i.state),
@@ -428,7 +434,7 @@ impl Facts {
                     String::new()
                 } else {
                     format!(
-                        "; their review run {}{}",
+                        "; their most recent review run {}{}",
                         one_line(&r.outcome),
                         if r.ended_at.is_empty() {
                             String::new()
@@ -1092,6 +1098,30 @@ mod tests {
             block.contains("no tracker state"),
             "the block must say plainly that the ticket's state is unknown: {block}"
         );
+    }
+
+    /// A pull-request coordinate is not a ticket, so it is never told it has no tracker state.
+    ///
+    /// The honest line for a terminal TICKET — *"not among the tickets this team's trackers
+    /// returned this cycle"* — is noise on a coordinate that could never have been in that fetch,
+    /// and it invites an answer to discuss a ticket that does not exist.
+    #[test]
+    fn a_pull_request_coordinate_is_never_reported_as_a_ticket() {
+        let f = resolved(
+            "pr:acme/rhapsody#12",
+            Outcome {
+                key: "pr:acme/rhapsody#12".into(),
+                issue: None,
+                reviews: vec![review("jimmy", "alice", REVIEW_STATUS_APPROVED, true)],
+                ..Outcome::default()
+            },
+        );
+        let block = f.render();
+        assert!(
+            !block.contains("ticket:"),
+            "a pull request has no tracker state to be missing:\n{block}"
+        );
+        assert!(block.contains("verdict: approved"), "{block}");
     }
 
     /// A ticket the cycle DOES carry reports its real state, so the honesty above is not silence.
