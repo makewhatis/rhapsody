@@ -60,10 +60,16 @@ export type AskOutcome =
  *
  * The `waiting` branch is a stronger claim than [`roomEmptyNote`](./console-watch)'s, and it is
  * allowed to be, because of a property of the read rather than of this function. `GET
- * /api/v1/teams/room` serves the NEWEST messages when more are available (`crates/config/src/room.rs`)
+ * /api/v1/teams/room` is served by `RoomLog::read_since`, whose contract is "at most `limit`
+ * messages, the NEWEST ones when more are available, oldest first" (`crates/config/src/room.rs`),
  * and a reply is always appended AFTER the post it answers. So a read containing the question also
  * contains every message written since it — the manager's reply among them, if one exists. Absence
  * is then evidence, and "not answered yet" is true rather than merely unrefuted.
+ *
+ * That premise is the whole warrant for the claim, so it is worth being precise about what it does
+ * NOT rest on. It does not need the read to be complete, and the day-partitioned
+ * `MAX_ROOM_FILE_SCAN` bound under the message window cannot weaken it: that bound drops the
+ * OLDEST day files, which can only ever remove messages written BEFORE the question.
  *
  * Lose that premise and the claim goes with it: once the question itself has fallen out of the
  * window, the read says nothing at all about what came after, so the outcome is `past-window` and
