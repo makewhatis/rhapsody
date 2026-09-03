@@ -1165,6 +1165,29 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     await waitFor(() => expect(document.querySelector(".trlatest")).toBeNull());
   });
 
+  it("keeps a grep that is not hiding the playhead when the chip takes the page back", async () => {
+    // The chip is offered for two independent reasons, and only one of them is the filter's
+    // fault. Here the grep is showing the head perfectly well and the operator has simply
+    // scrolled up: taking the page back to the bottom is all that was asked for, and wiping what
+    // they typed on the way would be a loss they did not ask for at all.
+    sizePage(() => 2000);
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    fireEvent.change(grepField(), { target: { value: "cargo" } });
+    await waitFor(() => expect(spineTitles()).toEqual(["Verified"]));
+    expect(nowStep()).toBe("Verified"); // the head is on the spine, so the page is still following
+
+    scroller().scrollTop = 0;
+    fireEvent.scroll(window);
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
+    fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
+
+    await waitFor(() => expect(scroller().scrollTop).toBe(2000));
+    expect(grepField().value).toBe("cargo");
+    expect(spineTitles()).toEqual(["Verified"]);
+  });
+
   it("keeps a live run pinned to the bottom as the stream appends to it", async () => {
     let height = 1000;
     sizePage(() => height);
@@ -1204,6 +1227,40 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     // And the chip is the way back: it re-takes the playhead AND the bottom of the page.
     fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
     await waitFor(() => expect(scroller().scrollTop).toBe(3000));
+  });
+
+  it("never drags a scrolled-up operator down when a filtered-in phase flips follow back on", async () => {
+    // The other half of the same promise, and the half a detached scroll listener used to break:
+    // while the page is not following, the operator's position is still theirs. The page is tall
+    // only while the head is VISIBLE (the `now` badge is on the spine) — exactly when follow can
+    // be on — so the growth and the follow-flip land in ONE commit, the way a real poll does.
+    sizePage(() => (document.querySelector(".trstep.now") === null ? 2000 : 3000));
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+
+    // A grep for a step the run has not written yet hides every phase, the head included: the
+    // page stops following, and the chip is offered.
+    fireEvent.change(grepField(), { target: { value: "cargo" } });
+    await waitFor(() => expect(spineTitles()).toEqual([]));
+    expect(nowStep()).toBe("");
+    expect(document.querySelector(".trlatest")).toBeTruthy();
+
+    // The operator scrolls up to read. Nothing about follow being off makes this position less
+    // real, and the follow rule has to observe it.
+    scroller().scrollTop = 0;
+    fireEvent.scroll(window);
+
+    // The poll brings the phase the grep was looking for. It is the newest one, so it is BOTH
+    // visible and the head: follow flips back on and the page grows in the same commit.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(spineTitles()).toEqual(["Verified"]));
+    expect(nowStep()).toBe("Verified"); // follow really did flip back on
+
+    expect(scroller().scrollTop).toBe(0);
+    // Still where they left it, and the chip still says how to get back.
+    expect(document.querySelector(".trlatest")).toBeTruthy();
   });
 
   it("never offers a playhead or a jump on a run that has finished", async () => {
@@ -1263,6 +1320,20 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
   });
 });
 
+/**
+ * Waits long enough for a send that WAS started to reach the mocked endpoint.
+ *
+ * `send.mutate` hands the body to react-query, which calls the mutation fn on a later tick — so a
+ * synchronous `not.toHaveBeenCalled()` after a click proves only that the tick has not come round
+ * yet, and passes with the refusal deleted. `refuses to send an empty message at all` carries the
+ * positive control that this wait is long enough to be worth anything.
+ */
+async function flushSend() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+}
+
 describe("the live run — the Message composer (§3A)", () => {
   it("sends an operator message to the running agent through the daemon's own endpoint", async () => {
     h.sendRunMessage.mockResolvedValue({ id: 3, identifier: "STUDIO-654", status: "sent" });
@@ -1297,14 +1368,25 @@ describe("the live run — the Message composer (§3A)", () => {
   });
 
   it("refuses to send an empty message at all", async () => {
+    h.sendRunMessage.mockResolvedValue({ id: 3, identifier: "STUDIO-654", status: "sent" });
     mountDetail([run(LIVE)]);
     await waitFor(() => expect(action(/^message/i)).toBeTruthy());
     fireEvent.click(action(/^message/i));
-    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
-      target: { value: "   " },
-    });
+    const box = await screen.findByLabelText(/message the running agent/i);
+    fireEvent.change(box, { target: { value: "   " } });
+    // Both ways in. The button is the one a mouse takes; the textarea's Enter is the one that
+    // reaches `submit` even when the button is disabled, and so the one that pins the refusal.
     fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    fireEvent.keyDown(box, { key: "Enter" });
+    await flushSend();
     expect(h.sendRunMessage).not.toHaveBeenCalled();
+
+    // The positive control for that flush, on the very same wait: whitespace is what was refused,
+    // not a send that simply had not reached the endpoint yet. (And Enter sends, trimmed.)
+    fireEvent.change(box, { target: { value: "  say something  " } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    await flushSend();
+    expect(h.sendRunMessage).toHaveBeenCalledExactlyOnceWith(547, "say something");
   });
 
   it("keeps a half-written message on screen when the run ends underneath it", async () => {
@@ -1330,8 +1412,14 @@ describe("the live run — the Message composer (§3A)", () => {
     );
     // Discarding what the operator typed is not this view's call to make; refusing to send it is.
     expect(box.value).toBe("btw the branch moved");
-    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    const send = screen.getByRole("button", { name: /^send$/i }) as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    fireEvent.click(send);
+    // And `submit` refuses it too, which is what the textarea's Enter — never disabled — asks for.
+    fireEvent.keyDown(box, { key: "Enter" });
+    await flushSend();
     expect(h.sendRunMessage).not.toHaveBeenCalled();
+    expect(box.value).toBe("btw the branch moved");
   });
 
   // A finished run has no agent to reach, so the endpoint is not a dependency — it is inapplicable.

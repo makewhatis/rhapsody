@@ -819,11 +819,15 @@ function TraceSplit({
           className="trlatest"
           onClick={() => {
             setPicked(null);
-            // Same reason as the jump above: a playhead the filter hides cannot be returned to,
-            // so the way back to "latest" clears the filter rather than scrolling to a spine
-            // the newest step is not on.
-            setFilter("all");
-            setQuery("");
+            // Same reason as the jump above, and ONLY when it applies: a playhead the filter
+            // hides cannot be returned to, so a chip offered because the head is off the spine
+            // clears the filter to put it back. A chip offered because the operator merely
+            // scrolled up has nothing to fix — the head is right there — and throwing away the
+            // grep they typed to get the page back to its bottom would be a loss for free.
+            if (headHidden) {
+              setFilter("all");
+              setQuery("");
+            }
             scrollToBottom();
           }}
         >
@@ -852,30 +856,42 @@ function scrollToBottom() {
  * there as the stream appends.
  *
  * The geometry is `lib/follow-scroll`'s, shared verbatim with the logs follow — one definition of
- * "at the bottom", threshold and all, rather than a second one that drifts. When following is off
- * the hook reports `true` and listens to nothing: a finished run cannot fall behind anything.
+ * "at the bottom", threshold and all, rather than a second one that drifts.
+ *
+ * Where the operator has scrolled to is tracked whether following is on or OFF, because `active`
+ * can turn back on: a grep that hides a live run's head stops the follow, and the next poll to
+ * bring in a phase the grep MATCHES turns it on again while growing the page in the same commit.
+ * Observing the position only while active meant that commit had no reading of its own to go on —
+ * the last one was from before the operator scrolled — and the page dragged them to the bottom.
  */
 function useFollowScroll(active: boolean): boolean {
   const [atBottom, setAtBottom] = useState(true);
+  // The same reading as `atBottom`, mirrored into a ref: it is what the growth effect below reads,
+  // so a commit that carries BOTH a scroll reading and the growth acts on the reading rather than
+  // on the value its own render closed over. `hooks/useFollowScroll` mirrors its `following` the
+  // same way and for the same reason. Re-reading the page inside that effect would not do —
+  // after the growth an operator who never moved reads as "not at the bottom", and the legitimate
+  // follow would break.
+  const pinned = useRef(true);
   useEffect(() => {
-    if (!active) {
-      setAtBottom(true);
-      return;
-    }
     const el = pageScroller();
     if (el === null) return;
-    const read = () =>
-      setAtBottom(
-        isAtBottom({
-          scrollTop: el.scrollTop,
-          scrollHeight: el.scrollHeight,
-          clientHeight: el.clientHeight,
-        }),
-      );
-    read();
+    const read = () => {
+      const at = isAtBottom({
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      });
+      pinned.current = at;
+      setAtBottom(at);
+    };
+    // Nothing is read here: the scroll position at mount is the one the PREVIOUS view left in the
+    // document, not a choice the operator made about this run, and `lib/follow-scroll`'s other
+    // consumer opens a live view at its tail for exactly that reason. The first scroll event is
+    // the first thing that speaks for the operator.
     window.addEventListener("scroll", read, { passive: true });
     return () => window.removeEventListener("scroll", read);
-  }, [active]);
+  }, []);
 
   // Checked every render, acted on only when the page actually GREW: a poll that appends a step
   // must not push the newest line off the screen, and every other re-render — a keystroke in the
@@ -885,7 +901,12 @@ function useFollowScroll(active: boolean): boolean {
   useEffect(() => {
     const el = pageScroller();
     if (el === null) return;
-    if (active && atBottom && el.scrollHeight > height.current) scrollToBottom();
+    if (active && pinned.current && el.scrollHeight > height.current) {
+      scrollToBottom();
+      // Where the page now is. A browser confirms it with a scroll event, jsdom never does, and
+      // the next growth must not be decided on a reading that predates this scroll.
+      pinned.current = true;
+    }
     height.current = el.scrollHeight;
   });
   return atBottom;
