@@ -1828,6 +1828,9 @@ interface ReadProgress {
  * run. It costs one poll of "reading it back…", which claims nothing; a read outstanding on a
  * query that DOES hold data was replaced by the post, and its successor is exactly the read this
  * gate is looking for.
+ *
+ * A read that FAILS settles too, and either answer here costs nothing: a failed read is reported
+ * as a failed read by [`emptyNote`], before any note this gate could have chosen.
  */
 function useReadPostdatingMount(room: ReadProgress): boolean {
   // Read on the first render only — the mount, which is when the question landed.
@@ -1881,6 +1884,7 @@ function AskExchange({
   // (see [`useReadPostdatingMount`]). Until one has, the newest data on the key can only be a
   // window from before the question, and its silence about it means nothing — see
   // [`managerReply`], which is what turns that difference into what the dock is allowed to say.
+  // The card is keyed on the question, so this hook's "since the mount" is "since the question".
   const settledSinceAsking = useReadPostdatingMount(room);
   const outcome = useMemo(
     () => managerReply(messages, asked, settledSinceAsking),
