@@ -117,7 +117,7 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
  * That coarseness is why the strip now carries this and nothing beside it. On a healthy tracker
  * the set is very nearly the in-review set — the failed runs are the whole difference — and when
  * BOTH were painted, the honest answer looked like a bug: the same number, twice, two pills apart
- * in different colours (16/16 on the live default page, 24/24 over all 357 rows). The convergence
+ * in different colours (16/16 on the live default page, 27/27 over all 358 rows). The convergence
  * itself is not the defect, and narrowing it to manufacture a difference was tried and withdrawn
  * twice; if the tracker says twelve tickets are parked for review, twelve tickets really are
  * waiting on a human, and the console should say that ONCE. So per David's 2026-09-03 decision
@@ -386,7 +386,7 @@ export function filterConsoleJobs(
  * WHAT THE STRIP ACTUALLY PAINTS IS FOUR OF THESE FIVE. §3 gave the strip a "running / in review /
  * queued / blocked" row of pills and §6 added "Needs you" beside them, which put the operator's
  * question on the strip TWICE: measured over the live listing the two agreed exactly — 16 and 16
- * on the default page, 24 and 24 over all 357 rows, with neither difference set holding a single
+ * on the default page, 27 and 27 over all 358 rows, with neither difference set holding a single
  * ticket. David's 2026-09-03 decision is that the strip asks it ONCE, so `JobsView` no longer
  * renders an in-review pill and "Needs you" is the home's single human-attention flag.
  *
