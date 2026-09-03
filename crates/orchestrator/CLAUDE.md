@@ -136,9 +136,25 @@ the `Orchestrator` struct itself. Concretely:
   the one path that moves post text into a running agent uses `room_operator_wrap`, deliberately NOT
   `message.rs`'s `operator_wrap`, because `from: operator` on a room line is forgeable by any local
   process. Don't add a variant to `Intent`, don't let a key reach an action without going through
-  `find_issue`, and don't "unify" the two wraps. Its live-run relay rides the `stop.rs` seam
+  `find_issue`, and don't "unify" the two wraps. **One reviewed exception exists to the first of
+  those** (STUDIO-731, design record §3.1/§4): `Intent::Answer` is a fifth variant, and it was
+  admissible only because it adds no write power — it resolves to a room reply and returns *before*
+  the `find_issue` gate, so it shares no state-mutating path with the four action intents. That
+  early return is also why it is not a hole in the second rule: `Answer` is a READ, and its scope
+  guard is `TeamScope` inside `teamsknow` applied to every row the gather returned, not the cycle's
+  issue set (which a terminal ticket has already fallen out of — the bug the slice fixes). A sixth
+  variant needs the same argument made afresh; "there is already an exception" is not one.
+  Its live-run relay rides the `stop.rs` seam
   (`Event::TeamsRelay` → `handle_teams_relay`, which reuses `admit_to_mailbox`), so it is not a
   fifth state seam.
+  `teamsanswer.rs` is that fifth outcome's own module — the gather, the DATA-fenced facts block the
+  room prompt carries, and the vet that refuses model prose naming a ticket the team's own records
+  never resolved. Everything it renders is attacker-influenceable (design §9.2: agent memory, room
+  JSONL, GitHub comments), so nothing there is "the daemon's own trusted context" — treat any change
+  that widens what reaches the block, or that trusts a fact inside it, as a security change. It is
+  fed by `teamsknow.rs`'s accessor through `TriageDeps::knowledge`, which is `None` for a daemon
+  with no durable store; that `None` is what keeps every teams-off and `labels`-only prompt
+  byte-identical, so don't make it a `Noop` store instead.
 - **Cross-cutting constants**: `backoff.rs` (retry-cadence math), `telemetry_attrs.rs` (the
   bounded metric-label cardinality contract — project/model/outcome/reason only; never add an
   issue/run/session id here, that's a correctness bug, not a style nit).
