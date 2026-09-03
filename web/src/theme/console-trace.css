@@ -253,5 +253,19 @@
 .rh-console .askdock .g { color: var(--operator); flex: none; }
 .rh-console .askdock .q { flex: 1 1 260px; min-width: 0; font: inherit; font-size: 13px; padding: 7px 10px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r-sm); }
 .rh-console .askdock .q:disabled { opacity: .6; }
-.rh-console .askdock .posted { font-size: 11.5px; color: var(--ok); font-family: var(--mono); }
 .rh-console .askdock .acterr { font-size: 11.5px; color: var(--bad); max-width: 40ch; }
+
+/* STUDIO-733 — the question the dock posted and the manager's room reply to it, read back inline
+   above the dock so the answer is beside the question rather than somewhere in the room feed. */
+.rh-console .askwrap { margin-bottom: 18px; }
+.rh-console .askwrap .askdock { margin-bottom: 0; }
+/* Only when the card is actually above it: the two are one control then, so the dock drops
+   the rounded top corners the card's straight sides would otherwise meet. With nothing asked
+   the dock stands alone and keeps all four. */
+.rh-console .askex + .askdock { border-radius: 0 0 var(--r) var(--r); }
+.rh-console .askex { border: 1px solid var(--line); border-bottom: 0; border-radius: var(--r) var(--r) 0 0; background: var(--panel-2); padding: 11px 14px 12px; }
+.rh-console .askex .qq { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
+.rh-console .askex .qq .lbl { flex: none; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--operator); font-family: var(--mono); }
+.rh-console .askex .qq .qb { min-width: 0; font-size: 12.5px; color: var(--ink); overflow-wrap: anywhere; }
+.rh-console .askex .pending { font-size: 11.5px; color: var(--ink-3); }
+.rh-console .askex .pending .link { font-size: 11.5px; }

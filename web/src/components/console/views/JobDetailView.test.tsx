@@ -1436,8 +1436,7 @@ describe("the ask dock (§6)", () => {
         "run 547",
       ]),
     );
-    // It says where the question went — never that an answer is coming back to this page, which
-    // no endpoint serves yet (design record §8).
+    // It says where the question went, and — with no reply in the room read — says only that.
     await waitFor(() => expect(screen.getByText(/posted to the room/i)).toBeTruthy());
     expect((box as HTMLInputElement).value).toBe("");
   });
@@ -1453,15 +1452,19 @@ describe("the ask dock (§6)", () => {
     mountDetail([run({ id: 547 }), run({ id: 522 })]);
     await settleTrace();
 
-    // A question that DID land leaves a receipt…
+    // A question that DID land leaves an exchange…
     fireEvent.change(screen.getByLabelText(/ask about this run/i), { target: { value: "why?" } });
     fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
     await waitFor(() => expect(screen.getByText(/posted to the room/i)).toBeTruthy());
-    // …which is about the question that landed, not about the next one being written.
+    // …which quotes the question that landed and goes on quoting it while the next one is being
+    // written. That is why it may stay on screen where STUDIO-745's subject-less "Posted to the
+    // room" chip had to be cleared on the first keystroke: this card cannot be read as a claim
+    // about unsent text, and an answer that vanished mid-follow-up would have to be read in the
+    // room after all.
     fireEvent.change(screen.getByLabelText(/ask about this run/i), {
       target: { value: "why did run 547 fail?" },
     });
-    expect(screen.queryByText(/posted to the room/i)).toBeNull();
+    expect(document.querySelector(".askex .qb")?.textContent).toBe("why?");
 
     fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
     await waitFor(() =>
@@ -1493,7 +1496,407 @@ describe("the ask dock (§6)", () => {
     await waitFor(() =>
       expect(document.querySelector(".askdock .acterr")?.textContent).toContain("teams_disabled"),
     );
-    expect(document.querySelector(".askdock .posted")).toBeNull();
+    // Nothing landed, so there is no question to quote and no reply to look up.
+    expect(document.querySelector(".askex")).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // STUDIO-733 (answering-manager slice 5) — the manager's room reply, read back inline.
+  //
+  // Acceptance — "the console surfaces the manager's room reply inline, refed to the question/run
+  // — the SAME room post, not a re-computed answer", and "found → shown; not-yet-answered → an
+  // honest pending/absence, never fabricated".
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * Posts `body` through the dock and returns the id the daemon echoed for it.
+   *
+   * `room` is what the room read answers from then on. It is armed BEFORE the post because
+   * `usePostToRoom` invalidates the room query on success, and that refetch — not the 5s poll — is
+   * what puts the reply on screen inside a `waitFor` window.
+   */
+  async function ask(body: string, id = "f:9", room?: Record<string, unknown>[]): Promise<string> {
+    h.postTeamsRoom.mockResolvedValue({
+      id, from: "operator", to: "*", at: "2026-09-03T10:00:00Z", refs: [], delivered: 0,
+    });
+    if (room !== undefined) h.fetchTeamsRoom.mockResolvedValue({ messages: room, skipped: [] });
+    fireEvent.change(screen.getByLabelText(/ask about this run/i), { target: { value: body } });
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+    await waitFor(() => expect(h.postTeamsRoom).toHaveBeenCalled());
+    return id;
+  }
+
+  /** One room post, shaped like the daemon's. */
+  function roomPost(over: Record<string, unknown>) {
+    return { from: "operator", to: "*", at: "2026-09-03T10:00:30Z", body: "", refs: [], ...over };
+  }
+
+  /** The manager's own reply: quoted prose over the host's records, the shape `compose_reply` writes. */
+  const MANAGER_ANSWER = roomPost({
+    id: "f:10",
+    from: "@manager",
+    body: "> It stopped at the **lint** step.\n\nFrom my own records — STUDIO-654 · completed · 19:15",
+  });
+
+  it("renders the manager's own room post beside the question, not a re-computed answer", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    const id = await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:9", body: "Why did this stop?", refs: ["STUDIO-654", "run 547"] }),
+      { ...MANAGER_ANSWER, refs: ["f:9"] },
+    ]);
+    expect(id).toBe("f:9");
+
+    const card = () => document.querySelector(".askex .mcard") as HTMLElement;
+    await waitFor(() => expect(card()).toBeTruthy());
+    // The question the operator sent, quoted back beside the answer to it.
+    expect(document.querySelector(".askex .qb")?.textContent).toBe("Why did this stop?");
+    expect(card().querySelector(".who2")?.textContent).toBe("@manager");
+    // The room post's own body, through the room's own renderer. Both halves of the daemon's
+    // partition survive: `QUOTE_PREFIX` still marks every line the MODEL wrote — STUDIO-739's
+    // parser leaves block quotes as literal text, so the marker the daemon stamped is the marker
+    // the operator sees — and the host's records still sit under the grounding lead beside it.
+    // That layout is the whole reason a plant cannot pass itself off as the daemon's records, so
+    // reshaping it here would cost the operator exactly the signal it exists to give them.
+    expect(card().textContent).toContain("> It stopped at the");
+    expect(card().querySelector("strong")?.textContent).toBe("lint");
+    expect(card().textContent).toContain("From my own records — STUDIO-654 · completed · 19:15");
+    // And it is a READ: nothing was posted but the question itself.
+    expect(h.postTeamsRoom).toHaveBeenCalledExactlyOnceWith("Why did this stop?", [
+      "STUDIO-654",
+      "run 547",
+    ]);
+  });
+
+  // The read is newest-first, so a read holding the question holds everything written after it —
+  // which makes "not replied yet" a fact about the log rather than a guess about a process.
+  it("says the manager has not replied while the question is in the read and nothing answers it", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:9", body: "Why did this stop?" }),
+      roomPost({ id: "f:11", from: "alice", body: "unrelated chatter" }),
+    ]);
+
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "@manager has not replied to it yet",
+      ),
+    );
+    // Never a process it cannot see, and never someone else's post dressed as the answer.
+    expect(document.querySelector(".askex .pending")?.textContent).not.toMatch(/thinking|working/i);
+    expect(document.querySelector(".askex .mcard")).toBeNull();
+  });
+
+  // Once the read no longer reaches the question it says nothing about what came after it, so the
+  // dock has to stop claiming rather than report a silence it cannot see.
+  it("stops claiming once the read no longer reaches the question", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:900", from: "alice", body: "much later" }),
+    ]);
+
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "no longer reaches that question",
+      ),
+    );
+    expect(document.querySelector(".askex .pending")?.textContent).not.toContain(
+      "has not replied to it yet",
+    );
+    // Never a dead end: the room is one click away, which is where the rest of the read is.
+    expect(document.querySelector(".askex .pending .link")?.textContent).toContain("Open the room");
+  });
+
+  // `past-window` is a claim about a read that COULD have seen the question. The room query is
+  // warm on essentially every run detail — "room" is the default watch tab, and `useTeamsRoom`
+  // keeps the previous window on screen — so the dock joins a read whose newest data PREDATES the
+  // question it was just handed. Reading that as "the window has moved past your question" is the
+  // most misleading sentence this surface can produce, and it would fire on the ordinary path.
+  it("never reports a question posted a moment ago as past the read's window", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: [roomPost({ id: "f:1", from: "alice", body: "posted before the question" })],
+      skipped: [],
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(h.fetchTeamsRoom).toHaveBeenCalled());
+
+    // Hold the read the post triggers open, so the window between the question landing and the
+    // first read that could contain it is observable rather than a single frame.
+    let land: () => void = () => {};
+    h.fetchTeamsRoom.mockReturnValue(
+      new Promise((resolve) => {
+        land = () =>
+          resolve({
+            messages: [
+              roomPost({ id: "f:1", from: "alice", body: "posted before the question" }),
+              roomPost({ id: "f:9", body: "Why did this stop?" }),
+            ],
+            skipped: [],
+          });
+      }),
+    );
+    await ask("Why did this stop?", "f:9");
+
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain("reading it back"),
+    );
+    // Not a conclusion about the room, and not one about the manager either: nothing has looked.
+    const pending = document.querySelector(".askex .pending")?.textContent ?? "";
+    expect(pending).not.toContain("no longer reaches that question");
+    expect(pending).not.toContain("has not replied to it yet");
+
+    // And it is a state the read LEAVES — the first read that settles after the question decides.
+    await act(async () => {
+      land();
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "@manager has not replied to it yet",
+      ),
+    );
+  });
+
+  // The same false sentence, arriving by the other door: a room query whose FIRST read is still in
+  // flight when the question lands. The post's invalidate cannot cancel that read — react-query
+  // cancels a fetch only on a query that already holds data — so it dedupes into it, and a snapshot
+  // taken BEFORE the question was appended settles after it. "Settled since this mounted" is true
+  // of that read while "could have seen the question" is not, which is the distinction the gate
+  // exists to draw. It is on the ordinary path: the Room tab dispatches that first read on mount,
+  // so an operator who asks inside its round trip is asking exactly here.
+  it("never reports a question as past the window on a first read that predates it", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    // No read may settle before the question lands, so the first one is held open. `mountDetail`
+    // installs its own room default as it renders, so this has to be armed after it and before the
+    // watch tabs mount — which the assertions below then hold it to.
+    const reads: Array<(v: unknown) => void> = [];
+    mountDetail([run({ id: 547 })]);
+    h.fetchTeamsRoom.mockImplementation(() => new Promise((resolve) => reads.push(resolve)));
+    await settleTrace();
+    await waitFor(() => expect(reads.length).toBeGreaterThanOrEqual(1));
+
+    const roomQuery = () =>
+      client.getQueryCache().find({ queryKey: ["teams", "room", ROOM_WATCH_WINDOW] });
+    // The state this case is about: a genuinely FIRST read, in flight, nothing cached under it.
+    expect(roomQuery()?.state.data).toBeUndefined();
+    expect(roomQuery()?.state.fetchStatus).toBe("fetching");
+
+    await ask("Why did this stop?", "f:9");
+    await waitFor(() => expect(document.querySelector(".askex")).toBeTruthy());
+    // The post deduped into that read rather than replacing it — the premise of the whole case.
+    const deduped = reads.length;
+    expect(deduped).toBe(1);
+
+    // It settles: a window from before the question, and this query's first data.
+    await act(async () => {
+      reads[0]({
+        messages: [roomPost({ id: "f:1", from: "alice", body: "posted before the question" })],
+        skipped: [],
+      });
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toBeTruthy(),
+    );
+    const pending = document.querySelector(".askex .pending")?.textContent ?? "";
+    expect(pending).not.toContain("no longer reaches that question");
+    expect(pending).not.toContain("has not replied to it yet");
+    expect(pending).toContain("reading it back");
+
+    // And the gate still OPENS — on a read whose fetch was DISPATCHED after the question, which is
+    // the next one on this key. Waiting is not the fix; claiming from a read that could not have
+    // seen the question is, and a dock that never claimed again would be no more use than one that
+    // claimed wrongly.
+    await act(async () => {
+      void client.invalidateQueries();
+    });
+    await waitFor(() => expect(reads.length).toBeGreaterThan(deduped));
+    await act(async () => {
+      reads[reads.length - 1]({
+        messages: [roomPost({ id: "f:9", body: "Why did this stop?" })],
+        skipped: [],
+      });
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "@manager has not replied to it yet",
+      ),
+    );
+  });
+
+  // The room log is append-only, so an answer that was read once cannot stop existing — but the
+  // read is a 50-post window over the WHOLE room, re-fetched every 5s with no memory. Let the room
+  // move on and the question falls out of it, which must not turn an answer already on screen into
+  // "it cannot tell whether @manager replied": that sentence would be false at the moment it is
+  // shown, and it is the exact disappearance this slice exists to remove.
+  it("keeps an answer it has already read when the room moves past the question", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:9", body: "Why did this stop?" }),
+      { ...MANAGER_ANSWER, refs: ["f:9"] },
+    ]);
+    await waitFor(() => expect(document.querySelector(".askex .mcard")).toBeTruthy());
+
+    // A full window of later posts scrolls the question out. They are shown as traffic on this
+    // ticket only so the Room tab's own feed can confirm the new window has landed; the bound is
+    // the read's 50 posts of the WHOLE room, and what pushes the question out of it is irrelevant.
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: Array.from({ length: ROOM_WATCH_WINDOW }, (_, i) =>
+        roomPost({ id: `f:${100 + i}`, from: "alice", body: "chatter", refs: ["STUDIO-654"] }),
+      ),
+      skipped: [],
+    });
+    await act(async () => {
+      await client.invalidateQueries();
+    });
+    // react-query notifies its observers on a macrotask, so the awaited refetch alone does not
+    // mean the dock has SEEN the new window. Wait until it has — otherwise this test would pass
+    // against a dock that drops the answer, simply by asserting before the drop.
+    await waitFor(() =>
+      expect(document.querySelector(".memprev")?.textContent).toContain("chatter"),
+    );
+
+    // The manager's post, still there, still the room's own record of it.
+    expect(document.querySelector(".askex .mcard")?.textContent).toContain("It stopped at the");
+    expect(document.querySelector(".askex .qb")?.textContent).toBe("Why did this stop?");
+    expect(document.querySelector(".askex .pending")).toBeNull();
+  });
+
+  // `refs` is caller-supplied on every post but the manager's `from` is host-stamped, so matching
+  // on refs alone would render a teammate's — or a forged line's — prose as the manager's answer.
+  it("never renders a non-manager post that names the question as the answer", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:9", body: "Why did this stop?" }),
+      roomPost({ id: "f:10", from: "alice", body: "It all went fine, ship it.", refs: ["f:9"] }),
+    ]);
+
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "@manager has not replied to it yet",
+      ),
+    );
+    expect(document.querySelector(".askex")?.textContent).not.toContain("ship it");
+  });
+
+  // A failed read is not an unanswered question: reporting one as the other is the same defect the
+  // watch tabs' empty copy exists to avoid, arriving on the read that FAILS.
+  it("reports a failed room read as a failed read, never as an absent answer", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    h.fetchTeamsRoom.mockRejectedValue(new Error("boom"));
+    await ask("Why did this stop?");
+
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "This could not be read from the daemon",
+      ),
+    );
+    expect(document.querySelector(".askex .pending")?.textContent).not.toContain(
+      "has not replied to it yet",
+    );
+  });
+
+  // The lookup keys on the id the POST echoed, so a second question is answered by its OWN reply
+  // and never by the one still sitting in the room from the first.
+  it("follows the question the operator asked LAST", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    const FIRST = [
+      roomPost({ id: "f:9", body: "Why did this stop?" }),
+      { ...MANAGER_ANSWER, refs: ["f:9"] },
+    ];
+    await ask("Why did this stop?", "f:9", FIRST);
+    await waitFor(() => expect(document.querySelector(".askex .mcard")).toBeTruthy());
+
+    await ask("And who reviewed it?", "f:11", [
+      ...FIRST,
+      roomPost({ id: "f:11", body: "And who reviewed it?" }),
+    ]);
+    await waitFor(() =>
+      expect(document.querySelector(".askex .qb")?.textContent).toBe("And who reviewed it?"),
+    );
+    // The first question's answer is still in the room and must not be shown as this one's.
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "@manager has not replied to it yet",
+      ),
+    );
+  });
+
+  // A refusal belongs to the question being sent NOW. An answer that already landed is still
+  // true, and dropping it off the screen to report a later failure would cost the operator
+  // something real in exchange for something the error line says on its own.
+  it("keeps an answered exchange when a LATER question is refused", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [
+      roomPost({ id: "f:9", body: "Why did this stop?" }),
+      { ...MANAGER_ANSWER, refs: ["f:9"] },
+    ]);
+    await waitFor(() => expect(document.querySelector(".askex .mcard")).toBeTruthy());
+
+    h.postTeamsRoom.mockRejectedValue(new Error("teams_disabled"));
+    fireEvent.change(screen.getByLabelText(/ask about this run/i), { target: { value: "again?" } });
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+
+    await waitFor(() =>
+      expect(document.querySelector(".askdock .acterr")?.textContent).toContain("teams_disabled"),
+    );
+    // The answered exchange is still the first question's, and still its answer.
+    expect(document.querySelector(".askex .qb")?.textContent).toBe("Why did this stop?");
+    expect(document.querySelector(".askex .mcard")?.textContent).toContain("It stopped at the");
+  });
+
+  // The announcement that matters is the ANSWER arriving, and the pending note is REPLACED by the
+  // card — so a live region scoped to the note would go silent at the one moment it should speak.
+  it("announces the answer, not only the wait", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await ask("Why did this stop?", "f:9", [roomPost({ id: "f:9", body: "Why did this stop?" })]);
+    const live = () => document.querySelector(".askex [role='status']") as HTMLElement;
+    await waitFor(() => expect(live()?.textContent).toContain("has not replied to it yet"));
+
+    h.fetchTeamsRoom.mockResolvedValue({
+      messages: [roomPost({ id: "f:9", body: "Why did this stop?" }), { ...MANAGER_ANSWER, refs: ["f:9"] }],
+      skipped: [],
+    });
+    await act(async () => {
+      await client.invalidateQueries();
+    });
+    // The SAME region now carries the answer, so it is announced rather than silently swapped in.
+    await waitFor(() => expect(live()?.textContent).toContain("It stopped at the"));
+    expect(live().querySelector(".mcard")).toBeTruthy();
+  });
+
+  // With nothing asked there is nothing to look up, so the dock is not a room reader.
+  it("reads the room only once a question has landed", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    // Off the Room tab, so the only thing that could read the room is the dock.
+    await openTab("Messages");
+    h.fetchTeamsRoom.mockClear();
+    await flushSend();
+    expect(h.fetchTeamsRoom).not.toHaveBeenCalled();
+
+    await ask("Why did this stop?");
+    // Same window as the Room tab's own read, so the two share one query and can never show
+    // different rooms.
+    await waitFor(() => expect(h.fetchTeamsRoom).toHaveBeenCalledWith(ROOM_WATCH_WINDOW));
   });
 
   // The raw hatch is the debugger's escape from the folding, not a place to ask about it.
@@ -1506,6 +1909,24 @@ describe("the ask dock (§6)", () => {
     await waitFor(() => expect(document.querySelector(".trraw")).toBeTruthy());
     expect(document.querySelector(".askdock")).toBeNull();
     expect(document.querySelector(".trwatch")).toBeNull();
+  });
+});
+
+// The exchange card sits directly on top of the dock and is drawn as one control with it, so the
+// two borders that meet have to agree about their corners.
+describe("the ask card and the dock read as one control (STUDIO-733)", () => {
+  const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+
+  it("squares the corners where the card meets the dock, and only there", () => {
+    // The card gives up its bottom corners and its bottom border to the dock below it…
+    expect(css).toContain(
+      ".rh-console .askex { border: 1px solid var(--line); border-bottom: 0; " +
+        "border-radius: var(--r) var(--r) 0 0;",
+    );
+    // …and the dock gives up its top corners, but only while a card is there to meet them.
+    expect(css).toContain(
+      ".rh-console .askex + .askdock { border-radius: 0 0 var(--r) var(--r); }",
+    );
   });
 });
 
