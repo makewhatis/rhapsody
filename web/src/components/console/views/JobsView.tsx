@@ -258,38 +258,25 @@ function JobsRow({
 // serve it — would let every row draw its strip on load with no extra request at all.
 function TraceSpark({ runId, live, armed }: { runId: number; live: boolean; armed: boolean }) {
   // `inFlight: false` even for a live run: a worklist strip is a preview, not a stream, and a
-  // per-row 1.5s poll of a 30KB transcript is exactly the cost this component exists to avoid. The
-  // playhead says the run is still going; the run detail is where it is watched.
+  // per-row 1.5s poll of a 30KB transcript is exactly the cost this component exists to avoid. So
+  // a live row's strip is a SNAPSHOT taken when it was armed and does not grow as the run does —
+  // the playhead says the run is still going, and the run detail is where it is watched.
   const transcript = useTranscript(runId, false, armed && runId > 0);
   const steps = useMemo(
     () => traceSpark(buildTrace(transcript.data?.entries ?? []).phases, live),
     [transcript.data, live],
   );
 
+  // Every state is a labelled `role="img"`, the strip included: the cell's content is glyphs and
+  // ellipses either way, so the label is the only thing a screen reader can usefully announce.
   // Persistence off: there is no run row and so no transcript to read one from.
-  if (runId <= 0) return <span className="spark idle" title="No stored run">—</span>;
-  if (!armed) {
-    return (
-      <span className="spark idle" title="Point at this row to preview its trace">
-        ···
-      </span>
-    );
-  }
-  if (transcript.isPending) {
-    return (
-      <span className="spark idle" aria-busy="true" title="Reading the transcript…">
-        ···
-      </span>
-    );
-  }
+  if (runId <= 0) return <SparkNote label="No stored run" text="—" />;
+  if (!armed) return <SparkNote label="Trace — rest here to preview this run" text="···" />;
+  if (transcript.isPending) return <SparkNote label="Reading the transcript…" text="···" busy />;
   // A transcript the daemon could not serve, and a run that logged nothing, are both "no shape to
   // show" — never an invented one.
   if (steps.length === 0) {
-    return (
-      <span className="spark idle" title={transcript.isError ? "Transcript unavailable" : "No trace"}>
-        —
-      </span>
-    );
+    return <SparkNote label={transcript.isError ? "Transcript unavailable" : "No trace"} text="—" />;
   }
 
   const summary = sparkSummary(steps);
@@ -300,6 +287,15 @@ function TraceSpark({ runId, live, armed }: { runId: number; live: boolean; arme
           {step.glyph}
         </span>
       ))}
+    </span>
+  );
+}
+
+/** The strip's one-line states — unread, loading, and the two kinds of "nothing to show". */
+function SparkNote({ label, text, busy }: { label: string; text: string; busy?: boolean }) {
+  return (
+    <span className="spark idle" role="img" aria-label={label} title={label} aria-busy={busy}>
+      {text}
     </span>
   );
 }

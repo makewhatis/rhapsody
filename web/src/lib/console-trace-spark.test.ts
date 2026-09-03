@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LogEntry } from "@/lib/api";
 import { buildTrace } from "@/lib/trace-model";
 import { phaseGlyph } from "@/lib/console-trace-view";
-import { SPARK_KINDS, sparkSummary, traceSpark } from "@/lib/console-trace-spark";
+import { LIVE_GLYPH, SPARK_KINDS, sparkSummary, traceSpark } from "@/lib/console-trace-spark";
 
 // The Jobs worklist's trace sparkline (STUDIO-743, design record §6) — the glance-view half of
 // the vocabulary the run-detail spine speaks. Built over the SAME slice-1 phases the spine
@@ -76,6 +76,10 @@ describe("traceSpark", () => {
 
   it("is empty — never a fabricated shape — when there is no transcript", () => {
     expect(traceSpark([], false)).toEqual([]);
+  });
+
+  it("keeps the playhead apart from every phase glyph, not just apart by colour", () => {
+    expect(SPARK_KINDS.map(phaseGlyph)).not.toContain(LIVE_GLYPH);
   });
 
   it("covers every phase kind the model can produce", () => {

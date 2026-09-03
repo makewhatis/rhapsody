@@ -114,8 +114,8 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
  *
  * `blocked` qualifies only when it is a FAILED run. The other thing that reads blocked is a held
  * dependent (`runs-model`'s synthetic `waiting` row), and that one is waiting on its predecessor
- * rather than on the operator — a predecessor which is itself a row in this same worklist, and is
- * counted there. Counting the dependent too would bill one human decision twice.
+ * rather than on the operator. If that predecessor needs a human it is counted on its OWN row;
+ * counting the dependent as well would bill one human decision twice.
  *
  * Takes the run status as a plain string for the reason `fromRunOutcome` does: `JobRow.status` is
  * the wider `StatusKey`, and narrowing it with a cast would hide the case this has to survive.

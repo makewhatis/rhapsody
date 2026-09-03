@@ -27,8 +27,15 @@ import type { PhaseKind, TracePhase } from "@/lib/trace-model";
 // a signal. The run's OUTCOME is the honest one and the adjacent Status pill already carries it,
 // so the strip stays about shape alone.
 
-/** The playhead. Not a phase — the run has not finished the step it is on. */
-const LIVE_GLYPH = "●";
+/**
+ * The playhead. Not a phase — the run has not finished the step it is on.
+ *
+ * The prototype draws it as a filled disc, which is a hair away from `other`'s bullet at the 11px
+ * this cell renders at; the difference would then be carried by the teal tint alone, which is a
+ * colour-only distinction. A play head says the same thing and is unmistakable, and the test below
+ * holds it apart from every phase glyph.
+ */
+export const LIVE_GLYPH = "▶";
 
 /**
  * The phase kinds a strip may show, in the spine's declaration order (`trace-model`'s

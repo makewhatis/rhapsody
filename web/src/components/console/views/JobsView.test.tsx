@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueRun, StateResponse } from "@/lib/api";
+import { phaseGlyph } from "@/lib/console-trace-view";
 
 // STUDIO-681 §10, sub-ticket 2 — the Jobs worklist's acceptance boxes 2.6, 2.7 and 2.8,
 // driven through the real view against the endpoints §9 has: /api/v1/state for the live
@@ -35,8 +36,6 @@ vi.mock("@/lib/api", async (orig) => {
     postRefresh: vi.fn(async () => {}),
   };
 });
-
-import { phaseGlyph } from "@/lib/console-trace-view";
 
 const { JobsView } = await import("./JobsView");
 
@@ -503,6 +502,39 @@ describe("the row trace-sparkline (§6)", () => {
     await waitFor(() =>
       expect(row("A-1").querySelector(".spark")?.textContent).toBe("—"),
     );
+  });
+
+  // A held dependent is a synthetic row with no run behind it (`mergeJobs` gives it runId 0), so
+  // there is no transcript to read and the cell must say so rather than sit on a spinner.
+  it("says so, and asks for nothing, on a row that has never run", async () => {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      blocked: [
+        {
+          issue_identifier: "HELD",
+          title: "HELD title",
+          project: "rhapsody",
+          blocker_identifier: "C",
+          blocker_state: "In Review",
+          mode: "dag",
+        },
+      ],
+    });
+    h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+    await waitFor(() => expect(rowKeys()).toEqual(["HELD"]));
+
+    fireEvent.focus(row("HELD"));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(row("HELD").querySelector(".spark")?.textContent).toBe("—");
+    expect(h.fetchRunTranscript).not.toHaveBeenCalled();
   });
 
   it("marks a live run with the playhead", async () => {
