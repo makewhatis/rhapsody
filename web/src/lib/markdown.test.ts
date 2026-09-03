@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { inlineText, parseMarkdown, safeHref, type MdBlock } from "@/lib/markdown";
+import { parseMarkdown, safeHref, type MdBlock, type MdInline } from "@/lib/markdown";
 
 // STUDIO-739 — the agent-prose markdown subset. Agents write handoffs and self-reviews in
 // markdown, so the transcript, the room and memory all carry it; these pin the subset the
 // renderer promises (headings, emphasis, code, lists, links) and the two things that make it
 // safe to render agent-authored text: no markup escapes as HTML, and no non-http scheme
 // becomes a link.
+
+/** The plain text of an inline run — the parser ships no such helper, so the tests own one. */
+function inlineText(nodes: readonly MdInline[]): string {
+  return nodes
+    .map((node) => (node.type === "text" || node.type === "code" ? node.text : inlineText(node.children)))
+    .join("");
+}
 
 /** The first block, for the many single-block cases below. */
 function one(src: string): MdBlock {
@@ -195,6 +202,17 @@ describe("safeHref", () => {
 });
 
 describe("parseMarkdown — long input", () => {
+  // A hand-off summary is big, and the parse happens on the thread that draws the transcript.
+  // The shape below is the one that used to be quadratic: every `*` opens emphasis whose every
+  // candidate closer is preceded by a space, so each opener re-scanned the whole tail (59KB
+  // took 2.8s before the closer memo).
+  it("does not degrade on prose full of unclosed emphasis", () => {
+    const src = "a *b ".repeat(20_000);
+    const started = Date.now();
+    parseMarkdown(src);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it("stays linear on a big transcript body", () => {
     const src = Array.from({ length: 2000 }, (_, i) => `- item ${i} with **bold** and \`code\``).join(
       "\n",

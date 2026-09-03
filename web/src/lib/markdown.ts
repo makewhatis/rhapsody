@@ -58,21 +58,6 @@ export function safeHref(href: string): string | null {
   return SAFE_SCHEME.test(trimmed) ? trimmed : null;
 }
 
-/** The plain text of an inline run — what a body reads as with every marker resolved. */
-export function inlineText(nodes: readonly MdInline[]): string {
-  return nodes
-    .map((node) => {
-      switch (node.type) {
-        case "text":
-        case "code":
-          return node.text;
-        default:
-          return inlineText(node.children);
-      }
-    })
-    .join("");
-}
-
 // --- blocks -------------------------------------------------------------------------------
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)/;
@@ -201,8 +186,17 @@ const ESCAPABLE = /[\\`*_[\]()#+\-.!>~|]/;
 const WORD = /[\p{L}\p{N}]/u;
 const LINK = /^\[([^\]]*)\]\(([^()\s]*)\)/;
 
-/** Parses one run of inline text. Exported for the renderer's own unit tests. */
-export function parseInline(source: string): MdInline[] {
+/**
+ * Parses one run of inline text.
+ *
+ * `scanned` is what keeps this linear on a long body: a closer is rejected only for reasons
+ * that depend on the closer's own position (the character before it, and after it for `_`), so
+ * a candidate one opener has already rejected is rejected for every later opener too. Without
+ * the memo, prose shaped like `a *b a *b …` makes every opener re-scan the whole tail — 59KB of
+ * it took 2.8 seconds, on the thread that draws the transcript.
+ */
+function parseInline(source: string): MdInline[] {
+  const scanned = new Map<string, number>();
   const out: MdInline[] = [];
   let text = "";
   const flush = () => {
@@ -251,7 +245,7 @@ export function parseInline(source: string): MdInline[] {
     }
 
     if (ch === "*" || ch === "_") {
-      const span = matchEmphasis(source, i);
+      const span = matchEmphasis(source, i, scanned);
       if (span) {
         flush();
         out.push(span.node);
@@ -300,6 +294,7 @@ function matchCode(source: string, start: number): { text: string; end: number }
 function matchEmphasis(
   source: string,
   start: number,
+  scanned: Map<string, number>,
 ): { node: MdInline; end: number } | null {
   const delim = source[start];
   let open = start;
@@ -312,14 +307,20 @@ function matchEmphasis(
   const first = source[start + run];
   if (first === undefined || /\s/.test(first)) return null;
 
-  let from = start + run;
+  // Everything below `scanned` was already rejected as a closer for this marker.
+  let from = Math.max(start + run, scanned.get(marker) ?? 0);
   for (;;) {
     const close = source.indexOf(marker, from);
-    if (close === -1 || close === start + run) return null;
+    if (close === -1) {
+      scanned.set(marker, source.length);
+      return null;
+    }
+    if (close === start + run) return null;
     const prev = source[close - 1];
     const after = source[close + run] ?? "";
     if (/\s/.test(prev) || (delim === "_" && after !== "" && WORD.test(after))) {
       from = close + 1;
+      scanned.set(marker, from);
       continue;
     }
     const children = parseInline(source.slice(start + run, close));

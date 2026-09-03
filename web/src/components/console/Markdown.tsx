@@ -45,8 +45,10 @@ function Block({ block, lead }: { block: MdBlock; lead?: ReactNode }) {
       // The wide-content rule (STUDIO-681): the block scrolls inside its own box so the page
       // body never scrolls sideways. `data-lang` records the fence's language for a later
       // highlighter without claiming one now.
+      // `tabIndex` is what makes the scroll reachable without a mouse: a scrollable region that
+      // cannot take focus cannot be scrolled from the keyboard at all.
       return (
-        <pre className="mdpre" data-lang={block.lang === "" ? undefined : block.lang}>
+        <pre className="mdpre" tabIndex={0} data-lang={block.lang === "" ? undefined : block.lang}>
           <code className="mdcode">{block.text}</code>
         </pre>
       );

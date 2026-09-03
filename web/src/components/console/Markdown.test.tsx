@@ -49,6 +49,8 @@ describe("Markdown", () => {
     const pre = container.querySelector("pre.mdpre");
     expect(pre?.textContent).toBe("make lint");
     expect(pre?.querySelector("code")?.className).toContain("mdcode");
+    // A scrollable box that cannot take focus cannot be scrolled from the keyboard.
+    expect(pre?.getAttribute("tabindex")).toBe("0");
     // The box scrolls, not the page — STUDIO-681's discipline for wide content.
     expect(css).toMatch(/\.md pre\.mdpre\s*\{[^}]*overflow-x:\s*auto/);
     expect(css).toMatch(/\.md pre\.mdpre\s*\{[^}]*font-family:\s*var\(--mono\)/);
