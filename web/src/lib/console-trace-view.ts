@@ -253,7 +253,7 @@ function plainLead(source: string): string {
     .trim();
 }
 
-/** How many sentence boundaries of a lead are worth testing against the headline. */
+/** How many of a lead's boundaries — sentence ends, and line breaks — are worth testing. */
 const LEAD_SENTENCE_SCAN = 8;
 
 /**
@@ -263,8 +263,8 @@ const LEAD_SENTENCE_SCAN = 8;
  * only when the lead is exactly one sentence long. The far commoner real shape is "the headline,
  * and then more" — measured over the 441 recorded runs, requiring whole-lead equality left 184 of
  * them (41.7%) printing their own H1 again immediately under it. So the sentence PREFIX that
- * produced the headline is dropped and the rest kept, and a lead the headline already contains
- * whole is dropped entirely.
+ * produced the headline is dropped and the rest kept, and a lead an UNCLIPPED headline already
+ * contains whole is dropped entirely.
  *
  * Both comparisons run the lead through the STUDIO-739 renderer's own inline parse — the same pass
  * the headline went through — so a lead of `Photo attachment **shipped**.` is recognised as the
