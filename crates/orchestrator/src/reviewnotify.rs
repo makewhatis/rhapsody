@@ -290,6 +290,14 @@ impl Orchestrator {
     ///
     /// The verdict is NOT a gate. An approved round is notified too — with a deliberately tokenless
     /// comment (see the module docs), which is the documented no-op rather than a missing one.
+    ///
+    /// **Where the trusted origin comes from (§14.1 F-SEC).** Posting as the daemon on an arbitrary
+    /// repository would be a new way out of the trust boundary, so this path deliberately re-derives
+    /// nothing: the coordinates are copied from the [`ReviewRun`], which reaches a running entry
+    /// ONLY through [`Orchestrator::dispatch_review`], which refuses any `repo_url` no enabled
+    /// project owns. The comment can therefore only ever land on a repository this daemon is
+    /// configured for, and it inherits that property structurally rather than re-checking it — a
+    /// second allowlist here could disagree with the first, which is worse than one.
     pub(crate) fn plan_review_notify(
         &self,
         run: &ReviewRun,
