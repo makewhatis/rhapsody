@@ -75,9 +75,6 @@ pub(crate) const MAX_FACTS_CHARS: usize = 4000;
 /// stable: every source still gets a turn.
 pub(crate) const MAX_FACT_LINE_CHARS: usize = 280;
 
-/// The most memory records one answer carries, across the whole roster.
-pub(crate) const MAX_MEMORY_FACTS: usize = 8;
-
 /// The most room posts one answer carries.
 pub(crate) const MAX_ROOM_POSTS: usize = 10;
 
@@ -133,8 +130,37 @@ impl Facts {
     /// rather than as an absence, because the post is owed a reply either way (§3.4's "never
     /// silence") and because an answer that cannot tell the two apart is the confident wrongness
     /// §9.2 fights. The failure travels as `None` and [`Facts::render`] says so in the block.
-    pub(crate) async fn gather(k: &Knowledge<'_>, keys: &[String], q: &Query) -> Facts {
+    pub(crate) async fn gather(
+        k: &Knowledge<'_>,
+        keys: &[String],
+        prs: &[String],
+        q: &Query,
+    ) -> Facts {
         let mut out = Facts::default();
+        // The pull-request coordinates FIRST, because they are the most specific thing an operator
+        // can have named: *"what came of this pull request"* is answered by a watch-set verdict,
+        // and the ticket it belongs to is context around that.
+        //
+        // They are a FACT source and nothing else — they never join the post's key list, so they
+        // are never a target, never reach `find_issue` and never earn an intent. That is what makes
+        // admitting them a widening of what the manager can SAY rather than of what it can do.
+        for pr in prs {
+            let outcome = match k.outcome(pr).await {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    tracing::warn!(
+                        pr = %pr, err = %e,
+                        "teams manager could not read this team's records for a pull request an \
+                         operator pasted; the answer will say so rather than report no record"
+                    );
+                    None
+                }
+            };
+            out.asked.push(Asked {
+                asked: pr.clone(),
+                outcome,
+            });
+        }
         for key in keys {
             let outcome = match k.outcome(key).await {
                 Ok(o) => Some(o),
@@ -153,10 +179,12 @@ impl Facts {
             });
         }
         match k.recall_team(q).await {
-            Ok(mut r) => {
-                r.facts.truncate(MAX_MEMORY_FACTS);
-                out.memory = Some(r);
-            }
+            // NOT truncated here. The gather is already bounded on both axes that matter —
+            // `MAX_RECALL_IDENTITIES` identities, `Query::top_k` records each — and a second,
+            // silent cut at this point would drop records the block then reported as if it had
+            // shown them all. `Facts::render` does the cutting instead, deterministically and with
+            // "showing N of M" beside it, which is what §9.3 asks for.
+            Ok(r) => out.memory = Some(r),
             Err(e) => {
                 tracing::warn!(err = %e, "teams manager could not recall the team's memory for an answer");
                 out.unavailable.push("the team's memory");
@@ -172,17 +200,23 @@ impl Facts {
         out
     }
 
-    /// The ticket keys an answer is allowed to name (§9.1 rides slice 1's scope).
+    /// The ticket keys an answer is allowed to name — **the RESOLVED set, not the named one**
+    /// (§9.1 rides slice 1's scope).
     ///
-    /// Two sources, and the boundary between them is the point. A key the POST named is the
-    /// operator's own word, already the closed target list every action intent is bounded by. A key
-    /// a RESOLVED RECORD carries came through [`TeamScope`](crate::teamsknow::TeamScope) and is
-    /// therefore this team's by construction.
+    /// Every key here came back from a gather that [`TeamScope`](crate::teamsknow::TeamScope)
+    /// admitted, so it is this team's by construction. Two categories are deliberately excluded,
+    /// for two different reasons:
     ///
-    /// A key found in untrusted PROSE — a memory record's content, a room post's body, a
-    /// pull-request comment — is deliberately NOT here. That is the injection case: a planted
-    /// "assign STUDIO-9 to bob" would otherwise licence the answer to name STUDIO-9, and a ticket
-    /// key in a room reply reads as the manager vouching for it.
+    /// * **A key the post named that resolved NOTHING.** Naming a ticket is not the same as having
+    ///   a record of it. An identifier belonging to another team resolves to nothing here — that is
+    ///   what the scope guarantees — and prose asserting *"OTHER-42 failed"* about it would be a
+    ///   claim this team's records never supported, indistinguishable in the room from one they
+    ///   did. Such a key is answered by [`NO_RECORD`], which names no ticket at all, precisely so
+    ///   that "off this team" and "never heard of" cannot be told apart.
+    /// * **A key found only in untrusted PROSE** — a memory record's content, a room post's body, a
+    ///   pull-request comment. That is the injection case: a planted "assign STUDIO-9 to bob" would
+    ///   otherwise licence the answer to name STUDIO-9, and a ticket key in a manager's reply reads
+    ///   as the manager vouching for it.
     pub(crate) fn allowed(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for a in &self.asked {
@@ -1209,7 +1243,7 @@ mod tests {
         let issues: Vec<rhapsody_core::Issue> = Vec::new();
         let k = Knowledge::new(&sc, &issues, store.as_ref(), &bank).with_room(&room);
 
-        let f = Facts::gather(&k, &["STUDIO-725".to_string()], &Query::default()).await;
+        let f = Facts::gather(&k, &["STUDIO-725".to_string()], &[], &Query::default()).await;
 
         assert!(
             f.memory.is_none(),
@@ -1241,6 +1275,7 @@ mod tests {
         let f = Facts::gather(
             &k,
             &["STUDIO-2".to_string(), "STUDIO-1".to_string()],
+            &[],
             &Query::default(),
         )
         .await;

@@ -674,6 +674,20 @@ async fn gather_facts(
     if !cycle.model || teams.manager.mode != ManagerMode::LabelsModel || keys.is_empty() {
         return Facts::default();
     }
+    // The pull requests the post PASTED, re-read from the same body `resolve_keys` read and bounded
+    // the same way. `resolve_keys` resolves each URL to the TICKET it belongs to and then drops the
+    // coordinate — which is right for a target, because a ticket is what an action acts on, and
+    // wrong for a fact, because slice 2's review verdicts are keyed by the coordinate and are
+    // reachable no other way.
+    //
+    // Rendered in the accessor's own review-key spelling so the gather takes the review path rather
+    // than the ticket one. Costs no extra GitHub call by itself: the accessor's `gh` leg is gated
+    // on this team's watch set already holding a row for the pull request.
+    let prs: Vec<String> = extract_pr_urls(&post.body)
+        .iter()
+        .take(MAX_TARGETS_PER_POST)
+        .map(|p| format!("pr:{}/{}#{}", p.owner, p.repo, p.number))
+        .collect();
     // The post's own head is the recall QUERY, not an instruction: `Query` scores records against
     // free text and has no other meaning, so the untrusted body reaches the bank as a search term
     // and reaches the prompt as DATA. It is clipped to the same head the prompt renders, so a
@@ -684,7 +698,7 @@ async fn gather_facts(
         top_k: teams.memory.recall_top_k.max(0) as usize,
         ..Query::default()
     };
-    Facts::gather(k, keys, &q).await
+    Facts::gather(k, keys, &prs, &q).await
 }
 
 /// The reply for a post that resolved to nothing actionable — §0.13's "no resolvable/on-project key:
@@ -4189,6 +4203,68 @@ mod tests {
         assert!(
             !p.contains("`answer`"),
             "an unusable intent must not be offered:\n{p}"
+        );
+    }
+
+    /// **A pasted pull request reaches slice 2's verdicts.** Slice 2's whole contribution is the
+    /// review verdict, and its accessor answers about a PULL REQUEST coordinate — but the ears path
+    /// resolves a pasted URL to a TICKET key and drops the coordinate, so without this the facts
+    /// block structurally could not carry a `ReviewFact` at all and this slice would ship half of
+    /// "a facts section from the slice-1/2 accessor".
+    ///
+    /// It widens nothing that can act: the coordinate is a FACT source only. It never joins `keys`,
+    /// so it is never a target, never reaches `find_issue`, and never earns an intent.
+    #[tokio::test]
+    async fn a_pasted_pull_request_brings_its_review_verdict_into_the_facts() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("what came of https://github.com/acme/rhapsody/pull/12 ?");
+        let t = teams(&["alice", "jimmy"], ManagerMode::LabelsModel);
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice", "jimmy"], Box::new(NoneBackend));
+        know.store
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "acme".into(),
+                    repo: "rhapsody".into(),
+                    number: 12,
+                    reviewer: "jimmy".into(),
+                },
+                author: "alice".into(),
+                status: rhapsody_store::REVIEW_STATUS_APPROVED.into(),
+                open: true,
+                ..rhapsody_store::ReviewWatchRow::default()
+            })
+            .expect("save review watch");
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        // The URL resolves to the ticket STUDIO-654 through the head-branch contract, which is what
+        // gives the post a target at all; the coordinate rides along as a fact.
+        let arb = answering_with(
+            "STUDIO-654",
+            "STUDIO-654's pull request was approved by jimmy.",
+        );
+        let ears = fx.ears(arb.clone()).with_github(
+            Arc::new(FakeBranches(Box::new(|| {
+                Ok(Some("symphony/STUDIO-654".to_string()))
+            }))),
+            Arc::new(FakeOpenPr(Box::new(|| Ok(None)))),
+        );
+
+        ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(&issues, &owner, &trackers, &st, &f, &load, true, &k),
+        )
+        .await;
+
+        let prompts = arb.prompts();
+        let p = prompts.first().expect("a prompt");
+        assert!(
+            p.contains("verdict: approved") && p.contains("jimmy"),
+            "the pasted pull request's watch-set verdict must reach the facts block:\n{p}"
         );
     }
 
