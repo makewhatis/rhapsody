@@ -1,22 +1,19 @@
 // The Job-detail model — STUDIO-681 §4, built by STUDIO-683.
 //
-// Everything one ticket's page shows, derived from `GET /api/v1/issues/<KEY>/history` (the run
-// rows) and `GET /api/v1/runs/<id>/transcript` (a run's humanized timeline). Both are existing
-// endpoints; §9 maps this view to exactly them.
+// What survives of it. STUDIO-742 rebuilt the run detail into the "Trace" three zones, and the
+// summary strip, the run `.rmeta` line, the run one-liner and the flat §4 timeline that this
+// module served went with the view that showed them (`buildJobSummary`, `runMeta`,
+// `runDescription`, `transcriptTimeline`) — the zones read `lib/trace-model` and
+// `lib/console-trace-view` instead. What is left is what the new view still asks of this module:
+// the run ordering, the local clock time, a run's own outcome Pill, and the §4 pull-request card's
+// model.
 //
-// DEPENDENCY (§9/§11): two of §4's fields have no daemon source and are NOT invented here.
-//   - Run KIND (implement / review / rebase / …) — `store::RunSummary` records `outcome` and
-//     `attempt`, never a kind. The run row labels itself by outcome instead.
-//   - The PULL REQUEST — no endpoint serves a PR number, its checks or its mergeability. The
-//     card below renders from a `PullRequestView` a caller supplies; the app has no such caller
-//     yet and shows the dependency in its place rather than fabricating a PR.
-import { formatTokens, runDuration } from "@/lib/format";
-import type { LogEntry, RunSummary } from "@/lib/api";
-import { CONSOLE_STATUS_LABELS, consoleJobStatus, relativeSince } from "@/lib/console-jobs";
+// DEPENDENCY (§9/§11): the PULL REQUEST has no daemon source and is NOT invented here — no
+// endpoint serves a PR number, its checks or its mergeability. The card below renders from a
+// `PullRequestView` a caller supplies; the app has no such caller yet and shows the dependency in
+// its place rather than fabricating a PR.
+import type { RunSummary } from "@/lib/api";
 import type { ConsoleJobStatus } from "@/lib/console-jobs";
-import { jobStatus } from "@/lib/runs-model";
-
-const DASH = "—";
 
 /** Newest run first (§4, §10 box 2.10). Ties keep their incoming order via the run id. */
 export function runsNewestFirst(runs: readonly RunSummary[]): RunSummary[] {
@@ -41,91 +38,6 @@ export function clockTime(iso: string): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** The §4 summary strip — one `.kv` cell each. */
-export interface JobSummary {
-  status: ConsoleJobStatus;
-  statusLabel: string;
-  /** Teammate name, or "" when solo/unassigned. */
-  assignee: string;
-  /** PR reference + state, or "—" while no endpoint serves one. */
-  pullRequest: string;
-  /** Newest run's branch, or "—". */
-  branch: string;
-  runs: number;
-  updated: string;
-  /** The ticket's title, from its newest run row. */
-  title: string;
-  /** Project display slug, or "". */
-  project: string;
-}
-
-/**
- * Builds the summary strip from a ticket's run history. `live` reports whether the ticket is
- * in the daemon's running snapshot — the one signal the history rows cannot carry, since a run
- * row is only written as the run progresses.
- */
-export function buildJobSummary(
-  runs: readonly RunSummary[],
-  opts: { live?: boolean; assignee?: string; pullRequest?: string; nowMs: number },
-): JobSummary {
-  const ordered = runsNewestFirst(runs);
-  const newest = ordered[0];
-  // Liveness is its own signal, prepended rather than stamped onto a stored row: the run that
-  // is in flight may not have been persisted yet, so marking the newest HISTORY row live would
-  // both misdescribe that row and, for a ticket with no history at all, lose the signal
-  // entirely — a just-dispatched ticket would read "queued".
-  const signals = ordered.map((r) => ({ outcome: r.outcome, live: false, queued: false }));
-  if (opts.live ?? false) signals.unshift({ outcome: "running", live: true, queued: false });
-  const status = consoleJobStatus(jobStatus(signals));
-  const updatedAtMs = ordered.reduce(
-    (max, r) => Math.max(max, parseMs(r.ended_at) || parseMs(r.started_at)),
-    0,
-  );
-  return {
-    status,
-    statusLabel: CONSOLE_STATUS_LABELS[status],
-    assignee: opts.assignee ?? "",
-    pullRequest: opts.pullRequest ?? "",
-    branch: newest?.branch || DASH,
-    runs: runs.length,
-    updated: relativeSince(updatedAtMs, opts.nowMs),
-    title: newest?.title ?? "",
-    project: newest?.project_slug ?? "",
-  };
-}
-
-/** The `.rmeta` line of an expanded run (§4): who ran it, when, for how long, at what cost. */
-export interface RunMeta {
-  /** Teammate name, or "" — a stored run row carries no identity (see the DEPENDENCY note). */
-  identity: string;
-  /** "19:11 → 19:15" — the run's window; the end is omitted while it is still going. */
-  window: string;
-  duration: string;
-  turns: string;
-  tokens: string;
-}
-
-export function runMeta(run: RunSummary, identity = ""): RunMeta {
-  const start = clockTime(run.started_at);
-  const end = clockTime(run.ended_at);
-  return {
-    identity,
-    window: start === "" ? DASH : end === "" ? `${start} →` : `${start} → ${end}`,
-    duration: runDuration(run.started_at, run.ended_at),
-    turns: `${run.turns} ${run.turns === 1 ? "turn" : "turns"}`,
-    tokens: `${run.usage_estimated ? "~" : ""}${formatTokens(run.total_tokens)} tokens`,
-  };
-}
-
-/**
- * A run's one-line description in the collapsed row. No kind is recorded (see the DEPENDENCY
- * note), so a run identifies itself by what it did: its error when it failed, else its outcome.
- */
-export function runDescription(run: RunSummary): string {
-  if (run.error !== "") return run.error;
-  return run.outcome === "" ? DASH : run.outcome;
-}
-
 /**
  * The Pill a RUN's own outcome paints in the runs list. This is the run's state, not the
  * ticket's, so it keeps the taxonomy-v2 spelling: only a clean `completed` is blue-`done`, a
@@ -143,64 +55,6 @@ export function runOutcomePill(outcome: string): ConsoleJobStatus {
     default:
       return "queued";
   }
-}
-
-/** The transcript timeline's line kinds (§4) — each paints its own glyph. */
-export type TimelineKind = "turn" | "tool" | "post" | "retain" | "note" | "done";
-
-export interface TimelineEntry {
-  seq: number;
-  kind: TimelineKind;
-  text: string;
-  /** Tool name on a `tool`/`post`/`retain` line; "" otherwise. */
-  tool: string;
-  /** The tool's folded result line, "" when it produced none. */
-  result: string;
-}
-
-/**
- * Folds a run's humanized transcript into the §4 timeline: the turn's start, its tool calls
- * (with each call's result folded onto the call that produced it, as the prototype renders
- * them), its room posts and memory retentions, and its completion.
- *
- * The `done` tint is presentation only — an event line the daemon words differently still
- * renders, just with the neutral turn glyph. Nothing downstream branches on it.
- */
-export function transcriptTimeline(entries: readonly LogEntry[]): TimelineEntry[] {
-  const out: TimelineEntry[] = [];
-  for (const entry of entries) {
-    if (entry.kind === "tool_result") {
-      // Belongs to the call above it. With no call to attach to (a truncated transcript) it
-      // becomes its own note rather than being dropped.
-      const last = out[out.length - 1];
-      if (last && last.result === "" && (last.kind === "tool" || last.kind === "post" || last.kind === "retain")) {
-        last.result = entry.text;
-        continue;
-      }
-      out.push({ seq: entry.seq, kind: "note", text: entry.text, tool: "", result: "" });
-      continue;
-    }
-    out.push({
-      seq: entry.seq,
-      kind: timelineKind(entry),
-      text: entry.text,
-      tool: entry.kind === "tool_use" ? entry.tool : "",
-      result: "",
-    });
-  }
-  return out;
-}
-
-function timelineKind(entry: LogEntry): TimelineKind {
-  if (entry.kind === "tool_use") {
-    if (entry.tool === "teams_post") return "post";
-    if (entry.tool === "teams_retain") return "retain";
-    return "tool";
-  }
-  if (entry.kind === "event") {
-    return /\bcomplet(ed|e)\b/i.test(entry.text) ? "done" : "turn";
-  }
-  return "note";
 }
 
 // --- Pull request card (§4) ---------------------------------------------------------------

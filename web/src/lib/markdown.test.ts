@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseMarkdown, safeHref, type MdBlock, type MdInline } from "@/lib/markdown";
+import { inlineText, parseMarkdown, safeHref, type MdBlock, type MdInline } from "@/lib/markdown";
 
 // STUDIO-739 — the agent-prose markdown subset. Agents write handoffs and self-reviews in
 // markdown, so the transcript, the room and memory all carry it; these pin the subset the
@@ -8,9 +8,9 @@ import { parseMarkdown, safeHref, type MdBlock, type MdInline } from "@/lib/mark
 // becomes a link.
 
 /** The plain text of an inline run — the parser ships no such helper, so the tests own one. */
-function inlineText(nodes: readonly MdInline[]): string {
+function nodeText(nodes: readonly MdInline[]): string {
   return nodes
-    .map((node) => (node.type === "text" || node.type === "code" ? node.text : inlineText(node.children)))
+    .map((node) => (node.type === "text" || node.type === "code" ? node.text : nodeText(node.children)))
     .join("");
 }
 
@@ -25,7 +25,7 @@ describe("parseMarkdown — blocks", () => {
   it("reads an ATX heading and its level", () => {
     const block = one("## Verification");
     expect(block).toMatchObject({ type: "heading", level: 2 });
-    expect(inlineText(block.type === "heading" ? block.children : [])).toBe("Verification");
+    expect(nodeText(block.type === "heading" ? block.children : [])).toBe("Verification");
   });
 
   it("caps a heading at six hashes and leaves a hash without a space as prose", () => {
@@ -38,7 +38,7 @@ describe("parseMarkdown — blocks", () => {
     // in a retained fact was shown with its leading spaces before this parser existed.
     const block = one("first line\n   second line  ");
     expect(block).toMatchObject({ type: "paragraph" });
-    expect(inlineText(block.type === "paragraph" ? block.children : [])).toBe(
+    expect(nodeText(block.type === "paragraph" ? block.children : [])).toBe(
       "first line\n   second line",
     );
   });
@@ -83,7 +83,7 @@ describe("parseMarkdown — blocks", () => {
     expect(block.type).toBe("list");
     if (block.type !== "list") return;
     expect(block.ordered).toBe(false);
-    expect(block.items.map((i) => inlineText(i.children))).toEqual(["one", "two", "three"]);
+    expect(block.items.map((i) => nodeText(i.children))).toEqual(["one", "two", "three"]);
   });
 
   it("reads an ordered list", () => {
@@ -95,8 +95,8 @@ describe("parseMarkdown — blocks", () => {
     const block = one("- outer\n  - inner\n- second");
     if (block.type !== "list") throw new Error("expected a list");
     expect(block.items).toHaveLength(2);
-    expect(inlineText(block.items[0].children)).toBe("outer");
-    expect(block.items[0].list?.items.map((i) => inlineText(i.children))).toEqual(["inner"]);
+    expect(nodeText(block.items[0].children)).toBe("outer");
+    expect(block.items[0].list?.items.map((i) => nodeText(i.children))).toEqual(["inner"]);
     expect(block.items[1].list).toBeNull();
   });
 
@@ -106,8 +106,8 @@ describe("parseMarkdown — blocks", () => {
     // was deleted, and a hand-off's sub-bullet vanished from the only place an operator reads it.
     const block = one("- a\n    - x\n  - y");
     if (block.type !== "list") throw new Error("expected a list");
-    expect(block.items.map((i) => inlineText(i.children))).toEqual(["a"]);
-    expect(block.items[0].list?.items.map((i) => inlineText(i.children))).toEqual(["x", "y"]);
+    expect(block.items.map((i) => nodeText(i.children))).toEqual(["a"]);
+    expect(block.items[0].list?.items.map((i) => nodeText(i.children))).toEqual(["x", "y"]);
   });
 
   it("keeps a loose list (blank lines between items) as one list", () => {
@@ -120,7 +120,7 @@ describe("parseMarkdown — blocks", () => {
   it("continues an item onto its lazy continuation line", () => {
     const block = one("- one that\n  wraps");
     if (block.type !== "list") throw new Error("expected a list");
-    expect(inlineText(block.items[0].children)).toBe("one that\nwraps");
+    expect(nodeText(block.items[0].children)).toBe("one that\nwraps");
   });
 
   it("ends a list at a fence and starts the code block", () => {
@@ -276,5 +276,22 @@ describe("parseMarkdown — long input", () => {
     const blocks = parseMarkdown(src);
     expect(blocks).toHaveLength(1);
     expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe("inlineText", () => {
+  it("flattens an inline run to the prose the reader sees", () => {
+    expect(inlineText("**Wired** the `watcher` [end to end](https://example.com).")).toBe(
+      "Wired the watcher end to end.",
+    );
+  });
+
+  // The flanking rule is the whole point of sharing this parse with the renderer: a heading that
+  // stripped emphasis on its own turned `load_live_review_watch` into `loadlivereview_watch`.
+  it("keeps an underscore that sits inside a word", () => {
+    expect(inlineText("Fixed load_live_review_watch and `teams_post`.")).toBe(
+      "Fixed load_live_review_watch and teams_post.",
+    );
+    expect(inlineText("_really_ fixed it")).toBe("really fixed it");
   });
 });

@@ -1,0 +1,155 @@
+/* ============================================================================
+   Console "Trace" run detail — the three zones (STUDIO-742).
+
+   Ported from the design record's prototype (`~/.rhapsody/docs/
+   console-run-detail-prototype.html`, Screen 2) onto the STUDIO-682 token set.
+   Every class here is `tr`-prefixed and scoped to `.rh-console`: the prototype
+   names `.hd`, `.card`, `.split` and `.filter` collide with the shipped design
+   system's own `.card > .hd` and the jobs filter bar, so a bare port would
+   restyle components this view does not own.
+
+   The wide-content rule (STUDIO-681, and this ticket's acceptance): anything
+   that can be arbitrarily wide — a tool result, a raw transcript line — scrolls
+   or wraps INSIDE its own box, so the page body never scrolls sideways.
+   ============================================================================ */
+
+/* ---- (A) the sticky header ---- */
+.rh-console .trhd {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 11px 0;
+  margin-bottom: 4px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.rh-console .trhd .back { color: var(--ink-3); background: none; border: 0; font: inherit; font-size: 17px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.rh-console .trhd .back:hover { color: var(--ink); }
+.rh-console .trhd .idw { min-width: 0; }
+.rh-console .trhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+.rh-console .trhd h1 { margin: 0; font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
+.rh-console .trvitals { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-4); display: flex; gap: 14px; flex-wrap: wrap; }
+.rh-console .trvitals b { color: var(--ink-2); font-weight: 500; }
+.rh-console .trhd .acts { display: flex; gap: 7px; flex-wrap: wrap; }
+.rh-console .trhd .btn { padding: 6px 11px; font-size: 12px; }
+/* A dependency-named action stays hoverable — its `title` is what names the missing surface —
+   but is inert: `aria-disabled` instead of the `disabled` attribute, which suppresses the
+   mouse events the tooltip needs. */
+.rh-console .trhd .btn.dependency { cursor: not-allowed; opacity: .7; }
+.rh-console .trhd .btn.dependency:hover { background: var(--panel); color: var(--ink-2); border-color: var(--line); }
+.rh-console .trhd .btn:disabled { cursor: progress; opacity: .6; }
+.rh-console .trhd .acterr { font-size: 11.5px; color: var(--bad); align-self: center; max-width: 40ch; }
+/* A dependency-named action: it links its own missing surface rather than pretending to act. */
+.rh-console .dep { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-4); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; margin-left: 6px; }
+
+.rh-console .trtitle { margin: 0 0 10px; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
+
+.rh-console .trmode { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.rh-console .trmode .rt { margin-left: auto; }
+
+/* ---- (B) the Result card ---- */
+.rh-console .trrc { border: 1px solid var(--line); border-radius: var(--r); background: linear-gradient(180deg, var(--panel-2), var(--panel)); overflow: hidden; margin-bottom: 18px; }
+.rh-console .trrc .bar { height: 3px; background: var(--info); }
+.rh-console .trrc.fail .bar { background: var(--bad); }
+.rh-console .trrc.stop .bar { background: var(--warn); }
+.rh-console .trrc .in { padding: 18px 20px; display: flex; gap: 22px; flex-wrap: wrap; }
+.rh-console .trrc .body { flex: 1 1 380px; min-width: 0; }
+.rh-console .trrc .eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--info); font-weight: 600; margin-bottom: 6px; }
+.rh-console .trrc.fail .eyebrow { color: var(--bad); }
+.rh-console .trrc.stop .eyebrow { color: var(--warn); }
+.rh-console .trrc h2 { font-size: 20px; font-weight: 700; margin: 0 0 6px; line-height: 1.25; text-wrap: balance; }
+/* §3B's failure banner: the run row's own `error`, red for a failure and amber for a stop. It
+   wraps and scrolls inside itself — a raw agent error can be a single very long line. */
+.rh-console .trrc .trbanner { display: flex; gap: 9px; align-items: baseline; border: 1px solid var(--line); border-radius: 6px; padding: 8px 11px; margin-bottom: 10px; font-size: 12.5px; overflow-x: auto; }
+.rh-console .trrc .trbanner b { flex: none; font-family: var(--mono); font-size: 10px; letter-spacing: .07em; text-transform: uppercase; font-weight: 600; }
+.rh-console .trrc .trbanner span { min-width: 0; overflow-wrap: anywhere; color: var(--ink-2); }
+.rh-console .trrc .trbanner.fail { border-color: var(--bad); background: var(--bad-soft); }
+.rh-console .trrc .trbanner.fail b { color: var(--bad); }
+.rh-console .trrc .trbanner.stop { border-color: var(--warn); background: var(--warn-soft); }
+.rh-console .trrc .trbanner.stop b { color: var(--warn); }
+/* The headline's placeholder while the transcript loads — the card has no answer yet, and its
+   fallback sentence would be a confident wrong one. */
+.rh-console .trrc .trskel { height: 25px; max-width: 32ch; border-radius: 5px; background: var(--line); opacity: .55; }
+/* The placeholder is a live region, and a live region announces its CONTENT — an aria-label on an
+   empty box announces nothing on most screen readers. The bar carries the same "Loading transcript…"
+   the Split shows in the open, hidden from sight but not from the accessibility tree. */
+.rh-console .trrc .trskel .vh { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.rh-console .trrc .sect { margin-top: 14px; }
+.rh-console .trrc .sect .lab { font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--accent); font-weight: 600; }
+.rh-console .trrc .sect .head { font-size: 12.5px; font-weight: 600; color: var(--ink); margin: 2px 0 4px; }
+.rh-console .trreceipt { flex: 0 0 190px; border-left: 1px solid var(--line); padding-left: 18px; display: flex; flex-direction: column; gap: 9px; }
+.rh-console .trreceipt .rv { font-family: var(--mono); font-size: 12px; color: var(--ink-2); display: flex; justify-content: space-between; gap: 10px; }
+.rh-console .trreceipt .rv b { color: var(--ink-4); font-weight: 500; }
+
+/* ---- (C) The Split ---- */
+.rh-console .trsplit { display: grid; grid-template-columns: 264px minmax(0, 1fr); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; background: var(--panel); margin-bottom: 18px; }
+@media (max-width: 900px) {
+  .rh-console .trsplit { grid-template-columns: minmax(0, 1fr); }
+}
+/* The spine sticks BELOW the sticky header, whose height is not a constant — the action cluster
+   and the attempt selector wrap onto a second row on a narrow window. `--trhd-h` is published by
+   the view from a `ResizeObserver` on the header itself; the literal is the fallback for the
+   first render and for any engine without one. */
+.rh-console .trspine { border-right: 1px solid var(--line); padding: 10px; align-self: start; position: sticky; top: var(--trhd-h, 64px); }
+.rh-console .trfilter { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
+.rh-console .trfilter .chip { padding: 3px 9px; font-size: 11.5px; }
+.rh-console .trspine .grep { width: 100%; font-size: 12px; padding: 6px 9px; margin-bottom: 8px; }
+.rh-console .trstep { display: flex; gap: 10px; width: 100%; text-align: left; font: inherit; padding: 10px 9px; border: 0; border-radius: var(--r-sm); background: none; color: inherit; cursor: pointer; position: relative; }
+.rh-console .trstep:hover { background: var(--panel-2); }
+.rh-console .trstep[aria-pressed="true"] { background: var(--raise); }
+.rh-console .trstep[aria-pressed="true"]::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; border-radius: 2px; background: var(--operator); }
+.rh-console .trstep .g { flex: 0 0 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; font-size: 13px; background: var(--panel-2); border: 1px solid var(--line); color: var(--ink-2); }
+.rh-console .trstep.err .g { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
+.rh-console .trstep .txt { min-width: 0; }
+.rh-console .trstep .stt { font-weight: 600; font-size: 13px; display: block; }
+.rh-console .trstep .ssub { font-size: 11px; color: var(--ink-4); font-family: var(--mono); display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rh-console .trstep .fx { display: flex; gap: 5px; margin-top: 5px; flex-wrap: wrap; }
+.rh-console .fxchip { font-size: 10px; color: var(--ink-4); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font-family: var(--mono); }
+.rh-console .fxchip.error { color: var(--bad); border-color: var(--bad); }
+.rh-console .fxchip.edited { color: var(--ok); }
+.rh-console .fxchip.room { color: var(--info); }
+.rh-console .fxchip.memory { color: var(--ticket); }
+
+.rh-console .trinsp { padding: 16px 18px; min-width: 0; }
+.rh-console .trinsp h4 { font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-4); margin: 0 0 10px; font-weight: 600; }
+.rh-console .trcard { border: 1px solid var(--line); border-radius: var(--r-sm); margin-bottom: 8px; background: var(--panel-2); overflow: hidden; }
+.rh-console .trcard .top { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 11px; font: inherit; text-align: left; border: 0; background: none; color: inherit; cursor: pointer; min-width: 0; }
+.rh-console .trcard .top:hover { background: var(--raise); }
+.rh-console .trcard .cg { flex: 0 0 20px; text-align: center; font-size: 13px; color: var(--ink-3); }
+.rh-console .trcard .tool { font-family: var(--mono); font-size: 12px; color: var(--ink); font-weight: 500; flex: none; }
+.rh-console .trcard .tgt { font-family: var(--mono); font-size: 12px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.rh-console .trcard .res { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-4); flex: none; }
+.rh-console .trcard .res.ok { color: var(--ok); }
+.rh-console .trcard .res.bad { color: var(--bad); }
+.rh-console .trcard .caret { color: var(--ink-4); flex: 0 0 12px; font-size: 10px; transition: transform .12s; }
+.rh-console .trcard.open .caret { transform: rotate(90deg); }
+.rh-console .trcard.err { border-color: var(--bad); }
+.rh-console .trcard.orphan .reslab { font-family: var(--mono); font-size: 11px; color: var(--ink-4); padding: 8px 11px; }
+.rh-console .trcard .out { border-top: 1px solid var(--line); padding: 11px 13px; background: var(--bg); }
+.rh-console .trcard .out pre { margin: 0; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; max-height: 420px; overflow-y: auto; }
+
+.rh-console .trsaid { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.rh-console .trsaid .hdr { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; }
+.rh-console .trsaid .sg { color: var(--ink-4); font-size: 11px; }
+.rh-console .trsaid .lab { font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-4); font-weight: 600; }
+/* SAID is muted by construction (design record §2): prose is secondary to the calls above it. */
+.rh-console .trsaid .prose { color: var(--ink-2); font-size: 13px; }
+.rh-console .trsaid .more { font: inherit; font-size: 11.5px; color: var(--ink-3); background: none; border: 0; padding: 4px 0 0; cursor: pointer; }
+.rh-console .trsaid .more:hover { color: var(--accent); }
+.rh-console .trsaid .think { margin-top: 9px; }
+.rh-console .trsaid .think > button { font: inherit; font-size: 12px; font-style: italic; color: var(--ink-4); background: none; border: 0; padding: 0; cursor: pointer; }
+.rh-console .trsaid .think > button:hover { color: var(--ink-3); }
+.rh-console .trsaid .think .md { color: var(--ink-3); font-size: 12.5px; margin-top: 6px; }
+
+/* ---- the raw-transcript escape hatch ---- */
+.rh-console .trraw { border: 1px solid var(--line); border-radius: var(--r); background: var(--bg); padding: 14px 16px; margin-bottom: 18px; }
+.rh-console .trraw .rawline { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); padding: 3px 0; border-bottom: 1px solid var(--line-soft); white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; }
+.rh-console .trraw .rawline:last-child { border-bottom: 0; }
+.rh-console .trraw .rk { color: var(--ink-4); }
+
+/* ---- the §4 context cards the zones did not replace (slice 4 folds them into the watch tabs) ---- */
+.rh-console .trctx { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; align-items: start; }

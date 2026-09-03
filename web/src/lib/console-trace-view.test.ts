@@ -1,0 +1,341 @@
+import { describe, expect, it } from "vitest";
+import type { LogEntry, RunSummary } from "@/lib/api";
+import { buildResult, buildTrace } from "@/lib/trace-model";
+import {
+  TRACE_FILTERS,
+  cardLead,
+  filterPhases,
+  githubRepo,
+  leadParagraph,
+  phaseGlyph,
+  prSearchUrl,
+  resultBanner,
+  resultEyebrow,
+  runBranch,
+  runVitals,
+  ticketUrl,
+} from "@/lib/console-trace-view";
+
+// The slice-2 view model (STUDIO-742) — the derivations the three-zone run detail needs that are
+// not the slice-1 trace model itself: the header's vitals, the spine's filter, and the honest
+// links behind the header's actions.
+
+function entry(over: Partial<LogEntry> & Pick<LogEntry, "seq">): LogEntry {
+  return { kind: "text", tool: "", text: "", ...over };
+}
+
+function run(over: Partial<RunSummary> = {}): RunSummary {
+  return {
+    id: 1,
+    issue_id: "i",
+    issue_identifier: "STUDIO-742",
+    title: "Trace",
+    attempt: 1,
+    session_uuid: "s",
+    branch: "symphony/STUDIO-742",
+    project_slug: "",
+    repo: "git@github.com:makewhatis/rhapsody.git",
+    started_at: "2026-09-03T10:00:00Z",
+    ended_at: "2026-09-03T10:04:30Z",
+    outcome: "completed",
+    turns: 3,
+    input_tokens: 1,
+    output_tokens: 2,
+    total_tokens: 38_000,
+    usage_estimated: false,
+    error: "",
+    transcript_path: "",
+    ...over,
+  };
+}
+
+const TRANSCRIPT: LogEntry[] = [
+  entry({ seq: 1, kind: "tool_use", tool: "Read", text: "file_path=/repo/src/lib/api.ts" }),
+  entry({ seq: 2, kind: "tool_result", text: "export interface RunSummary" }),
+  entry({ seq: 3, kind: "thinking", text: "The header needs the branch." }),
+  entry({ seq: 4, kind: "tool_use", tool: "Edit", text: "file_path=/repo/src/lib/api.ts" }),
+  entry({ seq: 5, kind: "tool_result", text: "applied" }),
+  entry({ seq: 6, kind: "tool_use", tool: "Bash", text: "command=npm test" }),
+  entry({ seq: 7, kind: "tool_result", text: "Error: 1 failed" }),
+];
+
+describe("runVitals — the header's mono strip derives from RunSummary (§3A)", () => {
+  it("reads duration from ended−started, and turns/tokens/branch verbatim", () => {
+    const v = runVitals(run(), buildTrace(TRANSCRIPT).phases);
+    expect(v.duration).toBe("4m 30s");
+    expect(v.turns).toBe("3 turns");
+    expect(v.tokens).toBe("38.0k");
+    expect(v.branch).toBe("symphony/STUDIO-742");
+  });
+
+  it("counts the trace's tool calls for the Result card's receipt", () => {
+    expect(runVitals(run(), buildTrace(TRANSCRIPT).phases).tools).toBe(3);
+  });
+
+  it("marks an estimated token total rather than presenting it as authoritative", () => {
+    expect(runVitals(run({ usage_estimated: true }), []).tokens).toBe("~38.0k");
+  });
+
+  it("shows a dash, never a fabricated 0s, while the run has not ended", () => {
+    expect(runVitals(run({ ended_at: "", outcome: "running" }), []).duration).toBe("—");
+  });
+
+  // The daemon writes NO branch on any run row — `persist_start_run` leaves the column at its
+  // default and is its only writer — so reading the row alone made this vital a permanent dash.
+  it("names the branch the daemon's own naming gives the ticket when the row carries none", () => {
+    expect(runVitals(run({ branch: "" }), []).branch).toBe("symphony/STUDIO-742");
+  });
+
+  it("shows a dash only when there is no ticket to derive a branch from either", () => {
+    expect(runVitals(run({ branch: "", issue_identifier: "" }), []).branch).toBe("—");
+  });
+});
+
+describe("runBranch — the workspace branch, served or derived (§3A)", () => {
+  it("prefers the row's own branch whenever the daemon served one", () => {
+    expect(runBranch(run({ branch: "symphony/OTHER-1" }))).toBe("symphony/OTHER-1");
+    expect(runBranch(run({ branch: "  symphony/OTHER-1  " }))).toBe("symphony/OTHER-1");
+  });
+
+  it("derives `symphony/<KEY>` — the frozen branch-naming contract — when it did not", () => {
+    expect(runBranch(run({ branch: "", issue_identifier: "STUDIO-742" }))).toBe("symphony/STUDIO-742");
+  });
+
+  // The daemon derives the branch from `sanitize_key(identifier)`, not the raw identifier: a key
+  // with a character outside `[A-Za-z0-9._-]` names a DIFFERENT branch than the ticket spells.
+  it("sanitizes the key exactly as the daemon does, so the name is one it really creates", () => {
+    expect(runBranch(run({ branch: "", issue_identifier: "team/issue 1" }))).toBe("symphony/team_issue_1");
+    expect(runBranch(run({ branch: "", issue_identifier: "abc.def_ghi-1" }))).toBe("symphony/abc.def_ghi-1");
+    expect(runBranch(run({ branch: "", issue_identifier: "." }))).toBe("symphony/_");
+  });
+
+  it("derives nothing at all rather than a bare prefix when the row names no ticket", () => {
+    expect(runBranch(run({ branch: "", issue_identifier: "" }))).toBe("");
+    expect(runBranch(run({ branch: "", issue_identifier: "   " }))).toBe("");
+  });
+});
+
+describe("resultBanner — the Result card says WHY a run ended badly (§3B)", () => {
+  it("carries a failed run's error, red, whether or not it also wrote a hand-off", () => {
+    const banner = resultBanner(run({ outcome: "failed", error: "agent exited 1: turn timeout" }));
+    expect(banner).toEqual({ label: "Error", tone: "fail", text: "agent exited 1: turn timeout" });
+  });
+
+  it("carries a stopped run's reason, amber", () => {
+    expect(resultBanner(run({ outcome: "stopped", error: "operator stopped the run" }))).toEqual({
+      label: "Reason",
+      tone: "stop",
+      text: "operator stopped the run",
+    });
+    expect(resultBanner(run({ outcome: "interrupted", error: "daemon restarted" }))?.tone).toBe("stop");
+  });
+
+  it("has no banner for a run that recorded no error", () => {
+    expect(resultBanner(run())).toBeNull();
+    expect(resultBanner(run({ outcome: "failed", error: "   " }))).toBeNull();
+  });
+});
+
+describe("filterPhases — the spine's filter narrows to matching phases (§3C)", () => {
+  const phases = buildTrace(TRANSCRIPT).phases;
+
+  it("offers exactly the four named filters, All first", () => {
+    expect(TRACE_FILTERS).toEqual(["all", "edits", "bash", "errors"]);
+  });
+
+  it("All keeps every phase", () => {
+    expect(filterPhases(phases, "all", "")).toHaveLength(phases.length);
+  });
+
+  it("Edits keeps only phases that actually changed a file", () => {
+    const kept = filterPhases(phases, "edits", "");
+    expect(kept).not.toHaveLength(0);
+    kept.forEach((p) => expect(p.effects.some((e) => e.kind === "edited")).toBe(true));
+  });
+
+  it("Bash keeps only phases that ran a shell command", () => {
+    const kept = filterPhases(phases, "bash", "");
+    expect(kept).not.toHaveLength(0);
+    kept.forEach((p) => expect(p.did.some((c) => c.tool === "Bash")).toBe(true));
+  });
+
+  it("Errors keeps only failing phases", () => {
+    const kept = filterPhases(phases, "errors", "");
+    expect(kept).not.toHaveLength(0);
+    kept.forEach((p) => expect(p.failed).toBe(true));
+  });
+
+  it("greps the phase's own text — its title, its calls and its prose", () => {
+    expect(filterPhases(phases, "all", "api.ts").length).toBeGreaterThan(0);
+    expect(filterPhases(phases, "all", "the branch")).toHaveLength(1);
+    expect(filterPhases(phases, "all", "no such string anywhere")).toHaveLength(0);
+  });
+
+  it("greps case-insensitively and ignores surrounding whitespace", () => {
+    expect(filterPhases(phases, "all", "  NPM TEST ")).toEqual(filterPhases(phases, "all", "npm test"));
+    expect(filterPhases(phases, "all", "npm test")).toHaveLength(1);
+  });
+
+  it("applies the chip and the grep together, not either-or", () => {
+    expect(filterPhases(phases, "edits", "npm test")).toHaveLength(0);
+  });
+});
+
+describe("resultEyebrow — the Result card says what kind of ending this was (§3B)", () => {
+  it("distinguishes a run that handed off from one that merely stopped talking", () => {
+    expect(resultEyebrow(run(), "handoff")).toEqual({ text: "done · handed off", tone: "done" });
+    expect(resultEyebrow(run(), "text")).toEqual({ text: "done", tone: "done" });
+  });
+
+  it("tones a failed run red and a stopped run amber", () => {
+    expect(resultEyebrow(run({ outcome: "failed" }), "text")).toEqual({ text: "failed", tone: "fail" });
+    expect(resultEyebrow(run({ outcome: "stopped" }), "text")).toEqual({ text: "stopped", tone: "stop" });
+  });
+
+  it("names an outcome it does not know rather than claiming the run is done", () => {
+    expect(resultEyebrow(run({ outcome: "interrupted" }), "text").text).toBe("interrupted");
+    expect(resultEyebrow(run({ outcome: "" }), "fallback").text).toBe("unknown");
+  });
+});
+
+describe("the header's links are real or absent — never a fabricated PR (§5 dependency rule)", () => {
+  it("reads owner/name off both remote spellings", () => {
+    expect(githubRepo("git@github.com:makewhatis/rhapsody.git")).toBe("makewhatis/rhapsody");
+    expect(githubRepo("https://github.com/makewhatis/rhapsody.git")).toBe("makewhatis/rhapsody");
+  });
+
+  it("returns nothing for a host it cannot vouch for, so no link is offered", () => {
+    expect(githubRepo("git@gitlab.com:makewhatis/rhapsody.git")).toBe("");
+    expect(githubRepo("")).toBe("");
+    expect(githubRepo("github.com.evil.example/a/b")).toBe("");
+  });
+
+  it("links View PR to a head-branch SEARCH, since no endpoint serves a PR number", () => {
+    expect(prSearchUrl(run())).toBe(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-742",
+    );
+  });
+
+  // The head-branch search would otherwise be dead code: no run row the daemon has ever written
+  // carries a branch, so the ONLY path that ever fires in production is the derived one.
+  it("searches the derived head branch on a row whose branch the daemon left empty", () => {
+    expect(prSearchUrl(run({ branch: "" }))).toBe(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-742",
+    );
+  });
+
+  it("offers no PR link at all when there is no branch to search or no remote to search it on", () => {
+    expect(prSearchUrl(run({ branch: "", issue_identifier: "" }))).toBe("");
+    expect(prSearchUrl(run({ repo: "" }))).toBe("");
+    expect(prSearchUrl(run({ repo: "git@gitlab.example:acme/app.git" }))).toBe("");
+  });
+
+  it("builds the ticket deep link from the connected workspace, or not at all", () => {
+    expect(ticketUrl("studio49", "STUDIO-742")).toBe("https://linear.app/studio49/issue/STUDIO-742");
+    expect(ticketUrl("", "STUDIO-742")).toBe("");
+    expect(ticketUrl("studio49", "")).toBe("");
+  });
+});
+
+describe("phaseGlyph — one glyph per phase kind, shared with the Jobs sparkline (§6)", () => {
+  it("gives every phase kind a distinct glyph", () => {
+    const kinds = ["oriented", "implemented", "verified", "coordinated", "handoff", "other"] as const;
+    const glyphs = kinds.map(phaseGlyph);
+    expect(new Set(glyphs).size).toBe(kinds.length);
+    glyphs.forEach((g) => expect(g).not.toBe(""));
+  });
+});
+
+describe("cardLead — the Result card shows a lead only when the H1 does not already say it", () => {
+  const card = (lead: string, headline: string) =>
+    cardLead({ headline, lead, sections: [], source: "text" });
+
+  it("drops a lead the headline was drawn from, rather than printing it twice", () => {
+    expect(card("Photo attachment shipped.", "Photo attachment shipped.")).toBe("");
+    expect(card("Photo attachment **shipped**.", "Photo attachment shipped.")).toBe("");
+  });
+
+  // Measured over the 441 recorded runs: requiring whole-lead equality left 184 (41.7%) printing
+  // their own H1 again directly under it, because the model GROWS the headline out of the lead.
+  it("drops only the sentence the headline was grown from, keeping the rest of the lead", () => {
+    expect(card("Postgres is up on 5433. Running the full suite next.", "Postgres is up on 5433.")).toBe(
+      "Running the full suite next.",
+    );
+    expect(card("Shipped it.\n\nDetail follows.", "Shipped it.")).toBe("Detail follows.");
+    expect(
+      card("**Wired** the watcher. It polls every 2s.", "Wired the watcher."),
+    ).toBe("It polls every 2s.");
+  });
+
+  it("drops a lead the headline reached PAST — the H1 already carries all of it", () => {
+    expect(card("Done. And here is why.", "Done. And here is why. More.")).toBe("");
+  });
+
+  // A whole SENTENCE the headline continues past, not merely a string prefix of it.
+  it("keeps a lead that only happens to spell the start of the headline", () => {
+    expect(card("A", "Absolutely everything changed.")).toBe("A");
+    expect(card("Wired", "Wired the watcher end to end.")).toBe("Wired");
+  });
+
+  it("keeps a lead whose opening sentence is not the one the headline was grown from", () => {
+    expect(card("A first line. A second.", "Something else entirely.")).toBe(
+      "A first line. A second.",
+    );
+  });
+
+  it("has nothing to show when the prose opened on a heading", () => {
+    expect(card("", "Anything")).toBe("");
+  });
+
+  // 25 of the 446 recorded runs signed off on a bare URL, which carries no sentence punctuation
+  // for the walk to end on, so the whole lead — headline included — printed under the H1.
+  it("ends the headline's sentence at a line break when it has no punctuation to end on", () => {
+    expect(card("Done. Draft PR: https://example.com/pull/5\n\nThe suite is green.", "Done. Draft PR: https://example.com/pull/5")).toBe(
+      "The suite is green.",
+    );
+  });
+
+  // A CLIPPED headline is a prefix of the sentence it came from, so the whole lead trivially
+  // starts with it — the answer-first card must still print everything past that sentence.
+  // Measured over the 445 recorded runs, treating that prefix as "the H1 already said it" deleted
+  // the entire hand-off from 15 of them, one of them a 3,355-char six-paragraph lead.
+  it("keeps the rest of a lead the headline could only CLIP", () => {
+    const prose = [
+      "The CI success gate can never fail under `sh`, which makes it a rubber stamp: every job",
+      "reports green whether or not the suite it shells out to actually ran to completion. Your two",
+      "questions, both now answered.",
+      "",
+      "The gate is a one-liner and it swallows the exit status.",
+      "",
+      "The fix is one flag, and the suite proves it.",
+    ].join("\n");
+    const built = buildResult([entry({ seq: 1, text: prose })]);
+    expect(built.headline.endsWith("\u2026")).toBe(true);
+    const rest = cardLead(built);
+    expect(rest).toContain("The gate is a one-liner");
+    expect(rest).toContain("The fix is one flag");
+    expect(rest).not.toBe("");
+  });
+});
+
+describe("leadParagraph — SAID collapses to its lead (§3C)", () => {
+  it("cuts at the first blank line", () => {
+    expect(leadParagraph("Lead paragraph.\n\nSecond.\n\nThird.")).toBe("Lead paragraph.");
+  });
+
+  it("keeps a multi-line paragraph whole", () => {
+    expect(leadParagraph("One line\nand its continuation.\n\nNext.")).toBe(
+      "One line\nand its continuation.",
+    );
+  });
+
+  it("never cuts inside a fenced block, whose blank lines are content", () => {
+    const source = "```sh\ncargo test\n\ncargo build\n```\n\nAfter.";
+    expect(leadParagraph(source)).toBe("```sh\ncargo test\n\ncargo build\n```");
+  });
+
+  it("returns the whole prose when it is a single paragraph", () => {
+    expect(leadParagraph("  Just the one.  ")).toBe("Just the one.");
+    expect(leadParagraph("")).toBe("");
+  });
+});
