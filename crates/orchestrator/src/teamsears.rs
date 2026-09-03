@@ -5707,4 +5707,23 @@ mod tests {
             "and what it still could not fit is counted out loud: {refused}"
         );
     }
+
+    /// **The §9.1 degradation wording survives the SMALLEST share a reply can hand out.**
+    ///
+    /// "Never silence" is an acceptance criterion, and every arm of `Facts::grounded` is now inside
+    /// a caller-supplied cap — which means the one sentence that says *"I have no record of that"*
+    /// is a sentence a bound could clip. `MIN_DISPOSITION_BYTES` is what stops it, so the property
+    /// is asserted rather than left to arithmetic nobody re-does.
+    #[test]
+    fn the_no_record_wording_survives_the_smallest_disposition_share() {
+        let smallest = disposition_budget(MAX_TARGETS_PER_POST + 1);
+        let facts = Facts::default();
+        for cap in [smallest, crate::teamsanswer::split_budget(smallest).0] {
+            assert_eq!(
+                facts.grounded("STUDIO-1", cap),
+                crate::teamsknow::NO_RECORD,
+                "the degradation line must never be the thing a bound cuts (cap {cap})"
+            );
+        }
+    }
 }
