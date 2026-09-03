@@ -157,7 +157,12 @@ export function parseMarkdown(source: string): MdBlock[] {
   return blocks;
 }
 
-function isClosingFence(line: string, marker: string): boolean {
+/**
+ * Whether `line` closes a block opened with `marker` — a run of the same character, at least as
+ * long, and nothing else on the line. Exported for the room feed, which SPLITS a body: a cut can
+ * leave a tail whose first line reads as one of these, and only this rule knows that.
+ */
+export function isClosingFence(line: string, marker: string): boolean {
   const close = new RegExp(`^ {0,3}${marker[0] === "`" ? "`" : "~"}{${marker.length},}\\s*$`);
   return close.test(line);
 }

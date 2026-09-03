@@ -1,5 +1,5 @@
 import type { TeamsRoomMessage } from "@/lib/api";
-import { fenceSpans } from "@/lib/markdown";
+import { fenceSpans, isClosingFence } from "@/lib/markdown";
 
 // room-model — the pure logic behind the Teams console's room (STUDIO-681 §5, built by
 // STUDIO-684): what kind of event a post is, which teammates it concerns, how a day of them
@@ -398,9 +398,17 @@ function fenceSafeSplit(text: string, cut: number): { head: string; rest: string
   if (cut < fence.body) return plainSplit(text, fence.start);
   // Inside the CLOSING one: every content line is already in the head, so take the fence too.
   if (cut >= fence.close) return plainSplit(text, fence.end);
+  // A cut inside a line can also MANUFACTURE a closing fence: split `cat ```' at its space and
+  // the tail opens on " ```", which closes the reopened block at once and spills the rest of the
+  // code out as prose. Backing up to that line's start puts the line back together.
+  const eol = text.indexOf("\n", cut);
+  const at = isClosingFence(text.slice(cut, eol === -1 ? text.length : eol), fence.marker)
+    ? text.lastIndexOf("\n", cut) + 1
+    : cut;
+  const head = text.slice(0, at);
   return {
-    head: `${text.slice(0, cut)}\n${fence.marker}`,
-    rest: `${fence.marker}${fence.info}\n${text.slice(cut)}`.trimEnd(),
+    head: `${head}${head.endsWith("\n") ? "" : "\n"}${fence.marker}`,
+    rest: `${fence.marker}${fence.info}\n${text.slice(at)}`.trimEnd(),
   };
 }
 

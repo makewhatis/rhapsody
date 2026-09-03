@@ -377,6 +377,17 @@ describe("3.7 — a long body truncates with the rest kept for the expand", () =
     expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
   });
 
+  it("does not let the cut manufacture a closing fence on the tail", () => {
+    // The cut falls on the space inside `cat ```' — splitting there would open the tail on
+    // " ```", which IS a closing fence, so the reopened block would close empty and spill the
+    // rest of the code out as prose. Backing up to the line's start puts the line back together.
+    const body = `\`\`\`\n${"filler line\n".repeat(17)}cat \`\`\`\nmorecode\n\`\`\`\ntail`;
+    const { head, rest } = truncateBody(body);
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+    expect(codeOf(rest)[0]).toBe("cat ```\nmorecode");
+  });
+
   it("adds only the fence it needs and drops nothing else", () => {
     const body = `lead in\n\n\`\`\`rust\n${"line of output\n".repeat(20)}\`\`\`\ntail`;
     const { head, rest } = truncateBody(body);
