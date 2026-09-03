@@ -151,9 +151,6 @@
 .rh-console .trraw .rawline:last-child { border-bottom: 0; }
 .rh-console .trraw .rk { color: var(--ink-4); }
 
-/* ---- the §4 context cards the zones did not replace (slice 4 folds them into the watch tabs) ---- */
-.rh-console .trctx { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; align-items: start; }
-
 /* ---- slice 3 (STUDIO-744): the live playhead, the failing-step jump, the relay baton ---- */
 
 /* The header's live pulse (§3A). It is decoration beside the outcome pill, which already says

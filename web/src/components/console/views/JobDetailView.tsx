@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -212,9 +213,12 @@ function RunTrace({
   // instruction — only the panel that is showing is mounted, and its own state dies with it.
   const [tab, setTab] = useState<WatchTabId>(DEFAULT_WATCH_TAB);
   const [draft, setDraft] = useState("");
-  // A focus request, not a flag: the header's Message action selects the Messages tab AND puts the
-  // cursor in the composer, and asking twice must focus twice even though the tab did not change.
-  const [focusMessage, setFocusMessage] = useState(0);
+  // A focus request the composer CONSUMES. It has to survive the tab change that mounts the
+  // composer, so it cannot live in the panel — and it has to be cleared once taken, or the panel's
+  // mount effect would re-steal focus every later time the operator merely CLICKS the Messages
+  // tab, ejecting a keyboard user from the tablist they just used.
+  const [focusMessage, setFocusMessage] = useState(false);
+  const takeMessageFocus = useCallback(() => setFocusMessage(false), []);
   // A jump request rather than a selection: the Result card asks, the Split acts. It carries a
   // nonce so asking TWICE re-opens a card the operator folded away between the two clicks — the
   // jump is an instruction, and a bare "which card" would compare equal and do nothing.
@@ -228,7 +232,8 @@ function RunTrace({
   //
   // The draft goes with it. An instruction written for run 522 is not an instruction for run 547,
   // and silently retargeting it at whichever attempt the operator switched to would send their
-  // words somewhere they never chose.
+  // words somewhere they never chose. The ask dock is keyed by run id for the same reason: its
+  // question is REFED to the attempt, so an unsent one must not follow the operator to another.
   const selectRun = (id: number) => {
     setJump(null);
     setDraft("");
@@ -263,7 +268,7 @@ function RunTrace({
         onCompose={() => {
           setRaw(false);
           setTab("messages");
-          setFocusMessage((n) => n + 1);
+          setFocusMessage(true);
         }}
       />
 
@@ -315,6 +320,7 @@ function RunTrace({
                   draft={draft}
                   onDraft={setDraft}
                   focusComposer={focusMessage}
+                  onComposerFocused={takeMessageFocus}
                   onOpenMemory={onOpenMemory}
                 />
               </WatchTabsRail>
@@ -323,7 +329,11 @@ function RunTrace({
           {/* §6's "Ask about this run": a room post refed to the run TODAY, which upgrades to the
               answering-manager Answer path when one is served. It needs a room to post into, so
               a daemon with Teams off gets no dock rather than a control that cannot act. */}
-          {teamsEnabled ? <AskDock run={live} who={who} /> : null}
+          {/* Keyed per attempt, like the Split above it, so switching resets the question — but
+              NOT with the bare run id, which is the Split's own key among these same siblings. Two
+              siblings sharing a key is a collision React resolves by dropping one of them, which
+              left the previous attempt's Split mounted after a switch. */}
+          {teamsEnabled ? <AskDock key={`ask:${run.id}`} run={live} who={who} /> : null}
         </>
       )}
     </div>
@@ -1183,6 +1193,7 @@ function WatchPanel({
   draft,
   onDraft,
   focusComposer,
+  onComposerFocused,
   onOpenMemory,
 }: {
   tab: WatchTabId;
@@ -1192,7 +1203,8 @@ function WatchPanel({
   teamsEnabled: boolean;
   draft: string;
   onDraft: (text: string) => void;
-  focusComposer: number;
+  focusComposer: boolean;
+  onComposerFocused: () => void;
   onOpenMemory: () => void;
 }) {
   switch (tab) {
@@ -1202,7 +1214,10 @@ function WatchPanel({
       return <ReviewPanel run={run} roster={roster} teamsEnabled={teamsEnabled} />;
     case "memory":
       return (
-        <TeamsPanel teamsEnabled={teamsEnabled} what="the memory this ticket's runs retained">
+        <TeamsPanel
+          teamsEnabled={teamsEnabled}
+          what="this ticket's runs retained no memory to show"
+        >
           <MemoryPanel issue={run.issue_identifier} roster={roster} onOpenMemory={onOpenMemory} />
         </TeamsPanel>
       );
@@ -1214,15 +1229,30 @@ function WatchPanel({
           draft={draft}
           onDraft={onDraft}
           focus={focusComposer}
+          onFocused={onComposerFocused}
         />
       );
     default:
       return (
-        <TeamsPanel teamsEnabled={teamsEnabled} what="the room posts about this ticket">
+        <TeamsPanel teamsEnabled={teamsEnabled} what="there is no room for anyone to post in">
           <RoomPanel issue={run.issue_identifier} roster={roster} />
         </TeamsPanel>
       );
   }
+}
+
+/**
+ * What a panel with no rows should say.
+ *
+ * `isPending` alone is not the question. A settled react-query ERROR is not pending, so branching
+ * on it renders the empty copy as a statement of fact about a read that never landed — and the
+ * Messages tab's version of that ("No message has been sent to this run's agent") is one an
+ * operator answers by sending the same message twice. A failure says so, and says it is a failure
+ * to READ rather than an absence.
+ */
+function emptyNote(query: { isPending: boolean; isError: boolean }, loading: string, none: string) {
+  if (query.isError) return "This could not be read from the daemon — the request failed.";
+  return query.isPending ? loading : none;
 }
 
 /**
@@ -1238,11 +1268,12 @@ function TeamsPanel({
   children,
 }: {
   teamsEnabled: boolean;
+  /** A whole clause, not a noun to be joined onto one — see the test that reads the sentence. */
   what: string;
   children: ReactNode;
 }) {
   if (teamsEnabled) return <>{children}</>;
-  return <div className="trdep">Teams is off on this daemon, so there is no {what}.</div>;
+  return <div className="trdep">Teams is off on this daemon, so {what}.</div>;
 }
 
 /**
@@ -1322,9 +1353,11 @@ function ReviewPanel({
   if (rows.length === 0) {
     return (
       <div className="empty">
-        {reviews.isPending
-          ? "Loading reviews…"
-          : "No review has been requested for this run's work yet."}
+        {emptyNote(
+          reviews,
+          "Loading reviews…",
+          "No review has been requested for this run's work yet.",
+        )}
       </div>
     );
   }
@@ -1381,7 +1414,7 @@ function RoomPanel({ issue, roster }: { issue: string; roster: readonly string[]
       ))}
       {posts.length === 0 ? (
         <div className="empty">
-          {room.isPending ? "Loading room…" : "No room posts reference this ticket."}
+          {emptyNote(room, "Loading room…", "No room posts reference this ticket.")}
         </div>
       ) : null}
     </div>
@@ -1415,7 +1448,7 @@ function MemoryPanel({
         ))}
         {facts.data.length === 0 ? (
           <div className="empty">
-            {facts.isPending ? "Loading memory…" : "No facts were retained from this ticket."}
+            {emptyNote(facts, "Loading memory…", "No facts were retained from this ticket.")}
           </div>
         ) : null}
       </div>
@@ -1457,21 +1490,26 @@ function MessagesPanel({
   draft,
   onDraft,
   focus,
+  onFocused,
 }: {
   runId: number;
   live: boolean;
   draft: string;
   onDraft: (text: string) => void;
-  /** A focus request from the header's Message action; 0 means it has never asked. */
-  focus: number;
+  /** Whether the header's Message action is waiting for the cursor to land in the composer. */
+  focus: boolean;
+  /** Consumes that request, so a later plain tab click does not re-steal the focus. */
+  onFocused: () => void;
 }) {
   const messages = useRunMessages(runId, live);
   const send = useSendRunMessage(runId);
   const [problem, setProblem] = useState("");
   const box = useRef<HTMLTextAreaElement | null>(null);
   useEffect(() => {
-    if (focus > 0) box.current?.focus();
-  }, [focus]);
+    if (!focus) return;
+    box.current?.focus();
+    onFocused();
+  }, [focus, onFocused]);
 
   const submit = () => {
     const body = draft.trim();
@@ -1503,9 +1541,11 @@ function MessagesPanel({
         })}
         {rows.length === 0 ? (
           <div className="empty">
-            {messages.isPending
-              ? "Loading messages…"
-              : "No message has been sent to this run's agent."}
+            {emptyNote(
+              messages,
+              "Loading messages…",
+              "No message has been sent to this run's agent.",
+            )}
           </div>
         ) : null}
       </div>
@@ -1595,7 +1635,12 @@ function AskDock({ run, who }: { run: RunSummary; who: string }) {
         }
         value={question}
         disabled={post.isPending}
-        onChange={(e) => setQuestion(e.target.value)}
+        onChange={(e) => {
+          setQuestion(e.target.value);
+          // The receipt is about the question that LANDED. The moment the operator starts writing
+          // the next one, a lingering "Posted to the room" is a claim about text nobody has sent.
+          setAsked(false);
+        }}
         onKeyDown={(e) => {
           if (e.key === "Enter" && !e.nativeEvent.isComposing) {
             e.preventDefault();

@@ -88,6 +88,9 @@
 .rh-console .tline .tt2 { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); margin-left: auto; flex: none; }
 .rh-console .tline code { font-size: 11px; }
 
+/* DORMANT since STUDIO-745: the §4 pull-request card these style was replaced by the run detail's
+   watch-tabs Diff tab. Kept with the model and glyphs that draw it (see `lib/console-job-detail`)
+   for slice 7's live Merge; nothing renders `.checks`/`.chk`/`.prnote` today. */
 .rh-console .checks { padding: 4px 14px 8px; }
 .rh-console .chk { display: flex; align-items: center; gap: 9px; padding: 6px 0; font-size: 12.5px; border-bottom: 1px solid var(--line-soft); }
 .rh-console .chk:last-child { border-bottom: 0; }

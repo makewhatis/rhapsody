@@ -988,9 +988,17 @@ describe("Room · this ticket / Memory from this ticket (§3C)", () => {
     mountDetail([run({ id: 1 })]);
     await settleTrace();
 
-    await waitFor(() => expect(panel().textContent).toContain("Teams is off on this daemon"));
+    // The WHOLE sentence, not its prefix: a `so there is no {noun phrase}` join renders as
+    // "…so there is no the room posts about this ticket." and a prefix assertion never sees it.
+    await waitFor(() =>
+      expect(panel().textContent).toBe(
+        "Teams is off on this daemon, so there is no room for anyone to post in.",
+      ),
+    );
     await openTab("Memory");
-    expect(panel().textContent).toContain("Teams is off on this daemon");
+    expect(panel().textContent).toBe(
+      "Teams is off on this daemon, so this ticket's runs retained no memory to show.",
+    );
     expect(h.fetchTeamsRoom).not.toHaveBeenCalled();
     expect(h.fetchTeamsRecall).not.toHaveBeenCalled();
     // And there is no room to ask into either, so the dock is not offered.
@@ -1070,6 +1078,34 @@ describe("Messages — the composer and its timeline (§3C)", () => {
     expect(screen.getAllByLabelText(/message the running agent/i)).toHaveLength(1);
   });
 
+  // The focus request is CONSUMED. A monotonic counter re-fired on every later mount of the panel,
+  // so merely clicking the Messages tab ejected a keyboard user out of the tablist and into the
+  // textarea, and scrolled the page under a mouse user.
+  it("does not re-steal focus when the operator later just clicks the Messages tab", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+
+    fireEvent.click(action(/^message/i));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByLabelText(/message the running agent/i)),
+    );
+
+    await openTab("Room");
+    const tab = screen.getByRole("tab", { name: /^messages/i });
+    tab.focus();
+    fireEvent.click(tab);
+    await waitFor(() => expect(screen.queryByLabelText(/message the running agent/i)).toBeTruthy());
+    // The tab the operator activated keeps the focus; the composer does not take it back.
+    expect(document.activeElement).toBe(tab);
+
+    // But asking AGAIN through the header still lands the cursor in the box.
+    fireEvent.click(action(/^message/i));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByLabelText(/message the running agent/i)),
+    );
+  });
+
   // Reading the room mid-compose must not throw away what the operator typed, which is why the
   // draft is held above the panel that unmounts.
   it("keeps a half-written message across a trip to another tab", async () => {
@@ -1105,6 +1141,49 @@ describe("Messages — the composer and its timeline (§3C)", () => {
         (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
       ).toBe(""),
     );
+  });
+});
+
+// A settled react-query ERROR is not `isPending`, so branching on that alone states the empty copy
+// as fact about a read that never landed. The Messages one is the damaging case: an operator told
+// "no message has been sent" answers it by sending the same message a second time.
+describe("a failed read is never reported as an empty one", () => {
+  const cases = [
+    { tab: "Messages", none: /No message has been sent/i, fail: () => h.fetchRunMessages.mockRejectedValue(new Error("boom")) },
+    { tab: "Review", none: /No review has been requested/i, fail: () => h.fetchReviews.mockRejectedValue(new Error("boom")) },
+  ];
+
+  for (const c of cases) {
+    it(`says the ${c.tab} read failed rather than that there is nothing`, async () => {
+      h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+      c.fail();
+      mountDetail([run({ id: 547 })]);
+      await settleTrace();
+      await openTab(c.tab);
+      await waitFor(() => expect(panel().textContent).toContain("the request failed"));
+      expect(panel().textContent).not.toMatch(c.none);
+    });
+  }
+
+  it("says the room read failed rather than that nobody mentioned this ticket", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    h.fetchTeamsRoom.mockRejectedValue(new Error("boom"));
+    await settleTrace();
+    await waitFor(() => expect(panel().textContent).toContain("the request failed"));
+    expect(panel().textContent).not.toMatch(/No room posts reference/i);
+  });
+
+  // One bank failing is enough: "no facts were retained" would otherwise be asserted about a
+  // teammate's memory the console could not read.
+  it("says the memory read failed when any one teammate's bank cannot be read", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    h.fetchTeamsRecall.mockRejectedValue(new Error("boom"));
+    await settleTrace();
+    await openTab("Memory");
+    await waitFor(() => expect(panel().textContent).toContain("the request failed"));
+    expect(panel().textContent).not.toMatch(/No facts were retained/i);
   });
 });
 
@@ -1214,6 +1293,37 @@ describe("the ask dock (§6)", () => {
     // no endpoint serves yet (design record §8).
     await waitFor(() => expect(screen.getByText(/posted to the room/i)).toBeTruthy());
     expect((box as HTMLInputElement).value).toBe("");
+  });
+
+  // The dock's whole claim is that the question is about THIS attempt (that is what `refs` says),
+  // so an unsent one must not ride an attempt switch and be posted refed to a run it was never
+  // about — the same rule the composer's draft follows.
+  it("drops an unsent question, and its receipt, when the operator switches attempt", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.postTeamsRoom.mockResolvedValue({
+      id: "f:9", from: "operator", to: "*", at: "2026-09-03T10:00:00Z", refs: [], delivered: 0,
+    });
+    mountDetail([run({ id: 547 }), run({ id: 522 })]);
+    await settleTrace();
+
+    // A question that DID land leaves a receipt…
+    fireEvent.change(screen.getByLabelText(/ask about this run/i), { target: { value: "why?" } });
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+    await waitFor(() => expect(screen.getByText(/posted to the room/i)).toBeTruthy());
+    // …which is about the question that landed, not about the next one being written.
+    fireEvent.change(screen.getByLabelText(/ask about this run/i), {
+      target: { value: "why did run 547 fail?" },
+    });
+    expect(screen.queryByText(/posted to the room/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    await waitFor(() =>
+      expect((screen.getByLabelText(/ask about this run/i) as HTMLInputElement).value).toBe(""),
+    );
+    // And nothing about run 547 was posted refed to run 522.
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+    await flushSend();
+    expect(h.postTeamsRoom).toHaveBeenCalledExactlyOnceWith("why?", ["STUDIO-654", "run 547"]);
   });
 
   it("refuses an empty question rather than posting one", async () => {
