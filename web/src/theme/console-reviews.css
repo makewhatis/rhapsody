@@ -1,0 +1,45 @@
+/* ============================================================================
+   Rhapsody Console — the Reviews surface (STUDIO-722, slice 8)
+
+   The ticketless review watch set, and the two operator controls §15-e moves
+   off the team room and onto this console. It composes §1's components and
+   §2's table (`.jtbl`, `theme/console-views.css`); everything here is the small
+   delta that table needs when its rows hold buttons instead of navigating.
+
+   Scoped under `.rh-console` for the same reason every other view file is, and
+   declaring no color of its own — every value is a token.
+   ============================================================================ */
+
+/* The Active/All filter, laid out like the Jobs worklist's own filter bar. */
+.rh-console .rfilters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+
+/* A quiet aside: the retired count beside the filter, and the "retired" marker that stands in for
+   the controls on a row there is nothing left to steer on. */
+.rh-console .hint { color: var(--ink-4); font-size: 11.5px; }
+
+/* A review row is not an activation target — it holds two buttons, and a row that also navigated
+   would make every click ambiguous. So it takes back the pointer and the hover the worklist's rows
+   declare, and keeps only the hairline. */
+.rh-console .rtbl tbody tr { cursor: default; }
+.rh-console .rtbl tbody tr:hover { background: transparent; }
+
+/* The pull-request cell's link wraps a chip; it must not also carry the browser's underline. */
+.rh-console .rtbl a.ti { text-decoration: none; display: inline-block; }
+
+/* The controls, right-aligned and out of the reading column. */
+.rh-console .rtbl .rctl { text-align: right; white-space: nowrap; }
+.rh-console .rtbl .rctl .btn + .btn { margin-left: 8px; }
+
+/* A header a screen reader reads and the eye does not: the controls column has no visible title,
+   but a `<th>` with no accessible name leaves its cells unlabelled. */
+.rh-console .sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}

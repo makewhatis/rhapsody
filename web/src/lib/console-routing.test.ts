@@ -51,6 +51,7 @@ describe("consoleRouteHash", () => {
       { name: "teams", key: "" },
       { name: "memory", key: "" },
       { name: "manage", key: "" },
+      { name: "reviews", key: "" },
       { name: "settings", key: "" },
     ] as const;
     for (const r of routes) {
@@ -93,6 +94,9 @@ describe("consoleNavFor", () => {
   it("highlights the parent of a child route", () => {
     expect(consoleNavFor({ name: "job", key: "STUDIO-654" })).toBe("jobs");
     expect(consoleNavFor({ name: "manage", key: "" })).toBe("teams");
+    // The Reviews surface (STUDIO-722) is a Teams child like Manage team, so it lights the Teams
+    // rail item rather than adding one of its own.
+    expect(consoleNavFor({ name: "reviews", key: "" })).toBe("teams");
   });
 
   it("highlights a top-level route itself", () => {
