@@ -70,6 +70,7 @@ pub mod snapshot;
 pub mod snapshot_json;
 pub mod stop;
 pub mod teams;
+pub mod teamsanswer;
 mod teamscompose;
 pub mod teamsears;
 pub mod teamsknow;
@@ -121,9 +122,9 @@ pub use teamsprefetch::{
     PrefetchTarget, prefetch_enabled, run_prefetch_schedule,
 };
 pub use triage::{
-    ClaudeTriageArbiter, IdentityHistory, MAX_TRIAGE_BACKOFF_MS, StoreIdentityHistory,
-    TRIAGE_INTERVAL, TriageArbiter, TriageDecision, TriageDeps, TriageHandle, TriageRequest,
-    TriageTarget, run_triage_schedule, triage_enabled,
+    ClaudeTriageArbiter, IdentityHistory, KnowledgeDeps, MAX_TRIAGE_BACKOFF_MS,
+    StoreIdentityHistory, TRIAGE_INTERVAL, TriageArbiter, TriageDecision, TriageDeps, TriageHandle,
+    TriageRequest, TriageTarget, run_triage_schedule, triage_enabled,
 };
 pub use worker::{WorkerDeps, WorkerError, run_agent_attempt};
 pub use workspace_gc::WorkspaceGcPlan;
