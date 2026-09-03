@@ -460,26 +460,52 @@ describe("failingStep — where 'jump to failing step' lands", () => {
   });
 });
 
-describe("runTeammate — who a run was, from fields the daemon actually serves", () => {
+describe("runTeammate — who a run was, from the records the daemon actually keeps", () => {
+  const ROUTED = new Map([
+    [522, "alice"],
+    [547, "jimmy"],
+  ]);
+  const NONE = new Map<number, string>();
+
   it("reads a ticketless review run's reviewer out of its own `pr:` key", () => {
     expect(
-      runTeammate(run({ issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" }), "alice"),
+      runTeammate(run({ issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" }), NONE, "alice"),
     ).toBe("jimmy");
   });
 
-  it("falls back to the ticket's durable assignee for a tracker run", () => {
-    expect(runTeammate(run({ issue_identifier: "STUDIO-744" }), "alice")).toBe("alice");
+  // STUDIO-746 — the durable record, which is what survives the run: it outranks the live roster,
+  // and it answers for an attempt the live roster has never heard of.
+  it("names a run from its OWN durable dispatch identity, over the live fallback", () => {
+    expect(runTeammate(run({ id: 547, issue_identifier: "STUDIO-746" }), ROUTED, "alice")).toBe(
+      "jimmy",
+    );
+    expect(runTeammate(run({ id: 522, issue_identifier: "STUDIO-746" }), ROUTED, "")).toBe("alice");
+  });
+
+  it("falls back to the live roster only for a run with no durable record at all", () => {
+    expect(runTeammate(run({ id: 999, issue_identifier: "STUDIO-746" }), ROUTED, "alice")).toBe(
+      "alice",
+    );
+  });
+
+  // The tri-state's whole point: a run whose ledger says it routed to NOBODY is not a run whose
+  // teammate is merely unknown, so the live roster must not answer for it.
+  it("names nobody for a run recorded as unrouted, rather than borrowing the live name", () => {
+    const unrouted = new Map([[547, ""]]);
+    expect(runTeammate(run({ id: 547, issue_identifier: "STUDIO-746" }), unrouted, "alice")).toBe(
+      "",
+    );
   });
 
   it("names nobody rather than guessing, when there is nobody to name", () => {
-    expect(runTeammate(run({ issue_identifier: "STUDIO-744" }), "")).toBe("");
-    expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1@" }), "")).toBe("");
+    expect(runTeammate(run({ issue_identifier: "STUDIO-744" }), NONE, "")).toBe("");
+    expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1@" }), NONE, "")).toBe("");
   });
 
   // The `@` is what makes the suffix a name. Without one there is no reviewer in the key, and
   // slicing from a `lastIndexOf` of -1 would render the whole coordinate as a teammate.
   it("names nobody for a `pr:` key carrying no reviewer at all", () => {
-    expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1" }), "alice")).toBe("");
+    expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1" }), NONE, "alice")).toBe("");
   });
 });
 
@@ -487,37 +513,58 @@ describe("relayBatons — the handoff baton the attempt selector switches betwee
   const older = run({ id: 522, started_at: "2026-09-03T08:00:00Z" });
   const newer = run({ id: 547, started_at: "2026-09-03T10:00:00Z" });
   const relay = [newer, older]; // newest-first, as `runsNewestFirst` orders it
+  const NONE = new Map<number, string>();
 
   it("hands the baton IN to a run that follows another, naming both teammates", () => {
     const review = run({ id: 547, issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" });
-    const { incoming, outgoing } = relayBatons([review, older], review, "alice");
+    const { incoming, outgoing } = relayBatons([review, older], review, NONE, "alice");
     expect(incoming).toEqual({ from: "alice", to: "jimmy", text: "alice → jimmy" });
     expect(outgoing).toBeNull();
   });
 
   it("hands the baton OUT of the run its successor picked up from", () => {
     const review = run({ id: 547, issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" });
-    const { incoming, outgoing } = relayBatons([review, older], older, "alice");
+    const { incoming, outgoing } = relayBatons([review, older], older, NONE, "alice");
     expect(incoming).toBeNull();
     expect(outgoing).toEqual({ from: "alice", to: "jimmy", text: "alice → jimmy" });
   });
 
+  // STUDIO-746 — the relay the design record's §6 is actually about: two attempts of ONE ticket,
+  // each naming the teammate its own dispatch recorded. Before the per-run identity both sides
+  // resolved to the ticket's single name and the row could only say "run 522 → run 547".
+  it("names each attempt's OWN teammate across an implement→review relay", () => {
+    const identities = new Map([
+      [522, "alice"],
+      [547, "jimmy"],
+    ]);
+    expect(relayBatons(relay, newer, identities, "").incoming).toEqual({
+      from: "alice",
+      to: "jimmy",
+      text: "alice → jimmy",
+    });
+    expect(relayBatons(relay, older, identities, "").outgoing).toEqual({
+      from: "alice",
+      to: "jimmy",
+      text: "alice → jimmy",
+    });
+  });
+
   it("names the runs, not a teammate handing to herself, when one identity covers both", () => {
-    const { incoming } = relayBatons(relay, newer, "alice");
+    const { incoming } = relayBatons(relay, newer, NONE, "alice");
     expect(incoming).toEqual({ from: "alice", to: "alice", text: "alice · run 522 → run 547" });
   });
 
   it("still marks the relay when no teammate resolves at all", () => {
-    const { incoming } = relayBatons(relay, newer, "");
+    const { incoming } = relayBatons(relay, newer, NONE, "");
     expect(incoming).toEqual({ from: "", to: "", text: "run 522 → run 547" });
   });
 
   it("gives a ticket's only run no baton in either direction", () => {
-    expect(relayBatons([newer], newer, "alice")).toEqual({ incoming: null, outgoing: null });
+    expect(relayBatons([newer], newer, NONE, "alice")).toEqual({ incoming: null, outgoing: null });
   });
 
   it("gives a run the list does not contain no baton, rather than guessing a neighbour", () => {
-    expect(relayBatons(relay, run({ id: 999 }), "alice")).toEqual({
+    expect(relayBatons(relay, run({ id: 999 }), NONE, "alice")).toEqual({
       incoming: null,
       outgoing: null,
     });

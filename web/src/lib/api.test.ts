@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   fetchDaySummary,
   fetchIssueRuns,
+  fetchRunIdentityEvents,
   fetchRunMessages,
   fetchState,
   fetchVersion,
@@ -273,5 +274,54 @@ describe("fetchVersion", () => {
     expect(v.commit).toBe("581e28193d420970a04d545e65087ebf9bbc45e4");
     expect(v.version).toBe("v0.3.1-8-g581e281");
     expect(v.built_at).toBe("2026-08-13T16:10:35Z");
+  });
+});
+
+// STUDIO-746 — the run detail's durable per-run attribution. The routing rows are the daemon's own
+// record of who a run was dispatched as; one bounded search covers every attempt of a ticket
+// because a dispatch writes exactly one of them.
+describe("run identity events (STUDIO-746)", () => {
+  it("asks the event search for BOTH routing kinds, scoped to the ticket", async () => {
+    const fetchMock = vi.fn(async (url: string) =>
+      new Response(
+        JSON.stringify({
+          hits: [
+            {
+              run_id: url.includes("unrouted") ? 522 : 547,
+              issue_identifier: "STUDIO-746",
+              seq: 1,
+              at: "",
+              kind: url.includes("unrouted") ? "teams.unrouted" : "teams.route",
+              tool: "",
+              text: url.includes("unrouted") ? "reason=solo" : "identity=alice reason=label",
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const hits = await fetchRunIdentityEvents("STUDIO-746");
+    const asked = fetchMock.mock.calls.map((c) => c[0]);
+    expect(asked).toContain("/api/v1/events?issue=STUDIO-746&kind=teams.route&limit=100");
+    expect(asked).toContain("/api/v1/events?issue=STUDIO-746&kind=teams.unrouted&limit=100");
+    expect(hits.map((h) => h.run_id).sort()).toEqual([522, 547]);
+  });
+
+  it("percent-encodes a ticketless review run's own `pr:` key", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string) => new Response(JSON.stringify({ hits: [] }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchRunIdentityEvents("pr:makewhatis/rhapsody#12@jimmy");
+    for (const [url] of fetchMock.mock.calls) {
+      expect(url).toContain("issue=pr%3Amakewhatis%2Frhapsody%2312%40jimmy");
+    }
+  });
+
+  it("tolerates a null/omitted hits array so the model can fold safely", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchRunIdentityEvents("STUDIO-746")).toEqual([]);
   });
 });

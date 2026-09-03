@@ -24,6 +24,7 @@ import { teammateColor } from "@/theme/teammates";
 import {
   useIssueHistory,
   useRunDetail,
+  useRunIdentityEvents,
   useRunMessages,
   useTranscript,
 } from "@/hooks/useRunDetail";
@@ -81,11 +82,13 @@ import {
   type WatchTabId,
 } from "@/lib/console-watch";
 import { reviewRow } from "@/lib/reviews-model";
+import { runIdentities } from "@/lib/run-identity";
 import {
   baseToolName,
   buildResult,
   buildTrace,
   type DidCard,
+  type PhaseKind,
   type ResultCard,
   type SaidBlock,
   type TracePhase,
@@ -117,6 +120,11 @@ import "@/theme/console-trace.css";
 // trace now live, joined by the run's operator-message timeline and an "Ask about this run" dock
 // that posts to the room refed to the run (§6).
 //
+// Slice 5 (STUDIO-746) wires the DURABLE per-run identity through all of it: the header keeps a
+// finished run's assignee once its teammate has left the live roster, the spine signs the steps
+// that changed something the team can see, and the baton names each attempt's own teammate so a
+// multi-agent ticket reads as a real relay (§3A/§3C/§6). Its source is `lib/run-identity`.
+//
 // The model behind all three zones is `lib/trace-model` (slice 1) and `lib/console-trace-view`;
 // the rail's own is `lib/console-watch`. Nothing here re-derives them. What no endpoint serves is
 // still not invented: there is no PR number (§5), so "View PR" resolves through a head-branch
@@ -134,14 +142,40 @@ export function JobDetailView({
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
 
+  // The ticket's DURABLE routing rows — who each attempt was dispatched as (STUDIO-746). Fetched
+  // beside the attempt list because it answers the same question that list does, and because it is
+  // the whole ticket's answer: the baton needs the NEIGHBOURING attempt's teammate, not only the
+  // one being read.
+  //
+  // Deliberately NOT gated on `teamsEnabled`, unlike every other Teams read on this page. That
+  // flag is the daemon's CURRENT one, and these rows were written when the runs happened: a
+  // daemon that ran a team and has since been switched to Teams-off still holds every one of
+  // them, so gating would blank the attribution on exactly the history this slice exists to keep.
+  // The cost of being wrong the other way is two sub-millisecond searches answering "no rows".
+  const identityEvents = useRunIdentityEvents(issue);
+  const identities = useMemo(() => runIdentities(identityEvents.data ?? []), [identityEvents.data]);
+  // The search's own load state travels WITH its map, the way `rosterRead` travels with the roster
+  // — because an empty map is not one answer but three. "Nothing fetched yet", "the fetch failed"
+  // and "this ticket has no routing row" are indistinguishable in the map alone, and only the last
+  // of them is the documented live-roster fallback.
+  const identityRead = { isPending: identityEvents.isPending, isError: identityEvents.isError };
+
   const runs = useMemo(() => runsNewestFirst(history.data?.runs ?? []), [history.data]);
   // The attempt the zones render. `null` follows the newest run, so a ticket that gains a run
   // while the page is open moves with it; picking an attempt pins the choice.
   const [pinned, setPinned] = useState<number | null>(null);
   const run = runs.find((r) => r.id === pinned) ?? runs[0];
-  // Live-only for now: a stored run row carries no identity. STUDIO-735's per-run `identity` is
-  // wired into this header — and into the spine's attribution — by slice 5.
-  const assignee = ticketAssignees(overview.data).get(issue) ?? "";
+  // The live roster, which only ever names a RUNNING ticket — the gap-filler behind the durable
+  // record for a run whose ledger has no routing row at all (`runTeammate`).
+  //
+  // Withheld until the durable read has SUCCEEDED, because "no routing row" is the ONLY state it
+  // answers for. Handed an in-flight or failed search it answers for those too, and then a
+  // completed, unrouted run whose ticket has since been re-dispatched is captioned with whoever
+  // holds it right now — avatar, ramp colour and all — for a run its own ledger says had nobody.
+  // That is the same fabrication `fetchRunIdentityEvents` refuses `allSettled` to avoid, one layer
+  // up: no answer YET is not "no record", and a search that failed never became one either.
+  const identityKnown = !identityRead.isPending && !identityRead.isError;
+  const assignee = identityKnown ? (ticketAssignees(overview.data).get(issue) ?? "") : "";
   const roster = (overview.data?.roster ?? []).map((m) => m.name);
   // The roster is a PREREQUISITE read, not just a list: a memory bank is per identity, so with no
   // roster there is nobody to recall from and `useTicketFacts` fires nothing at all — settling as
@@ -176,6 +210,8 @@ export function JobDetailView({
         <RunTrace
           run={run}
           runs={runs}
+          identities={identities}
+          identityRead={identityRead}
           assignee={assignee}
           roster={roster}
           rosterRead={rosterRead}
@@ -194,6 +230,8 @@ export function JobDetailView({
 function RunTrace({
   run,
   runs,
+  identities,
+  identityRead,
   assignee,
   roster,
   rosterRead,
@@ -205,6 +243,10 @@ function RunTrace({
 }: {
   run: RunSummary;
   runs: readonly RunSummary[];
+  /** Run id → the teammate that run was dispatched as; see `lib/run-identity` for the tri-state. */
+  identities: ReadonlyMap<number, string>;
+  /** How that map's own fetch is going — an empty map means nothing without it. */
+  identityRead: QueryState;
   assignee: string;
   roster: readonly string[];
   /** How the roster's own fetch is going — the Memory tab's read depends on it. */
@@ -227,10 +269,14 @@ function RunTrace({
   const trace = useMemo(() => buildTrace(entries), [entries]);
   const result = useMemo(() => buildResult(entries, live), [entries, live]);
   const vitals = runVitals(live, trace.phases);
-  const batons = useMemo(() => relayBatons(runs, run, assignee), [runs, run, assignee]);
-  // Resolved ONCE, so the header's avatar and the inspector's "what <who> did" can never disagree
-  // about whose run this is — they did while only the header knew about a review key.
-  const who = runTeammate(run, assignee);
+  const batons = useMemo(
+    () => relayBatons(runs, run, identities, assignee),
+    [runs, run, identities, assignee],
+  );
+  // Resolved ONCE, so the header's avatar, the spine's signed steps and the inspector's
+  // "what <who> did" can never disagree about whose run this is — they did while only the header
+  // knew about a review key.
+  const who = runTeammate(run, identities, assignee);
   const [raw, setRaw] = useState(false);
   // The rail's selection, and the draft in its composer. Both live HERE rather than in the panel
   // so that reading the room, then coming back, does not silently discard a half-written
@@ -279,6 +325,7 @@ function RunTrace({
         run={live}
         runs={runs}
         who={who}
+        resolvingWho={identityRead.isPending}
         roster={roster}
         vitals={vitals}
         inFlight={inFlight}
@@ -329,6 +376,7 @@ function RunTrace({
             key={run.id}
             phases={trace.phases}
             who={who}
+            roster={roster}
             pending={transcript.isPending}
             live={inFlight}
             batons={batons}
@@ -401,6 +449,7 @@ function TraceHeader({
   run,
   runs,
   who,
+  resolvingWho,
   roster,
   vitals,
   inFlight,
@@ -414,6 +463,8 @@ function TraceHeader({
   runs: readonly RunSummary[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
+  /** Whether the durable routing search may still name one — see the assignee slot below. */
+  resolvingWho: boolean;
   roster: readonly string[];
   vitals: RunVitals;
   inFlight: boolean;
@@ -433,11 +484,26 @@ function TraceHeader({
         <div className="k">{run.issue_identifier}</div>
         <h1>{run.title === "" ? run.issue_identifier : run.title}</h1>
       </div>
-      {who === "" ? null : (
+      {/* The persistent assignee (§3A). A run nothing can name keeps the slot and reads "—":
+          the header's job is to say who ran this, and an omitted element says nothing at all —
+          which is indistinguishable from a layout that forgot to render it.
+
+          While the durable search is still in flight the slot is kept but says NOTHING, for the
+          same reason the Result card's headline waits: "—" is an assertion that this run had
+          nobody, and it would be a wrong one for every routed run. Only a search that has
+          answered gets to fill the slot. A ticketless review run is named by its own key and
+          never reaches this. */}
+      {who !== "" ? (
         <span className="who2">
           <TeammateAvatar color={teammateColor(roster, who)} size={7} />
           {who}
         </span>
+      ) : resolvingWho ? (
+        <span className="whoskel" role="status">
+          <span className="vh">Resolving who ran this…</span>
+        </span>
+      ) : (
+        <span className="who2 none">—</span>
       )}
       <Pill variant={runOutcomePill(run.outcome)}>
         {run.outcome === "" ? "unknown" : run.outcome}
@@ -445,10 +511,9 @@ function TraceHeader({
       {/* The live pulse (§3A). Decorative beside the outcome pill, which already says "running"
           in words — a screen reader that announced a second "live" would only repeat it. */}
       {inFlight ? <span className="trpulse" aria-hidden="true" /> : null}
-      {/* The attempt selector — the implement→revise relay. Switching swaps the Result card and
-          the spine to that run, and the spine draws the handoff baton either side of it
-          (`relayBatons`); each attempt's OWN teammate is slice 5, which is why the baton names
-          the runs when one ticket identity covers both.
+      {/* The attempt selector — the implement→revise relay. Switching swaps the Result card, the
+          spine and the header's assignee to that run, and the spine draws the handoff baton
+          either side of it (`relayBatons`), naming each attempt's own teammate.
 
           Labelled by RUN ID, not by `attempt`: the daemon only increments `attempt` on the retry
           path, so a ticket re-summoned or re-dispatched records every one of its runs as attempt
@@ -702,6 +767,7 @@ function ResultCardZone({
 function TraceSplit({
   phases,
   who,
+  roster,
   pending,
   live,
   batons,
@@ -711,6 +777,7 @@ function TraceSplit({
   phases: readonly TracePhase[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
+  roster: readonly string[];
   pending: boolean;
   /** Whether this attempt is still streaming — what turns the spine into a playhead (§3C). */
   live: boolean;
@@ -793,6 +860,8 @@ function TraceSplit({
           <SpineStep
             key={phase.id}
             phase={phase}
+            who={who}
+            roster={roster}
             selected={phase.id === selected?.id}
             playing={phase.id === playing?.id}
             onSelect={() => setPicked(phase.id)}
@@ -964,18 +1033,37 @@ function BatonRow({ baton, direction }: { baton: Baton; direction: "in" | "out" 
   );
 }
 
+/**
+ * The phases a step is SIGNED with its teammate on (§6, "persistent assignee on the header and
+ * every post/handoff step").
+ *
+ * These two and no others, because these are the steps whose effect leaves the run: a room post and
+ * a retained fact are read back into a teammate's later prompts, and a hand-off moves the ticket.
+ * Whose they were is part of what they mean. Reading and editing are the agent's own work inside
+ * its own worktree — signing every step would just repeat the header on every row.
+ */
+const SIGNED_PHASES: ReadonlySet<PhaseKind> = new Set<PhaseKind>(["coordinated", "handoff"]);
+
 function SpineStep({
   phase,
+  who,
+  roster,
   selected,
   playing,
   onSelect,
 }: {
   phase: TracePhase;
+  /** The teammate this attempt is attributed to; "" when none resolves. */
+  who: string;
+  roster: readonly string[];
   selected: boolean;
   /** The playhead sits here — the newest phase of a run that is still streaming. */
   playing: boolean;
   onSelect: () => void;
 }) {
+  // Unattributed rather than guessed: a step signed with a name nothing recorded would put words
+  // in a teammate's mouth about a post the room can be read back for.
+  const signed = who !== "" && SIGNED_PHASES.has(phase.kind);
   return (
     <button
       type="button"
@@ -987,7 +1075,15 @@ function SpineStep({
         {phaseGlyph(phase.kind)}
       </span>
       <span className="txt">
-        <span className="stt">{phase.title}</span>
+        <span className="sthd">
+          <span className="stt">{phase.title}</span>
+          {signed ? (
+            <span className="stwho">
+              <TeammateAvatar color={teammateColor(roster, who)} size={6} />
+              <span className="n">{who}</span>
+            </span>
+          ) : null}
+        </span>
         {phase.subtitle === "" ? null : <span className="ssub">{phase.subtitle}</span>}
         {phase.effects.length === 0 ? null : (
           <span className="fx">
