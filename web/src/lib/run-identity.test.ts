@@ -63,12 +63,44 @@ describe("runIdentities — the ticket's per-run dispatch record, keyed by run",
     expect(map.has(999)).toBe(false);
   });
 
-  it("keeps the lowest-seq row when a run somehow carries more than one", () => {
+  // The daemon probes `teams.route` FIRST and returns it unconditionally; its unrouted probe only
+  // runs for a run that recorded no route (`run_identity`, crates/orchestrator/src/lifecycle.rs).
+  // Letting the two kinds compete on `seq` instead would resolve a run carrying both by whichever
+  // came first — and answer a DEFINITE nobody for a run the daemon reads as routed.
+  it("prefers a route row over an unrouted one, whatever their seqs", () => {
+    const both = (routeSeq: number, unroutedSeq: number) =>
+      runIdentities([
+        hit({ run_id: 547, seq: routeSeq, text: "identity=alice reason=label" }),
+        hit({ run_id: 547, seq: unroutedSeq, kind: UNROUTED_EVENT_KIND, text: "reason=solo" }),
+      ]).get(547);
+    expect(both(3, 1)).toBe("alice");
+    expect(both(1, 3)).toBe("alice");
+  });
+
+  // `search_events` orders `e.seq DESC` and the daemon's probe is `LIMIT 1`, so the HIGHEST seq is
+  // the row it reads. Not reachable today — every routing row in the real store sits at seq 1 and
+  // no run carries two — but the fold claims to mirror the daemon, so it has to mirror it here too.
+  it("keeps the highest-seq row when a run somehow carries more than one, as the daemon does", () => {
     const map = runIdentities([
-      hit({ run_id: 547, seq: 4, text: "identity=mallory reason=label" }),
+      hit({ run_id: 547, seq: 4, text: "identity=jimmy reason=label" }),
       hit({ run_id: 547, seq: 1, text: "identity=alice reason=label" }),
     ]);
-    expect(map.get(547)).toBe("alice");
+    expect(map.get(547)).toBe("jimmy");
+  });
+
+  // The daemon reads ONE route row and falls through to the unrouted probe when it carries no
+  // identity — it does not go looking for an older route row that parses, and neither does this.
+  it("falls through an unparseable top route row to the unrouted probe, not to an older route", () => {
+    const rows = [
+      hit({ run_id: 547, seq: 4, text: "reason=label" }),
+      hit({ run_id: 547, seq: 1, text: "identity=alice reason=label" }),
+    ];
+    expect(runIdentities(rows).has(547)).toBe(false);
+    const withUnrouted = runIdentities([
+      ...rows,
+      hit({ run_id: 547, seq: 2, kind: UNROUTED_EVENT_KIND, text: "reason=solo" }),
+    ]);
+    expect(withUnrouted.get(547)).toBe("");
   });
 
   it("ignores a row of any other kind, and a route row carrying no identity at all", () => {

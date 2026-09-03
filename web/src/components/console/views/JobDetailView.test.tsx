@@ -2199,7 +2199,8 @@ describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => 
     };
   }
 
-  /** A dispatch that routed to NOBODY — a solo, unmatched or Teams-off run. */
+  /** A dispatch that routed to NOBODY — a solo or unmatched run. (A Teams-OFF dispatch writes no
+      row at all, so it is "no record" and falls through to the live roster; see `run-identity`.) */
   function unrouted(run_id: number, reason: string) {
     return { ...routed(run_id, "x"), kind: "teams.unrouted", text: `reason=${reason}` };
   }
@@ -2295,6 +2296,59 @@ describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => 
       expect(document.querySelector(".trbaton.out")?.textContent).toContain("alice → jimmy"),
     );
     expect(document.querySelector(".trhd .who2")?.textContent).toContain("alice");
+  });
+
+  /** The live roster WITH the ticket — a re-dispatch holds it now, whoever ran the old attempt. */
+  function rosterHoldingTheTicket(name: string) {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [teammate(name)],
+    });
+  }
+
+  // The live-roster fallback belongs to ONE state — "this ticket has no routing row for the run".
+  // Reading it off an empty map also handed it "the search has not answered yet", which let the
+  // header confidently name whoever holds the ticket RIGHT NOW for a run whose own ledger says
+  // nobody, and then flip to "—". So the fallback waits for the search to settle.
+  it("holds the assignee slot while the routing search is in flight, rather than naming the live teammate", async () => {
+    let release: () => void = () => {};
+    h.fetchRunIdentityEvents.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve([unrouted(547, "solo")]);
+        }),
+    );
+    rosterHoldingTheTicket("jimmy"); // jimmy holds STUDIO-654 now; run 547 was not his
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    await settleTrace();
+
+    // The slot is KEPT — an omitted element reads as a layout that forgot to render it — but it
+    // states nothing, exactly as the Result card's headline waits rather than asserting a wrong one.
+    const held = document.querySelector(".trhd .whoskel");
+    expect(held?.getAttribute("role")).toBe("status");
+    expect(held?.textContent).toBe("Resolving who ran this…");
+    expect(document.querySelector(".trhd .who2")).toBeNull();
+    expect(document.querySelector(".trhd")?.textContent).not.toContain("jimmy");
+
+    release();
+    await waitFor(() => expect(document.querySelector(".trhd .who2")?.textContent).toBe("—"));
+    expect(document.querySelector(".trhd .whoskel")).toBeNull();
+  });
+
+  // The in-flight window is transient; this one is not. After react-query gives up, a failed
+  // search read off an empty map IS the fabrication permanently — "no answer" is not "no record".
+  it("names nobody rather than the live teammate when the routing search fails outright", async () => {
+    h.fetchRunIdentityEvents.mockRejectedValue(new Error("boom"));
+    rosterHoldingTheTicket("jimmy");
+    mountDetail([run({ id: 547, outcome: "completed" })]);
+    await settleTrace();
+    await waitFor(() => expect(document.querySelector(".trhd .who2")?.textContent).toBe("—"));
+    expect(document.querySelector(".trhd")?.textContent).not.toContain("jimmy");
+    // A failed read is not a pending one: the slot settles on "—" rather than holding forever.
+    expect(document.querySelector(".trhd .whoskel")).toBeNull();
   });
 
   // §6: "persistent assignee (735) on the header AND every post/handoff step". A room post or a

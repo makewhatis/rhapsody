@@ -15,9 +15,14 @@ import { ROUTE_EVENT_KIND, UNROUTED_EVENT_KIND, type EventHit } from "@/lib/api"
 //
 // The daemon's reading is a TRI-STATE (`crates/orchestrator/src/lifecycle.rs`) and so is this one:
 // a `teams.route` row NAMES a teammate; a `teams.unrouted` row answers "nobody" definitively —
-// the run itself said so, for a solo, unmatched or Teams-off dispatch; and a run with no row is
-// not an answer, which is what lets the caller fall back to the live roster instead of publishing
-// a "—" it has no grounds for.
+// the run itself said so, for a solo or unmatched dispatch; and a run with no row is not an
+// answer, which is what lets the caller fall back to the live roster instead of publishing a "—"
+// it has no grounds for.
+//
+// Teams-OFF belongs to the third case, not the second: `route_teams` returns `None` for
+// `RouteReason::Off` and writes no event at all (`crates/orchestrator/src/teams.rs`), precisely so
+// that turning Teams off carries no behavioural delta. A Teams-off run has NO record, and falls
+// through to the live roster like any other unrecorded one.
 
 /**
  * The identity out of a `teams.route` event's text, or "" when it carries none.
@@ -40,28 +45,46 @@ export function routeEventIdentity(text: string): string {
  * written before Teams. Those are different answers and the caller acts on them differently, so
  * they are kept apart here rather than both collapsing to "".
  *
- * A route row carrying no parseable identity is dropped rather than recorded as a nobody, which is
- * how the daemon reads it too: `lifecycle.rs` falls through such a row to the unrouted probe.
- * Rows arrive newest-run-first (`ORDER BY e.run_id DESC, e.seq DESC`), so the LOWEST seq wins —
- * a run has exactly one routing row today, and the earliest is the dispatch decision if that ever
- * stops being true.
+ * The fold mirrors `run_identity` (`crates/orchestrator/src/lifecycle.rs`) rather than inventing a
+ * second reading of the same rows, because the two are answering one question and a reader who
+ * checks the Rust should not find them disagreeing. That means, exactly as the daemon's two probes
+ * do:
+ *
+ * - A `teams.route` row wins UNCONDITIONALLY over a `teams.unrouted` one. The daemon probes route
+ *   first and returns it; its unrouted probe only runs for a run that recorded no route. Letting
+ *   the kinds compete on `seq` instead would resolve a run carrying both by whichever came first,
+ *   and could answer a DEFINITE nobody — which stops the caller, refusing even the live-roster
+ *   fallback — for a run the daemon reads as routed.
+ * - Within a kind the HIGHEST `seq` wins. Each probe is `LIMIT 1` against a search ordered
+ *   `ORDER BY e.run_id DESC, e.seq DESC` (`crates/store/src/sqlite.rs`), so the newest row is the
+ *   one the daemon reads. No run in the real store carries two routing rows today; this is what
+ *   the mirror says should happen if one ever does.
+ * - A route row carrying no parseable identity is no route at all and falls through to the
+ *   unrouted probe — and only to the unrouted probe. The daemon reads ONE route row and does not
+ *   go looking for an older one that parses, so neither does this.
  */
 export function runIdentities(hits: readonly EventHit[]): ReadonlyMap<number, string> {
-  const seqs = new Map<number, number>();
-  const byRun = new Map<number, string>();
-  const take = (hit: EventHit, name: string) => {
-    const seen = seqs.get(hit.run_id);
-    if (seen !== undefined && seen <= hit.seq) return;
-    seqs.set(hit.run_id, hit.seq);
-    byRun.set(hit.run_id, name);
-  };
+  // Each kind folded separately, to the row its own probe would have read.
+  const routes = new Map<number, EventHit>();
+  const unrouted = new Set<number>();
   for (const hit of hits) {
     if (hit.kind === ROUTE_EVENT_KIND) {
-      const name = routeEventIdentity(hit.text);
-      if (name !== "") take(hit, name);
+      const seen = routes.get(hit.run_id);
+      if (seen === undefined || hit.seq > seen.seq) routes.set(hit.run_id, hit);
     } else if (hit.kind === UNROUTED_EVENT_KIND) {
-      take(hit, "");
+      // No seq needed on this side: the daemon's unrouted probe only asks WHETHER a row exists
+      // (`Ok(Some(_))`), and every such row answers the same "nobody".
+      unrouted.add(hit.run_id);
     }
+  }
+  const byRun = new Map<number, string>();
+  for (const [runId, hit] of routes) {
+    const name = routeEventIdentity(hit.text);
+    if (name !== "") byRun.set(runId, name);
+  }
+  // Only the runs the route probe did not answer for, which is the daemon's own ordering.
+  for (const runId of unrouted) {
+    if (!byRun.has(runId)) byRun.set(runId, "");
   }
   return byRun;
 }

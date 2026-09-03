@@ -147,6 +147,11 @@ export function JobDetailView({
   // The cost of being wrong the other way is two sub-millisecond searches answering "no rows".
   const identityEvents = useRunIdentityEvents(issue);
   const identities = useMemo(() => runIdentities(identityEvents.data ?? []), [identityEvents.data]);
+  // The search's own load state travels WITH its map, the way `rosterRead` travels with the roster
+  // — because an empty map is not one answer but three. "Nothing fetched yet", "the fetch failed"
+  // and "this ticket has no routing row" are indistinguishable in the map alone, and only the last
+  // of them is the documented live-roster fallback.
+  const identityRead = { isPending: identityEvents.isPending, isError: identityEvents.isError };
 
   const runs = useMemo(() => runsNewestFirst(history.data?.runs ?? []), [history.data]);
   // The attempt the zones render. `null` follows the newest run, so a ticket that gains a run
@@ -155,7 +160,15 @@ export function JobDetailView({
   const run = runs.find((r) => r.id === pinned) ?? runs[0];
   // The live roster, which only ever names a RUNNING ticket — the gap-filler behind the durable
   // record for a run whose ledger has no routing row at all (`runTeammate`).
-  const assignee = ticketAssignees(overview.data).get(issue) ?? "";
+  //
+  // Withheld until the durable read has SUCCEEDED, because "no routing row" is the ONLY state it
+  // answers for. Handed an in-flight or failed search it answers for those too, and then a
+  // completed, unrouted run whose ticket has since been re-dispatched is captioned with whoever
+  // holds it right now — avatar, ramp colour and all — for a run its own ledger says had nobody.
+  // That is the same fabrication `fetchRunIdentityEvents` refuses `allSettled` to avoid, one layer
+  // up: no answer YET is not "no record", and a search that failed never became one either.
+  const identityKnown = !identityRead.isPending && !identityRead.isError;
+  const assignee = identityKnown ? (ticketAssignees(overview.data).get(issue) ?? "") : "";
   const roster = (overview.data?.roster ?? []).map((m) => m.name);
   // The roster is a PREREQUISITE read, not just a list: a memory bank is per identity, so with no
   // roster there is nobody to recall from and `useTicketFacts` fires nothing at all — settling as
@@ -191,6 +204,7 @@ export function JobDetailView({
           run={run}
           runs={runs}
           identities={identities}
+          identityRead={identityRead}
           assignee={assignee}
           roster={roster}
           rosterRead={rosterRead}
@@ -210,6 +224,7 @@ function RunTrace({
   run,
   runs,
   identities,
+  identityRead,
   assignee,
   roster,
   rosterRead,
@@ -223,6 +238,8 @@ function RunTrace({
   runs: readonly RunSummary[];
   /** Run id → the teammate that run was dispatched as; see `lib/run-identity` for the tri-state. */
   identities: ReadonlyMap<number, string>;
+  /** How that map's own fetch is going — an empty map means nothing without it. */
+  identityRead: QueryState;
   assignee: string;
   roster: readonly string[];
   /** How the roster's own fetch is going — the Memory tab's read depends on it. */
@@ -301,6 +318,7 @@ function RunTrace({
         run={live}
         runs={runs}
         who={who}
+        resolvingWho={identityRead.isPending}
         roster={roster}
         vitals={vitals}
         inFlight={inFlight}
@@ -416,6 +434,7 @@ function TraceHeader({
   run,
   runs,
   who,
+  resolvingWho,
   roster,
   vitals,
   inFlight,
@@ -429,6 +448,8 @@ function TraceHeader({
   runs: readonly RunSummary[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
+  /** Whether the durable routing search may still name one — see the assignee slot below. */
+  resolvingWho: boolean;
   roster: readonly string[];
   vitals: RunVitals;
   inFlight: boolean;
@@ -450,14 +471,24 @@ function TraceHeader({
       </div>
       {/* The persistent assignee (§3A). A run nothing can name keeps the slot and reads "—":
           the header's job is to say who ran this, and an omitted element says nothing at all —
-          which is indistinguishable from a layout that forgot to render it. */}
-      {who === "" ? (
-        <span className="who2 none">—</span>
-      ) : (
+          which is indistinguishable from a layout that forgot to render it.
+
+          While the durable search is still in flight the slot is kept but says NOTHING, for the
+          same reason the Result card's headline waits: "—" is an assertion that this run had
+          nobody, and it would be a wrong one for every routed run. Only a search that has
+          answered gets to fill the slot. A ticketless review run is named by its own key and
+          never reaches this. */}
+      {who !== "" ? (
         <span className="who2">
           <TeammateAvatar color={teammateColor(roster, who)} size={7} />
           {who}
         </span>
+      ) : resolvingWho ? (
+        <span className="whoskel" role="status">
+          <span className="vh">Resolving who ran this…</span>
+        </span>
+      ) : (
+        <span className="who2 none">—</span>
       )}
       <Pill variant={runOutcomePill(run.outcome)}>
         {run.outcome === "" ? "unknown" : run.outcome}
