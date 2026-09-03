@@ -194,6 +194,9 @@ function RunTrace({
   const result = useMemo(() => buildResult(entries, live), [entries, live]);
   const vitals = runVitals(live, trace.phases);
   const batons = useMemo(() => relayBatons(runs, run, assignee), [runs, run, assignee]);
+  // Resolved ONCE, so the header's avatar and the inspector's "what <who> did" can never disagree
+  // about whose run this is — they did while only the header knew about a review key.
+  const who = runTeammate(run, assignee);
   const [raw, setRaw] = useState(false);
   const [composing, setComposing] = useState(false);
   // A jump request rather than a selection: the Result card asks, the Split acts. It carries a
@@ -208,6 +211,7 @@ function RunTrace({
   // remounts on the same switch — cannot open a card belonging to the trace it just replaced.
   const selectRun = (id: number) => {
     setJump(null);
+    setComposing(false);
     onSelectRun(id);
   };
 
@@ -225,7 +229,7 @@ function RunTrace({
         ref={headerRef}
         run={live}
         runs={runs}
-        assignee={assignee}
+        who={who}
         roster={roster}
         vitals={vitals}
         inFlight={inFlight}
@@ -275,7 +279,7 @@ function RunTrace({
           <TraceSplit
             key={run.id}
             phases={trace.phases}
-            assignee={assignee}
+            who={who}
             pending={transcript.isPending}
             live={inFlight}
             batons={batons}
@@ -313,7 +317,7 @@ function TraceHeader({
   ref,
   run,
   runs,
-  assignee,
+  who,
   roster,
   vitals,
   inFlight,
@@ -325,7 +329,8 @@ function TraceHeader({
   ref: RefObject<HTMLDivElement | null>;
   run: RunSummary;
   runs: readonly RunSummary[];
-  assignee: string;
+  /** The teammate this attempt is attributed to; "" when none resolves. */
+  who: string;
   roster: readonly string[];
   vitals: RunVitals;
   inFlight: boolean;
@@ -335,10 +340,6 @@ function TraceHeader({
   onCompose: () => void;
 }) {
   const workspaceURLKey = useLinearIdentity().data?.workspace_url_key ?? "";
-  // A ticketless review run's key IS `pr:owner/repo#n@reviewer`, so the reviewer is named by the
-  // run's own identifier — the one case where the header can attribute an attempt rather than a
-  // ticket. Everything else still falls back to the ticket's durable assignee until slice 5.
-  const who = runTeammate(run, assignee);
   return (
     <div className="trhd" ref={ref}>
       <button type="button" className="back" aria-label="Back to Jobs" onClick={onBack}>
@@ -360,8 +361,10 @@ function TraceHeader({
       {/* The live pulse (§3A). Decorative beside the outcome pill, which already says "running"
           in words — a screen reader that announced a second "live" would only repeat it. */}
       {inFlight ? <span className="trpulse" aria-hidden="true" /> : null}
-      {/* The attempt selector. Slice 3 turns this into the implement→review relay, with the
-          hand-off baton and each attempt's own teammate; here it only picks which run to read.
+      {/* The attempt selector — the implement→revise relay. Switching swaps the Result card and
+          the spine to that run, and the spine draws the handoff baton either side of it
+          (`relayBatons`); each attempt's OWN teammate is slice 5, which is why the baton names
+          the runs when one ticket identity covers both.
 
           Labelled by RUN ID, not by `attempt`: the daemon only increments `attempt` on the retry
           path, so a ticket re-summoned or re-dispatched records every one of its runs as attempt
@@ -452,7 +455,12 @@ function HeaderActions({
           already serves. On a finished run it is dependency-named for a different reason than the
           rest of this cluster: there is no missing endpoint, there is no agent left to read it. */}
       {inFlight ? (
-        <Button variant="sec" aria-expanded={composing} onClick={onCompose}>
+        <Button
+          variant="sec"
+          aria-expanded={composing}
+          aria-controls={MESSAGE_COMPOSER_ID}
+          onClick={onCompose}
+        >
           Message
         </Button>
       ) : (
@@ -518,6 +526,9 @@ function DepButton({ title, children }: { title: string; children: ReactNode }) 
  * console has no toast surface, so a refusal (the daemon caps pending messages per run) reports
  * here or nowhere.
  */
+/** The composer's element id, so the header's Message action can name what it expands. */
+const MESSAGE_COMPOSER_ID = "trmsg";
+
 function MessageComposer({ runId, onClose }: { runId: number; onClose: () => void }) {
   const send = useSendRunMessage(runId);
   const [text, setText] = useState("");
@@ -534,7 +545,7 @@ function MessageComposer({ runId, onClose }: { runId: number; onClose: () => voi
     });
   };
   return (
-    <div className="trmsg">
+    <div className="trmsg" id={MESSAGE_COMPOSER_ID}>
       <textarea
         aria-label="Message the running agent"
         placeholder="The agent picks this up at its next step…"
@@ -663,14 +674,15 @@ function ResultCardZone({
 
 function TraceSplit({
   phases,
-  assignee,
+  who,
   pending,
   live,
   batons,
   jump,
 }: {
   phases: readonly TracePhase[];
-  assignee: string;
+  /** The teammate this attempt is attributed to; "" when none resolves. */
+  who: string;
   pending: boolean;
   /** Whether this attempt is still streaming — what turns the spine into a playhead (§3C). */
   live: boolean;
@@ -693,14 +705,13 @@ function TraceSplit({
   // playhead, and it costs no timer of its own.
   const selected = visible.find((phase) => phase.id === picked) ?? (live ? playhead : visible[0]);
 
-  // A jump aims at a phase and, when it has one, a call to open. The nonce is the dependency, so
-  // clicking twice re-opens a card folded away in between; `picked` is set rather than the
-  // selection forced, because the operator can then move on from where the jump landed.
+  // A jump aims at a phase and, when it has one, a call to open. `picked` is SET rather than the
+  // selection forced, so the operator can move on from where the jump landed.
   const target = jump?.step ?? null;
   const nonce = jump?.nonce ?? 0;
   useEffect(() => {
-    if (target !== null) setPicked(target.phaseId);
-  }, [target, nonce]);
+    if (jump !== null) setPicked(jump.step.phaseId);
+  }, [jump]);
 
   const following = live && (picked === null || picked === playhead?.id);
   const atBottom = useFollowScroll(following);
@@ -750,7 +761,7 @@ function TraceSplit({
         {selected === undefined ? null : (
           <Inspector
             phase={selected}
-            assignee={assignee}
+            who={who}
             openSeq={target?.phaseId === selected.id ? target.cardSeq : null}
             openNonce={nonce}
           />
@@ -892,24 +903,24 @@ function SpineStep({
 /** The selected phase's frame: what the agent DID first, then — muted — what it SAID (§2). */
 function Inspector({
   phase,
-  assignee,
+  who,
   openSeq,
   openNonce,
 }: {
   phase: TracePhase;
-  assignee: string;
+  who: string;
   /** The call a jump asked to open, when it landed on THIS phase; null otherwise. */
   openSeq: number | null;
   openNonce: number;
 }) {
-  const who = assignee === "" ? "the agent" : assignee;
+  const name = who === "" ? "the agent" : who;
   return (
     <>
       <h4>
-        {phase.title} — what {who} did
+        {phase.title} — what {name} did
       </h4>
       {phase.did.map((card) => (
-        <CallCard key={card.seq} card={card} open={card.seq === openSeq ? openNonce : 0} />
+        <CallCard key={card.seq} card={card} jump={card.seq === openSeq ? openNonce : 0} />
       ))}
       {phase.did.length === 0 ? <div className="empty">No tool calls in this step.</div> : null}
       {/* A result with no call to fold onto — a truncated transcript. Surfaced, never dropped. */}
@@ -921,7 +932,7 @@ function Inspector({
           </div>
         </div>
       ))}
-      {phase.said.length === 0 ? null : <Said said={phase.said} who={who} />}
+      {phase.said.length === 0 ? null : <Said said={phase.said} who={name} />}
     </>
   );
 }
@@ -932,16 +943,16 @@ function Inspector({
  * A failing call starts OPEN and tinted, because the whole point of the spine is that the
  * operator should not have to hunt for the step that broke (design record §3C).
  *
- * `open` is a JUMP NONCE, not a boolean: the Result card's "jump to failing step" has to re-open a
- * card the operator folded away since the last jump, and a boolean that is already `true` would
- * change nothing. Zero means no jump has asked for this card.
+ * `jump` is a NONCE, not a boolean: the Result card's "jump to failing step" has to re-open a card
+ * the operator folded away since the last jump, and a boolean that is already `true` would change
+ * nothing. Zero means no jump has ever asked for this card.
  */
-function CallCard({ card, open: jumped }: { card: DidCard; open: number }) {
+function CallCard({ card, jump }: { card: DidCard; jump: number }) {
   const [override, setOverride] = useState<boolean | null>(null);
   const open = override ?? card.failed;
   useEffect(() => {
-    if (jumped > 0) setOverride(true);
-  }, [jumped]);
+    if (jump > 0) setOverride(true);
+  }, [jump]);
   const hasResult = card.result !== "";
   return (
     <div className={`trcard${open ? " open" : ""}${card.failed ? " err" : ""}`}>

@@ -1345,19 +1345,33 @@ describe("the attempt relay — the handoff baton (§3C/§6)", () => {
     );
   });
 
-  it("names both teammates when the attempt relays to a ticketless review run", async () => {
-    mountDetail([
-      run({ id: 547, issue_identifier: "pr:makewhatis/rhapsody#12@jimmy", started_at: "2026-09-01T19:11:00Z" }),
-      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
-    ]);
-    await waitFor(() =>
-      expect(document.querySelector(".trbaton.in")?.textContent).toContain("alice → jimmy"),
-    );
-  });
+  // NOT tested through the view: a baton naming two DIFFERENT teammates. Nothing the daemon
+  // serves can produce that payload — `/issues/{id}/history` matches `issue_identifier` exactly
+  // (`crates/store/src/sqlite.rs`), so every run in one selector shares a key, and one key
+  // resolves to one name. `relayBatons`' own unit tests pin the two-name branch, and slice 5's
+  // per-run identity is what will reach it. A view test over a history the store never writes
+  // would be green and prove nothing.
 
   it("gives a ticket with a single run no baton in either direction", async () => {
     mountDetail([run({ id: 547 })]);
     await settleTrace();
     expect(document.querySelector(".trbaton")).toBeNull();
+  });
+
+  // The one run the console CAN attribute to a teammate per-run: a ticketless review carries its
+  // reviewer in its own key, and the header and the inspector must not disagree about who it was.
+  it("attributes a ticketless review run to the reviewer named in its own key", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([
+      run({
+        id: 547,
+        issue_id: "pr:makewhatis/rhapsody#12@jimmy",
+        issue_identifier: "pr:makewhatis/rhapsody#12@jimmy",
+        title: "Review makewhatis/rhapsody#12 at 9f1c0aa",
+      }),
+    ]);
+    await settleTrace();
+    expect(document.querySelector(".trhd .who2")?.textContent).toContain("jimmy");
+    expect(document.querySelector(".trinsp h4")?.textContent).toBe("Oriented — what jimmy did");
   });
 });
