@@ -1229,6 +1229,31 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     await waitFor(() => expect(scroller().scrollTop).toBe(3000));
   });
 
+  it("follows the stream again once the chip has taken the page back", async () => {
+    // The chip does not only move the page, it re-takes the pin: the NEXT growth has to follow.
+    // A browser would confirm the chip's own scroll with a scroll event, but a rule that only
+    // works because the engine volunteers one is a rule that does not work.
+    let height = 2000;
+    sizePage(() => height);
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    scroller().scrollTop = 0;
+    fireEvent.scroll(window);
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
+
+    fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
+    await waitFor(() => expect(scroller().scrollTop).toBe(2000));
+    // Nothing left to be behind, so nothing left to offer.
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeNull());
+
+    height = 3000;
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(spineTitles()).toContain("Verified"));
+    expect(scroller().scrollTop).toBe(3000);
+  });
+
   it("never drags a scrolled-up operator down when a filtered-in phase flips follow back on", async () => {
     // The other half of the same promise, and the half a detached scroll listener used to break:
     // while the page is not following, the operator's position is still theirs. The page is tall

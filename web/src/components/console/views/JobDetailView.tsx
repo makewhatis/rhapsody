@@ -759,7 +759,7 @@ function TraceSplit({
   // still following: there is nothing to track, and nothing to have fallen behind either.
   const headHidden = playhead !== undefined && playing === undefined;
   const following = live && !headHidden && (picked === null || picked === playhead?.id);
-  const atBottom = useFollowScroll(following);
+  const { atBottom, jumpToBottom } = useFollowScroll(following);
   const behind = live && (!following || !atBottom);
 
   return (
@@ -828,7 +828,7 @@ function TraceSplit({
               setFilter("all");
               setQuery("");
             }
-            scrollToBottom();
+            jumpToBottom();
           }}
         >
           Jump to latest ↓
@@ -851,6 +851,14 @@ function scrollToBottom() {
   if (el !== null) el.scrollTop = el.scrollHeight;
 }
 
+/** What the follow rule gives the view: where the page is, and the way back to the bottom. */
+interface FollowScroll {
+  /** Whether the page is still pinned to the bottom, auto-following what the stream appends. */
+  atBottom: boolean;
+  /** Take the page back to the bottom and resume following it (the "jump to latest" chip). */
+  jumpToBottom: () => void;
+}
+
 /**
  * Follow-mode for a live run: reports whether the page is still pinned to the bottom, and keeps it
  * there as the stream appends.
@@ -864,7 +872,7 @@ function scrollToBottom() {
  * Observing the position only while active meant that commit had no reading of its own to go on —
  * the last one was from before the operator scrolled — and the page dragged them to the bottom.
  */
-function useFollowScroll(active: boolean): boolean {
+function useFollowScroll(active: boolean): FollowScroll {
   const [atBottom, setAtBottom] = useState(true);
   // The same reading as `atBottom`, mirrored into a ref: it is what the growth effect below reads,
   // so a commit that carries BOTH a scroll reading and the growth acts on the reading rather than
@@ -909,7 +917,17 @@ function useFollowScroll(active: boolean): boolean {
     }
     height.current = el.scrollHeight;
   });
-  return atBottom;
+
+  // The way back, and the one thing that RE-takes the pin: an operator who scrolled up has said
+  // they are not following, and only they can say they are again. Assigning the position is not
+  // enough on its own — a browser announces a programmatic scroll with a scroll event and jsdom
+  // never does, so the reading is set here rather than waited for.
+  const jumpToBottom = () => {
+    scrollToBottom();
+    pinned.current = true;
+    setAtBottom(true);
+  };
+  return { atBottom, jumpToBottom };
 }
 
 /**
