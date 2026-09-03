@@ -297,6 +297,22 @@ pub const MAX_REVIEW_REVIEWERS: usize = 8;
 /// store anyway — the comment is the colour, never the only fact.
 pub const PR_COMMENT_LOOKBACK_DAYS: i64 = 30;
 
+/// The most bytes an operator-supplied identifier may be before it names nothing.
+///
+/// §9.3 bounds the GATHER, and the key is part of the gather: it becomes a SQL parameter on every
+/// probe and it is echoed back as [`Outcome::key`], which slice 3 renders into a room reply. An
+/// operator post is untrusted DATA of no fixed length (§0.11.5), so without a cap a pasted essay
+/// would travel as an "identifier" all the way into the facts block and crowd out the closed rules
+/// the prompt ends with — ANS-BUDGET-TRUNC, reached from the one direction the render-side cap
+/// cannot see.
+///
+/// Over-long is treated as naming NOTHING rather than truncated to something: a clipped identifier
+/// is a different identifier, and answering about a different one is the confident wrongness this
+/// design exists to stop. 256 bytes is comfortably past every real shape — a Linear key is a
+/// dozen, a review key with GitHub's longest legal owner and repository is under 160, and a pull
+/// request URL with a discussion fragment is about 200.
+pub const MAX_KEY_BYTES: usize = 256;
+
 /// The most bytes of ONE pull-request comment body an outcome carries.
 ///
 /// A review comment is agent prose with no length contract at all, and it lands in the same
@@ -332,7 +348,8 @@ pub struct PrRef {
 /// design exists to stop, and precisely on the terminal-reach path this slice adds.
 ///
 /// [`Knowledge::key`] is the only thing that builds one, and every read goes through it, so the
-/// two reads cannot drift apart again. The canonical spelling is resolved from DATA wherever data
+/// two reads cannot drift apart again — which also makes it the one place an operator string is
+/// bounded before it becomes a query parameter and a rendered fact ([`MAX_KEY_BYTES`]). The canonical spelling is resolved from DATA wherever data
 /// exists — a key the cycle knows takes the cycle's own spelling, whatever case it was typed in —
 /// and only falls back to a shape rule (`TEAM-123` folds to upper case, the form Linear mints) for
 /// a key no source has spelled yet. That fold is a GUESS about a tracker this accessor cannot see,
@@ -832,7 +849,13 @@ impl<'a> Knowledge<'a> {
     /// every read below uses. See [`Key`] for why one shared normalization is a requirement rather
     /// than a tidiness.
     pub fn key(&self, raw: &str) -> Key {
-        let raw = raw.trim().to_string();
+        let raw = raw.trim();
+        if raw.len() > MAX_KEY_BYTES {
+            // Not an identifier by any reading, so it names nothing — and nothing is what the rest
+            // of the gather then reads. See [`MAX_KEY_BYTES`].
+            return Key::default();
+        }
+        let raw = raw.to_string();
         let pr = parse_pr_ref(&raw);
         let canonical = if let Some(iss) = self
             .issues
@@ -3080,6 +3103,39 @@ mod tests {
             Some(REVIEW_STATUS_APPROVED),
             "…while the verdict itself still arrives"
         );
+    }
+
+    /// An operator string too long to be an identifier names NOTHING — it does not become a SQL
+    /// parameter, it does not reach the `gh` leg, and it is not echoed back as a "key" for slice 3
+    /// to render into the facts block. §9.3 bounds the gather, and the key is part of the gather.
+    #[tokio::test]
+    async fn an_over_long_key_names_nothing() {
+        let st = store();
+        let scope = scope_of(&["alpha"], &["alice"]);
+        let none = NoneBackend;
+        let issues: Vec<Issue> = Vec::new();
+        let gh = RecordingSummons::with_body("@symphony requested changes");
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none).with_pr_comments(&gh);
+
+        // Long enough to be a paste, and shaped like a pull-request coordinate so the `gh` leg
+        // would fire if the cap did not come first.
+        let essay = format!("acme/{}#12", "r".repeat(MAX_KEY_BYTES));
+        let key = k.key(&essay);
+        assert!(key.is_empty(), "an over-long key resolves to nothing");
+        assert!(key.pr().is_none(), "and therefore names no pull request");
+
+        let got = k.outcome(&essay).await.expect("outcome");
+        assert_eq!(got.degradation(), Some(NO_RECORD));
+        assert!(
+            got.key.is_empty(),
+            "the operator's paste is not echoed back"
+        );
+        assert!(gh.calls().is_empty(), "and gh was never asked");
+
+        // …while a key at the cap is still an ordinary key.
+        let at_cap = format!("acme/{}#12", "r".repeat(MAX_KEY_BYTES - "acme/#12".len()));
+        assert_eq!(at_cap.len(), MAX_KEY_BYTES);
+        assert!(k.key(&at_cap).pr().is_some());
     }
 
     /// The three shapes an operator has to hand, and the ones that must fail closed.
