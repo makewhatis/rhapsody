@@ -27,6 +27,13 @@
 //! off-team returns nothing at all: no row, no field, no "exists but not yours". Slice 2 turns that
 //! nothing into the operator-facing degradation line.
 //!
+//! Treating the store's filter as an optimisation has a second consequence that is easy to miss and
+//! is **not** a leak: the SQL `LIMIT` runs before the drop does, so a capped page can arrive full of
+//! rows about to be discarded, and a team owning plenty of runs would be told it owns none. The
+//! gather therefore pages ([`Knowledge::scan`]) until it holds a page of ADMITTED rows or has read
+//! [`MAX_SCAN_ROWS`]. Both halves matter: the drop keeps the answer from saying too much, the fill
+//! keeps it from confidently saying nothing.
+//!
 //! # The fact-source allowlist (§9.4)
 //!
 //! Four sources, and no fifth: the projected [`RunFact`] subset of a [`RunSummary`], recall
@@ -43,6 +50,10 @@
 //! a `RunSummary` at all. It returns [`RunFact`], which has four fields and cannot grow one by
 //! accident: a reviewer adding a field to `RunSummary` changes nothing here.
 //!
+//! Its fourth field is the run's RECORDED dispatch identity (the `teams.route` event), not the
+//! ticket's current label: a reassigned ticket must not rewrite who ran its history, and a wrong
+//! name in an unauthenticated room is worse than no name because nobody can tell it is wrong.
+//!
 //! # Recall is pinned, roster-scoped, and refuses a shared bank (§9.3, ANS-MEM-SCOPE)
 //!
 //! Three separate guards, because they fail differently:
@@ -57,7 +68,15 @@
 //!    ([`LocalBank::with_bank_overrides`](rhapsody_config::memory::LocalBank::with_bank_overrides))
 //!    lets two identities name the same bank id. If the other claimant is outside this team, the
 //!    override would be a cross-team read wearing an in-team identity's name, so the recall is
-//!    refused outright rather than filtered afterwards.
+//!    refused outright rather than filtered afterwards. The comparison is only sound over bank ids
+//!    resolved the way the BACKEND resolves them — it drops a non-label-safe override and silently
+//!    reads `<prefix><name>` instead, which another identity's override may name — so the scope is
+//!    built from ids that went through
+//!    [`resolve_bank_id`](rhapsody_config::memory::resolve_bank_id). See [`TeamScope`].
+//!
+//! What these three do NOT do is validate the roster. A `bank:` override that is not label-safe
+//! still loads; it is resolved away here rather than rejected at `Teams::validate`, because making
+//! it a config error would turn an existing `teams.yaml` into a disabled Teams runtime.
 //!
 //! # Errors are values, and an absence is not an error
 //!
@@ -65,6 +84,11 @@
 //! from, not this module's to swallow. An off-team, unknown or unrecorded identifier is `Ok` with
 //! nothing in it — "I have no record of that" and "the read failed" are different answers and the
 //! manager must be able to tell them apart.
+//!
+//! Between those two sits a third answer this module also refuses to blur: **partial**. A recall
+//! reports the records the backend could not parse and how much of the roster it covered
+//! ([`Recall`]), and a truncated gather logs. An answer that is short because a bank is corrupt or
+//! because a cap bit must not read as an answer that is short because there is nothing to say.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -170,6 +194,31 @@ pub struct IssueFact {
     pub state: String,
     /// The roster identity wearing this ticket, or empty.
     pub identity: String,
+}
+
+/// **What one scoped recall produced** — the facts, what the backend could not read, and how much
+/// of the roster the gather covered.
+///
+/// `skipped` exists here because [`Recalled::skipped`] exists there: a corrupt record file is
+/// "skipped **loudly**, never fatal", and `rhapsody-config` deliberately does no logging of its own
+/// so that "the reason travels to the caller that owns the log". This module IS that caller.
+/// Dropping the list would make the loud part silent — a bank whose records will not parse answers
+/// short and reads exactly like a teammate who remembers nothing, which is the one distinction §8
+/// says the manager must be able to make.
+///
+/// The identity counts are §9.3's "showing N of M" captured while M is still known. Slice 3 renders
+/// the truncation; it cannot render a total this method threw away.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recall {
+    /// The VALID facts — roster order for a team-wide gather.
+    pub facts: Vec<Fact>,
+    /// `(file name, why)` for every record the backend could not read.
+    pub skipped: Vec<(String, String)>,
+    /// How many identities the gather actually read. Zero when the scope refused the only one.
+    pub identities_read: usize,
+    /// How many it could have read: the roster for [`Knowledge::recall_team`], one for
+    /// [`Knowledge::recall`]. Greater than `identities_read` means the answer is partial.
+    pub identities_total: usize,
 }
 
 /// **The team's identity, reconstructed for every read** (§9.1).
@@ -320,8 +369,15 @@ impl<'a> Knowledge<'a> {
         }
     }
 
-    /// Attaches the team's room. The handle IS the scope — rooms are per team on disk
-    /// (`teams/room/<team>/`), so there is nothing further to filter.
+    /// Attaches the team's room. The handle IS the team scope — rooms are per team on disk
+    /// (`teams/room/<team>/`), so no further TEAM filtering is needed or done.
+    ///
+    /// It is not the whole filter, though: [`Knowledge::room`] reads as the empty identity, which
+    /// `Audience::visible_to("")` admits `Audience::Room` for and rejects every `Audience::Direct`
+    /// for. So the accessor sees BROADCAST posts only — the safe direction, and the same view
+    /// `teams_room_read` serves — but it means a post directed at the manager is not in the fact
+    /// set, and an answer about one would be confidently partial. Whether the manager should
+    /// instead read as its own identity is slice 2/3's call, and deliberately not taken here.
     pub fn with_room(mut self, room: &'a dyn RoomLog) -> Knowledge<'a> {
         self.room = Some(room);
         self
@@ -415,29 +471,58 @@ impl<'a> Knowledge<'a> {
     /// `identity`'s VALID facts matching `q`, bounded by `q.top_k`.
     ///
     /// Empty for an off-roster identity, for one whose bank cannot be resolved, and for one whose
-    /// bank another team also claims. [`Query::state`] is overridden to [`RecallState::Valid`] and
-    /// the result is filtered again, because a backend is a trait and the request is not a promise.
-    pub async fn recall(&self, identity: &str, q: &Query) -> Result<Vec<Fact>, KnowledgeError> {
+    /// bank another team also claims — and in those three cases `identities_read` is 0, so a
+    /// refusal is distinguishable from a bank that is simply empty. [`Query::state`] is overridden
+    /// to [`RecallState::Valid`] and the result is filtered again, because a backend is a trait and
+    /// the request is not a promise.
+    pub async fn recall(&self, identity: &str, q: &Query) -> Result<Recall, KnowledgeError> {
         if !self.scope.admits_identity(identity) || !self.scope.admits_bank(identity) {
-            return Ok(Vec::new());
+            return Ok(Recall {
+                identities_total: 1,
+                ..Recall::default()
+            });
         }
         let q = Query {
             state: RecallState::Valid,
             ..q.clone()
         };
         let recalled = self.memory.recall(identity, &q).await?;
-        Ok(recalled
-            .facts
-            .into_iter()
-            .filter(|f| f.state == STATE_VALID)
-            .collect())
+        Ok(Recall {
+            facts: recalled
+                .facts
+                .into_iter()
+                .filter(|f| f.state == STATE_VALID)
+                .collect(),
+            skipped: recalled.skipped,
+            identities_read: 1,
+            identities_total: 1,
+        })
     }
 
     /// The same recall across this team's roster, capped at [`MAX_RECALL_IDENTITIES`] identities.
-    pub async fn recall_team(&self, q: &Query) -> Result<Vec<Fact>, KnowledgeError> {
-        let mut out: Vec<Fact> = Vec::new();
+    ///
+    /// The cap truncates in roster order — [`TeamScope::identities`] is a `BTreeSet`, so the choice
+    /// is deterministic rather than arbitrary — and says so: the returned counts carry N of M, and
+    /// a truncated gather logs, because a silently partial answer is indistinguishable from a
+    /// complete one to the operator reading it.
+    pub async fn recall_team(&self, q: &Query) -> Result<Recall, KnowledgeError> {
+        let total = self.scope.identities.len();
+        if total > MAX_RECALL_IDENTITIES {
+            tracing::info!(
+                read = MAX_RECALL_IDENTITIES,
+                roster = total,
+                "teams knowledge recalled from part of the roster; the gather is capped per answer"
+            );
+        }
+        let mut out = Recall {
+            identities_total: total,
+            ..Recall::default()
+        };
         for identity in self.scope.identities.iter().take(MAX_RECALL_IDENTITIES) {
-            out.extend(self.recall(identity, q).await?);
+            let one = self.recall(identity, q).await?;
+            out.facts.extend(one.facts);
+            out.skipped.extend(one.skipped);
+            out.identities_read += one.identities_read;
         }
         Ok(out)
     }
@@ -1011,8 +1096,16 @@ mod tests {
                 .map(|r| r.identity.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(by_key("AAA-2"), "", "an unrouted run must not be attributed");
-        assert_eq!(by_key("AAA-3"), "", "an off-roster route must not be reported");
+        assert_eq!(
+            by_key("AAA-2"),
+            "",
+            "an unrouted run must not be attributed"
+        );
+        assert_eq!(
+            by_key("AAA-3"),
+            "",
+            "an off-roster route must not be reported"
+        );
     }
 
     // --- §9.3 ANS-MEM-SCOPE ------------------------------------------------------------------
@@ -1060,7 +1153,7 @@ mod tests {
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &bank);
 
         // Even asked for ALL states, the accessor pins Valid.
-        let facts = k
+        let got = k
             .recall(
                 "alice",
                 &Query {
@@ -1071,13 +1164,18 @@ mod tests {
             )
             .await
             .expect("recall");
-        assert_eq!(facts.len(), 1, "{facts:?}");
-        assert!(facts[0].content.contains("standing"));
+        assert_eq!(got.facts.len(), 1, "{got:?}");
+        assert!(got.facts[0].content.contains("standing"));
+        assert_eq!((got.identities_read, got.identities_total), (1, 1));
 
         // And a backend that answers with an invalidated record regardless is filtered anyway.
         let lying = LyingBank;
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &lying);
-        let facts = k.recall("alice", &Query::default()).await.expect("recall");
+        let facts = k
+            .recall("alice", &Query::default())
+            .await
+            .expect("recall")
+            .facts;
         assert_eq!(
             facts.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
             vec!["good"],
@@ -1114,7 +1212,8 @@ mod tests {
                 },
             )
             .await
-            .expect("recall");
+            .expect("recall")
+            .facts;
         assert!(facts.is_empty(), "{facts:?}");
     }
 
@@ -1151,7 +1250,8 @@ mod tests {
                 },
             )
             .await
-            .expect("recall");
+            .expect("recall")
+            .facts;
         assert!(
             facts.is_empty(),
             "a shared-bank override became a cross-team read: {facts:?}"
@@ -1172,6 +1272,7 @@ mod tests {
             )
             .await
             .expect("recall")
+            .facts
             .len(),
             1
         );
@@ -1244,7 +1345,8 @@ mod tests {
                 },
             )
             .await
-            .expect("recall");
+            .expect("recall")
+            .facts;
         assert!(
             facts.is_empty(),
             "recall crossed into another team's bank through a dropped override: {facts:?}"
@@ -1284,6 +1386,7 @@ mod tests {
             )
             .await
             .expect("recall")
+            .facts
             .len(),
             1,
             "a bank shared inside one team is not a cross-team read"
@@ -1300,11 +1403,12 @@ mod tests {
         let issues: Vec<Issue> = Vec::new();
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
         assert!(!scope.admits_bank("alice"));
-        assert!(
-            k.recall("alice", &Query::default())
-                .await
-                .expect("recall")
-                .is_empty()
+        let got = k.recall("alice", &Query::default()).await.expect("recall");
+        assert!(got.facts.is_empty());
+        assert_eq!(
+            (got.identities_read, got.identities_total),
+            (0, 1),
+            "a refused recall must be distinguishable from an empty bank"
         );
     }
 
@@ -1335,9 +1439,92 @@ mod tests {
             })
             .await
             .expect("recall_team");
-        let mut who: Vec<&str> = facts.iter().map(|f| f.identity.as_str()).collect();
+        let mut who: Vec<&str> = facts.facts.iter().map(|f| f.identity.as_str()).collect();
         who.sort_unstable();
         assert_eq!(who, vec!["alice", "bob"]);
+    }
+
+    /// **A record the backend could not read is reported, not swallowed (STUDIO-729 review).**
+    /// `rhapsody-config` does no logging of its own precisely so the reason reaches the caller that
+    /// owns the log — this module — and a bank of unparseable records must not read as a teammate
+    /// who simply remembers nothing.
+    #[tokio::test]
+    async fn recall_reports_the_records_the_backend_could_not_read() {
+        let dir = TempDir::new();
+        let bank = LocalBank::new(dir.child(DEFAULT_BANKS_SUBDIR), "agent-");
+        bank.retain(&Record {
+            identity: "alice".into(),
+            document_id: "run-1".into(),
+            at: now(),
+            content: "a good record".into(),
+            ..Record::default()
+        })
+        .expect("retain");
+        let bank_dir = bank.bank_dir("alice").expect("bank dir");
+        std::fs::write(bank_dir.join("00000000T000000Z-broken.md"), "not a record")
+            .expect("write corrupt");
+
+        let scope = scope_of(&["alpha"], &["alice"]);
+        let st = store();
+        let issues: Vec<Issue> = Vec::new();
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &bank);
+
+        let q = Query {
+            browse: true,
+            ..Query::default()
+        };
+        let got = k.recall("alice", &q).await.expect("recall");
+        assert_eq!(got.facts.len(), 1, "the good record still comes back");
+        assert_eq!(
+            got.skipped.len(),
+            1,
+            "the unreadable record was swallowed: {got:?}"
+        );
+        assert_eq!(got.skipped[0].0, "00000000T000000Z-broken.md");
+
+        // …and it survives the team-wide gather too, which is where slice 2 reads it.
+        let team = k.recall_team(&q).await.expect("recall_team");
+        assert_eq!(team.skipped.len(), 1, "{team:?}");
+    }
+
+    /// **The roster cap says so (STUDIO-729 review).** `recall_team` reads the alphabetically first
+    /// [`MAX_RECALL_IDENTITIES`], deterministically — but a partial answer that reports itself as
+    /// complete is the §9.3 failure, so the counts carry N of M while M is still knowable.
+    #[tokio::test]
+    async fn a_truncated_team_recall_reports_how_much_it_covered() {
+        let dir = TempDir::new();
+        let bank = LocalBank::new(dir.child(DEFAULT_BANKS_SUBDIR), "agent-");
+        let roster: Vec<String> = (0..(MAX_RECALL_IDENTITIES + 3))
+            .map(|n| format!("mate-{n}"))
+            .collect();
+        for who in &roster {
+            bank.retain(&Record {
+                identity: who.clone(),
+                document_id: format!("run-{who}"),
+                at: now(),
+                content: format!("{who}'s note"),
+                ..Record::default()
+            })
+            .expect("retain");
+        }
+        let scope = scope_of(
+            &["alpha"],
+            &roster.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let st = store();
+        let issues: Vec<Issue> = Vec::new();
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &bank);
+
+        let got = k
+            .recall_team(&Query {
+                browse: true,
+                ..Query::default()
+            })
+            .await
+            .expect("recall_team");
+        assert_eq!(got.identities_read, MAX_RECALL_IDENTITIES);
+        assert_eq!(got.identities_total, roster.len());
+        assert_eq!(got.facts.len(), MAX_RECALL_IDENTITIES);
     }
 
     // --- §9.4 ANS-CONFIG-NOT-A-FACT ----------------------------------------------------------
@@ -1459,11 +1646,23 @@ mod tests {
         // --- shape 1: the legacy empty slug, whose SQL filter is no filter at all.
         let st = store();
         for n in 0..MAX_HISTORY_ROWS {
-            seed_ok(&st, "LEG-1", "", &format!("2026-09-01T10:{n:02}:00Z"), "completed");
+            seed_ok(
+                &st,
+                "LEG-1",
+                "",
+                &format!("2026-09-01T10:{n:02}:00Z"),
+                "completed",
+            );
         }
         // …then MORE than a page of NEWER rows this team does not own, same identifier.
         for n in 0..(MAX_HISTORY_ROWS + 5) {
-            seed_ok(&st, "LEG-1", "beta", &format!("2026-09-02T10:{n:02}:00Z"), "failed");
+            seed_ok(
+                &st,
+                "LEG-1",
+                "beta",
+                &format!("2026-09-02T10:{n:02}:00Z"),
+                "failed",
+            );
         }
         let scope = scope_of(&[""], &["alice"]);
         let none = NoneBackend;
@@ -1482,7 +1681,10 @@ mod tests {
         );
         let recent = k.recent_runs(0).expect("recent_runs");
         assert_eq!(recent.len() as i64, MAX_HISTORY_ROWS, "{recent:?}");
-        assert!(recent.iter().all(|r| r.outcome == "completed"), "{recent:?}");
+        assert!(
+            recent.iter().all(|r| r.outcome == "completed"),
+            "{recent:?}"
+        );
 
         // --- shape 2: an ORDINARY slug, gated on a Linear team the SQL knows nothing about.
         let st = store();
@@ -1498,16 +1700,30 @@ mod tests {
             );
         };
         for n in 0..5 {
-            seed_team("AAA-1", "linear-a", &format!("2026-09-01T10:{n:02}:00Z"), "completed");
+            seed_team(
+                "AAA-1",
+                "linear-a",
+                &format!("2026-09-01T10:{n:02}:00Z"),
+                "completed",
+            );
         }
         for n in 0..(MAX_HISTORY_ROWS + 5) {
-            seed_team("AAA-1", "linear-b", &format!("2026-09-02T10:{n:02}:00Z"), "failed");
+            seed_team(
+                "AAA-1",
+                "linear-b",
+                &format!("2026-09-02T10:{n:02}:00Z"),
+                "failed",
+            );
         }
         let scope = scope_of(&["alpha"], &["alice"]).with_linear_teams(["linear-a"]);
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
         let runs = k.issue_runs("AAA-1", 0).expect("issue_runs");
-        assert_eq!(runs.len(), 5, "the Linear-team gate emptied a page it should have filled");
+        assert_eq!(
+            runs.len(),
+            5,
+            "the Linear-team gate emptied a page it should have filled"
+        );
         assert!(runs.iter().all(|r| r.outcome == "completed"), "{runs:?}");
         assert_eq!(k.recent_runs(0).expect("recent_runs").len(), 5);
     }
@@ -1558,6 +1774,7 @@ mod tests {
             k.recall_team(&Query::default())
                 .await
                 .expect("recall_team")
+                .facts
                 .is_empty()
         );
     }

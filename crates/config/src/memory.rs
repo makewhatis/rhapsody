@@ -1576,7 +1576,10 @@ mod tests {
         // And the one that matters: a dropped override resolves onto the fallback
         // another identity may legitimately claim, so the collision is VISIBLE.
         assert_eq!(resolve_bank_id("agent-", "Not/Safe", "dave"), "agent-dave");
-        assert_eq!(resolve_bank_id("agent-", "agent-dave", "mallory"), "agent-dave");
+        assert_eq!(
+            resolve_bank_id("agent-", "agent-dave", "mallory"),
+            "agent-dave"
+        );
     }
 
     /// A record id is the filename with ONE `.md` stripped. `trim_end_matches`
