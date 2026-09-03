@@ -1,5 +1,6 @@
 import type { RunSummary } from "@/lib/api";
 import { formatTokens, runDuration } from "@/lib/format";
+import { fenceSpans, inlineText } from "@/lib/markdown";
 import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "@/lib/trace-model";
 
 // console-trace-view — the derivations the "Trace" run detail needs on top of the slice-1 trace
@@ -178,4 +179,43 @@ const PHASE_GLYPHS: Record<PhaseKind, string> = {
 
 export function phaseGlyph(kind: PhaseKind): string {
   return PHASE_GLYPHS[kind];
+}
+
+/**
+ * The markdown the Result card should print under its H1, or "" when the H1 already says it.
+ *
+ * The slice-1 model derives the headline FROM the lead, so printing both verbatim shows the run's
+ * opening sentence twice — the common shape, since a hand-off usually opens with one line and then
+ * goes straight to `## What changed`. The comparison strips the lead's inline markdown through the
+ * STUDIO-739 renderer's own parse, which is the same pass the headline went through, so a lead of
+ * `Photo attachment **shipped**.` is recognised as the headline it produced.
+ */
+export function cardLead(card: ResultCard): string {
+  const lead = card.lead.trim();
+  if (lead === "") return "";
+  const plain = inlineText(lead.replace(/!\[/g, "[")).replace(/\s+/g, " ").trim();
+  return plain === card.headline ? "" : lead;
+}
+
+/**
+ * A body's lead paragraph — everything up to the first blank line, which is what the inspector
+ * shows before the operator asks for more (design record §3C, "collapsed to a lead paragraph").
+ *
+ * A blank line INSIDE a fenced block is content, not a paragraph break: cutting there would show
+ * half a command and hide the half that failed, so fenced spans are skipped and a body that opens
+ * on a fence leads with the whole block.
+ */
+export function leadParagraph(source: string): string {
+  const text = source.trim();
+  const spans = fenceSpans(text);
+  const re = /\n[ \t]*\n/g;
+  let match = re.exec(text);
+  while (match !== null) {
+    const at = match.index;
+    // `close`, not `end`: the newline that terminates the CLOSING fence line sits inside the
+    // span but is a real paragraph break, so bounding on the block's content ends the lead there.
+    if (!spans.some((span) => at >= span.start && at < span.close)) return text.slice(0, at).trim();
+    match = re.exec(text);
+  }
+  return text;
 }

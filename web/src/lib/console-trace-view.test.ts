@@ -3,8 +3,10 @@ import type { LogEntry, RunSummary } from "@/lib/api";
 import { buildTrace } from "@/lib/trace-model";
 import {
   TRACE_FILTERS,
+  cardLead,
   filterPhases,
   githubRepo,
+  leadParagraph,
   phaseGlyph,
   prSearchUrl,
   resultEyebrow,
@@ -179,5 +181,50 @@ describe("phaseGlyph — one glyph per phase kind, shared with the Jobs sparklin
     const glyphs = kinds.map(phaseGlyph);
     expect(new Set(glyphs).size).toBe(kinds.length);
     glyphs.forEach((g) => expect(g).not.toBe(""));
+  });
+});
+
+describe("cardLead — the Result card shows a lead only when the H1 does not already say it", () => {
+  const card = (lead: string, headline: string) =>
+    cardLead({ headline, lead, sections: [], source: "text" });
+
+  it("drops a lead the headline was drawn from, rather than printing it twice", () => {
+    expect(card("Photo attachment shipped.", "Photo attachment shipped.")).toBe("");
+    expect(card("Photo attachment **shipped**.", "Photo attachment shipped.")).toBe("");
+  });
+
+  it("keeps a lead that carries more than its opening sentence", () => {
+    expect(card("Done. And here is why.", "Done. And here is why. More.")).toBe(
+      "Done. And here is why.",
+    );
+    expect(card("Shipped it.\n\nDetail follows.", "Shipped it.")).toBe(
+      "Shipped it.\n\nDetail follows.",
+    );
+  });
+
+  it("has nothing to show when the prose opened on a heading", () => {
+    expect(card("", "Anything")).toBe("");
+  });
+});
+
+describe("leadParagraph — SAID collapses to its lead (§3C)", () => {
+  it("cuts at the first blank line", () => {
+    expect(leadParagraph("Lead paragraph.\n\nSecond.\n\nThird.")).toBe("Lead paragraph.");
+  });
+
+  it("keeps a multi-line paragraph whole", () => {
+    expect(leadParagraph("One line\nand its continuation.\n\nNext.")).toBe(
+      "One line\nand its continuation.",
+    );
+  });
+
+  it("never cuts inside a fenced block, whose blank lines are content", () => {
+    const source = "```sh\ncargo test\n\ncargo build\n```\n\nAfter.";
+    expect(leadParagraph(source)).toBe("```sh\ncargo test\n\ncargo build\n```");
+  });
+
+  it("returns the whole prose when it is a single paragraph", () => {
+    expect(leadParagraph("  Just the one.  ")).toBe("Just the one.");
+    expect(leadParagraph("")).toBe("");
   });
 });
