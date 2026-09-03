@@ -382,6 +382,10 @@ impl LifecycleCache {
         let mut answers: HashMap<String, String> = HashMap::new();
         let mut covered: HashSet<String> = HashSet::new();
         let mut unanswered: Vec<IssueKey> = Vec::new();
+        // Of `unanswered`, the ids whose ledger was READ and simply held no routing row — as
+        // opposed to one the store could not read at all. Both go to the label; only these may be
+        // concluded about when there is no label to read either.
+        let mut silent: HashSet<String> = HashSet::new();
         for key in &stale {
             match run_identity(store.as_ref(), key.run_id) {
                 RunIdentity::Routed(name) => {
@@ -393,7 +397,11 @@ impl LifecycleCache {
                 RunIdentity::Unrouted => {
                     covered.insert(key.id.clone());
                 }
-                RunIdentity::Unknown => unanswered.push(key.clone()),
+                RunIdentity::Silent => {
+                    silent.insert(key.id.clone());
+                    unanswered.push(key.clone());
+                }
+                RunIdentity::Unreadable => unanswered.push(key.clone()),
             }
         }
         // Then the label, for whatever is left — and `covered` grows by which of those the tracker
@@ -405,11 +413,13 @@ impl LifecycleCache {
                 answers.extend(labelled);
                 covered.extend(asked);
             }
-            // No tracker to ask AT ALL — before the first config load — is not a failed round-trip,
-            // it is a complete answer for this window: nothing else could have spoken. Covering
-            // these ids is what caches it. Without this the whole store loop re-ran on every
-            // dashboard load until a config landed, which is exactly what the memo exists to stop.
-            None => covered.extend(unanswered.iter().map(|k| k.id.clone())),
+            // No tracker to ask AT ALL — before the first config load — is not a failed round-trip.
+            // For a ledger that was READ and held nothing, it completes the answer: nothing else
+            // could have spoken, so "nobody" caches. Without that the whole store loop re-ran on
+            // every dashboard load until a config landed, which is what the memo exists to stop.
+            // An UNREADABLE ledger is excluded, by the same rule a failed label round trip is: two
+            // failures in a row must not become a cached "nobody" that blanks the column for a TTL.
+            None => covered.extend(silent),
         }
         let mut guard = self
             .assignees
@@ -481,17 +491,26 @@ impl LifecycleCache {
     }
 }
 
-/// What ONE run's ledger says about who ran it. The third variant is the load-bearing one: "no
-/// routing row" and "a routing row that named nobody" are different facts, and only the first may
-/// fall through to the ticket's label.
+/// What ONE run's ledger says about who ran it. All four cases are distinct on purpose, and
+/// collapsing any pair loses a decision the caller has to make:
+///
+///   * `Unrouted` vs `Silent` — "a routing row that named nobody" is an ANSWER and must not fall
+///     through to the ticket's label; "no routing row" is a gap and must.
+///   * `Silent` vs `Unreadable` — a gap the store reported honestly can be cached as "nobody" when
+///     there is no tracker left to ask, because nothing else could have spoken. A gap that is
+///     really a failed read cannot: caching it would blank a column over a transient error, which
+///     is the same rule [`label_identities`] follows for a failed round trip.
 enum RunIdentity {
     /// A `teams.route` row naming this teammate.
     Routed(String),
     /// A `teams.unrouted` row: this dispatch was solo or matched nobody, on the record.
     Unrouted,
-    /// No routing row at all — Teams was off when this run dispatched, the retention prune has
-    /// deleted the row, or the store could not be read. The label may still know.
-    Unknown,
+    /// The ledger was read and holds no routing row — Teams was off when this run dispatched, or
+    /// its event batch never landed. The label may still know.
+    Silent,
+    /// The ledger could not be read at all. Indistinguishable from `Silent` in what it knows, but
+    /// not in what may be concluded from it.
+    Unreadable,
 }
 
 /// What identity the run `run_id` wore, from the store's own event ledger — `teams.route`'s
@@ -507,11 +526,15 @@ enum RunIdentity {
 ///
 /// Two probes rather than one whole-ledger read: each is `LIMIT 1` against `idx_events_run_seq`,
 /// and the second only runs for a run that recorded no route — so a routed run, the common case,
-/// costs exactly one indexed row. A store error answers [`RunIdentity::Unknown`] — "ask the label
-/// instead" — rather than propagating.
+/// costs exactly one indexed row. A store error is logged and answers [`RunIdentity::Unreadable`]
+/// rather than propagating: the listing this decorates has already succeeded, and no caller could
+/// act on it.
+///
+/// A `run_id` of zero is [`RunIdentity::Silent`], not [`RunIdentity::Unreadable`] — there is no run
+/// to have a ledger, which is a definite absence rather than a failed read.
 fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) -> RunIdentity {
     if run_id <= 0 {
-        return RunIdentity::Unknown;
+        return RunIdentity::Silent;
     }
     let probe = |kind: &str| {
         let q = rhapsody_store::EventQuery {
@@ -543,11 +566,12 @@ fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) 
             }
         }
         Ok(None) => {}
-        Err(()) => return RunIdentity::Unknown,
+        Err(()) => return RunIdentity::Unreadable,
     }
     match probe(crate::teams::EVENT_UNROUTED) {
         Ok(Some(_)) => RunIdentity::Unrouted,
-        Ok(None) | Err(()) => RunIdentity::Unknown,
+        Ok(None) => RunIdentity::Silent,
+        Err(()) => RunIdentity::Unreadable,
     }
 }
 
@@ -1413,6 +1437,246 @@ mod tests {
             .await;
         assert_eq!(past.get("a").map(String::as_str), Some("alice"));
         assert_eq!(tr.labels_by_id_calls(), 1, "past the TTL it asks");
+    }
+
+    /// A store whose `search_events` always fails, delegating everything else to a real in-memory
+    /// [`rhapsody_store::Sqlite`]. The same shape as `promote.rs`'s `ErrHistStore`, for the one
+    /// distinction [`RunIdentity`] exists to keep: an UNREADABLE ledger must not be concluded from.
+    struct UnreadableEvents(Arc<dyn rhapsody_store::Store + Send + Sync>);
+
+    impl rhapsody_store::Store for UnreadableEvents {
+        fn search_events(
+            &self,
+            _q: rhapsody_store::EventQuery,
+        ) -> Result<Vec<rhapsody_store::EventHit>, rhapsody_store::StoreError> {
+            Err(rhapsody_store::StoreError::Disabled)
+        }
+        fn start_run(
+            &self,
+            a0: rhapsody_store::RunStart,
+        ) -> Result<i64, rhapsody_store::StoreError> {
+            self.0.start_run(a0)
+        }
+        fn end_run(
+            &self,
+            a0: i64,
+            a1: rhapsody_store::RunEnd,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.end_run(a0, a1)
+        }
+        fn update_run_progress(
+            &self,
+            a0: i64,
+            a1: rhapsody_store::RunProgress,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.update_run_progress(a0, a1)
+        }
+        fn append_events(
+            &self,
+            a0: i64,
+            a1: &[rhapsody_store::EventRow],
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.append_events(a0, a1)
+        }
+        fn save_retry(
+            &self,
+            a0: rhapsody_store::RetryRow,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_retry(a0)
+        }
+        fn delete_retry(&self, a0: &str) -> Result<(), rhapsody_store::StoreError> {
+            self.0.delete_retry(a0)
+        }
+        fn save_claim(
+            &self,
+            a0: &str,
+            a1: &str,
+            a2: &str,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_claim(a0, a1, a2)
+        }
+        fn delete_claim(&self, a0: &str) -> Result<(), rhapsody_store::StoreError> {
+            self.0.delete_claim(a0)
+        }
+        fn load_recovery(&self) -> Result<rhapsody_store::Recovery, rhapsody_store::StoreError> {
+            self.0.load_recovery()
+        }
+        fn mark_running_interrupted(&self) -> Result<i64, rhapsody_store::StoreError> {
+            self.0.mark_running_interrupted()
+        }
+        fn save_totals(
+            &self,
+            a0: rhapsody_store::Totals,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_totals(a0)
+        }
+        fn load_totals(&self) -> Result<rhapsody_store::Totals, rhapsody_store::StoreError> {
+            self.0.load_totals()
+        }
+        fn list_runs(
+            &self,
+            a0: rhapsody_store::RunFilter,
+        ) -> Result<Vec<rhapsody_store::RunSummary>, rhapsody_store::StoreError> {
+            self.0.list_runs(a0)
+        }
+        fn list_issue_runs(
+            &self,
+            a0: rhapsody_store::RunFilter,
+        ) -> Result<Vec<rhapsody_store::RunSummary>, rhapsody_store::StoreError> {
+            self.0.list_issue_runs(a0)
+        }
+        fn day_totals(
+            &self,
+            a0: &str,
+            a1: &str,
+        ) -> Result<rhapsody_store::DayTotals, rhapsody_store::StoreError> {
+            self.0.day_totals(a0, a1)
+        }
+        fn issue_history(
+            &self,
+            a0: &str,
+            a1: &str,
+            a2: i64,
+        ) -> Result<Vec<rhapsody_store::RunSummary>, rhapsody_store::StoreError> {
+            self.0.issue_history(a0, a1, a2)
+        }
+        fn get_run(
+            &self,
+            a0: i64,
+        ) -> Result<Option<rhapsody_store::RunSummary>, rhapsody_store::StoreError> {
+            self.0.get_run(a0)
+        }
+        fn run_events(
+            &self,
+            a0: i64,
+        ) -> Result<Vec<rhapsody_store::EventRow>, rhapsody_store::StoreError> {
+            self.0.run_events(a0)
+        }
+        fn earliest_run_start(&self) -> Result<Option<String>, rhapsody_store::StoreError> {
+            self.0.earliest_run_start()
+        }
+        fn metrics(
+            &self,
+            a0: i64,
+            a1: &str,
+        ) -> Result<Vec<rhapsody_store::DayRollup>, rhapsody_store::StoreError> {
+            self.0.metrics(a0, a1)
+        }
+        fn insert_run_message(
+            &self,
+            a0: i64,
+            a1: &str,
+            a2: i64,
+        ) -> Result<i64, rhapsody_store::StoreError> {
+            self.0.insert_run_message(a0, a1, a2)
+        }
+        fn mark_oldest_run_message_delivered(
+            &self,
+            a0: i64,
+            a1: i64,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.mark_oldest_run_message_delivered(a0, a1)
+        }
+        fn expire_run_messages(&self, a0: i64) -> Result<(), rhapsody_store::StoreError> {
+            self.0.expire_run_messages(a0)
+        }
+        fn list_run_messages(
+            &self,
+            a0: i64,
+        ) -> Result<Vec<rhapsody_store::RunMessage>, rhapsody_store::StoreError> {
+            self.0.list_run_messages(a0)
+        }
+        fn save_review_watch(
+            &self,
+            a0: rhapsody_store::ReviewWatchRow,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.save_review_watch(a0)
+        }
+        fn mark_review_requested(
+            &self,
+            a0: &rhapsody_store::ReviewWatchKey,
+            a1: &str,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.mark_review_requested(a0, a1)
+        }
+        fn mark_review_completed(
+            &self,
+            a0: &rhapsody_store::ReviewWatchKey,
+            a1: &str,
+            a2: &str,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.mark_review_completed(a0, a1, a2)
+        }
+        fn mark_review_truncated(
+            &self,
+            a0: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.mark_review_truncated(a0)
+        }
+        fn drop_review_watch(
+            &self,
+            a0: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.drop_review_watch(a0)
+        }
+        fn get_review_watch(
+            &self,
+            a0: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<Option<rhapsody_store::ReviewWatchRow>, rhapsody_store::StoreError> {
+            self.0.get_review_watch(a0)
+        }
+        fn load_review_watch(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ReviewWatchRow>, rhapsody_store::StoreError> {
+            self.0.load_review_watch()
+        }
+        fn load_live_review_watch(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ReviewWatchRow>, rhapsody_store::StoreError> {
+            self.0.load_live_review_watch()
+        }
+        fn prune(&self, a0: i64) -> Result<(), rhapsody_store::StoreError> {
+            self.0.prune(a0)
+        }
+        fn close(&self) -> Result<(), rhapsody_store::StoreError> {
+            self.0.close()
+        }
+    }
+
+    // A store read that FAILED is not a store read that answered "nobody". With no tracker left to
+    // ask, a silent ledger caches the negative (above) but an unreadable one must not — otherwise a
+    // transient store error blanks a column that was right, for a whole TTL window. This is the
+    // rule `label_identities` already follows for a failed round trip, applied to the other source.
+    #[tokio::test]
+    async fn an_unreadable_ledger_does_not_cache_nobody_over_an_answer() {
+        let ledger = Ledger::new();
+        let run = ledger.routed("MT-1", "alice");
+        let cache = LifecycleCache::default();
+        let keys = [key("a", run)];
+        let t0 = Instant::now();
+
+        let got = cache
+            .resolve_assignees(&keys, &ledger.store(), None, t0)
+            .await;
+        assert_eq!(got.get("a").map(String::as_str), Some("alice"));
+
+        let broken: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(UnreadableEvents(ledger.store()));
+        let after = cache
+            .resolve_assignees(&keys, &broken, None, t0 + LIFECYCLE_TTL)
+            .await;
+        assert_eq!(
+            after.get("a").map(String::as_str),
+            Some("alice"),
+            "a failed read must leave the answer standing, not replace it with nobody: {after:?}",
+        );
+
+        // And it did not cache the negative either: the store recovering answers again immediately
+        // rather than serving a memoized "" for the rest of the window.
+        let healed = cache
+            .resolve_assignees(&keys, &ledger.store(), None, t0 + LIFECYCLE_TTL)
+            .await;
+        assert_eq!(healed.get("a").map(String::as_str), Some("alice"));
     }
 
     // Two identity labels resolve deterministically, whatever order the tracker lists them in — a
