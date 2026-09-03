@@ -234,6 +234,14 @@ where
     // repository a `bypassPermissions` agent will check out, so on every other installation the
     // introduction is unrepresentable rather than merely skipped.
     let review_intro_rx = spawn_review_intro(&teams_cfg).then(|| o.open_review_intro_channel());
+    // --- ticketless review completion notification (STUDIO-723, slice 9; design record §14.2
+    // "author re-summon needs the brand token") ---
+    //
+    // The channel a finished review round hands its author-facing comment to. Spawned on exactly
+    // the introduction's condition, because a round can only exist where one was introduced. Its
+    // sender lives on the orchestrator alone and never on `o.control()`: the only thing that sends
+    // on it is the review's own exit, which runs on the control task.
+    let review_notify_rx = spawn_review_intro(&teams_cfg).then(|| o.open_review_notify_channel());
     // --- ticketless review watcher (STUDIO-721, slice 5; design record §14.1, §14.4) ---
     //
     // The slice that makes reviews actually fire. It owns its own poll cadence and every `gh` call
@@ -582,6 +590,29 @@ where
         })
     });
 
+    // The notification task, the ticketless path's other off-loop writer. It holds the ONE `gh`
+    // seam in this subsystem that writes — `PrCommentSink` — and nothing else: it takes no
+    // `Orchestrator`, reads no store, and a hung `gh pr comment` parks it alone.
+    let review_notify_task = review_notify_rx.map(|rx| {
+        let notify_ctx = shutdown.wait();
+        let deps = rhapsody_orchestrator::reviewnotify::ReviewNotifyDeps {
+            // The same `gh` seam and construction input as the introduction task's. The summon
+            // token `GH::new` takes builds its MATCHER, which the comment path does not use; the
+            // token the comment itself leads with is resolved on the control task from the same
+            // config, so a daemon with no readable workflow still posts the shipped default.
+            comments: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+                &resolved
+                    .as_ref()
+                    .map(|c| c.tracker.summon_token.clone())
+                    .unwrap_or_default(),
+                None,
+            ))),
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::reviewnotify::run_review_notify_task(notify_ctx, deps, rx).await;
+        })
+    });
+
     // The watcher task. Its `PrStateSource` is the same `gh` seam the introduction task uses, and
     // like it, the task holds no `Orchestrator`: a hung `gh` parks THIS task and the daemon keeps
     // ticking.
@@ -670,6 +701,11 @@ where
     // The watcher is cancelled by the same signal and checks it on both sides of its sleep as well
     // as between `gh` calls, so the wait is bounded by one lookup already in flight.
     if let Some(t) = review_watch_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
+    }
+    // The notification task is cancelled by the same signal and checks it on both sides of its
+    // receive, so the wait is bounded by whatever `gh pr comment` is already in flight.
+    if let Some(t) = review_notify_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     // The prefetch task is cancelled by the same signal and checks it on both sides of its sleep as
