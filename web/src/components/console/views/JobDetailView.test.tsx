@@ -1654,6 +1654,71 @@ describe("the ask dock (§6)", () => {
     );
   });
 
+  // The same false sentence, arriving by the other door: a room query whose FIRST read is still in
+  // flight when the question lands. The post's invalidate cannot cancel that read — react-query
+  // cancels a fetch only on a query that already holds data — so it dedupes into it, and a snapshot
+  // taken BEFORE the question was appended settles after it. "Settled since this mounted" is true
+  // of that read while "could have seen the question" is not, which is the distinction the gate
+  // exists to draw. It is on the ordinary path: the Room tab dispatches that first read on mount,
+  // so an operator who asks inside its round trip is asking exactly here.
+  it("never reports a question as past the window on a first read that predates it", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    // No read may settle before the question lands, so the first one is held open from the mount.
+    const reads: Array<(v: unknown) => void> = [];
+    h.fetchTeamsRoom.mockImplementation(() => new Promise((resolve) => reads.push(resolve)));
+    mountDetail([run({ id: 547 })]);
+    h.fetchTeamsRoom.mockImplementation(() => new Promise((resolve) => reads.push(resolve)));
+    await settleTrace();
+    await waitFor(() => expect(reads.length).toBeGreaterThanOrEqual(1));
+
+    const roomQuery = () =>
+      client.getQueryCache().find({ queryKey: ["teams", "room", ROOM_WATCH_WINDOW] });
+    // The state this case is about: a genuinely FIRST read, in flight, nothing cached under it.
+    expect(roomQuery()?.state.data).toBeUndefined();
+    expect(roomQuery()?.state.fetchStatus).toBe("fetching");
+
+    await ask("Why did this stop?", "f:9");
+    await waitFor(() => expect(document.querySelector(".askex")).toBeTruthy());
+    // The post deduped into that read rather than replacing it — the premise of the whole case.
+    const deduped = reads.length;
+    expect(deduped).toBe(1);
+
+    // It settles: a window from before the question, and this query's first data.
+    await act(async () => {
+      reads[0]({
+        messages: [roomPost({ id: "f:1", from: "alice", body: "posted before the question" })],
+        skipped: [],
+      });
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toBeTruthy(),
+    );
+    const pending = document.querySelector(".askex .pending")?.textContent ?? "";
+    expect(pending).not.toContain("no longer reaches that question");
+    expect(pending).not.toContain("has not replied to it yet");
+    expect(pending).toContain("reading it back");
+
+    // And the gate still OPENS — on a read whose fetch was DISPATCHED after the question, which is
+    // the next one on this key. Waiting is not the fix; claiming from a read that could not have
+    // seen the question is, and a dock that never claimed again would be no more use than one that
+    // claimed wrongly.
+    await act(async () => {
+      void client.invalidateQueries();
+    });
+    await waitFor(() => expect(reads.length).toBeGreaterThan(deduped));
+    await act(async () => {
+      reads[reads.length - 1]({
+        messages: [roomPost({ id: "f:9", body: "Why did this stop?" })],
+        skipped: [],
+      });
+    });
+    await waitFor(() =>
+      expect(document.querySelector(".askex .pending")?.textContent).toContain(
+        "@manager has not replied to it yet",
+      ),
+    );
+  });
+
   // The room log is append-only, so an answer that was read once cannot stop existing — but the
   // read is a 50-post window over the WHOLE room, re-fetched every 5s with no memory. Let the room
   // move on and the question falls out of it, which must not turn an answer already on screen into

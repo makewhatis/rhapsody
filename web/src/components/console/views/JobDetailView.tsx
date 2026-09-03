@@ -1789,6 +1789,62 @@ function AskDock({
   );
 }
 
+/** How far a shared query has got, seen by a component that has just mounted into it. */
+interface ReadProgress {
+  data: unknown;
+  dataUpdatedAt: number;
+  isFetching: boolean;
+  isFetchedAfterMount: boolean;
+}
+
+/**
+ * Whether a room read that COULD have seen this exchange's question has come back.
+ *
+ * This is the gate [`managerReply`] needs before it may read a question's absence from the window
+ * as "the read has moved past it" rather than "the read has not caught up". The card is keyed on
+ * the question, so mounting IS the moment the question landed, and the gate is a statement about
+ * reads relative to that mount.
+ *
+ * `isFetchedAfterMount` alone is not that statement. It says a read SETTLED since the mount, which
+ * is the same thing only when the reads outstanding at the mount were thrown away. On a WARM room
+ * query — the ordinary case, the Room tab holding this key open — they are: `usePostToRoom`
+ * invalidates the key on success, and what that does to a read already in flight is drop it and
+ * dispatch another. That behaviour belongs to a different module, so it is pinned by its own test
+ * (`useTeams.test.tsx`, "discards a room read already in flight"): stop invalidating there, or
+ * replace the invalidate with an optimistic update, and the warm door reopens with every test of
+ * THIS surface still green.
+ *
+ * A COLD query is the case that cannot cover, and it is why this hook exists. React-query cancels
+ * a fetch only on a query that already holds data, so on the FIRST read of the key — the one the
+ * Room tab dispatches on mount — the post's invalidate cancels nothing and dedupes into it. That
+ * read is a snapshot of the room from BEFORE the question was appended, yet it settles after,
+ * flipping `isFetchedAfterMount` and licensing the dock to announce that its read no longer
+ * reaches a question asked a second ago. So a read already outstanding at the mount with nothing
+ * cached under it is DISCOUNTED: the gate opens on the settle AFTER it, which — one query fetching
+ * serially — can only come from a fetch dispatched once that read had finished, and so after the
+ * question.
+ *
+ * The discount is deliberately narrow, and it is applied only where the cancel provably could not
+ * run. It costs one poll of "reading it back…", which claims nothing; a read outstanding on a
+ * query that DOES hold data was replaced by the post, and its successor is exactly the read this
+ * gate is looking for.
+ */
+function useReadPostdatingMount(room: ReadProgress): boolean {
+  // Read on the first render only — the mount, which is when the question landed.
+  const uncancellableAtMount = useRef(room.data === undefined && room.isFetching);
+  // What that discounted read delivered, kept so the settle after it can be told apart. Both
+  // halves matter: the data reference changes whenever the room's content did, and the timestamp
+  // changes on every success — including one whose content react-query structurally shared.
+  const discounted = useRef<{ data: unknown; at: number } | null>(null);
+  if (!room.isFetchedAfterMount) return false;
+  if (!uncancellableAtMount.current) return true;
+  if (discounted.current === null) {
+    discounted.current = { data: room.data, at: room.dataUpdatedAt };
+    return false;
+  }
+  return room.data !== discounted.current.data || room.dataUpdatedAt !== discounted.current.at;
+}
+
 /**
  * One question the dock posted, and what the room says about it — "you asked X / @manager answered
  * Y", against the one room post the manager wrote.
@@ -1821,16 +1877,14 @@ function AskExchange({
 }) {
   const room = useTeamsRoom(true, ROOM_WATCH_WINDOW);
   const messages = useMemo(() => room.data?.messages ?? [], [room.data]);
-  // `isFetchedAfterMount` is this exchange's own read gate, and it is exact because it counts
-  // updates rather than comparing clocks: it is true once the shared room query has settled since
-  // THIS exchange mounted, which — the card being keyed on the question — is since the question
-  // landed. Until then the newest data on the key can only be a window from before it, and its
-  // silence about the question means nothing (see [`managerReply`]). It also flips on a settled
-  // FAILURE, which costs nothing here: a failed read is reported as one below, before any note
-  // this outcome could choose.
+  // This exchange's own read gate: whether a read that COULD have seen the question has come back
+  // (see [`useReadPostdatingMount`]). Until one has, the newest data on the key can only be a
+  // window from before the question, and its silence about it means nothing — see
+  // [`managerReply`], which is what turns that difference into what the dock is allowed to say.
+  const settledSinceAsking = useReadPostdatingMount(room);
   const outcome = useMemo(
-    () => managerReply(messages, asked, room.isFetchedAfterMount),
-    [messages, asked, room.isFetchedAfterMount],
+    () => managerReply(messages, asked, settledSinceAsking),
+    [messages, asked, settledSinceAsking],
   );
   // The answer, once any read has shown it. A room log is append-only, so a reply that existed
   // cannot stop existing: an `answered` outcome is a fact about the ROOM, while `past-window` is
