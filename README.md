@@ -343,7 +343,8 @@ Three bounds are worth knowing as an operator. The answer is **team-scoped**: an
 to another team on the same daemon resolves to nothing at all, and gets *"I have no record of that on
 this team's projects"* rather than a leak. The records the manager reads are treated as **untrusted
 data, not instructions**, and the guarantees that gives you are worth stating exactly, because a
-model composes the sentence and no amount of framing makes a model obey. A planted line can never
+model composes the sentence and no amount of framing can guarantee a model follows its
+instructions. A planted line can never
 cause an **action** — nothing inside a record can get a ticket assigned, a review filed or a message
 relayed — and it can never make the manager **name a ticket** the team's own records did not resolve,
 because such an answer is discarded whole in favour of the daemon's own plainer wording. What it
