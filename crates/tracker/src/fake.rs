@@ -111,6 +111,8 @@ pub struct Fake {
     pub candidates_err: Option<TrackerError>,
     pub by_state_err: Option<TrackerError>,
     pub by_id_err: Option<TrackerError>,
+    /// When set, returned by `fetch_issue_labels_by_ids` (the call is still recorded). STUDIO-735.
+    pub labels_by_id_err: Option<TrackerError>,
 
     /// When set, returned by `move_issue_state` (the move is still recorded).
     pub move_err: Option<TrackerError>,
@@ -207,6 +209,7 @@ struct Inner {
     candidate_calls: usize,
     by_state_calls: usize,
     by_id_calls: usize,
+    labels_by_id_calls: usize,
     blocked_backlog_calls: usize,
     branch_by_id_calls: usize,
 
@@ -251,6 +254,10 @@ impl Fake {
     /// Number of `fetch_issue_states_by_ids` calls.
     pub fn by_id_calls(&self) -> usize {
         self.lock().by_id_calls
+    }
+    /// Number of `fetch_issue_labels_by_ids` calls.
+    pub fn labels_by_id_calls(&self) -> usize {
+        self.lock().labels_by_id_calls
     }
     /// Number of `fetch_blocked_backlog_issues` calls.
     pub fn blocked_backlog_calls(&self) -> usize {
@@ -367,6 +374,29 @@ impl Tracker for Fake {
             }
         }
         Ok(out)
+    }
+
+    /// Serves the `by_id` map, keeping only the fields the real adapters populate — id, identifier
+    /// and labels (STUDIO-735). An empty slice returns an empty result WITHOUT recording a call,
+    /// mirroring the no-API-call contract.
+    async fn fetch_issue_labels_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.lock().labels_by_id_calls += 1;
+        if let Some(e) = &self.labels_by_id_err {
+            return Err(e.clone());
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| self.by_id.get(id))
+            .map(|iss| Issue {
+                id: iss.id.clone(),
+                identifier: iss.identifier.clone(),
+                labels: iss.labels.clone(),
+                ..Issue::default()
+            })
+            .collect())
     }
 
     async fn fetch_blocked_backlog_issues(&self) -> Result<Vec<Issue>, TrackerError> {
