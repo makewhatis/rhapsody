@@ -4,27 +4,30 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { LogEntry, RunDetail, RunSummary, StateResponse } from "@/lib/api";
-import type { PullRequestView } from "@/lib/console-job-detail";
+import type { LogEntry, RunDetail, RunMessage, RunSummary, StateResponse } from "@/lib/api";
 
 // STUDIO-742 — the "Trace" run detail's three zones (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3), replacing STUDIO-683's summary strip and
-// flat runs list. The §4 side cards it did NOT replace (the PR dependency card, the room slice,
-// the ticket's memory) keep their boxes from STUDIO-681 §10 sub-ticket 2 until the watch-tabs
-// rail takes them over in slice 4.
+// flat runs list — plus the states of slice 3 (STUDIO-744) and the watch-tabs rail of slice 4
+// (STUDIO-745), which is where §4's side cards moved: Diff / Review / Room / Memory / Messages,
+// under the inspector, with an "Ask about this run" dock beneath the split.
 
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
   fetchRunDetail: vi.fn(),
   fetchRunTranscript: vi.fn(),
   sendRunMessage: vi.fn(),
+  fetchRunMessages: vi.fn(),
   fetchState: vi.fn(),
+  fetchReviews: vi.fn(),
+  postTeamsRoom: vi.fn(),
   fetchTeamsOverview: vi.fn(),
   fetchTeamsRoom: vi.fn(),
   fetchTeamsRecall: vi.fn(),
   fetchLinearIdentity: vi.fn(),
   stopRun: vi.fn(),
   resumeRun: vi.fn(),
+  fetchVersion: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (orig) => {
@@ -35,23 +38,21 @@ vi.mock("@/lib/api", async (orig) => {
     fetchRunDetail: h.fetchRunDetail,
     fetchRunTranscript: h.fetchRunTranscript,
     sendRunMessage: h.sendRunMessage,
+    fetchRunMessages: h.fetchRunMessages,
     fetchState: h.fetchState,
+    fetchReviews: h.fetchReviews,
+    postTeamsRoom: h.postTeamsRoom,
     fetchTeamsOverview: h.fetchTeamsOverview,
     fetchTeamsRoom: h.fetchTeamsRoom,
     fetchTeamsRecall: h.fetchTeamsRecall,
     fetchLinearIdentity: h.fetchLinearIdentity,
     stopRun: h.stopRun,
     resumeRun: h.resumeRun,
-    fetchVersion: vi.fn(async () => ({
-      version: "v0.4.0",
-      commit: "abc",
-      built_at: "",
-      teams_enabled: true,
-    })),
+    fetchVersion: h.fetchVersion,
   };
 });
 
-const { JobDetailView, PullRequestCard } = await import("./JobDetailView");
+const { JobDetailView } = await import("./JobDetailView");
 
 const EMPTY_STATE: StateResponse = {
   status: "ok",
@@ -197,6 +198,22 @@ function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
   });
   h.fetchTeamsRoom.mockResolvedValue({ messages: [], skipped: [] });
   h.fetchTeamsRecall.mockResolvedValue({ identity: "alice", facts: [], skipped: [] });
+  // Configured BEFORE mounting by a test that cares what they say; these are only the defaults.
+  if (h.fetchRunMessages.getMockImplementation() === undefined) {
+    h.fetchRunMessages.mockResolvedValue([]);
+  }
+  if (h.fetchReviews.getMockImplementation() === undefined) {
+    h.fetchReviews.mockResolvedValue({ enabled: true, reviews: [] });
+  }
+  // A test about a Teams-OFF daemon configures this before mounting; this is only the default.
+  if (h.fetchVersion.getMockImplementation() === undefined) {
+    h.fetchVersion.mockResolvedValue({
+      version: "v0.4.0",
+      commit: "abc",
+      built_at: "",
+      teams_enabled: true,
+    });
+  }
   h.fetchLinearIdentity.mockResolvedValue({
     connected: true,
     name: "d",
@@ -245,6 +262,11 @@ afterEach(() => {
   // installed only when there is none — so without this a test that configured the poll would
   // hand its answer to every test after it.
   h.fetchRunDetail.mockReset();
+  // Same reason: `clearAllMocks` clears calls, not implementations, so a Teams-off version answer,
+  // a review watch set or a message timeline would otherwise be handed to every test after it.
+  h.fetchVersion.mockReset();
+  h.fetchRunMessages.mockReset();
+  h.fetchReviews.mockReset();
   // The page geometry is defined on the live document, which outlives a render.
   const el = scroller() as unknown as Record<string, unknown>;
   delete el.scrollHeight;
@@ -838,112 +860,395 @@ describe("the raw-transcript escape hatch (§4)", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// The §4 side cards STUDIO-742 did not replace — retained until slice 4's watch-tabs rail.
+// Slice 4 (STUDIO-745) — the watch-tabs rail under the inspector (§3C), and the ask dock (§6).
 // ---------------------------------------------------------------------------------------------
-describe("the pull-request card (§4)", () => {
-  function card(pr: PullRequestView | null) {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={qc}>
-        <PullRequestCard pr={pr} />
-      </QueryClientProvider>,
-    );
-  }
 
-  const checks: PullRequestView["checks"] = [
-    { name: "lint", state: "pass", detail: "passed" },
-    { name: "test", state: "fail", detail: "failing" },
-    { name: "web", state: "pending", detail: "running" },
-  ];
+/** The rail's tab buttons, by label, in the order they render. */
+function tabLabels(): string[] {
+  return [...document.querySelectorAll(".trwatch .tab")].map((el) => el.textContent ?? "");
+}
 
-  // Box 2.11
-  it("lists each CI check with its pass/fail state and the blocked note", () => {
-    card({ number: "#230", url: "https://example/230", draft: false, behind: 0, checks });
-    expect([...document.querySelectorAll(".chk")].map((el) => el.textContent)).toEqual([
-      "lintpassed",
-      "testfailing",
-      "webrunning",
-    ]);
-    expect(document.querySelector(".chk.ok")?.textContent).toContain("lint");
-    expect(document.querySelector(".chk.bad")?.textContent).toContain("test");
-    expect(document.querySelector(".chk.pending")?.textContent).toContain("web");
-    expect(document.querySelector(".prnote")?.textContent).toContain("Blocked — 1 failing check.");
+/** Selects one of the rail's tabs and waits for its panel to be the one showing. */
+async function openTab(label: string) {
+  fireEvent.click(screen.getByRole("tab", { name: new RegExp(`^${label}`, "i") }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("tab", { name: new RegExp(`^${label}`, "i") }).getAttribute("aria-selected"),
+    ).toBe("true"),
+  );
+}
+
+/** What the one mounted panel currently reads. */
+function panel(): HTMLElement {
+  return document.querySelector(`#${"trwatch-panel"}`) as HTMLElement;
+}
+
+function reviewJob(over: Record<string, unknown> = {}) {
+  return {
+    owner: "makewhatis",
+    repo: "rhapsody",
+    number: 105,
+    reviewer: "jimmy",
+    author: "alice",
+    introduced_by: "handoff:STUDIO-654",
+    requested_sha: "abc1234def",
+    last_reviewed_sha: "",
+    status: "in_flight",
+    open: true,
+    ...over,
+  };
+}
+
+function runMessage(over: Partial<RunMessage> = {}): RunMessage {
+  return { id: 1, run_id: 547, body: "btw the branch moved", created_at_ms: 0, status: "sent", ...over };
+}
+
+describe("the watch-tabs rail (§3C)", () => {
+  it("puts the five tabs under the inspector, with Diff the only one marked a dependency", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+
+    // Inside the split's right column, under the inspector — not a row of its own below the trace.
+    const right = document.querySelector(".trsplit .trright") as HTMLElement;
+    expect(right.querySelector(".trinsp")).toBeTruthy();
+    expect(right.querySelector(".trwatch")).toBeTruthy();
+
+    expect(tabLabels()).toEqual(["Diffdep", "Review", "Room", "Memory", "Messages"]);
+    expect(screen.getByRole("tab", { name: /^room/i }).getAttribute("aria-selected")).toBe("true");
+    // Every tab drives the one panel, and the panel names the tab that filled it.
+    for (const tab of screen.getAllByRole("tab")) {
+      expect(tab.getAttribute("aria-controls")).toBe("trwatch-panel");
+    }
+    expect(panel().getAttribute("aria-labelledby")).toBe("trtab-room");
   });
 
-  it("reports a mergeable PR", () => {
-    card({
-      number: "#230",
-      url: "https://example/230",
-      draft: false,
-      behind: 0,
-      checks: [{ name: "lint", state: "pass", detail: "passed" }],
-    });
-    expect(document.querySelector(".prnote")?.textContent).toContain("mergeable");
-    expect(screen.getByText("#230")).toBeTruthy();
-  });
+  // The whole reason only ONE panel is mounted: four surfaces polling for nobody to read.
+  it("fetches a tab's data only once that tab is opened", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(h.fetchTeamsRoom).toHaveBeenCalled());
+    expect(h.fetchReviews).not.toHaveBeenCalled();
+    expect(h.fetchRunMessages).not.toHaveBeenCalled();
 
-  // §11 — the card must name the missing data source, not fabricate a PR.
-  it("names the dependency when no PR data exists, which is the shipped state", () => {
-    card(null);
-    expect(screen.getByText(/the daemon serves no PR endpoint yet/i)).toBeTruthy();
-    expect(document.querySelector(".chk")).toBeNull();
+    await openTab("Review");
+    await waitFor(() => expect(h.fetchReviews).toHaveBeenCalled());
+    expect(h.fetchRunMessages).not.toHaveBeenCalled();
   });
 });
 
-describe("the side column's teams cards (§4)", () => {
-  // STUDIO-739 — the room slice and the ticket's memory carry the same agent prose the room and
-  // the memory page do, so they render it the same way.
-  it("renders the markdown in a room post and in a retained fact", async () => {
-    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
-    mountDetail([run({ id: 1 })]);
-    h.fetchTeamsRoom.mockResolvedValue({
-      messages: [
-        { id: "f:1", from: "alice", to: "*", at: "2026-09-01T16:37:00Z", body: "STUDIO-654 is **up for review**.", refs: ["STUDIO-654"] },
-      ],
-      skipped: [],
-    });
-    h.fetchTeamsRecall.mockResolvedValue({
-      identity: "alice",
-      facts: [
-        { id: "1", identity: "alice", document_id: "", ticket: "STUDIO-654", commit_sha: "", pr: "", run_id: "547", at: "", state: "valid", reason: "", content: "Run `make fixtures` first." },
-      ],
-      skipped: [],
-    });
-
-    await waitFor(() => expect(document.querySelector(".mcard strong")).toBeTruthy());
-    expect(document.querySelector(".mcard strong")?.textContent).toBe("up for review");
-    await waitFor(() =>
-      expect([...document.querySelectorAll(".mcard code")].map((c) => c.textContent)).toContain(
-        "make fixtures",
-      ),
-    );
-  });
-
-  it("shows the room posts and memory facts that reference this ticket", async () => {
+// Acceptance — "Room tab shows this ticket's room posts; Memory tab shows this ticket's facts."
+describe("Room · this ticket / Memory from this ticket (§3C)", () => {
+  it("shows the room posts that reference this ticket and hides the ones that do not", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
     mountDetail([run({ id: 1 })]);
     h.fetchTeamsRoom.mockResolvedValue({
       messages: [
         { id: "f:1", from: "operator", to: "*", at: "2026-09-01T16:37:00Z", body: "Who can review this?", refs: ["STUDIO-654"] },
         { id: "f:2", from: "alice", to: "*", at: "2026-09-01T19:11:00Z", body: "Unrelated post", refs: [] },
-      ],
-      skipped: [],
-    });
-    h.fetchTeamsRecall.mockResolvedValue({
-      identity: "alice",
-      facts: [
-        { id: "1", identity: "alice", document_id: "", ticket: "STUDIO-654", commit_sha: "", pr: "", run_id: "547", at: "", state: "valid", reason: "", content: "Grep DeepSeek after a config rebase." },
-        { id: "2", identity: "alice", document_id: "", ticket: "OTHER-1", commit_sha: "", pr: "", run_id: "1", at: "", state: "valid", reason: "", content: "Not this ticket." },
+        { id: "f:3", from: "alice", to: "*", at: "2026-09-01T19:20:00Z", body: "STUDIO-654 is **up for review**.", refs: [] },
       ],
       skipped: [],
     });
 
     await waitFor(() => expect(screen.getByText("Who can review this?")).toBeTruthy());
     expect(screen.queryByText("Unrelated post")).toBeNull();
-    await waitFor(() =>
-      expect(screen.getByText("Grep DeepSeek after a config rebase.")).toBeTruthy(),
-    );
+    // STUDIO-739's renderer, the same one the room page uses — the prose is agent markdown.
+    expect(panel().querySelector(".mcard strong")?.textContent).toBe("up for review");
+    // Newest first, matching the room itself.
+    expect([...panel().querySelectorAll(".mcard")][0].textContent).toContain("up for review");
+  });
+
+  it("shows only the facts this ticket's runs retained, on the Memory tab", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    mountDetail([run({ id: 1 })]);
+    h.fetchTeamsRecall.mockResolvedValue({
+      identity: "alice",
+      facts: [
+        { id: "1", identity: "alice", document_id: "", ticket: "STUDIO-654", commit_sha: "", pr: "", run_id: "547", at: "", state: "valid", reason: "", content: "Run `make fixtures` first." },
+        { id: "2", identity: "alice", document_id: "", ticket: "OTHER-1", commit_sha: "", pr: "", run_id: "1", at: "", state: "valid", reason: "", content: "Not this ticket." },
+      ],
+      skipped: [],
+    });
+    await settleTrace();
+    await openTab("Memory");
+
+    await waitFor(() => expect(screen.getByText(/make fixtures/)).toBeTruthy());
     expect(screen.queryByText("Not this ticket.")).toBeNull();
+    expect(panel().querySelector(".mcard code")?.textContent).toBe("make fixtures");
+    expect(panel().textContent).toContain("run 547");
+  });
+
+  // Nothing under `/api/v1/teams*` is fetched with Teams off — so the tab says which feature would
+  // fill it rather than showing an empty list that reads as "nobody said anything".
+  it("names the dependency, and fetches nothing, on a Teams-off daemon", async () => {
+    h.fetchVersion.mockResolvedValue({ version: "v0.4.0", commit: "a", built_at: "", teams_enabled: false });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    mountDetail([run({ id: 1 })]);
+    await settleTrace();
+
+    await waitFor(() => expect(panel().textContent).toContain("Teams is off on this daemon"));
+    await openTab("Memory");
+    expect(panel().textContent).toContain("Teams is off on this daemon");
+    expect(h.fetchTeamsRoom).not.toHaveBeenCalled();
+    expect(h.fetchTeamsRecall).not.toHaveBeenCalled();
+    // And there is no room to ask into either, so the dock is not offered.
+    expect(document.querySelector(".askdock")).toBeNull();
+  });
+});
+
+// Acceptance — "Messages composer posts to /runs/{id}/message and flips sent→delivered."
+describe("Messages — the composer and its timeline (§3C)", () => {
+  it("lists what was sent and flips its chip to delivered when the daemon says so", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunMessages.mockResolvedValue([runMessage()]);
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    await openTab("Messages");
+
+    await waitFor(() => expect(panel().querySelector(".trmsgs .msg")).toBeTruthy());
+    expect(panel().querySelector(".trmsgs .msg .body")?.textContent).toBe("btw the branch moved");
+    expect(panel().querySelector(".trmsgs .msg .chip")?.textContent).toBe("sent");
+    expect(panel().querySelector(".trmsgs .msg .chip.delivered")).toBeNull();
+
+    // The 2s in-flight poll is what notices the agent picking it up.
+    h.fetchRunMessages.mockResolvedValue([runMessage({ status: "delivered", delivered_turn: 3 })]);
+    await poll(["run-messages", 547]);
+    await waitFor(() =>
+      expect(panel().querySelector(".trmsgs .msg .chip.delivered")?.textContent).toBe(
+        "delivered · turn 3",
+      ),
+    );
+  });
+
+  it("posts a composed message to the daemon's own endpoint and clears the box", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.sendRunMessage.mockResolvedValue({ id: 3, identifier: "STUDIO-654", status: "sent" });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    await openTab("Messages");
+
+    const box = (await screen.findByLabelText(/message the running agent/i)) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "btw the branch moved" } });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    await waitFor(() =>
+      expect(h.sendRunMessage).toHaveBeenCalledExactlyOnceWith(547, "btw the branch moved"),
+    );
+    await waitFor(() => expect(box.value).toBe(""));
+  });
+
+  // The list is HISTORY, so it is shown for a finished run too — what was delivered, and what
+  // expired because the run ended first. Only the send is impossible.
+  it("still shows a finished run's timeline, including a message that expired undelivered", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunMessages.mockResolvedValue([runMessage({ status: "expired" })]);
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Messages");
+
+    await waitFor(() =>
+      expect(panel().querySelector(".trmsgs .msg .chip.expired")?.textContent).toContain(
+        "the run ended first",
+      ),
+    );
+    expect((screen.getByRole("button", { name: /^send$/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // The header's action is the way IN to the tab now — one composer, in the rail, not two.
+  it("is where the header's Message action lands, with the cursor already in the box", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(screen.queryByLabelText(/message the running agent/i)).toBeNull();
+
+    fireEvent.click(action(/^message/i));
+    const box = await screen.findByLabelText(/message the running agent/i);
+    expect(screen.getByRole("tab", { name: /^messages/i }).getAttribute("aria-selected")).toBe("true");
+    await waitFor(() => expect(document.activeElement).toBe(box));
+    // Exactly one composer in the document — the rail's.
+    expect(screen.getAllByLabelText(/message the running agent/i)).toHaveLength(1);
+  });
+
+  // Reading the room mid-compose must not throw away what the operator typed, which is why the
+  // draft is held above the panel that unmounts.
+  it("keeps a half-written message across a trip to another tab", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    await openTab("Messages");
+    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
+      target: { value: "btw the branch moved" },
+    });
+
+    await openTab("Room");
+    expect(screen.queryByLabelText(/message the running agent/i)).toBeNull();
+    await openTab("Messages");
+    const box = (await screen.findByLabelText(/message the running agent/i)) as HTMLTextAreaElement;
+    expect(box.value).toBe("btw the branch moved");
+  });
+
+  // An instruction written for one attempt is not an instruction for another, and retargeting it
+  // silently would send the operator's words to a run they never chose.
+  it("drops the draft when the operator switches attempt", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ ...LIVE }), run({ id: 522, outcome: "completed" })]);
+    await settleTrace();
+    await openTab("Messages");
+    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
+      target: { value: "btw the branch moved" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
+      ).toBe(""),
+    );
+  });
+});
+
+// Acceptance — "Diff + Review render as dependency-named (deep-link / status), never fake."
+describe("Diff and Review — dependency-named, never invented (§5)", () => {
+  it("shows no diff at all, names the endpoint it waits on, and deep-links the pull request", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+
+    expect(panel().querySelector(".trdep")?.textContent).toContain("needs a daemon endpoint");
+    // Nothing that could be read as a diff: no patch text, no +/- lines, no file list.
+    expect(panel().querySelector("pre")).toBeNull();
+    expect(panel().textContent).not.toMatch(/^[+-]{3}/m);
+    // The deep link is the head-branch SEARCH, so it can never assert a PR that does not exist.
+    const link = within(panel()).getByRole("link", { name: /pull request/i });
+    expect(link.getAttribute("href")).toBe(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
+    );
+    expect(panel().textContent).toContain("symphony/STUDIO-654");
+  });
+
+  it("names the missing link too when the run's remote is not a GitHub one", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547, repo: "git@gitlab.com:o/r.git" })]);
+    await settleTrace();
+    await openTab("Diff");
+    expect(within(panel()).queryByRole("link")).toBeNull();
+    expect(panel().textContent).toContain("not on github.com");
+  });
+
+  it("reports the reviewer and the watch-set status, and names the verdict as the dependency", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchReviews.mockResolvedValue({
+      enabled: true,
+      reviews: [
+        reviewJob({ status: "reviewed", last_reviewed_sha: "e90ccc6457f" }),
+        // A different ticket's pull request: this run's tab must not claim it.
+        reviewJob({ number: 104, reviewer: "bob", introduced_by: "handoff:STUDIO-744" }),
+      ],
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Review");
+
+    await waitFor(() => expect(panel().querySelectorAll(".trrev .rev")).toHaveLength(1));
+    const row = panel().querySelector(".trrev .rev") as HTMLElement;
+    expect(row.textContent).toContain("jimmy");
+    expect(row.querySelector(".pill")?.textContent).toContain("Reviewed");
+    expect(row.querySelector(".pr")?.getAttribute("href")).toBe(
+      "https://github.com/makewhatis/rhapsody/pull/105",
+    );
+    expect(row.textContent).toContain("e90ccc6");
+    // What is NOT served: the findings. The panel says so rather than printing a verdict.
+    expect(panel().querySelector(".trdep")?.textContent).toContain(
+      "The verdict itself is a dependency",
+    );
+  });
+
+  it("says nothing is watching this run rather than showing an empty table", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Review");
+    await waitFor(() =>
+      expect(panel().textContent).toContain("No review has been requested"),
+    );
+    expect(panel().querySelector(".trrev")).toBeNull();
+  });
+
+  // `{enabled: false}` is the daemon's own answer — Teams is off, or the review mode is not
+  // `ticketless`. It is not an error, and it is not "no reviewer yet".
+  it("distinguishes a daemon that does not run ticketless review at all", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchReviews.mockResolvedValue({ enabled: false, reviews: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Review");
+    await waitFor(() =>
+      expect(panel().textContent).toContain("Ticketless review is not enabled"),
+    );
+  });
+});
+
+// Acceptance — "'Ask about this run' posts a room message refed to the run."
+describe("the ask dock (§6)", () => {
+  it("posts the operator's question to the room, refed to the ticket AND the run", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.postTeamsRoom.mockResolvedValue({
+      id: "f:9", from: "operator", to: "*", at: "2026-09-03T10:00:00Z", refs: [], delivered: 0,
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+
+    const box = screen.getByLabelText(/ask about this run/i);
+    fireEvent.change(box, { target: { value: "Why did alice pick this reviewer?" } });
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+
+    await waitFor(() =>
+      expect(h.postTeamsRoom).toHaveBeenCalledExactlyOnceWith("Why did alice pick this reviewer?", [
+        "STUDIO-654",
+        "run 547",
+      ]),
+    );
+    // It says where the question went — never that an answer is coming back to this page, which
+    // no endpoint serves yet (design record §8).
+    await waitFor(() => expect(screen.getByText(/posted to the room/i)).toBeTruthy());
+    expect((box as HTMLInputElement).value).toBe("");
+  });
+
+  it("refuses an empty question rather than posting one", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    fireEvent.change(screen.getByLabelText(/ask about this run/i), { target: { value: "  " } });
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+    await flushSend();
+    expect(h.postTeamsRoom).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a refused post rather than swallowing it", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.postTeamsRoom.mockRejectedValue(new Error("teams_disabled"));
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    fireEvent.change(screen.getByLabelText(/ask about this run/i), { target: { value: "why?" } });
+    fireEvent.click(screen.getByRole("button", { name: /^ask$/i }));
+    await waitFor(() =>
+      expect(document.querySelector(".askdock .acterr")?.textContent).toContain("teams_disabled"),
+    );
+    expect(document.querySelector(".askdock .posted")).toBeNull();
+  });
+
+  // The raw hatch is the debugger's escape from the folding, not a place to ask about it.
+  it("is not offered while the raw transcript is open", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".askdock")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Raw transcript" }));
+    await waitFor(() => expect(document.querySelector(".trraw")).toBeTruthy());
+    expect(document.querySelector(".askdock")).toBeNull();
+    expect(document.querySelector(".trwatch")).toBeNull();
   });
 });
 
@@ -978,8 +1283,18 @@ describe("wide content is contained (STUDIO-681's layout rule)", () => {
     // A CSS grid track is `min-width: auto` by default, which means "as wide as the content" —
     // the one way a fenced code block inside the inspector can push the whole page sideways.
     expect(rule(".rh-console .trsplit")).toMatch(/grid-template-columns:\s*264px minmax\(0, 1fr\)/);
+    // `.trright` is the grid CHILD now — the inspector and the watch rail share that column — so
+    // it is the one that has to carry the zero minimum; `.trinsp` alone would not save the page.
+    expect(rule(".rh-console .trright")).toMatch(/min-width:\s*0/);
     expect(rule(".rh-console .trinsp")).toMatch(/min-width:\s*0/);
+    expect(rule(".rh-console .trwatch .tabbody")).toMatch(/min-width:\s*0/);
     expect(rule(".rh-console .trrc .body")).toMatch(/min-width:\s*0/);
+  });
+
+  it("wraps an operator message body rather than widening the rail", () => {
+    const body = rule(".rh-console .trmsgs .msg .body");
+    expect(body).toMatch(/white-space:\s*pre-wrap/);
+    expect(body).toMatch(/overflow-wrap:\s*anywhere/);
   });
 
   it("keeps the spine's one-line summaries from being widened by a long command", () => {

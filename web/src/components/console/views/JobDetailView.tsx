@@ -9,7 +9,6 @@ import {
 } from "react";
 import {
   Button,
-  Card,
   Chip,
   Markdown,
   Mono,
@@ -20,20 +19,19 @@ import {
   Timestamp,
 } from "@/components/console";
 import { teammateColor } from "@/theme/teammates";
-import { useIssueHistory, useRunDetail, useTranscript } from "@/hooks/useRunDetail";
+import {
+  useIssueHistory,
+  useRunDetail,
+  useRunMessages,
+  useTranscript,
+} from "@/hooks/useRunDetail";
 import { useLinearIdentity } from "@/hooks/useConfig";
 import { useResumeRun, useSendRunMessage, useStopRun } from "@/hooks/useRunActions";
-import { useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
+import { useReviews } from "@/hooks/useReviews";
+import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
 import { useTicketFacts } from "@/hooks/useTicketFacts";
 import { ticketAssignees } from "@/lib/console-jobs";
-import {
-  checksSummary,
-  clockTime,
-  mergeNote,
-  runOutcomePill,
-  runsNewestFirst,
-  type PullRequestView,
-} from "@/lib/console-job-detail";
+import { clockTime, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
 import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
@@ -51,6 +49,7 @@ import {
   relayBatons,
   resultBanner,
   resultEyebrow,
+  runBranch,
   runTeammate,
   runVitals,
   ticketUrl,
@@ -61,6 +60,16 @@ import {
   type TraceFilter,
 } from "@/lib/console-trace-view";
 import {
+  DEFAULT_WATCH_TAB,
+  WATCH_TABS,
+  askRefs,
+  messageChip,
+  reviewsForRun,
+  roomPostsFor,
+  type WatchTabId,
+} from "@/lib/console-watch";
+import { reviewRow } from "@/lib/reviews-model";
+import {
   baseToolName,
   buildResult,
   buildTrace,
@@ -69,8 +78,7 @@ import {
   type SaidBlock,
   type TracePhase,
 } from "@/lib/trace-model";
-import type { LogEntry, RunSummary, TeamsFact, TeamsRoomMessage } from "@/lib/api";
-import { CrossGlyph, PendingGlyph, TickGlyph } from "./glyphs";
+import type { LogEntry, RunSummary, TeamsFact } from "@/lib/api";
 import "@/theme/console-trace.css";
 
 // Job detail — the "Trace" run detail (STUDIO-742), the three zones of the design record
@@ -92,11 +100,16 @@ import "@/theme/console-trace.css";
 // oldest→newest `LogEntry` list. The folding is a documented heuristic — a debugger is never
 // trapped inside it.
 //
+// Slice 4 (STUDIO-745) adds §3C's watch-tabs rail under the inspector — Diff / Review / Room /
+// Memory / Messages — which is where the §4 side cards that used to sit in their own row below the
+// trace now live, joined by the run's operator-message timeline and an "Ask about this run" dock
+// that posts to the room refed to the run (§6).
+//
 // The model behind all three zones is `lib/trace-model` (slice 1) and `lib/console-trace-view`;
-// nothing here re-derives it. What no endpoint serves is still not invented: there is no PR
-// number (§5), so "View PR" resolves through a head-branch search and "Merge" names the daemon
-// endpoint it is waiting on. The §4 side cards below the zones — the PR dependency card, the room
-// slice, this ticket's memory — are unchanged, and move into the watch-tabs rail in slice 4.
+// the rail's own is `lib/console-watch`. Nothing here re-derives them. What no endpoint serves is
+// still not invented: there is no PR number (§5), so "View PR" resolves through a head-branch
+// search, "Merge" names the daemon endpoint it is waiting on, and the Diff tab is a dependency
+// card with a deep link rather than a diff nobody served.
 
 export function JobDetailView({
   issue,
@@ -147,20 +160,12 @@ export function JobDetailView({
           runs={runs}
           assignee={assignee}
           roster={roster}
+          teamsEnabled={teamsEnabled}
           onBack={() => onNavigate("jobs")}
           onSelectRun={setPinned}
+          onOpenMemory={() => onNavigate("memory")}
         />
       )}
-
-      {/* The §4 context cards the three zones did not replace. They become the inspector's
-          watch-tabs rail in slice 4; until then they keep their own row under the trace. */}
-      <div className="trctx">
-        <PullRequestCard pr={null} />
-        {teamsEnabled ? <RoomSliceCard issue={issue} roster={roster} /> : null}
-        {teamsEnabled ? (
-          <TicketMemoryCard issue={issue} roster={roster} onOpenMemory={() => onNavigate("memory")} />
-        ) : null}
-      </div>
     </section>
   );
 }
@@ -171,15 +176,19 @@ function RunTrace({
   runs,
   assignee,
   roster,
+  teamsEnabled,
   onBack,
   onSelectRun,
+  onOpenMemory,
 }: {
   run: RunSummary;
   runs: readonly RunSummary[];
   assignee: string;
   roster: readonly string[];
+  teamsEnabled: boolean;
   onBack: () => void;
   onSelectRun: (id: number) => void;
+  onOpenMemory: () => void;
 }) {
   // The two polls slice 3 rides on, both already the daemon's own cadence: the run detail at 2s
   // and the transcript at 1.5s. `/issues/{id}/history` is fetched once and cached for 10s, which
@@ -198,7 +207,14 @@ function RunTrace({
   // about whose run this is — they did while only the header knew about a review key.
   const who = runTeammate(run, assignee);
   const [raw, setRaw] = useState(false);
-  const [composing, setComposing] = useState(false);
+  // The rail's selection, and the draft in its composer. Both live HERE rather than in the panel
+  // so that reading the room, then coming back, does not silently discard a half-written
+  // instruction — only the panel that is showing is mounted, and its own state dies with it.
+  const [tab, setTab] = useState<WatchTabId>(DEFAULT_WATCH_TAB);
+  const [draft, setDraft] = useState("");
+  // A focus request, not a flag: the header's Message action selects the Messages tab AND puts the
+  // cursor in the composer, and asking twice must focus twice even though the tab did not change.
+  const [focusMessage, setFocusMessage] = useState(0);
   // A jump request rather than a selection: the Result card asks, the Split acts. It carries a
   // nonce so asking TWICE re-opens a card the operator folded away between the two clicks — the
   // jump is an instruction, and a bare "which card" would compare equal and do nothing.
@@ -209,9 +225,13 @@ function RunTrace({
 
   // Switching attempt drops a jump aimed at the attempt being left, so the incoming Split — which
   // remounts on the same switch — cannot open a card belonging to the trace it just replaced.
+  //
+  // The draft goes with it. An instruction written for run 522 is not an instruction for run 547,
+  // and silently retargeting it at whichever attempt the operator switched to would send their
+  // words somewhere they never chose.
   const selectRun = (id: number) => {
     setJump(null);
-    setComposing(false);
+    setDraft("");
     onSelectRun(id);
   };
 
@@ -233,20 +253,19 @@ function RunTrace({
         roster={roster}
         vitals={vitals}
         inFlight={inFlight}
-        composing={composing}
+        composerId={!raw && tab === "messages" ? MESSAGE_COMPOSER_ID : undefined}
         onBack={onBack}
         onSelectRun={selectRun}
-        onCompose={() => setComposing(!composing)}
+        // The operator's own line into a running agent (`POST /api/v1/runs/{id}/message`) is the
+        // rail's Messages tab now, so the header's action takes them there and puts the cursor in
+        // it rather than mounting a second composer beside the one in the rail. It also leaves the
+        // raw hatch, which does not carry the rail.
+        onCompose={() => {
+          setRaw(false);
+          setTab("messages");
+          setFocusMessage((n) => n + 1);
+        }}
       />
-
-      {/* The operator's own line into a running agent (`POST /api/v1/runs/{id}/message`). Only a
-          LIVE run can be reached — a finished one has no agent left, so the header's action names
-          that instead of offering a send that cannot land — but a composer already open when the
-          run ends stays open, rather than taking a half-written instruction down with it. The
-          MESSAGE LIST, with its sent→delivered chips, is slice 4's watch-tab. */}
-      {composing ? (
-        <MessageComposer runId={run.id} live={inFlight} onClose={() => setComposing(false)} />
-      ) : null}
 
       <div className="trmode">
         <div className="rt">
@@ -285,7 +304,26 @@ function RunTrace({
             live={inFlight}
             batons={batons}
             jump={jump}
+            watch={
+              <WatchTabsRail tab={tab} onSelect={setTab}>
+                <WatchPanel
+                  tab={tab}
+                  run={live}
+                  inFlight={inFlight}
+                  roster={roster}
+                  teamsEnabled={teamsEnabled}
+                  draft={draft}
+                  onDraft={setDraft}
+                  focusComposer={focusMessage}
+                  onOpenMemory={onOpenMemory}
+                />
+              </WatchTabsRail>
+            }
           />
+          {/* §6's "Ask about this run": a room post refed to the run TODAY, which upgrades to the
+              answering-manager Answer path when one is served. It needs a room to post into, so
+              a daemon with Teams off gets no dock rather than a control that cannot act. */}
+          {teamsEnabled ? <AskDock run={live} who={who} /> : null}
         </>
       )}
     </div>
@@ -322,7 +360,7 @@ function TraceHeader({
   roster,
   vitals,
   inFlight,
-  composing,
+  composerId,
   onBack,
   onSelectRun,
   onCompose,
@@ -335,7 +373,8 @@ function TraceHeader({
   roster: readonly string[];
   vitals: RunVitals;
   inFlight: boolean;
-  composing: boolean;
+  /** The rail composer's element id while it is actually on screen; undefined otherwise. */
+  composerId: string | undefined;
   onBack: () => void;
   onSelectRun: (id: number) => void;
   onCompose: () => void;
@@ -403,7 +442,7 @@ function TraceHeader({
         run={run}
         ticketHref={ticketUrl(workspaceURLKey, run.issue_identifier)}
         inFlight={inFlight}
-        composing={composing}
+        composerId={composerId}
         onCompose={onCompose}
       />
     </div>
@@ -414,13 +453,13 @@ function HeaderActions({
   run,
   ticketHref,
   inFlight,
-  composing,
+  composerId,
   onCompose,
 }: {
   run: RunSummary;
   ticketHref: string;
   inFlight: boolean;
-  composing: boolean;
+  composerId: string | undefined;
   onCompose: () => void;
 }) {
   const stop = useStopRun(run.id);
@@ -454,14 +493,15 @@ function HeaderActions({
       ) : null}
       {/* Real while the run is live — `POST /api/v1/runs/{id}/message` is an endpoint the daemon
           already serves. On a finished run it is dependency-named for a different reason than the
-          rest of this cluster: there is no missing endpoint, there is no agent left to read it. */}
+          rest of this cluster: there is no missing endpoint, there is no agent left to read it.
+          (The Messages TAB still opens on a finished run — the timeline of what was sent, and what
+          expired undelivered, is history worth reading; only the send is impossible.) */}
       {inFlight ? (
         <Button
           variant="sec"
-          aria-expanded={composing}
-          // Named only while the composer is actually mounted: `aria-controls` pointing at an id
-          // that is not in the document is a dangling reference, not a hint.
-          aria-controls={composing ? MESSAGE_COMPOSER_ID : undefined}
+          // Named only while the rail's composer is actually on screen: `aria-controls` pointing at
+          // an id that is not in the document is a dangling reference, not a hint.
+          aria-controls={composerId}
           onClick={onCompose}
         >
           Message
@@ -517,87 +557,6 @@ function DepButton({ title, children }: { title: string; children: ReactNode }) 
       {children}
       <span className="dep">dep</span>
     </button>
-  );
-}
-
-/** The composer's element id, so the header's Message action can name what it expands. */
-const MESSAGE_COMPOSER_ID = "trmsg";
-
-/**
- * The operator's line into a running agent (`POST /api/v1/runs/{id}/message`, INF-250).
- *
- * Deliberately just the composer. The message LIST — each row's sent→delivered chip, polled at 2s
- * — is the Messages watch-tab of slice 4, and building half of it here would be the thing the
- * slice plan splits these tickets to avoid. What this owns is the send and its outcome: the
- * console has no toast surface, so a refusal (the daemon caps pending messages per run) reports
- * here or nowhere.
- *
- * It stays mounted when the run ends underneath it (`live` goes false) instead of unmounting with
- * whatever was typed in it: the send is impossible then and says so, but silently discarding an
- * operator's half-written instruction is not this component's call to make.
- */
-function MessageComposer({
-  runId,
-  live,
-  onClose,
-}: {
-  runId: number;
-  live: boolean;
-  onClose: () => void;
-}) {
-  const send = useSendRunMessage(runId);
-  const [text, setText] = useState("");
-  const [problem, setProblem] = useState("");
-  const submit = () => {
-    const body = text.trim();
-    // An empty send is not an error to report — it is nothing to say. The daemon would reject it
-    // anyway, and spending a request to be told so is worse than not making one. Nor is there
-    // anything to send to once the run has ended.
-    if (!live || body === "" || send.isPending) return;
-    setProblem("");
-    send.mutate(body, {
-      onSuccess: () => setText(""),
-      onError: (err) => setProblem(err.message),
-    });
-  };
-  return (
-    <div className="trmsg" id={MESSAGE_COMPOSER_ID}>
-      <textarea
-        aria-label="Message the running agent"
-        placeholder="The agent picks this up at its next step…"
-        maxLength={4000}
-        rows={2}
-        value={text}
-        disabled={send.isPending}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          // Enter sends, Shift+Enter breaks the line — and a composition (CJK and friends) is
-          // being CONFIRMED by that Enter, never sent by it.
-          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-            e.preventDefault();
-            submit();
-          }
-        }}
-      />
-      <div className="row">
-        {live ? null : (
-          <span className="acterr" role="status">
-            This run has ended — there is no agent left to deliver this to.
-          </span>
-        )}
-        {problem === "" ? null : (
-          <span className="acterr" role="status">
-            {problem}
-          </span>
-        )}
-        <Button onClick={submit} disabled={!live || send.isPending}>
-          Send
-        </Button>
-        <Button variant="sec" onClick={onClose}>
-          Close
-        </Button>
-      </div>
-    </div>
   );
 }
 
@@ -703,6 +662,7 @@ function TraceSplit({
   live,
   batons,
   jump,
+  watch,
 }: {
   phases: readonly TracePhase[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
@@ -712,6 +672,8 @@ function TraceSplit({
   live: boolean;
   batons: RelayBatons;
   jump: { step: FailingStep; nonce: number } | null;
+  /** §3C's watch-tabs rail, which sits under the inspector in the same column. */
+  watch: ReactNode;
 }) {
   const [filter, setFilter] = useState<TraceFilter>("all");
   const [query, setQuery] = useState("");
@@ -802,15 +764,20 @@ function TraceSplit({
           <div className="empty">No step matches.</div>
         ) : null}
       </div>
-      <div className="trinsp">
-        {selected === undefined ? null : (
-          <Inspector
-            phase={selected}
-            who={who}
-            openSeq={target?.phaseId === selected.id ? target.cardSeq : null}
-            openNonce={nonce}
-          />
-        )}
+      {/* The inspector and the rail share the right column: the rail is what the SELECTED frame
+          is watched against, so it sits under it rather than beside the spine. */}
+      <div className="trright">
+        <div className="trinsp">
+          {selected === undefined ? null : (
+            <Inspector
+              phase={selected}
+              who={who}
+              openSeq={target?.phaseId === selected.id ? target.cardSeq : null}
+              openNonce={nonce}
+            />
+          )}
+        </div>
+        {watch}
       </div>
       {/* Only while the run is LIVE: on a finished trace there is no "latest" to fall behind. */}
       {behind ? (
@@ -1155,104 +1122,274 @@ function RawTranscript({ entries, pending }: { entries: readonly LogEntry[]; pen
   );
 }
 
-// --- the §4 side cards, unchanged — they move into slice 4's watch-tabs rail --------------
+
+// --- (C, continued) the watch-tabs rail (§3C, slice 4) --------------------------------------
+
+/** The panel's element id, so every tab in the rail can name what it controls. */
+const WATCH_PANEL_ID = "trwatch-panel";
 
 /**
- * The §4 pull-request card. `pr === null` is the SHIPPED state: no daemon endpoint carries a
- * PR, its checks or its mergeability (§9/§11), so the card names the dependency instead of
- * inventing one. Exported so §10 box 2.11 can exercise the populated card directly.
+ * The rail: five tabs under the inspector, and the one panel they switch between.
+ *
+ * Only the SELECTED panel is mounted, which is what keeps the rail's cost honest — a run detail
+ * that polled the room, the reviews and the message list all at once, for four surfaces nobody was
+ * looking at, would be four background requests per operator per tick. The state a panel must not
+ * lose across a switch (the composer's draft) is held by `RunTrace` above it for exactly that
+ * reason.
  */
-export function PullRequestCard({ pr }: { pr: PullRequestView | null }) {
-  if (pr === null) {
-    return (
-      <Card title="Pull request">
-        <div className="empty">
-          No pull-request data — the daemon serves no PR endpoint yet. Tracked as a dependency of
-          STUDIO-681 §9.
+function WatchTabsRail({
+  tab,
+  onSelect,
+  children,
+}: {
+  tab: WatchTabId;
+  onSelect: (tab: WatchTabId) => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="trwatch">
+      <div className="tabs" role="tablist" aria-label="Watch">
+        {WATCH_TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            id={`trtab-${t.id}`}
+            className={t.id === tab ? "tab on" : "tab"}
+            aria-selected={t.id === tab}
+            aria-controls={WATCH_PANEL_ID}
+            onClick={() => onSelect(t.id)}
+          >
+            {t.label}
+            {/* On the TAB, not only in the panel: §5's deferred surfaces should be legible without
+                opening them, exactly as the header's dependency actions are. */}
+            {t.dependency ? <span className="dep">dep</span> : null}
+          </button>
+        ))}
+      </div>
+      <div className="tabbody" role="tabpanel" id={WATCH_PANEL_ID} aria-labelledby={`trtab-${tab}`}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function WatchPanel({
+  tab,
+  run,
+  inFlight,
+  roster,
+  teamsEnabled,
+  draft,
+  onDraft,
+  focusComposer,
+  onOpenMemory,
+}: {
+  tab: WatchTabId;
+  run: RunSummary;
+  inFlight: boolean;
+  roster: readonly string[];
+  teamsEnabled: boolean;
+  draft: string;
+  onDraft: (text: string) => void;
+  focusComposer: number;
+  onOpenMemory: () => void;
+}) {
+  switch (tab) {
+    case "diff":
+      return <DiffPanel run={run} />;
+    case "review":
+      return <ReviewPanel run={run} roster={roster} teamsEnabled={teamsEnabled} />;
+    case "memory":
+      return (
+        <TeamsPanel teamsEnabled={teamsEnabled} what="the memory this ticket's runs retained">
+          <MemoryPanel issue={run.issue_identifier} roster={roster} onOpenMemory={onOpenMemory} />
+        </TeamsPanel>
+      );
+    case "messages":
+      return (
+        <MessagesPanel
+          runId={run.id}
+          live={inFlight}
+          draft={draft}
+          onDraft={onDraft}
+          focus={focusComposer}
+        />
+      );
+    default:
+      return (
+        <TeamsPanel teamsEnabled={teamsEnabled} what="the room posts about this ticket">
+          <RoomPanel issue={run.issue_identifier} roster={roster} />
+        </TeamsPanel>
+      );
+  }
+}
+
+/**
+ * A panel whose whole content comes from `/api/v1/teams*`.
+ *
+ * With Teams off the app makes no Teams request at all (`useTeamsEnabled` is THE gate), so the tab
+ * says which feature would fill it rather than sitting empty or, worse, fetching anyway. The
+ * children are not mounted, so no gated hook runs.
+ */
+function TeamsPanel({
+  teamsEnabled,
+  what,
+  children,
+}: {
+  teamsEnabled: boolean;
+  what: string;
+  children: ReactNode;
+}) {
+  if (teamsEnabled) return <>{children}</>;
+  return <div className="trdep">Teams is off on this daemon, so there is no {what}.</div>;
+}
+
+/**
+ * The Diff tab — a dependency, and deliberately nothing else (design record §5, §9 slice 7).
+ *
+ * No endpoint serves a run-branch unified diff, so there is no diff to show and none is invented:
+ * the panel names the dependency and deep-links to where the change actually is. The link is the
+ * same head-branch SEARCH the header's "View PR" uses, so it can never point at a pull request the
+ * console guessed at.
+ */
+function DiffPanel({ run }: { run: RunSummary }) {
+  const prHref = prSearchUrl(run);
+  const branch = runBranch(run);
+  return (
+    <div className="trdep">
+      <b>The diff is a dependency.</b> A run-branch unified diff needs a daemon endpoint, deferred
+      to slice 7 of the Trace plan. Until it exists this panel shows no diff rather than a
+      reconstructed one.
+      {branch === "" ? null : (
+        <div className="row">
+          <Mono>{branch}</Mono>
         </div>
-      </Card>
+      )}
+      <div className="row">
+        {prHref === "" ? (
+          <span className="note">
+            This run's remote is not on github.com, so there is no pull request to link to either.
+          </span>
+        ) : (
+          <a href={prHref} target="_blank" rel="noreferrer noopener">
+            Open this branch's pull request ↗
+          </a>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The Review tab — who is reviewing this run's work, and how far they have got.
+ *
+ * What IS served is the ticketless watch set (`GET /api/v1/reviews`): one row per (pull request,
+ * reviewer) with a status. What is NOT served anywhere is a structured VERDICT — the findings are
+ * posted on the pull request by the reviewing agent, and no endpoint carries them back. So the
+ * reviewer and the status are real, and the verdict is dependency-named with a link to where it
+ * was actually written, per §5's "never fake".
+ */
+function ReviewPanel({
+  run,
+  roster,
+  teamsEnabled,
+}: {
+  run: RunSummary;
+  roster: readonly string[];
+  teamsEnabled: boolean;
+}) {
+  // Gated on Teams like every other `/api/v1/teams*`-adjacent surface, and — because this panel is
+  // mounted only while its tab is showing — it polls the watch set only while someone is reading.
+  const reviews = useReviews(teamsEnabled);
+  const jobs = reviews.data?.reviews ?? [];
+  const rows = useMemo(() => reviewsForRun(jobs, run).map(reviewRow), [jobs, run]);
+
+  if (!teamsEnabled) {
+    return <div className="trdep">Teams is off on this daemon, so no reviewer is assigned.</div>;
+  }
+  // `enabled: false` is the daemon's own answer, not an error: Teams is off, or the review mode is
+  // not `ticketless`. Either way nothing is watching this run's pull request, and saying so is
+  // more use than an empty list that reads as "no reviewer yet".
+  if (reviews.data?.enabled === false) {
+    return (
+      <div className="trdep">
+        Ticketless review is not enabled on this daemon, so no reviewer is watching this run's pull
+        request.
+      </div>
     );
   }
-  const note = mergeNote(pr);
-  const { failed } = checksSummary(pr.checks);
+  if (rows.length === 0) {
+    return (
+      <div className="empty">
+        {reviews.isPending
+          ? "Loading reviews…"
+          : "No review has been requested for this run's work yet."}
+      </div>
+    );
+  }
   return (
-    <Card title="Pull request" right={<TicketChip variant="pr">{pr.number}</TicketChip>}>
-      <div className="checks">
-        {pr.checks.map((check) => (
-          <div key={check.name} className={`chk ${checkClass(check.state)}`}>
-            <CheckGlyph state={check.state} />
-            <span className="nm2">{check.name}</span>
-            <span className="rt">{check.detail}</span>
+    <>
+      <div className="trrev">
+        {rows.map((row) => (
+          <div className="rev" key={row.key}>
+            <span className="who2" style={{ color: teammateColor(roster, row.job.reviewer) }}>
+              <TeammateAvatar color={teammateColor(roster, row.job.reviewer)} size={7} />
+              {row.job.reviewer}
+            </span>
+            <Pill variant={row.variant}>{row.label}</Pill>
+            <a className="pr" href={row.url} target="_blank" rel="noreferrer noopener">
+              {row.pr} ↗
+            </a>
+            {row.reviewedShort === "" ? null : <Mono>read {row.reviewedShort}</Mono>}
           </div>
         ))}
       </div>
-      <div className="prnote">
-        {note.blocked ? <b>{failed > 0 ? "Blocked: " : "Waiting: "}</b> : null}
-        {note.text}
+      {/* The one part of a review nothing serves back. Said once, under the rows, rather than
+          dressed up as a verdict the console does not have. */}
+      <div className="trdep">
+        <b>The verdict itself is a dependency.</b> A reviewer posts its findings on the pull
+        request; no endpoint serves them back, so this panel reports who is reviewing and how far
+        they have got, and never a verdict it did not read.
       </div>
-    </Card>
+    </>
   );
 }
 
-function checkClass(state: PullRequestView["checks"][number]["state"]): string {
-  return state === "pass" ? "ok" : state === "fail" ? "bad" : "pending";
-}
-
-function CheckGlyph({ state }: { state: PullRequestView["checks"][number]["state"] }) {
-  if (state === "pass") return <TickGlyph className="st" />;
-  if (state === "fail") return <CrossGlyph className="st" />;
-  return <PendingGlyph className="st" />;
-}
-
-/** "Room · this ticket" (§4) — the room posts that reference this key. */
-function RoomSliceCard({ issue, roster }: { issue: string; roster: readonly string[] }) {
+/** "Room · this ticket" (§3C) — the room posts that reference this run's ticket. */
+function RoomPanel({ issue, roster }: { issue: string; roster: readonly string[] }) {
   const room = useTeamsRoom(true);
-  const posts = useMemo(
-    () => roomPostsFor(room.data?.messages ?? [], issue),
-    [room.data, issue],
-  );
+  const posts = useMemo(() => roomPostsFor(room.data?.messages ?? [], issue), [room.data, issue]);
   return (
-    <Card title="Room · this ticket">
-      <div className="memprev">
-        {posts.map((post) => (
-          <div className="mcard" key={post.id}>
-            <div className="top">
-              <span
-                className="who2"
-                style={{ color: post.from === "operator" ? "var(--operator)" : teammateColor(roster, post.from) }}
-              >
-                {post.from}
-              </span>
-              <Timestamp>{clockTime(post.at)}</Timestamp>
-            </div>
-            <Markdown source={post.body} />
+    <div className="memprev">
+      {posts.map((post) => (
+        <div className="mcard" key={post.id}>
+          <div className="top">
+            <span
+              className="who2"
+              style={{
+                color:
+                  post.from === "operator" ? "var(--operator)" : teammateColor(roster, post.from),
+              }}
+            >
+              {post.from}
+            </span>
+            <Timestamp>{clockTime(post.at)}</Timestamp>
           </div>
-        ))}
-        {posts.length === 0 ? (
-          <div className="empty">{room.isPending ? "Loading room…" : "No room posts reference this ticket."}</div>
-        ) : null}
-      </div>
-    </Card>
+          <Markdown source={post.body} />
+        </div>
+      ))}
+      {posts.length === 0 ? (
+        <div className="empty">
+          {room.isPending ? "Loading room…" : "No room posts reference this ticket."}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
-/**
- * A post belongs to a ticket when it REFERENCES the key — in `refs`, which is what proves it,
- * or in the body, which is how a teammate writes it in prose. Newest first, matching the room.
- */
-export function roomPostsFor(
-  messages: readonly TeamsRoomMessage[],
-  issue: string,
-): TeamsRoomMessage[] {
-  if (issue === "") return [];
-  return messages
-    .filter((m) => (m.refs ?? []).includes(issue) || m.body.includes(issue))
-    .slice()
-    .reverse();
-}
-
-/** "Memory from this ticket" (§4) — the facts this ticket's runs retained. */
-function TicketMemoryCard({
+/** "Memory from this ticket" (§3C) — the facts this ticket's runs retained. */
+function MemoryPanel({
   issue,
   roster,
   onOpenMemory,
@@ -1263,26 +1400,14 @@ function TicketMemoryCard({
 }) {
   const facts = useTicketFacts(roster, issue);
   return (
-    <Card
-      title="Memory from this ticket"
-      right={
-        <a
-          className="link"
-          href="#memory"
-          onClick={(e) => {
-            e.preventDefault();
-            onOpenMemory();
-          }}
-        >
-          Open →
-        </a>
-      }
-    >
+    <>
       <div className="memprev">
         {facts.data.map((fact: TeamsFact) => (
           <div className="mcard" key={`${fact.identity}:${fact.id}`}>
             <div className="top">
-              <TicketChip variant="sha">{fact.run_id === "" ? fact.id : `run ${fact.run_id}`}</TicketChip>
+              <TicketChip variant="sha">
+                {fact.run_id === "" ? fact.id : `run ${fact.run_id}`}
+              </TicketChip>
               <Timestamp>{fact.identity}</Timestamp>
             </div>
             <Markdown source={fact.content} />
@@ -1294,6 +1419,205 @@ function TicketMemoryCard({
           </div>
         ) : null}
       </div>
-    </Card>
+      <div className="trwatchfoot">
+        <a
+          className="link"
+          href="#memory"
+          onClick={(e) => {
+            e.preventDefault();
+            onOpenMemory();
+          }}
+        >
+          Open Memory →
+        </a>
+      </div>
+    </>
+  );
+}
+
+/** The composer's element id, so the header's Message action can name where it sent the cursor. */
+const MESSAGE_COMPOSER_ID = "trmsg";
+
+/**
+ * The Messages tab — the operator's line into a run's agent, both halves (INF-250).
+ *
+ * The LIST (`GET /api/v1/runs/{id}/messages`) is history and is shown for every run: what was
+ * sent, what the agent actually picked up and on which turn, and what expired because the run
+ * ended first. It rides the same 2s in-flight cadence the rest of the view does, so a
+ * sent→delivered flip shows up without a reload, and freezes when the run does.
+ *
+ * The COMPOSER (`POST /api/v1/runs/{id}/message`) can only reach a LIVE run — a finished one has
+ * no agent left to read it — so on a finished run it stays visible and refuses, rather than
+ * vanishing and taking a half-written instruction with it. The console has no toast surface, so a
+ * refusal (the daemon caps pending messages per run) reports here or nowhere.
+ */
+function MessagesPanel({
+  runId,
+  live,
+  draft,
+  onDraft,
+  focus,
+}: {
+  runId: number;
+  live: boolean;
+  draft: string;
+  onDraft: (text: string) => void;
+  /** A focus request from the header's Message action; 0 means it has never asked. */
+  focus: number;
+}) {
+  const messages = useRunMessages(runId, live);
+  const send = useSendRunMessage(runId);
+  const [problem, setProblem] = useState("");
+  const box = useRef<HTMLTextAreaElement | null>(null);
+  useEffect(() => {
+    if (focus > 0) box.current?.focus();
+  }, [focus]);
+
+  const submit = () => {
+    const body = draft.trim();
+    // An empty send is not an error to report — it is nothing to say. The daemon would reject it
+    // anyway, and spending a request to be told so is worse than not making one. Nor is there
+    // anything to send to once the run has ended.
+    if (!live || body === "" || send.isPending) return;
+    setProblem("");
+    send.mutate(body, {
+      onSuccess: () => onDraft(""),
+      onError: (err) => setProblem(err.message),
+    });
+  };
+
+  const rows = messages.data ?? [];
+  return (
+    <>
+      {/* Oldest first — the served order (`ORDER BY id`), and the one a conversation reads in,
+          with the composer that continues it at the bottom. */}
+      <div className="trmsgs">
+        {rows.map((message) => {
+          const chip = messageChip(message);
+          return (
+            <div className="msg" key={message.id}>
+              <div className="body">{message.body}</div>
+              <span className={`chip ${chip.tone}`}>{chip.label}</span>
+            </div>
+          );
+        })}
+        {rows.length === 0 ? (
+          <div className="empty">
+            {messages.isPending
+              ? "Loading messages…"
+              : "No message has been sent to this run's agent."}
+          </div>
+        ) : null}
+      </div>
+      <div className="trmsg" id={MESSAGE_COMPOSER_ID}>
+        <textarea
+          ref={box}
+          aria-label="Message the running agent"
+          placeholder="The agent picks this up at its next step…"
+          maxLength={4000}
+          rows={2}
+          value={draft}
+          disabled={send.isPending}
+          onChange={(e) => onDraft(e.target.value)}
+          onKeyDown={(e) => {
+            // Enter sends, Shift+Enter breaks the line — and a composition (CJK and friends) is
+            // being CONFIRMED by that Enter, never sent by it.
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+        <div className="row">
+          {live ? null : (
+            <span className="acterr" role="status">
+              This run has ended — there is no agent left to deliver this to.
+            </span>
+          )}
+          {problem === "" ? null : (
+            <span className="acterr" role="status">
+              {problem}
+            </span>
+          )}
+          <Button onClick={submit} disabled={!live || send.isPending}>
+            Send
+          </Button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * "Ask about this run" (design record §6, §8) — a room post, refed to the run.
+ *
+ * The design record is explicit about what this is TODAY and what it becomes: "ship as a room post
+ * refed to the run now; upgrade to the answering-manager Answer path when it lands". Nothing serves
+ * an answer yet — there is no answer route on `/api/v1` — so the dock does the real thing it can
+ * do, posts the question into the team room where a manager and every teammate will read it, and
+ * says so in its own words rather than implying a reply is coming back to this page.
+ *
+ * `refs` carries the ticket AND the run (`askRefs`), which is what makes it a question about this
+ * attempt rather than about the ticket in general.
+ */
+function AskDock({ run, who }: { run: RunSummary; who: string }) {
+  const post = usePostToRoom();
+  const [question, setQuestion] = useState("");
+  const [problem, setProblem] = useState("");
+  const [asked, setAsked] = useState(false);
+  const submit = () => {
+    const body = question.trim();
+    if (body === "" || post.isPending) return;
+    setProblem("");
+    post.mutate(
+      { body, refs: askRefs(run) },
+      {
+        onSuccess: () => {
+          setQuestion("");
+          setAsked(true);
+        },
+        onError: (err) => setProblem(err.message),
+      },
+    );
+  };
+  return (
+    <div className="askdock">
+      <span className="g" aria-hidden="true">
+        ✦
+      </span>
+      <input
+        className="q"
+        aria-label="Ask about this run"
+        placeholder={
+          who === ""
+            ? "Ask the team about this run — it posts to the room…"
+            : `Ask the team about ${who}'s run — it posts to the room…`
+        }
+        value={question}
+        disabled={post.isPending}
+        onChange={(e) => setQuestion(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+            e.preventDefault();
+            submit();
+          }
+        }}
+      />
+      {problem === "" ? null : (
+        <span className="acterr" role="status">
+          {problem}
+        </span>
+      )}
+      {/* Said only after a post actually landed, and never as "answered": the room is where the
+          question went, and no endpoint brings a reply back to this page yet. */}
+      {problem === "" && asked ? (
+        <span className="posted" role="status">
+          Posted to the room
+        </span>
+      ) : null}
+      <Button onClick={submit} disabled={post.isPending}>
+        Ask
+      </Button>
+    </div>
   );
 }

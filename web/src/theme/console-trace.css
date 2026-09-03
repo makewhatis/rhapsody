@@ -193,3 +193,53 @@
    scrolled away from the place it would otherwise sit. */
 .rh-console .trlatest { position: fixed; right: 26px; bottom: 22px; z-index: 6; font: inherit; font-size: 12px; padding: 8px 14px; border-radius: 999px; cursor: pointer; background: var(--raise); color: var(--ink); border: 1px solid var(--operator); box-shadow: 0 4px 14px rgb(0 0 0 / .35); }
 .rh-console .trlatest:hover { background: var(--panel-2); }
+
+/* ---- slice 4 (STUDIO-745): the watch-tabs rail under the inspector, and the ask dock ---- */
+
+/* The inspector and the rail share the split's right column. `min-width: 0` on the wrapper for the
+   same reason `.trinsp` carries it: a grid track defaults to `min-width: auto`, and a fenced block
+   or a long branch name inside would otherwise stretch the whole page sideways. */
+.rh-console .trright { min-width: 0; display: flex; flex-direction: column; }
+
+.rh-console .trwatch { border-top: 1px solid var(--line); margin-top: auto; }
+.rh-console .trwatch .tabs { display: flex; gap: 4px; padding: 10px 18px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.rh-console .trwatch .tab { font: inherit; font-size: 12px; padding: 7px 12px; color: var(--ink-3); background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer; display: flex; align-items: center; }
+.rh-console .trwatch .tab:hover { color: var(--ink); }
+.rh-console .trwatch .tab.on { color: var(--ink); border-bottom-color: var(--operator); font-weight: 600; }
+.rh-console .trwatch .tabbody { padding: 14px 18px; min-width: 0; }
+.rh-console .trwatch .memprev { padding: 0; }
+.rh-console .trwatchfoot { display: flex; justify-content: flex-end; margin-top: 10px; }
+
+/* A surface no endpoint serves: it names the dependency and links to where the thing actually is
+   (design record §5/§6, "never fake" and "never a dead button"). Dashed, so it does not read as a
+   card of real data. */
+.rh-console .trdep { border: 1px dashed var(--line); border-radius: var(--r-sm); background: var(--panel-2); padding: 14px 16px; font-size: 12.5px; color: var(--ink-3); }
+.rh-console .trdep b { color: var(--ink); font-weight: 600; }
+.rh-console .trdep .row { margin-top: 9px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rh-console .trdep .note { color: var(--ink-4); }
+.rh-console .trdep a { color: var(--operator); }
+.rh-console .trrev + .trdep { margin-top: 12px; }
+
+/* The Review tab's served half: one row per (pull request, reviewer). */
+.rh-console .trrev { display: flex; flex-direction: column; gap: 8px; }
+.rh-console .trrev .rev { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; font-size: 12.5px; }
+.rh-console .trrev .rev .who2 { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.rh-console .trrev .rev .pr { font-family: var(--mono); font-size: 11.5px; color: var(--operator); }
+
+/* The Messages tab's timeline. Oldest first, with the delivery chip the daemon's status decides. */
+.rh-console .trmsgs { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.rh-console .trmsgs .msg { border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: var(--panel-2); padding: 9px 11px; display: flex; gap: 10px; align-items: baseline; }
+.rh-console .trmsgs .msg .body { flex: 1; min-width: 0; font-size: 12.5px; color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.rh-console .trmsgs .msg .chip { flex: none; font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); }
+.rh-console .trmsgs .msg .chip.delivered { color: var(--ok); }
+.rh-console .trmsgs .msg .chip.expired { color: var(--warn); }
+.rh-console .trwatch .trmsg { margin-bottom: 0; }
+
+/* "Ask about this run" — a room post refed to the run (§6), under the split rather than inside it:
+   the question is about the whole run, not the frame the inspector happens to be on. */
+.rh-console .askdock { display: flex; align-items: center; gap: 11px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel-2); padding: 11px 14px; margin-bottom: 18px; flex-wrap: wrap; }
+.rh-console .askdock .g { color: var(--operator); flex: none; }
+.rh-console .askdock .q { flex: 1 1 260px; min-width: 0; font: inherit; font-size: 13px; padding: 7px 10px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.rh-console .askdock .q:disabled { opacity: .6; }
+.rh-console .askdock .posted { font-size: 11.5px; color: var(--ok); font-family: var(--mono); }
+.rh-console .askdock .acterr { font-size: 11.5px; color: var(--bad); max-width: 40ch; }
