@@ -85,10 +85,13 @@
 //! nothing in it — "I have no record of that" and "the read failed" are different answers and the
 //! manager must be able to tell them apart.
 //!
-//! Between those two sits a third answer this module also refuses to blur: **partial**. A recall
-//! reports the records the backend could not parse and how much of the roster it covered
-//! ([`Recall`]), and a truncated gather logs. An answer that is short because a bank is corrupt or
-//! because a cap bit must not read as an answer that is short because there is nothing to say.
+//! Between those two sits a third answer this module also refuses to blur: **partial**. Every
+//! gather reports its own shortfalls rather than returning a bare list: a recall carries the
+//! records the backend could not parse and how much of the roster it covered ([`Recall`]), a run
+//! history carries whether `limit` left rows behind and whether the scan hit its ceiling
+//! ([`Runs`]), and a truncated roster gather logs as well. An answer that is short because a bank
+//! is corrupt or because a bound bit must not read as an answer that is short because there is
+//! nothing to say.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -117,6 +120,11 @@ pub const MAX_HISTORY_ROWS: i64 = 20;
 /// The ceiling is what the guarantee stops at, stated plainly: on a box busy enough that this
 /// team owns none of the newest 500 rows for a slug, its older runs are still out of reach. That
 /// is a bound on a bounded read, not a hole in the drop — nothing off-team can escape either way.
+///
+/// Reaching it is REPORTED, never silent: [`Runs::scan_exhausted`] carries it to the caller and
+/// the scan logs it. A gather that stopped at the ceiling has the shape the fill was added to
+/// prevent — an answer confidently shorter than the history it describes — just further out, so
+/// it is told rather than absorbed.
 pub const MAX_SCAN_ROWS: i64 = 500;
 
 /// One page of that scan. Large enough that the ordinary case — a store whose rows are mostly this
@@ -223,6 +231,31 @@ pub struct Recall {
     /// How many it could have read: the roster for [`Knowledge::recall_team`], one for
     /// [`Knowledge::recall`]. Greater than `identities_read` means the answer is partial.
     pub identities_total: usize,
+}
+
+/// **What one scoped run gather produced** — the facts, and the two reasons the list may be
+/// shorter than the team's real history.
+///
+/// A bare `Vec<RunFact>` made three situations byte-identical to the caller: the whole history;
+/// the newest `limit` of a longer one; and a page the scan could not fill before it hit
+/// [`MAX_SCAN_ROWS`]. The last is [`Recall`]'s problem one notch further out — an answer short
+/// because a bound bit, read back into a room reply as if it were the whole history — so the run
+/// path reports it for the same reason the recall path does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Runs {
+    /// The projected runs, newest first.
+    pub facts: Vec<RunFact>,
+    /// There are in-scope runs this answer does NOT contain, because `limit` bounded it. Exact,
+    /// not a guess: the gather asks each slug for one row more than it will return, so "filled the
+    /// page" and "there is more behind it" are the same fact rather than two.
+    pub capped: bool,
+    /// A slug read [`MAX_SCAN_ROWS`] rows without filling the page: the SEARCH stopped before the
+    /// store did, so there may be older in-scope runs it never reached. Deliberately weaker than
+    /// `capped` — the scan cannot tell a store that ran out exactly at the ceiling from one that
+    /// did not, and claiming the stronger thing is the kind of confident wrongness this type
+    /// exists to prevent. Distinct from `capped` because the remedy differs: `capped` is answered
+    /// by asking for more rows, this is not.
+    pub scan_exhausted: bool,
 }
 
 /// **The team's identity, reconstructed for every read** (§9.1).
@@ -397,27 +430,27 @@ impl<'a> Knowledge<'a> {
     /// Empty — not an error — when the key belongs to another team, to no project this team owns,
     /// or to nothing the store has ever seen. Those three are indistinguishable on purpose: a
     /// distinguishable "exists but not yours" is itself the leak.
-    pub fn issue_runs(&self, identifier: &str, limit: i64) -> Result<Vec<RunFact>, KnowledgeError> {
+    pub fn issue_runs(&self, identifier: &str, limit: i64) -> Result<Runs, KnowledgeError> {
         let limit = clamp_rows(limit);
-        let rows = self.scan(
+        let scan = self.scan(
             &RunFilter {
                 issue: identifier.to_string(),
                 ..RunFilter::default()
             },
             limit,
         )?;
-        self.project_rows(rows, limit)
+        self.project_rows(scan, limit)
     }
 
     /// This team's most recent runs, newest first, projected.
-    pub fn recent_runs(&self, limit: i64) -> Result<Vec<RunFact>, KnowledgeError> {
+    pub fn recent_runs(&self, limit: i64) -> Result<Runs, KnowledgeError> {
         let limit = clamp_rows(limit);
-        let rows = self.scan(&RunFilter::default(), limit)?;
-        self.project_rows(rows, limit)
+        let scan = self.scan(&RunFilter::default(), limit)?;
+        self.project_rows(scan, limit)
     }
 
-    /// Reads `base` once per owned project slug, paging until `limit` rows have been ADMITTED by
-    /// the scope or [`MAX_SCAN_ROWS`] have been read, and returns the admitted rows.
+    /// Reads `base` once per owned project slug, paging until the slug has yielded one row more
+    /// than `limit` ADMITTED by the scope or [`MAX_SCAN_ROWS`] have been read.
     ///
     /// The paging is the point. `Store` applies its `LIMIT` in SQL, before this accessor sees a
     /// row, and its `project` filter is weaker than [`TeamScope::admits_run`] in two shapes that
@@ -426,15 +459,25 @@ impl<'a> Knowledge<'a> {
     /// SQL counterpart on any slug. A single capped query in either shape can return a full page
     /// of rows that are all dropped, so the read has to keep asking rather than accept the page.
     ///
+    /// The one row past `limit` is what makes [`Runs::capped`] a fact rather than a guess: a slug
+    /// that stops exactly AT `limit` cannot tell "that is all there is" from "I stopped asking".
+    /// One extra admitted row costs nothing and answers it.
+    ///
     /// [`Store::list_runs`] rather than [`Store::issue_history`] because only the former takes an
     /// `offset`; with `RunFilter::issue` set it is the same query, plus the ability to page it.
-    fn scan(&self, base: &RunFilter, limit: i64) -> Result<Vec<RunSummary>, KnowledgeError> {
-        let mut kept: Vec<RunSummary> = Vec::new();
+    fn scan(&self, base: &RunFilter, limit: i64) -> Result<Scan, KnowledgeError> {
+        // One past the answer, so the caller can distinguish a full page from a complete one.
+        let want_admitted = limit.max(0).saturating_add(1) as usize;
+        let mut out = Scan::default();
         for slug in &self.scope.projects {
             let mut admitted = 0usize;
             let mut offset: i64 = 0;
-            while admitted < limit.max(0) as usize && offset < MAX_SCAN_ROWS {
-                let want = SCAN_PAGE_ROWS.min(MAX_SCAN_ROWS - offset);
+            while admitted < want_admitted && offset < MAX_SCAN_ROWS {
+                // Never zero: `RunFilter::limit <= 0` means "default page" to the store rather than
+                // an error, so a zero here would silently ask for 50 (`store::types`). It cannot be
+                // zero at these constants; `max(1)` keeps that true by construction rather than by
+                // arithmetic, for whoever changes one of them.
+                let want = SCAN_PAGE_ROWS.min(MAX_SCAN_ROWS - offset).max(1);
                 let page = self.store.list_runs(RunFilter {
                     project: slug.clone(),
                     limit: want,
@@ -445,7 +488,7 @@ impl<'a> Knowledge<'a> {
                 for row in page {
                     if self.scope.admits_run(&row) {
                         admitted += 1;
-                        kept.push(row);
+                        out.rows.push(row);
                     }
                 }
                 if read < want {
@@ -453,8 +496,22 @@ impl<'a> Knowledge<'a> {
                 }
                 offset += read;
             }
+            if admitted < want_admitted && offset >= MAX_SCAN_ROWS {
+                // The ceiling bit before the page was full: this slug's older runs are out of reach
+                // on this read. Logged as well as reported, so the bound is visible in the daemon
+                // log without a caller having to plumb the flag anywhere.
+                out.scan_exhausted = true;
+                tracing::info!(
+                    slug = %slug,
+                    scanned = offset,
+                    admitted,
+                    limit,
+                    "teams knowledge stopped scanning run history at the per-slug ceiling; \
+                     older runs on this slug are out of reach for this answer"
+                );
+            }
         }
-        Ok(kept)
+        Ok(out)
     }
 
     /// The cycle ticket with this identifier, projected. `None` for a key this team's own trackers
@@ -575,28 +632,36 @@ impl<'a> Knowledge<'a> {
     /// row on the box. [`Knowledge::scan`] applies the same predicate while paging, so that the
     /// page is FILLED with in-scope rows; this second application is what makes the guarantee hold
     /// for any row that reaches the projection, however it got here.
-    fn project_rows(
-        &self,
-        mut rows: Vec<RunSummary>,
-        limit: i64,
-    ) -> Result<Vec<RunFact>, KnowledgeError> {
+    fn project_rows(&self, scan: Scan, limit: i64) -> Result<Runs, KnowledgeError> {
+        let Scan {
+            mut rows,
+            scan_exhausted,
+        } = scan;
         rows.retain(|r| self.scope.admits_run(r));
         // The store orders by (started_at DESC, id DESC); one merged list of per-slug pages has to
         // be put back into that order, and `id` breaks a same-instant tie exactly as SQLite does.
         rows.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.id.cmp(&a.id)));
         rows.dedup_by_key(|r| r.id);
-        rows.truncate(limit.max(0) as usize);
+        // The scan read one admitted row past `limit` per slug, so a merged set that still exceeds
+        // `limit` is a MEASURED "there is more", not an assumption that a full page implies one.
+        let limit = limit.max(0) as usize;
+        let capped = rows.len() > limit;
+        rows.truncate(limit);
         // Resolved for the BOUNDED page only, so the lookup cost follows the answer's size.
         let dispatched = self.dispatch_identities(&rows)?;
-        Ok(rows
-            .iter()
-            .map(|r| RunFact {
-                key: r.issue_identifier.clone(),
-                outcome: r.outcome.clone(),
-                ended_at: r.ended_at.clone(),
-                identity: dispatched.get(&r.id).cloned().unwrap_or_default(),
-            })
-            .collect())
+        Ok(Runs {
+            facts: rows
+                .iter()
+                .map(|r| RunFact {
+                    key: r.issue_identifier.clone(),
+                    outcome: r.outcome.clone(),
+                    ended_at: r.ended_at.clone(),
+                    identity: dispatched.get(&r.id).cloned().unwrap_or_default(),
+                })
+                .collect(),
+            capped,
+            scan_exhausted,
+        })
     }
 
     /// Which roster identity each of `rows` was DISPATCHED as, keyed by run id, from the
@@ -658,6 +723,17 @@ impl<'a> Knowledge<'a> {
 
 /// A non-positive row limit is the caller asking for the default, never for "unbounded" — the same
 /// rule [`Query::top_k`] and `memory.recall_top_k` follow.
+/// What one [`Knowledge::scan`] read: the admitted rows, and whether any slug stopped at
+/// [`MAX_SCAN_ROWS`] rather than because it had what it needed.
+///
+/// Internal because the rows are unprojected `RunSummary` — the console-grade fields §9.3 keeps out
+/// of the room live on them, and [`Knowledge::project_rows`] is the only thing that may see them.
+#[derive(Debug, Default)]
+struct Scan {
+    rows: Vec<RunSummary>,
+    scan_exhausted: bool,
+}
+
 fn clamp_rows(limit: i64) -> i64 {
     if limit <= 0 {
         MAX_HISTORY_ROWS
@@ -863,10 +939,13 @@ mod tests {
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
         assert!(
-            k.issue_runs("BBB-2", 0).expect("issue_runs").is_empty(),
+            k.issue_runs("BBB-2", 0)
+                .expect("issue_runs")
+                .facts
+                .is_empty(),
             "team A resolved team B's terminal key through the global store"
         );
-        let recent = k.recent_runs(0).expect("recent_runs");
+        let recent = k.recent_runs(0).expect("recent_runs").facts;
         assert_eq!(
             recent.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
             vec!["AAA-1"],
@@ -888,10 +967,13 @@ mod tests {
         let scope = scope_of(&["", "alpha"], &["alice"]);
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
         assert!(
-            k.issue_runs("BBB-2", 0).expect("issue_runs").is_empty(),
+            k.issue_runs("BBB-2", 0)
+                .expect("issue_runs")
+                .facts
+                .is_empty(),
             "the accessor leaned on the store's project filter instead of its own drop"
         );
-        let recent = k.recent_runs(0).expect("recent_runs");
+        let recent = k.recent_runs(0).expect("recent_runs").facts;
         assert_eq!(
             recent.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
             vec!["AAA-1"],
@@ -910,8 +992,13 @@ mod tests {
         let issues: Vec<Issue> = Vec::new();
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
-        assert!(k.issue_runs("AAA-1", 0).expect("issue_runs").is_empty());
-        assert!(k.recent_runs(0).expect("recent_runs").is_empty());
+        assert!(
+            k.issue_runs("AAA-1", 0)
+                .expect("issue_runs")
+                .facts
+                .is_empty()
+        );
+        assert!(k.recent_runs(0).expect("recent_runs").facts.is_empty());
     }
 
     /// The legacy shape: a team bound to the EMPTY slug sees the unattributed rows and nothing else,
@@ -926,12 +1013,17 @@ mod tests {
         let issues: Vec<Issue> = Vec::new();
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
-        let recent = k.recent_runs(0).expect("recent_runs");
+        let recent = k.recent_runs(0).expect("recent_runs").facts;
         assert_eq!(
             recent.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
             vec!["LEG-1"]
         );
-        assert!(k.issue_runs("BBB-2", 0).expect("issue_runs").is_empty());
+        assert!(
+            k.issue_runs("BBB-2", 0)
+                .expect("issue_runs")
+                .facts
+                .is_empty()
+        );
     }
 
     /// The optional second drop condition §9.1 names. Off by default; on, it drops a row whose
@@ -976,13 +1068,14 @@ mod tests {
 
         let open = scope_of(&["alpha"], &["alice"]);
         let k = Knowledge::new(&open, &issues, st.as_ref(), &none);
-        assert_eq!(k.recent_runs(0).expect("recent_runs").len(), 2);
+        assert_eq!(k.recent_runs(0).expect("recent_runs").facts.len(), 2);
 
         let gated = scope_of(&["alpha"], &["alice"]).with_linear_teams(["linear-a"]);
         let k = Knowledge::new(&gated, &issues, st.as_ref(), &none);
         assert_eq!(
             k.recent_runs(0)
                 .expect("recent_runs")
+                .facts
                 .iter()
                 .map(|r| r.key.as_str())
                 .collect::<Vec<_>>(),
@@ -1019,7 +1112,7 @@ mod tests {
         let issues = vec![issue_with("AAA-1", "Done", &["rhapsody:@alice"])];
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
-        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs");
+        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs").facts;
         assert_eq!(runs.len(), 1);
         assert_eq!(
             runs[0],
@@ -1088,7 +1181,7 @@ mod tests {
         let issues = vec![issue_with("AAA-1", "In Review", &["rhapsody:@jimmy"])];
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
-        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs");
+        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs").facts;
         assert_eq!(
             runs.iter()
                 .map(|r| (r.outcome.as_str(), r.identity.as_str()))
@@ -1103,6 +1196,7 @@ mod tests {
         let by_key = |key: &str| {
             k.issue_runs(key, 0)
                 .expect("issue_runs")
+                .facts
                 .first()
                 .map(|r| r.identity.clone())
                 .unwrap_or_default()
@@ -1592,8 +1686,8 @@ mod tests {
 
         let rendered = format!(
             "{:?}{:?}{:?}{:?}{:?}",
-            k.recent_runs(0).expect("recent_runs"),
-            k.issue_runs("AAA-1", 0).expect("issue_runs"),
+            k.recent_runs(0).expect("recent_runs").facts,
+            k.issue_runs("AAA-1", 0).expect("issue_runs").facts,
             k.issue("AAA-1"),
             k.recall_team(&Query {
                 browse: true,
@@ -1635,14 +1729,17 @@ mod tests {
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
         assert_eq!(
-            k.issue_runs("AAA-1", 0).expect("issue_runs").len() as i64,
+            k.issue_runs("AAA-1", 0).expect("issue_runs").facts.len() as i64,
             MAX_HISTORY_ROWS
         );
         assert_eq!(
-            k.issue_runs("AAA-1", 1_000).expect("issue_runs").len() as i64,
+            k.issue_runs("AAA-1", 1_000)
+                .expect("issue_runs")
+                .facts
+                .len() as i64,
             MAX_HISTORY_ROWS
         );
-        assert_eq!(k.issue_runs("AAA-1", 3).expect("issue_runs").len(), 3);
+        assert_eq!(k.issue_runs("AAA-1", 3).expect("issue_runs").facts.len(), 3);
     }
 
     /// **The page must be FILLED from in-scope rows (STUDIO-729 review, BLOCKER 2).** The store
@@ -1680,7 +1777,7 @@ mod tests {
         let issues: Vec<Issue> = Vec::new();
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
-        let runs = k.issue_runs("LEG-1", 0).expect("issue_runs");
+        let runs = k.issue_runs("LEG-1", 0).expect("issue_runs").facts;
         assert_eq!(
             runs.len() as i64,
             MAX_HISTORY_ROWS,
@@ -1690,7 +1787,7 @@ mod tests {
             runs.iter().all(|r| r.outcome == "completed"),
             "an off-team row survived: {runs:?}"
         );
-        let recent = k.recent_runs(0).expect("recent_runs");
+        let recent = k.recent_runs(0).expect("recent_runs").facts;
         assert_eq!(recent.len() as i64, MAX_HISTORY_ROWS, "{recent:?}");
         assert!(
             recent.iter().all(|r| r.outcome == "completed"),
@@ -1729,14 +1826,138 @@ mod tests {
         let scope = scope_of(&["alpha"], &["alice"]).with_linear_teams(["linear-a"]);
         let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
 
-        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs");
+        let runs = k.issue_runs("AAA-1", 0).expect("issue_runs").facts;
         assert_eq!(
             runs.len(),
             5,
             "the Linear-team gate emptied a page it should have filled"
         );
         assert!(runs.iter().all(|r| r.outcome == "completed"), "{runs:?}");
-        assert_eq!(k.recent_runs(0).expect("recent_runs").len(), 5);
+        assert_eq!(k.recent_runs(0).expect("recent_runs").facts.len(), 5);
+    }
+
+    /// **A short run history must say WHY it is short (STUDIO-729 review, SF3).** Three situations
+    /// were byte-identical to a caller holding a bare `Vec<RunFact>`: the whole history, the newest
+    /// `limit` of a longer one, and a page [`Knowledge::scan`] could not fill before it burned
+    /// [`MAX_SCAN_ROWS`] on rows the scope drops. The third is the one that stings — a partial run
+    /// list read back into a room reply as if it were the whole history — and it is the fill fix
+    /// one notch further out, so [`Runs`] reports both bounds.
+    #[test]
+    fn a_short_run_history_reports_which_bound_shortened_it() {
+        let none = NoneBackend;
+        let issues: Vec<Issue> = Vec::new();
+        let scope = scope_of(&[""], &["alice"]);
+
+        // --- complete: nothing was left behind and nothing was out of reach.
+        let st = store();
+        for n in 0..3 {
+            seed_ok(
+                &st,
+                "LEG-1",
+                "",
+                &format!("2026-09-02T10:{n:02}:00Z"),
+                "completed",
+            );
+        }
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
+        let runs = k.issue_runs("LEG-1", 0).expect("issue_runs");
+        assert_eq!(runs.facts.len(), 3);
+        assert!(
+            !runs.capped,
+            "a complete history must not claim to be capped"
+        );
+        assert!(!runs.scan_exhausted);
+        assert!(!k.recent_runs(0).expect("recent_runs").capped);
+
+        // --- capped: the team owns MORE than the answer carries, and is told so. The scan reads
+        // one admitted row past `limit` precisely so this is measured rather than inferred from a
+        // full page — seeding exactly `MAX_HISTORY_ROWS` below proves it does not over-claim.
+        let st = store();
+        for n in 0..(MAX_HISTORY_ROWS + 5) {
+            seed_ok(
+                &st,
+                "LEG-1",
+                "",
+                &format!("2026-09-02T10:{n:02}:00Z"),
+                "completed",
+            );
+        }
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
+        let runs = k.issue_runs("LEG-1", 0).expect("issue_runs");
+        assert_eq!(runs.facts.len() as i64, MAX_HISTORY_ROWS);
+        assert!(runs.capped, "a truncated history must say it was truncated");
+        assert!(
+            !runs.scan_exhausted,
+            "nothing was out of reach; it was bounded"
+        );
+        assert!(k.recent_runs(0).expect("recent_runs").capped);
+        // A caller cannot ask its way past the cap — `clamp_rows` bounds every request at
+        // `MAX_HISTORY_ROWS` — so an explicit smaller limit is the only one that moves, and it
+        // still reports honestly.
+        assert!(k.issue_runs("LEG-1", 3).expect("issue_runs").capped);
+
+        let st = store();
+        for n in 0..MAX_HISTORY_ROWS {
+            seed_ok(
+                &st,
+                "LEG-1",
+                "",
+                &format!("2026-09-02T10:{n:02}:00Z"),
+                "completed",
+            );
+        }
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
+        let runs = k.issue_runs("LEG-1", 0).expect("issue_runs");
+        assert_eq!(runs.facts.len() as i64, MAX_HISTORY_ROWS);
+        assert!(
+            !runs.capped,
+            "a history that exactly fills the page is complete, not capped"
+        );
+
+        // --- the ceiling: two in-scope runs, then more than MAX_SCAN_ROWS rows the scope drops.
+        // The gather comes back with two of them and must not present that as the whole history.
+        let st = store();
+        for n in 0..2 {
+            seed_ok(
+                &st,
+                "LEG-1",
+                "",
+                &format!("2026-09-02T10:{n:02}:00Z"),
+                "completed",
+            );
+        }
+        for n in 0..(MAX_SCAN_ROWS + 5) {
+            let (h, m) = (n / 60, n % 60);
+            seed_ok(
+                &st,
+                "LEG-1",
+                "beta",
+                &format!("2026-09-01T{h:02}:{m:02}:00Z"),
+                "failed",
+            );
+        }
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none);
+        let runs = k.issue_runs("LEG-1", 0).expect("issue_runs");
+        assert_eq!(
+            runs.facts.len(),
+            2,
+            "the drop still holds: {:?}",
+            runs.facts
+        );
+        assert!(
+            runs.facts.iter().all(|r| r.outcome == "completed"),
+            "an off-team row escaped: {:?}",
+            runs.facts
+        );
+        assert!(
+            runs.scan_exhausted,
+            "the scan hit its ceiling and reported a complete history"
+        );
+        assert!(
+            !runs.capped,
+            "nothing was left behind by `limit`; the SEARCH ran out, not the page"
+        );
+        assert!(k.recent_runs(0).expect("recent_runs").scan_exhausted);
     }
 
     /// The room read is bounded and returns the posts oldest-first, and a room that was never
@@ -1777,8 +1998,13 @@ mod tests {
         let issues: Vec<Issue> = Vec::new();
         let k = Knowledge::new(&scope, &issues, &st, &none);
 
-        assert!(k.issue_runs("AAA-1", 0).expect("issue_runs").is_empty());
-        assert!(k.recent_runs(0).expect("recent_runs").is_empty());
+        assert!(
+            k.issue_runs("AAA-1", 0)
+                .expect("issue_runs")
+                .facts
+                .is_empty()
+        );
+        assert!(k.recent_runs(0).expect("recent_runs").facts.is_empty());
         assert!(k.issue("AAA-1").is_none());
         assert!(k.room(10).expect("room").is_empty());
         assert!(

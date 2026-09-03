@@ -491,15 +491,23 @@ impl TeamsMemory {
         })
     }
 
-    /// The identity → bank-id map the backend was built with, so the composition
-    /// root can hand the SAME resolution to `LocalBank::with_bank_overrides`.
+    /// The identity → bank-id map this runtime resolved: every value is a bank id
+    /// the backend will ACTUALLY open, resolved through [`resolve_bank_id`], so a
+    /// non-label-safe `bank:` override reads as the `<prefix><name>` the backend
+    /// falls back to rather than as the raw string.
     ///
-    /// Resolved through [`resolve_bank_id`], so every value is a bank id the
-    /// backend will actually open — a non-label-safe `bank:` override reads as
-    /// the `<prefix><name>` the backend falls back to, never as the raw string.
-    /// [`TeamScope`](crate::teamsknow::TeamScope) compares bank ids for a
-    /// cross-team collision, and a map that reported the raw override made that
-    /// comparison miss the collision entirely (STUDIO-729).
+    /// **This map is not what the composition root hands the backends.** It builds
+    /// each of them — the hindsight backend, the
+    /// [`LocalBank`](rhapsody_config::memory::LocalBank) and the room
+    /// `Cursors` — straight from the raw roster (`rhapsodyd::run`), because each
+    /// applies the same drop itself on the way in. Raw-then-drop and
+    /// resolve-then-honour land on the same directory, so the two agree; this map
+    /// exists for the callers that must *reason* about a bank id rather than open
+    /// one, where the raw string would be a different answer.
+    ///
+    /// [`TeamScope`](crate::teamsknow::TeamScope) is that caller: it compares bank
+    /// ids for a cross-team collision, and a map reporting the raw override made
+    /// that comparison miss the collision entirely (STUDIO-729).
     pub fn bank_ids(&self) -> &HashMap<String, String> {
         &self.bank_ids
     }
@@ -917,6 +925,56 @@ mod tests {
             view.roster,
             "the overview must not compute derived status a second way"
         );
+    }
+
+    /// **The roster VIEW reports the bank the backend actually opens** — including for an override
+    /// the backend DROPS.
+    ///
+    /// `RosterRow::bank` is served by the `teams_roster` MCP tool and by `GET /api/v1/teams`, so
+    /// this is an operator-visible shape. A non-label-safe `bank:` is not a directory name, so
+    /// `LocalBank::with_bank_overrides` discards it and reads `agent-<name>`; reporting the raw
+    /// string here made the view name `Not/Safe` while every record landed in `agent-dave` — the
+    /// exact divergence `LocalBank::with_bank_overrides`' own docs call out as the thing to avoid,
+    /// and the one STUDIO-729's cross-team scope guard was silently built on top of.
+    ///
+    /// This fails if `roster` goes back to reporting `Identity::bank` verbatim.
+    #[tokio::test]
+    async fn the_roster_view_reports_the_bank_the_backend_opens() {
+        let dir = TempDir::new();
+        let honoured = Identity {
+            bank: "custom-bank".to_string(),
+            ..ident("alice")
+        };
+        let dropped = Identity {
+            bank: "Not/Safe".to_string(),
+            ..ident("dave")
+        };
+        let teams = teams_on(vec![honoured, dropped, ident("bob")]);
+        let bank = LocalBank::new(dir.child(DEFAULT_BANKS_SUBDIR), "agent-").with_bank_overrides(
+            teams
+                .roster
+                .iter()
+                .map(|i| (i.name.clone(), i.bank.clone())),
+        );
+        let mem = TeamsMemory::new(Arc::clone(&teams), Arc::new(bank.clone()));
+
+        let rows = mem.roster().expect("roster").roster;
+        let banks: Vec<&str> = rows.iter().map(|r| r.bank.as_str()).collect();
+        assert_eq!(
+            banks,
+            vec!["custom-bank", "agent-dave", "agent-bob"],
+            "the view must name the directory the backend reads, never the raw `bank:`"
+        );
+        // Asserted against the BACKEND rather than against a restatement of the rule, because the
+        // two agreeing is the whole property.
+        for row in &rows {
+            assert_eq!(
+                row.bank,
+                bank.bank_id(&row.name),
+                "roster view disagreed with the backend for {}",
+                row.name
+            );
+        }
     }
 
     /// Teams off ⇒ the overview is `teams_disabled`, exactly like every other Teams surface.
