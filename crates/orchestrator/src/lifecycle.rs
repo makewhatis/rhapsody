@@ -382,10 +382,12 @@ impl LifecycleCache {
         let mut answers: HashMap<String, String> = HashMap::new();
         let mut covered: HashSet<String> = HashSet::new();
         let mut unanswered: Vec<IssueKey> = Vec::new();
-        // Of `unanswered`, the ids whose ledger was READ and simply held no routing row — as
-        // opposed to one the store could not read at all. Both go to the label; only these may be
-        // concluded about when there is no label to read either.
+        // `unanswered` splits two ways, and the halves may be concluded from differently: `silent`
+        // is a ledger that was READ and simply held no routing row, `unreadable` is one the store
+        // could not read at all. Both go to the label; only a `silent` one may be concluded about
+        // when the label says nothing either.
         let mut silent: HashSet<String> = HashSet::new();
+        let mut unreadable: HashSet<String> = HashSet::new();
         for key in &stale {
             match run_identity(store.as_ref(), key.run_id) {
                 RunIdentity::Routed(name) => {
@@ -401,7 +403,10 @@ impl LifecycleCache {
                     silent.insert(key.id.clone());
                     unanswered.push(key.clone());
                 }
-                RunIdentity::Unreadable => unanswered.push(key.clone()),
+                RunIdentity::Unreadable => {
+                    unreadable.insert(key.id.clone());
+                    unanswered.push(key.clone());
+                }
             }
         }
         // Then the label, for whatever is left — and `covered` grows by which of those the tracker
@@ -417,8 +422,6 @@ impl LifecycleCache {
             // For a ledger that was READ and held nothing, it completes the answer: nothing else
             // could have spoken, so "nobody" caches. Without that the whole store loop re-ran on
             // every dashboard load until a config landed, which is what the memo exists to stop.
-            // An UNREADABLE ledger is excluded, by the same rule a failed label round trip is: two
-            // failures in a row must not become a cached "nobody" that blanks the column for a TTL.
             None => covered.extend(silent),
         }
         let mut guard = self
@@ -429,6 +432,17 @@ impl LifecycleCache {
             // Caching the EMPTY name is deliberate: it is what stops a solo, unrouted or Teams-off
             // ticket being asked about again on every dashboard load.
             let name = answers.get(&key.id).cloned().unwrap_or_default();
+            // With ONE exception: an id whose ledger could not be READ may cache a name, never the
+            // negative. `covered` says only that something answered — and the tracker answering
+            // about a ticket that wears no `rhapsody:@` label rules out the LABEL, not the routing
+            // row the store just failed to read. The tracker branch cannot enforce that itself
+            // (`label_identities` reports every id in a chunk it fetched, unreadable ones
+            // included), so it is enforced here, for both branches at once. Without it one
+            // transient store error both drops the standing answer AND memoizes "nobody" hard
+            // enough that the store recovering inside the same window still renders "—".
+            if name.is_empty() && unreadable.contains(&key.id) {
+                continue;
+            }
             if name.is_empty() {
                 // A refresh that now answers "nobody" drops the stale answer rather than keep
                 // reporting an attribution nothing confirms — the rule `resolve` follows too.
@@ -496,10 +510,11 @@ impl LifecycleCache {
 ///
 ///   * `Unrouted` vs `Silent` — "a routing row that named nobody" is an ANSWER and must not fall
 ///     through to the ticket's label; "no routing row" is a gap and must.
-///   * `Silent` vs `Unreadable` — a gap the store reported honestly can be cached as "nobody" when
-///     there is no tracker left to ask, because nothing else could have spoken. A gap that is
-///     really a failed read cannot: caching it would blank a column over a transient error, which
-///     is the same rule [`label_identities`] follows for a failed round trip.
+///   * `Silent` vs `Unreadable` — a gap the store reported honestly can be cached as "nobody" once
+///     the label has spoken (or there is no tracker to ask), because then everything that could
+///     have named someone has been consulted. A gap that is really a failed read cannot, on either
+///     branch: caching it would blank a column over a transient error, which is the same rule
+///     [`label_identities`] follows for a failed round trip.
 enum RunIdentity {
     /// A `teams.route` row naming this teammate.
     Routed(String),
@@ -1677,6 +1692,87 @@ mod tests {
             .resolve_assignees(&keys, &ledger.store(), None, t0 + LIFECYCLE_TTL)
             .await;
         assert_eq!(healed.get("a").map(String::as_str), Some("alice"));
+    }
+
+    // The same rule on the branch a CONFIGURED daemon always takes, which is the one that matters:
+    // the tracker is present and answers about the ticket, but the ticket wears no `rhapsody:@`
+    // label. That answer rules out the LABEL and nothing else — it says nothing about the routing
+    // row the store just failed to read — so it must not become a memoized "nobody". The test above
+    // passes `None` throughout and so only ever exercised the branch that already behaved.
+    #[tokio::test]
+    async fn an_unreadable_ledger_does_not_cache_nobody_even_when_the_tracker_answers() {
+        let ledger = Ledger::new();
+        let run = ledger.routed("MT-1", "alice");
+        let mut f = Fake::default();
+        // Answered about, and carrying no identity label: `asked` covers the id, `labelled` is
+        // empty. Exactly the shape that used to re-admit an unreadable id to the negative cache.
+        f.by_id.insert("a".into(), labelled("a", &["backend"]));
+        let tr = Arc::new(f);
+        let target = || Some(Arc::clone(&tr) as Arc<dyn Tracker>);
+        let cache = LifecycleCache::default();
+        let keys = [key("a", run)];
+        let t0 = Instant::now();
+
+        let got = cache
+            .resolve_assignees(&keys, &ledger.store(), target(), t0)
+            .await;
+        assert_eq!(got.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            0,
+            "a routed run never asks the label"
+        );
+
+        let broken: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(UnreadableEvents(ledger.store()));
+        let after = cache
+            .resolve_assignees(&keys, &broken, target(), t0 + LIFECYCLE_TTL)
+            .await;
+        assert_eq!(
+            after.get("a").map(String::as_str),
+            Some("alice"),
+            "a failed read must leave the answer standing, not replace it with nobody: {after:?}",
+        );
+
+        let healed = cache
+            .resolve_assignees(&keys, &ledger.store(), target(), t0 + LIFECYCLE_TTL)
+            .await;
+        assert_eq!(
+            healed.get("a").map(String::as_str),
+            Some("alice"),
+            "the store recovering inside the window must answer again, not serve a memoized nobody",
+        );
+    }
+
+    // The other half of the same distinction, so the fix above cannot be over-applied: an
+    // unreadable ledger whose ticket DOES carry an identity label caches that label. A name is a
+    // real answer whatever the store did, and suppressing it would re-ask the tracker every load.
+    #[tokio::test]
+    async fn an_unreadable_ledger_still_caches_a_label_it_did_find() {
+        let mut f = Fake::default();
+        f.by_id
+            .insert("a".into(), labelled("a", &["rhapsody:@alice"]));
+        let tr = Arc::new(f);
+        let target = || Some(Arc::clone(&tr) as Arc<dyn Tracker>);
+        let broken: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(UnreadableEvents(empty_store()));
+        let cache = LifecycleCache::default();
+        let keys = [key("a", 7)];
+        let t0 = Instant::now();
+
+        let first = cache.resolve_assignees(&keys, &broken, target(), t0).await;
+        assert_eq!(first.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(tr.labels_by_id_calls(), 1);
+
+        let second = cache
+            .resolve_assignees(&keys, &broken, target(), t0 + LIFECYCLE_TTL / 2)
+            .await;
+        assert_eq!(second.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            1,
+            "a name found over an unreadable ledger is a real answer and caches",
+        );
     }
 
     // Two identity labels resolve deterministically, whatever order the tracker lists them in — a
