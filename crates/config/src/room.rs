@@ -982,6 +982,12 @@ impl Cursors {
     /// [`LocalBank::with_bank_overrides`](crate::memory::LocalBank::with_bank_overrides)
     /// does: an override that is not label-safe is dropped rather than joined,
     /// because it becomes a directory name.
+    ///
+    /// The terms are the same because both ask
+    /// [`bank_override_honoured`](crate::memory::bank_override_honoured) rather than each
+    /// spelling the rule out. A cursor directory desynced from a bank directory is not a
+    /// read that returns nothing — it is a teammate silently re-reading or skipping room
+    /// posts, which is a great deal harder to notice.
     pub fn with_bank_overrides<I, K, V>(mut self, overrides: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -990,7 +996,7 @@ impl Cursors {
     {
         for (identity, bank) in overrides {
             let (identity, bank) = (identity.into(), bank.into());
-            if !bank.is_empty() && crate::teams::is_label_safe(&bank) {
+            if crate::memory::bank_override_honoured(&bank) {
                 self.banks.insert(identity, bank);
             }
         }
@@ -1442,10 +1448,14 @@ mod tests {
     #[test]
     fn cursor_dir_matches_the_memory_bank_dir() {
         let root = PathBuf::from("/tmp/banks");
-        let overrides = [("alice", "custom-bank"), ("bob", "")];
+        // `dave`'s override is NOT label-safe, so both readers must DROP it and fall back to
+        // `agent-dave`. That is the shape STUDIO-729's cross-team leak was built out of, and the
+        // one an inlined second copy of the predicate would desync on; the other two rows cannot
+        // catch it, because an honoured override and an absent one agree either way.
+        let overrides = [("alice", "custom-bank"), ("bob", ""), ("dave", "Not/Safe")];
         let bank = LocalBank::new(&root, "agent-").with_bank_overrides(overrides);
         let cursors = Cursors::new(&root, "agent-").with_bank_overrides(overrides);
-        for identity in ["alice", "bob"] {
+        for identity in ["alice", "bob", "dave"] {
             assert_eq!(
                 cursors.dir(identity).expect("cursor dir"),
                 bank.bank_dir(identity).expect("bank dir"),
@@ -1456,6 +1466,11 @@ mod tests {
         // becomes a directory name, so a `..` would escape the root.
         assert!(cursors.dir("../etc").is_err());
         assert!(bank.bank_dir("../etc").is_err());
+        // Named rather than only implied, so a future desync says which way it went.
+        assert_eq!(
+            cursors.dir("dave").expect("cursor dir"),
+            root.join("agent-dave")
+        );
     }
 
     /// The scan is bounded by [`MAX_ROOM_FILE_SCAN`] days, and the days it drops

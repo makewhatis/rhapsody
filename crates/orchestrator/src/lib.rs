@@ -72,6 +72,7 @@ pub mod stop;
 pub mod teams;
 mod teamscompose;
 pub mod teamsears;
+pub mod teamsknow;
 pub mod teamsmemory;
 pub mod teamspost;
 pub mod teamsprefetch;
