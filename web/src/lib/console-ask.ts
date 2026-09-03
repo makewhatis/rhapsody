@@ -92,9 +92,11 @@ export type AskOutcome =
  * exotic: the Room tab holds this very query open on essentially every run detail, so the newest
  * data on the key at the moment a question lands is routinely a window from before it.
  *
- * The caller supplies the difference; it is not a clock comparison, because two reads can settle
- * inside one millisecond. It is that a read has SETTLED since the question landed — react-query's
- * `isFetchedAfterMount`, an update count against the one this exchange mounted on. An absence the
+ * The caller supplies the difference, and what it must vouch for is stronger than "a read came
+ * back after the question landed": a read DISPATCHED before the question can settle after it, and
+ * what it carries is a snapshot of the room from before the question was ever in it. So
+ * `readSettledSinceAsking` means a read whose FETCH postdates the question has come back — not a
+ * clock comparison either way, since two reads can settle inside one millisecond. An absence the
  * gate has not vouched for is `unread`, which claims nothing at all.
  *
  * Note what the gate does NOT touch: `answered` and `waiting` are positive findings, impossible to
