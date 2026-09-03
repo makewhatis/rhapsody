@@ -169,7 +169,11 @@ function buildList(raw: readonly RawItem[]): MdList {
       const parent = top.list.items[top.list.items.length - 1];
       // A deeper line with no item above it (a malformed body) joins the level it landed on.
       if (parent) {
-        const nested: MdList = { ordered: item.ordered, items: [] };
+        // The parent's EXISTING sublist, when it has one. A dedent that lands between two levels
+        // (`- a` / 4-space `- x` / 2-space `- y`) pops the deeper level and arrives back here, and
+        // a fresh list assigned over `parent.list` would make the items already gathered under it
+        // unreachable — the sub-bullet would not be mis-nested, it would be gone.
+        const nested: MdList = parent.list ?? { ordered: item.ordered, items: [] };
         parent.list = nested;
         top = { indent: item.indent, list: nested };
         stack.push(top);

@@ -83,6 +83,16 @@ describe("parseMarkdown — blocks", () => {
     expect(block.items[1].list).toBeNull();
   });
 
+  it("keeps every item when the indentation step is uneven", () => {
+    // 4-then-2 is ordinary in generated markdown. A dedent that lands between two levels used to
+    // rebuild a fresh sublist on a parent that already owned one, so `x` was not mis-nested — it
+    // was deleted, and a hand-off's sub-bullet vanished from the only place an operator reads it.
+    const block = one("- a\n    - x\n  - y");
+    if (block.type !== "list") throw new Error("expected a list");
+    expect(block.items.map((i) => inlineText(i.children))).toEqual(["a"]);
+    expect(block.items[0].list?.items.map((i) => inlineText(i.children))).toEqual(["x", "y"]);
+  });
+
   it("keeps a loose list (blank lines between items) as one list", () => {
     const block = one("- one\n\n- two");
     expect(block).toMatchObject({ type: "list" });
