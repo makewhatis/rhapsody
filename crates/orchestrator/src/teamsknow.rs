@@ -513,6 +513,15 @@ impl Outcome {
     /// non-empty — so [`Outcome::comment_unavailable`] implies `!reviews.is_empty()` implies this
     /// method has already returned `None`. Store and bank failures are never silent: they are
     /// [`KnowledgeError`], and an [`Outcome`] with one of them in it does not exist.
+    ///
+    /// One case this deliberately does NOT special-case: a bare coordinate whose roster fan-out hit
+    /// [`MAX_REVIEW_REVIEWERS`] without finding a watch row still answers [`NO_RECORD`], even
+    /// though a reviewer past the cap might hold one. That is [`Runs::scan_exhausted`]'s shape
+    /// again — a bound that bit, not a claim that nothing exists — and it is handled the same way:
+    /// REPORTED rather than absorbed, on [`Outcome::reviewers_capped`], for slice 3 to render
+    /// beside the line. A second degradation string is the wrong fix, because §9.1 pins one wording
+    /// precisely so that a key off this team's projects and a key nobody has heard of cannot be
+    /// told apart by which sentence comes back.
     pub fn degradation(&self) -> Option<&'static str> {
         let empty = self.issue.is_none()
             && self.runs.facts.is_empty()
