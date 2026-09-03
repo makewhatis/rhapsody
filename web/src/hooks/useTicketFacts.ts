@@ -20,7 +20,7 @@ import { TEAMS_RECALL_QUERY_KEY } from "@/hooks/useTeams";
 export function useTicketFacts(
   roster: readonly string[],
   ticket: string,
-): { data: TeamsFact[]; isPending: boolean } {
+): { data: TeamsFact[]; isPending: boolean; isError: boolean } {
   const results = useQueries({
     queries: roster.map((identity) => ({
       queryKey: [...TEAMS_RECALL_QUERY_KEY, identity, ""],
@@ -33,5 +33,12 @@ export function useTicketFacts(
   const facts = results
     .flatMap((r) => r.data?.facts ?? [])
     .filter((f) => f.ticket === ticket);
-  return { data: facts, isPending: results.some((r) => r.isPending) };
+  // ANY bank failing is reported, because the fan-out is the read: a caller that showed "no facts
+  // were retained" while one teammate's bank 500'd would be stating, as fact, something it could
+  // not know. The facts that DID come back are still returned — a partial answer beats none.
+  return {
+    data: facts,
+    isPending: results.some((r) => r.isPending),
+    isError: results.some((r) => r.isError),
+  };
 }
