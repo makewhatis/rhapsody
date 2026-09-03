@@ -157,7 +157,11 @@ the `Orchestrator` struct itself. Concretely:
   ticket, but a keyless planted sentence ("the deploy is safe") CAN reach a reply if the turn obeys
   it. The containment for that is `answer_for` rendering `Facts::grounded` under every accepted
   prose, so the host's own records are always beside the sentence — don't remove it, and don't
-  restate the old claim that a planted line "is never obeyed". It is fed by `teamsknow.rs`'s
+  restate the old claim that a planted line "is never obeyed". That containment is a claim about
+  LAYOUT, so two guards keep the layout honest and both are load-bearing: `vet_answer` refuses prose
+  that contains `GROUNDING_LEAD` (untrusted text minting the host's own structure, the same rule
+  `one_line` applies to a fence-closing backtick run), and `Answerable::offered` refuses an `answer`
+  the prompt never offered because the facts block did not fit the budget. It is fed by `teamsknow.rs`'s
   accessor through `TriageDeps::knowledge`, which is `None` for a daemon
   with no durable store; that `None` is what keeps every teams-off and `labels`-only prompt
   byte-identical, so don't make it a `Noop` store instead.

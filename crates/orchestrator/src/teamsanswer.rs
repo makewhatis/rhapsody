@@ -28,7 +28,7 @@
 //! * **One fact is one line.** Newlines inside untrusted prose are folded to spaces, so a fact
 //!   cannot mint structure — a heading, a bullet list, a fake section — inside the block.
 //! * **A fact cannot close the fence.** A run of three or more backticks is neutralised
-//!   ([`fence_safe`]), because a fact that closes the block escapes the framing that makes it data
+//!   ([`one_line`]), because a fact that closes the block escapes the framing that makes it data
 //!   and lands in the prompt as bare instructions.
 //! * **The block is bounded and truncated by the HOST**, deterministically, most-relevant-first,
 //!   and says so ("showing N of M"). §9.3 (ANS-BUDGET-TRUNC) is the reason: the prompt's own
@@ -62,6 +62,12 @@
 //!   operator reads the host's own records beside the sentence. An ungrounded claim is then
 //!   visibly unsupported rather than silently authoritative. That is the design's option (a), and
 //!   it is a mitigation, not a proof.
+//! * **A plant can never FORGE that partition.** The mitigation above is a claim about layout, and
+//!   layout is the one thing untrusted prose can imitate: a sentence that carries
+//!   [`GROUNDING_LEAD`] itself renders above the real one and reads as the daemon's records rather
+//!   than as a claim beside them. So [`vet_answer`] refuses prose containing the lead whole, the
+//!   same way [`one_line`] refuses a fact the right to close the DATA fence. Both are the same
+//!   rule: untrusted text that can mint the HOST's own structure has stopped being data.
 //!
 //! # Recorded decision: the gather is unconditional, and the ACTION prompt carries it too
 //!
@@ -115,6 +121,12 @@ pub(crate) const MAX_FACTS_CHARS: usize = 4000;
 /// The operator has to be able to tell the two apart at a glance: everything above this line is a
 /// sentence the model composed, everything after it is what the daemon's records actually say. A
 /// claim the records do not support is then visibly unsupported rather than silently authoritative.
+///
+/// **That partition is worth nothing unless the untrusted half cannot MINT it**, so [`vet_answer`]
+/// refuses prose carrying this lead outright. It is the same hazard [`one_line`] neutralises one
+/// layer down — untrusted text minting the host's own structure stops being data — and it bites
+/// harder here: a forged lead renders FIRST, above the real one, plausible and *extending* it,
+/// in the position the design reserves for the daemon's records.
 pub(crate) const GROUNDING_LEAD: &str = "From my own records — ";
 
 /// The most characters of ONE untrusted prose fact — a memory record, a room post, a pull-request
@@ -652,6 +664,23 @@ pub(crate) fn vet_answer(prose: &str, allowed: &BTreeSet<String>) -> Result<Stri
              {MAX_ANSWER_CHARS})"
         ));
     }
+    // **The grounding lead is HOST structure, and prose that mints it forges the one partition the
+    // whole mitigation rests on.** `answer_for` prints the daemon's own records under that line
+    // exactly so the operator can tell composed prose from records at a glance; a sentence carrying
+    // the lead itself lands ABOVE the real one, reading as its opening rather than as a claim
+    // standing next to it. Refused WHOLE, like an unallowed key and for the same reason — the words
+    // around it were composed to carry it — after which the grounded records answer alone.
+    //
+    // Compared as the operator SEES it, not as it is spelled: a capital or a folded line break
+    // changes nothing about what the reply looks like in the room, and the trailing space is
+    // trimmed so a lead that runs straight into its sentence is caught too.
+    if fold_ws(prose).contains(&fold_ws(GROUNDING_LEAD.trim_end())) {
+        return Err(
+            "the room turn's answer minted the host's own grounding lead, which only the daemon \
+             writes"
+                .to_string(),
+        );
+    }
     // UNBOUNDED, unlike the post's own scan: a post is bounded because every key it names costs a
     // lookup, while this scan costs nothing and is the guard itself. A 33rd key that escaped the
     // check is precisely where an injected one would sit.
@@ -686,6 +715,19 @@ const FACTS_PREAMBLE: &str = "\n## My own records about those tickets\n\n\
 /// The fence the DATA block opens and closes with — [`build_room_prompt`](crate::teamsears) uses
 /// the same one for the post, for §0.11.5's reason.
 const FENCE: &str = "```";
+
+/// Lowercased with every whitespace run folded to a single space — a sentence as the operator SEES
+/// it rather than as it is spelled.
+///
+/// [`vet_answer`] compares against this rather than the raw prose because neither a capital letter
+/// nor a line break changes what a forged [`GROUNDING_LEAD`] looks like in the room, and a
+/// containment check on the raw bytes would miss both.
+fn fold_ws(s: &str) -> String {
+    s.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Renders untrusted prose as exactly ONE fence-safe line.
 ///
@@ -1384,7 +1426,16 @@ mod tests {
         // A cap that fits the preamble and both fences but not one record. Rendering the frame
         // around nothing would spend several hundred characters of the operator's own prompt
         // budget to say nothing at all.
-        let frame_only = FACTS_PREAMBLE.chars().count() + (2 * FENCE.chars().count()) + 8;
+        // Measured from the SAME head and widest tail `render` reserves, so this reaches the
+        // `shown == 0` guard it is named for. A hand-rolled approximation smaller than
+        // `head + widest_tail` takes the `checked_sub → None` path one line earlier instead, and
+        // pins the other branch under this one's name.
+        let frame_only = format!("{FACTS_PREAMBLE}{FENCE}\n").chars().count()
+            + format!(
+                "{FENCE}\n(showing 1 of 1 records; the rest were dropped to fit this answer.)\n"
+            )
+            .chars()
+            .count();
         assert_eq!(
             f.render(frame_only),
             "",
