@@ -1561,7 +1561,7 @@ mod tests {
             ("alice", ""),             // no override -> <prefix><name>
             ("bob", "shared-rust"),    // label-safe   -> honoured
             ("carol", "../../escape"), // separator    -> dropped
-            ("dave", "Not/Safe"),      // uppercase    -> dropped
+            ("dave", "Not/Safe"),      // both, again  -> dropped
             ("erin", "-leading"),      // leading dash -> dropped
         ];
         let b = LocalBank::new(dir.path().join(DEFAULT_BANKS_SUBDIR), "agent-")

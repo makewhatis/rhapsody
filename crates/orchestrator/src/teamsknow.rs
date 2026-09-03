@@ -113,6 +113,10 @@ pub const MAX_HISTORY_ROWS: i64 = 20;
 /// and the team's own rows never reach it — and §9.3's ANS-BUDGET-TRUNC is explicit that a
 /// confidently wrong "I have no record of that" is the failure this design exists to fix. The
 /// gather therefore pages until it holds `limit` ADMITTED rows or has read this many.
+///
+/// The ceiling is what the guarantee stops at, stated plainly: on a box busy enough that this
+/// team owns none of the newest 500 rows for a slug, its older runs are still out of reach. That
+/// is a bound on a bounded read, not a hole in the drop — nothing off-team can escape either way.
 pub const MAX_SCAN_ROWS: i64 = 500;
 
 /// One page of that scan. Large enough that the ordinary case — a store whose rows are mostly this
@@ -622,6 +626,10 @@ impl<'a> Knowledge<'a> {
             .map(|r| r.issue_identifier.as_str())
             .filter(|k| !k.is_empty())
             .collect();
+        // A ticket's route rows cover every run of it, including runs this page does not carry and
+        // the scope may never have admitted. Keeping only the ones being projected is what makes
+        // "only for rows the scope has already admitted" true of the data and not just the query.
+        let wanted: BTreeSet<i64> = rows.iter().map(|r| r.id).collect();
         let mut out: HashMap<i64, String> = HashMap::new();
         for key in keys {
             let hits = self.store.search_events(EventQuery {
@@ -633,6 +641,9 @@ impl<'a> Knowledge<'a> {
             // Ordered (run_id DESC, seq DESC), so the first row seen for a run is its LAST routing
             // decision — the one it actually ran under if it was ever re-routed mid-run.
             for hit in hits {
+                if !wanted.contains(&hit.run_id) {
+                    continue;
+                }
                 let Some(name) = route_event_identity(&hit.text) else {
                     continue;
                 };
