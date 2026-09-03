@@ -716,6 +716,7 @@ mod tests {
     const REPO: &str = "rhapsody";
     const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HEAD_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
     fn ident(name: &str, max_concurrent: i64) -> Identity {
         Identity {
@@ -1355,6 +1356,43 @@ mod tests {
         );
         assert_eq!(dispatched.lock().expect("lock").len(), spent + 1);
         assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    /// **A re-run buys exactly the re-read it asked for, and not a fresh budget** (STUDIO-722).
+    ///
+    /// The cap (§14.2) is the floor under a force-push loop, so an operator clicking through it must
+    /// not reset it: clearing the counter outright would hand an already-runaway pull request eight
+    /// more UNATTENDED rounds, which is the very cost the cap exists to bound. Refunding one round
+    /// gives the operator the read they asked for and leaves the cap holding the line behind them.
+    #[test]
+    fn an_operator_rerun_refunds_one_round_and_not_the_whole_budget() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+
+        for round in 0..REVIEW_ROUNDS_PER_PR_CAP {
+            let head = format!("{round:040}");
+            o.handle_review_sweep(&[open_at(12, &head)]);
+            complete(&mut o, 12, "bob", &head);
+        }
+        let spent = dispatched.lock().expect("lock").len();
+
+        // One re-run, one round.
+        assert_eq!(
+            o.handle_review_rerun(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+        complete(&mut o, 12, "bob", HEAD_B);
+        assert_eq!(dispatched.lock().expect("lock").len(), spent + 1);
+
+        // And then the cap is holding again: the NEXT push is deferred exactly as it was before the
+        // operator intervened, rather than running free for another whole budget.
+        assert_eq!(
+            o.handle_review_sweep(&[open_at(12, HEAD_C)]).dispatched,
+            0,
+            "a re-run must not reset the churn budget, only refund the round it spent"
+        );
+        assert_eq!(dispatched.lock().expect("lock").len(), spent + 1);
     }
 
     /// The other half: a dismissal stops the watcher dead. The pull request is still open and its

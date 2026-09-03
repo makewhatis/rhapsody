@@ -183,11 +183,13 @@ impl Orchestrator {
     /// * It re-arms **regardless of SHA**. An advance is only meaningful when the head moved; an
     ///   operator re-running a pull request nobody has pushed to is asking for a second read of the
     ///   same code, which is a coherent thing to want after a reviewer crashed or came back thin.
-    /// * It **clears the per-pull-request churn budget**. That cap (§14.2) exists as a floor against
-    ///   force-push loops and, once reached, defers every further round "until the daemon restarts
-    ///   or the pull request closes" — so leaving it in place would let a capped pull request accept
-    ///   this click and then silently never review. An authenticated operator IS the escape hatch
-    ///   the cap defers to.
+    /// * It **refunds ONE round of the per-pull-request churn budget**. That cap (§14.2) exists as a
+    ///   floor against force-push loops and, once reached, defers every further round "until the
+    ///   daemon restarts or the pull request closes" — so leaving it in place would let a capped
+    ///   pull request accept this click and then silently never review. An authenticated operator IS
+    ///   the escape hatch the cap defers to. A refund and not a reset, though: the operator asked
+    ///   for one re-read, and clearing the counter would hand an already-runaway pull request the
+    ///   whole budget again UNATTENDED, which is the exact cost the cap is there to bound.
     pub(crate) fn handle_review_rerun(&mut self, pr: &PrCoord) -> ReviewControlOutcome {
         if !self.review_ticketless_enabled() {
             return ReviewControlOutcome::Dormant; // §16
@@ -255,7 +257,17 @@ impl Orchestrator {
             }
         }
         if armed > 0 {
-            self.review_rounds.remove(&churn_key(pr));
+            // One ROUND back, in the dispatches the counter is kept in — the same scaling
+            // `service_review_pr` applies to the cap, so a two-reviewer config gets a two-dispatch
+            // round back rather than half of one. Saturating: a counter below one round's cost just
+            // returns to zero.
+            let round = self
+                .teams
+                .as_ref()
+                .map_or(1, |t| t.review.effective_reviewers().max(1));
+            if let Some(spent) = self.review_rounds.get_mut(&churn_key(pr)) {
+                *spent = spent.saturating_sub(round);
+            }
             tracing::info!(pr = %pr, rows = armed, "ticketless review: operator re-ran a review");
         }
         ReviewControlOutcome::Applied(armed)
@@ -689,10 +701,13 @@ mod tests {
     }
 
     /// The churn cap (§14.2) defers every further round of a pull request "until the daemon restarts
-    /// or the pull request closes". An authenticated operator IS that escape hatch, so a re-run
-    /// clears the budget — otherwise the button would accept the click and never review.
+    /// or the pull request closes". An authenticated operator IS that escape hatch, so a re-run buys
+    /// a round back — otherwise the button would accept the click and never review.
+    ///
+    /// ONE round back, not the whole budget: the operator asked for one re-read, and a reset would
+    /// give a pull request that has already had eight rounds eight more unattended ones.
     #[test]
-    fn a_rerun_clears_the_per_pull_request_churn_budget() {
+    fn a_rerun_refunds_one_round_of_the_per_pull_request_churn_budget() {
         let mut o = ticketless();
         watch(&mut o, "bob", REVIEW_STATUS_APPROVED, HEAD_A, HEAD_A);
         o.review_rounds.insert(
@@ -706,9 +721,36 @@ mod tests {
         );
         assert_eq!(
             o.review_rounds.get("makewhatis/rhapsody#12"),
-            None,
-            "a spent budget must not swallow the operator's own request"
+            Some(&(REVIEW_ROUNDS_PER_PR_CAP - 1)),
+            "a spent budget must not swallow the operator's own request, nor be reset by it"
         );
+    }
+
+    /// The refund cannot go negative, and cannot become free budget: a pull request that has spent
+    /// less than one round's worth comes back to zero, not below it.
+    #[test]
+    fn a_rerun_refund_saturates_at_an_unspent_budget() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_APPROVED, HEAD_A, HEAD_A);
+
+        assert_eq!(
+            o.handle_review_rerun(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            o.review_rounds.get("makewhatis/rhapsody#12"),
+            None,
+            "a pull request with no entry gains none"
+        );
+
+        o.review_rounds
+            .insert("makewhatis/rhapsody#12".to_string(), 0);
+        watch(&mut o, "bob", REVIEW_STATUS_APPROVED, HEAD_A, HEAD_A);
+        assert_eq!(
+            o.handle_review_rerun(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(o.review_rounds.get("makewhatis/rhapsody#12"), Some(&0));
     }
 
     /// Re-run re-arms rows and introduces none — the same property
