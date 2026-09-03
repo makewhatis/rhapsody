@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   Chip,
@@ -13,6 +13,7 @@ import {
   TeammateAvatar,
   TicketChip,
 } from "@/components/console";
+import { cn } from "@/lib/utils";
 import { teammateColor } from "@/theme/teammates";
 import {
   CONSOLE_JOB_FILTERS,
@@ -24,10 +25,13 @@ import {
   type ConsoleJobFilterId,
   type ConsoleJobRow,
 } from "@/lib/console-jobs";
+import { sparkSummary, traceSpark } from "@/lib/console-trace-spark";
+import { buildTrace } from "@/lib/trace-model";
 import { mergeJobs } from "@/lib/runs-model";
 import { useLinearProjects } from "@/hooks/useConfig";
 import { useIssueRuns } from "@/hooks/useHistory";
 import { useNow } from "@/hooks/useNow";
+import { useTranscript } from "@/hooks/useRunDetail";
 import { useRefresh, useStateQuery } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview } from "@/hooks/useTeams";
 
@@ -94,6 +98,9 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
           <Stat value={counts.review} label="in review" tone="acc" />
           <Stat value={counts.queued} label="queued" />
           <Stat value={counts.blocked} label="blocked" tone="bad" />
+          {/* The operator's own queue (STUDIO-743, design record §6). It cuts across the four
+              above rather than partitioning with them — see `needsOperator`. */}
+          <Stat value={counts.needsYou} label="needs you" tone="op" />
         </NowStats>
       </NowStrip>
 
@@ -120,6 +127,7 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
               <th>Ticket</th>
               <th>Assigned</th>
               <th>Status</th>
+              <th>Trace</th>
               <th>PR</th>
               <th>Updated</th>
             </tr>
@@ -141,6 +149,12 @@ function emptyMessage(total: number, loading: boolean): string {
   return total === 0 ? "No jobs yet." : "No jobs match this filter.";
 }
 
+// How long the operator must rest on a row before its transcript is fetched. The guard is the
+// whole reason a sweep down the table costs nothing: every row that is merely PASSED — crossed by
+// the pointer, or tabbed through on the way to another — clears its timer on the way out, so only
+// a row that was actually stopped on is ever fetched.
+const SPARK_DWELL_MS = 120;
+
 // One worklist row. It is a real activation target, not a div with a click handler: the whole
 // row navigates, so it owes Enter/Space and a focus ring as well as the pointer (§10 box 2.8).
 function JobsRow({
@@ -152,12 +166,38 @@ function JobsRow({
   roster: readonly string[];
   onOpen: (issue: string) => void;
 }) {
+  // Arming is one-way: once this row's transcript has been asked for it stays asked for, so the
+  // strip does not blink away when the operator moves on.
+  const [armed, setArmed] = useState(false);
+  const dwell = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearDwell = () => {
+    if (dwell.current !== null) {
+      clearTimeout(dwell.current);
+      dwell.current = null;
+    }
+  };
+  const arm = () => {
+    if (!armed && dwell.current === null) {
+      dwell.current = setTimeout(() => {
+        dwell.current = null;
+        setArmed(true);
+      }, SPARK_DWELL_MS);
+    }
+  };
+  useEffect(() => clearDwell, []);
+
   return (
     <tr
       tabIndex={0}
       role="link"
       aria-label={`${row.issue} ${row.title}`}
       onClick={() => onOpen(row.issue)}
+      onMouseEnter={arm}
+      onMouseLeave={clearDwell}
+      // Focus arms too, so the strip is reachable without a pointer — and behind the same dwell,
+      // because tabbing to the tenth row passes through nine others exactly as a pointer does.
+      onFocus={arm}
+      onBlur={clearDwell}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
@@ -190,8 +230,76 @@ function JobsRow({
           {row.subLabel === undefined ? "" : ` · ${row.subLabel}`}
         </Pill>
       </td>
+      <td>
+        <TraceSpark runId={row.runId} live={row.live} armed={armed} />
+      </td>
       <td>{row.pr === "" ? "—" : <TicketChip variant="pr">{row.pr}</TicketChip>}</td>
       <td className="up">{row.updated}</td>
     </tr>
+  );
+}
+
+// The row's trace-sparkline (STUDIO-743; design record §6) — the run's shape in the same phase
+// glyphs the run-detail spine draws.
+//
+// WHY IT IS LAZY, AND THE DEPENDENCY THAT WOULD MAKE IT EAGER. The shape can only be computed from
+// the run's transcript, and NOTHING in the worklist's own payload carries it: `IssueRun`
+// (`GET /api/v1/history/issues`) is a `RunSummary` plus a lifecycle, a tracker state and an
+// assignee — an outcome, a turn count and token totals, no phases. Drawing the whole table
+// eagerly therefore means one `GET /api/v1/runs/{id}/transcript` per row, and those are not small:
+// over the 400 most recent recorded runs the median transcript is 30KB and the largest 212KB, so a
+// 50-row page would pull ~1.5MB and re-parse 50 session logs on the daemon to fill a table cell.
+// The ticket's acceptance rules that out, so the fetch waits for the operator to point at ONE row
+// (see `SPARK_DWELL_MS`) and is cached under the same query key the run detail uses, which makes
+// opening the row afterwards free.
+//
+// The dependency this leaves open, flagged rather than brute-forced (ticket + design record §5):
+// a cheap per-run PHASE SUMMARY on the issue listing — the daemon already reads each transcript to
+// serve it — would let every row draw its strip on load with no extra request at all.
+function TraceSpark({ runId, live, armed }: { runId: number; live: boolean; armed: boolean }) {
+  // `inFlight: false` even for a live run: a worklist strip is a preview, not a stream, and a
+  // per-row 1.5s poll of a 30KB transcript is exactly the cost this component exists to avoid. The
+  // playhead says the run is still going; the run detail is where it is watched.
+  const transcript = useTranscript(runId, false, armed && runId > 0);
+  const steps = useMemo(
+    () => traceSpark(buildTrace(transcript.data?.entries ?? []).phases, live),
+    [transcript.data, live],
+  );
+
+  // Persistence off: there is no run row and so no transcript to read one from.
+  if (runId <= 0) return <span className="spark idle" title="No stored run">—</span>;
+  if (!armed) {
+    return (
+      <span className="spark idle" title="Point at this row to preview its trace">
+        ···
+      </span>
+    );
+  }
+  if (transcript.isPending) {
+    return (
+      <span className="spark idle" aria-busy="true" title="Reading the transcript…">
+        ···
+      </span>
+    );
+  }
+  // A transcript the daemon could not serve, and a run that logged nothing, are both "no shape to
+  // show" — never an invented one.
+  if (steps.length === 0) {
+    return (
+      <span className="spark idle" title={transcript.isError ? "Transcript unavailable" : "No trace"}>
+        —
+      </span>
+    );
+  }
+
+  const summary = sparkSummary(steps);
+  return (
+    <span className="spark" role="img" aria-label={summary} title={summary}>
+      {steps.map((step) => (
+        <span key={step.kind} className={cn("gly", step.kind === "live" && "now")} aria-hidden="true">
+          {step.glyph}
+        </span>
+      ))}
+    </span>
   );
 }

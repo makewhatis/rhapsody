@@ -104,12 +104,37 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
   }
 }
 
+/**
+ * Whether this ticket is waiting on the OPERATOR — the "Needs you" count the design record's §6
+ * adds to the Now strip. Derived from the state the worklist already holds; no new endpoint.
+ *
+ * `review` qualifies because nothing else is moving it: `consoleJobStatus` lets a LIVE run outrank
+ * the ticket, so a ticket an agent is reviewing right now reads `run`, and what is left under
+ * `review` is work parked for a person to read and merge.
+ *
+ * `blocked` qualifies only when it is a FAILED run. The other thing that reads blocked is a held
+ * dependent (`runs-model`'s synthetic `waiting` row), and that one is waiting on its predecessor
+ * rather than on the operator — a predecessor which is itself a row in this same worklist, and is
+ * counted there. Counting the dependent too would bill one human decision twice.
+ *
+ * Takes the run status as a plain string for the reason `fromRunOutcome` does: `JobRow.status` is
+ * the wider `StatusKey`, and narrowing it with a cast would hide the case this has to survive.
+ */
+export function needsOperator(status: ConsoleJobStatus, runStatus: string): boolean {
+  if (status === "review") return true;
+  return status === "blocked" && runStatus !== "waiting";
+}
+
 /** One row of the §3 worklist, fully derived so the table stays presentational. */
 export interface ConsoleJobRow {
   /** Stable React key. */
   key: string;
   /** Ticket key — also the `job/:key` route target (§10 box 2.8). */
   issue: string;
+  /** The run the row's trace-sparkline previews; 0 when persistence is off (there is none). */
+  runId: number;
+  /** True while this ticket's newest run is genuinely in flight — the sparkline's playhead. */
+  live: boolean;
   title: string;
   /** Project display name, or "—" when the daemon runs single-project. */
   project: string;
@@ -129,6 +154,8 @@ export interface ConsoleJobRow {
   updatedAtMs: number;
   /** Held/failed detail, e.g. "waiting on STUDIO-1 · In Progress". */
   subLabel?: string;
+  /** Whether the ticket's next move is the OPERATOR's — the Now strip's "Needs you" (§6). */
+  needsYou: boolean;
 }
 
 /**
@@ -264,6 +291,8 @@ export function buildConsoleJobs(
     return {
       key: job.key,
       issue: job.issue,
+      runId: job.runId,
+      live: job.live,
       title: job.title,
       project: job.projectShort,
       projectSlug: job.project,
@@ -278,6 +307,7 @@ export function buildConsoleJobs(
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
+      needsYou: needsOperator(status, job.status),
     };
   });
 
@@ -307,21 +337,28 @@ export function filterConsoleJobs(
   );
 }
 
-/** The four Now-strip stat pills of §3 (§10 box 2.6). */
+/**
+ * The Now-strip stat pills: §3's original four, plus the "Needs you" the design record's §6 adds.
+ *
+ * `needsYou` deliberately CUTS ACROSS the other four rather than partitioning with them — see
+ * [`needsOperator`] — so the five numbers do not sum to the row count and are not meant to.
+ */
 export interface ConsoleJobCounts {
   running: number;
   review: number;
   queued: number;
   blocked: number;
+  needsYou: number;
 }
 
 export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCounts {
-  const counts: ConsoleJobCounts = { running: 0, review: 0, queued: 0, blocked: 0 };
+  const counts: ConsoleJobCounts = { running: 0, review: 0, queued: 0, blocked: 0, needsYou: 0 };
   for (const row of rows) {
     if (row.status === "run") counts.running += 1;
     else if (row.status === "review") counts.review += 1;
     else if (row.status === "queued") counts.queued += 1;
     else if (row.status === "blocked") counts.blocked += 1;
+    if (row.needsYou) counts.needsYou += 1;
   }
   return counts;
 }

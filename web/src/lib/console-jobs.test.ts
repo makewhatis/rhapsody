@@ -12,6 +12,7 @@ import {
   lastActivityByIssue,
   lifecycleByIssue,
   mateStates,
+  needsOperator,
   relativeSince,
   ticketAssignees,
 } from "./console-jobs";
@@ -200,7 +201,13 @@ describe("buildConsoleJobs", () => {
     // No answer => the old behaviour, unchanged.
     expect(status("UNKNOWN")).toBe("review");
     // Only REVIEW and the unresolved UNKNOWN count as awaiting a reviewer; MERGED no longer does.
-    expect(consoleJobCounts(rows)).toEqual({ running: 0, review: 2, queued: 1, blocked: 0 });
+    expect(consoleJobCounts(rows)).toEqual({
+      running: 0,
+      review: 2,
+      queued: 1,
+      blocked: 0,
+      needsYou: 2,
+    });
   });
 
   // The Done tab was permanently empty because `done` was unreachable — §3's filter Seg.
@@ -245,7 +252,15 @@ describe("buildConsoleJobs", () => {
       undefined,
       NOW,
     );
-    expect(consoleJobCounts(rows)).toEqual({ running: 1, review: 2, queued: 1, blocked: 2 });
+    // needsYou (STUDIO-743) cuts across the four: B and C await a reviewer and E failed, while
+    // F is held on a dependency and is therefore waiting on its predecessor, not on the operator.
+    expect(consoleJobCounts(rows)).toEqual({
+      running: 1,
+      review: 2,
+      queued: 1,
+      blocked: 2,
+      needsYou: 3,
+    });
   });
 
   it("pins running tickets first, then orders by newest activity", () => {
@@ -407,5 +422,87 @@ describe("filterConsoleJobs", () => {
     for (const f of CONSOLE_JOB_FILTERS) {
       expect(() => filterConsoleJobs(rows, f.id, "")).not.toThrow();
     }
+  });
+});
+
+// STUDIO-743 (design record §6) — the Now strip's fifth stat. "Needs you" is the operator's own
+// queue: the tickets whose next move is a HUMAN's, which is not the same set as any one pill.
+describe("needsOperator", () => {
+  it("counts a ticket parked in review — nobody is working it, a person must look", () => {
+    expect(needsOperator("review", "completed")).toBe(true);
+  });
+
+  it("counts a failed run — a person has to decide what happens next", () => {
+    expect(needsOperator("blocked", "failed")).toBe(true);
+  });
+
+  // A held dependent is `blocked` too, but it is waiting on its PREDECESSOR, not on the operator —
+  // and that predecessor is itself a row in this worklist, counted there. Counting the dependent
+  // as well would bill the same human decision twice.
+  it("does not count a ticket held on an uncleared dependency", () => {
+    expect(needsOperator("blocked", "waiting")).toBe(false);
+  });
+
+  it("counts nothing the daemon is still driving or has finished with", () => {
+    expect(needsOperator("run", "running")).toBe(false);
+    expect(needsOperator("queued", "stopped")).toBe(false);
+    expect(needsOperator("done", "completed")).toBe(false);
+  });
+});
+
+describe("the Now strip's Needs you count", () => {
+  function rows() {
+    return buildConsoleJobs(
+      [
+        job({ issue: "LIVE", status: "running" }),
+        job({ issue: "REVIEW", status: "completed" }),
+        job({ issue: "MERGED", status: "completed" }),
+        job({ issue: "FAILED", status: "failed" }),
+        job({ issue: "HELD", status: "waiting" }),
+      ],
+      [
+        issueRow({ issue_identifier: "REVIEW", lifecycle: "in_review" }),
+        issueRow({ issue_identifier: "MERGED", lifecycle: "done" }),
+      ],
+      undefined,
+      NOW,
+    );
+  }
+
+  it("marks each row that is waiting on the operator", () => {
+    const needs = rows()
+      .filter((r) => r.needsYou)
+      .map((r) => r.issue)
+      .sort();
+    expect(needs).toEqual(["FAILED", "REVIEW"]);
+  });
+
+  it("counts them alongside the four existing pills", () => {
+    expect(consoleJobCounts(rows())).toEqual({
+      running: 1,
+      review: 1,
+      queued: 0,
+      blocked: 2,
+      needsYou: 2,
+    });
+  });
+});
+
+// The sparkline needs the run it should preview, and whether that run is still going.
+describe("the row's run identity", () => {
+  it("carries the durable run id and the live flag through to the row", () => {
+    const rows = buildConsoleJobs(
+      [
+        job({ issue: "LIVE", status: "running", runId: 42 }),
+        job({ issue: "OFF", status: "completed", runId: 0 }),
+      ],
+      [],
+      undefined,
+      NOW,
+    );
+    const row = (issue: string) => rows.find((r) => r.issue === issue);
+    expect(row("LIVE")).toMatchObject({ runId: 42, live: true });
+    // Persistence off: no run to read a transcript from, and the row says so rather than guessing.
+    expect(row("OFF")).toMatchObject({ runId: 0, live: false });
   });
 });

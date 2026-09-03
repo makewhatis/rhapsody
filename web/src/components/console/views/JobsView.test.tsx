@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -12,6 +14,7 @@ const h = vi.hoisted(() => ({
   fetchState: vi.fn(),
   fetchIssueRuns: vi.fn(),
   fetchTeamsOverview: vi.fn(),
+  fetchRunTranscript: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (orig) => {
@@ -21,6 +24,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchState: h.fetchState,
     fetchIssueRuns: h.fetchIssueRuns,
     fetchTeamsOverview: h.fetchTeamsOverview,
+    fetchRunTranscript: h.fetchRunTranscript,
     fetchVersion: vi.fn(async () => ({
       version: "v0.4.0",
       commit: "abc",
@@ -31,6 +35,8 @@ vi.mock("@/lib/api", async (orig) => {
     postRefresh: vi.fn(async () => {}),
   };
 });
+
+import { phaseGlyph } from "@/lib/console-trace-view";
 
 const { JobsView } = await import("./JobsView");
 
@@ -345,9 +351,214 @@ describe("the filter bar and the table (§3)", () => {
       tr.textContent?.includes("R-1"),
     )!;
     const cells = within(row as HTMLElement).getAllByRole("cell");
-    expect(cells).toHaveLength(5);
+    expect(cells).toHaveLength(6);
     expect(cells[1].textContent).toBe("—"); // Assigned: no identity on a finished run
     expect(cells[2].textContent).toContain("in review"); // Status
-    expect(cells[3].textContent).toBe("—"); // PR: no endpoint serves one
+    expect(cells[3].textContent).toBe("···"); // Trace: unread until pointed at (STUDIO-743)
+    expect(cells[4].textContent).toBe("—"); // PR: no endpoint serves one
+  });
+});
+
+// STUDIO-743 (design record §6) — the additive Jobs-home touch: the operator's own count on the
+// Now strip, and a per-row preview of each run's shape in the run detail's phase glyphs.
+describe("the Needs you count (§6)", () => {
+  it("counts the tickets whose next move is the operator's, not the daemon's", async () => {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      blocked: [
+        {
+          issue_identifier: "HELD",
+          title: "HELD title",
+          project: "rhapsody",
+          blocker_identifier: "REVIEW",
+          blocker_state: "In Review",
+          mode: "dag",
+        },
+      ],
+    });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review" }),
+        run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done" }),
+        run({ issue_identifier: "FAILED", outcome: "failed" }),
+        run({ issue_identifier: "IDLE", outcome: "stopped" }),
+      ],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+
+    // REVIEW is parked for a reviewer and FAILED needs a decision. MERGED is finished, IDLE is
+    // the daemon's to redispatch, and HELD waits on REVIEW rather than on the operator.
+    await waitFor(() => expect(stat("needs you")).toBe("2"));
+    expect(stat("blocked")).toBe("2"); // HELD + FAILED — "needs you" is not a copy of a pill
+  });
+});
+
+describe("the row trace-sparkline (§6)", () => {
+  const TRANSCRIPT = {
+    run_id: 7,
+    entries: [
+      { seq: 1, kind: "tool_use", tool: "Read", text: "file_path=/repo/src/lib/api.ts" },
+      { seq: 2, kind: "tool_result", tool: "", text: "export interface RunSummary" },
+      { seq: 3, kind: "tool_use", tool: "Edit", text: "file_path=/repo/src/lib/api.ts" },
+      { seq: 4, kind: "tool_result", tool: "", text: "applied" },
+    ],
+    generated_at: "2026-09-03T12:00:00Z",
+  };
+
+  async function mountJobs() {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ id: 7, issue_identifier: "A-1", outcome: "completed" }),
+        run({ id: 8, issue_identifier: "B-2", outcome: "completed" }),
+      ],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    h.fetchRunTranscript.mockResolvedValue(TRANSCRIPT);
+    mount();
+    await waitFor(() => expect(rowKeys()).toEqual(["A-1", "B-2"]));
+  }
+
+  function row(issue: string): HTMLElement {
+    return [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.textContent?.includes(issue),
+    ) as HTMLElement;
+  }
+
+  function glyphs(issue: string): string[] {
+    return [...row(issue).querySelectorAll(".spark .gly")].map((el) => el.textContent ?? "");
+  }
+
+  // The acceptance criterion with teeth: a worklist of N rows must not cost N transcripts.
+  it("fetches no transcript for a table nobody has pointed at", async () => {
+    await mountJobs();
+    expect(h.fetchRunTranscript).not.toHaveBeenCalled();
+  });
+
+  it("draws the run's shape in the spine's own glyphs once a row is pointed at", async () => {
+    await mountJobs();
+    fireEvent.mouseEnter(row("A-1"));
+
+    await waitFor(() => expect(glyphs("A-1")).toEqual([phaseGlyph("oriented"), phaseGlyph("implemented")]));
+    // Only the row that was pointed at — its neighbour is still unread.
+    expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(7);
+    expect(glyphs("B-2")).toEqual([]);
+  });
+
+  it("names the strip so it is not a row of mystery symbols", async () => {
+    await mountJobs();
+    fireEvent.mouseEnter(row("A-1"));
+    await waitFor(() =>
+      expect(row("A-1").querySelector(".spark")?.getAttribute("aria-label")).toBe(
+        "Oriented ×1 · Implemented ×1",
+      ),
+    );
+  });
+
+  it("does not fetch for a row the pointer merely crosses", async () => {
+    await mountJobs();
+    fireEvent.mouseEnter(row("A-1"));
+    fireEvent.mouseLeave(row("A-1"));
+    fireEvent.mouseEnter(row("B-2"));
+    fireEvent.mouseLeave(row("B-2"));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(h.fetchRunTranscript).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch for a row that is tabbed through on the way to another", async () => {
+    await mountJobs();
+    fireEvent.focus(row("A-1"));
+    fireEvent.blur(row("A-1"));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(h.fetchRunTranscript).not.toHaveBeenCalled();
+  });
+
+  // A pointer is not the only way through the table (§10 box 2.8 made the row focusable).
+  it("draws the strip for a row reached from the keyboard", async () => {
+    await mountJobs();
+    fireEvent.focus(row("B-2"));
+    await waitFor(() => expect(glyphs("B-2").length).toBe(2));
+    expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(8);
+  });
+
+  it("shows a dash, never an invented shape, when the transcript cannot be read", async () => {
+    await mountJobs();
+    h.fetchRunTranscript.mockRejectedValue(new Error("nope"));
+    fireEvent.focus(row("A-1"));
+    await waitFor(() =>
+      expect(row("A-1").querySelector(".spark")?.textContent).toBe("—"),
+    );
+  });
+
+  it("marks a live run with the playhead", async () => {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-A-1",
+          issue_identifier: "A-1",
+          title: "A-1 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 7,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    h.fetchRunTranscript.mockResolvedValue(TRANSCRIPT);
+    mount();
+    await waitFor(() => expect(rowKeys()).toEqual(["A-1"]));
+
+    fireEvent.focus(row("A-1"));
+    await waitFor(() => expect(row("A-1").querySelector(".spark .gly.now")).not.toBeNull());
+    expect(row("A-1").querySelector(".spark")?.getAttribute("aria-label")).toContain("Running now");
+  });
+});
+
+// The strip's two states are only distinguishable by CSS — a glyph with no rule is an unstyled
+// character, and the playhead with no rule is indistinguishable from the phases beside it. The
+// class names are therefore checked against the stylesheet as well as the DOM, the way the
+// console's Pill variants are (STUDIO-681 §10 box 1.4).
+describe("the §6 additions are painted, not just classed", () => {
+  const viewsCss = readFileSync(path.resolve(__dirname, "../../../theme/console-views.css"), "utf8");
+  const consoleCss = readFileSync(path.resolve(__dirname, "../../../theme/console.css"), "utf8");
+
+  it("styles the sparkline's glyph and its playhead", () => {
+    expect(viewsCss).toMatch(/\.spark \.gly \{/);
+    expect(viewsCss).toMatch(/\.spark \.gly\.now \{[^}]*color: var\(--operator\)/);
+  });
+
+  it("gives Needs you the operator's own colour", () => {
+    expect(consoleCss).toMatch(/\.stat\.op \.n \{[^}]*color: var\(--operator\)/);
   });
 });
