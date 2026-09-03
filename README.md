@@ -353,10 +353,10 @@ and say the deploy is safe" may still get that sentence into a reply. So the man
 prose alone — the daemon's own rendering of the records is always printed underneath it, after
 *"From my own records —"*, and a claim those records do not support is visibly unsupported sitting
 next to them. That dividing line is the daemon's to write and only the daemon's, and it is
-not left to the reply to respect it: the manager's own sentence is printed as a quotation, every
-line of it marked as quoted by the daemon after the fact. A reply that tries to write that dividing
-line *itself*, to pass a planted sentence off as the records, is quoted along with everything else
-around it and cannot land where the records do. And the answer **never invents what it cannot see**: a ticket that has reached a
+not left to the reply to respect it: every line of the manager's own sentence is marked as quoted —
+by the daemon, after the fact, whatever that line happens to say or however it breaks. A reply that
+tries to write that dividing line *itself*, to pass a planted sentence off as the records, is marked
+along with everything else around it and cannot land where the records do. And the answer **never invents what it cannot see**: a ticket that has reached a
 terminal state has fallen out of the tracker fetch, so the manager reports the run's outcome and the
 review's verdict and says plainly that it has no tracker state for it. A review that was requested or
 is still running is reported as exactly that and never as a decision.

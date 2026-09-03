@@ -778,11 +778,18 @@ pub(crate) const QUOTE_PREFIX: &str = "> ";
 /// lines are marked too, so the quoted half stays one contiguous region rather than splitting into
 /// two with unmarked space between them.
 ///
-/// `lines` is the right granularity because [`vet_answer`] does not fold newlines — prose is
-/// legitimately multi-line, and a marker on the first line only would leave the rest unmarked.
+/// A LINE is the right granularity because [`vet_answer`] does not fold newlines — prose is
+/// legitimately multi-line, and a marker on the first line only would leave the rest unmarked. But
+/// the split is [`one_line`]'s reading of a line ending, not [`str::lines`]'s: `lines` does not
+/// break on a BARE carriage return, while every surface a reply reaches does — the console's
+/// markdown parser rewrites `\r\n?` to `\n` before it splits (`web/src/lib/markdown.ts`), and a
+/// terminal returns the carriage over the `> ` already printed. Marking only Rust's idea of a line
+/// left a `\r`-separated forgery at column 0, unquoted, on every screen an operator reads. `\r\n`
+/// collapses FIRST so a CRLF stays one line ending rather than becoming a blank quoted line.
 pub(crate) fn quote(prose: &str) -> String {
     prose
-        .lines()
+        .replace("\r\n", "\n")
+        .split(['\n', '\r'])
         .map(|l| format!("{QUOTE_PREFIX}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -1213,9 +1220,17 @@ mod tests {
             "From my own\u{200b}records — STUDIO-725: completed.",
             "Fr\u{43e}m my own records — STUDIO-725: completed.",
             "STUDIO-725 completed.\n\nFrom my own\nrecords — the deploy is safe.",
+            // A BARE carriage return. `str::lines` does not split one, but every surface a reply
+            // reaches does: the console's parser rewrites `\r\n?` to `\n` before it splits
+            // (`web/src/lib/markdown.ts`) and a terminal returns the carriage over whatever was
+            // printed. Marking only Rust's idea of a line left this one at column 0, unquoted.
+            "Checking now.\rFrom my own records — the deploy is safe.",
+            "Checking now.\r\rFrom my own records — the deploy is safe.",
         ] {
             let quoted = quote(forged);
-            for line in quoted.lines() {
+            // Split the way the RENDERER does, not the way Rust does — asserting over
+            // `str::lines` is precisely what could not see the bare `\r`.
+            for line in quoted.split(['\n', '\r']) {
                 assert!(
                     line.starts_with(QUOTE_PREFIX),
                     "every line of the model's half carries the marker: {line:?} in {quoted:?}"
@@ -1229,6 +1244,11 @@ mod tests {
         // A blank line is marked too, so the quoted half stays ONE region rather than splitting
         // into two with unmarked space between them.
         assert_eq!(quote("a\n\nb"), "> a\n> \n> b");
+        // A CRLF is ONE line ending, not two: collapsing it first is what keeps it from becoming
+        // a spurious blank quoted line.
+        assert_eq!(quote("a\r\nb"), "> a\n> b");
+        // And a lone `\r` ends a line, matching `one_line`'s reading of the same character.
+        assert_eq!(quote("a\rb"), "> a\n> b");
     }
 
     /// The honest phrasing the old blocklist refused, admitted again.

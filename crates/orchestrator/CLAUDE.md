@@ -164,7 +164,12 @@ the `Orchestrator` struct itself. Concretely:
   `one_line` applies to a fence-closing backtick run: untrusted text never mints host structure).
   Do not replace that prefix with a check that REFUSES prose containing the lead — that shape was
   tried and is a blocklist, refusing the honest phrasing the prompt's own heading invites while
-  admitting a singular *record*, a dropped *From* or a homoglyph. And `Answerable::offered` refuses
+  admitting a singular *record*, a dropped *From* or a homoglyph. `quote` splits on `['\n', '\r']`
+  and not `str::lines` on purpose: a BARE `\r` is not a line break to Rust but is one on every
+  surface a reply reaches (`web/src/lib/markdown.ts` rewrites `\r\n?` to `\n` before splitting; a
+  terminal returns the carriage over the `> ` already printed), so `lines` left a `\r`-separated
+  forgery unquoted at column 0. Assert on renderer lines, never on `str::lines`, or the test cannot
+  see the hazard it is named for. And `Answerable::offered` refuses
   an `answer` about a key whose records the facts block never rendered — a SET of keys, not a bool,
   because `Facts::render` fills front-to-back and drops per key: on a multi-key post a prompt-wide
   "the block rendered" is true for every key it dropped, and so is `Facts::resolved`. It is fed by `teamsknow.rs`'s
