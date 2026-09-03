@@ -108,20 +108,40 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
  * Whether this ticket is waiting on the OPERATOR — the "Needs you" count the design record's §6
  * adds to the Now strip. Derived from the state the worklist already holds; no new endpoint.
  *
- * `review` qualifies because nothing else is moving it: `consoleJobStatus` lets a LIVE run outrank
- * the ticket, so a ticket an agent is reviewing right now reads `run`, and what is left under
- * `review` is work parked for a person to read and merge.
+ * It is a strict SUBSET of the pills rather than a re-tint of one, and the narrowing is the whole
+ * point. A row reads `review` for either of two reasons, and only one of them is a fact:
  *
- * `blocked` qualifies only when it is a FAILED run. The other thing that reads blocked is a held
- * dependent (`runs-model`'s synthetic `waiting` row), and that one is waiting on its predecessor
- * rather than on the operator. If that predecessor needs a human it is counted on its OWN row;
- * counting the dependent as well would bill one human decision twice.
+ *   - The TRACKER says the ticket is in a review state (`lifecycle === "in_review"`). That is a
+ *     ticket parked for a person: `consoleJobStatus` lets a live run outrank the ticket, so one an
+ *     agent is working right now reads `run` instead. Counted.
+ *   - Nothing said so, and `fromRunOutcome` mapped a `completed` run to `review`. That is an
+ *     INFERENCE, and an outcome never expires — the daemon answers no lifecycle for a ticket it
+ *     cannot resolve (a deleted issue, another team, a tracker round-trip that failed), so what
+ *     collects here is old finished work. NOT counted: measured against the live daemon's own
+ *     356-issue listing, 154 of the 177 rows reading "in review" are this, none of them newer than
+ *     305 hours, and counting them made "Needs you" a second rendering of the "in review" pill.
+ *
+ * `blocked` qualifies only when it is a FAILED run — a person has to decide what happens next. The
+ * other thing that reads blocked is a held dependent (`runs-model`'s synthetic `waiting` row), and
+ * that one is waiting on its predecessor rather than on the operator. If that predecessor needs a
+ * human it is counted on its OWN row; counting the dependent as well would bill one decision twice.
+ *
+ * WHAT WOULD MAKE IT SHARPER, flagged rather than guessed at (§9/§11). "Needs you" ought to mean
+ * "your merge is the next move", and the two facts that would say so are not served to this view:
+ * no endpoint carries a ticket's PR or its checks (the PR column renders "—" for the same reason),
+ * and no per-ticket record says whether a REVIEWER — human or agent — already has it. Until one
+ * does, the tracker's own confirmation is the strongest available answer, and it is a fact rather
+ * than a threshold guessed from a timestamp.
  *
  * Takes the run status as a plain string for the reason `fromRunOutcome` does: `JobRow.status` is
  * the wider `StatusKey`, and narrowing it with a cast would hide the case this has to survive.
  */
-export function needsOperator(status: ConsoleJobStatus, runStatus: string): boolean {
-  if (status === "review") return true;
+export function needsOperator(
+  status: ConsoleJobStatus,
+  runStatus: string,
+  lifecycle: IssueLifecycle | undefined,
+): boolean {
+  if (status === "review") return lifecycle === "in_review";
   return status === "blocked" && runStatus !== "waiting";
 }
 
@@ -307,7 +327,7 @@ export function buildConsoleJobs(
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
-      needsYou: needsOperator(status, job.status),
+      needsYou: needsOperator(status, job.status, ticket?.lifecycle),
     };
   });
 

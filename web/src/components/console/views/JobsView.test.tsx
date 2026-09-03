@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueRun, StateResponse } from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
+import { SPARK_KINDS } from "@/lib/console-trace-spark";
 
 // STUDIO-681 §10, sub-ticket 2 — the Jobs worklist's acceptance boxes 2.6, 2.7 and 2.8,
 // driven through the real view against the endpoints §9 has: /api/v1/state for the live
@@ -378,6 +379,9 @@ describe("the Needs you count (§6)", () => {
     h.fetchIssueRuns.mockResolvedValue({
       issues: [
         run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review" }),
+        // A finished run the tracker has no answer for. It reads "in review" off the outcome
+        // alone, which is an inference that never expires — so it is NOT the operator's to act on.
+        run({ issue_identifier: "STALE", outcome: "completed" }),
         run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done" }),
         run({ issue_identifier: "FAILED", outcome: "failed" }),
         run({ issue_identifier: "IDLE", outcome: "stopped" }),
@@ -396,7 +400,11 @@ describe("the Needs you count (§6)", () => {
     // REVIEW is parked for a reviewer and FAILED needs a decision. MERGED is finished, IDLE is
     // the daemon's to redispatch, and HELD waits on REVIEW rather than on the operator.
     await waitFor(() => expect(stat("needs you")).toBe("2"));
-    expect(stat("blocked")).toBe("2"); // HELD + FAILED — "needs you" is not a copy of a pill
+    // The stat is not a re-tint of its neighbours, and this pins it against BOTH of the pills it
+    // overlaps: two rows read "in review" and only one of them wants a human, two read "blocked"
+    // (HELD + FAILED) and only one of them does.
+    expect(stat("in review")).toBe("2");
+    expect(stat("blocked")).toBe("2");
   });
 });
 
@@ -443,6 +451,11 @@ describe("the row trace-sparkline (§6)", () => {
     return [...row(issue).querySelectorAll(".spark .gly")].map((el) => el.textContent ?? "");
   }
 
+  /** The glyphs of the kinds the run actually reached — the slots that are not empty. */
+  function lit(issue: string): string[] {
+    return [...row(issue).querySelectorAll(".spark .gly:not(.off)")].map((el) => el.textContent ?? "");
+  }
+
   // The acceptance criterion with teeth: a worklist of N rows must not cost N transcripts.
   it("fetches no transcript for a table nobody has pointed at", async () => {
     await mountJobs();
@@ -453,7 +466,13 @@ describe("the row trace-sparkline (§6)", () => {
     await mountJobs();
     fireEvent.mouseEnter(row("A-1"));
 
-    await waitFor(() => expect(glyphs("A-1")).toEqual([phaseGlyph("oriented"), phaseGlyph("implemented")]));
+    await waitFor(() =>
+      expect(lit("A-1")).toEqual([phaseGlyph("oriented"), phaseGlyph("implemented")]),
+    );
+    // Every kind keeps its column, whether the run reached it or not: that is what makes the cell
+    // a checklist a reader can compare with the row above rather than an invented chronology.
+    expect(glyphs("A-1")).toEqual(SPARK_KINDS.map(phaseGlyph));
+    expect(row("A-1").querySelectorAll(".spark .gly.off").length).toBe(4);
     // Only the row that was pointed at — its neighbour is still unread.
     expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(7);
     expect(glyphs("B-2")).toEqual([]);
@@ -463,10 +482,31 @@ describe("the row trace-sparkline (§6)", () => {
     await mountJobs();
     fireEvent.mouseEnter(row("A-1"));
     await waitFor(() =>
+      // The exact counts AND what the run never reached — the empty slots only imply the latter,
+      // and "it never tested" is worth saying out loud rather than leaving to be inferred.
       expect(row("A-1").querySelector(".spark")?.getAttribute("aria-label")).toBe(
-        "Oriented ×1 · Implemented ×1",
+        "Oriented ×1 · Implemented ×1 — none: Verified, Coordinated, Handed off, Worked",
       ),
     );
+  });
+
+  // The strip's label is asserted through the ROLE and the computed accessible NAME, not by reading
+  // the attribute back off the element. The row around it is a `<tr role="link" aria-label=…>`
+  // (§10 box 2.8), and a labelled ancestor is exactly the shape that can swallow a descendant's
+  // name — `link` is not one of the roles ARIA marks children-presentational, so the strip stays
+  // its own named node, and this query fails if that ever stops being true.
+  it("announces the strip as a named image of its own, inside the labelled row", async () => {
+    await mountJobs();
+    fireEvent.mouseEnter(row("A-1"));
+    await waitFor(() =>
+      expect(
+        within(row("A-1")).getByRole("img", {
+          name: "Oriented ×1 · Implemented ×1 — none: Verified, Coordinated, Handed off, Worked",
+        }),
+      ).toBeTruthy(),
+    );
+    // And the row keeps its own name — the two names coexist rather than one replacing the other.
+    expect(row("A-1").getAttribute("aria-label")).toBe("A-1 A-1 title");
   });
 
   it("does not fetch for a row the pointer merely crosses", async () => {
@@ -491,7 +531,9 @@ describe("the row trace-sparkline (§6)", () => {
   it("draws the strip for a row reached from the keyboard", async () => {
     await mountJobs();
     fireEvent.focus(row("B-2"));
-    await waitFor(() => expect(glyphs("B-2").length).toBe(2));
+    await waitFor(() =>
+      expect(lit("B-2")).toEqual([phaseGlyph("oriented"), phaseGlyph("implemented")]),
+    );
     expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(8);
   });
 
@@ -588,6 +630,15 @@ describe("the §6 additions are painted, not just classed", () => {
   it("styles the sparkline's glyph and its playhead", () => {
     expect(viewsCss).toMatch(/\.spark \.gly \{/);
     expect(viewsCss).toMatch(/\.spark \.gly\.now \{[^}]*color: var\(--operator\)/);
+  });
+
+  // A reserved slot with no rule of its own is indistinguishable from a kind the run DID reach,
+  // which would turn the checklist into a lie; a weight tier with no rule is invisible.
+  it("holds the empty slot and the weight tiers apart from a lit glyph", () => {
+    expect(viewsCss).toMatch(/\.spark \.gly\.off \{[^}]*border-style: dashed/);
+    for (const tier of ["light", "mid", "heavy"]) {
+      expect(viewsCss).toMatch(new RegExp(`\\.spark \\.gly\\.wt-${tier} \\{[^}]*color:`));
+    }
   });
 
   it("gives Needs you the operator's own colour", () => {

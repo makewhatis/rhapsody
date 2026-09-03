@@ -247,8 +247,8 @@ function JobsRow({
 // (`GET /api/v1/history/issues`) is a `RunSummary` plus a lifecycle, a tracker state and an
 // assignee — an outcome, a turn count and token totals, no phases. Drawing the whole table
 // eagerly therefore means one `GET /api/v1/runs/{id}/transcript` per row, and those are not small:
-// over the 400 most recent recorded runs the median transcript is 30KB and the largest 212KB, so a
-// 50-row page would pull ~1.5MB and re-parse 50 session logs on the daemon to fill a table cell.
+// over the 453 recorded runs the median transcript is 29KB and the largest 207KB, so a 50-row page
+// would pull ~1.5MB and re-parse 50 session logs on the daemon to fill a table cell.
 // The ticket's acceptance rules that out, so the fetch waits for the operator to point at ONE row
 // (see `SPARK_DWELL_MS`) and is cached under the same query key the run detail uses, which makes
 // opening the row afterwards free.
@@ -283,7 +283,19 @@ function TraceSpark({ runId, live, armed }: { runId: number; live: boolean; arme
   return (
     <span className="spark" role="img" aria-label={summary} title={summary}>
       {steps.map((step) => (
-        <span key={step.kind} className={cn("gly", step.kind === "live" && "now")} aria-hidden="true">
+        // `off` is the RESERVED slot of a kind this run never reached — drawn, not dropped, so the
+        // column keeps its meaning down the whole table. `wt-*` is how heavily the run leaned on
+        // the kind; the exact counts are in the accessible name above, so the tier only ever adds.
+        <span
+          key={step.kind}
+          className={cn(
+            "gly",
+            step.kind === "live" && "now",
+            !step.present && "off",
+            `wt-${step.weight}`,
+          )}
+          aria-hidden="true"
+        >
           {step.glyph}
         </span>
       ))}

@@ -201,12 +201,14 @@ describe("buildConsoleJobs", () => {
     // No answer => the old behaviour, unchanged.
     expect(status("UNKNOWN")).toBe("review");
     // Only REVIEW and the unresolved UNKNOWN count as awaiting a reviewer; MERGED no longer does.
+    // "Needs you" is narrower still (STUDIO-743): UNKNOWN reads "in review" off an outcome nobody
+    // confirmed, so it is not on the operator's list.
     expect(consoleJobCounts(rows)).toEqual({
       running: 0,
       review: 2,
       queued: 1,
       blocked: 0,
-      needsYou: 2,
+      needsYou: 1,
     });
   });
 
@@ -252,14 +254,16 @@ describe("buildConsoleJobs", () => {
       undefined,
       NOW,
     );
-    // needsYou (STUDIO-743) cuts across the four: B and C await a reviewer and E failed, while
-    // F is held on a dependency and is therefore waiting on its predecessor, not on the operator.
+    // needsYou (STUDIO-743) cuts across the four rather than partitioning with them, and is a
+    // strict subset: only E, the failed run, is on the operator's list. B and C read "in review"
+    // off their `completed` outcome alone — no issue rows were passed, so no tracker confirmed
+    // either — and F is held on a dependency, waiting on its predecessor rather than on a human.
     expect(consoleJobCounts(rows)).toEqual({
       running: 1,
       review: 2,
       queued: 1,
       blocked: 2,
-      needsYou: 3,
+      needsYou: 1,
     });
   });
 
@@ -428,25 +432,34 @@ describe("filterConsoleJobs", () => {
 // STUDIO-743 (design record §6) — the Now strip's fifth stat. "Needs you" is the operator's own
 // queue: the tickets whose next move is a HUMAN's, which is not the same set as any one pill.
 describe("needsOperator", () => {
-  it("counts a ticket parked in review — nobody is working it, a person must look", () => {
-    expect(needsOperator("review", "completed")).toBe(true);
+  it("counts a ticket the TRACKER says is parked in review", () => {
+    expect(needsOperator("review", "completed", "in_review")).toBe(true);
+  });
+
+  // THE POINT OF THE STAT. A row reads "in review" either because the tracker said so or because
+  // a `completed` outcome was mapped to it, and an outcome never expires — so the inferred half is
+  // an old finished run whose ticket the daemon simply could not resolve. Counting it would make
+  // "Needs you" a second rendering of the "in review" pill, which is what it was.
+  it("does NOT count an in-review row the tracker never confirmed", () => {
+    expect(needsOperator("review", "completed", undefined)).toBe(false);
   });
 
   it("counts a failed run — a person has to decide what happens next", () => {
-    expect(needsOperator("blocked", "failed")).toBe(true);
+    expect(needsOperator("blocked", "failed", undefined)).toBe(true);
+    expect(needsOperator("blocked", "failed", "open")).toBe(true);
   });
 
   // A held dependent is `blocked` too, but it is waiting on its PREDECESSOR, not on the operator —
   // and that predecessor is itself a row in this worklist, counted there. Counting the dependent
   // as well would bill the same human decision twice.
   it("does not count a ticket held on an uncleared dependency", () => {
-    expect(needsOperator("blocked", "waiting")).toBe(false);
+    expect(needsOperator("blocked", "waiting", undefined)).toBe(false);
   });
 
   it("counts nothing the daemon is still driving or has finished with", () => {
-    expect(needsOperator("run", "running")).toBe(false);
-    expect(needsOperator("queued", "stopped")).toBe(false);
-    expect(needsOperator("done", "completed")).toBe(false);
+    expect(needsOperator("run", "running", "in_review")).toBe(false);
+    expect(needsOperator("queued", "stopped", "open")).toBe(false);
+    expect(needsOperator("done", "completed", "done")).toBe(false);
   });
 });
 
@@ -456,6 +469,8 @@ describe("the Now strip's Needs you count", () => {
       [
         job({ issue: "LIVE", status: "running" }),
         job({ issue: "REVIEW", status: "completed" }),
+        // A finished run the tracker has no answer for — the commonest real "in review" row.
+        job({ issue: "STALE", status: "completed" }),
         job({ issue: "MERGED", status: "completed" }),
         job({ issue: "FAILED", status: "failed" }),
         job({ issue: "HELD", status: "waiting" }),
@@ -480,11 +495,28 @@ describe("the Now strip's Needs you count", () => {
   it("counts them alongside the four existing pills", () => {
     expect(consoleJobCounts(rows())).toEqual({
       running: 1,
-      review: 1,
+      review: 2,
       queued: 0,
       blocked: 2,
       needsYou: 2,
     });
+  });
+
+  // "Needs you" is not a re-tint of any pill, and this pins it from BOTH sides: STALE reads "in
+  // review" without needing anybody (its `completed` outcome was mapped there, the tracker never
+  // confirmed it), and FAILED needs somebody without reading "in review".
+  //
+  // Measured on the live daemon's own 356-issue listing, this is the ordinary case rather than a
+  // contrived one: 177 rows read "in review", of which 23 carry a tracker-confirmed `in_review`
+  // (2.4–255h old) and 154 are outcome-inferred (305–624h old, a project the tracker no longer
+  // answers for). The two populations do not even overlap in age.
+  it("is not a copy of the in-review pill, in either direction", () => {
+    const counts = consoleJobCounts(rows());
+    expect(counts.needsYou).toBeLessThan(counts.review + counts.blocked);
+    const byIssue = new Map(rows().map((r) => [r.issue, r]));
+    expect(byIssue.get("STALE")).toMatchObject({ status: "review", needsYou: false });
+    expect(byIssue.get("FAILED")).toMatchObject({ status: "blocked", needsYou: true });
+    expect(byIssue.get("REVIEW")).toMatchObject({ status: "review", needsYou: true });
   });
 });
 

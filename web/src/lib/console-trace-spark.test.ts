@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { LogEntry } from "@/lib/api";
 import { buildTrace } from "@/lib/trace-model";
 import { phaseGlyph } from "@/lib/console-trace-view";
-import { LIVE_GLYPH, SPARK_KINDS, sparkSummary, traceSpark } from "@/lib/console-trace-spark";
+import {
+  LIVE_GLYPH,
+  SPARK_KINDS,
+  sparkSummary,
+  sparkWeight,
+  traceSpark,
+} from "@/lib/console-trace-spark";
 
 // The Jobs worklist's trace sparkline (STUDIO-743, design record §6) — the glance-view half of
 // the vocabulary the run-detail spine speaks. Built over the SAME slice-1 phases the spine
@@ -26,10 +32,37 @@ const FULL: LogEntry[] = [
   entry({ seq: 10, kind: "tool_result", text: "moved to In Review" }),
 ];
 
+/**
+ * A run whose REAL chronology contradicts the strip's order: it runs the suite first, then reads,
+ * then edits — so first appearance is verified > oriented > implemented. Over the 453 recorded runs
+ * measured for STUDIO-743 the strip's fixed order disagrees with first appearance in 403 of them
+ * (89%), so this is the common case, not a curiosity. The strip is a CHECKLIST of kinds, not a
+ * timeline, and these tests pin that choice: reordering the slots by first appearance reds them.
+ */
+const OUT_OF_ORDER: LogEntry[] = [
+  entry({ seq: 1, kind: "tool_use", tool: "Bash", text: "command=cargo test --workspace" }),
+  entry({ seq: 2, kind: "tool_result", text: "test result: ok" }),
+  entry({ seq: 3, kind: "tool_use", tool: "Read", text: "file_path=/repo/src/lib/api.ts" }),
+  entry({ seq: 4, kind: "tool_result", text: "export interface RunSummary" }),
+  entry({ seq: 5, kind: "tool_use", tool: "Edit", text: "file_path=/repo/src/lib/api.ts" }),
+  entry({ seq: 6, kind: "tool_result", text: "applied" }),
+];
+
+/** The order the run's kinds actually first appeared in — the chronology a timeline would draw. */
+function firstAppearance(entries: LogEntry[]): string[] {
+  const seen: string[] = [];
+  for (const phase of buildTrace(entries).phases) {
+    if (!seen.includes(phase.kind)) seen.push(phase.kind);
+  }
+  return seen;
+}
+
 describe("traceSpark", () => {
-  it("shows one glyph per phase kind the run touched, in the spine's own order", () => {
+  it("reserves a slot for every phase kind, in the spine's own order", () => {
     const steps = traceSpark(buildTrace(FULL).phases, false);
-    expect(steps.map((s) => s.kind)).toEqual([
+    // Every kind, present or not — that is what makes column 3 mean "Verified" on EVERY row.
+    expect(steps.map((s) => s.kind)).toEqual([...SPARK_KINDS]);
+    expect(steps.filter((s) => s.present).map((s) => s.kind)).toEqual([
       "oriented",
       "implemented",
       "verified",
@@ -37,13 +70,32 @@ describe("traceSpark", () => {
       "handoff",
     ]);
     // The vocabulary is the spine's, not a second table that could drift from it.
-    expect(steps.map((s) => s.glyph)).toEqual([
-      phaseGlyph("oriented"),
-      phaseGlyph("implemented"),
-      phaseGlyph("verified"),
-      phaseGlyph("coordinated"),
-      phaseGlyph("handoff"),
+    expect(steps.map((s) => s.glyph)).toEqual(SPARK_KINDS.map(phaseGlyph));
+  });
+
+  it("is a checklist of kinds, NOT the run's chronology", () => {
+    // The fixture's real order is verified > oriented > implemented. The strip prints the model's
+    // declaration order regardless, because a left-to-right run of glyphs that MOVED per row would
+    // claim a timeline the cell is too small to draw honestly (a run has a median of 27 phases).
+    expect(firstAppearance(OUT_OF_ORDER)).toEqual(["verified", "oriented", "implemented"]);
+    const steps = traceSpark(buildTrace(OUT_OF_ORDER).phases, false);
+    expect(steps.filter((s) => s.present).map((s) => s.kind)).toEqual([
+      "oriented",
+      "implemented",
+      "verified",
     ]);
+  });
+
+  it("holds each kind in the SAME column whatever the run did", () => {
+    // The payoff of the fixed order, and the reason an absent kind keeps its slot rather than
+    // collapsing: a row is comparable with the row above it. Measured over the 453 recorded runs,
+    // collapsing the gaps put `handoff` in 4 different columns and `other` in 5.
+    const full = traceSpark(buildTrace(FULL).phases, false);
+    const sparse = traceSpark(buildTrace(OUT_OF_ORDER).phases, false);
+    const lonely = traceSpark(buildTrace(FULL.slice(0, 2)).phases, false);
+    for (const strip of [full, sparse, lonely]) {
+      expect(strip.map((s) => s.kind)).toEqual([...SPARK_KINDS]);
+    }
   });
 
   it("names each glyph with the phase's own title and how many of them there were", () => {
@@ -58,9 +110,38 @@ describe("traceSpark", () => {
     expect(oriented?.count).toBe(2);
   });
 
-  it("omits a kind the run never reached rather than showing an empty slot", () => {
-    const readOnly = FULL.slice(0, 2);
-    expect(traceSpark(buildTrace(readOnly).phases, false).map((s) => s.kind)).toEqual(["oriented"]);
+  it("marks a kind the run never reached as an empty slot, and never counts it", () => {
+    const steps = traceSpark(buildTrace(FULL.slice(0, 2)).phases, false);
+    expect(steps.filter((s) => s.present).map((s) => s.kind)).toEqual(["oriented"]);
+    for (const step of steps.filter((s) => !s.present)) {
+      expect(step.count).toBe(0);
+      expect(step.weight).toBe("none");
+      // The empty slot still SAYS what it stands for — that is what makes the column readable.
+      expect(step.label).not.toBe("");
+    }
+  });
+
+  it("carries how heavily the run leaned on each kind, so the cell says more than hover", () => {
+    // The visible cell is otherwise 41% one value (the modal strip covers 186 of the 453 recorded
+    // runs), with all the discriminating detail hidden in the tooltip. Tiering the count by the
+    // corpus quartiles (p25=1, median=4, p75=9) takes that from 26 distinct cells to 195, and the
+    // modal one from 41% of rows to 3.5%.
+    expect(sparkWeight(0)).toBe("none");
+    expect(sparkWeight(1)).toBe("light");
+    expect(sparkWeight(4)).toBe("mid");
+    expect(sparkWeight(5)).toBe("heavy");
+    // Interleaved, because the model groups CONSECUTIVE same-kind work into one phase — five reads
+    // in a row are one `oriented`, which is exactly the alternation real runs show.
+    const many = [...FULL];
+    for (let i = 0; i < 5; i += 1) {
+      many.push(entry({ seq: 20 + i * 2, kind: "tool_use", tool: "Read", text: "file_path=/a" }));
+      many.push(entry({ seq: 21 + i * 2, kind: "tool_use", tool: "Edit", text: "file_path=/a" }));
+    }
+    const steps = traceSpark(buildTrace(many).phases, false);
+    const oriented = steps.find((s) => s.kind === "oriented");
+    expect(oriented?.count).toBe(6);
+    expect(oriented?.weight).toBe("heavy");
+    expect(steps.find((s) => s.kind === "handoff")?.weight).toBe("light");
   });
 
   it("appends the playhead, last, while the run is still in flight", () => {
@@ -74,7 +155,8 @@ describe("traceSpark", () => {
     expect(traceSpark([], true).map((s) => s.kind)).toEqual(["live"]);
   });
 
-  it("is empty — never a fabricated shape — when there is no transcript", () => {
+  it("is empty — never six empty slots — when there is no transcript", () => {
+    // A run whose transcript nobody has read must not render as a run that DID nothing.
     expect(traceSpark([], false)).toEqual([]);
   });
 
@@ -103,7 +185,13 @@ describe("sparkSummary", () => {
   it("reads as a sentence a screen reader can announce", () => {
     const steps = traceSpark(buildTrace(FULL).phases, false);
     expect(sparkSummary(steps)).toBe(
-      "Oriented ×1 · Implemented ×1 · Verified ×1 · Coordinated ×1 · Handed off ×1",
+      "Oriented ×1 · Implemented ×1 · Verified ×1 · Coordinated ×1 · Handed off ×1 — none: Worked",
+    );
+  });
+
+  it("names the kinds the run never reached, which the empty slots only imply", () => {
+    expect(sparkSummary(traceSpark(buildTrace(FULL.slice(0, 2)).phases, false))).toBe(
+      "Oriented ×1 — none: Implemented, Verified, Coordinated, Handed off, Worked",
     );
   });
 
