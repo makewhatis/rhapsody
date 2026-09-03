@@ -219,7 +219,7 @@ describe("dismissNotice", () => {
   // A dismissal is irreversible from this console — `drop_review_watch` clears `open`, and both
   // controls then exclude the row — so the notice has to say what the operator can no longer undo.
   it("confirms the drop and says what re-introduces the pull request", () => {
-    const done = dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 2 });
+    const done = dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 2 }, false);
     expect(done.tone).toBe("info");
     expect(done.text).toContain("makewhatis/rhapsody#12");
     expect(done.text).toContain("2 rows");
@@ -227,8 +227,26 @@ describe("dismissNotice", () => {
   });
 
   it("does not claim a drop the daemon reports it did not make", () => {
-    const none = dismissNotice({ pr: "o/r#1", rows: 0 });
+    const none = dismissNotice({ pr: "o/r#1", rows: 0 }, false);
     expect(none.tone).toBe("warn");
     expect(none.text).toContain("Nothing changed");
+  });
+
+  /**
+   * Dismissing does NOT stop a review that is already running: the daemon deliberately leaves it to
+   * finish, so an agent stays checked out on that pull request's head and still posts its findings.
+   * The row reading `Dropped` a moment later is exactly the picture that makes an operator think
+   * they cancelled it. Say what actually happened, and where the stop control really is.
+   */
+  it("warns that a dismissal did not stop the review that was already running", () => {
+    const running = dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 1 }, true);
+    expect(running.tone).toBe("warn");
+    expect(running.text).toMatch(/still running/i);
+    expect(running.text).toMatch(/does not stop it|did not stop it/i);
+
+    // Nothing was running, so there is nothing to warn about.
+    expect(dismissNotice({ pr: "makewhatis/rhapsody#12", rows: 1 }, false).text).not.toMatch(
+      /still running/i,
+    );
   });
 });

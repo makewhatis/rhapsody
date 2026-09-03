@@ -194,6 +194,48 @@ describe("the Reviews surface", () => {
     expect(status.textContent).toContain("2 reviewers");
   });
 
+  /**
+   * A dismissal leaves a RUNNING review to finish — stopping a run is `/api/v1/runs/{id}/stop`'s
+   * job. So an agent is still checked out on that head under `bypassPermissions` and will still
+   * post its findings, while the row reads `Dropped`. Saying nothing is how an operator concludes
+   * they cancelled a review they did not.
+   */
+  it("says a dismissal did not stop the review that was already running", async () => {
+    h.postReviewDismiss.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 1 });
+    mount({ enabled: true, reviews: [job({ status: "in_flight" })] });
+
+    fireEvent.click(await screen.findByLabelText("Dismiss makewhatis/rhapsody#12 from the watch set"));
+    // The confirmation warns BEFORE the click, which is where it stops a misclick.
+    expect(
+      screen.getByRole("group", { name: "Dismiss makewhatis/rhapsody#12?" }).textContent,
+    ).toMatch(/still running/i);
+    fireEvent.click(screen.getByLabelText("Confirm dismissing makewhatis/rhapsody#12"));
+
+    const status = await screen.findByRole("status");
+    expect(status.textContent).toMatch(/still running/i);
+  });
+
+  /**
+   * The default `active` filter hides a row the moment it is dropped, so a dismissal used to be
+   * answered by the row simply vanishing. Showing the retired rows afterwards puts the `Dropped`
+   * pill in front of the operator, which is the evidence the click landed.
+   */
+  it("reveals the retired rows after a dismissal, so the dropped row is visible", async () => {
+    h.postReviewDismiss.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 1 });
+    mount({ enabled: true, reviews: [job()] });
+
+    fireEvent.click(await screen.findByLabelText("Dismiss makewhatis/rhapsody#12 from the watch set"));
+    // What the daemon will serve on the refetch the write invalidates: the row, now dropped.
+    h.fetchReviews.mockResolvedValue({
+      enabled: true,
+      reviews: [job({ status: "dropped", open: false })],
+    });
+    fireEvent.click(screen.getByLabelText("Confirm dismissing makewhatis/rhapsody#12"));
+
+    await screen.findByRole("status");
+    await waitFor(() => expect(screen.getByText("Dropped")).toBeTruthy());
+  });
+
   it("confirms a dismissal landed, and how many rows it dropped", async () => {
     h.postReviewDismiss.mockResolvedValue({ pr: "makewhatis/rhapsody#12", rows: 2 });
     mount({ enabled: true, reviews: [job()] });

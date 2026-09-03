@@ -42,14 +42,17 @@ export function useRerunReview() {
   });
 }
 
-// useDismissReview drops a pull request out of the watch set. Same refresh, for the same reason:
-// the row does not disappear (a retirement is a soft delete) — it re-renders as `dropped`, which is
-// the evidence the click landed.
+// useDismissReview drops a pull request out of the watch set. Same refresh, for the same reason —
+// but a dismissal is not merely a slower version of a re-run, so two things about it live in the
+// VIEW rather than here, and this comment is where they are recorded:
 //
-// "Re-renders as dropped" is the CONSOLE's rule, not necessarily the stored status: a review that
-// was in flight can complete after the drop and write its own terminal over `dropped`, since
-// `mark_review_completed` owns the status column and never touches `open`. `reviews-model`'s
-// `rowLook` reads `open` first for exactly that case.
+//   * A retirement is a soft delete, so the row survives the drop — but `isLive` excludes it and
+//     the surface's default `active` filter would hide it, which would answer the click by making
+//     the row vanish. `ReviewsView` switches to `all` on success so the `Dropped` pill is visible.
+//   * That pill is the CONSOLE's rule, not necessarily the stored status: a review that was in
+//     flight can complete after the drop and write its own terminal over `dropped`, since
+//     `mark_review_completed` owns the status column and never touches `open`. `reviews-model`'s
+//     `rowLook` reads `open` first for exactly that case.
 export function useDismissReview() {
   const qc = useQueryClient();
   return useMutation<ReviewActionResponse, Error, ReviewJob>({

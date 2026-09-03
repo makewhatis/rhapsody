@@ -200,16 +200,28 @@ export function rerunNotice(res: ReviewActionResponse): ReviewNotice {
   };
 }
 
-/** The outcome of a dismissal, including the part of it the operator cannot take back. */
-export function dismissNotice(res: ReviewActionResponse): ReviewNotice {
+/**
+ * The outcome of a dismissal, including the part of it the operator cannot take back.
+ *
+ * `liveReview` says whether a round of this pull request was `in_flight` when the operator clicked.
+ * A dismissal deliberately does NOT stop one — stopping a run is `POST /api/v1/runs/{id}/stop`'s
+ * job, and the drop cannot resurrect the row afterwards — so an agent stays checked out on that
+ * head and still posts its findings while the row reads `Dropped`. That combination is exactly what
+ * makes an operator believe they cancelled a review they did not, so it is said out loud.
+ */
+export function dismissNotice(res: ReviewActionResponse, liveReview: boolean): ReviewNotice {
   if (res.rows === 0) {
     return {
       tone: "warn",
       text: `Nothing changed — the daemon dropped no watch row of ${res.pr}.`,
     };
   }
-  return {
-    tone: "info",
-    text: `${res.pr} is out of the watch set — ${res.rows} ${res.rows === 1 ? "row" : "rows"} dropped. Only a new hand-off re-introduces it.`,
-  };
+  const dropped = `${res.pr} is out of the watch set — ${res.rows} ${res.rows === 1 ? "row" : "rows"} dropped. Only a new hand-off re-introduces it.`;
+  if (liveReview) {
+    return {
+      tone: "warn",
+      text: `${dropped} A review of it is still running: dismissing does not stop it, so it will finish and post its findings. Stop the run itself if that is what you meant.`,
+    };
+  }
+  return { tone: "info", text: dropped };
 }

@@ -101,12 +101,20 @@ export function ReviewsView({ onNavigate, pollMs }: ReviewsViewProps) {
   };
 
   const onDismiss = (job: ReviewJob) => {
+    // Read BEFORE the write: the row leaves the live watch set the moment the daemon answers, and
+    // whether a round was running is what decides whether the operator needs telling that it still
+    // is.
+    const running = job.status === "in_flight";
     dismiss.mutate(job, {
       // Disarmed on either outcome: the row is gone from the live list on success, and on a refusal
       // the operator should re-read the warning before clicking a destructive control again.
       onSuccess: (res) => {
         setConfirming(null);
-        setNotice({ role: "status", ...dismissNotice(res) });
+        // The default filter hides a dropped row, so a dismissal would otherwise be answered by the
+        // row simply vanishing. Show the retired ones: the `Dropped` pill is the evidence the click
+        // landed, and it is where the reviewed SHA the round did read stays legible.
+        setFilter("all");
+        setNotice({ role: "status", ...dismissNotice(res, running) });
       },
       onError: (e) => {
         setConfirming(null);
@@ -271,6 +279,12 @@ function ReviewsRow({
             <div className="rconfirm" role="group" aria-label={`Dismiss ${row.pr}?`}>
               <span className="rwhy">
                 Dismiss removes {row.pr} from review — only a new hand-off re-introduces it.
+                {/* A dismissal is about the WATCH SET, not the run. The round already checked out
+                    on this head keeps going, so promising otherwise here is how a misclick reads
+                    as a cancellation. */}
+                {row.job.status === "in_flight"
+                  ? " Its review is still running and will not be stopped."
+                  : ""}
               </span>
               <span className="racts">
                 <Button
