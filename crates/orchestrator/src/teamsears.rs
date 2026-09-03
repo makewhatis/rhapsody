@@ -1119,11 +1119,13 @@ struct Answerable<'a> {
 /// way the post gets a line: an answer is never silence.
 fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
     let facts = answerable.facts;
-    // **The two shares tile THIS answer's budget, and that budget is a share of the reply's.** The
-    // first cut of this slice sized both against the whole `MAX_MESSAGE_BODY_BYTES`, which is only
-    // this answer's budget when it is the reply's only line — see [`disposition_budget`].
-    let (records_cap, prose_cap) = split_budget(answerable.budget);
-    let grounded = facts.grounded(&target.key, records_cap);
+    // **The records get the WHOLE line budget on every path that answers from them alone.**
+    // Reserving room for prose that is not coming is the same mistake the reserve exists to fix,
+    // pointed the other way: it is budget the records never get to spend on a reply the prose was
+    // never going to reach. So this is the fallback everywhere below, re-rendered rather than
+    // reused, and it is what makes a refused answer carry MORE evidence than an accepted one — the
+    // right direction, since a refused answer is the one an operator has least reason to trust.
+    let alone = || facts.grounded(&target.key, answerable.budget);
     // **Nothing to compose from ⇒ nothing to compose.** Two different ways for that to be true, and
     // the gather alone tells only the first: a key this team's records said nothing about has no
     // second half to stand under the prose, and a key whose records the BUDGET dropped out of the
@@ -1132,8 +1134,13 @@ fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
     // key: on a multi-key post the other keys' records rendering says nothing about this one.
     // Either way the host's own line answers on its own.
     if !answerable.offered.contains(&target.key) || !facts.resolved(&target.key) {
-        return grounded;
+        return alone();
     }
+    // **The two shares tile THIS answer's budget, and that budget is a share of the reply's.** The
+    // first cut of this slice sized both against the whole `MAX_MESSAGE_BODY_BYTES`, which is only
+    // this answer's budget when it is the reply's only line — see [`disposition_budget`].
+    let (records_cap, prose_cap) = split_budget(answerable.budget);
+    let grounded = facts.grounded(&target.key, records_cap);
     let allowed = facts.allowed_for(&target.key);
     // **The records are reserved first and the prose gets the remainder** — §9.3's rule, one layer
     // below the facts block. The room renders only `MAX_MESSAGE_BODY_BYTES` of any message and cuts
@@ -1176,7 +1183,7 @@ fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
                      host's own records out of what the room renders; answering from the records \
                      alone"
                 );
-                grounded
+                alone()
             }
         }
         Err(why) => {
@@ -1186,7 +1193,7 @@ fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
                 "teams manager refused its own room turn's answer prose and answered from the \
                  host's rendering of the same records instead"
             );
-            grounded
+            alone()
         }
     }
 }
@@ -5627,5 +5634,77 @@ mod tests {
                 "the preamble states the enforced budget at pad {pad}"
             );
         }
+    }
+
+    /// **A reply the prose never reaches gives the records the WHOLE line budget.**
+    ///
+    /// The reserve exists so the prose cannot delete the evidence; reserving room for prose that is
+    /// not coming is the same mistake pointed the other way — budget the records never get to spend
+    /// on a reply the prose was never going to reach. A refused answer therefore carries MORE
+    /// evidence than an accepted one, which is the right direction: it is the answer an operator
+    /// has least reason to trust.
+    #[test]
+    fn a_records_only_answer_spends_the_whole_line_budget_on_records() {
+        use crate::teamsanswer::{Asked, split_budget};
+        use crate::teamsknow::{Outcome, RunFact, Runs};
+
+        let facts = Facts {
+            asked: vec![Asked {
+                asked: "STUDIO-725".into(),
+                outcome: Some(Outcome {
+                    key: "STUDIO-725".into(),
+                    runs: Runs {
+                        facts: (0..6)
+                            .map(|n| RunFact {
+                                key: "STUDIO-725".into(),
+                                outcome: format!("completed {}", "x".repeat(60 + n)),
+                                ended_at: "2026-09-01T12:00:00Z".into(),
+                                ..RunFact::default()
+                            })
+                            .collect(),
+                        ..Runs::default()
+                    },
+                    ..Outcome::default()
+                }),
+            }],
+            ..Facts::default()
+        };
+        let target = Target {
+            key: "STUDIO-725".into(),
+            intent: Intent::Answer,
+            assignee: None,
+            // Names a ticket this team's records never resolved, so the vet refuses it WHOLE and
+            // the records answer alone — the ordinary refusal path, not a contrived one.
+            answer: "STUDIO-9 is what actually happened here.".into(),
+        };
+        let refused = answer_for(
+            &target,
+            &Answerable {
+                facts: &facts,
+                offered: ["STUDIO-725".to_string()].into_iter().collect(),
+                budget: REPLY_CAP,
+            },
+        );
+        assert!(
+            refused.len() <= REPLY_CAP,
+            "still bounded by what a reader renders ({} bytes)",
+            refused.len()
+        );
+        assert!(
+            !refused.contains("STUDIO-9"),
+            "the refusal is whole: {refused}"
+        );
+        // Strictly more evidence than the records' SHARE of the same budget would have held.
+        assert!(
+            refused.len() > split_budget(REPLY_CAP).0,
+            "a records-only reply must not be capped at the share reserved for a reply that also \
+             carries prose ({} bytes against a share of {}): {refused}",
+            refused.len(),
+            split_budget(REPLY_CAP).0
+        );
+        assert!(
+            refused.contains(" records)"),
+            "and what it still could not fit is counted out loud: {refused}"
+        );
     }
 }
