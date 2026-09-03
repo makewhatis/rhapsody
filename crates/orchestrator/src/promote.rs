@@ -684,6 +684,12 @@ mod tests {
         ) -> Result<Option<rhapsody_store::ReviewWatchRow>, StoreError> {
             self.0.get_review_watch(key)
         }
+        fn find_review_watch(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<Option<rhapsody_store::ReviewWatchRow>, StoreError> {
+            self.0.find_review_watch(key)
+        }
         fn load_review_watch(&self) -> Result<Vec<rhapsody_store::ReviewWatchRow>, StoreError> {
             self.0.load_review_watch()
         }

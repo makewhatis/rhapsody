@@ -186,6 +186,14 @@ const REVIEW_WATCH_COLS: &str = "owner, repo, number, reviewer, author, introduc
 /// two of them can ever disagree about what "one row" means.
 const REVIEW_WATCH_KEY_WHERE: &str = "owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4";
 
+/// [`REVIEW_WATCH_KEY_WHERE`] with the three TEXT components compared case-insensitively, for
+/// [`Store::find_review_watch`] and for nothing else — see that method for why the collation is a
+/// property of the one READ rather than of the columns. The predicate cannot use the primary key's
+/// implicit index, which is why it is confined to a table whose row count is one per watched
+/// (pull request, reviewer).
+const REVIEW_WATCH_KEY_WHERE_NOCASE: &str = "owner = ?1 COLLATE NOCASE AND repo = ?2 COLLATE NOCASE \
+     AND number = ?3 AND reviewer = ?4 COLLATE NOCASE";
+
 /// The four key columns as positional params `?1..?4` for [`REVIEW_WATCH_KEY_WHERE`].
 fn review_watch_key_params(key: &ReviewWatchKey) -> [&dyn rusqlite::ToSql; 4] {
     [&key.owner, &key.repo, &key.number, &key.reviewer]
@@ -1129,6 +1137,26 @@ impl Store for Sqlite {
                WHERE {REVIEW_WATCH_KEY_WHERE}"
         ))?;
         // The composite PRIMARY KEY makes this at most one row; absent is Ok(None), not an error.
+        let mut rows = stmt.query_map(&review_watch_key_params(key)[..], map_review_watch)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn find_review_watch(
+        &self,
+        key: &ReviewWatchKey,
+    ) -> Result<Option<ReviewWatchRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {REVIEW_WATCH_COLS} FROM rhapsody_review_watch \
+               WHERE {REVIEW_WATCH_KEY_WHERE_NOCASE} \
+               ORDER BY owner, repo, reviewer LIMIT 1"
+        ))?;
+        // Unlike the exact read this can match more than one row, because the primary key's binary
+        // collation lets case-variant spellings of one coordinate coexist; the ORDER BY makes which
+        // one comes back a fact rather than an accident.
         let mut rows = stmt.query_map(&review_watch_key_params(key)[..], map_review_watch)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -3107,6 +3135,57 @@ mod tests {
         assert_eq!(set[1].requested_sha, "", "nothing was dispatched for #85");
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // STUDIO-730: the three TEXT key columns have no NOCASE collation, so `get_review_watch` is a
+    // byte comparison. That is right for the watcher, which only looks a row up with the spelling
+    // it wrote, and wrong for a reader handed a coordinate a PERSON typed — GitHub treats an owner
+    // and a repository case-insensitively, so `Acme/Rhapsody#84` is the same pull request.
+    // `find_review_watch` is that reader's lookup, and it must not become a second way to write.
+    #[test]
+    fn a_mis_cased_coordinate_finds_the_row_it_names() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let key = wkey("makewhat", "rhapsody", 84, "alice");
+        store
+            .save_review_watch(introduced(key.clone()))
+            .expect("introduce");
+
+        for typed in [
+            wkey("MakeWhat", "Rhapsody", 84, "alice"),
+            wkey("MAKEWHAT", "RHAPSODY", 84, "ALICE"),
+            wkey("makewhat", "rhapsody", 84, "Alice"),
+        ] {
+            // The exact read cannot see it — which is the bug this method exists for.
+            assert_eq!(
+                store.get_review_watch(&typed).expect("get"),
+                None,
+                "{typed:?} is not byte-identical, so the exact read must still miss"
+            );
+            let row = store
+                .find_review_watch(&typed)
+                .expect("find")
+                .expect("the case-insensitive read finds it");
+            assert_eq!(
+                row.key, key,
+                "and hands back the STORE's spelling, which is what every key derived from it \
+                 must use"
+            );
+        }
+
+        // The number is NOT case-folded into anything: a different pull request stays different,
+        // and so does a repository this coordinate does not name.
+        assert_eq!(
+            store
+                .find_review_watch(&wkey("makewhat", "rhapsody", 85, "alice"))
+                .expect("find"),
+            None
+        );
+        assert_eq!(
+            store
+                .find_review_watch(&wkey("other", "rhapsody", 84, "alice"))
+                .expect("find"),
+            None
+        );
     }
 
     // STUDIO-721: a reviewer run that burned its whole turn budget without finishing is recorded

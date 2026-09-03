@@ -145,6 +145,12 @@ impl Store for Noop {
     ) -> Result<Option<ReviewWatchRow>, StoreError> {
         Ok(None)
     }
+    fn find_review_watch(
+        &self,
+        _key: &ReviewWatchKey,
+    ) -> Result<Option<ReviewWatchRow>, StoreError> {
+        Ok(None)
+    }
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
         Ok(Vec::new())
     }

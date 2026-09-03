@@ -39,8 +39,12 @@
 //! Slice 1's four: the projected [`RunFact`] subset of a [`RunSummary`], recall [`Fact::content`],
 //! the cycle's [`Issue`] fields, and the [`RoomLog`]. Slice 2 adds exactly two more, both named by
 //! §9.5: the projected [`ReviewFact`] subset of a watch-set row, and a pull request's newest
-//! summoning [`Comment`] — the one source that leaves the daemon, and the one gated on the key
-//! naming a pull request at all. **No config struct is a fact source.** That is enforced by the
+//! summoning [`Comment`] — the one source that leaves the daemon, and therefore the one that needs
+//! a scope gate the store's `project` filter cannot supply: it is read only for a pull request
+//! this team's own watch set says one of its own reviewers is watching. §3.2 scopes the accessor
+//! to "the team's own entities — nothing external", and an ungated `gh` leg would spend the
+//! daemon's own credential on any repository an operator can name. See [`Knowledge::pr_comment`].
+//! **No config struct is a fact source.** That is enforced by the
 //! constructor rather than by a rule: nothing here accepts a
 //! [`Teams`](rhapsody_config::teams::Teams), a `Memory` or a tracker — the caller hands in a
 //! project-slug set, an identity set and an already-resolved bank map, none of which can carry an
@@ -291,10 +295,17 @@ pub const MAX_REVIEW_REVIEWERS: usize = 8;
 
 /// How far back the PR-comment gather asks GitHub to look, in days.
 ///
-/// The bound is server-side: [`SummonSource::summons_since`] passes it as the REST `since` filter,
-/// so a repository with years of comments costs the same as a quiet one. A month is well past the
-/// life of any review round this daemon runs, and a review older than that has a run row in the
-/// store anyway — the comment is the colour, never the only fact.
+/// It bounds the gather in TIME and only in time. [`SummonSource::summons_since`] passes it as the
+/// REST `since` filter, so a repository with years of comments costs no more than a quiet one — but
+/// the two endpoints it reads are the repository's whole `issues/comments` and `pulls/comments`
+/// streams, paged to the end and matched down to one pull request in this process. The breadth is
+/// therefore the repository's month, not the pull request's; a per-PR endpoint
+/// (`repos/{owner}/{repo}/issues/{number}/comments`) would make it proportional, and that belongs
+/// to [`SummonSource`], which the watcher shares. What keeps the cost off an arbitrary repository
+/// is not this constant but the scope gate on [`Knowledge::pr_comment`].
+///
+/// A month is well past the life of any review round this daemon runs, and a review older than that
+/// has a run row in the store anyway — the comment is the colour, never the only fact.
 pub const PR_COMMENT_LOOKBACK_DAYS: i64 = 30;
 
 /// The most bytes an operator-supplied identifier may be before it names nothing.
@@ -372,8 +383,10 @@ impl Key {
         &self.raw
     }
 
-    /// The pull request this key names, when it names one. The ONLY gate on the `gh` PR-comment
-    /// path (§9.5 slice 2: *"gh PR-comment path only when a PR key is present"*).
+    /// The pull request this key names, when it names one — the FIRST gate on the `gh` PR-comment
+    /// path (§9.5 slice 2: *"gh PR-comment path only when a PR key is present"*), and never the
+    /// only one: naming a pull request is not the same as it being this team's, so
+    /// [`Knowledge::pr_comment`] also requires the watch set to agree.
     pub fn pr(&self) -> Option<&PrRef> {
         self.pr.as_ref()
     }
@@ -461,7 +474,9 @@ pub struct Comment {
 /// [`Outcome::degradation`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
-    /// The canonical spelling every read below used.
+    /// The spelling this identifier RESOLVED under: the store's own, when a run row matched, and
+    /// otherwise [`Key::canonical`] — which is then a spelling nothing has confirmed, exactly as it
+    /// was when the gather began.
     pub key: String,
     /// The live cycle ticket, when this team's own trackers returned one.
     pub issue: Option<IssueFact>,
@@ -490,6 +505,14 @@ impl Outcome {
     /// NOT a degradation, it is the true and useful answer *"I know that ticket and it has never
     /// been dispatched"*. The degradation is for a key that reached no source — which, for a key
     /// belonging to another team, is exactly what [`TeamScope`] guarantees it reaches.
+    ///
+    /// "Reached no source" is a claim about the whole gather, so a source that was reached and
+    /// FAILED must not read as one that was never asked. It cannot here, and the reason is
+    /// structural rather than a check: the only leg that can fail without returning an error is the
+    /// `gh` one, and [`Knowledge::pr_comment`] does not take it unless `reviews` is already
+    /// non-empty — so [`Outcome::comment_unavailable`] implies `!reviews.is_empty()` implies this
+    /// method has already returned `None`. Store and bank failures are never silent: they are
+    /// [`KnowledgeError`], and an [`Outcome`] with one of them in it does not exist.
     pub fn degradation(&self) -> Option<&'static str> {
         let empty = self.issue.is_none()
             && self.runs.facts.is_empty()
@@ -603,6 +626,28 @@ impl TeamScope {
     /// Whether `identity` is on this team's roster.
     pub fn admits_identity(&self, identity: &str) -> bool {
         self.identities.contains(identity)
+    }
+
+    /// The ROSTER's spelling of `identity`, resolved case-insensitively, or `None` when this team
+    /// has no such teammate.
+    ///
+    /// The counterpart of [`Knowledge::key`] for the other half of a review key. A reviewer reaches
+    /// this accessor from two places whose case nobody controls — an operator typing
+    /// `pr:acme/rhapsody#12@Alice`, and a watch row written before the roster's spelling settled —
+    /// and both then have to match a `BTreeSet` lookup, a `rhapsody_review_watch.reviewer` column
+    /// with no `NOCASE` collation, and a run's own `issue_identifier`. Three exact comparisons in a
+    /// row is three chances to answer "no record" about a teammate who is on the roster, so the
+    /// spelling is resolved ONCE here and the roster's own is what every one of them is given.
+    ///
+    /// The roster is the authority precisely because it is the only one of the three that is
+    /// configuration rather than data: [`TeamScope::admits_identity`] is what the scope guard is
+    /// written against, so an identity admitted under any other spelling would be admitted under a
+    /// name the guard never saw.
+    pub fn identity(&self, identity: &str) -> Option<&str> {
+        self.identities
+            .iter()
+            .find(|i| i.eq_ignore_ascii_case(identity))
+            .map(String::as_str)
     }
 
     /// Whether `identity`'s bank may be read: it must be on the roster, must resolve to a bank at
@@ -891,8 +936,10 @@ impl<'a> Knowledge<'a> {
     /// The gather is bounded on every axis §9.3 names: [`MAX_OUTCOME_RUNS`] history rows through
     /// [`Knowledge::scan`]'s own [`MAX_SCAN_ROWS`] ceiling, [`MAX_REVIEW_REVIEWERS`] watch-set
     /// lookups, [`MAX_PR_COMMENT_BYTES`] of comment body over a [`PR_COMMENT_LOOKBACK_DAYS`]
-    /// window — and the `gh` path is not merely bounded but GATED: no pull request in the key, no
-    /// process spawned.
+    /// window — and the `gh` path is not merely bounded but GATED twice: no pull request in the
+    /// key, no process spawned; no in-roster watch row for that pull request, no process spawned
+    /// either. The second gate is the team scope for the one leg [`TeamScope`] cannot reach, and
+    /// it is why *every* leg of this gather is scoped and not merely most of them.
     ///
     /// **Not for the control task.** The `gh` leg goes through
     /// [`SummonSource`](crate::ghsummons::SummonSource), whose production implementation shells out
@@ -910,9 +957,17 @@ impl<'a> Knowledge<'a> {
         let issue = self.issue_of(&key);
         let runs = self.runs_of(&key, MAX_OUTCOME_RUNS)?;
         let (reviews, reviewers_capped) = self.reviews_of(&key, &runs)?;
-        let (comment, comment_unavailable) = self.pr_comment(&key).await;
+        let (comment, comment_unavailable) = self.pr_comment(&key, &reviews).await;
         Ok(Outcome {
-            key: key.canonical,
+            // The spelling that MATCHED, not the fold that went looking. `runs_of` may resolve on
+            // either probe, and echoing the canonical one after the raw one hit would put an
+            // identifier no source holds into the facts block — the one place the design says never
+            // to fabricate. With nothing matched there is nothing to echo but the fold.
+            key: runs
+                .facts
+                .first()
+                .map(|r| r.key.clone())
+                .unwrap_or(key.canonical),
             issue,
             runs,
             reviews,
@@ -1003,15 +1058,21 @@ impl<'a> Knowledge<'a> {
                 );
             }
             (roster, capped)
-        } else if self.scope.admits_identity(&pr.reviewer) {
-            (vec![pr.reviewer.clone()], false)
+        } else if let Some(known) = self.scope.identity(&pr.reviewer) {
+            // The ROSTER's spelling, not the operator's: it is what the scope guard admitted and
+            // what the watch-set and run lookups below are given. See [`TeamScope::identity`].
+            (vec![known.to_string()], false)
         } else {
             (Vec::new(), false)
         };
 
         let mut out = Vec::new();
         for reviewer in reviewers {
-            let row = self.store.get_review_watch(&ReviewWatchKey {
+            // A case-insensitive coordinate read, because the operator typed the owner and the
+            // repository and this table stores them case-SENSITIVELY: `Acme/Rhapsody#12` names the
+            // same pull request as `acme/rhapsody#12` to GitHub and to the person asking, and an
+            // exact read would answer "no record" about a pull request the team is reviewing.
+            let row = self.store.find_review_watch(&ReviewWatchKey {
                 owner: pr.owner.clone(),
                 repo: pr.repo.clone(),
                 number: pr.number,
@@ -1026,8 +1087,23 @@ impl<'a> Knowledge<'a> {
             // A review KEY is already its own run's identifier, so the gather that produced
             // `gathered` has read exactly these rows — reading them again would be a second
             // bounded scan for an answer already in hand.
-            let run_key = review_key(&pr.owner, &pr.repo, pr.number, &reviewer);
+            //
+            // Built from the STORE's spelling of the coordinate, never the operator's. The run and
+            // the watch row are minted from the same `ReviewRun` fields
+            // ([`ReviewRun::key`](crate::review::ReviewRun) and its `watch_key`), so the row that
+            // just came back names the exact bytes `runs.issue_identifier` holds — and that column
+            // is a case-SENSITIVE `=` too, which is the third and last exact match between a typed
+            // coordinate and this answer.
+            let run_key = review_key(
+                &row.key.owner,
+                &row.key.repo,
+                row.key.number,
+                &row.key.reviewer,
+            );
             let newest: Option<RunFact> = if run_key == key.canonical {
+                // Byte-identical to what `runs_of` already probed, so its rows ARE this lookup.
+                // Only an exact match may take the shortcut: a coordinate whose case the store
+                // corrected was probed under the operator's spelling and found nothing.
                 gathered.facts.first().cloned()
             } else {
                 self.runs_of(&self.key(&run_key), 1)?
@@ -1037,11 +1113,14 @@ impl<'a> Knowledge<'a> {
             };
             out.push(ReviewFact {
                 reviewer,
-                author: if self.scope.admits_identity(&row.author) {
-                    row.author.clone()
-                } else {
-                    String::new()
-                },
+                // The roster's spelling for the same reason the reviewer's is the roster's, and
+                // empty when this team has no such teammate — a row's author is a store string,
+                // and §0.11.1 leaves a name this team does not own out of the answer entirely.
+                author: self
+                    .scope
+                    .identity(&row.author)
+                    .unwrap_or_default()
+                    .to_string(),
                 status: row.status.clone(),
                 open: row.open,
                 outcome: newest
@@ -1055,20 +1134,49 @@ impl<'a> Knowledge<'a> {
     }
 
     /// The newest summoning comment on the pull request this key named — the ONLY leg of the
-    /// gather that leaves the daemon, and the only one gated on a pull request being named at all.
+    /// gather that leaves the daemon, and therefore the one with a scope gate of its own.
     ///
-    /// Two conditions, both necessary: the key carries a [`PrRef`], and a source has been wired
-    /// with [`Knowledge::with_pr_comments`]. A ticket key never spawns `gh`, which is what §9.5's
-    /// slice 2 asks for and what `the_pr_comment_path_is_not_invoked_without_a_pr_key` pins.
+    /// Three conditions, all necessary: the key carries a [`PrRef`], a source has been wired with
+    /// [`Knowledge::with_pr_comments`], and `reviews` is NON-EMPTY.
+    ///
+    /// The third is the team scope (§3.2, *"scoped to the team's own entities — nothing
+    /// external"*). Every other leg reads the daemon's own store through [`TeamScope`]; this one
+    /// spends the daemon's OWN GitHub credential on a repository named in operator text, so
+    /// "bounded" is not enough — an ungated leg answers
+    /// `some-other-org/private-infra#12` by reading a private repository the team has nothing to do
+    /// with and returning it as a positive answer, which slice 3 then renders into an
+    /// unauthenticated shared room. That is a confused-deputy read primitive, not a long answer.
+    ///
+    /// `reviews` is the gate because it is already the roster-scoped resolution of this exact
+    /// coordinate: [`Knowledge::reviews_of`] has just asked the watch set which of THIS team's
+    /// reviewers are watching this pull request, and a pull request with no in-roster watch row is
+    /// not this team's pull request. The watch set is also the one place a PR coordinate is
+    /// trusted from — it is written from a handoff's own resolved repository or by an operator
+    /// through the authenticated console, never from room text
+    /// ([`ReviewWatchRow::introduced_by`](rhapsody_store::ReviewWatchRow), design §14.1 F-SEC) —
+    /// so gating on it keeps the untrusted half of the key from selecting the request.
     ///
     /// A failed fetch is not an error the caller has to handle: the rest of the answer is still
     /// true, and refusing to answer at all because GitHub was unreachable would be the silence §3.4
     /// exists to end. It is REPORTED instead, as [`Outcome::comment_unavailable`], so a short
-    /// answer is never mistaken for a complete one.
-    async fn pr_comment(&self, key: &Key) -> (Option<Comment>, bool) {
+    /// answer is never mistaken for a complete one. Note what the gate does to that flag: nothing
+    /// is attempted without a watch row, so `comment_unavailable` now IMPLIES a non-empty
+    /// `reviews`, and [`Outcome::degradation`] can never claim "no record" about a key whose only
+    /// reached source failed.
+    async fn pr_comment(&self, key: &Key, reviews: &[ReviewFact]) -> (Option<Comment>, bool) {
         let (Some(pr), Some(src)) = (key.pr(), self.pr_comments) else {
             return (None, false);
         };
+        if reviews.is_empty() {
+            tracing::debug!(
+                owner = %pr.owner,
+                repo = %pr.repo,
+                number = pr.number,
+                "teams knowledge left a pull request's comments unread: no reviewer on this \
+                 team's roster is watching it, so it is not this team's pull request"
+            );
+            return (None, false);
+        }
         let since = Utc::now() - Duration::days(PR_COMMENT_LOOKBACK_DAYS);
         match src.summons_since(&pr.owner, &pr.repo, since).await {
             Ok(by_pr) => (by_pr.get(&pr.number).map(project_comment), false),
@@ -2839,16 +2947,23 @@ mod tests {
         );
         // Folded to SMK-9, which the store does not hold — the raw probe is what finds it.
         assert_eq!(k.key("smk-9").canonical(), "SMK-9");
+        let got = k.outcome("smk-9").await.expect("outcome");
         assert_eq!(
-            k.outcome("smk-9")
-                .await
-                .expect("outcome")
-                .runs
-                .facts
-                .first()
-                .map(|r| r.outcome.as_str()),
+            got.runs.facts.first().map(|r| r.outcome.as_str()),
             Some("failed")
         );
+        // …and the answer reports the spelling that MATCHED, not the fold that went looking for
+        // it. Echoing "SMK-9" here would put an identifier no source holds into the facts block,
+        // which is the one thing the design says an answer may never invent.
+        assert_eq!(
+            got.key, "smk-9",
+            "the answer's key is the store's spelling once the store has spelled it"
+        );
+        // With nothing matched there is nothing to echo but the fold, and the degradation says so
+        // rather than the key implying a record exists.
+        let unknown = k.outcome("smk-404").await.expect("outcome");
+        assert_eq!(unknown.key, "SMK-404");
+        assert_eq!(unknown.degradation(), Some(NO_RECORD));
     }
 
     /// **The `gh` gate (§9.5 slice 2).** A question naming no pull request must not spawn a
@@ -2858,6 +2973,7 @@ mod tests {
     async fn the_pr_comment_path_is_not_invoked_without_a_pr_key() {
         let st = store();
         seed_ok(&st, "AAA-1", "alpha", "2026-09-01T10:00:00Z", "completed");
+        seed_watch(&st, 12, "alice", "bob", REVIEW_STATUS_APPROVED);
         let scope = scope_of(&["alpha"], &["alice"]);
         let none = NoneBackend;
         let issues = vec![issue_with("AAA-1", "In Review", &[])];
@@ -2875,7 +2991,7 @@ mod tests {
             gh.calls()
         );
 
-        // …and the same accessor DOES take the leg once a key names one.
+        // …and the same accessor DOES take the leg for a pull request this team is watching.
         let got = k.outcome("acme/rhapsody#12").await.expect("outcome");
         assert_eq!(
             got.comment.map(|c| c.body),
@@ -2889,6 +3005,134 @@ mod tests {
             window >= Duration::days(PR_COMMENT_LOOKBACK_DAYS)
                 && window <= Duration::days(PR_COMMENT_LOOKBACK_DAYS + 1),
             "the gh lookback is bounded to {PR_COMMENT_LOOKBACK_DAYS} days, got {window}"
+        );
+    }
+
+    /// **The `gh` leg is team-scoped, not merely bounded (§3.2).** It is the one read that leaves
+    /// the daemon, and it spends the daemon's OWN credential on a repository named in operator
+    /// text — so a coordinate this team is not watching must not reach GitHub at all.
+    ///
+    /// Ungated, the accessor answers `some-other-org/private-infra#12` by reading a private
+    /// repository the team has nothing to do with and returning it as a POSITIVE answer, which
+    /// slice 3 renders into an unauthenticated shared room: a confused-deputy read primitive out of
+    /// any token-mentioning comment the daemon's token can see. The watch set is the gate because
+    /// it is the one place a PR coordinate is trusted from.
+    #[tokio::test]
+    async fn the_pr_comment_path_is_not_invoked_for_a_pull_request_off_the_team() {
+        let st = store();
+        // The team watches exactly one pull request, and it is not the one being asked about.
+        seed_watch(&st, 12, "alice", "bob", REVIEW_STATUS_APPROVED);
+        let scope = scope_of(&["alpha"], &["alice"]);
+        let none = NoneBackend;
+        let issues: Vec<Issue> = Vec::new();
+        let gh = RecordingSummons::with_body("@symphony ship it");
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none).with_pr_comments(&gh);
+
+        for off in [
+            // Another organisation's private repository, named in operator text.
+            "https://github.com/some-other-org/private-infra/pull/12",
+            "some-other-org/private-infra#12",
+            // The team's OWN repository, but a pull request nobody on the roster watches.
+            "acme/rhapsody#99",
+            // The right pull request, but the reviewer named is not on this roster.
+            "pr:acme/rhapsody#12@mallory",
+        ] {
+            let got = k.outcome(off).await.expect("outcome");
+            assert!(
+                got.reviews.is_empty(),
+                "{off} resolves no in-roster watcher"
+            );
+            assert!(got.comment.is_none(), "{off} must carry no comment");
+            assert!(
+                !got.comment_unavailable,
+                "{off} attempted nothing, so there is no gap to report"
+            );
+            assert_eq!(
+                got.degradation(),
+                Some(NO_RECORD),
+                "{off} reached no source at all"
+            );
+        }
+        assert!(
+            gh.calls().is_empty(),
+            "no in-roster watch row, so the daemon's credential must never have left: {:?}",
+            gh.calls()
+        );
+
+        // The gate is the WATCH ROW, not the repository name: the same accessor reads the one
+        // pull request the roster is watching.
+        let watched = k.outcome("acme/rhapsody#12").await.expect("outcome");
+        assert_eq!(
+            watched.comment.map(|c| c.body),
+            Some("@symphony ship it".into())
+        );
+        assert_eq!(gh.calls().len(), 1);
+    }
+
+    /// **A mis-cased pull-request coordinate resolves (STUDIO-729's bug, on this slice's path).**
+    ///
+    /// Three case-sensitive exact matches stand between what an operator types and this answer:
+    /// `rhapsody_review_watch.owner`/`.repo`/`.reviewer` are TEXT with no `NOCASE`, the roster is a
+    /// `BTreeSet`, and the review run's own `issue_identifier = ?` is a byte comparison. Miss any
+    /// of them and the daemon says "no record" about a pull request the team is ACTIVELY
+    /// reviewing — the confident wrongness this design exists to stop.
+    #[tokio::test]
+    async fn a_mis_cased_pull_request_key_resolves_and_still_respects_the_scope() {
+        let st = store();
+        seed_watch(&st, 12, "alice", "bob", REVIEW_STATUS_REVIEWED);
+        seed_ok(
+            &st,
+            "pr:acme/rhapsody#12@alice",
+            "alpha",
+            "2026-09-01T10:00:00Z",
+            "completed",
+        );
+        let scope = scope_of(&["alpha"], &["alice", "bob"]);
+        let none = NoneBackend;
+        let issues: Vec<Issue> = Vec::new();
+        let gh = RecordingSummons::with_body("@symphony requested changes");
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none).with_pr_comments(&gh);
+
+        let expected = ReviewFact {
+            reviewer: "alice".into(),
+            author: "bob".into(),
+            status: REVIEW_STATUS_REVIEWED.into(),
+            open: true,
+            // The review RUN resolved too, which is the third exact match: it is only reachable
+            // through the store's own spelling of the coordinate, never the operator's.
+            outcome: "completed".into(),
+            ended_at: "2026-09-01T12:00:00Z".into(),
+        };
+        for typed in [
+            "Acme/Rhapsody#12",
+            "ACME/RHAPSODY#12",
+            "pr:Acme/Rhapsody#12@Alice",
+            "https://github.com/Acme/Rhapsody/pull/12",
+        ] {
+            let got = k.outcome(typed).await.expect("outcome");
+            assert_eq!(
+                got.reviews,
+                vec![expected.clone()],
+                "{typed} names the pull request the team is reviewing"
+            );
+            assert_eq!(got.degradation(), None, "{typed} is not a no-record");
+            assert!(
+                got.comment.is_some(),
+                "{typed} is in scope, so the comment leg runs"
+            );
+        }
+
+        // …and the case fold is not a way around the scope: a repository this team does not watch
+        // stays unreachable however it is spelled.
+        for off in ["Other/Repo#12", "OTHER/REPO#12"] {
+            let got = k.outcome(off).await.expect("outcome");
+            assert_eq!(got.degradation(), Some(NO_RECORD), "{off} is off the team");
+        }
+        assert_eq!(
+            gh.calls().len(),
+            4,
+            "one call per in-scope spelling and none for an off-team one: {:?}",
+            gh.calls()
         );
     }
 
@@ -2997,6 +3241,9 @@ mod tests {
     #[tokio::test]
     async fn a_multi_byte_comment_body_is_clipped_without_panicking() {
         let st = store();
+        // The comment leg is team-scoped, so it needs a pull request the roster is watching before
+        // there is a body to clip at all.
+        seed_watch(&st, 12, "alice", "bob", REVIEW_STATUS_APPROVED);
         let scope = scope_of(&["alpha"], &["alice"]);
         let none = NoneBackend;
         let issues: Vec<Issue> = Vec::new();
@@ -3035,6 +3282,51 @@ mod tests {
             1,
             "and the rest of the answer still arrived"
         );
+        assert_eq!(
+            got.degradation(),
+            None,
+            "a reached-and-failed source is not an absence of records"
+        );
+    }
+
+    /// **`degradation()` never claims "no record" about a source that was reached and FAILED.**
+    ///
+    /// The invariant is structural rather than a check, and this pins the shape of it: the only
+    /// leg that fails without returning an error is `gh`, and it is not taken unless the watch set
+    /// has already produced an in-roster row — so `comment_unavailable` implies a non-empty
+    /// `reviews` implies [`Outcome::degradation`] is already `None`.
+    ///
+    /// With an EMPTY store the failing source is therefore never asked, and [`NO_RECORD`] is then
+    /// the true answer rather than a flat assertion of absence in the one case the daemon
+    /// demonstrably does not know.
+    #[tokio::test]
+    async fn a_flat_no_record_is_never_returned_over_a_source_that_failed() {
+        let st = store();
+        let scope = scope_of(&["alpha"], &["alice"]);
+        let none = NoneBackend;
+        let issues: Vec<Issue> = Vec::new();
+        let gh = RecordingSummons::failing();
+        let k = Knowledge::new(&scope, &issues, st.as_ref(), &none).with_pr_comments(&gh);
+
+        let got = k.outcome("acme/rhapsody#12").await.expect("outcome");
+        assert!(
+            !got.comment_unavailable,
+            "nothing was attempted, so there is no gap to report"
+        );
+        assert!(
+            gh.calls().is_empty(),
+            "and the failing source was not asked"
+        );
+        assert_eq!(got.degradation(), Some(NO_RECORD));
+
+        // The two are mutually exclusive by construction, over every key this test can reach.
+        for probe in ["acme/rhapsody#12", "AAA-1", "pr:acme/rhapsody#12@alice", ""] {
+            let got = k.outcome(probe).await.expect("outcome");
+            assert!(
+                !(got.comment_unavailable && got.degradation().is_some()),
+                "{probe} claimed no-record while a source it reached had failed"
+            );
+        }
     }
 
     /// A ticket the cycle knows but the store has never run is NOT a degradation — it is the true
