@@ -121,7 +121,7 @@ export function reviewRow(job: ReviewJob): ReviewRow {
 export function reviewRows(jobs: readonly ReviewJob[], filter: ReviewFilter): ReviewRow[] {
   const rows = jobs.map(reviewRow);
   const visible = filter === "all" ? rows : rows.filter((r) => r.live);
-  return visible.slice().sort((a, b) => Number(b.live) - Number(a.live));
+  return visible.sort((a, b) => Number(b.live) - Number(a.live));
 }
 
 /** How many rows the "Show retired" toggle would reveal — 0 retires the toggle. */

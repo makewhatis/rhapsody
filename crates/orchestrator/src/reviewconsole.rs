@@ -346,20 +346,22 @@ impl ControlHandle {
     /// The operator's **re-run** (`POST /api/v1/reviews/rerun`) — §15-e's trusted lever, delivered
     /// as an in-process control Event rather than a room post (§14.1 F-SEC).
     pub async fn rerun_review(&self, pr: PrCoord) -> ReviewControlOutcome {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.review_control(Event::ReviewRerun { pr, reply: tx }, rx)
+        self.review_control(|reply| Event::ReviewRerun { pr, reply })
             .await
     }
 
     /// The operator's **dismiss** (`POST /api/v1/reviews/dismiss`), the same path for the same
     /// reason.
     pub async fn dismiss_review(&self, pr: PrCoord) -> ReviewControlOutcome {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.review_control(Event::ReviewDismiss { pr, reply: tx }, rx)
+        self.review_control(|reply| Event::ReviewDismiss { pr, reply })
             .await
     }
 
     /// Sends one console control and waits for the control task's verdict.
+    ///
+    /// It owns the reply channel and hands the caller only the SENDER, so an event can never be
+    /// sent paired with somebody else's receiver — a pairing this would otherwise have to take on
+    /// trust from two call sites, and one that fails as a hang rather than as an error.
     ///
     /// The wait is bounded by the daemon lifetime rather than a timer, as
     /// [`ControlHandle::introduce_review`]'s is: a busy tick should delay an operator's click, not
@@ -368,9 +370,10 @@ impl ControlHandle {
     /// subsystem off" are different facts, and only the second reads as working as configured.
     async fn review_control(
         &self,
-        ev: Event,
-        rx: tokio::sync::oneshot::Receiver<ReviewControlOutcome>,
+        ev: impl FnOnce(tokio::sync::oneshot::Sender<ReviewControlOutcome>) -> Event,
     ) -> ReviewControlOutcome {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ev = ev(tx);
         const GONE: ReviewControlOutcome =
             ReviewControlOutcome::Refused("the control task is gone");
         if self.events.send(ev).is_err() {
