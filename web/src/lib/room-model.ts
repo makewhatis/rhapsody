@@ -1,4 +1,5 @@
 import type { TeamsRoomMessage } from "@/lib/api";
+import { fenceSpans } from "@/lib/markdown";
 
 // room-model — the pure logic behind the Teams console's room (STUDIO-681 §5, built by
 // STUDIO-684): what kind of event a post is, which teammates it concerns, how a day of them
@@ -366,8 +367,24 @@ export function truncateBody(body: string, at: number = BODY_TRUNCATE_AT): { hea
   if (text.length <= at) return { head: text, rest: "" };
   // Break on the last space before the limit so the visible half never ends mid-word.
   const space = text.lastIndexOf(" ", at);
-  const cut = space > at / 2 ? space : at;
+  const cut = fenceSafeCut(text, space > at / 2 ? space : at);
   return { head: text.slice(0, cut), rest: text.slice(cut).trim() };
+}
+
+/**
+ * The same cut, moved clear of any fenced code block (STUDIO-739).
+ *
+ * Both halves are rendered as markdown INDEPENDENTLY, so a cut inside a fence leaves the tail
+ * starting on the closing fence — which opens a new unterminated block, turning every remaining
+ * word of the post into monospace code. A post that leads with its verification output produces
+ * exactly that. Cut before the block instead, so the fence stays whole on one side; when the
+ * block starts at the very top there is no head to keep, so take the whole block into it.
+ */
+function fenceSafeCut(text: string, cut: number): number {
+  for (const { start, end } of fenceSpans(text)) {
+    if (cut > start && cut < end) return start > 0 ? start : end;
+  }
+  return cut;
 }
 
 // --- the day pager ---

@@ -1,3 +1,4 @@
+import { parseMarkdown } from "@/lib/markdown";
 import { describe, expect, it } from "vitest";
 import type { TeamsRoomMessage } from "@/lib/api";
 import {
@@ -307,6 +308,38 @@ describe("3.7 — a long body truncates with the rest kept for the expand", () =
     const { head, rest } = truncateBody(body);
     expect(head).toHaveLength(220);
     expect(head + rest).toBe(body);
+  });
+
+  // STUDIO-739 — both halves are rendered as markdown independently now. A cut inside a fence
+  // leaves the TAIL starting on the closing fence, which opens a new unterminated block and turns
+  // every remaining word of the post into monospace code.
+  it("never cuts inside a fenced code block", () => {
+    const body = `Verification:\n\n\`\`\`\n${"cargo test --workspace\n".repeat(12)}\`\`\`\n\nAll green, wired into the transcript.`;
+    const { head, rest } = truncateBody(body);
+    expect(head).toBe("Verification:\n\n");
+    expect(rest.startsWith("```")).toBe(true);
+    for (const half of [head, rest]) {
+      expect(parseMarkdown(half).filter((b) => b.type === "code")).toHaveLength(
+        half === head ? 0 : 1,
+      );
+    }
+    // The prose after the block is prose on both sides of the split.
+    expect(parseMarkdown(rest).at(-1)).toMatchObject({ type: "paragraph" });
+  });
+
+  it("keeps a block whole when the body opens with one", () => {
+    const body = `\`\`\`\n${"cargo test --workspace\n".repeat(12)}\`\`\`\n\nThat is the run.`;
+    const { head, rest } = truncateBody(body);
+    expect(parseMarkdown(head).map((b) => b.type)).toEqual(["code"]);
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["paragraph"]);
+  });
+
+  it("keeps every character across a fence-aware split", () => {
+    const body = `lead in\n\n\`\`\`\n${"line of output\n".repeat(20)}\`\`\`\ntail`;
+    const { head, rest } = truncateBody(body);
+    expect(head + rest).toBe(body.slice(0, head.length) + body.slice(head.length).trim());
+    expect(body.startsWith(head)).toBe(true);
+    expect(body.endsWith(rest)).toBe(true);
   });
 });
 

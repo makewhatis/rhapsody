@@ -162,6 +162,40 @@ function isClosingFence(line: string, marker: string): boolean {
   return close.test(line);
 }
 
+/**
+ * The `[start, end)` offset of every fenced code block in `text`, in order.
+ *
+ * For callers that CUT a body before parsing it (the room feed truncates a long post). A cut
+ * inside a fence is not a cosmetic problem: the head is left with an unterminated fence, which is
+ * harmless, but the tail then STARTS with the closing fence — which opens a new unterminated one,
+ * so every remaining word of the post renders as code. An unterminated block ends at the text's
+ * end, matching how [`parseMarkdown`] closes one.
+ */
+export function fenceSpans(text: string): { start: number; end: number }[] {
+  const spans: { start: number; end: number }[] = [];
+  let start = -1;
+  let marker = "";
+  let at = 0;
+  while (at <= text.length) {
+    const eol = text.indexOf("\n", at);
+    const line = text.slice(at, eol === -1 ? text.length : eol);
+    if (start === -1) {
+      const fence = FENCE.exec(line);
+      if (fence) {
+        start = at;
+        marker = fence[1];
+      }
+    } else if (isClosingFence(line, marker)) {
+      spans.push({ start, end: eol === -1 ? text.length : eol + 1 });
+      start = -1;
+    }
+    if (eol === -1) break;
+    at = eol + 1;
+  }
+  if (start !== -1) spans.push({ start, end: text.length });
+  return spans;
+}
+
 /** Folds the gathered list lines into a tree, one level per step of indentation. */
 function buildList(raw: readonly RawItem[]): MdList {
   const root: MdList = { ordered: raw.length > 0 && raw[0].ordered, items: [] };
