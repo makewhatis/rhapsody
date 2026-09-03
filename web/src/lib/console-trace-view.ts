@@ -269,7 +269,9 @@ const LEAD_SENTENCE_SCAN = 8;
  * Both comparisons run the lead through the STUDIO-739 renderer's own inline parse — the same pass
  * the headline went through — so a lead of `Photo attachment **shipped**.` is recognised as the
  * headline it produced. A headline the model CLIPPED ends in an ellipsis and is matched as a
- * prefix, since the sentence behind it is longer than the H1 that showed it.
+ * prefix of a SENTENCE of the lead, since the sentence behind it is longer than the H1 that showed
+ * it — never as a prefix of the lead as a whole, which it always is and which therefore says
+ * nothing about how much of the lead the card may drop.
  */
 export function cardLead(card: ResultCard): string {
   const lead = card.lead.trim();
@@ -278,7 +280,12 @@ export function cardLead(card: ResultCard): string {
   const target = clipped ? card.headline.slice(0, -1).trimEnd() : card.headline;
   const isHeadline = (text: string) => (clipped ? text.startsWith(target) : text === target);
   const whole = plainLead(lead);
-  if (isHeadline(whole)) return "";
+  // Deliberately NOT `isHeadline`. A clipped headline is a PREFIX of the sentence it was cut from,
+  // so the whole lead starts with it by construction — treating that as "the H1 already said it"
+  // deleted the entire hand-off from 15 of the 445 recorded runs, the worst a 3,355-char six-
+  // paragraph body under a one-sentence H1. The clipped case belongs to the sentence walk below,
+  // which drops the clipped sentence and keeps everything after it.
+  if (!clipped && whole === target) return "";
   // The headline can also be GROWN past the lead — the model reaches into the next paragraph when
   // the opening sentence is a bare "Done." — in which case the H1 already carries the whole lead.
   // The lead must be a whole SENTENCE the headline then continues past, not merely a string

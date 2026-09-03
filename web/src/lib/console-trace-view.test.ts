@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LogEntry, RunSummary } from "@/lib/api";
-import { buildTrace } from "@/lib/trace-model";
+import { buildResult, buildTrace } from "@/lib/trace-model";
 import {
   TRACE_FILTERS,
   cardLead,
@@ -285,6 +285,28 @@ describe("cardLead — the Result card shows a lead only when the H1 does not al
 
   it("has nothing to show when the prose opened on a heading", () => {
     expect(card("", "Anything")).toBe("");
+  });
+
+  // A CLIPPED headline is a prefix of the sentence it came from, so the whole lead trivially
+  // starts with it — the answer-first card must still print everything past that sentence.
+  // Measured over the 445 recorded runs, treating that prefix as "the H1 already said it" deleted
+  // the entire hand-off from 15 of them, one of them a 3,355-char six-paragraph lead.
+  it("keeps the rest of a lead the headline could only CLIP", () => {
+    const prose = [
+      "The CI success gate can never fail under `sh`, which makes it a rubber stamp: every job",
+      "reports green whether or not the suite it shells out to actually ran to completion. Your two",
+      "questions, both now answered.",
+      "",
+      "The gate is a one-liner and it swallows the exit status.",
+      "",
+      "The fix is one flag, and the suite proves it.",
+    ].join("\n");
+    const built = buildResult([entry({ seq: 1, text: prose })]);
+    expect(built.headline.endsWith("\u2026")).toBe(true);
+    const rest = cardLead(built);
+    expect(rest).toContain("The gate is a one-liner");
+    expect(rest).toContain("The fix is one flag");
+    expect(rest).not.toBe("");
   });
 });
 
