@@ -394,11 +394,13 @@ function plainSplit(text: string, cut: number): { head: string; rest: string } {
 function fenceSafeSplit(text: string, cut: number): { head: string; rest: string } {
   const fence = fenceSpans(text).find((f) => cut > f.start && cut < f.end);
   if (!fence) return plainSplit(text, cut);
-  // Inside the OPENING fence line: no part of the block can be kept, so cut just before it —
-  // except when the block OPENS the post, where cutting before it leaves no head at all. There
-  // the plain cut is the only bounded answer: keeping the opening line whole would grow the head
-  // by a line that is itself unbounded, and the preview it buys is an empty box either way.
-  if (cut < fence.body) return plainSplit(text, fence.start > 0 ? fence.start : cut);
+  // Inside the OPENING fence line: no part of the block can be kept, so cut just before it. When
+  // the block OPENS the post that leaves no head at all — but no cut can do better there, because
+  // a head ending mid-fence-line is a truncated unterminated fence, which renders as an EMPTY code
+  // box and leaves the tail starting mid-info-string: the content lines then lazily continue as a
+  // paragraph and the CLOSING fence reopens as a block that swallows the trailing prose. Blank
+  // either way, so protect the tail.
+  if (cut < fence.body) return plainSplit(text, fence.start);
   // Inside the CLOSING one: every content line is already in the head, so take the fence too.
   if (cut >= fence.close) return plainSplit(text, fence.end);
   // A cut inside a line can also MANUFACTURE a closing fence: split `cat ```' at its space and

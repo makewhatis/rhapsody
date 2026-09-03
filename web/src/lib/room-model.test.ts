@@ -411,14 +411,18 @@ describe("3.7 — a long body truncates with the rest kept for the expand", () =
     expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code"]);
   });
 
-  it("keeps a preview when the post opens with a long fence line", () => {
-    // Nothing precedes the block, so cutting to its start would leave an EMPTY preview and a
-    // blank post in the collapsed feed. The plain cut keeps the head inside the budget.
-    const body = `~~~ ${"opt ".repeat(60)}\ncode\n~~~`;
+  it("keeps the tail whole when the post opens with a fence line past the budget", () => {
+    // The opening line alone outruns the budget, so no cut buys a preview: a head ending inside a
+    // fence line is a truncated unterminated fence, which renders as an empty code box. The only
+    // thing left to protect is the TAIL, so this asserts through the PARSER rather than on string
+    // lengths — cutting mid-line instead inverts it, rendering the code as prose (the content
+    // lines lazily continue a paragraph) and the prose as code (the closing fence reopens a
+    // block), which is exactly what this split exists to prevent.
+    const body = `~~~ ${"opt ".repeat(60)}\ncode\n~~~\ntrailing prose`;
     const { head, rest } = truncateBody(body);
-    expect(head).not.toBe("");
-    expect(head.length).toBeLessThanOrEqual(BODY_TRUNCATE_AT);
-    expect(rest).not.toBe("");
+    expect(parseMarkdown(rest).map((b) => b.type)).toEqual(["code", "paragraph"]);
+    expect(codeOf(rest)).toEqual(["code"]);
+    expect(head).toBe("");
   });
 
   it("previews a post that opens with an inline code span", () => {
