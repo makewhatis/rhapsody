@@ -880,6 +880,12 @@ function useFollowScroll(active: boolean): FollowScroll {
   // same way and for the same reason. Re-reading the page inside that effect would not do —
   // after the growth an operator who never moved reads as "not at the bottom", and the legitimate
   // follow would break.
+  //
+  // Be warned before simplifying this away on a green suite: NO test holds the ref in place. Swap
+  // it for the `atBottom` state in the growth effect and every test still passes, because React
+  // happens to flush the listener's `setAtBottom` before the growth render in each sequence they
+  // cover. The ref is defence against an ordering this file does not currently produce, not
+  // against one it does — which is exactly why the next reader will think it is redundant.
   const pinned = useRef(true);
   useEffect(() => {
     const el = pageScroller();

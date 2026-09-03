@@ -1205,6 +1205,24 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     expect(document.querySelector(".trlatest")).toBeNull();
   });
 
+  it("follows a live run opened at the top of a tall page", async () => {
+    // The other side of the same rule, and the one an operator meets FIRST: nobody has scrolled
+    // yet, so the position at mount belongs to the view they came from, not to this run. Reading
+    // it as a choice is what used to open a live trace pinned to nothing and never follow again.
+    let height = 2000;
+    sizePage(() => height);
+    scroller().scrollTop = 0; // not the bottom of a 2000px page — and not the operator's doing
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+
+    height = 3000;
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(spineTitles()).toContain("Verified"));
+    expect(scroller().scrollTop).toBe(3000);
+  });
+
   it("never drags a scrolled-up operator back down, however much the stream grows", async () => {
     let height = 2000;
     sizePage(() => height);
