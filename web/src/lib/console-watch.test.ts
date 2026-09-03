@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import type { ReviewJob, RunMessage, RunSummary, TeamsRoomMessage } from "@/lib/api";
 import {
   DEFAULT_WATCH_TAB,
+  MEMORY_EMPTY_NOTE,
+  ROOM_WATCH_WINDOW,
   WATCH_TABS,
   askRefs,
   messageChip,
   originTicket,
   reviewRunPr,
   reviewsForRun,
+  roomEmptyNote,
   roomPostsFor,
 } from "@/lib/console-watch";
 
@@ -241,5 +244,40 @@ describe("askRefs", () => {
 
   it("still refs the run when the row carries no identifier", () => {
     expect(askRefs(run({ issue_identifier: "" }))).toEqual(["run 547"]);
+  });
+});
+
+// A settled, successful, TRUNCATED read is the third member of the family `emptyNote` handles: the
+// panel really did read, really did find nothing — but only inside a window it never mentions.
+describe("the absence a bounded read is entitled to state", () => {
+  it("asks for the daemon's own ceiling, so the window is as wide as it can be", () => {
+    expect(ROOM_WATCH_WINDOW).toBe(50);
+  });
+
+  it("names the window when the read came back full, because more may lie behind it", () => {
+    const note = roomEmptyNote(ROOM_WATCH_WINDOW);
+    expect(note).toContain(String(ROOM_WATCH_WINDOW));
+    // It says what was READ, and never that the room as a whole is silent about the ticket.
+    expect(note).not.toMatch(/^No post in the room mentions/);
+  });
+
+  it("states the plain absence only when the whole room fitted in the window", () => {
+    expect(roomEmptyNote(ROOM_WATCH_WINDOW - 1)).toBe("No post in the room mentions this ticket.");
+  });
+
+  it("treats a read that somehow overran the window as bounded too", () => {
+    expect(roomEmptyNote(ROOM_WATCH_WINDOW + 1)).toBe(roomEmptyNote(ROOM_WATCH_WINDOW));
+  });
+
+  it("never lets an empty room read as a window-bounded one", () => {
+    expect(roomEmptyNote(0)).toBe("No post in the room mentions this ticket.");
+  });
+
+  // Recall carries no bound in its response and the console cannot set one, so there is no read
+  // the Memory tab may call complete — its sentence names the window unconditionally.
+  it("names the recall window in the memory sentence, always", () => {
+    expect(MEMORY_EMPTY_NOTE).toMatch(/newest/i);
+    expect(MEMORY_EMPTY_NOTE).toContain("this ticket");
+    expect(MEMORY_EMPTY_NOTE).not.toMatch(/^No facts were retained/);
   });
 });

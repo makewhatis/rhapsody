@@ -70,6 +70,50 @@ export function roomPostsFor(
     .reverse();
 }
 
+/**
+ * The window the Room tab asks the daemon for: its own hard ceiling.
+ *
+ * `GET /api/v1/teams/room?limit=` can only NARROW — `effective_limit` clamps every caller to
+ * `MAX_ROOM_WINDOW` (`crates/config/src/room.rs`) and falls back to `DEFAULT_ROOM_WINDOW = 20`
+ * when the caller names none. Asking for the ceiling is therefore the widest read available to any
+ * client, and it is still a WINDOW — which is what [`roomEmptyNote`] exists to say out loud.
+ */
+export const ROOM_WATCH_WINDOW = 50;
+
+/**
+ * What the Room tab may state when no post it read mentions this ticket.
+ *
+ * The room is read newest-first and bounded, THEN filtered to the ticket, so an empty panel has
+ * two quite different causes and only one of them is "the room is silent about this ticket". When
+ * the read came back full, everything older than the window went unfetched, and a bare "no room
+ * posts reference this ticket" is a claim about posts the console never saw — the same defect as
+ * reporting a pending or failed read as an empty one, arriving on the read that SUCCEEDS.
+ *
+ * `read` is how many posts came back, which separates the two cases without a total the endpoint
+ * does not serve: short of the window means the whole room fitted inside it and the plain absence
+ * is true; at the window — or, defensively, past it — the sentence names what was read instead.
+ */
+export function roomEmptyNote(read: number): string {
+  return read >= ROOM_WATCH_WINDOW
+    ? `No post in the room's most recent ${ROOM_WATCH_WINDOW} mentions this ticket.`
+    : "No post in the room mentions this ticket.";
+}
+
+/**
+ * What the Memory tab may state when no fact it read is stamped with this ticket.
+ *
+ * Unconditional, unlike [`roomEmptyNote`], because recall gives the console nothing to condition
+ * on. An empty-query browse is bounded by `recall_top_k` — "browse widens what MATCHES, never how
+ * much comes back" (`crates/orchestrator/src/teamsmemory.rs`), unset meaning `FALLBACK_TOP_K = 8`
+ * (`crates/config/src/memory.rs`) — and neither the request nor `TeamsRecallResponse` carries
+ * that bound, so a bank returning N facts is indistinguishable from a bank truncated AT N. Since
+ * no read here is one the tab may call complete, it names the window every time rather than
+ * sometimes overclaiming.
+ */
+export const MEMORY_EMPTY_NOTE =
+  "No fact in the newest records the daemon returns from each teammate's bank is stamped with " +
+  "this ticket.";
+
 /** Every regex metacharacter neutralised — a tracker key is not guaranteed to carry none. */
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

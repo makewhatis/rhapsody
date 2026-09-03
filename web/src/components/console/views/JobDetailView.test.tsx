@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { LogEntry, RunDetail, RunMessage, RunSummary, StateResponse } from "@/lib/api";
+import { MEMORY_EMPTY_NOTE, ROOM_WATCH_WINDOW } from "@/lib/console-watch";
 
 // STUDIO-742 — the "Trace" run detail's three zones (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3), replacing STUDIO-683's summary strip and
@@ -929,6 +930,32 @@ describe("the watch-tabs rail (§3C)", () => {
     expect(panel().getAttribute("aria-labelledby")).toBe("trtab-room");
   });
 
+  // `role="tablist"` is a promise about the keyboard, not only about the screen reader: an
+  // operator who reaches the rail expects the arrows to move between tabs, not to do nothing.
+  it("moves between the tabs on the arrow keys, and to the ends on Home/End", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+
+    const list = document.querySelector('.trwatch [role="tablist"]') as HTMLElement;
+    const selected = () =>
+      screen.getAllByRole("tab").find((t) => t.getAttribute("aria-selected") === "true")
+        ?.textContent;
+
+    expect(selected()).toBe("Room");
+    fireEvent.keyDown(list, { key: "ArrowRight" });
+    await waitFor(() => expect(selected()).toBe("Memory"));
+    fireEvent.keyDown(list, { key: "ArrowLeft" });
+    await waitFor(() => expect(selected()).toBe("Room"));
+    fireEvent.keyDown(list, { key: "End" });
+    await waitFor(() => expect(selected()).toBe("Messages"));
+    // And it wraps, rather than dead-ending on the last tab.
+    fireEvent.keyDown(list, { key: "ArrowRight" });
+    await waitFor(() => expect(selected()).toBe("Diffdep"));
+    fireEvent.keyDown(list, { key: "Home" });
+    await waitFor(() => expect(selected()).toBe("Diffdep"));
+  });
+
   // The whole reason only ONE panel is mounted: four surfaces polling for nobody to read.
   it("fetches a tab's data only once that tab is opened", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
@@ -1009,6 +1036,77 @@ describe("Room · this ticket / Memory from this ticket (§3C)", () => {
     expect(h.fetchTeamsRecall).not.toHaveBeenCalled();
     // And there is no room to ask into either, so the dock is not offered.
     expect(document.querySelector(".askdock")).toBeNull();
+  });
+});
+
+// A read that SUCCEEDED and came back empty is still not licence to state an absence: both these
+// panels read a bounded window, so what they may say is bounded too. Room can tell the two cases
+// apart by the size of its own read; recall carries no bound, so Memory names the window always.
+describe("a bounded read never states an unbounded absence", () => {
+  /** `n` room posts, none of them about the run's ticket. */
+  function otherPosts(n: number) {
+    return Array.from({ length: n }, (_, i) => ({
+      id: `f:${i}`,
+      from: "alice",
+      to: "*",
+      at: "2026-09-01T19:11:00Z",
+      body: `OTHER-${i} moved on`,
+      refs: [],
+    }));
+  }
+
+  it("asks the daemon for the widest room window it will serve", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    mountDetail([run({ id: 1 })]);
+    await settleTrace();
+    // Not the default 20 the daemon falls back to when the console names no limit.
+    await waitFor(() => expect(h.fetchTeamsRoom).toHaveBeenCalledWith(ROOM_WATCH_WINDOW));
+  });
+
+  it("says what it read when the room came back full and none of it names this ticket", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    mountDetail([run({ id: 1 })]);
+    h.fetchTeamsRoom.mockResolvedValue({ messages: otherPosts(ROOM_WATCH_WINDOW), skipped: [] });
+    await settleTrace();
+
+    await waitFor(() =>
+      expect(panel().textContent).toContain(
+        `No post in the room's most recent ${ROOM_WATCH_WINDOW} mentions this ticket.`,
+      ),
+    );
+    // Never the bare absence: everything older than the window went unread.
+    expect(panel().textContent).not.toContain("No post in the room mentions this ticket.");
+  });
+
+  it("states the plain absence only when the whole room fitted inside the window", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    mountDetail([run({ id: 1 })]);
+    h.fetchTeamsRoom.mockResolvedValue({ messages: otherPosts(3), skipped: [] });
+    await settleTrace();
+
+    await waitFor(() =>
+      expect(panel().textContent).toContain("No post in the room mentions this ticket."),
+    );
+    expect(panel().textContent).not.toContain("most recent");
+  });
+
+  // The escape the sentence owes the operator: the window is the console's, not the room's.
+  it("offers the room itself when the window had nothing about this ticket", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    const onNavigate = mountDetail([run({ id: 1 })]);
+    await settleTrace();
+
+    fireEvent.click(await within(panel()).findByRole("link", { name: /open the room/i }));
+    expect(onNavigate).toHaveBeenCalledWith("teams");
+  });
+
+  it("names the recall window rather than claiming this ticket retained nothing", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 1, generated_at: "", entries: [] });
+    mountDetail([run({ id: 1 })]);
+    await settleTrace();
+    await openTab("Memory");
+
+    await waitFor(() => expect(panel().textContent).toContain(MEMORY_EMPTY_NOTE));
   });
 });
 
@@ -1177,7 +1275,7 @@ describe("a failed read is never reported as an empty one", () => {
     h.fetchTeamsRoom.mockRejectedValue(new Error("boom"));
     await settleTrace();
     await waitFor(() => expect(panel().textContent).toContain("the request failed"));
-    expect(panel().textContent).not.toMatch(/No room posts reference/i);
+    expect(panel().textContent).not.toMatch(/mentions this ticket/i);
   });
 
   // ONE bank failing is enough. The roster is deliberately TWO teammates with only bob's bank
@@ -1202,7 +1300,7 @@ describe("a failed read is never reported as an empty one", () => {
     await settleTrace();
     await openTab("Memory");
     await waitFor(() => expect(panel().textContent).toContain("the request failed"));
-    expect(panel().textContent).not.toMatch(/No facts were retained/i);
+    expect(panel().textContent).not.toMatch(/is stamped with this ticket/i);
   });
 
   // The recall's own PREREQUISITE. With no roster there is nobody to recall from, so the fan-out
@@ -1215,7 +1313,7 @@ describe("a failed read is never reported as an empty one", () => {
     await settleTrace();
     await openTab("Memory");
     await waitFor(() => expect(panel().textContent).toContain("the request failed"));
-    expect(panel().textContent).not.toMatch(/No facts were retained/i);
+    expect(panel().textContent).not.toMatch(/is stamped with this ticket/i);
     // And it really did have no bank to ask — the claim would have been about nothing.
     expect(h.fetchTeamsRecall).not.toHaveBeenCalled();
   });

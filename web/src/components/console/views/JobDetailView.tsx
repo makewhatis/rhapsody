@@ -19,6 +19,7 @@ import {
   TicketChip,
   Timestamp,
 } from "@/components/console";
+import { handleTablistKeyDown } from "@/components/shell/tabs";
 import { teammateColor } from "@/theme/teammates";
 import {
   useIssueHistory,
@@ -62,10 +63,13 @@ import {
 } from "@/lib/console-trace-view";
 import {
   DEFAULT_WATCH_TAB,
+  MEMORY_EMPTY_NOTE,
+  ROOM_WATCH_WINDOW,
   WATCH_TABS,
   askRefs,
   messageChip,
   reviewsForRun,
+  roomEmptyNote,
   roomPostsFor,
   type WatchTabId,
 } from "@/lib/console-watch";
@@ -117,7 +121,7 @@ export function JobDetailView({
   onNavigate,
 }: {
   issue: string;
-  onNavigate: (route: "jobs" | "memory") => void;
+  onNavigate: (route: "jobs" | "memory" | "teams") => void;
 }) {
   const history = useIssueHistory(issue);
   const teamsEnabled = useTeamsEnabled();
@@ -172,6 +176,7 @@ export function JobDetailView({
           onBack={() => onNavigate("jobs")}
           onSelectRun={setPinned}
           onOpenMemory={() => onNavigate("memory")}
+          onOpenRoom={() => onNavigate("teams")}
         />
       )}
     </section>
@@ -189,6 +194,7 @@ function RunTrace({
   onBack,
   onSelectRun,
   onOpenMemory,
+  onOpenRoom,
 }: {
   run: RunSummary;
   runs: readonly RunSummary[];
@@ -200,6 +206,7 @@ function RunTrace({
   onBack: () => void;
   onSelectRun: (id: number) => void;
   onOpenMemory: () => void;
+  onOpenRoom: () => void;
 }) {
   // The two polls slice 3 rides on, both already the daemon's own cadence: the run detail at 2s
   // and the transcript at 1.5s. `/issues/{id}/history` is fetched once and cached for 10s, which
@@ -333,6 +340,7 @@ function RunTrace({
                   focusComposer={focusMessage}
                   onComposerFocused={takeMessageFocus}
                   onOpenMemory={onOpenMemory}
+                  onOpenRoom={onOpenRoom}
                 />
               </WatchTabsRail>
             }
@@ -1169,7 +1177,23 @@ function WatchTabsRail({
 }) {
   return (
     <div className="trwatch">
-      <div className="tabs" role="tablist" aria-label="Watch">
+      {/* The ARIA roles below are a promise about the keyboard as much as about the screen
+          reader, and `shell/tabs` is the repo's own answer to it — the same wire-up the Settings
+          rail uses, so the two tablists behave alike. */}
+      <div
+        className="tabs"
+        role="tablist"
+        aria-label="Watch"
+        onKeyDown={(e) =>
+          handleTablistKeyDown(
+            e,
+            WATCH_TABS.map((t) => t.id),
+            tab,
+            onSelect,
+            "horizontal",
+          )
+        }
+      >
         {WATCH_TABS.map((t) => (
           <button
             key={t.id}
@@ -1207,6 +1231,7 @@ function WatchPanel({
   focusComposer,
   onComposerFocused,
   onOpenMemory,
+  onOpenRoom,
 }: {
   tab: WatchTabId;
   run: RunSummary;
@@ -1219,6 +1244,7 @@ function WatchPanel({
   focusComposer: boolean;
   onComposerFocused: () => void;
   onOpenMemory: () => void;
+  onOpenRoom: () => void;
 }) {
   switch (tab) {
     case "diff":
@@ -1253,7 +1279,7 @@ function WatchPanel({
     default:
       return (
         <TeamsPanel teamsEnabled={teamsEnabled} what="there is no room for anyone to post in">
-          <RoomPanel issue={run.issue_identifier} roster={roster} />
+          <RoomPanel issue={run.issue_identifier} roster={roster} onOpenRoom={onOpenRoom} />
         </TeamsPanel>
       );
   }
@@ -1419,35 +1445,65 @@ function ReviewPanel({
   );
 }
 
-/** "Room · this ticket" (§3C) — the room posts that reference this run's ticket. */
-function RoomPanel({ issue, roster }: { issue: string; roster: readonly string[] }) {
-  const room = useTeamsRoom(true);
-  const posts = useMemo(() => roomPostsFor(room.data?.messages ?? [], issue), [room.data, issue]);
+/**
+ * "Room · this ticket" (§3C) — the room posts that reference this run's ticket.
+ *
+ * The read asks for the daemon's widest window ([`ROOM_WATCH_WINDOW`]) and is a window even so, so
+ * the empty copy comes from [`roomEmptyNote`], which states what was READ rather than what the
+ * room contains, and the panel offers the room itself as the way past its own bound. A by-ticket
+ * room read is a DAEMON change (STUDIO-759) and deliberately not attempted here.
+ */
+function RoomPanel({
+  issue,
+  roster,
+  onOpenRoom,
+}: {
+  issue: string;
+  roster: readonly string[];
+  onOpenRoom: () => void;
+}) {
+  const room = useTeamsRoom(true, ROOM_WATCH_WINDOW);
+  const messages = useMemo(() => room.data?.messages ?? [], [room.data]);
+  const posts = useMemo(() => roomPostsFor(messages, issue), [messages, issue]);
   return (
-    <div className="memprev">
-      {posts.map((post) => (
-        <div className="mcard" key={post.id}>
-          <div className="top">
-            <span
-              className="who2"
-              style={{
-                color:
-                  post.from === "operator" ? "var(--operator)" : teammateColor(roster, post.from),
-              }}
-            >
-              {post.from}
-            </span>
-            <Timestamp>{clockTime(post.at)}</Timestamp>
+    <>
+      <div className="memprev">
+        {posts.map((post) => (
+          <div className="mcard" key={post.id}>
+            <div className="top">
+              <span
+                className="who2"
+                style={{
+                  color:
+                    post.from === "operator" ? "var(--operator)" : teammateColor(roster, post.from),
+                }}
+              >
+                {post.from}
+              </span>
+              <Timestamp>{clockTime(post.at)}</Timestamp>
+            </div>
+            <Markdown source={post.body} />
           </div>
-          <Markdown source={post.body} />
-        </div>
-      ))}
-      {posts.length === 0 ? (
-        <div className="empty">
-          {emptyNote(room, "Loading room…", "No room posts reference this ticket.")}
-        </div>
-      ) : null}
-    </div>
+        ))}
+        {posts.length === 0 ? (
+          <div className="empty">
+            {emptyNote(room, "Loading room…", roomEmptyNote(messages.length))}
+          </div>
+        ) : null}
+      </div>
+      <div className="trwatchfoot">
+        <a
+          className="link"
+          href="#teams"
+          onClick={(e) => {
+            e.preventDefault();
+            onOpenRoom();
+          }}
+        >
+          Open the room →
+        </a>
+      </div>
+    </>
   );
 }
 
@@ -1485,7 +1541,7 @@ function MemoryPanel({
         ))}
         {facts.data.length === 0 ? (
           <div className="empty">
-            {emptyNote(read, "Loading memory…", "No facts were retained from this ticket.")}
+            {emptyNote(read, "Loading memory…", MEMORY_EMPTY_NOTE)}
           </div>
         ) : null}
       </div>
