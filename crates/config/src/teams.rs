@@ -148,6 +148,15 @@ fn default_quorum_reviewers() -> i64 {
     DEFAULT_QUORUM_REVIEWERS
 }
 
+/// `review.reviewers` — how many teammates review one pull request on the
+/// ticketless path (STUDIO-721; design decision C). One, not the quorum's two:
+/// each reviewer is a whole agent run against the pull request's head.
+pub const DEFAULT_REVIEW_REVIEWERS: i64 = 1;
+
+fn default_review_reviewers() -> i64 {
+    DEFAULT_REVIEW_REVIEWERS
+}
+
 /// The `manager:` block (§2.2). Carried as config in T1; the routing function
 /// that reads `default_identity` is T3a and the model turn that reads `model` /
 /// `max_tokens` / `timeout_ms` is T3b's off-loop triage task (§0.11.2).
@@ -261,10 +270,43 @@ pub enum ReviewMode {
 /// §16's "the whole subsystem is dormant unless `teams.enabled`" structural
 /// rather than remembered: there is no way to spell an active review mode
 /// outside Teams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Review {
     #[serde(default)]
     pub mode: ReviewMode,
+    /// How many teammates review ONE pull request, clamped to the roster minus
+    /// the author (STUDIO-721; design decision C, §13.5/§15-f). Default **1** —
+    /// deliberately not [`Quorum::reviewers`]'s 2: a ticketless review is a full
+    /// agent run against the pull request's head, so the second reviewer is a
+    /// second bill rather than a second comment on a ticket.
+    ///
+    /// A distinct key from `quorum.reviewers` for [`ReviewMode`]'s reason: the
+    /// two paths are mutually exclusive, and reusing the quorum's count would
+    /// silently give a ticketless installation the quorum's default.
+    #[serde(default = "default_review_reviewers")]
+    pub reviewers: i64,
+}
+
+impl Default for Review {
+    fn default() -> Self {
+        Self {
+            mode: ReviewMode::default(),
+            reviewers: DEFAULT_REVIEW_REVIEWERS,
+        }
+    }
+}
+
+impl Review {
+    /// [`Review::reviewers`] with the floor applied — the number an introduction
+    /// asks for, before the roster clamps it further.
+    ///
+    /// Floored at one for [`Quorum::effective_reviewers`]'s reason: zero
+    /// reviewers is not a review policy, it is the subsystem switched off, and
+    /// `mode: off` is how that is spelled.
+    pub fn effective_reviewers(&self) -> usize {
+        usize::try_from(self.reviewers.max(MIN_QUORUM_REVIEWERS))
+            .unwrap_or(DEFAULT_REVIEW_REVIEWERS as usize)
+    }
 }
 
 /// The `memory:` block (§2.2). Carried as config in T1 — no backend is
@@ -1313,7 +1355,10 @@ mod tests {
         ] {
             let t = Teams {
                 enabled,
-                review: Review { mode },
+                review: Review {
+                    mode,
+                    ..Review::default()
+                },
                 ..Teams::disabled()
             };
             assert_eq!(
@@ -1383,7 +1428,10 @@ mod tests {
                     enabled: quorum,
                     ..Quorum::default()
                 },
-                review: Review { mode },
+                review: Review {
+                    mode,
+                    ..Review::default()
+                },
                 roster: vec![Identity {
                     name: "alice".to_string(),
                     ..Identity::default()
@@ -1393,6 +1441,38 @@ mod tests {
             t.validate()
                 .unwrap_or_else(|e| panic!("quorum={quorum} mode={mode:?}: {e}"));
         }
+    }
+
+    /// STUDIO-721 (decision C): the ticketless path asks ONE teammate by default
+    /// — not the quorum's two — and a nonsensical count clamps up to one rather
+    /// than turning an enabled review mode into a silent no-op.
+    #[test]
+    fn review_reviewers_defaults_to_one_and_floors_at_one() {
+        assert_eq!(Review::default().reviewers, DEFAULT_REVIEW_REVIEWERS);
+        assert_eq!(Review::default().effective_reviewers(), 1);
+        assert_eq!(
+            Teams::disabled().review.reviewers,
+            1,
+            "an absent `review:` block is one reviewer, not the quorum's two"
+        );
+        for (configured, want) in [(-7, 1), (0, 1), (1, 1), (2, 2), (5, 5)] {
+            let r = Review {
+                reviewers: configured,
+                ..Review::default()
+            };
+            assert_eq!(r.effective_reviewers(), want, "reviewers: {configured}");
+        }
+    }
+
+    /// An absent `reviewers:` key keeps the default while an explicit one is
+    /// honoured — the serde default has to be the CONST, not `i64::default()`.
+    #[test]
+    fn review_reviewers_absent_is_the_default_and_present_is_honoured() {
+        let absent: Review = serde_yaml_ng::from_str("mode: ticketless").expect("parse");
+        assert_eq!(absent.reviewers, DEFAULT_REVIEW_REVIEWERS);
+        let present: Review =
+            serde_yaml_ng::from_str("mode: ticketless\nreviewers: 4").expect("parse");
+        assert_eq!(present.reviewers, 4);
     }
 
     /// The Settings editor writes a `Teams` and the daemon boots the same one —
@@ -1407,6 +1487,7 @@ mod tests {
             enabled: true,
             review: Review {
                 mode: ReviewMode::Ticketless,
+                reviewers: 3,
             },
             roster: vec![Identity {
                 name: "alice".to_string(),
@@ -1490,6 +1571,7 @@ mod tests {
             // also enables the quorum and `validate` rejects that pair.
             review: Review {
                 mode: ReviewMode::Tickets,
+                ..Review::default()
             },
             roster: vec![Identity {
                 name: "alice".to_string(),

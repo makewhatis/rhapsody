@@ -453,6 +453,10 @@ pub struct Orchestrator {
     /// `pending_stack` is). The worker spawn happens inside `dispatch_issue`, so the pinned head has
     /// to be in place before the call rather than stamped on afterwards. STUDIO-715.
     pub(crate) pending_review: crate::review::PendingReviews,
+    /// How many review ROUNDS each watched pull request has been given this daemon lifetime — the
+    /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
+    /// loop-side handler, and dropped when the pull request leaves the watch set.
+    pub(crate) review_rounds: crate::reviewwatch::ReviewRounds,
     /// Aggregate token + runtime accounting.
     pub totals: Totals,
 
@@ -660,6 +664,7 @@ impl Orchestrator {
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
+            review_rounds: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
             store: Arc::new(store::Noop),

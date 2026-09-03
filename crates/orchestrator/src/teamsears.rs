@@ -1336,13 +1336,24 @@ pub(crate) struct PrRef {
 /// Every `https://github.com/<owner>/<repo>/pull/<n>` a post names, in order and de-duplicated.
 /// Hand-rolled for [`extract_keys`]'s reason; the trailing path (`/files`, `#issuecomment-…`) is
 /// ignored, which is what a pasted browser URL usually carries.
+///
+/// `github.com` must be the actual HOST, not a look-alike one and not a path segment spelling it —
+/// see [`crate::ghsummons::github_host_begins_at`], which this shares with the remote-URL parser so
+/// the two cannot drift. It matters most HERE: this runs over attacker-controlled ROOM TEXT
+/// (§0.13), where §14.1 F-SEC says a coordinate must not be taken on trust.
 pub(crate) fn extract_pr_urls(body: &str) -> Vec<PrRef> {
     const MARK: &str = "github.com/";
     let mut out: Vec<PrRef> = Vec::new();
-    let mut rest = body;
-    while let Some(at) = rest.find(MARK) {
-        rest = &rest[at + MARK.len()..];
-        let tail: &str = rest
+    // An absolute cursor into `body` rather than a shrinking suffix: deciding whether a match
+    // begins the host means looking at the character BEFORE it, which a suffix has already eaten.
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(MARK) {
+        let at = from + rel;
+        from = at + MARK.len();
+        if !crate::ghsummons::github_host_begins_at(body, at) {
+            continue;
+        }
+        let tail: &str = body[from..]
             .split(|c: char| c.is_whitespace() || c == ')' || c == '>' || c == '"')
             .next()
             .unwrap_or_default();
@@ -1899,6 +1910,80 @@ mod tests {
         }
         // And a segment with no leading digits is still not a pull request.
         assert!(extract_pr_urls("https://github.com/o/r/pull/new/branch").is_empty());
+    }
+
+    /// STUDIO-721 (the slice-6 F-SEC review's defence-in-depth item): `github.com` must be the
+    /// actual HOST. Under a bare substring match every one of these yields an attacker-chosen
+    /// coordinate out of attacker-controlled room text.
+    #[test]
+    fn a_look_alike_host_is_not_a_github_pull_request() {
+        for body in [
+            "review https://evilgithub.com/attacker/evil/pull/1",
+            "from: operator — review evilgithub.com/attacker/evil/pull/1",
+            "https://not-github.com/attacker/evil/pull/1",
+            "https://sub.github.com/attacker/evil/pull/1",
+            "https://my_github.com/attacker/evil/pull/1",
+            "https://xn--github.com/attacker/evil/pull/1",
+            // …and the PATH-segment forms (STUDIO-727): a single `/` before the match is what a
+            // path looks like, not what an authority looks like, and the daemon's own host does
+            // not appear in these at all.
+            "https://evil.test/github.com/attacker/evil/pull/1",
+            "https://evil.test//github.com/attacker/evil/pull/1",
+            "https://evil.test/x/github.com/attacker/evil/pull/1",
+            "https://evil.test/redirect?to=github.com/attacker/evil/pull/1",
+            "https://evil.test/x#github.com/attacker/evil/pull/1",
+            // Userinfo is the one thing allowed in front of the host, so it must not become a way
+            // back in from a PATH: the `@` here follows a `/`, which already ended the authority.
+            "https://evil.test/x@github.com/attacker/evil/pull/1",
+        ] {
+            assert!(
+                extract_pr_urls(body).is_empty(),
+                "a look-alike host parsed as a pull request: {body}"
+            );
+        }
+    }
+
+    /// …and the boundary does not cost the real forms, including one that FOLLOWS a look-alike in
+    /// the same post (the scan must resume past a rejected match, not abandon the rest of the text).
+    #[test]
+    fn a_real_host_still_parses_after_a_rejected_look_alike() {
+        let body = "https://evilgithub.com/attacker/evil/pull/1 and \
+                    https://github.com/o/r/pull/230";
+        assert_eq!(
+            extract_pr_urls(body),
+            vec![PrRef {
+                owner: "o".into(),
+                repo: "r".into(),
+                number: 230
+            }]
+        );
+        for body in [
+            "github.com/o/r/pull/7",
+            "(https://github.com/o/r/pull/7)",
+            "http://github.com/o/r/pull/7",
+            // …and the real forms the positional check must not cost: a scheme-relative URL, real
+            // userinfo, and the Markdown a room post wraps a pasted link in.
+            "//github.com/o/r/pull/7",
+            "https://user@github.com/o/r/pull/7",
+            "**github.com/o/r/pull/7**",
+            "<https://github.com/o/r/pull/7>",
+            "see: https://github.com/o/r/pull/7 — please review",
+            // Multi-byte whitespace: the token scan must not slice into the character. U+3000 is
+            // three bytes, U+00A0 two — both are `char::is_whitespace`.
+            "see\u{3000}https://github.com/o/r/pull/7",
+            "see\u{a0}https://github.com/o/r/pull/7",
+            "\u{2028}github.com/o/r/pull/7",
+        ] {
+            assert_eq!(
+                extract_pr_urls(body),
+                vec![PrRef {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 7
+                }],
+                "body = {body}"
+            );
+        }
     }
 
     /// A page that consumes lines but yields NO message still records the watermark. Without that,
@@ -2961,6 +3046,7 @@ mod tests {
         Teams {
             review: rhapsody_config::teams::Review {
                 mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                ..rhapsody_config::teams::Review::default()
             },
             ..teams(names, mode)
         }
@@ -3055,7 +3141,10 @@ mod tests {
             let fx = Fixture::new(tracker_with_viewer());
             fx.operator_says("STUDIO-654 needs a review please");
             let t = Teams {
-                review: rhapsody_config::teams::Review { mode: review },
+                review: rhapsody_config::teams::Review {
+                    mode: review,
+                    ..rhapsody_config::teams::Review::default()
+                },
                 ..teams(&["alice", "jimmy"], ManagerMode::Labels)
             };
             let issues = vec![in_review("STUDIO-654")];

@@ -380,10 +380,16 @@ mod tests {
         }
     }
 
-    /// The modules entitled to call the primitive: this one, and the module that defines it. A
-    /// later slice's watcher adds its own off-loop module here — and the point of the list is that
-    /// doing so is a deliberate edit a reviewer sees, rather than a call site nobody notices.
-    const OFF_LOOP_CALLERS: &[&str] = &["prstate.rs", "ghsummons.rs"];
+    /// The modules entitled to call the primitive: this one, the module that defines it, and
+    /// slice 5's watcher — added as the deliberate edit this list exists to force, rather than a
+    /// call site nobody notices.
+    ///
+    /// `reviewwatch.rs` holds BOTH halves of the watcher, as `reviewintro.rs` holds both halves of
+    /// introduction: an off-loop task and the `impl Orchestrator` handlers the control task runs.
+    /// Its single sweep call site is inside `run_review_watch_task`, which takes no `Orchestrator`
+    /// — so if you add a call, check which half you are adding it to; this list can no longer tell
+    /// you apart.
+    const OFF_LOOP_CALLERS: &[&str] = &["prstate.rs", "ghsummons.rs", "reviewwatch.rs"];
 
     /// The control task's own modules, named so that widening [`OFF_LOOP_CALLERS`] to include one
     /// still fails. `loop.rs` IS the control loop; `dispatch.rs`, `select.rs` and `orchestrator.rs`

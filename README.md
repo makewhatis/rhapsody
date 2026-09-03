@@ -499,14 +499,20 @@ needs a durable home, and the Go v0.4.0 reference — which has no review featur
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **7** |
+| `PRAGMA user_version` | 6 | **8** |
 | tables | `runs`, `events`, `retry_queue`, `claims`, `totals`, `run_messages` | the same 6, byte-identical, **plus** `rhapsody_review_watch` |
 
-One row per (PR, reviewer): repository owner/name, PR **number**, the reviewing teammate, the origin
-that introduced the PR, `requested_sha`, `last_reviewed_sha`, a five-value `status`
-(`requested` / `in_flight` / `reviewed` / `approved` / `dropped`) and an `open` flag. The reviewer is
-part of the primary key, not a column, because a single `last_reviewed_sha` per PR lets the first
-completer stamp the PR as reviewed and silently drops a second reviewer whose run crashed.
+One row per (PR, reviewer): repository owner/name, PR **number**, the reviewing teammate, the pull
+request's **author** (step 8, STUDIO-721 — the one identity that must never be selected to review it,
+persisted because `runs` carries no identity column and the watcher substitutes reviewers long after
+the authoring run has ended), the origin that introduced the PR, `requested_sha`,
+`last_reviewed_sha`, a six-value `status`
+(`requested` / `in_flight` / `reviewed` / `approved` / `truncated` / `dropped`) and an `open` flag.
+The reviewer is part of the primary key, not a column, because a single `last_reviewed_sha` per PR
+lets the first completer stamp the PR as reviewed and silently drops a second reviewer whose run
+crashed. `truncated` is the non-terminal status a reviewer run that burned its whole turn budget
+without finishing records, so the watcher re-reviews that same head instead of shipping a partial
+review as a complete one.
 
 **How the parity golden still gates the other six tables.** `harness/fixtures/schema.sql` is
 recaptured only from the real Go daemon (`make fixtures`), so it can never be made to contain a table
@@ -531,8 +537,28 @@ never enabled Teams, and on a Go-written database opened by Rhapsody. It is iner
 subsystem is gated on `teams.enabled` (design §16), nothing outside that path writes a row, and an
 empty table changes no query, no endpoint and no payload. A database that Rhapsody has opened is no
 longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
-runs steps at or above its own `user_version`, so a v7 database is left alone rather than corrupted,
+runs steps at or above its own `user_version`, so a v8 database is left alone rather than corrupted,
 and running both daemons against one file was never supported in either direction.
+
+### A host boundary in the GitHub URL parsers (STUDIO-721)
+
+Go's `ghsummons.ParseRepo` matches `github.com` as a bare **substring** of a remote URL, so
+`https://evilgithub.com/attacker/evil` parses as `(attacker, evil)` — and so does
+`https://evil.test/github.com/attacker/evil`, in which GitHub is not the host at all. Rhapsody
+requires the match to BEGIN the URL's **authority**: it takes the whitespace-delimited token the
+match sits in, finds where that token's authority starts (after `://`, after a leading `//`, or at
+the start for a bare `github.com/o/r`), and accepts only when nothing but userinfo stands between
+that point and the match. So a look-alike host (`evilgithub.com`, `not-github.com`, the
+`sub.github.com` subdomain) is refused, and so is every URL component that merely spells the host —
+a path segment, a query value, a fragment. One rule, `ghsummons::github_host_begins_at`, is shared
+by `parse_repo` and by the room-post parser `extract_pr_urls` (Rhapsody-only, no Go counterpart), so
+the two cannot drift apart.
+
+The parsed pair is what the ticketless review subsystem compares a pull request's owner/repo against
+to decide whether it may check that pull request out and run an agent over its diff, and
+`extract_pr_urls` runs over attacker-controlled room text. A config naming a look-alike host would
+otherwise vouch for a repository on the real `github.com`. The behaviour differs from Go only for a
+URL whose host is not GitHub — a configuration that could never have cloned in either daemon.
 
 ### A third workspace shape and a review-only agent env var (STUDIO-715)
 

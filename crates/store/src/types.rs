@@ -282,6 +282,12 @@ pub const REVIEW_STATUS_REVIEWED: &str = "reviewed";
 pub const REVIEW_STATUS_APPROVED: &str = "approved";
 /// The PR left the watch set — merged, closed, or gone. Terminal; paired with `open = false`.
 pub const REVIEW_STATUS_DROPPED: &str = "dropped";
+/// The reviewer run ENDED without the agent ever declaring it had finished: it burned its whole
+/// turn budget (`max_turns`) mid-review. **Deliberately non-terminal** (STUDIO-721): the head was
+/// read only partially, so `last_reviewed_sha` is NOT advanced and the watcher re-reviews this same
+/// head. Recording such a round as [`REVIEW_STATUS_REVIEWED`] is how a partial — or entirely
+/// absent — review ships as if it had happened.
+pub const REVIEW_STATUS_TRUNCATED: &str = "truncated";
 
 /// ReviewWatchKey identifies one watch-set row: a pull request and the ONE reviewer watching it.
 ///
@@ -312,6 +318,16 @@ pub struct ReviewWatchKey {
 pub struct ReviewWatchRow {
     /// The (PR, reviewer) identity of this row.
     pub key: ReviewWatchKey,
+    /// The teammate whose handoff produced the pull request — the ONE identity that must never be
+    /// selected to review it (design §13.1, "picks a teammate … who is not the author").
+    ///
+    /// Persisted rather than re-derived because the watcher substitutes reviewers long after the
+    /// authoring run has ended: `runs` carries no identity column (the routing decision lives in
+    /// the `teams.route` event, not on the row), so by the time a capped reviewer needs replacing
+    /// there is nothing left in the daemon that knows who wrote the pull request. Empty means
+    /// UNKNOWN, and a consumer must fail closed on it rather than treat it as "nobody is the
+    /// author" — see `Orchestrator::choose_review_reviewer`.
+    pub author: String,
     /// Origin — how this PR entered the watch set (a handoff's own resolved `repo_url`, or an
     /// operator introducing it through the authenticated console). A PR coordinate is NEVER
     /// trusted from room text (design §14.1 F-SEC), so the origin is recorded, not inferred.

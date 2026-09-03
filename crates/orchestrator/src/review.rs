@@ -59,6 +59,10 @@ pub struct ReviewRun {
     pub number: i64,
     /// The reviewing teammate's Teams identity (the `rhapsody:@<name>` label's name).
     pub reviewer: String,
+    /// The teammate who AUTHORED the pull request — carried onto the watch row so a later
+    /// substitution can refuse to hand them their own pull request to review (STUDIO-721). Empty
+    /// means unknown, which the selection path fails closed on.
+    pub author: String,
     /// The reviewer's tracker team id, carried onto the synthetic issue.
     pub team_id: String,
     /// The clone URL of the pull request's repository. It comes from a TRUSTED origin — a handoff's
@@ -160,6 +164,53 @@ fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
 
+/// The synthetic issue's EXIT "state" when the reviewer found nothing worth posting — the agent
+/// declared `HANDOFF: approved` (STUDIO-721; design §15-c, "approved-pauses, push-re-arms").
+pub(crate) const REVIEW_STATE_APPROVED: &str = "review:approved";
+
+/// The synthetic issue's EXIT "state" for every other declared review completion: findings were
+/// posted, or the agent declared done without a verdict this daemon recognises.
+pub(crate) const REVIEW_STATE_FINDINGS: &str = "review:findings";
+
+/// Reads a review agent's VERDICT off its final result text, as the state a review run exits in.
+///
+/// A `pr:` key resolves to no tracker issue, so a review run has no tracker state to report and
+/// [`EvWorkerExit::last_state`](crate::retry::EvWorkerExit) would otherwise carry the empty string
+/// the synthetic issue was dispatched with. The review path gives that slot the one terminal fact a
+/// review DOES have. It is safe to do so precisely because the slot is dead on this path otherwise:
+/// its only reader is `classify_clean_exit`, which [`Orchestrator::on_review_exit`] returns before
+/// ever reaching (STUDIO-716), and the review branch below is unreachable for a run with no
+/// [`ReviewRun`].
+///
+/// The payload must be exactly `approved` (case- and whitespace-insensitive) rather than merely
+/// containing it, so that `HANDOFF: not approved` is what it says it is.
+pub(crate) fn review_exit_state(result_text: &str) -> &'static str {
+    let approved = result_text.lines().any(|ln| {
+        ln.trim()
+            .strip_prefix("HANDOFF:")
+            .is_some_and(|payload| payload.trim().eq_ignore_ascii_case("approved"))
+    });
+    if approved {
+        REVIEW_STATE_APPROVED
+    } else {
+        REVIEW_STATE_FINDINGS
+    }
+}
+
+/// The watch-set status a DECLARED review completion is recorded with, from the verdict
+/// [`review_exit_state`] put on the run's exit state.
+///
+/// Both are terminal at the reviewed head, so they pause re-review identically; they differ in what
+/// the console and the room will say about the round. An unrecognised value is `reviewed`, the
+/// conservative reading — "somebody looked and may have found something".
+fn declared_review_status(exit_state: &str) -> &'static str {
+    if exit_state == REVIEW_STATE_APPROVED {
+        REVIEW_STATUS_APPROVED
+    } else {
+        REVIEW_STATUS_REVIEWED
+    }
+}
+
 /// Canonicalizes a `rhapsody_review_watch.status` that a COMPLETED review round may be recorded
 /// with, or `None` for anything outside that closed domain (STUDIO-716).
 ///
@@ -249,6 +300,7 @@ impl Orchestrator {
         let watch_key = run.watch_key();
         if let Err(e) = self.store().save_review_watch(ReviewWatchRow {
             key: watch_key.clone(),
+            author: run.author.clone(),
             introduced_by: run.introduced_by.clone(),
             requested_sha: String::new(),
             last_reviewed_sha: String::new(),
@@ -285,7 +337,11 @@ impl Orchestrator {
             .as_ref()?
             .projects
             .iter()
-            .find(|p| !p.disabled && p.repo == repo_url)?;
+            // Spelling-insensitive, so this router and the introduction-side allowlist agree on
+            // what "the same repository" means (STUDIO-725). Today `review_repo_url` hands back the
+            // project's own `repo` string verbatim, so a raw comparison would also match — this
+            // keeps the pair correct if that binding source ever changes.
+            .find(|p| !p.disabled && crate::reviewintro::same_repository(&p.repo, repo_url))?;
         Some(DispatchRoute {
             slug: p.slug.clone(),
             group: p.group.clone(),
@@ -322,8 +378,23 @@ impl Orchestrator {
                 e.err_msg.as_str()
             };
             (store::OUTCOME_FAILED, reason)
+        } else if !e.declared_handoff {
+            // The `max_turns` backstop fired: the agent burned its whole turn budget without ever
+            // declaring it had finished, so this head was read PARTIALLY at best (STUDIO-721 — the
+            // nit carried from slice 4). Recording it `reviewed` at `head_sha` is what ships a
+            // partial — or entirely absent — review as a complete one, because the watcher's
+            // edge-trigger would then see `last_reviewed_sha == head` and never look again. The row
+            // is parked NON-terminally instead, which re-arms this same head for another round.
+            tracing::warn!(
+                review = %run.key(),
+                head = %run.head_sha,
+                "review run ended on the max_turns backstop without declaring it had finished; \
+                 recording the round as truncated so the head is reviewed again"
+            );
+            self.record_review_truncated(run);
+            (store::OUTCOME_COMPLETED, "")
         } else {
-            self.record_review_completed(run, REVIEW_STATUS_REVIEWED);
+            self.record_review_completed(run, declared_review_status(&e.last_state));
             (store::OUTCOME_COMPLETED, "")
         };
         self.persist_end_run(re, outcome, reason);
@@ -360,6 +431,19 @@ impl Orchestrator {
             .mark_review_completed(&run.watch_key(), &run.head_sha, status)
         {
             tracing::warn!(review = %run.key(), err = %e, "recording the reviewed head failed");
+        }
+    }
+
+    /// Parks a review round that ended WITHOUT the agent declaring it finished at a non-terminal
+    /// status, leaving both SHAs alone (STUDIO-721).
+    ///
+    /// Separate from [`record_review_completed`](Orchestrator::record_review_completed) because it
+    /// is the opposite bookkeeping: that one advances `last_reviewed_sha` to the head that WAS
+    /// read, and the whole point here is that nothing can be said to have been read. Best-effort
+    /// like every other store write on this path.
+    pub(crate) fn record_review_truncated(&self, run: &ReviewRun) {
+        if let Err(e) = self.store().mark_review_truncated(&run.watch_key()) {
+            tracing::warn!(review = %run.key(), err = %e, "recording the truncated review round failed");
         }
     }
 
@@ -474,6 +558,7 @@ mod tests {
             repo: "rhapsody".to_string(),
             number: 12,
             reviewer: reviewer.to_string(),
+            author: "alice".to_string(),
             team_id: "team-1".to_string(),
             repo_url: REPO_URL.to_string(),
             head_sha: head.to_string(),
@@ -793,6 +878,20 @@ mod tests {
 
     /// Hands a dispatched review its worker exit and returns the run row id it was recorded on.
     fn exit_review(o: &mut Orchestrator, run: &ReviewRun, failed: bool, err_msg: &str) -> i64 {
+        exit_review_as(o, run, failed, err_msg, true, "")
+    }
+
+    /// [`exit_review`] with the two fields the STUDIO-721 exit path reads spelled out: whether the
+    /// agent DECLARED it had finished (false ⇒ the `max_turns` backstop fired) and the verdict the
+    /// review branch of `run_turns` puts in the state slot.
+    fn exit_review_as(
+        o: &mut Orchestrator,
+        run: &ReviewRun,
+        failed: bool,
+        err_msg: &str,
+        declared_handoff: bool,
+        last_state: &str,
+    ) -> i64 {
         let id = run.key();
         let re = o.running.get(&id).expect("the review is running");
         let (started_at, run_id) = (re.started_at, re.run_id);
@@ -801,12 +900,95 @@ mod tests {
             failed,
             started_at,
             err_msg: err_msg.to_string(),
-            // A synthetic `pr:` issue has no state, so BOTH of the classifier's samples are empty —
-            // the exact input that made every clean review exit an OUTCOME_CONTINUED.
-            last_state: String::new(),
-            declared_handoff: true,
+            // A synthetic `pr:` issue has no tracker state, so BOTH of the classifier's samples are
+            // empty — the exact input that made every clean review exit an OUTCOME_CONTINUED.
+            last_state: last_state.to_string(),
+            declared_handoff,
         });
         run_id
+    }
+
+    /// STUDIO-721, the slice-4 nit: an agent that burned its whole turn budget WITHOUT declaring it
+    /// had finished read this head partially at best. Recording it `reviewed` at the pinned head is
+    /// what ships a partial — or entirely absent — review, because the watcher's edge-trigger then
+    /// sees `last_reviewed_sha == head` and never looks at this head again.
+    #[test]
+    fn a_max_turns_truncated_review_is_recorded_non_terminally() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+
+        exit_review_as(&mut o, &run, false, "", false, REVIEW_STATE_FINDINGS);
+
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("row exists");
+        assert_eq!(
+            row.status,
+            rhapsody_store::REVIEW_STATUS_TRUNCATED,
+            "a budget-ended round must not be recorded with a terminal status"
+        );
+        assert_eq!(
+            row.last_reviewed_sha, "",
+            "nothing was fully read, so no head was reviewed"
+        );
+        assert_eq!(
+            row.requested_sha, HEAD_A,
+            "the head that still needs reviewing is left in place"
+        );
+    }
+
+    /// §15-c: a review that found nothing declares `HANDOFF: approved`, and the round is recorded
+    /// `approved` at the head it read — the terminal that pauses re-review while the pull request
+    /// stays at that head.
+    #[test]
+    fn an_approving_declaration_is_recorded_approved_at_the_pinned_head() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+
+        exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_APPROVED);
+
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("row exists");
+        assert_eq!(row.status, REVIEW_STATUS_APPROVED);
+        assert_eq!(row.last_reviewed_sha, HEAD_A);
+    }
+
+    /// The verdict is read off the agent's OWN hand-off line, and only an exact `approved` payload
+    /// counts — so `HANDOFF: not approved` is what it says it is rather than an approval.
+    #[test]
+    fn only_an_exact_approved_payload_reads_as_an_approval() {
+        for approving in [
+            "HANDOFF: approved",
+            "posted nothing\n  HANDOFF:  Approved  ",
+            "HANDOFF:approved",
+        ] {
+            assert_eq!(
+                review_exit_state(approving),
+                REVIEW_STATE_APPROVED,
+                "{approving:?}"
+            );
+        }
+        for not_approving in [
+            "",
+            "HANDOFF: not approved",
+            "HANDOFF: review-posted",
+            "HANDOFF: approved with nits",
+            "approved",
+            "I approved of the change\nHANDOFF: 3 findings",
+        ] {
+            assert_eq!(
+                review_exit_state(not_approving),
+                REVIEW_STATE_FINDINGS,
+                "{not_approving:?}"
+            );
+        }
     }
 
     /// F4, the acceptance criterion: a clean review exit is recorded COMPLETED and schedules no

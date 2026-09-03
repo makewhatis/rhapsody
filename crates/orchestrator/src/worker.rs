@@ -517,12 +517,21 @@ impl WorkerDeps {
             // `max_turns` stays the backstop for an agent that never declares — bounded, and the
             // exit classifier records a review run completed rather than scheduling the
             // continuation retry that would re-dispatch it forever (see `retry::on_review_exit`).
+            // Whether the budget or the declaration ended the loop is what `declared_handoff` tells
+            // the exit path, which records a budget-ended round as a NON-terminal `truncated` one
+            // so the watcher reviews that head again (STUDIO-721).
+            //
+            // The state a review run returns is the agent's own VERDICT rather than a tracker state
+            // (`crate::review::review_exit_state`): a `pr:` key resolves to no ticket, so the slot
+            // is otherwise dead on this path, and the verdict is what decides whether the watch row
+            // is recorded `approved` or `reviewed`.
             //
             // `review` unset ⇒ this whole block is inert, i.e. byte-identical to a daemon built
             // before review mode.
             if self.review.is_some() {
                 if has_handoff_marker(&last_result) || turn >= self.max_turns {
-                    return (issue.state.clone(), last_result, None);
+                    let verdict = crate::review::review_exit_state(&last_result);
+                    return (verdict.to_string(), last_result, None);
                 }
                 turn += 1;
                 continue;
@@ -1428,7 +1437,12 @@ mod tests {
             has_handoff_marker(&result),
             "the declaring turn's text is the freshest result"
         );
-        assert_eq!(last, "", "a synthetic review issue carries no state");
+        assert_eq!(
+            last,
+            crate::review::REVIEW_STATE_FINDINGS,
+            "a synthetic review issue carries no tracker state, so the slot carries the agent's \
+             verdict instead — and `HANDOFF: review-posted` is not an approval"
+        );
     }
 
     // The inertness half of STUDIO-716: with `review` unset the loop is byte-identical — the

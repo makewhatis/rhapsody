@@ -133,6 +133,9 @@ impl Store for Noop {
     ) -> Result<(), StoreError> {
         Ok(())
     }
+    fn mark_review_truncated(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn drop_review_watch(&self, _key: &ReviewWatchKey) -> Result<(), StoreError> {
         Ok(())
     }
@@ -143,6 +146,9 @@ impl Store for Noop {
         Ok(None)
     }
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
         Ok(Vec::new())
     }
 

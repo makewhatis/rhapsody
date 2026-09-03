@@ -238,6 +238,18 @@ pub trait Store {
         status: &str,
     ) -> Result<(), StoreError>;
 
+    /// Records that a reviewer run ENDED without finishing its round — it burned its whole turn
+    /// budget mid-review — by parking `status` at [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER
+    /// SHA column (STUDIO-721).
+    ///
+    /// Deliberately not a `mark_review_completed` with a third status: that method's contract is to
+    /// advance `last_reviewed_sha`, and advancing it here is precisely the bug — the head was read
+    /// only partially, so a watcher reading `last_reviewed_sha == head` would consider a partial
+    /// review sufficient and never look at that head again. Leaving both SHAs alone keeps the row
+    /// non-terminal, which is what re-arms the same head for another round. A no-op when the row is
+    /// absent.
+    fn mark_review_truncated(&self, key: &ReviewWatchKey) -> Result<(), StoreError>;
+
     /// Drops one (PR, reviewer) row out of the watch set: clears `open` and parks `status` at
     /// [`REVIEW_STATUS_DROPPED`]. The terminal for Slice 1's `MERGED` / `CLOSED` / gone states.
     /// Both SHAs are left intact as the record of what was reviewed. Idempotent, and a no-op when
@@ -254,6 +266,17 @@ pub trait Store {
     /// is the watcher's rule (Slice 5), not the store's, and folding that filter in here would
     /// hide a row that a later rule cares about.
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
+
+    /// Only the rows still worth watching: `open` and not `dropped`. The watcher's hot paths run
+    /// this once per tick and once per observation, and they all apply exactly this predicate the
+    /// moment they get the rows back — so applying it in SQL costs nothing and stops a retired row
+    /// being deserialized forever (STUDIO-727).
+    ///
+    /// It matters because a retirement is a SOFT delete: [`Store::drop_review_watch`] sets
+    /// `status = 'dropped', open = 0` and [`Store::prune`] never touches this table, so the dead
+    /// rows are permanent. Callers whose predicate is genuinely broader — retirement, which must
+    /// also see a closed-but-undropped row — still use [`Store::load_review_watch`].
+    fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
 
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).

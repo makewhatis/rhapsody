@@ -666,6 +666,12 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.0.mark_review_completed(key, sha, status)
         }
+        fn mark_review_truncated(
+            &self,
+            key: &rhapsody_store::ReviewWatchKey,
+        ) -> Result<(), StoreError> {
+            self.0.mark_review_truncated(key)
+        }
         fn drop_review_watch(
             &self,
             key: &rhapsody_store::ReviewWatchKey,
@@ -680,6 +686,11 @@ mod tests {
         }
         fn load_review_watch(&self) -> Result<Vec<rhapsody_store::ReviewWatchRow>, StoreError> {
             self.0.load_review_watch()
+        }
+        fn load_live_review_watch(
+            &self,
+        ) -> Result<Vec<rhapsody_store::ReviewWatchRow>, StoreError> {
+            self.0.load_live_review_watch()
         }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)
