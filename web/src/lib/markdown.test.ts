@@ -166,9 +166,17 @@ describe("parseMarkdown — inline", () => {
   });
 
   it("leaves a link with an unsafe scheme as literal text", () => {
-    expect(inline("[click](javascript:alert(1))")).toEqual([
-      { type: "text", text: "[click](javascript:alert(1))" },
-    ]);
+    // The paren-free spellings are the ones that actually reach the guard. `LINK`'s href group
+    // excludes parentheses, so `javascript:alert(1)` fails the REGEX and never consults
+    // `safeHref` at all — a test written only that way passes even with the guard deleted.
+    for (const src of [
+      "[click](javascript:alert1)",
+      "[x](data:text/html,<script>alert1</script>)",
+      "[click](JaVaScRiPt:alert1)",
+      "[click](javascript:alert(1))",
+    ]) {
+      expect(inline(src), src).toEqual([{ type: "text", text: src }]);
+    }
   });
 
   it("keeps raw angle brackets as text — never as markup", () => {

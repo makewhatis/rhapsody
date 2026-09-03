@@ -92,9 +92,17 @@ describe("Markdown", () => {
   });
 
   it("refuses a javascript: link and shows the text the agent wrote instead", () => {
-    const { container } = render(<Markdown source="[click](javascript:alert(1))" />);
-    expect(container.querySelector("a")).toBeNull();
-    expect(container.textContent).toBe("[click](javascript:alert(1))");
+    // `javascript:alert(1)` never reaches `safeHref` — the link regex rejects the parens first —
+    // so only a paren-free payload exercises the render-path guard this assertion is here for.
+    for (const src of [
+      "[click](javascript:alert1)",
+      "[x](data:text/html,<script>alert1</script>)",
+      "[click](javascript:alert(1))",
+    ]) {
+      const { container } = render(<Markdown source={src} />);
+      expect(container.querySelector("a"), src).toBeNull();
+      expect(container.textContent, src).toBe(src);
+    }
   });
 
   it("renders a lead node inline with the first paragraph", () => {
