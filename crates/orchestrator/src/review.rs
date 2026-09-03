@@ -337,7 +337,11 @@ impl Orchestrator {
             .as_ref()?
             .projects
             .iter()
-            .find(|p| !p.disabled && p.repo == repo_url)?;
+            // Spelling-insensitive, so this router and the introduction-side allowlist agree on
+            // what "the same repository" means (STUDIO-725). Today `review_repo_url` hands back the
+            // project's own `repo` string verbatim, so a raw comparison would also match — this
+            // keeps the pair correct if that binding source ever changes.
+            .find(|p| !p.disabled && crate::reviewintro::same_repository(&p.repo, repo_url))?;
         Some(DispatchRoute {
             slug: p.slug.clone(),
             group: p.group.clone(),

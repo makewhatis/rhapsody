@@ -571,6 +571,13 @@ impl Orchestrator {
             if self.running.contains_key(&id) || self.claimed.contains(&id) {
                 continue;
             }
+            // Racing a watcher tick is safe TODAY, and only for a reason worth writing down: the
+            // tick decides from a snapshot loaded before this write, so it may still be holding the
+            // pre-arm row — but `review_round_due` returns the same verdict for every status this
+            // re-arm can replace (`requested`/`in_flight`/`truncated` already answer "due", and the
+            // two terminals are re-armed only when `last_reviewed_sha != head`, which is exactly
+            // what they answer "due" on). A future status that keys off `requested_sha` would break
+            // that invariance and needs a re-read here, not a stale snapshot.
             let armed_row = ReviewWatchRow {
                 status: REVIEW_STATUS_REQUESTED.to_string(),
                 open: true,
@@ -589,11 +596,16 @@ impl Orchestrator {
     /// Whether `owner/repo` is a repository this daemon is configured for — the watched-repo
     /// allowlist (§15-a), and the reason a pull-request coordinate is never taken on trust.
     ///
-    /// Every ENABLED project's `repo`, plus the top-level `repo` that the legacy single-project
-    /// config form carries instead of a `projects:` block. Comparison is on the parsed
-    /// `owner/repo` rather than on the URL text, so `git@github.com:o/r.git` and
-    /// `https://github.com/o/r` are the same repository — which they are — and case-insensitively,
-    /// because GitHub logins and repository names are.
+    /// Every ENABLED project's `repo`, and — only for a configuration that resolved to no projects
+    /// at all — the top-level `repo`. Comparison is on the parsed `owner/repo` rather than on the
+    /// URL text, so `git@github.com:o/r.git` and `https://github.com/o/r` are the same repository
+    /// — which they are — and case-insensitively, because GitHub logins and repository names are.
+    ///
+    /// The top-level fallback is narrow on purpose (STUDIO-725). `resolve_projects` inherits the
+    /// top-level `repo:` into every project that declares none, and synthesizes a project even for
+    /// the legacy single-project form, so whenever `projects` is non-empty the ONLY state in which
+    /// `cfg.repo` matches while no enabled project does is a PAUSED project — and re-admitting a
+    /// repository the operator explicitly paused is the one thing this guard exists to refuse.
     pub(crate) fn review_repo_is_configured(&self, owner: &str, repo: &str) -> bool {
         let Some(eff) = self.eff.as_ref() else {
             return false;
@@ -602,7 +614,27 @@ impl Orchestrator {
             crate::ghsummons::parse_repo(url)
                 .is_some_and(|(o, r)| o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo))
         };
-        eff.projects.iter().any(|p| !p.disabled && matches(&p.repo)) || matches(&eff.cfg.repo)
+        eff.projects.iter().any(|p| !p.disabled && matches(&p.repo))
+            || (eff.projects.is_empty() && matches(&eff.cfg.repo))
+    }
+}
+
+/// Whether two repository bindings name the SAME GitHub repository — the spelling-insensitive
+/// comparison the watched-repo allowlist uses, lifted so the dispatch-side router can share it
+/// (STUDIO-725, jimmy's finding #6). `git@github.com:o/r.git` and `https://github.com/o/r` are one
+/// repository, and logins and repository names are case-insensitive.
+///
+/// A binding neither side can parse (a non-GitHub remote) falls back to exact text equality, so a
+/// caller never loses a match it used to have.
+pub(crate) fn same_repository(a: &str, b: &str) -> bool {
+    match (
+        crate::ghsummons::parse_repo(a),
+        crate::ghsummons::parse_repo(b),
+    ) {
+        (Some((ao, ar)), Some((bo, br))) => {
+            ao.eq_ignore_ascii_case(&bo) && ar.eq_ignore_ascii_case(&br)
+        }
+        _ => a == b,
     }
 }
 
@@ -695,6 +727,8 @@ mod tests {
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const OTHER_URL: &str = "https://github.com/attacker/evil.git";
+    /// A second, ENABLED project's repository — the live half of a multi-project allowlist.
+    const LIVE_URL: &str = "https://github.com/makewhatis/podium.git";
     const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -734,6 +768,22 @@ mod tests {
         o.set_store(Arc::new(
             Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
         ));
+        o
+    }
+
+    /// The multi-project shape the paused-project allowlist property needs: the project owning
+    /// [`REPO_URL`] is PAUSED, a second project owning another repository is live, and the
+    /// top-level `repo:` still names [`REPO_URL`] exactly as `resolve_projects` would have
+    /// inherited it into a project that declares none.
+    fn orch_with_paused_owner(teams: Teams) -> Orchestrator {
+        let mut o = orch(teams);
+        let mut live = empty_resolved_project("podium", Arc::new(Fake::new()));
+        live.repo = LIVE_URL.to_string();
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.repo = REPO_URL.to_string();
+            eff.projects[0].disabled = true;
+            eff.projects.push(live);
+        }
         o
     }
 
@@ -859,9 +909,16 @@ mod tests {
         );
     }
 
-    /// **F-SEC at the plan.** A run bound to a repository no configured project owns introduces
+    /// **F-SEC at the plan.** A run bound to a repository no ENABLED project owns introduces
     /// nothing — the allowlist is the configuration, exactly as `find_issue` refuses a key that is
     /// not on a project this team works.
+    ///
+    /// The paused arm is the one that has to be pinned on a REAL configuration shape (STUDIO-725).
+    /// `resolve_projects` inherits the top-level `repo:` into a project that declares none, so on
+    /// any live multi-project config `cfg.repo` equals some project's repository — which means an
+    /// unconditional `cfg.repo` fallback re-admits precisely the project the operator paused. A
+    /// fixture that leaves `cfg.repo` empty asserts the property and proves nothing, so
+    /// [`orch_with_paused_owner`] populates it.
     #[test]
     fn an_off_allowlist_repository_binding_plans_no_introduction() {
         let o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
@@ -869,16 +926,27 @@ mod tests {
             o.plan_review_intro(&teammate_run("alice", OTHER_URL))
                 .is_none()
         );
-        // A DISABLED project's repository is not on the allowlist either: it is configuration this
-        // daemon was told to stop acting on.
-        let mut disabled = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
-        if let Some(eff) = disabled.eff.as_mut() {
-            eff.projects[0].disabled = true;
-        }
+        // A PAUSED project's repository is not on the allowlist either: it is configuration this
+        // daemon was told to stop acting on, and the still-populated top-level `repo:` naming it
+        // does not put it back.
+        let paused =
+            orch_with_paused_owner(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
         assert!(
-            disabled
+            !paused.eff.as_ref().expect("effective").cfg.repo.is_empty(),
+            "the fixture must exercise a POPULATED top-level repo, else it proves nothing"
+        );
+        assert!(
+            paused
                 .plan_review_intro(&teammate_run("alice", REPO_URL))
                 .is_none()
+        );
+        assert!(
+            !paused.review_repo_is_configured("makewhatis", "rhapsody"),
+            "a paused project's repository is off the allowlist"
+        );
+        assert!(
+            paused.review_repo_is_configured("makewhatis", "podium"),
+            "the live project alongside it still is"
         );
     }
 
