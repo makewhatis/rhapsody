@@ -91,7 +91,7 @@
 //! therefore leave David's ruling unmet on a fresh install, which is why
 //! [`ManagerMode`](rhapsody_config::teams::ManagerMode)'s default moved.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -608,7 +608,7 @@ async fn act_on_post(
     // possibly a `gh` call spent on a post the floor was always going to answer deterministically.
     let facts = gather_facts(teams, cycle, post, &keys).await;
     let (targets, offered) = if keys.is_empty() {
-        (Vec::new(), false)
+        (Vec::new(), BTreeSet::new())
     } else {
         plan_targets(teams, ears, cycle, post, &keys, &facts).await
     };
@@ -754,10 +754,10 @@ async fn resolve_keys(ears: &Ears, cycle: &EarsCycle<'_>, body: &str) -> (Vec<St
 /// Decides the intent for each key: the model when there is one to ask, the deterministic floor when
 /// there is not. Either way the KEYS are the ones extracted above and nothing else.
 ///
-/// Returns the prompt's [`RoomPrompt::offers_answer`] alongside the targets, because this is the
-/// only place it is known and [`answer_for`] is where it is needed. It describes the PROMPT, not
-/// the targets, so it is `false` only when no prompt was composed at all — the two deterministic
-/// fallbacks below still report what the turn was actually offered, which costs nothing either way
+/// Returns the prompt's [`RoomPrompt::answers_for`] alongside the targets, because this is the only
+/// place it is known and [`answer_for`] is where it is needed. It describes the PROMPT, not the
+/// targets, so it is empty only when no prompt was composed at all — the two deterministic
+/// fallbacks below still report what the turn was actually shown, which costs nothing either way
 /// because [`floor_target`] can never choose [`Intent::Answer`].
 async fn plan_targets(
     teams: &Teams,
@@ -766,13 +766,13 @@ async fn plan_targets(
     post: &Message,
     keys: &[String],
     facts: &Facts,
-) -> (Vec<Target>, bool) {
+) -> (Vec<Target>, BTreeSet<String>) {
     let floor = || keys.iter().map(|k| floor_target(cycle, k)).collect();
     if !cycle.model || teams.manager.mode != ManagerMode::LabelsModel {
-        return (floor(), false);
+        return (floor(), BTreeSet::new());
     }
     let prompt = build_room_prompt(teams, cycle, post, keys, facts);
-    let offers_answer = prompt.offers_answer;
+    let answers_for = prompt.answers_for;
     let req = TriageRequest {
         command: cycle.agent_command.to_string(),
         billing_guard: cycle.billing_guard,
@@ -787,9 +787,9 @@ async fn plan_targets(
             if validated.is_empty() {
                 // A turn that named nothing usable is a turn that failed, not a turn that meant
                 // "do nothing" — the floor still owes this post an answer.
-                (floor(), offers_answer)
+                (floor(), answers_for)
             } else {
-                (validated, offers_answer)
+                (validated, answers_for)
             }
         }
         Err(e) => {
@@ -798,7 +798,7 @@ async fn plan_targets(
                 err = %e,
                 "teams manager's room turn failed; answering this post from the deterministic floor"
             );
-            (floor(), offers_answer)
+            (floor(), answers_for)
         }
     }
 }
@@ -911,17 +911,17 @@ impl Done {
     }
 }
 
-/// Everything an [`Intent::Answer`] may be composed from: the gather, and whether the prompt
-/// actually SHOWED it to the turn.
+/// Everything an [`Intent::Answer`] may be composed from: the gather, and which keys the prompt
+/// actually SHOWED the turn.
 ///
 /// They travel together because either one alone licenses a reply nothing stands behind — a gather
-/// that resolved but was dropped for budget looks identical, from the reply's side, to one that
-/// reached the model.
+/// that resolved but whose records were dropped for budget looks identical, from the reply's side,
+/// to one that reached the model.
 struct Answerable<'a> {
     /// What [`gather_facts`] returned, gathered once for both the prompt and the reply.
     facts: &'a Facts,
-    /// [`RoomPrompt::offers_answer`], carried down from the prompt that was actually sent.
-    offered: bool,
+    /// [`RoomPrompt::answers_for`], carried down from the prompt that was actually sent.
+    offered: BTreeSet<String>,
 }
 
 /// The lines ONE [`Intent::Answer`] target contributes — the model's own prose ON TOP OF the host's
@@ -947,7 +947,7 @@ fn answer_for(target: &Target, answerable: &Answerable<'_>) -> String {
     // second half to stand under the prose, and a block the BUDGET dropped never reached the turn
     // at all — so whatever it wrote about that key, it wrote from an empty prompt. Either way the
     // host's own line answers on its own.
-    if !answerable.offered || !facts.resolved(&target.key) {
+    if !answerable.offered.contains(&target.key) || !facts.resolved(&target.key) {
         return grounded;
     }
     let allowed = facts.allowed_for(&target.key);
@@ -1676,12 +1676,12 @@ pub(crate) fn build_room_prompt(
     // with no accessor, for the same reason. The re-composed header is strictly SHORTER than the
     // one already measured, so it cannot reintroduce the overflow it is resolving.
     let mut s = match floor_head {
-        Some(f) if block.is_empty() => f,
+        Some(f) if block.text.is_empty() => f,
         _ => head,
     };
     // Empty for every prompt that gathered nothing, which is what keeps the `labels`-only and
     // teams-off shapes byte-identical to their pre-STUDIO-731 selves.
-    s.push_str(&block);
+    s.push_str(&block.text);
     s.push_str(&tail);
     RoomPrompt {
         // A formality whenever the head itself fits: both sections below it were sized against what
@@ -1690,22 +1690,27 @@ pub(crate) fn build_room_prompt(
         // `MIN_PROMPT_BYTES` — and there the cut lands inside the rules themselves, which no
         // ordering of the sections under them can fix.
         text: truncate_chars(&s, budget),
-        offers_answer: !block.is_empty(),
+        answers_for: block.shown,
     }
 }
 
-/// A composed room prompt, and whether it actually OFFERED the turn the `answer` intent.
+/// A composed room prompt, and which keys it actually SHOWED the turn records for.
 ///
-/// The flag is carried out rather than re-derived because nothing downstream can recompute it:
-/// [`Facts::resolved`] says a GATHER happened, this says the block survived the budget and reached
-/// the turn, and at a lowered `manager.max_tokens` those differ. [`answer_for`] needs the second
-/// one — a turn that answers from a records section it was never shown had nothing to compose
-/// from, whatever it wrote.
+/// The set is carried out rather than re-derived because nothing downstream can recompute it:
+/// [`Facts::resolved`] says a GATHER happened, this says the key's records survived the budget and
+/// reached the turn, and at a lowered `manager.max_tokens` those differ. [`answer_for`] needs the
+/// second one — a turn that answers from records it was never shown had nothing to compose from,
+/// whatever it wrote.
+///
+/// **Per key, not one bool for the prompt.** [`Facts::render`] fills front-to-back and stops, so a
+/// multi-key post shows some keys and drops others; a prompt-wide "the block rendered" would be
+/// true for every one of the dropped ones.
 pub(crate) struct RoomPrompt {
     /// The prompt text, already truncated to the manager's budget.
     pub(crate) text: String,
-    /// Whether the facts block rendered, which is exactly when the `answer` intent was offered.
-    pub(crate) offers_answer: bool,
+    /// The keys whose records the facts block actually carried — exactly the keys for which the
+    /// `answer` intent was offered with something behind it.
+    pub(crate) answers_for: BTreeSet<String>,
 }
 
 /// Everything the post's DATA section says before the untrusted body — §0.11.5 requirement 1's
@@ -1734,10 +1739,12 @@ const POST_CLOSE: &str = "\n```\n";
 /// turn on an outcome that can only degrade to "I have no record of that", which is a worse reply
 /// than the deterministic one it replaced.
 ///
-/// That is the courtesy; the guard is [`Answerable::offered`], which carries this SAME condition
-/// down to [`answer_for`] so the two can never disagree. Models emit values they were not offered —
-/// that is why [`validate_targets`] exists for keys and assignees — and an `answer` composed
-/// against a records section the prompt never rendered is prose with provably nothing behind it.
+/// That is the courtesy, and it is prompt-wide because the ADVERTISED intent is. The guard is
+/// [`Answerable::offered`], and it is finer: the block is dropped per KEY, so the guard names the
+/// keys whose records actually reached the turn rather than asserting that some did. Models emit
+/// values they were not offered — that is why [`validate_targets`] exists for keys and assignees —
+/// and an `answer` about a key whose records the prompt never rendered is prose with provably
+/// nothing behind it, whatever the rest of the block showed.
 fn room_prompt_head(
     teams: &Teams,
     cycle: &EarsCycle<'_>,
@@ -1952,9 +1959,10 @@ mod tests {
 
     // ── scaffolding ─────────────────────────────────────────────────────────────────────────────
 
-    /// The composed prompt's TEXT. The prompt asserted on and the flag carried to [`answer_for`]
-    /// come out of the same call, so a test that reads only the prose still reads the real one —
-    /// `offers_answer` is observable in the text anyway, as the `|answer` intent it advertises.
+    /// The composed prompt's TEXT. The prompt asserted on and the key set carried to
+    /// [`answer_for`] come out of the same call, so a test that reads only the prose still reads
+    /// the real one — `answers_for` is observable in the text anyway, as the `|answer` intent it
+    /// advertises and the per-key headings it renders.
     fn room_prompt_text(
         teams: &Teams,
         cycle: &EarsCycle<'_>,
@@ -4252,6 +4260,79 @@ mod tests {
         assert!(
             body.contains("STUDIO-725") && body.contains("completed"),
             "and the host's own records answer instead of silence: {body:?}"
+        );
+    }
+
+    /// **The same guard at the granularity the block is actually dropped: PER KEY.**
+    ///
+    /// [`Facts::render`] fills front-to-back across per-key groups and stops at the first chunk that
+    /// does not fit, so a multi-key post routinely renders some keys and drops others. A prompt-wide
+    /// "the block rendered" bool is TRUE for every dropped key, and so is `Facts::resolved` — the
+    /// gather succeeded for all of them. Both halves of the guard would pass for a key the turn
+    /// provably never saw a record for, and the manager would answer about it from nothing, above
+    /// records that say otherwise.
+    ///
+    /// Multi-key is the ordinary case, not the corner: `extract_keys_capped` admits up to 32. The
+    /// single-key test above cannot see this, because there "the block rendered" and "this key
+    /// rendered" are the same fact.
+    #[tokio::test]
+    async fn an_answer_about_a_key_the_block_dropped_is_not_posted() {
+        let fx = Fixture::new(tracker_with_viewer());
+        fx.operator_says("What were the results of STUDIO-725 and STUDIO-724?");
+        let mut t = teams(&["alice"], ManagerMode::LabelsModel);
+        // Enough for the block and the FIRST key's records, not enough for the second's — the
+        // premise, asserted on the real prompt below rather than assumed.
+        t.manager.max_tokens = 860;
+        let issues = vec![in_review("STUDIO-654")];
+        let owner = owner_of(&issues);
+        let trackers: Vec<Arc<dyn Tracker>> = vec![Arc::clone(&fx.tracker) as Arc<dyn Tracker>];
+        let (st, f, load) = (states(), facts(), HashMap::new());
+        let know = Know::new(&["alice"], Box::new(NoneBackend));
+        know.seed_run("STUDIO-725", "completed");
+        know.seed_run("STUDIO-724", "completed");
+        let k = know.knowledge(&issues, fx.room.as_ref());
+        // The turn answers about the key whose records were DROPPED, and names only that key — so
+        // it resolves, the key vet admits it, and only the per-key guard can refuse it.
+        let arb = answering_with(
+            "STUDIO-724",
+            "STUDIO-724 was abandoned after a data-loss incident.",
+        );
+        let ears = fx.ears(Arc::clone(&arb) as Arc<dyn RoomArbiter>);
+
+        let report = ears_pass(
+            &t,
+            fx.room.as_ref(),
+            &ears,
+            &cycle_knowing(cycle(&issues, &owner, &trackers, &st, &f, &load, true), &k),
+        )
+        .await;
+
+        let prompts = arb.prompts();
+        assert_eq!(prompts.len(), 1, "one turn: {prompts:?}");
+        let p = &prompts[0];
+        assert!(
+            p.contains("|answer") && p.contains("### STUDIO-725"),
+            "the premise: the block rendered and the answer intent WAS offered:\n{p}"
+        );
+        assert!(
+            !p.contains("### STUDIO-724"),
+            "the premise: this key's own group was dropped for budget:\n{p}"
+        );
+        assert_eq!(
+            (report.filed, report.assigned, report.relayed),
+            (0, 0, 0),
+            "an answer writes nothing whatever the budget"
+        );
+        let bodies = fx.reply_bodies();
+        assert_eq!(bodies.len(), 1, "one reply: {bodies:?}");
+        let body = &bodies[0];
+        assert!(
+            !body.contains("abandoned after a data-loss incident"),
+            "prose about a key whose records the turn never saw must not be posted: {body:?}"
+        );
+        assert!(
+            body.contains("STUDIO-724") && body.contains("completed"),
+            "and the host's own records answer for it instead of silence: {body:?}"
         );
     }
 

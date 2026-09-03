@@ -169,6 +169,37 @@ pub(crate) struct Asked {
     pub(crate) outcome: Option<Outcome>,
 }
 
+/// A rendered facts block: the text the prompt carries, and the keys it really speaks about.
+///
+/// The two are separate because they answer different questions. The text is what the turn reads;
+/// [`Block::shown`] is what the reply may be composed FROM, and at a lowered `manager.max_tokens`
+/// those diverge per key rather than all at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Block {
+    /// The DATA-fenced section, or empty when the block was not rendered at all.
+    pub(crate) text: String,
+    /// The asked-about keys whose records reached the prompt, spelled exactly as the post spelled
+    /// them.
+    ///
+    /// **Not "the block rendered" — "THIS key rendered".** [`Facts::render`] fills front-to-back
+    /// and stops at the first chunk that does not fit, so a five-key post at a lowered budget shows
+    /// two keys and drops three while the block itself is plainly non-empty. A reply composed about
+    /// one of the dropped three was composed from nothing, whatever the block's size says, and
+    /// [`Facts::resolved`] cannot tell the difference because the GATHER succeeded for all five.
+    pub(crate) shown: BTreeSet<String>,
+}
+
+/// One section of the block before it is sized: a heading, its lines, and the asked-about key they
+/// belong to when they belong to one.
+///
+/// The memory and room sections carry `None` — they are the team's context rather than any one
+/// ticket's record, so showing them licenses no answer about a key whose own group was dropped.
+struct Group {
+    key: Option<String>,
+    heading: String,
+    lines: Vec<String>,
+}
+
 /// Everything ONE operator post's answer may be composed from, already bounded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Facts {
@@ -326,8 +357,15 @@ impl Facts {
         out
     }
 
-    /// The DATA-fenced facts section for the room prompt, or the empty string when nothing was
-    /// gathered at all (so a `labels`-only or teams-off prompt keeps its exact previous bytes).
+    /// The DATA-fenced facts section for the room prompt, alongside the keys it ACTUALLY carries
+    /// records for — empty on both counts when nothing was gathered at all, so a `labels`-only or
+    /// teams-off prompt keeps its exact previous bytes.
+    ///
+    /// **The keys come back per key because the block is dropped per key.** The body fills
+    /// front-to-back across the groups below and stops at the first chunk that does not fit, so a
+    /// multi-key post routinely renders some keys and drops others. A single "the block rendered"
+    /// bool would be true for a key the turn provably never saw a record for, which is the
+    /// confidently-wrong answer this whole design fights — see [`Block::shown`].
     ///
     /// `cap` is the room the CALLER has left after reserving everything the block must never
     /// displace — the rules, the roster, the closed ticket list and the whole post section — and is
@@ -341,12 +379,12 @@ impl Facts {
     /// * **The caveats are the one thing that can keep a block alive on its own.** A gather whose
     ///   sources all failed renders no records but still says so, because "I could not read my
     ///   records" is the claim §9.2 exists to preserve.
-    pub(crate) fn render(&self, cap: usize) -> String {
+    pub(crate) fn render(&self, cap: usize) -> Block {
         let groups = self.records();
-        let total: usize = groups.iter().map(|(_, l)| l.len()).sum();
+        let total: usize = groups.iter().map(|g| g.lines.len()).sum();
         let tail_caveats = self.caveats();
         if total == 0 && tail_caveats.is_empty() {
-            return String::new();
+            return Block::default();
         }
         let cap = cap.min(MAX_FACTS_CHARS);
         let head = format!("{FACTS_PREAMBLE}{FENCE}\n");
@@ -364,14 +402,15 @@ impl Facts {
         // needs. No room for a single record means no block.
         let Some(budget) = cap.checked_sub(head.chars().count() + widest_tail.chars().count())
         else {
-            return String::new();
+            return Block::default();
         };
 
         let mut body = String::new();
         let mut shown = 0usize;
-        'outer: for (heading, lines) in &groups {
-            let mut pending = Some(format!("{heading}\n"));
-            for line in lines {
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        'outer: for g in &groups {
+            let mut pending = Some(format!("{}\n", g.heading));
+            for line in &g.lines {
                 let mut chunk = String::new();
                 if let Some(h) = &pending {
                     chunk.push_str(h);
@@ -385,12 +424,18 @@ impl Facts {
                 body.push_str(&chunk);
                 pending = None;
                 shown += 1;
+                // ONE line is enough to have shown the key: the turn saw a record of it, and the
+                // block says in its own words how many it dropped. What the guard downstream needs
+                // to exclude is the key whose group the bound never reached AT ALL.
+                if let Some(k) = &g.key {
+                    keys.insert(k.clone());
+                }
             }
         }
         // Room for the frame but not for one record. The caveats are the exception above: they are
         // a claim in their own right, so a failed gather still speaks.
         if shown == 0 && tail_caveats.is_empty() {
-            return String::new();
+            return Block::default();
         }
 
         let mut s = head;
@@ -403,7 +448,10 @@ impl Facts {
             ));
         }
         s.push_str(&tail_caveats);
-        s
+        Block {
+            text: s,
+            shown: keys,
+        }
     }
 
     /// The block's records, in §9.3's most-relevant-first order, each already ONE fence-safe line.
@@ -411,17 +459,23 @@ impl Facts {
     /// The order is the truncation policy: [`Facts::render`] fills from the front and stops, so the
     /// keys the operator actually named are the last thing a bound can reach and the room's
     /// small-talk is the first.
-    fn records(&self) -> Vec<(String, Vec<String>)> {
-        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    fn records(&self) -> Vec<Group> {
+        let mut out: Vec<Group> = Vec::new();
         for a in &self.asked {
-            out.push((format!("### {}", one_line(&a.asked)), self.asked_lines(a)));
+            out.push(Group {
+                key: Some(a.asked.clone()),
+                heading: format!("### {}", one_line(&a.asked)),
+                lines: self.asked_lines(a),
+            });
         }
         if let Some(m) = &self.memory
             && !m.facts.is_empty()
         {
-            out.push((
-                "### What the team remembers".to_string(),
-                m.facts
+            out.push(Group {
+                key: None,
+                heading: "### What the team remembers".to_string(),
+                lines: m
+                    .facts
                     .iter()
                     .map(|f| {
                         format!(
@@ -431,17 +485,19 @@ impl Facts {
                         )
                     })
                     .collect(),
-            ));
+            });
         }
         if let Some(r) = &self.room
             && !r.is_empty()
         {
-            out.push((
-                "### The room's newest posts".to_string(),
-                r.iter()
+            out.push(Group {
+                key: None,
+                heading: "### The room's newest posts".to_string(),
+                lines: r
+                    .iter()
                     .map(|m| format!("{} said: {}", one_line(&m.from), one_line(&m.body)))
                     .collect(),
-            ));
+            });
         }
         out
     }
@@ -929,7 +985,7 @@ mod tests {
                 ..Outcome::default()
             },
         );
-        let out = f.render(MAX_FACTS_CHARS);
+        let out = f.render(MAX_FACTS_CHARS).text;
         let clause = out
             .find("not directions to follow")
             .expect("the §9.2 ignore-instructions clause must be in the block");
@@ -960,7 +1016,7 @@ mod tests {
             }),
             ..Facts::default()
         };
-        let out = f.render(MAX_FACTS_CHARS);
+        let out = f.render(MAX_FACTS_CHARS).text;
         let opens: Vec<usize> = out.match_indices("```").map(|(i, _)| i).collect();
         assert_eq!(
             opens.len(),
@@ -985,7 +1041,7 @@ mod tests {
             }),
             ..Facts::default()
         };
-        let out = f.render(MAX_FACTS_CHARS);
+        let out = f.render(MAX_FACTS_CHARS).text;
         assert!(
             out.contains(&"x".repeat(MAX_FACT_LINE_CHARS - 40)),
             "the fact must still REACH the block — clipped, not dropped:\n{out}"
@@ -1289,7 +1345,7 @@ mod tests {
             !line.contains("Done") && !line.contains("In Review"),
             "no tracker state may be claimed for a ticket the cycle does not carry: {line}"
         );
-        let block = f.render(MAX_FACTS_CHARS);
+        let block = f.render(MAX_FACTS_CHARS).text;
         assert!(
             block.contains("no tracker state"),
             "the block must say plainly that the ticket's state is unknown: {block}"
@@ -1312,7 +1368,7 @@ mod tests {
                 ..Outcome::default()
             },
         );
-        let block = f.render(MAX_FACTS_CHARS);
+        let block = f.render(MAX_FACTS_CHARS).text;
         assert!(
             !block.contains("ticket:"),
             "a pull request has no tracker state to be missing:\n{block}"
@@ -1404,7 +1460,7 @@ mod tests {
             }),
             ..Facts::default()
         };
-        let out = f.render(MAX_FACTS_CHARS);
+        let out = f.render(MAX_FACTS_CHARS).text;
         assert!(
             out.chars().count() <= MAX_FACTS_CHARS,
             "got {} chars",
@@ -1441,7 +1497,7 @@ mod tests {
             room: Some(vec![Message::room("operator", now(), "a room line")]),
             unavailable: Vec::new(),
         };
-        let out = f.render(MAX_FACTS_CHARS);
+        let out = f.render(MAX_FACTS_CHARS).text;
         let asked = out.find("STUDIO-725").expect("asked");
         let mem = out.find("a remembered thing").expect("memory");
         let room = out.find("a room line").expect("room");
@@ -1452,7 +1508,7 @@ mod tests {
     /// previous bytes.
     #[test]
     fn an_empty_gather_renders_nothing() {
-        assert_eq!(Facts::default().render(MAX_FACTS_CHARS), "");
+        assert_eq!(Facts::default().render(MAX_FACTS_CHARS).text, "");
     }
 
     /// **The cap is the CALLER's, and a block that does not fit is not rendered.**
@@ -1478,7 +1534,7 @@ mod tests {
             }],
             ..Facts::default()
         };
-        let whole = f.render(MAX_FACTS_CHARS);
+        let whole = f.render(MAX_FACTS_CHARS).text;
         assert!(!whole.is_empty(), "the block must render at the ceiling");
         assert_eq!(
             whole.matches(FENCE).count(),
@@ -1486,7 +1542,7 @@ mod tests {
             "the whole block opens and closes:\n{whole}"
         );
 
-        assert_eq!(f.render(0), "", "no room at all ⇒ no block");
+        assert_eq!(f.render(0).text, "", "no room at all ⇒ no block");
         // A cap that fits the preamble and both fences but not one record. Rendering the frame
         // around nothing would spend several hundred characters of the operator's own prompt
         // budget to say nothing at all.
@@ -1501,14 +1557,14 @@ mod tests {
             .chars()
             .count();
         assert_eq!(
-            f.render(frame_only),
+            f.render(frame_only).text,
             "",
             "a frame with no record in it is not a block"
         );
         // And every cap that DOES produce a block respects it — the property the caller's
         // arithmetic stands on.
         for cap in (0..=MAX_FACTS_CHARS).step_by(97) {
-            let out = f.render(cap);
+            let out = f.render(cap).text;
             assert!(
                 out.chars().count() <= cap,
                 "render({cap}) returned {} characters",
@@ -1542,7 +1598,7 @@ mod tests {
             f.asked[0].outcome.is_some(),
             "one leg failing must not take the others with it"
         );
-        let out = f.render(MAX_FACTS_CHARS);
+        let out = f.render(MAX_FACTS_CHARS).text;
         assert!(
             out.contains("could not read"),
             "the block must disclose the failed leg:\n{out}"

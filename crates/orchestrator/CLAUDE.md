@@ -165,7 +165,9 @@ the `Orchestrator` struct itself. Concretely:
   Do not replace that prefix with a check that REFUSES prose containing the lead — that shape was
   tried and is a blocklist, refusing the honest phrasing the prompt's own heading invites while
   admitting a singular *record*, a dropped *From* or a homoglyph. And `Answerable::offered` refuses
-  an `answer` the prompt never offered because the facts block did not fit the budget. It is fed by `teamsknow.rs`'s
+  an `answer` about a key whose records the facts block never rendered — a SET of keys, not a bool,
+  because `Facts::render` fills front-to-back and drops per key: on a multi-key post a prompt-wide
+  "the block rendered" is true for every key it dropped, and so is `Facts::resolved`. It is fed by `teamsknow.rs`'s
   accessor through `TriageDeps::knowledge`, which is `None` for a daemon
   with no durable store; that `None` is what keeps every teams-off and `labels`-only prompt
   byte-identical, so don't make it a `Noop` store instead.
