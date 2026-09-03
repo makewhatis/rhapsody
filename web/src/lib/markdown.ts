@@ -61,6 +61,8 @@ export function safeHref(href: string): string | null {
 // --- blocks -------------------------------------------------------------------------------
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)/;
+const HEADING = /^ {0,3}(#{1,6})\s+(.*)$/;
+const BULLET = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 
 /**
  * The fence `line` opens, or `null` when it opens none.
@@ -79,8 +81,6 @@ function fenceOpen(line: string): RegExpExecArray | null {
   if (marker[0] === "`" && line.slice(line.indexOf(marker) + marker.length).includes("`")) return null;
   return fence;
 }
-const HEADING = /^ {0,3}(#{1,6})\s+(.*)$/;
-const BULLET = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 
 /** One list line while the run is being gathered, before it becomes a tree. */
 interface RawItem {
