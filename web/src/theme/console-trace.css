@@ -153,3 +153,43 @@
 
 /* ---- the §4 context cards the zones did not replace (slice 4 folds them into the watch tabs) ---- */
 .rh-console .trctx { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; align-items: start; }
+
+/* ---- slice 3 (STUDIO-744): the live playhead, the failing-step jump, the relay baton ---- */
+
+/* The header's live pulse (§3A). It is decoration beside the outcome pill, which already says
+   "running" in words — hence `aria-hidden` on the element itself. */
+.rh-console .trhd .trpulse { width: 7px; height: 7px; border-radius: 50%; background: var(--operator); flex: none; margin-left: -8px; animation: trpulse 1.6s ease-in-out infinite; }
+@keyframes trpulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+/* A run can stream for an hour with this on screen; an operator who asked the OS not to animate
+   gets the dot without the beat rather than nothing to look at. */
+@media (prefers-reduced-motion: reduce) {
+  .rh-console .trhd .trpulse { animation: none; }
+}
+
+/* The operator's line into a running agent. */
+.rh-console .trmsg { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); padding: 12px 14px; margin-bottom: 14px; }
+.rh-console .trmsg textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px 10px; resize: vertical; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.rh-console .trmsg textarea:disabled { opacity: .6; }
+.rh-console .trmsg .row { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.rh-console .trmsg .acterr { margin-right: auto; font-size: 11.5px; color: var(--bad); max-width: 46ch; }
+
+/* "jump to failing step →" — a link inside the red banner, never a button competing with the
+   card's own primary action. */
+.rh-console .trrc .trbanner .jump { flex: none; font: inherit; font-size: 12px; color: var(--bad); background: none; border: 0; padding: 0; margin-left: auto; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.rh-console .trrc .trbanner .jump:hover { color: var(--ink); }
+
+/* The playhead: the newest step of a run that is still streaming. */
+.rh-console .trstep.now .g { border-color: var(--operator); color: var(--operator); }
+.rh-console .trstep.now .stt { color: var(--operator); }
+
+/* The relay baton — what happened BETWEEN two attempts, so it is a rule across the spine rather
+   than another step to click. */
+.rh-console .trbaton { display: flex; align-items: center; gap: 9px; padding: 8px 9px; margin: 4px 0; font-size: 11px; color: var(--ink-4); border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line); }
+.rh-console .trbaton .g { flex: 0 0 26px; text-align: center; font-size: 13px; }
+.rh-console .trbaton .bt { min-width: 0; overflow-wrap: anywhere; }
+.rh-console .trbaton b { color: var(--ink-2); font-weight: 600; }
+
+/* "Jump to latest" — pinned to the viewport, because the operator sees it exactly when they have
+   scrolled away from the place it would otherwise sit. */
+.rh-console .trlatest { position: fixed; right: 26px; bottom: 22px; z-index: 6; font: inherit; font-size: 12px; padding: 8px 14px; border-radius: 999px; cursor: pointer; background: var(--raise); color: var(--ink); border: 1px solid var(--operator); box-shadow: 0 4px 14px rgb(0 0 0 / .35); }
+.rh-console .trlatest:hover { background: var(--panel-2); }
