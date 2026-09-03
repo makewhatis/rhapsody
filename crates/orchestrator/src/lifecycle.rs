@@ -31,10 +31,10 @@
 //!
 //! Two durable records answer it, in strict preference order:
 //!
-//!   1. **The run's own routing decision**, the `teams.route` events row every routed dispatch
-//!      writes (`crate::teams::EVENT_ROUTE`). It is a fact about the RUN — this run wore this
-//!      identity — so it is right even after a roster change, a re-label, or a re-assignment, and
-//!      it is local, needing no tracker at all.
+//!   1. **The DISPLAYED RUN's own routing decision** — the routing row that dispatch wrote into
+//!      that run's ledger (`crate::teams::EVENT_ROUTE` / `EVENT_UNROUTED`). It is a fact about the
+//!      RUN — this run wore this identity — so it is right even after a roster change, a re-label,
+//!      or a re-assignment, and it is local, needing no tracker at all.
 //!   2. **The `rhapsody:@<name>` label**, which IS the assignment (design record
 //!      `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.1). It answers where the events row
 //!      does not: `storage.retention_days` prunes run history long before a ticket stops being
@@ -42,13 +42,24 @@
 //!      [`Tracker::fetch_issue_labels_by_ids`], which answers for a MERGED ticket — the case the
 //!      whole decoration exists for.
 //!
-//! Both are silent about a ticket nobody was routed for, which is what keeps the column's "—"
-//! honest: a solo (`rhapsody:solo`) or unrouted dispatch writes no `teams.route` row, and a Teams-off daemon
-//! writes neither that row nor the label — so the answer is "" and the column renders "—". (A
-//! Teams-off daemon CAN still meet an identity label, on a ticket routed before Teams was turned
-//! off. Naming that teammate is the true historical answer, which is the whole point, so the label
-//! is read wherever it is found.) Nothing here consults the live roster, and nothing here can invent
-//! an assignee for a run that had none.
+//! **"The displayed run" is the precise scope, and the imprecise version was a bug.** The Jobs row
+//! shows the ticket's newest run (`Store::list_issue_runs`, `started_at DESC`), so the teammate
+//! shown must be that run's. Searching the TICKET for its newest `teams.route` row instead is not
+//! an approximation of that, it is wrong in one direction: `crate::teams::route_teams` records
+//! `teams.unrouted` for a solo or unmatched dispatch and NO event at all with Teams off, so a later
+//! run of either kind cannot shadow an earlier route — and the ticket-wide search would keep naming
+//! the teammate of a run that is no longer the one on screen. Every read here goes by `run_id`
+//! ([`IssueKey::run_id`]), which also settles an ordering mismatch hiding in the same code: the
+//! event search ordered by `run_id`, the row by `started_at`.
+//!
+//! That scoping is what keeps the column's "—" honest, and it makes the two records asymmetric: a
+//! run that recorded `teams.unrouted` answers "nobody" and stops, because the run itself says so
+//! and a label added afterwards cannot rewrite it. Only a run with NO routing row falls through to
+//! the label — the retention prune deleted it, or Teams was off when it dispatched. (A Teams-off
+//! daemon CAN still meet an identity label, on a ticket routed before Teams was turned off. Naming
+//! that teammate is the true historical answer, which is the whole point, so the label is read
+//! wherever it is found.) Nothing here consults the live roster, and nothing here can invent an
+//! assignee for a run that had none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -142,16 +153,18 @@ pub fn classify(state: &str, states: &DispatchStates) -> Option<IssueLifecycle> 
     Some(IssueLifecycle::Open)
 }
 
-/// One history row's ticket coordinates. Both halves are needed and neither substitutes for the
-/// other: the tracker is queried by opaque `id`, while the store's own event ledger joins runs on
-/// the human `identifier`.
+/// One history row's coordinates. Both halves are needed and neither substitutes for the other: the
+/// tracker is queried by opaque issue `id`, while the store's own event ledger is read by `run_id`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueKey {
     /// The tracker's opaque issue id — the key every resolved map is keyed by, matching the
     /// `issue_id` on the history row being decorated.
     pub id: String,
-    /// The human identifier (`"STUDIO-735"`), as stored on the run row.
-    pub identifier: String,
+    /// The id of the run the row DISPLAYS, i.e. the one `Store::list_issue_runs` kept for this
+    /// ticket. Attribution is scoped to exactly this run and never to the ticket: a ticket routed
+    /// to a teammate and later re-run solo, unrouted or with Teams off must show the SECOND run's
+    /// answer, which is "nobody" (STUDIO-735 route-back).
+    pub run_id: i64,
 }
 
 /// Bounds the memo at [`MAX_CACHE_ENTRIES`]: expired entries go first, and if the map is still over
@@ -177,10 +190,16 @@ struct Entry {
 /// The TTL cache behind [`ControlHandle::issue_lifecycles`]. Shared (`Arc`) between the orchestrator
 /// and every clone of its control handle, so the whole daemon has ONE window rather than one per
 /// HTTP task.
-/// One cached assignee. An EMPTY `name` records "nobody was routed for this ticket" and is cached
+/// One cached assignee. An EMPTY `name` records "nobody was routed for this run" and is cached
 /// exactly like a hit, so a solo or Teams-off ticket is not re-queried on every dashboard load.
+///
+/// `run_id` is the run the answer was resolved FOR. It is part of the freshness test, not just
+/// bookkeeping: a new run of the same ticket makes the memo's answer an answer to a different
+/// question, and serving it for the TTL's remainder would show the previous run's teammate on the
+/// new run's row.
 struct AssigneeEntry {
     name: String,
+    run_id: i64,
     at: Instant,
 }
 
@@ -297,24 +316,30 @@ impl LifecycleCache {
     /// stale, and answers the empty string for a ticket nobody was routed for. Tickets with no
     /// answer at all are simply absent from the result.
     ///
-    /// The two sources are consulted in the module doc's preference order and the second is only
-    /// asked about what the first could not answer:
+    /// The two sources are consulted in the module doc's preference order, and the second is only
+    /// asked about the rows the first was SILENT on — which is not the same as the rows it did not
+    /// name a teammate for:
     ///
-    ///   1. `store` — the ticket's newest `teams.route` events row. Local, and a fact about the RUN
-    ///      rather than about the ticket's labels today.
-    ///   2. `tracker` — the `rhapsody:@<name>` label, for the tickets whose route rows the retention
-    ///      prune has already deleted. Skipped entirely when there is nothing left to ask about, so
-    ///      a healthy Teams deployment pays no tracker call here at all.
+    ///   1. `store` — the displayed run's own routing row ([`run_identity`]). Local, and a fact
+    ///      about the RUN rather than about the ticket's labels today. It answers three ways, and
+    ///      the third is why this is not a two-way fallback: a run that recorded
+    ///      `teams.unrouted` answers "nobody" DEFINITIVELY and stops here, because the run itself
+    ///      says it was solo or unmatched and a label cannot overrule it.
+    ///   2. `tracker` — the `rhapsody:@<name>` label, for the rows whose routing evidence is simply
+    ///      gone: the retention prune deleted it, or the dispatch happened with Teams off and never
+    ///      wrote one. Skipped entirely when there is nothing left to ask about, so a healthy Teams
+    ///      deployment pays no tracker call here at all.
     ///
     /// Best-effort throughout, exactly like [`Self::resolve`]: a store error, an absent tracker or a
     /// failed round-trip leaves a ticket unanswered rather than propagating, because the listing
     /// this decorates has already succeeded and no caller could act on the failure.
     ///
     /// The store reads are synchronous and run on the calling HTTP task, as every other store read
-    /// on this layer does. They are bounded by the same [`MAX_LIFECYCLE_REFRESH`] cap and the same
-    /// TTL as the tracker refresh beside them — one full page of cold ids measures ~240ms against a
-    /// 300k-event store, well under the two network round trips the lifecycle decoration makes on
-    /// the same request, and once per TTL window rather than per read.
+    /// on this layer does. Each is one run-scoped `LIMIT 1` probe seeking `idx_events_run_seq`
+    /// (never [`rhapsody_store::Store::run_events`], which would pull a whole run's transcript-sized
+    /// ledger into memory for a single row), they are bounded by the same [`MAX_LIFECYCLE_REFRESH`]
+    /// cap and the same TTL as the tracker refresh beside them, and they happen once per TTL window
+    /// rather than per read.
     pub async fn resolve_assignees(
         &self,
         keys: &[IssueKey],
@@ -328,19 +353,25 @@ impl LifecycleCache {
         }
         // The local ledger first: it needs no network, and it is the truer record.
         let mut answers: HashMap<String, String> = HashMap::new();
+        let mut covered: HashSet<String> = HashSet::new();
         let mut unanswered: Vec<IssueKey> = Vec::new();
         for key in &stale {
-            match route_identity(store.as_ref(), &key.identifier) {
-                Some(name) => {
+            match run_identity(store.as_ref(), key.run_id) {
+                RunIdentity::Routed(name) => {
                     answers.insert(key.id.clone(), name);
+                    covered.insert(key.id.clone());
                 }
-                None => unanswered.push(key.clone()),
+                // The run said, on the record, that it was routed to nobody. That is an ANSWER —
+                // it is covered, it caches, and the label is never asked.
+                RunIdentity::Unrouted => {
+                    covered.insert(key.id.clone());
+                }
+                RunIdentity::Unknown => unanswered.push(key.clone()),
             }
         }
-        // Then the label, for whatever is left — and `covered` is which of those the tracker
+        // Then the label, for whatever is left — and `covered` grows by which of those the tracker
         // actually answered about, so a failed round-trip leaves its ids untouched instead of
         // caching "nobody" over an assignee the console already had.
-        let mut covered: HashSet<String> = answers.keys().cloned().collect();
         if let Some(tracker) = tracker.filter(|_| !unanswered.is_empty()) {
             let (labelled, asked) = label_identities(tracker.as_ref(), &unanswered).await;
             answers.extend(labelled);
@@ -361,7 +392,14 @@ impl LifecycleCache {
             } else {
                 out.insert(key.id.clone(), name.clone());
             }
-            guard.insert(key.id.clone(), AssigneeEntry { name, at: now });
+            guard.insert(
+                key.id.clone(),
+                AssigneeEntry {
+                    name,
+                    run_id: key.run_id,
+                    at: now,
+                },
+            );
         }
         prune_assignees(&mut guard, now);
         out
@@ -371,8 +409,15 @@ impl LifecycleCache {
     /// is returned AS WELL AS re-queried (it is what the caller gets when the refresh fails), and
     /// the refresh set is deduplicated and capped at [`MAX_LIFECYCLE_REFRESH`].
     ///
-    /// A key with no `identifier` is still refreshable — the label lookup goes by `id` — but a key
-    /// with no `id` is dropped: there is nothing to key the answer by.
+    /// It adds a third rule, and the first rule bends to it: an entry resolved for a DIFFERENT run
+    /// than the one this row displays is not stale, it is IRRELEVANT — it answers a different
+    /// question — so it is neither served nor counted, exactly as if the memo held nothing. Serving
+    /// it as the "beats no answer" fallback would put the previous run's teammate back on the new
+    /// run's row whenever the refresh is capped or the tracker is down, which is the very
+    /// mis-attribution the run scoping exists to prevent.
+    ///
+    /// A key with no `run_id` is still refreshable — the label lookup goes by `id` — but a key with
+    /// no `id` is dropped: there is nothing to key the answer by.
     fn partition_assignees(
         &self,
         keys: &[IssueKey],
@@ -389,7 +434,7 @@ impl LifecycleCache {
             if key.id.is_empty() || !seen.insert(key.id.as_str()) {
                 continue;
             }
-            let entry = guard.get(&key.id);
+            let entry = guard.get(&key.id).filter(|e| e.run_id == key.run_id);
             if let Some(name) = entry.map(|e| e.name.as_str()).filter(|n| !n.is_empty()) {
                 cached.insert(key.id.clone(), name.to_string());
             }
@@ -402,38 +447,73 @@ impl LifecycleCache {
     }
 }
 
-/// The identity the ticket's NEWEST run wore, from the store's own event ledger — `teams.route`'s
+/// What ONE run's ledger says about who ran it. The third variant is the load-bearing one: "no
+/// routing row" and "a routing row that named nobody" are different facts, and only the first may
+/// fall through to the ticket's label.
+enum RunIdentity {
+    /// A `teams.route` row naming this teammate.
+    Routed(String),
+    /// A `teams.unrouted` row: this dispatch was solo or matched nobody, on the record.
+    Unrouted,
+    /// No routing row at all — Teams was off when this run dispatched, the retention prune has
+    /// deleted the row, or the store could not be read. The label may still know.
+    Unknown,
+}
+
+/// What identity the run `run_id` wore, from the store's own event ledger — `teams.route`'s
 /// `identity=<name> reason=<why>` text, parsed by [`crate::triage::route_event_identity`].
 ///
-/// `limit: 1` with the query's `run_id DESC` ordering is what makes it the newest run's: the Jobs
-/// row shows that run, so the assignee shown must be the one that ran it. A blank identifier has
-/// nothing to look up, and a store error answers `None` — "ask the label instead" — rather than
-/// propagating.
-fn route_identity(
-    store: &(dyn rhapsody_store::Store + Send + Sync),
-    identifier: &str,
-) -> Option<String> {
-    if identifier.is_empty() {
-        return None;
+/// **Scoped to the DISPLAYED run, never to the ticket** (STUDIO-735 route-back). A ticket-wide
+/// search for the newest `teams.route` row gets a ticket re-run solo, unrouted or with Teams off
+/// wrong in the one direction that matters: `crate::teams::route_teams` writes `teams.unrouted` for
+/// those dispatches and NO event at all with Teams off, so neither can shadow an older
+/// `teams.route`, and the row would keep naming a teammate who did not do this run's work. It also
+/// dissolves an ordering mismatch that was invisible in the same code: `list_issue_runs` picks the
+/// displayed run by `started_at DESC`, while the event search ordered by `run_id DESC`.
+///
+/// Two probes rather than one whole-ledger read: each is `LIMIT 1` against `idx_events_run_seq`,
+/// and the second only runs for a run that recorded no route — so a routed run, the common case,
+/// costs exactly one indexed row. A store error answers [`RunIdentity::Unknown`] — "ask the label
+/// instead" — rather than propagating.
+fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) -> RunIdentity {
+    if run_id <= 0 {
+        return RunIdentity::Unknown;
     }
-    let q = rhapsody_store::EventQuery {
-        text: String::new(),
-        issue: identifier.to_string(),
-        kind: crate::teams::EVENT_ROUTE.to_string(),
-        limit: 1,
-    };
-    match store.search_events(q) {
-        Ok(hits) => hits
-            .first()
-            .and_then(|h| crate::triage::route_event_identity(&h.text)),
-        Err(err) => {
-            tracing::warn!(
-                issue = %identifier,
-                error = %err,
-                "assignee lookup could not read the run history; falling back to the ticket label",
-            );
-            None
+    let probe = |kind: &str| {
+        let q = rhapsody_store::EventQuery {
+            text: String::new(),
+            issue: String::new(),
+            kind: kind.to_string(),
+            run: run_id,
+            limit: 1,
+        };
+        match store.search_events(q) {
+            Ok(hits) => Ok(hits.into_iter().next()),
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    error = %err,
+                    "assignee lookup could not read the run history; falling back to the ticket label",
+                );
+                Err(())
+            }
         }
+    };
+    // A `teams.route` row whose text somehow carries no `identity=` is treated as no route at all,
+    // which is what the parse already said; it then falls to the unrouted probe and, failing that,
+    // to the label.
+    match probe(crate::teams::EVENT_ROUTE) {
+        Ok(Some(hit)) => {
+            if let Some(name) = crate::triage::route_event_identity(&hit.text) {
+                return RunIdentity::Routed(name);
+            }
+        }
+        Ok(None) => {}
+        Err(()) => return RunIdentity::Unknown,
+    }
+    match probe(crate::teams::EVENT_UNROUTED) {
+        Ok(Some(_)) => RunIdentity::Unrouted,
+        Ok(None) | Err(()) => RunIdentity::Unknown,
     }
 }
 
@@ -924,47 +1004,79 @@ mod tests {
 
     // ─── the durable assignee (STUDIO-735) ───────────────────────────────────────────────────
 
-    /// An in-memory store carrying one FINISHED run per (identifier, identity) pair, each with the
-    /// `teams.route` row a routed dispatch writes. Runs are inserted in order, so the LAST entry for
-    /// an identifier is its newest run.
-    fn store_with_routes(routes: &[(&str, &str)]) -> Arc<dyn rhapsody_store::Store + Send + Sync> {
-        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
-            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open store"),
-        );
-        for (identifier, identity) in routes {
-            let run = store
+    /// An in-memory store the assignee tests seed one FINISHED run at a time, each seeding call
+    /// returning that run's id — because the row's answer is scoped to the run it displays, so a
+    /// test that cannot name a run cannot state what it is asserting.
+    struct Ledger(Arc<dyn rhapsody_store::Store + Send + Sync>);
+
+    impl Ledger {
+        fn new() -> Self {
+            Self(Arc::new(
+                rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory)
+                    .expect("open store"),
+            ))
+        }
+
+        /// One finished run of `identifier`, carrying `routing` (kind, text) — or NO routing row at
+        /// all, which is exactly what a Teams-off dispatch leaves behind (`route_teams` returns
+        /// `None` before any event is described).
+        fn run(&self, identifier: &str, routing: Option<(&str, String)>) -> i64 {
+            let run = self
+                .0
                 .start_run(rhapsody_store::RunStart {
-                    issue_identifier: (*identifier).to_string(),
+                    issue_identifier: identifier.to_string(),
                     ..rhapsody_store::RunStart::default()
                 })
                 .expect("start run");
-            store
-                .append_events(
-                    run,
-                    &[rhapsody_store::EventRow {
-                        seq: 1,
-                        at: "2026-09-02T00:00:00Z".into(),
-                        kind: crate::teams::EVENT_ROUTE.into(),
-                        tool: String::new(),
-                        text: format!("identity={identity} reason=label"),
-                    }],
-                )
-                .expect("append route event");
-            store
+            if let Some((kind, text)) = routing {
+                self.0
+                    .append_events(
+                        run,
+                        &[rhapsody_store::EventRow {
+                            seq: 1,
+                            at: "2026-09-02T00:00:00Z".into(),
+                            kind: kind.into(),
+                            tool: String::new(),
+                            text,
+                        }],
+                    )
+                    .expect("append routing event");
+            }
+            self.0
                 .end_run(run, rhapsody_store::RunEnd::default())
                 .expect("end run");
+            run
         }
-        store
+
+        fn routed(&self, identifier: &str, identity: &str) -> i64 {
+            let text = format!("identity={identity} reason=label");
+            self.run(identifier, Some((crate::teams::EVENT_ROUTE, text)))
+        }
+
+        fn unrouted(&self, identifier: &str, reason: &str) -> i64 {
+            let text = format!("reason={reason}");
+            self.run(identifier, Some((crate::teams::EVENT_UNROUTED, text)))
+        }
+
+        fn teams_off(&self, identifier: &str) -> i64 {
+            self.run(identifier, None)
+        }
+
+        fn store(&self) -> Arc<dyn rhapsody_store::Store + Send + Sync> {
+            Arc::clone(&self.0)
+        }
     }
 
+    /// A store holding no runs at all: every key's routing evidence is absent, so every answer
+    /// these tests get comes from the label. Used where the ledger is not what is under test.
     fn empty_store() -> Arc<dyn rhapsody_store::Store + Send + Sync> {
-        store_with_routes(&[])
+        Ledger::new().store()
     }
 
-    fn key(id: &str, identifier: &str) -> IssueKey {
+    fn key(id: &str, run_id: i64) -> IssueKey {
         IssueKey {
             id: id.to_string(),
-            identifier: identifier.to_string(),
+            run_id,
         }
     }
 
@@ -981,11 +1093,12 @@ mod tests {
     // has long since dropped off the live roster — and the ASSIGNED column must still name her.
     #[tokio::test]
     async fn a_finished_run_keeps_the_teammate_that_ran_it() {
-        let store = store_with_routes(&[("MT-1", "alice")]);
+        let ledger = Ledger::new();
+        let run = ledger.routed("MT-1", "alice");
         let cache = LifecycleCache::default();
 
         let got = cache
-            .resolve_assignees(&[key("a", "MT-1")], &store, None, Instant::now())
+            .resolve_assignees(&[key("a", run)], &ledger.store(), None, Instant::now())
             .await;
 
         assert_eq!(
@@ -995,29 +1108,106 @@ mod tests {
         );
     }
 
-    // The ticket's newest run is the one the Jobs row shows, so it is the one that names the row.
+    // The row displays ONE run, and that run names it. The earlier run of the same ticket is not
+    // consulted even though it is the same ticket — attribution is per-run, not per-ticket.
     #[tokio::test]
-    async fn the_newest_run_names_the_ticket() {
-        let store = store_with_routes(&[("MT-1", "alice"), ("MT-1", "jimmy")]);
+    async fn the_displayed_run_names_the_row() {
+        let ledger = Ledger::new();
+        let first = ledger.routed("MT-1", "alice");
+        let second = ledger.routed("MT-1", "jimmy");
         let cache = LifecycleCache::default();
 
         let got = cache
-            .resolve_assignees(&[key("a", "MT-1")], &store, None, Instant::now())
+            .resolve_assignees(&[key("a", second)], &ledger.store(), None, Instant::now())
+            .await;
+        assert_eq!(got.get("a").map(String::as_str), Some("jimmy"));
+
+        let got = LifecycleCache::default()
+            .resolve_assignees(&[key("a", first)], &ledger.store(), None, Instant::now())
+            .await;
+        assert_eq!(
+            got.get("a").map(String::as_str),
+            Some("alice"),
+            "the older run still answers for itself: {got:?}",
+        );
+    }
+
+    // THE ROUTE-BACK BLOCKER (acceptance 3). A ticket alice ran, re-run solo/unmatched: dispatch
+    // records `teams.unrouted`, which is a NEWER row of a DIFFERENT kind, so nothing about the
+    // ticket's `teams.route` history shadows it. The row must read "—", never "alice".
+    //
+    // Both halves are load-bearing. The run-scoped read is what stops run 1's route answering; the
+    // `teams.unrouted` row being an ANSWER (not a miss) is what stops the still-present
+    // `rhapsody:@alice` label answering in its place.
+    #[tokio::test]
+    async fn a_re_run_that_routed_to_nobody_does_not_inherit_the_earlier_teammate() {
+        let ledger = Ledger::new();
+        let _routed = ledger.routed("MT-1", "alice");
+        let solo = ledger.unrouted("MT-1", "solo");
+        let mut f = Fake::default();
+        f.by_id
+            .insert("a".into(), labelled("a", &["rhapsody:@alice"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(
+                &[key("a", solo)],
+                &ledger.store(),
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
             .await;
 
-        assert_eq!(got.get("a").map(String::as_str), Some("jimmy"));
+        assert!(
+            got.is_empty(),
+            "the displayed run routed to nobody; the previous run's teammate is not this run's: {got:?}",
+        );
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            0,
+            "an on-the-record `teams.unrouted` is an answer, not a gap for the label to fill",
+        );
+    }
+
+    // The same blocker with Teams OFF for the re-run: `route_teams` returns before describing any
+    // event, so run 2's ledger is silent rather than saying "nobody". The label is then the only
+    // record left — and where there is none either, the row reads "—" instead of borrowing run 1's.
+    #[tokio::test]
+    async fn a_teams_off_re_run_does_not_inherit_the_earlier_teammate() {
+        let ledger = Ledger::new();
+        let _routed = ledger.routed("MT-1", "alice");
+        let off = ledger.teams_off("MT-1");
+        let tr = Arc::new(Fake::default());
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(
+                &[key("a", off)],
+                &ledger.store(),
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            got.is_empty(),
+            "a Teams-off run wore no identity, and the ticket's older route row is not its: {got:?}",
+        );
     }
 
     // Acceptance 3: nothing routed, nothing labelled — the column stays "—" rather than guessing.
     #[tokio::test]
     async fn an_unrouted_ticket_answers_nobody() {
         let tr = Arc::new(Fake::default());
+        let ledger = Ledger::new();
+        let run = ledger.teams_off("MT-1");
         let cache = LifecycleCache::default();
 
         let got = cache
             .resolve_assignees(
-                &[key("a", "MT-1")],
-                &empty_store(),
+                &[key("a", run)],
+                &ledger.store(),
                 Some(Arc::clone(&tr) as Arc<dyn Tracker>),
                 Instant::now(),
             )
@@ -1037,12 +1227,14 @@ mod tests {
         f.by_id
             .insert("a".into(), labelled("a", &["rhapsody:@alice", "backend"]));
         let tr = Arc::new(f);
+        let ledger = Ledger::new();
+        let run = ledger.teams_off("MT-1");
         let cache = LifecycleCache::default();
 
         let got = cache
             .resolve_assignees(
-                &[key("a", "MT-1")],
-                &empty_store(),
+                &[key("a", run)],
+                &ledger.store(),
                 Some(Arc::clone(&tr) as Arc<dyn Tracker>),
                 Instant::now(),
             )
@@ -1060,12 +1252,14 @@ mod tests {
         f.by_id
             .insert("a".into(), labelled("a", &["rhapsody:@jimmy"]));
         let tr = Arc::new(f);
+        let ledger = Ledger::new();
+        let run = ledger.routed("MT-1", "alice");
         let cache = LifecycleCache::default();
 
         let got = cache
             .resolve_assignees(
-                &[key("a", "MT-1")],
-                &store_with_routes(&[("MT-1", "alice")]),
+                &[key("a", run)],
+                &ledger.store(),
                 Some(Arc::clone(&tr) as Arc<dyn Tracker>),
                 Instant::now(),
             )
@@ -1089,18 +1283,52 @@ mod tests {
             labelled("a", &["rhapsody:@alice", "rhapsody:solo"]),
         );
         let tr = Arc::new(f);
+        let ledger = Ledger::new();
+        let run = ledger.teams_off("MT-1");
         let cache = LifecycleCache::default();
 
         let got = cache
             .resolve_assignees(
-                &[key("a", "MT-1")],
-                &empty_store(),
+                &[key("a", run)],
+                &ledger.store(),
                 Some(Arc::clone(&tr) as Arc<dyn Tracker>),
                 Instant::now(),
             )
             .await;
 
         assert!(got.is_empty(), "the solo opt-out is absolute: {got:?}");
+    }
+
+    // The memo answers PER RUN. A cached answer for the previous run is not a stale answer to this
+    // row's question, it is an answer to a different one — so a new run re-resolves even inside the
+    // TTL, and the old name is not served in the meantime.
+    #[tokio::test]
+    async fn a_new_run_of_the_same_ticket_does_not_wear_the_previous_run_s_answer() {
+        let ledger = Ledger::new();
+        let first = ledger.routed("MT-1", "alice");
+        let cache = LifecycleCache::default();
+        let t0 = Instant::now();
+
+        let got = cache
+            .resolve_assignees(&[key("a", first)], &ledger.store(), None, t0)
+            .await;
+        assert_eq!(got.get("a").map(String::as_str), Some("alice"));
+
+        // Well inside the TTL, and with the refresh unable to answer (no tracker, and the new run
+        // recorded nothing): the memo must NOT serve alice as its "beats no answer" fallback.
+        let second = ledger.teams_off("MT-1");
+        let got = cache
+            .resolve_assignees(
+                &[key("a", second)],
+                &ledger.store(),
+                None,
+                t0 + LIFECYCLE_TTL / 2,
+            )
+            .await;
+        assert!(
+            got.is_empty(),
+            "the memo answered the previous run's question, not this one: {got:?}",
+        );
     }
 
     // Two identity labels resolve deterministically, whatever order the tracker lists them in — a
@@ -1125,7 +1353,7 @@ mod tests {
             .insert("a".into(), labelled("a", &["rhapsody:@alice"]));
         let tr = Arc::new(f);
         let cache = LifecycleCache::default();
-        let keys = [key("a", "MT-1"), key("b", "MT-2")];
+        let keys = [key("a", 1), key("b", 2)];
         let target = || Some(Arc::clone(&tr) as Arc<dyn Tracker>);
         let store = empty_store();
         let t0 = Instant::now();
@@ -1161,7 +1389,7 @@ mod tests {
             .insert("a".into(), labelled("a", &["rhapsody:@alice"]));
         let tr = Arc::new(f);
         let cache = LifecycleCache::default();
-        let keys = [key("a", "MT-1")];
+        let keys = [key("a", 1)];
         let store = empty_store();
         let t0 = Instant::now();
 
@@ -1206,7 +1434,7 @@ mod tests {
         let cache = LifecycleCache::default();
         let store = empty_store();
 
-        let dupes = [key("i0", "MT-1"), key("i0", "MT-1"), key("", "MT-2")];
+        let dupes = [key("i0", 1), key("i0", 1), key("", 2)];
         let got = cache
             .resolve_assignees(
                 &dupes,
@@ -1221,7 +1449,7 @@ mod tests {
         // The per-request ceiling, on a cache of its own: ids past it keep whatever they had (here,
         // nothing), which reads as "no answer" and falls back to the live roster.
         let many: Vec<IssueKey> = (0..MAX_LIFECYCLE_REFRESH + 50)
-            .map(|i| key(&format!("i{i}"), &format!("MT-{i}")))
+            .map(|i| key(&format!("i{i}"), i as i64 + 1))
             .collect();
         let got = LifecycleCache::default()
             .resolve_assignees(
@@ -1241,6 +1469,7 @@ mod tests {
         let now = t0 + LIFECYCLE_TTL * 2;
         let entry = |at| AssigneeEntry {
             name: "alice".into(),
+            run_id: 1,
             at,
         };
 
@@ -1292,7 +1521,7 @@ mod tests {
 
         let got = o
             .control()
-            .issue_assignees(&[key("a", "MT-1"), key("b", "MT-2")])
+            .issue_assignees(&[key("a", run), key("b", run + 1)])
             .await;
 
         assert_eq!(got.get("a").map(String::as_str), Some("alice"));

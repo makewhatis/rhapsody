@@ -96,7 +96,9 @@ pub(crate) async fn handle_issue_runs(
         .iter()
         .map(|r| IssueKey {
             id: r.issue_id.clone(),
-            identifier: r.issue_identifier.clone(),
+            // The run this row DISPLAYS. Attribution is that run's, not the ticket's: a ticket
+            // routed to a teammate and re-run solo must show the re-run's answer (STUDIO-735).
+            run_id: r.id,
         })
         .collect();
     let (lifecycles, assignees) = tokio::join!(
@@ -359,6 +361,9 @@ pub(crate) async fn handle_event_search(
         text: qget(&q, "q").to_string(),
         issue: qget(&q, "issue").to_string(),
         kind: qget(&q, "kind").to_string(),
+        // No `run` query parameter: the endpoint is the cross-run search Go's is, and per-run
+        // events already have `GET /api/v1/runs/{id}/events`.
+        run: 0,
         limit,
     };
     let hits = match provider.history().search_events(query) {
@@ -961,8 +966,8 @@ mod tests {
     #[tokio::test]
     async fn issue_runs_carry_the_durable_assignee() {
         let store = mem_store();
-        seed_run_for("iss_done", "MT-1", "2026-08-01T00:00:00Z", &store);
-        seed_run_for("iss_solo", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let done = seed_run_for("iss_done", "MT-1", "2026-08-01T00:00:00Z", &store);
+        let solo = seed_run_for("iss_solo", "MT-2", "2026-08-01T00:01:00Z", &store);
         let provider = Arc::new(
             FakeProvider::ok(empty_snapshot())
                 .with_history(Arc::new(store))
@@ -988,8 +993,9 @@ mod tests {
             by_ident["MT-2"],
         );
 
-        // Both halves of the key are forwarded: the tracker read goes by id, the daemon's own run
-        // ledger by identifier, and neither substitutes for the other.
+        // Both halves of the key are forwarded: the tracker read goes by issue id, the daemon's own
+        // routing ledger by the id of the run this row DISPLAYS — the row's own run, so a re-run
+        // cannot be attributed to the teammate of the run before it (STUDIO-735 route-back).
         let mut asked = provider.issue_assignees_asked();
         asked.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(
@@ -997,11 +1003,11 @@ mod tests {
             vec![
                 IssueKey {
                     id: "iss_done".into(),
-                    identifier: "MT-1".into()
+                    run_id: done,
                 },
                 IssueKey {
                     id: "iss_solo".into(),
-                    identifier: "MT-2".into()
+                    run_id: solo,
                 },
             ],
         );

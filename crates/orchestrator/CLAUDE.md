@@ -46,9 +46,10 @@ the `Orchestrator` struct itself. Concretely:
     `GET /api/v1/history/issues`). The control task never touches them, so it is a seam only in the
     sense that the handle carries it; neither lock is held across the tracker `.await`, and the
     state sets it classifies with are read through the `reads.rs` cell above rather than from
-    loop-owned `Effective`. The assignee half also READS the store (the `teams.route` events row a
-    routed dispatch writes) — a read-only use of the same `Arc<dyn Store>` the handle already
-    carries, never a write.
+    loop-owned `Effective`. The assignee half also READS the store (the routing event a dispatch
+    wrote into the DISPLAYED RUN's ledger — always scoped by `run_id`, never searched ticket-wide,
+    because a ticket's runs can disagree about who ran them) — a read-only use of the same
+    `Arc<dyn Store>` the handle already carries, never a write.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
   five seams; if none fits, that's a real design decision — don't reach for a sixth ad hoc

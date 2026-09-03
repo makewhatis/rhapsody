@@ -91,9 +91,10 @@ pub trait StateProvider: Send + Sync {
     /// routed for answers the empty string, and one with no answer at all is simply ABSENT; the
     /// client then falls back to the live Teams roster, which can only name a RUNNING ticket.
     ///
-    /// It takes the identifier as well as the id because the two durable records are keyed
-    /// differently: the tracker's label read goes by opaque id, and the daemon's own run ledger by
-    /// the human identifier.
+    /// It takes the displayed RUN's id as well as the issue id because the two durable records are
+    /// keyed differently: the tracker's label read goes by opaque issue id, and the daemon's own
+    /// routing ledger by run — the run the row shows, so a re-run cannot inherit its predecessor's
+    /// teammate.
     ///
     /// Infallible for the same reason [`Self::issue_lifecycles`] is. Rhapsody-only (no Go v0.4.0
     /// counterpart); the default answers nothing, which is exactly how the endpoint behaved before

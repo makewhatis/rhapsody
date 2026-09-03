@@ -371,6 +371,7 @@ impl StoreIdentityHistory {
             text: String::new(),
             issue: String::new(),
             kind: crate::teams::EVENT_ROUTE.to_string(),
+            run: 0,
             limit: 1,
         };
         match self.store.search_events(q) {
@@ -392,6 +393,7 @@ impl IdentityHistory for StoreIdentityHistory {
             text: String::new(),
             issue: issue_identifier.to_string(),
             kind: crate::teams::EVENT_ROUTE.to_string(),
+            run: 0,
             limit: RECONCILE_HISTORY_LIMIT,
         };
         match self.store.search_events(q) {
