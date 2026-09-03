@@ -1,4 +1,5 @@
-//! lifecycle — the ticket's CURRENT tracker state, for the read path (STUDIO-702).
+//! lifecycle — the ticket's CURRENT tracker state and its DURABLE assignee, for the read path
+//! (STUDIO-702, STUDIO-735).
 //!
 //! Rhapsody-only; no Go v0.4.0 counterpart. The dashboard's Jobs worklist folds the issue-level
 //! history listing, which is one row per ticket that has EVER had a run, and had nothing but the
@@ -21,6 +22,30 @@
 //!     or an id the tracker does not return all yield "no answer" for that ticket, and the console
 //!     falls back to exactly the run-outcome mapping it used before. A lifecycle lookup can make
 //!     the Jobs list better; it can never make it fail.
+//!
+//! The second decoration is the ticket's DURABLE ASSIGNEE (STUDIO-735) — who did this work — and it
+//! is here because it has the same shape: an off-loop, TTL-cached, best-effort per-ticket lookup
+//! the listing does not wait on being right. The console previously read the assignee from the LIVE
+//! Teams roster, which lists each teammate's currently-active tickets, so the moment a run finished
+//! its teammate's name vanished from the row and the historical "who did what" was lost.
+//!
+//! Two durable records answer it, in strict preference order:
+//!
+//!   1. **The run's own routing decision**, the `teams.route` events row every routed dispatch
+//!      writes (`crate::teams::EVENT_ROUTE`). It is a fact about the RUN — this run wore this
+//!      identity — so it is right even after a roster change, a re-label, or a re-assignment, and
+//!      it is local, needing no tracker at all.
+//!   2. **The `rhapsody:@<name>` label**, which IS the assignment (design record
+//!      `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.11.1). It answers where the events row
+//!      does not: `storage.retention_days` prunes run history long before a ticket stops being
+//!      interesting, and the label outlives the prune. Read with
+//!      [`Tracker::fetch_issue_labels_by_ids`], which answers for a MERGED ticket — the case the
+//!      whole decoration exists for.
+//!
+//! Both are silent about a ticket nobody was routed for: a solo (`rhapsody:solo`) or Teams-off run
+//! writes no `teams.route` row and carries no identity label, so it answers "" and the column keeps
+//! rendering "—". Nothing here consults the live roster, and nothing here can invent an assignee for
+//! a run that had none.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -114,6 +139,18 @@ pub fn classify(state: &str, states: &DispatchStates) -> Option<IssueLifecycle> 
     Some(IssueLifecycle::Open)
 }
 
+/// One history row's ticket coordinates. Both halves are needed and neither substitutes for the
+/// other: the tracker is queried by opaque `id`, while the store's own event ledger joins runs on
+/// the human `identifier`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssueKey {
+    /// The tracker's opaque issue id — the key every resolved map is keyed by, matching the
+    /// `issue_id` on the history row being decorated.
+    pub id: String,
+    /// The human identifier (`"STUDIO-735"`), as stored on the run row.
+    pub identifier: String,
+}
+
 /// Bounds the memo at [`MAX_CACHE_ENTRIES`]: expired entries go first, and if the map is still over
 /// the cap it is cleared. Called with the lock already held, right after a batch of inserts.
 fn prune(entries: &mut HashMap<String, Entry>, now: Instant) {
@@ -137,9 +174,21 @@ struct Entry {
 /// The TTL cache behind [`ControlHandle::issue_lifecycles`]. Shared (`Arc`) between the orchestrator
 /// and every clone of its control handle, so the whole daemon has ONE window rather than one per
 /// HTTP task.
+/// One cached assignee. An EMPTY `name` records "nobody was routed for this ticket" and is cached
+/// exactly like a hit, so a solo or Teams-off ticket is not re-queried on every dashboard load.
+struct AssigneeEntry {
+    name: String,
+    at: Instant,
+}
+
 #[derive(Default)]
 pub struct LifecycleCache {
     entries: Mutex<HashMap<String, Entry>>,
+    /// The assignee memo (STUDIO-735), keyed by tracker issue id and bounded exactly as `entries`
+    /// is. A second map rather than a second field on [`Entry`] because the two decorations resolve
+    /// from different sources and must fail independently: a tracker that cannot say what state a
+    /// ticket is in must not also erase who worked it, which the store alone can answer.
+    assignees: Mutex<HashMap<String, AssigneeEntry>>,
 }
 
 impl LifecycleCache {
@@ -240,6 +289,208 @@ impl LifecycleCache {
         }
         (cached, stale)
     }
+
+    /// Resolves `keys` to each ticket's DURABLE assignee (STUDIO-735), refreshing whatever has gone
+    /// stale, and answers the empty string for a ticket nobody was routed for. Tickets with no
+    /// answer at all are simply absent from the result.
+    ///
+    /// The two sources are consulted in the module doc's preference order and the second is only
+    /// asked about what the first could not answer:
+    ///
+    ///   1. `store` — the ticket's newest `teams.route` events row. Local, and a fact about the RUN
+    ///      rather than about the ticket's labels today.
+    ///   2. `tracker` — the `rhapsody:@<name>` label, for the tickets whose route rows the retention
+    ///      prune has already deleted. Skipped entirely when there is nothing left to ask about, so
+    ///      a healthy Teams deployment pays no tracker call here at all.
+    ///
+    /// Best-effort throughout, exactly like [`Self::resolve`]: a store error, an absent tracker or a
+    /// failed round-trip leaves a ticket unanswered rather than propagating, because the listing
+    /// this decorates has already succeeded and no caller could act on the failure.
+    pub async fn resolve_assignees(
+        &self,
+        keys: &[IssueKey],
+        store: &Arc<dyn rhapsody_store::Store + Send + Sync>,
+        tracker: Option<Arc<dyn Tracker>>,
+        now: Instant,
+    ) -> HashMap<String, String> {
+        let (mut out, stale) = self.partition_assignees(keys, now);
+        if stale.is_empty() {
+            return out;
+        }
+        // The local ledger first: it needs no network, and it is the truer record.
+        let mut answers: HashMap<String, String> = HashMap::new();
+        let mut unanswered: Vec<IssueKey> = Vec::new();
+        for key in &stale {
+            match route_identity(store.as_ref(), &key.identifier) {
+                Some(name) => {
+                    answers.insert(key.id.clone(), name);
+                }
+                None => unanswered.push(key.clone()),
+            }
+        }
+        // Then the label, for whatever is left — and `covered` is which of those the tracker
+        // actually answered about, so a failed round-trip leaves its ids untouched instead of
+        // caching "nobody" over an assignee the console already had.
+        let mut covered: HashSet<String> = answers.keys().cloned().collect();
+        if let Some(tracker) = tracker.filter(|_| !unanswered.is_empty()) {
+            let (labelled, asked) = label_identities(tracker.as_ref(), &unanswered).await;
+            answers.extend(labelled);
+            covered.extend(asked);
+        }
+        let mut guard = self
+            .assignees
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for key in stale.iter().filter(|k| covered.contains(&k.id)) {
+            // Caching the EMPTY name is deliberate: it is what stops a solo, unrouted or Teams-off
+            // ticket being asked about again on every dashboard load.
+            let name = answers.get(&key.id).cloned().unwrap_or_default();
+            match name.is_empty() {
+                true => out.remove(&key.id),
+                false => out.insert(key.id.clone(), name.clone()),
+            };
+            guard.insert(key.id.clone(), AssigneeEntry { name, at: now });
+        }
+        prune_assignees(&mut guard, now);
+        out
+    }
+
+    /// The assignee half of [`Self::partition`], and it follows the same two rules: a stale answer
+    /// is returned AS WELL AS re-queried (it is what the caller gets when the refresh fails), and
+    /// the refresh set is deduplicated and capped at [`MAX_LIFECYCLE_REFRESH`].
+    ///
+    /// A key with no `identifier` is still refreshable — the label lookup goes by `id` — but a key
+    /// with no `id` is dropped: there is nothing to key the answer by.
+    fn partition_assignees(
+        &self,
+        keys: &[IssueKey],
+        now: Instant,
+    ) -> (HashMap<String, String>, Vec<IssueKey>) {
+        let mut cached = HashMap::new();
+        let mut stale = Vec::new();
+        let mut seen = HashSet::new();
+        let guard = self
+            .assignees
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for key in keys {
+            if key.id.is_empty() || !seen.insert(key.id.as_str()) {
+                continue;
+            }
+            let entry = guard.get(&key.id);
+            if let Some(name) = entry.map(|e| e.name.as_str()).filter(|n| !n.is_empty()) {
+                cached.insert(key.id.clone(), name.to_string());
+            }
+            let fresh = entry.is_some_and(|e| now.duration_since(e.at) < LIFECYCLE_TTL);
+            if !fresh && stale.len() < MAX_LIFECYCLE_REFRESH {
+                stale.push(key.clone());
+            }
+        }
+        (cached, stale)
+    }
+}
+
+/// The identity the ticket's NEWEST run wore, from the store's own event ledger — `teams.route`'s
+/// `identity=<name> reason=<why>` text, parsed by [`crate::triage::route_event_identity`].
+///
+/// `limit: 1` with the query's `run_id DESC` ordering is what makes it the newest run's: the Jobs
+/// row shows that run, so the assignee shown must be the one that ran it. A blank identifier has
+/// nothing to look up, and a store error answers `None` — "ask the label instead" — rather than
+/// propagating.
+fn route_identity(
+    store: &(dyn rhapsody_store::Store + Send + Sync),
+    identifier: &str,
+) -> Option<String> {
+    if identifier.is_empty() {
+        return None;
+    }
+    let q = rhapsody_store::EventQuery {
+        text: String::new(),
+        issue: identifier.to_string(),
+        kind: crate::teams::EVENT_ROUTE.to_string(),
+        limit: 1,
+    };
+    match store.search_events(q) {
+        Ok(hits) => hits
+            .first()
+            .and_then(|h| crate::triage::route_event_identity(&h.text)),
+        Err(err) => {
+            tracing::warn!(
+                issue = %identifier,
+                error = %err,
+                "assignee lookup could not read the run history; falling back to the ticket label",
+            );
+            None
+        }
+    }
+}
+
+/// The `rhapsody:@<name>` label of each of `keys`, batched exactly as the lifecycle refresh batches
+/// its own lookup, beside the set of ids a round-trip actually COVERED — which is not the same
+/// thing: a ticket the tracker answered about but that carries no identity label is covered with no
+/// label, and that distinction is what lets the caller cache "nobody" without also caching it over
+/// a chunk that simply failed. A failed round-trip stops the refresh and is logged; it never
+/// propagates.
+async fn label_identities(
+    tracker: &dyn Tracker,
+    keys: &[IssueKey],
+) -> (Vec<(String, String)>, HashSet<String>) {
+    let mut out = Vec::new();
+    let mut covered = HashSet::new();
+    for chunk in keys.chunks(LIFECYCLE_BATCH) {
+        let ids: Vec<String> = chunk.iter().map(|k| k.id.clone()).collect();
+        let issues = match tracker.fetch_issue_labels_by_ids(&ids).await {
+            Ok(issues) => issues,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    ids = ids.len(),
+                    "assignee label lookup failed; serving cached ticket assignees",
+                );
+                break;
+            }
+        };
+        out.extend(
+            issues
+                .iter()
+                .filter_map(|iss| Some((iss.id.clone(), label_identity(iss)?))),
+        );
+        covered.extend(ids);
+    }
+    (out, covered)
+}
+
+/// The identity a ticket's labels name, or `None` for a ticket that names none.
+///
+/// Two rules mirror the router that wrote the label ([`crate::teams::route`]) rather than restating
+/// it loosely. `rhapsody:solo` is checked FIRST and is absolute: a solo ticket dispatches
+/// identity-less however it is otherwise labelled, so an identity label beside the opt-out never
+/// described who ran it. And a ticket wearing two identity labels resolves to the smallest by name
+/// rather than to whichever Linear happened to list first — the router breaks that tie by roster
+/// order, which this read path does not have, and a tie broken by response order would make the
+/// column flicker between loads.
+fn label_identity(iss: &rhapsody_core::Issue) -> Option<String> {
+    if crate::teams::is_solo(iss) {
+        return None;
+    }
+    iss.labels
+        .iter()
+        .flatten()
+        .filter_map(|l| l.strip_prefix(crate::teams::IDENTITY_LABEL_PREFIX))
+        .filter(|name| !name.is_empty())
+        .min()
+        .map(str::to_string)
+}
+
+/// [`prune`] for the assignee memo — same bound, same "expired first, then give up" rule.
+fn prune_assignees(entries: &mut HashMap<String, AssigneeEntry>, now: Instant) {
+    if entries.len() <= MAX_CACHE_ENTRIES {
+        return;
+    }
+    entries.retain(|_, e| now.duration_since(e.at) < LIFECYCLE_TTL);
+    if entries.len() > MAX_CACHE_ENTRIES {
+        entries.clear();
+    }
 }
 
 impl ControlHandle {
@@ -252,6 +503,19 @@ impl ControlHandle {
     pub async fn issue_lifecycles(&self, ids: &[String]) -> HashMap<String, IssueLifecycleRow> {
         self.lifecycle
             .resolve(ids, self.reads_lifecycle_target(), Instant::now())
+            .await
+    }
+
+    /// The daemon's off-loop "who did this work?" surface, backing the `assignee` field on
+    /// `GET /api/v1/history/issues` (STUDIO-735). Read-only and infallible: a ticket with no answer
+    /// is absent from the map, and one nobody was routed for answers the empty string.
+    ///
+    /// It takes the SAME account-level tracker as [`Self::issue_lifecycles`], for the same reason —
+    /// the label read filters on `id: { in: … }` and carries no project scope — and reads it from
+    /// the same hot-reloaded cell.
+    pub async fn issue_assignees(&self, keys: &[IssueKey]) -> HashMap<String, String> {
+        self.lifecycle
+            .resolve_assignees(keys, &self.store, self.reads_tracker(), Instant::now())
             .await
     }
 
@@ -644,5 +908,382 @@ mod tests {
             MAX_LIFECYCLE_REFRESH.div_ceil(LIFECYCLE_BATCH),
             "batched, not one query per id",
         );
+    }
+
+    // ─── the durable assignee (STUDIO-735) ───────────────────────────────────────────────────
+
+    /// An in-memory store carrying one FINISHED run per (identifier, identity) pair, each with the
+    /// `teams.route` row a routed dispatch writes. Runs are inserted in order, so the LAST entry for
+    /// an identifier is its newest run.
+    fn store_with_routes(routes: &[(&str, &str)]) -> Arc<dyn rhapsody_store::Store + Send + Sync> {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open store"),
+        );
+        for (identifier, identity) in routes {
+            let run = store
+                .start_run(rhapsody_store::RunStart {
+                    issue_identifier: (*identifier).to_string(),
+                    ..rhapsody_store::RunStart::default()
+                })
+                .expect("start run");
+            store
+                .append_events(
+                    run,
+                    &[rhapsody_store::EventRow {
+                        seq: 1,
+                        at: "2026-09-02T00:00:00Z".into(),
+                        kind: crate::teams::EVENT_ROUTE.into(),
+                        tool: String::new(),
+                        text: format!("identity={identity} reason=label"),
+                    }],
+                )
+                .expect("append route event");
+            store
+                .end_run(run, rhapsody_store::RunEnd::default())
+                .expect("end run");
+        }
+        store
+    }
+
+    fn empty_store() -> Arc<dyn rhapsody_store::Store + Send + Sync> {
+        store_with_routes(&[])
+    }
+
+    fn key(id: &str, identifier: &str) -> IssueKey {
+        IssueKey {
+            id: id.to_string(),
+            identifier: identifier.to_string(),
+        }
+    }
+
+    fn labelled(id: &str, labels: &[&str]) -> Issue {
+        Issue {
+            id: id.to_string(),
+            identifier: id.to_string(),
+            labels: Some(labels.iter().map(|l| (*l).to_string()).collect()),
+            ..Issue::default()
+        }
+    }
+
+    // THE BUG (acceptance 1): the run is over — it has an outcome and an end time, and its teammate
+    // has long since dropped off the live roster — and the ASSIGNED column must still name her.
+    #[tokio::test]
+    async fn a_finished_run_keeps_the_teammate_that_ran_it() {
+        let store = store_with_routes(&[("MT-1", "alice")]);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(&[key("a", "MT-1")], &store, None, Instant::now())
+            .await;
+
+        assert_eq!(
+            got.get("a").map(String::as_str),
+            Some("alice"),
+            "the run's own routing record outlives the run: {got:?}",
+        );
+    }
+
+    // The ticket's newest run is the one the Jobs row shows, so it is the one that names the row.
+    #[tokio::test]
+    async fn the_newest_run_names_the_ticket() {
+        let store = store_with_routes(&[("MT-1", "alice"), ("MT-1", "jimmy")]);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(&[key("a", "MT-1")], &store, None, Instant::now())
+            .await;
+
+        assert_eq!(got.get("a").map(String::as_str), Some("jimmy"));
+    }
+
+    // Acceptance 3: nothing routed, nothing labelled — the column stays "—" rather than guessing.
+    #[tokio::test]
+    async fn an_unrouted_ticket_answers_nobody() {
+        let tr = Arc::new(Fake::default());
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(
+                &[key("a", "MT-1")],
+                &empty_store(),
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            got.is_empty(),
+            "no record anywhere must not invent one: {got:?}"
+        );
+    }
+
+    // The label answers where the events row cannot: `storage.retention_days` deletes run history
+    // long before a ticket stops being worth attributing.
+    #[tokio::test]
+    async fn the_label_answers_when_the_route_row_is_gone() {
+        let mut f = Fake::default();
+        f.by_id
+            .insert("a".into(), labelled("a", &["rhapsody:@alice", "backend"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(
+                &[key("a", "MT-1")],
+                &empty_store(),
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(got.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(tr.labels_by_id_calls(), 1);
+    }
+
+    // Preference order, and the reason for it: the label says who the ticket is assigned to NOW,
+    // the route row says who actually ran it. A re-assignment must not rewrite history.
+    #[tokio::test]
+    async fn the_run_record_outranks_the_label_and_costs_no_tracker_call() {
+        let mut f = Fake::default();
+        f.by_id
+            .insert("a".into(), labelled("a", &["rhapsody:@jimmy"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(
+                &[key("a", "MT-1")],
+                &store_with_routes(&[("MT-1", "alice")]),
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(got.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            0,
+            "the tracker is asked only about what the local ledger could not answer",
+        );
+    }
+
+    // Acceptance 3, the other half: `rhapsody:solo` is the dispatch opt-out and outranks every
+    // label beside it, so a solo ticket has no assignee however it is otherwise labelled.
+    #[tokio::test]
+    async fn a_solo_ticket_answers_nobody_even_wearing_an_identity_label() {
+        let mut f = Fake::default();
+        f.by_id.insert(
+            "a".into(),
+            labelled("a", &["rhapsody:@alice", "rhapsody:solo"]),
+        );
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_assignees(
+                &[key("a", "MT-1")],
+                &empty_store(),
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(got.is_empty(), "the solo opt-out is absolute: {got:?}");
+    }
+
+    // Two identity labels resolve deterministically, whatever order the tracker lists them in — a
+    // column that flickered between loads would be worse than one that said nothing.
+    #[test]
+    fn two_identity_labels_resolve_the_same_way_whatever_the_order() {
+        let one = labelled("a", &["rhapsody:@jimmy", "rhapsody:@alice"]);
+        let other = labelled("a", &["rhapsody:@alice", "rhapsody:@jimmy"]);
+        assert_eq!(label_identity(&one), Some("alice".to_string()));
+        assert_eq!(label_identity(&other), label_identity(&one));
+        assert_eq!(label_identity(&labelled("a", &["rhapsody:@"])), None);
+        assert_eq!(label_identity(&labelled("a", &["backend"])), None);
+    }
+
+    // Acceptance 4: the decoration is TTL-cached, so a dashboard reloading inside the window costs
+    // neither a tracker call nor a fresh store read — including for the tickets that answered
+    // NOBODY, which are the ones a naive cache would re-ask about forever.
+    #[tokio::test]
+    async fn a_second_read_inside_the_ttl_asks_nothing_even_about_the_unassigned() {
+        let mut f = Fake::default();
+        f.by_id
+            .insert("a".into(), labelled("a", &["rhapsody:@alice"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let keys = [key("a", "MT-1"), key("b", "MT-2")];
+        let target = || Some(Arc::clone(&tr) as Arc<dyn Tracker>);
+        let store = empty_store();
+        let t0 = Instant::now();
+
+        let first = cache.resolve_assignees(&keys, &store, target(), t0).await;
+        assert_eq!(first.get("a").map(String::as_str), Some("alice"));
+        assert!(!first.contains_key("b"));
+        assert_eq!(tr.labels_by_id_calls(), 1);
+
+        let second = cache
+            .resolve_assignees(&keys, &store, target(), t0 + LIFECYCLE_TTL / 2)
+            .await;
+        assert_eq!(second.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            1,
+            "a fresh entry must not re-query"
+        );
+
+        let third = cache
+            .resolve_assignees(&keys, &store, target(), t0 + LIFECYCLE_TTL)
+            .await;
+        assert_eq!(third.get("a").map(String::as_str), Some("alice"));
+        assert_eq!(tr.labels_by_id_calls(), 2, "past the TTL it re-queries");
+    }
+
+    // A failed round-trip must not blank a column the console already had right. The refresh stops
+    // and the cached answer stands, exactly as the lifecycle refresh behaves.
+    #[tokio::test]
+    async fn a_failed_label_lookup_keeps_the_assignee_it_already_had() {
+        let mut f = Fake::default();
+        f.by_id
+            .insert("a".into(), labelled("a", &["rhapsody:@alice"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let keys = [key("a", "MT-1")];
+        let store = empty_store();
+        let t0 = Instant::now();
+
+        assert_eq!(
+            cache
+                .resolve_assignees(&keys, &store, Some(Arc::clone(&tr) as Arc<dyn Tracker>), t0)
+                .await
+                .get("a")
+                .map(String::as_str),
+            Some("alice"),
+        );
+
+        let mut broken = Fake::default();
+        broken.labels_by_id_err = Some(rhapsody_tracker::TrackerError::Other("linear down".into()));
+        let after = cache
+            .resolve_assignees(
+                &keys,
+                &store,
+                Some(Arc::new(broken) as Arc<dyn Tracker>),
+                t0 + LIFECYCLE_TTL,
+            )
+            .await;
+
+        assert_eq!(
+            after.get("a").map(String::as_str),
+            Some("alice"),
+            "a stale answer beats no answer when the lookup itself failed: {after:?}",
+        );
+    }
+
+    // The same bounds the lifecycle refresh carries: blank ids are dropped, a repeat is one lookup,
+    // and one request can only provoke so much work.
+    #[tokio::test]
+    async fn the_assignee_refresh_dedupes_drops_blank_ids_and_caps_the_batch() {
+        let mut f = Fake::default();
+        for i in 0..MAX_LIFECYCLE_REFRESH + 50 {
+            let id = format!("i{i}");
+            f.by_id
+                .insert(id.clone(), labelled(&id, &["rhapsody:@alice"]));
+        }
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let store = empty_store();
+
+        let dupes = [key("i0", "MT-1"), key("i0", "MT-1"), key("", "MT-2")];
+        let got = cache
+            .resolve_assignees(
+                &dupes,
+                &store,
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(got.len(), 1, "a blank id has nothing to key an answer by");
+        assert_eq!(tr.labels_by_id_calls(), 1);
+
+        // The per-request ceiling, on a cache of its own: ids past it keep whatever they had (here,
+        // nothing), which reads as "no answer" and falls back to the live roster.
+        let many: Vec<IssueKey> = (0..MAX_LIFECYCLE_REFRESH + 50)
+            .map(|i| key(&format!("i{i}"), &format!("MT-{i}")))
+            .collect();
+        let got = LifecycleCache::default()
+            .resolve_assignees(
+                &many,
+                &store,
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(got.len(), MAX_LIFECYCLE_REFRESH);
+    }
+
+    // The memo is bounded exactly like the lifecycle memo — same rule, same order.
+    #[test]
+    fn prune_assignees_drops_the_expired_first_and_only_then_gives_up() {
+        let t0 = Instant::now();
+        let now = t0 + LIFECYCLE_TTL * 2;
+        let entry = |at| AssigneeEntry {
+            name: "alice".into(),
+            at,
+        };
+
+        let mut small: HashMap<String, AssigneeEntry> =
+            (0..8).map(|i| (format!("i{i}"), entry(t0))).collect();
+        prune_assignees(&mut small, now);
+        assert_eq!(small.len(), 8, "a small memo is left alone");
+
+        let mut mixed: HashMap<String, AssigneeEntry> = (0..MAX_CACHE_ENTRIES + 10)
+            .map(|i| (format!("i{i}"), entry(if i < 20 { now } else { t0 })))
+            .collect();
+        prune_assignees(&mut mixed, now);
+        assert_eq!(mixed.len(), 20, "only the fresh entries survive");
+
+        let mut fresh: HashMap<String, AssigneeEntry> = (0..MAX_CACHE_ENTRIES + 10)
+            .map(|i| (format!("i{i}"), entry(now)))
+            .collect();
+        prune_assignees(&mut fresh, now);
+        assert!(
+            fresh.is_empty(),
+            "an unprunable memo is dropped, never grown"
+        );
+    }
+
+    // The handle's own wiring: the store is the one the orchestrator holds, and the tracker is the
+    // hot-reloaded account client — so the surface answers before any config has loaded (from the
+    // store alone) and gains the label fallback once one has.
+    #[tokio::test]
+    async fn the_handle_answers_from_the_store_before_a_config_has_loaded() {
+        let (o, store) = crate::testsupport::orch_with_store();
+        let run = store
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "MT-1".into(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start run");
+        store
+            .append_events(
+                run,
+                &[rhapsody_store::EventRow {
+                    seq: 1,
+                    at: "2026-09-02T00:00:00Z".into(),
+                    kind: crate::teams::EVENT_ROUTE.into(),
+                    tool: String::new(),
+                    text: "identity=alice reason=label".into(),
+                }],
+            )
+            .expect("append route event");
+
+        let got = o
+            .control()
+            .issue_assignees(&[key("a", "MT-1"), key("b", "MT-2")])
+            .await;
+
+        assert_eq!(got.get("a").map(String::as_str), Some("alice"));
+        assert!(!got.contains_key("b"));
     }
 }
