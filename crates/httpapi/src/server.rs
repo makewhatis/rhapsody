@@ -16,7 +16,7 @@ use rhapsody_orchestrator::teamsmemory::{
     TeamsMemoryError, TeamsView,
 };
 use rhapsody_orchestrator::{
-    HandoffResult, Identity, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
+    HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
     RunMessageResult, Snapshot, StopResult,
 };
 
@@ -79,6 +79,25 @@ pub trait StateProvider: Send + Sync {
         &self,
         _ids: &[String],
     ) -> std::collections::HashMap<String, IssueLifecycleRow> {
+        std::collections::HashMap::new()
+    }
+
+    /// The DURABLE assignee of each of `keys`, keyed by tracker issue id — what decorates
+    /// `GET /api/v1/history/issues` with the `assignee` field (STUDIO-735). A ticket nobody was
+    /// routed for answers the empty string, and one with no answer at all is simply ABSENT; the
+    /// client then falls back to the live Teams roster, which can only name a RUNNING ticket.
+    ///
+    /// It takes the identifier as well as the id because the two durable records are keyed
+    /// differently: the tracker's label read goes by opaque id, and the daemon's own run ledger by
+    /// the human identifier.
+    ///
+    /// Infallible for the same reason [`Self::issue_lifecycles`] is. Rhapsody-only (no Go v0.4.0
+    /// counterpart); the default answers nothing, which is exactly how the endpoint behaved before
+    /// the field existed.
+    async fn issue_assignees(
+        &self,
+        _keys: &[IssueKey],
+    ) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
     }
 

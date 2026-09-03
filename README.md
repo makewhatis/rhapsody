@@ -230,6 +230,16 @@ does NOT carry them and its `api/history.json` golden is untouched (STUDIO-702).
 dashboard had only a run OUTCOME to colour a ticket with, so every completed run read as "in review"
 for as long as the store kept it.
 
+`GET /api/v1/history/issues` carries a third optional field, `assignee` — the Rhapsody Teams
+teammate the ticket's newest run was dispatched under, so a job that has left "running" keeps naming
+who did it (STUDIO-735). It is resolved from two DURABLE records, in order: the run's own
+`teams.route` history row, and failing that the ticket's `rhapsody:@<name>` label (read by id, so it
+answers for a merged ticket). The field is OMITTED — never empty — for a ticket nobody was routed
+for, which is every ticket on a Teams-off daemon and every `rhapsody:solo` one. The lookup shares the
+lifecycle decoration's shape exactly: off the control loop, TTL-cached, best-effort, and unable to
+fail the listing. Before it, the console read the assignee from the LIVE Teams roster, so the column
+went blank the moment a run finished.
+
 The day boundary for `/history/summary` is **local, not UTC**: the caller sends its own local
 midnight as `since` (the dashboard does), and omitting it falls back to the daemon host's local
 midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would
