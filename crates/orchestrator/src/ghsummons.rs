@@ -82,7 +82,12 @@ pub fn parse_repo(repo_url: &str) -> Option<(String, String)> {
 /// because each of those ENDS the authority and starts a component this daemon must not read a host
 /// out of.
 pub(crate) fn github_host_begins_at(url: &str, at: usize) -> bool {
-    let before = &url[..at];
+    // `get`, not `&url[..at]`: every caller derives `at` from a match on this same string, so a bad
+    // index cannot happen — and a guard that returns "not a host" is still cheaper than a panic on
+    // the path that reads attacker-controlled text.
+    let Some(before) = url.get(..at) else {
+        return false;
+    };
     // A URL cannot contain a space, so anything before the last one is surrounding prose. Split
     // rather than slice past a `rfind`: whitespace is not always one byte (U+3000 is three), and
     // `&before[i + 1..]` would land inside the character and panic — on room text an attacker
