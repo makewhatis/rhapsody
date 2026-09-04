@@ -920,15 +920,21 @@ function runMessage(over: Partial<RunMessage> = {}): RunMessage {
 }
 
 describe("the watch-tabs rail (§3C)", () => {
-  it("puts the five tabs under the inspector, with Diff the only one marked a dependency", async () => {
+  it("gives the five tabs their own zone below the split, with Diff the only one marked a dependency", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
 
-    // Inside the split's right column, under the inspector — not a row of its own below the trace.
-    const right = document.querySelector(".trsplit .trright") as HTMLElement;
-    expect(right.querySelector(".trinsp")).toBeTruthy();
-    expect(right.querySelector(".trwatch")).toBeTruthy();
+    // Zone D (STUDIO-766): the tabs are RUN-scoped, so they are a full-width sibling BELOW the
+    // split rather than a strip welded under the step-scoped inspector inside its right column.
+    const split = document.querySelector(".trsplit") as HTMLElement;
+    const watch = document.querySelector(".trwatch") as HTMLElement;
+    expect(split.querySelector(".trright .trinsp")).toBeTruthy();
+    expect(split.querySelector(".trwatch")).toBeNull();
+    expect(watch.parentElement).toBe(split.parentElement);
+    expect(split.compareDocumentPosition(watch) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // And it SAYS which scope it is, rather than leaving the operator to infer it from position.
+    expect(watch.querySelector(".eyebrow")?.textContent).toBe("This whole run");
 
     expect(tabLabels()).toEqual(["Diffdep", "Review", "Room", "Memory", "Messages"]);
     expect(screen.getByRole("tab", { name: /^room/i }).getAttribute("aria-selected")).toBe("true");
@@ -937,6 +943,32 @@ describe("the watch-tabs rail (§3C)", () => {
       expect(tab.getAttribute("aria-controls")).toBe("trwatch-panel");
     }
     expect(panel().getAttribute("aria-labelledby")).toBe("trtab-room");
+  });
+
+  // The whole point of the split zones: the inspector answers "this step", the rail answers
+  // "this run". Clicking a step must move the first and leave the second alone — including
+  // anything half-written in it, which is the loudest way a false step-scope would show.
+  it("is untouched when the spine's selected step changes", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    await openTab("Messages");
+    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
+      target: { value: "btw the branch moved" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Implemented/ }));
+    await waitFor(() =>
+      expect(document.querySelector(".trinsp h4")?.textContent).toContain("Implemented"),
+    );
+
+    expect(screen.getByRole("tab", { name: /^messages/i }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    expect(panel().getAttribute("aria-labelledby")).toBe("trtab-messages");
+    expect(
+      (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
+    ).toBe("btw the branch moved");
   });
 
   // `role="tablist"` is a promise about the keyboard, not only about the screen reader: an
@@ -1927,6 +1959,37 @@ describe("the ask card and the dock read as one control (STUDIO-733)", () => {
     expect(css).toContain(
       ".rh-console .askex + .askdock { border-radius: 0 0 var(--r) var(--r); }",
     );
+  });
+});
+
+// The rail reads as a zone of its own, on the Result card's treatment, rather than as a strip
+// welded to the bottom of the inspector (STUDIO-766).
+describe("the watch-tabs zone is drawn like the other run-scoped zone (STUDIO-766)", () => {
+  const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+
+  function rule(selector: string): string {
+    const at = css.indexOf(`${selector} {`);
+    expect(at, `${selector} is not declared`).toBeGreaterThan(-1);
+    return css.slice(at, css.indexOf("}", at));
+  }
+
+  it("gives the rail the Result card's border, radius, surface and rhythm", () => {
+    const watch = rule(".rh-console .trwatch");
+    expect(watch).toMatch(/border:\s*1px solid var\(--line\)/);
+    expect(watch).toMatch(/border-radius:\s*var\(--r\)/);
+    expect(watch).toMatch(/background:\s*var\(--panel\)/);
+    // The same 18px that separates the Result card from the split above it.
+    expect(watch).toMatch(/margin-bottom:\s*18px/);
+  });
+
+  it("drops the weld that made the rail look like part of the inspector", () => {
+    const watch = rule(".rh-console .trwatch");
+    // `border-top` alone was the whole visual join, and `margin-top: auto` floated the rail to a
+    // different height on every step — both belong to the old in-column rail.
+    expect(watch).not.toMatch(/border-top:/);
+    expect(watch).not.toMatch(/margin-top:\s*auto/);
+    // The right track holds only the inspector now, so it has no column to lay out.
+    expect(rule(".rh-console .trright")).not.toMatch(/flex-direction:\s*column/);
   });
 });
 

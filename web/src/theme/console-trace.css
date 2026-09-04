@@ -206,15 +206,20 @@
 .rh-console .trlatest { position: fixed; right: 26px; bottom: 22px; z-index: 6; font: inherit; font-size: 12px; padding: 8px 14px; border-radius: 999px; cursor: pointer; background: var(--raise); color: var(--ink); border: 1px solid var(--operator); box-shadow: 0 4px 14px rgb(0 0 0 / .35); }
 .rh-console .trlatest:hover { background: var(--panel-2); }
 
-/* ---- slice 4 (STUDIO-745): the watch-tabs rail under the inspector, and the ask dock ---- */
+/* ---- slice 4 (STUDIO-745): the watch-tabs rail, and the ask dock ---- */
 
-/* The inspector and the rail share the split's right column. `min-width: 0` on the wrapper for the
-   same reason `.trinsp` carries it: a grid track defaults to `min-width: auto`, and a fenced block
+/* The split's right track holds the inspector alone. `min-width: 0` on the wrapper for the same
+   reason `.trinsp` carries it: a grid track defaults to `min-width: auto`, and a fenced block
    or a long branch name inside would otherwise stretch the whole page sideways. */
-.rh-console .trright { min-width: 0; display: flex; flex-direction: column; }
+.rh-console .trright { min-width: 0; }
 
-.rh-console .trwatch { border-top: 1px solid var(--line); margin-top: auto; }
-.rh-console .trwatch .tabs { display: flex; gap: 4px; padding: 10px 18px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+/* Zone D (STUDIO-766): a full-width surface of its own below the split, drawn like the Result
+   card because it is RUN-scoped as that card is — not step-scoped like the inspector it used to
+   hang from on a hairline border, which read as though it should change with the spine.
+   `overflow: hidden` so the tabs' rule and the panel stay inside the rounded corners. */
+.rh-console .trwatch { border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); margin-bottom: 18px; overflow: hidden; }
+.rh-console .trwatch .eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-4); font-weight: 600; padding: 12px 18px 0; }
+.rh-console .trwatch .tabs { display: flex; gap: 4px; padding: 8px 18px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .rh-console .trwatch .tab { font: inherit; font-size: 12px; padding: 7px 12px; color: var(--ink-3); background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer; display: flex; align-items: center; }
 .rh-console .trwatch .tab:hover { color: var(--ink); }
 .rh-console .trwatch .tab.on { color: var(--ink); border-bottom-color: var(--operator); font-weight: 600; }

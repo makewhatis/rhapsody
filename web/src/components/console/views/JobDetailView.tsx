@@ -381,25 +381,32 @@ function RunTrace({
             live={inFlight}
             batons={batons}
             jump={jump}
-            watch={
-              <WatchTabsRail tab={tab} onSelect={setTab}>
-                <WatchPanel
-                  tab={tab}
-                  run={live}
-                  inFlight={inFlight}
-                  roster={roster}
-                  rosterRead={rosterRead}
-                  teamsEnabled={teamsEnabled}
-                  draft={draft}
-                  onDraft={setDraft}
-                  focusComposer={focusMessage}
-                  onComposerFocused={takeMessageFocus}
-                  onOpenMemory={onOpenMemory}
-                  onOpenRoom={onOpenRoom}
-                />
-              </WatchTabsRail>
-            }
           />
+          {/* Zone D (STUDIO-766): the rail is RUN-scoped — the same five surfaces whichever step
+              the spine has selected — so it is a full-width sibling of the Split, on the Result
+              card's treatment, rather than a strip welded under the STEP-scoped inspector inside
+              the Split's right column. There it read as though it should change per step.
+              Keyed per attempt, as it was implicitly while it rode inside the Split's key: the
+              mounted panel keeps state of its own (the Messages composer's send error), and a
+              failure reported against the attempt being LEFT must not follow the operator to the
+              one they switched to. The key is its own — two siblings sharing one is a collision
+              React resolves by dropping a sibling, which is why AskDock's is prefixed too. */}
+          <WatchTabsRail key={`watch:${run.id}`} tab={tab} onSelect={setTab}>
+            <WatchPanel
+              tab={tab}
+              run={live}
+              inFlight={inFlight}
+              roster={roster}
+              rosterRead={rosterRead}
+              teamsEnabled={teamsEnabled}
+              draft={draft}
+              onDraft={setDraft}
+              focusComposer={focusMessage}
+              onComposerFocused={takeMessageFocus}
+              onOpenMemory={onOpenMemory}
+              onOpenRoom={onOpenRoom}
+            />
+          </WatchTabsRail>
           {/* §6's "Ask about this run": a room post refed to the run TODAY, which upgrades to the
               answering-manager Answer path when one is served. It needs a room to post into, so
               a daemon with Teams off gets no dock rather than a control that cannot act. */}
@@ -772,7 +779,6 @@ function TraceSplit({
   live,
   batons,
   jump,
-  watch,
 }: {
   phases: readonly TracePhase[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
@@ -783,8 +789,6 @@ function TraceSplit({
   live: boolean;
   batons: RelayBatons;
   jump: { step: FailingStep; nonce: number } | null;
-  /** §3C's watch-tabs rail, which sits under the inspector in the same column. */
-  watch: ReactNode;
 }) {
   const [filter, setFilter] = useState<TraceFilter>("all");
   const [query, setQuery] = useState("");
@@ -877,8 +881,8 @@ function TraceSplit({
           <div className="empty">No step matches.</div>
         ) : null}
       </div>
-      {/* The inspector and the rail share the right column: the rail is what the SELECTED frame
-          is watched against, so it sits under it rather than beside the spine. */}
+      {/* The right column holds the inspector alone — everything in the Split is scoped to the
+          step the spine has selected. The run-scoped watch-tabs are zone D, below (STUDIO-766). */}
       <div className="trright">
         <div className="trinsp">
           {selected === undefined ? null : (
@@ -890,7 +894,6 @@ function TraceSplit({
             />
           )}
         </div>
-        {watch}
       </div>
       {/* Only while the run is LIVE: on a finished trace there is no "latest" to fall behind. */}
       {behind ? (
@@ -1269,7 +1272,11 @@ function RawTranscript({ entries, pending }: { entries: readonly LogEntry[]; pen
 const WATCH_PANEL_ID = "trwatch-panel";
 
 /**
- * The rail: five tabs under the inspector, and the one panel they switch between.
+ * Zone D: five tabs below the Split, and the one panel they switch between.
+ *
+ * Every one of them is scoped to the whole RUN, unlike the inspector above, which is scoped to
+ * the step the spine has selected. The eyebrow states that in words rather than leaving the
+ * operator to discover it by clicking a step and watching the tabs not move (STUDIO-766).
  *
  * Only the SELECTED panel is mounted, which is what keeps the rail's cost honest — a run detail
  * that polled the room, the reviews and the message list all at once, for four surfaces nobody was
@@ -1288,6 +1295,7 @@ function WatchTabsRail({
 }) {
   return (
     <div className="trwatch">
+      <div className="eyebrow">This whole run</div>
       {/* The ARIA roles below are a promise about the keyboard as much as about the screen
           reader, and `shell/tabs` is the repo's own answer to it — the same wire-up the Settings
           rail uses, so the two tablists behave alike. */}
