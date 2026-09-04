@@ -3,6 +3,7 @@ import type { LogEntry, RunDetail, RunSummary } from "@/lib/api";
 import { buildResult, buildTrace } from "@/lib/trace-model";
 import {
   TRACE_FILTERS,
+  attemptBucket,
   attemptOptions,
   cardLead,
   failingStep,
@@ -599,6 +600,25 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
 
   it("survives a ticket with no runs at all", () => {
     expect(attemptOptions([], NONE, "")).toEqual([]);
+  });
+});
+
+describe("attemptBucket — the single-row breakpoint the header publishes (STUDIO-763)", () => {
+  // The stylesheet grants the one-row header per count because the width it costs is not a
+  // constant: the selector grows ~110px per attempt while every other member is fixed. These are
+  // the four thresholds `console-trace.css` is written against — 1160 / 1280 / 1400 / 1700.
+  it("names one bucket per measured breakpoint", () => {
+    expect(attemptBucket(1)).toBe("1");
+    expect(attemptBucket(2)).toBe("2");
+    expect(attemptBucket(3)).toBe("3");
+    expect(attemptBucket(4)).toBe("many");
+    expect(attemptBucket(9)).toBe("many");
+  });
+
+  // A ticket the console has fetched no history for yet renders the header before its runs land,
+  // and a bucket the stylesheet has no rule for would leave that header with no breakpoint at all.
+  it("puts a ticket with no attempts yet in the narrowest bucket, not a fifth one", () => {
+    expect(attemptBucket(0)).toBe("1");
   });
 });
 

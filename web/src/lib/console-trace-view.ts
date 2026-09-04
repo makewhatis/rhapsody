@@ -513,6 +513,27 @@ export function attemptOptions(
   });
 }
 
+/**
+ * How many attempts the header's selector is carrying, in the buckets its single-row breakpoints
+ * are written against (STUDIO-763). The view publishes it as `data-attempts` on `.trhd`.
+ *
+ * The stylesheet needs it because the width one header row costs is not a constant: every member
+ * but the attempt selector has a fixed natural width, and the selector grows ~110px per attempt.
+ * A single viewport breakpoint therefore either denies the row to a one-attempt ticket that had
+ * room for it, or grants it to a five-attempt ticket that has to crush every label to a glyph to
+ * keep it — which is the failure [`attemptOptions`] exists to end. A media query cannot read the
+ * count on its own, so the view hands it over and `console-trace.css` sets a threshold per bucket.
+ *
+ * Four buckets, not the raw count: past three attempts the row needs a display no laptop has, so
+ * every larger ticket wants the same (highest) threshold and a fifth bucket would buy nothing.
+ */
+export function attemptBucket(count: number): "1" | "2" | "3" | "many" {
+  if (count <= 1) return "1";
+  if (count === 2) return "2";
+  if (count === 3) return "3";
+  return "many";
+}
+
 /** One handoff baton — the relay between two of a ticket's runs (design record §3C/§6). */
 export interface Baton {
   /** The teammate who handed off; "" when none resolves. */

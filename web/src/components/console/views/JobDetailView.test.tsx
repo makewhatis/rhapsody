@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { LogEntry, RunDetail, RunMessage, RunSummary, StateResponse } from "@/lib/api";
@@ -346,6 +346,33 @@ describe("zone A — the sticky header (§3A)", () => {
   it("marks an estimated token total rather than presenting it as authoritative", async () => {
     mountDetail([run({ id: 547, usage_estimated: true })]);
     await waitFor(() => expect(document.querySelector(".trvitals")?.textContent).toContain("~38.0k"));
+  });
+
+  // The stylesheet's single-row rules are keyed to these two hooks, and jsdom does no layout, so
+  // this is the only thing in CI that can see them at all: the header must PUBLISH its attempt
+  // count, and the three receipt-duplicated vitals must be shed-able as one group.
+  it("publishes its attempt count for the single-row breakpoint", async () => {
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ]);
+    await waitFor(() =>
+      expect(document.querySelector(".trhd")?.getAttribute("data-attempts")).toBe("2"),
+    );
+  });
+
+  // Duration, turns and tokens all repeat verbatim in the Result card's receipt ~8px below, so the
+  // squeezed row drops them and keeps the branch, which the receipt does NOT carry. Grouping them
+  // is what lets the stylesheet drop all three and only those three.
+  it("groups the receipt-duplicated vitals apart from the branch", async () => {
+    mountDetail([run({ id: 547, turns: 3 })]);
+    await waitFor(() => expect(document.querySelector(".trvitals .trdup")).toBeTruthy());
+    const shed = document.querySelector(".trvitals .trdup")?.textContent ?? "";
+    expect(shed).toContain("3 turns");
+    expect(shed).toContain("38.0k");
+    // The branch is outside the group the row sheds — that is the whole point of the grouping.
+    expect(shed).not.toContain("symphony/STUDIO-654");
+    expect(document.querySelector(".trvitals .mono")?.textContent).toBe("symphony/STUDIO-654");
   });
 
   it("navigates back to Jobs from the breadcrumb and the back control", async () => {
@@ -1977,6 +2004,70 @@ describe("the ask card and the dock read as one control (STUDIO-733)", () => {
   });
 });
 
+// jsdom does no layout, so nothing in CI can see the single header row itself — the widths in
+// `console-trace.css`'s own comment are the only record of what it was measured to do. What CAN be
+// held is the handful of declarations the row is built out of, each of which was a real bug when
+// it was missing, and the class names, which is where the playhead's collision lived.
+describe("the single header row is built out of what it says it is (STUDIO-763)", () => {
+  const traceCss = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+  const themeDir = path.resolve(__dirname, "../../../theme");
+
+  it("floors the vitals, so the branch and its tooltip cannot be squeezed to nothing", () => {
+    // `min-width: 0` here let the group reach 0px, which took the branch AND the `title` that was
+    // supposed to recover it — a 0px box has no hover target.
+    expect(traceCss).toMatch(/\.trhd \.trvitals \{[^}]*min-width: 19ch/);
+  });
+
+  it("sheds the three receipt-duplicated vitals as a group rather than clipping them", () => {
+    // `contents` while it is kept, so grouping them costs the vitals row no layout of its own.
+    expect(traceCss).toMatch(/\.trvitals \.trdup \{[^}]*display: contents/);
+    expect(traceCss).toMatch(/\.trhd \.trdup \{[^}]*display: none/);
+  });
+
+  it("ellipsizes a clipped attempt label, with a pixel of slack against sub-pixel rounding", () => {
+    const label = traceCss.slice(traceCss.indexOf(".rh-console .trhd .trattempts button > span {"));
+    const block = label.slice(0, label.indexOf("}"));
+    // Without the ellipsis a cut label is SILENT — "attempt 5 · a" reads as complete.
+    expect(block).toMatch(/text-overflow: ellipsis/);
+    // Without the slack it fires on a button that rounded a fraction of a pixel under its text.
+    expect(block).toMatch(/padding-right: 1px/);
+  });
+
+  it("draws the single-row breakpoint per attempt count, not once for every ticket", () => {
+    // The selector grows ~110px per attempt while every other member is fixed, so one threshold
+    // either denies the row to a ticket that had room or grants it to one that has to crush every
+    // label to a glyph. These four are the measured widths — see the block comment.
+    expect(traceCss).toContain("@media (min-width: 1160px)");
+    for (const [width, bucket] of [
+      ["1279.98", '.trhd:not([data-attempts="1"])'],
+      ["1399.98", '.trhd[data-attempts="3"]'],
+      ["1699.98", '.trhd[data-attempts="many"]'],
+    ] as const) {
+      expect(traceCss).toContain(`@media (max-width: ${width}px)`);
+      expect(traceCss).toContain(bucket);
+    }
+  });
+
+  // The addendum, and the twin of STUDIO-771's jobs-list fix. `.rh-console .now` is the Jobs-home
+  // banner card and `.rh-console .trstep` is equal specificity to it, so the playhead had to move.
+  it("names the spine playhead `ph`, and `ph` collides with nothing", () => {
+    expect(traceCss).toMatch(/\.rh-console \.trstep\.ph \.g \{[^}]*color: var\(--operator\)/);
+    expect(traceCss).toMatch(/\.rh-console \.trstep\.ph \.stt \{[^}]*color: var\(--operator\)/);
+    expect(traceCss).not.toContain(".trstep.now");
+    // Every theme stylesheet, not just this one: they are emitted into a SINGLE index-*.css, so a
+    // bare `.rh-console .ph` rule in any of them would reach the spine exactly as `.now` did.
+    // Reading one file is what let STUDIO-771's first guard pass green over a live collision.
+    for (const file of readdirSync(themeDir).filter((f) => f.endsWith(".css"))) {
+      const sheet = readFileSync(path.join(themeDir, file), "utf8");
+      expect(sheet, `${file} declares a bare .ph rule`).not.toMatch(/\.rh-console \.ph[\s.,:{]/);
+      expect(sheet, `${file} declares a bare .playhead rule`).not.toMatch(/\.playhead[\s.,:{]/);
+    }
+    // And the banner card this moved away from is untouched.
+    const consoleCss = readFileSync(path.join(themeDir, "console.css"), "utf8");
+    expect(consoleCss).toMatch(/\.rh-console \.now \{[^}]*margin-bottom: 16px/);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Acceptance 6 — wide content (code) scrolls in its own box; the page never scrolls sideways.
 // ---------------------------------------------------------------------------------------------
@@ -2073,9 +2164,9 @@ function selectedStep(): string {
   return document.querySelector('.trstep[aria-pressed="true"] .stt')?.textContent ?? "";
 }
 
-/** The step the playhead's `now` badge marks; "" when the spine marks none. */
+/** The step the playhead marks; "" when the spine marks none. See `playheadIsNotTheNowCard`. */
 function nowStep(): string {
-  return document.querySelector(".trstep.now .stt")?.textContent ?? "";
+  return document.querySelector(".trstep.ph .stt")?.textContent ?? "";
 }
 
 /** The spine's grep field. */
@@ -2123,7 +2214,12 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     expect(spineTitles()).toEqual(["Oriented", "Implemented"]);
     // A finished run opens on its FIRST step — you read a trace forwards. A live one does not.
     expect(selectedStep()).toBe("Implemented");
-    expect(document.querySelector(".trstep.now")).toBeTruthy();
+    expect(document.querySelector(".trstep.ph")).toBeTruthy();
+    // NOT `now`: `.rh-console .now` (console.css) is the Jobs-home banner CARD and is the same
+    // 0,0,2 specificity as `.rh-console .trstep`, so a step marked `now` wore that card's border,
+    // gradient and 16px bottom margin as well as the playhead treatment. Twin of STUDIO-771's
+    // jobs-list fix; jsdom does no layout, so the class name is the only thing CI can hold.
+    expect(document.querySelector(".trstep.now")).toBeNull();
   });
 
   it("advances the playhead when the transcript poll brings a newer phase", async () => {
@@ -2317,7 +2413,7 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     // while the page is not following, the operator's position is still theirs. The page is tall
     // only while the head is VISIBLE (the `now` badge is on the spine) — exactly when follow can
     // be on — so the growth and the follow-flip land in ONE commit, the way a real poll does.
-    sizePage(() => (document.querySelector(".trstep.now") === null ? 2000 : 3000));
+    sizePage(() => (document.querySelector(".trstep.ph") === null ? 2000 : 3000));
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
@@ -2351,7 +2447,7 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     mountDetail([run({ id: 547 })]);
     await settleTrace();
     expect(selectedStep()).toBe("Oriented");
-    expect(document.querySelector(".trstep.now")).toBeNull();
+    expect(document.querySelector(".trstep.ph")).toBeNull();
     scrollUp(600);
     expect(document.querySelector(".trlatest")).toBeNull();
   });

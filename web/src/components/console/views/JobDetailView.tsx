@@ -41,6 +41,7 @@ import {
   OUTCOME_RUNNING,
   TRACE_FILTERS,
   TRACE_FILTER_LABELS,
+  attemptBucket,
   attemptOptions,
   cardLead,
   failingStep,
@@ -485,7 +486,10 @@ function TraceHeader({
 }) {
   const workspaceURLKey = useLinearIdentity().data?.workspace_url_key ?? "";
   return (
-    <div className="trhd" ref={ref}>
+    // `data-attempts` is for the stylesheet, not for anyone reading the DOM: the width one header
+    // row costs grows with the attempt selector, so `console-trace.css` sets the single-row
+    // breakpoint per bucket rather than once for every ticket. See `attemptBucket`.
+    <div className="trhd" data-attempts={attemptBucket(attempts.length)} ref={ref}>
       <button type="button" className="back" aria-label="Back to Jobs" onClick={onBack}>
         ‹
       </button>
@@ -555,17 +559,24 @@ function TraceHeader({
         onChange={(v) => onSelectRun(Number(v))}
       />
       <div className="trvitals">
-        <span>
-          <b>{vitals.duration}</b>
+        {/* Duration, turns and tokens, grouped because they leave together: all three are repeated
+            verbatim in the Result card's receipt ~8px below (§3B), so the single-row header sheds
+            them rather than squeezing the branch, which the receipt does NOT carry. The wrapper is
+            `display: contents` until it is shed, so grouping them costs the row no layout. */}
+        <span className="trdup">
+          <span>
+            <b>{vitals.duration}</b>
+          </span>
+          <span>
+            <b>{vitals.turns}</b>
+          </span>
+          <span>
+            <b>{vitals.tokens}</b> tokens
+          </span>
         </span>
-        <span>
-          <b>{vitals.turns}</b>
-        </span>
-        <span>
-          <b>{vitals.tokens}</b> tokens
-        </span>
-        {/* The one vital the Result card's receipt does NOT repeat, and the first thing the
-            wide-view row gives up when it is squeezed — so it carries itself in a tooltip. */}
+        {/* The one vital the Result card's receipt does NOT repeat, so it is the member the row
+            keeps and floors — and it carries itself in a tooltip for a branch long enough to
+            ellipsize anyway. */}
         <Mono title={vitals.branch}>{vitals.branch}</Mono>
       </div>
       <HeaderActions
@@ -1088,7 +1099,11 @@ function SpineStep({
   return (
     <button
       type="button"
-      className={`trstep${phase.failed ? " err" : ""}${playing ? " now" : ""}`}
+      // `ph`, not `now`: `.rh-console .now` (console.css) is the Jobs-home banner CARD, equal
+      // specificity to `.rh-console .trstep`, so a step marked `now` inherited that card's border,
+      // gradient and 16px bottom margin on top of the playhead treatment (STUDIO-763 addendum, the
+      // twin of STUDIO-771's jobs-list fix).
+      className={`trstep${phase.failed ? " err" : ""}${playing ? " ph" : ""}`}
       aria-pressed={selected}
       onClick={onSelect}
     >
