@@ -438,9 +438,10 @@ describe("buildTrace — side effects", () => {
 
 // Dogfooding rc.13: a run headed its verification block "What I checked", the past tense missed
 // the pattern, and the card printed NOTES twice — once for it and once for the run's genuine notes
-// block. The corpus writes the whole tense family, not the bare stem.
+// block. The corpus writes "check" and "checks" but also "checked", which the bare stem missed;
+// "checking" is covered for symmetry rather than because the corpus has reached for it yet.
 describe("sectionLabel", () => {
-  it("reads the verification heading in every tense a run writes it", () => {
+  it("reads the verification heading in the tenses a run writes it", () => {
     expect(sectionLabel("What I checked")).toBe("How verified");
     expect(sectionLabel("What I am checking")).toBe("How verified");
     expect(sectionLabel("Checks")).toBe("How verified");
