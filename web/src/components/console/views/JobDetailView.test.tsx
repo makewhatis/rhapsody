@@ -1324,6 +1324,9 @@ describe("Messages — the composer and its timeline (§3C)", () => {
     await waitFor(() =>
       expect(document.querySelector(".trwatch")?.textContent).not.toMatch(failure),
     );
+    // ...because the panel was REMOUNTED, not because it went away: a rail that unmounted the
+    // Messages tab would satisfy the line above while proving nothing about the cleared state.
+    expect(screen.getByLabelText(/message the running agent/i)).toBeTruthy();
   });
 });
 
