@@ -167,14 +167,20 @@
 }
 @media (max-width: 1399.98px) {
   .rh-console .trhd[data-attempts="3"],
-  .rh-console .trhd[data-attempts="many"] { flex-wrap: wrap; gap: 14px; }
+  .rh-console .trhd[data-attempts="few"] { flex-wrap: wrap; gap: 14px; }
   .rh-console .trhd[data-attempts="3"] .trdup,
-  .rh-console .trhd[data-attempts="many"] .trdup { display: contents; }
+  .rh-console .trhd[data-attempts="few"] .trdup { display: contents; }
 }
 @media (max-width: 1699.98px) {
-  .rh-console .trhd[data-attempts="many"] { flex-wrap: wrap; gap: 14px; }
-  .rh-console .trhd[data-attempts="many"] .trdup { display: contents; }
+  .rh-console .trhd[data-attempts="few"] { flex-wrap: wrap; gap: 14px; }
+  .rh-console .trhd[data-attempts="few"] .trdup { display: contents; }
 }
+/* Six attempts or more, at every width — no media query, because there is no width to wait for.
+   Five is the widest selector a 1728px display holds whole; at six every label ellipsizes, from
+   1700 to 1920 alike, and a row of six buttons reading "attempt 6 · a…" names none of them. So
+   this bucket keeps the header it has always had rather than buying one row with the labels. */
+.rh-console .trhd[data-attempts="many"] { flex-wrap: wrap; gap: 14px; }
+.rh-console .trhd[data-attempts="many"] .trdup { display: contents; }
 
 .rh-console .trtitle { margin: 0 0 10px; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
 

@@ -611,7 +611,14 @@ describe("attemptBucket — the single-row breakpoint the header publishes (STUD
     expect(attemptBucket(1)).toBe("1");
     expect(attemptBucket(2)).toBe("2");
     expect(attemptBucket(3)).toBe("3");
-    expect(attemptBucket(4)).toBe("many");
+    expect(attemptBucket(4)).toBe("few");
+    expect(attemptBucket(5)).toBe("few");
+  });
+
+  // Five is the widest selector a 1728px display holds whole; at six every label ellipsizes at
+  // every width up to 1920, so there is no threshold to grant and this bucket never gets the row.
+  it("separates the counts no display fits from the ones a wide one does", () => {
+    expect(attemptBucket(6)).toBe("many");
     expect(attemptBucket(9)).toBe("many");
   });
 

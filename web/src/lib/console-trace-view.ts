@@ -524,13 +524,17 @@ export function attemptOptions(
  * keep it — which is the failure [`attemptOptions`] exists to end. A media query cannot read the
  * count on its own, so the view hands it over and `console-trace.css` sets a threshold per bucket.
  *
- * Four buckets, not the raw count: past three attempts the row needs a display no laptop has, so
- * every larger ticket wants the same (highest) threshold and a fifth bucket would buy nothing.
+ * Five buckets, not the raw count. Four of them name a measured width; `many` names the absence
+ * of one. Measured in Chrome, a five-attempt selector is the widest that fits a 1728px display
+ * whole — at six every label ellipsizes at every width tested up to 1920, so no threshold exists
+ * to grant, and the stylesheet keeps those tickets on the wrapped header at any size rather than
+ * buying one row with six labels that name nobody.
  */
-export function attemptBucket(count: number): "1" | "2" | "3" | "many" {
+export function attemptBucket(count: number): "1" | "2" | "3" | "few" | "many" {
   if (count <= 1) return "1";
   if (count === 2) return "2";
   if (count === 3) return "3";
+  if (count <= 5) return "few";
   return "many";
 }
 

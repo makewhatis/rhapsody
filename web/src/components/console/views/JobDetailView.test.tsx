@@ -2041,11 +2041,15 @@ describe("the single header row is built out of what it says it is (STUDIO-763)"
     for (const [width, bucket] of [
       ["1279.98", '.trhd:not([data-attempts="1"])'],
       ["1399.98", '.trhd[data-attempts="3"]'],
-      ["1699.98", '.trhd[data-attempts="many"]'],
+      ["1699.98", '.trhd[data-attempts="few"]'],
     ] as const) {
       expect(traceCss).toContain(`@media (max-width: ${width}px)`);
       expect(traceCss).toContain(bucket);
     }
+    // Six or more gets no threshold at all — no width fits it, so the rule carries no media query.
+    expect(traceCss).toMatch(
+      /\n\.rh-console \.trhd\[data-attempts="many"\] \{[^}]*flex-wrap: wrap/,
+    );
   });
 
   // The addendum, and the twin of STUDIO-771's jobs-list fix. `.rh-console .now` is the Jobs-home
