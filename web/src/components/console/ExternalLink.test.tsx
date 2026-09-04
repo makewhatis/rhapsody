@@ -56,6 +56,25 @@ describe("ExternalLink", () => {
     expect(click.defaultPrevented).toBe(false);
   });
 
+  // The props type omits `onClick`/`target`/`rel`, so this shape is a compile error at a real call
+  // site — the cast is what lets the test assert the RUNTIME half of that guarantee as well.
+  it("cannot have its seam displaced by a call site that smuggles its own onClick past the types", () => {
+    const theirs = vi.fn();
+    const props = { onClick: theirs, target: "_self" } as unknown as { className: string };
+    render(
+      <ExternalLink {...props} href="https://example.com/pr/2">
+        smuggled
+      </ExternalLink>,
+    );
+    const link = screen.getByRole("link", { name: "smuggled" });
+    expect(link.getAttribute("target")).toBe("_blank");
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(link, ev);
+    expect(theirs).not.toHaveBeenCalled();
+    expect(h.openExternal).toHaveBeenCalledWith("https://example.com/pr/2");
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
   it("passes the caller's class through, so a link can still be a button or a chip", () => {
     render(
       <ExternalLink className="btn sec" href="https://example.com">

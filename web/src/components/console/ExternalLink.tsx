@@ -19,12 +19,14 @@ export interface ExternalLinkProps
 // plain-browser dashboard is unchanged.
 //
 // The anchor keeps its `href`: copy-link, right-click and keyboard focus are anchor behaviour,
-// and only the click is redirected. `onClick`, `target` and `rel` are NOT accepted — a call
-// site that set its own `onClick` would silently replace the seam, which is the regression this
-// component exists to make impossible.
+// and only the click is redirected. `onClick`, `target` and `rel` are NOT accepted — a call site
+// that set its own `onClick` would silently replace the seam, which is the regression this
+// component exists to make impossible. `rest` is spread FIRST so that holds at runtime too, not
+// only in the types: whatever a caller passes, the seam is the handler that ends up on the anchor.
 export function ExternalLink({ href, children, ...rest }: ExternalLinkProps) {
   return (
     <a
+      {...rest}
       href={href}
       target="_blank"
       rel="noreferrer noopener"
@@ -35,14 +37,18 @@ export function ExternalLink({ href, children, ...rest }: ExternalLinkProps) {
         e.preventDefault();
         openExternal(href);
       }}
-      {...rest}
     >
       {children}
     </a>
   );
 }
 
-/** Mirrors `windowserver::open_external`'s scheme guard on the host side. */
+/**
+ * The host side of the seam, `windowserver::open_external`, opens `http`/`https` and refuses every
+ * other scheme. This is deliberately a shade stricter than that guard — a scheme-only `http:x`
+ * stays a plain anchor rather than becoming a rejected invoke — because falling back to the
+ * anchor is the behaviour every one of these links already had.
+ */
 function isWebUrl(href: string): boolean {
   return /^https?:\/\//i.test(href);
 }
