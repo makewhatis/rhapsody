@@ -123,7 +123,6 @@
      `min-width: 0` let this group reach 0px, and a 0px box has no hover target — which took the
      branch AND the tooltip that was supposed to recover it. */
   .rh-console .trhd .trvitals { flex: 0 1 auto; min-width: 19ch; flex-wrap: nowrap; overflow: hidden; }
-  .rh-console .trhd .trvitals > * { flex: none; }
   .rh-console .trhd .trvitals .mono { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Yields LAST — a truncated "attempt 3 · ali…" defeats the one thing this selector is for.
      The lopsided shrink factors are what make the order SEQUENTIAL rather than merely weighted,
