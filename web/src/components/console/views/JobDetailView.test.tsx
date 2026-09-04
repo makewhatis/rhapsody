@@ -449,9 +449,12 @@ describe("zone A — the sticky header (§3A)", () => {
       run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
       run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
     ]);
+    // The shape, not just "something follows `started`": `formatDateTime` degrades an unparseable
+    // timestamp to a dash, and an assertion loose enough to accept that would pass over a tooltip
+    // saying "started —". The timezone suffix is the viewer's, so it is matched but not named.
     await waitFor(() =>
       expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
-        /^run 547 · started \S/,
+        /^run 547 · started \d\d\/\d\d \d\d:\d\d \S/,
       ),
     );
     // And it names the attempt being READ, not the ticket's newest run — the pill describes this
@@ -459,7 +462,7 @@ describe("zone A — the sticky header (§3A)", () => {
     fireEvent.click(await screen.findByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() =>
       expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
-        /^run 522 · started \S/,
+        /^run 522 · started \d\d\/\d\d \d\d:\d\d \S/,
       ),
     );
   });
