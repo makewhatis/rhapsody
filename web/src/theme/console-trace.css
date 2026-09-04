@@ -218,7 +218,10 @@
    hang from on a hairline border, which read as though it should change with the spine.
    `overflow: hidden` so the tabs' rule and the panel stay inside the rounded corners. */
 .rh-console .trwatch { border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); margin-bottom: 18px; overflow: hidden; }
-.rh-console .trwatch .eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-4); font-weight: 600; padding: 12px 18px 0; }
+/* The Result card's eyebrow exactly — the same treatment on both RUN-scoped zones is itself part
+   of the statement. It is also the only readable choice: this label exists to be noticed, and the
+   faint `--ink-4` the inspector's own heading uses lands at ~2:1 on `--panel`. */
+.rh-console .trwatch .eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--info); font-weight: 600; padding: 12px 18px 0; }
 .rh-console .trwatch .tabs { display: flex; gap: 4px; padding: 8px 18px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .rh-console .trwatch .tab { font: inherit; font-size: 12px; padding: 7px 12px; color: var(--ink-3); background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer; display: flex; align-items: center; }
 .rh-console .trwatch .tab:hover { color: var(--ink); }

@@ -1982,6 +1982,18 @@ describe("the watch-tabs zone is drawn like the other run-scoped zone (STUDIO-76
     expect(watch).toMatch(/margin-bottom:\s*18px/);
   });
 
+  // A scope label nobody can read states nothing. `--ink-4`, which the inspector's own heading
+  // uses, sits at roughly 2:1 on `--panel`; the Result card's eyebrow ink clears 7:1 — and being
+  // the SAME ink on both run-scoped zones is part of what the label is saying.
+  it("gives the scope label the Result card's eyebrow treatment", () => {
+    const mine = rule(".rh-console .trwatch .eyebrow");
+    const card = rule(".rh-console .trrc .eyebrow");
+    for (const decl of ["text-transform: uppercase", "font-weight: 600", "color: var(--info)"]) {
+      expect(card, `.trrc .eyebrow no longer declares ${decl}`).toContain(decl);
+      expect(mine).toContain(decl);
+    }
+  });
+
   it("drops the weld that made the rail look like part of the inspector", () => {
     const watch = rule(".rh-console .trwatch");
     // `border-top` alone was the whole visual join, and `margin-top: auto` floated the rail to a
