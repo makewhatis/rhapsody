@@ -10,8 +10,10 @@ import { MEMORY_EMPTY_NOTE, ROOM_WATCH_WINDOW } from "@/lib/console-watch";
 // STUDIO-742 — the "Trace" run detail's three zones (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3), replacing STUDIO-683's summary strip and
 // flat runs list — plus the states of slice 3 (STUDIO-744) and the watch-tabs rail of slice 4
-// (STUDIO-745), which is where §4's side cards moved: Diff / Review / Room / Memory / Messages,
-// under the inspector, with an "Ask about this run" dock beneath the split.
+// (STUDIO-745), which is where §4's side cards moved: Diff / Review / Room / Memory / Messages.
+// STUDIO-766 then lifted that rail out of the split's right column into a zone D of its own, so
+// the running order below the header is Result card, split, watch-tabs, "Ask about this run" dock
+// — the last three all full-width siblings.
 
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
@@ -925,16 +927,20 @@ describe("the watch-tabs rail (§3C)", () => {
     mountDetail([run({ id: 547 })]);
     await settleTrace();
 
-    // Zone D (STUDIO-766): the tabs are RUN-scoped, so they are a full-width sibling BELOW the
-    // split rather than a strip welded under the step-scoped inspector inside its right column.
+    // Zone D (STUDIO-766): the tabs do not follow the spine, so they are a full-width sibling
+    // BELOW the split rather than a strip welded under the step-scoped inspector in its column.
     const split = document.querySelector(".trsplit") as HTMLElement;
     const watch = document.querySelector(".trwatch") as HTMLElement;
     expect(split.querySelector(".trright .trinsp")).toBeTruthy();
     expect(split.querySelector(".trwatch")).toBeNull();
     expect(watch.parentElement).toBe(split.parentElement);
     expect(split.compareDocumentPosition(watch) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // And it SAYS which scope it is, rather than leaving the operator to infer it from position.
-    expect(watch.querySelector(".eyebrow")?.textContent).toBe("This whole run");
+    // And it SAYS its scope rather than leaving the operator to infer it from position. The label
+    // has to be true of all five tabs: only Messages is run-scoped (`runId`), while Diff, Review,
+    // Room and Memory are ticket-scoped (every one of them built on `run.issue_identifier`), so a
+    // label naming EITHER of those two scopes would promise the other's tabs a change they never
+    // make — the very defect, one zone up, that moving this rail was meant to remove.
+    expect(watch.querySelector(".eyebrow")?.textContent).toBe("Not this step");
 
     expect(tabLabels()).toEqual(["Diffdep", "Review", "Room", "Memory", "Messages"]);
     expect(screen.getByRole("tab", { name: /^room/i }).getAttribute("aria-selected")).toBe("true");
@@ -945,8 +951,8 @@ describe("the watch-tabs rail (§3C)", () => {
     expect(panel().getAttribute("aria-labelledby")).toBe("trtab-room");
   });
 
-  // The whole point of the split zones: the inspector answers "this step", the rail answers
-  // "this run". Clicking a step must move the first and leave the second alone — including
+  // The whole point of the split zones: the inspector answers "this step" and the rail answers
+  // anything but. Clicking a step must move the first and leave the second alone — including
   // anything half-written in it, which is the loudest way a false step-scope would show.
   it("is untouched when the spine's selected step changes", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
@@ -1291,6 +1297,32 @@ describe("Messages — the composer and its timeline (§3C)", () => {
       expect(
         (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
       ).toBe(""),
+    );
+  });
+
+  // The draft above is dropped by `selectRun`, which is code anyone can read. The send FAILURE is
+  // not: it lives in `MessagesPanel`'s own `useState`, and the only thing that clears it across an
+  // attempt switch is the rail's `key={`watch:${run.id}`}` remounting the panel. That key came for
+  // free from `TraceSplit` until STUDIO-766 moved the rail out, and an explicit key on a
+  // non-list element is exactly what a later tidy-up deletes — so pin the behaviour, not the key.
+  it("drops a refused send when the operator switches attempt", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.sendRunMessage.mockRejectedValue(new Error("too many pending operator messages for this run"));
+    mountDetail([run({ ...LIVE }), run({ id: 522, outcome: "completed" })]);
+    await settleTrace();
+    await openTab("Messages");
+    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
+      target: { value: "btw the branch moved" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    const failure = /too many pending operator messages/;
+    await waitFor(() => expect(document.querySelector(".trwatch")?.textContent).toMatch(failure));
+
+    // A failure reported against the attempt being LEFT must not follow the operator to the one
+    // they arrive at, where it would read as that run having refused a message nobody sent it.
+    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    await waitFor(() =>
+      expect(document.querySelector(".trwatch")?.textContent).not.toMatch(failure),
     );
   });
 });
@@ -1964,7 +1996,7 @@ describe("the ask card and the dock read as one control (STUDIO-733)", () => {
 
 // The rail reads as a zone of its own, on the Result card's treatment, rather than as a strip
 // welded to the bottom of the inspector (STUDIO-766).
-describe("the watch-tabs zone is drawn like the other run-scoped zone (STUDIO-766)", () => {
+describe("the watch-tabs zone is drawn as a zone of its own (STUDIO-766)", () => {
   const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
 
   function rule(selector: string): string {
@@ -1973,18 +2005,21 @@ describe("the watch-tabs zone is drawn like the other run-scoped zone (STUDIO-76
     return css.slice(at, css.indexOf("}", at));
   }
 
-  it("gives the rail the Result card's border, radius, surface and rhythm", () => {
+  it("gives the rail the Result card's border, radius and rhythm", () => {
     const watch = rule(".rh-console .trwatch");
     expect(watch).toMatch(/border:\s*1px solid var\(--line\)/);
     expect(watch).toMatch(/border-radius:\s*var\(--r\)/);
+    // The SURFACE is not the Result card's: `.trrc` is a gradient over `--panel-2`, this is the
+    // flat `--panel` the ticket specified. Border, radius, rhythm and eyebrow ink are the shared
+    // part, and the assertions here claim no more than that.
     expect(watch).toMatch(/background:\s*var\(--panel\)/);
     // The same 18px that separates the Result card from the split above it.
     expect(watch).toMatch(/margin-bottom:\s*18px/);
   });
 
   // A scope label nobody can read states nothing. `--ink-4`, which the inspector's own heading
-  // uses, sits at roughly 2:1 on `--panel`; the Result card's eyebrow ink clears 7:1 — and being
-  // the SAME ink on both run-scoped zones is part of what the label is saying.
+  // uses, sits at roughly 2:1 on `--panel`; the Result card's eyebrow ink clears 7:1 — and the
+  // two zones that state a scope stating it in the SAME ink is part of what the label says.
   it("gives the scope label the Result card's eyebrow treatment", () => {
     const mine = rule(".rh-console .trwatch .eyebrow");
     const card = rule(".rh-console .trrc .eyebrow");
@@ -2036,12 +2071,19 @@ describe("wide content is contained (STUDIO-681's layout rule)", () => {
     // A CSS grid track is `min-width: auto` by default, which means "as wide as the content" —
     // the one way a fenced code block inside the inspector can push the whole page sideways.
     expect(rule(".rh-console .trsplit")).toMatch(/grid-template-columns:\s*264px minmax\(0, 1fr\)/);
-    // `.trright` is the grid CHILD now — the inspector and the watch rail share that column — so
-    // it is the one that has to carry the zero minimum; `.trinsp` alone would not save the page.
+    // `.trright` is the grid CHILD, wrapping the inspector it now holds alone, so it is the one
+    // that has to carry the zero minimum; `.trinsp` alone would not save the page.
     expect(rule(".rh-console .trright")).toMatch(/min-width:\s*0/);
     expect(rule(".rh-console .trinsp")).toMatch(/min-width:\s*0/);
-    expect(rule(".rh-console .trwatch .tabbody")).toMatch(/min-width:\s*0/);
     expect(rule(".rh-console .trrc .body")).toMatch(/min-width:\s*0/);
+  });
+
+  // STUDIO-766 moved the watch-tabs out of that grid, and a zero minimum means nothing outside
+  // one: the rail is an ordinary block whose width comes from the page, so what stops a panel too
+  // wide for it from widening the page is the zone's own clip. Asserting the old `min-width: 0`
+  // on `.tabbody` here would be asserting a no-op.
+  it("clips a too-wide panel inside the watch-tabs zone instead of widening the page", () => {
+    expect(rule(".rh-console .trwatch")).toMatch(/overflow:\s*hidden/);
   });
 
   it("wraps an operator message body rather than widening the rail", () => {

@@ -382,10 +382,12 @@ function RunTrace({
             batons={batons}
             jump={jump}
           />
-          {/* Zone D (STUDIO-766): the rail is RUN-scoped — the same five surfaces whichever step
-              the spine has selected — so it is a full-width sibling of the Split, on the Result
-              card's treatment, rather than a strip welded under the STEP-scoped inspector inside
-              the Split's right column. There it read as though it should change per step.
+          {/* Zone D (STUDIO-766): the rail is not step-scoped — the same five surfaces whichever
+              step the spine has selected — so it is a full-width sibling of the Split, on the
+              Result card's border, radius and rhythm, rather than a strip welded under the
+              STEP-scoped inspector inside the Split's right column. There it read as though it
+              should change per step. (What the five ARE scoped to is stated by the rail's own
+              eyebrow, and is not one single scope; see `WatchTabsRail`.)
               Keyed per attempt, as it was implicitly while it rode inside the Split's key: the
               mounted panel keeps state of its own (the Messages composer's send error), and a
               failure reported against the attempt being LEFT must not follow the operator to the
@@ -882,7 +884,8 @@ function TraceSplit({
         ) : null}
       </div>
       {/* The right column holds the inspector alone — everything in the Split is scoped to the
-          step the spine has selected. The run-scoped watch-tabs are zone D, below (STUDIO-766). */}
+          step the spine has selected. The watch-tabs, which follow no step, are zone D below
+          the Split (STUDIO-766). */}
       <div className="trright">
         <div className="trinsp">
           {selected === undefined ? null : (
@@ -1295,7 +1298,17 @@ function WatchTabsRail({
 }) {
   return (
     <div className="trwatch">
-      <div className="eyebrow">This whole run</div>
+      {/* What the five tabs are scoped to, STATED rather than left to be inferred from position —
+          the whole point of pulling this zone out from under the step-scoped inspector.
+          It is a negation because every positive label is a lie about part of the rail: only
+          Messages is scoped to the run (`runId={run.id}`). Diff, Review, Room and Memory are all
+          scoped to the TICKET — `runBranch`/`prSearchUrl`, `reviewsForRun`, `roomPostsFor` and
+          `useTicketFacts` are built on `run.issue_identifier` to the last one — so switching
+          attempt leaves those four byte-identical. "This whole run" would therefore promise a
+          scope change four of the five tabs never make, which is the same defect this ticket
+          exists to remove, moved one zone up. "Not this step" is true of all five, and it draws
+          the contrast with zone C that this label is here for. */}
+      <div className="eyebrow">Not this step</div>
       {/* The ARIA roles below are a promise about the keyboard as much as about the screen
           reader, and `shell/tabs` is the repo's own answer to it — the same wire-up the Settings
           rail uses, so the two tablists behave alike. */}

@@ -213,20 +213,26 @@
    or a long branch name inside would otherwise stretch the whole page sideways. */
 .rh-console .trright { min-width: 0; }
 
-/* Zone D (STUDIO-766): a full-width surface of its own below the split, drawn like the Result
-   card because it is RUN-scoped as that card is — not step-scoped like the inspector it used to
-   hang from on a hairline border, which read as though it should change with the spine.
-   `overflow: hidden` so the tabs' rule and the panel stay inside the rounded corners. */
+/* Zone D (STUDIO-766): a full-width surface of its own below the split, taking the Result card's
+   border, radius and 18px rhythm because it is not step-scoped like the inspector it used to hang
+   from on a hairline border, which read as though it should change with the spine. The SURFACE is
+   flat `--panel` as the ticket specified, not `.trrc`'s gradient; the shared eyebrow ink is what
+   ties the two zones together.
+   `overflow: hidden` keeps the tabs' rule and the panel inside the rounded corners, and since the
+   rail left the split's grid it is also this zone's containment guarantee: a child too wide to fit
+   is clipped here rather than widening the page. */
 .rh-console .trwatch { border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); margin-bottom: 18px; overflow: hidden; }
-/* The Result card's eyebrow exactly — the same treatment on both RUN-scoped zones is itself part
-   of the statement. It is also the only readable choice: this label exists to be noticed, and the
-   faint `--ink-4` the inspector's own heading uses lands at ~2:1 on `--panel`. */
+/* The Result card's eyebrow exactly: the two zones that STATE a scope should state it in one
+   voice. It is also the only readable choice — this label exists to be noticed, and the faint
+   `--ink-4` the inspector's own heading uses lands at ~2:1 on `--panel`. */
 .rh-console .trwatch .eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--info); font-weight: 600; padding: 12px 18px 0; }
 .rh-console .trwatch .tabs { display: flex; gap: 4px; padding: 8px 18px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 .rh-console .trwatch .tab { font: inherit; font-size: 12px; padding: 7px 12px; color: var(--ink-3); background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer; display: flex; align-items: center; }
 .rh-console .trwatch .tab:hover { color: var(--ink); }
 .rh-console .trwatch .tab.on { color: var(--ink); border-bottom-color: var(--operator); font-weight: 600; }
-.rh-console .trwatch .tabbody { padding: 14px 18px; min-width: 0; }
+/* No `min-width: 0` here: it did something only while the rail was a child of the split's grid,
+   and the zone's own `overflow: hidden` is what contains a wide panel now. */
+.rh-console .trwatch .tabbody { padding: 14px 18px; }
 .rh-console .trwatch .memprev { padding: 0; }
 .rh-console .trwatchfoot { display: flex; justify-content: flex-end; margin-top: 10px; }
 
