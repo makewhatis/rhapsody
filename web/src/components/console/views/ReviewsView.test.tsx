@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
   fetchReviews: vi.fn(),
   postReviewRerun: vi.fn(),
   postReviewDismiss: vi.fn(),
+  openExternal: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (orig) => {
@@ -26,6 +27,12 @@ vi.mock("@/lib/api", async (orig) => {
     postReviewRerun: h.postReviewRerun,
     postReviewDismiss: h.postReviewDismiss,
   };
+});
+
+// STUDIO-765 — the row's pull-request link leaves the app through the `openExternal` seam.
+vi.mock("@/lib/bindings", async (orig) => {
+  const actual = await orig<typeof import("@/lib/bindings")>();
+  return { ...actual, openExternal: h.openExternal };
 });
 
 const { ReviewsView } = await import("./ReviewsView");
@@ -102,6 +109,15 @@ describe("the Reviews surface", () => {
     mount({ enabled: true, reviews: [job()] });
     const link = await screen.findByRole("link");
     expect(link.getAttribute("href")).toBe("https://github.com/makewhatis/rhapsody/pull/12");
+  });
+
+  // STUDIO-765 — in the packaged app the href alone opened nothing; the click has to reach the OS.
+  it("opens that pull request in the browser rather than dropping the click", async () => {
+    mount({ enabled: true, reviews: [job()] });
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(await screen.findByRole("link"), ev);
+    expect(h.openExternal).toHaveBeenCalledWith("https://github.com/makewhatis/rhapsody/pull/12");
+    expect(ev.defaultPrevented).toBe(true);
   });
 
   /** **Acceptance 2.** Re-run POSTs the pull request's own coordinate to the trusted route. */
