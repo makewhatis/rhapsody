@@ -456,6 +456,12 @@ export interface AttemptOption {
   ordinal: number;
   /** What the button reads: "attempt 2 · jimmy", "attempt 2 · —", or "run 545". */
   label: string;
+  /**
+   * Whether the label names the attempt (an ordinal, and a teammate or a dash) rather than being
+   * the bare run-id fallback. The view reads it to decide whether the tooltip still has to supply
+   * the run id — on a fallback label the id is already on the button.
+   */
+  named: boolean;
   /** The run's `started_at`, verbatim — the view formats it for the tooltip. */
   startedAt: string;
 }
@@ -503,7 +509,7 @@ export function attemptOptions(
         : recordedNobody
           ? `attempt ${ordinal} · —`
           : `run ${run.id}`;
-    return { id: run.id, ordinal, label, startedAt: run.started_at };
+    return { id: run.id, ordinal, label, named: who !== "" || recordedNobody, startedAt: run.started_at };
   });
 }
 

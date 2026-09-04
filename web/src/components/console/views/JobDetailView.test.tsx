@@ -300,7 +300,8 @@ describe("zone A — the sticky header (§3A)", () => {
     const hd = document.querySelector(".trhd") as HTMLElement;
     expect(hd.querySelector(".k")?.textContent).toBe("STUDIO-654");
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Attach a photo in chat");
-    expect(hd.querySelector(".pill")?.textContent).toContain("completed");
+    // The prototype's own word for a clean run, not the daemon's `runs.outcome` column value.
+    expect(hd.querySelector(".pill")?.textContent).toContain("done");
     await waitFor(() => expect(hd.querySelector(".who2")?.textContent).toContain("alice"));
   });
 
@@ -343,27 +344,62 @@ describe("zone A — the sticky header (§3A)", () => {
   });
 
   // The daemon increments `attempt` only on the retry path, so a re-summoned ticket records every
-  // one of its runs as attempt 0 — 432 of 441 real rows. Labelling by attempt gave a five-run
-  // ticket five identical buttons; the run id is the daemon's own handle and is always distinct.
-  it("tells the attempts apart by run id, on rows that all record the same attempt", async () => {
+  // one of its runs as attempt 0 — 432 of 441 real rows. Labelling by that gave a five-run ticket
+  // five identical buttons; the ORDINAL below is the ticket's own run order instead (STUDIO-763).
+  it("labels each attempt by the ticket's run order, on rows that all record attempt 0", async () => {
     mountDetail([
       run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
       run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
       run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
     ]);
+    // The labels wait on the durable routing search, exactly as the header assignee does: until it
+    // has answered, an attempt is known only by its id.
     await waitFor(() => expect(document.querySelectorAll(".trattempts button")).toHaveLength(3));
-    expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual([
-      "run 547",
-      "run 545",
-      "run 522",
-    ]);
-    // The attempt and the start time are real data too — they ride along in the tooltip.
-    expect(document.querySelector(".trattempts button span")?.getAttribute("title")).toContain(
-      "attempt 0 · started ",
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · alice", "attempt 1 · alice"],
+      ),
+    );
+    // The run id is the daemon's own handle on an attempt and the ordinal is not, so it rides
+    // along in the tooltip with the start time — and so does the label, which a narrow window
+    // clips.
+    expect(document.querySelector(".trattempts button span")?.getAttribute("title")).toMatch(
+      /^attempt 3 · alice · run 547 · started /,
     );
     // Newest first AND newest selected — its transcript is the one fetched.
-    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe("run 547");
+    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe(
+      "attempt 3 · alice",
+    );
     await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547));
+  });
+
+  // The acceptance's two degradations, which are DIFFERENT answers about the same absence.
+  it("degrades to the run id, or to a dash, only where no identity resolves", async () => {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [{ ...teammate("alice"), tickets: [] }], // nobody holds the ticket now
+    });
+    h.fetchRunIdentityEvents.mockResolvedValue([
+      // 547 routed to alice; 545 recorded that it routed to NOBODY; 522 has no row at all.
+      { run_id: 547, issue_identifier: "STUDIO-654", seq: 1, at: "", kind: "teams.route", tool: "", text: "identity=alice reason=label" },
+      { run_id: 545, issue_identifier: "STUDIO-654", seq: 1, at: "", kind: "teams.unrouted", tool: "", text: "reason=solo" },
+    ]);
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+      run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
+    ]);
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · —", "run 522"],
+      ),
+    );
+    // A fallback label already IS the run id, so its tooltip does not say it twice.
+    const last = document.querySelectorAll(".trattempts button span")[2];
+    expect(last?.getAttribute("title")).toMatch(/^run 522 · started /);
   });
 
   it("renders one attempt's trace at a time, fetching only that attempt's transcript", async () => {
@@ -379,7 +415,7 @@ describe("zone A — the sticky header (§3A)", () => {
     await waitFor(() => expect(screen.getByText(/echo run 547/)).toBeTruthy());
     expect(screen.queryByText(/echo run 522/)).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() => expect(screen.getByText(/echo run 522/)).toBeTruthy());
     expect(h.fetchRunTranscript).toHaveBeenCalledWith(522);
     expect(screen.queryByText(/echo run 547/)).toBeNull();
@@ -1254,7 +1290,7 @@ describe("Messages — the composer and its timeline (§3C)", () => {
       target: { value: "btw the branch moved" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    fireEvent.click(screen.getByRole("button", { name: /attempt 1 · alice/i }));
     await waitFor(() =>
       expect(
         (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
@@ -1466,7 +1502,7 @@ describe("the ask dock (§6)", () => {
     });
     expect(document.querySelector(".askex .qb")?.textContent).toBe("why?");
 
-    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    fireEvent.click(screen.getByRole("button", { name: /attempt 1 · alice/i }));
     await waitFor(() =>
       expect((screen.getByLabelText(/ask about this run/i) as HTMLInputElement).value).toBe(""),
     );
@@ -2561,7 +2597,7 @@ describe("the attempt relay — the handoff baton (§3C/§6)", () => {
     );
     expect(document.querySelector(".trbaton.out")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() => expect(document.querySelector(".trbaton.out")).toBeTruthy());
     expect(document.querySelector(".trbaton.out")?.textContent).toContain("run 522 → run 547");
     expect(document.querySelector(".trbaton.in")).toBeNull();
@@ -2712,7 +2748,7 @@ describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => 
     );
     expect(document.querySelector(".trhd .who2")?.textContent).toContain("jimmy");
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() =>
       expect(document.querySelector(".trbaton.out")?.textContent).toContain("alice → jimmy"),
     );

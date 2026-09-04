@@ -557,11 +557,17 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
   // The two degradations the acceptance names, and they are DIFFERENT answers: a run whose ledger
   // recorded "nobody" is not a run nothing has answered for yet.
   it("says nobody for a run its own ledger recorded as unrouted", () => {
-    expect(labels(attemptOptions([c], new Map([[547, ""]]), "alice"))).toEqual(["attempt 1 · —"]);
+    const [only] = attemptOptions([c], new Map([[547, ""]]), "alice");
+    expect(only.label).toBe("attempt 1 · —");
+    // A dash IS an answer, so the option is named and the tooltip still owes the run id.
+    expect(only.named).toBe(true);
   });
 
   it("falls back to the run id while no record and no roster can name the attempt", () => {
-    expect(labels(attemptOptions([c, a], NONE, ""))).toEqual(["run 547", "run 522"]);
+    const opts = attemptOptions([c, a], NONE, "");
+    expect(labels(opts)).toEqual(["run 547", "run 522"]);
+    // Not named, so the view does not repeat the id it is already showing.
+    expect(opts.map((o) => o.named)).toEqual([false, false]);
   });
 
   // The live roster is the documented fallback for a run with no routing row at all, and the
@@ -585,9 +591,9 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
   it("keeps the daemon's run id and start time on every option, whatever the label says", () => {
     const identities = new Map([[547, "alice"]]);
     expect(attemptOptions(newestFirst, identities, "")).toEqual([
-      { id: 547, ordinal: 3, label: "attempt 3 · alice", startedAt: "2026-09-03T10:00:00Z" },
-      { id: 545, ordinal: 2, label: "run 545", startedAt: "2026-09-03T09:00:00Z" },
-      { id: 522, ordinal: 1, label: "run 522", startedAt: "2026-09-03T08:00:00Z" },
+      { id: 547, ordinal: 3, label: "attempt 3 · alice", named: true, startedAt: "2026-09-03T10:00:00Z" },
+      { id: 545, ordinal: 2, label: "run 545", named: false, startedAt: "2026-09-03T09:00:00Z" },
+      { id: 522, ordinal: 1, label: "run 522", named: false, startedAt: "2026-09-03T08:00:00Z" },
     ]);
   });
 

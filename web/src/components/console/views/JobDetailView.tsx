@@ -34,13 +34,14 @@ import { useReviews } from "@/hooks/useReviews";
 import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
 import { useTicketFacts } from "@/hooks/useTicketFacts";
 import { ticketAssignees } from "@/lib/console-jobs";
-import { clockTime, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
+import { clockTime, runOutcomeLabel, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
 import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
   OUTCOME_RUNNING,
   TRACE_FILTERS,
   TRACE_FILTER_LABELS,
+  attemptOptions,
   cardLead,
   failingStep,
   filterPhases,
@@ -56,6 +57,7 @@ import {
   runTeammate,
   runVitals,
   ticketUrl,
+  type AttemptOption,
   type Baton,
   type FailingStep,
   type RelayBatons,
@@ -273,6 +275,12 @@ function RunTrace({
     () => relayBatons(runs, run, identities, assignee),
     [runs, run, identities, assignee],
   );
+  // The selector's labels, resolved from the same three inputs the batons are — so an option, the
+  // baton beside it and the header assignee can never name different teammates for one attempt.
+  const attempts = useMemo(
+    () => attemptOptions(runs, identities, assignee),
+    [runs, identities, assignee],
+  );
   // Resolved ONCE, so the header's avatar, the spine's signed steps and the inspector's
   // "what <who> did" can never disagree about whose run this is — they did while only the header
   // knew about a review key.
@@ -323,7 +331,7 @@ function RunTrace({
       <TraceHeader
         ref={headerRef}
         run={live}
-        runs={runs}
+        attempts={attempts}
         who={who}
         resolvingWho={identityRead.isPending}
         roster={roster}
@@ -447,7 +455,7 @@ function useStickyHeaderHeight(ref: RefObject<HTMLDivElement | null>): number {
 function TraceHeader({
   ref,
   run,
-  runs,
+  attempts,
   who,
   resolvingWho,
   roster,
@@ -460,7 +468,8 @@ function TraceHeader({
 }: {
   ref: RefObject<HTMLDivElement | null>;
   run: RunSummary;
-  runs: readonly RunSummary[];
+  /** Every attempt the ticket has, newest first, already labelled — see `attemptOptions`. */
+  attempts: readonly AttemptOption[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
   /** Whether the durable routing search may still name one — see the assignee slot below. */
@@ -495,7 +504,8 @@ function TraceHeader({
           never reaches this. */}
       {who !== "" ? (
         <span className="who2">
-          <TeammateAvatar color={teammateColor(roster, who)} size={7} />
+          {/* The prototype's `.who` — a 20px avatar carrying the initial, then the name (§3A). */}
+          <TeammateAvatar color={teammateColor(roster, who)} size={20} name={who} />
           {who}
         </span>
       ) : resolvingWho ? (
@@ -505,9 +515,10 @@ function TraceHeader({
       ) : (
         <span className="who2 none">—</span>
       )}
-      <Pill variant={runOutcomePill(run.outcome)}>
-        {run.outcome === "" ? "unknown" : run.outcome}
-      </Pill>
+      {/* The outcome pill, in the prototype's own vocabulary rather than the daemon's column
+          value — "done", not "completed" (§3A). `runOutcomeLabel` translates only the three
+          states the prototype names and passes anything else through. */}
+      <Pill variant={runOutcomePill(run.outcome)}>{runOutcomeLabel(run.outcome)}</Pill>
       {/* The live pulse (§3A). Decorative beside the outcome pill, which already says "running"
           in words — a screen reader that announced a second "live" would only repeat it. */}
       {inFlight ? <span className="trpulse" aria-hidden="true" /> : null}
@@ -515,20 +526,28 @@ function TraceHeader({
           spine and the header's assignee to that run, and the spine draws the handoff baton
           either side of it (`relayBatons`), naming each attempt's own teammate.
 
-          Labelled by RUN ID, not by `attempt`: the daemon only increments `attempt` on the retry
-          path, so a ticket re-summoned or re-dispatched records every one of its runs as attempt
-          0 — 432 of the 441 rows the store has ever written — and an "attempt 0" label repeated
-          five times names none of them. The run id is the daemon's own handle on a run and is
-          always distinct. The attempt and the start time are real data too, so they ride along
-          in the tooltip rather than being dropped. */}
+          Labelled "attempt N · <teammate>", as the prototype's `.hd` labels it (STUDIO-763), from
+          the durable per-run identity STUDIO-746 wired. `attemptOptions` owns both halves — see it
+          for why the ordinal is the ticket's own run order rather than `runs.attempt`, and for the
+          two degradations when nothing can name an attempt. The run id is the daemon's own handle
+          and the ordinal is not, so it rides along in the tooltip with the start time. */}
       <Seg
         className="trattempts"
         aria-label="Attempt"
-        options={runs.map((r) => ({
-          value: String(r.id),
+        options={attempts.map((a) => ({
+          value: String(a.id),
           label: (
-            <span title={`attempt ${r.attempt} · started ${formatDateTime(r.started_at)}`}>
-              run {r.id}
+            // The label itself rides in the tooltip too: on a narrow wide-view window a long
+            // attempt list is clipped, and the teammate is exactly what must stay reachable. A
+            // fallback label already IS the run id, so the tooltip does not repeat it.
+            <span
+              title={
+                a.named
+                  ? `${a.label} · run ${a.id} · started ${formatDateTime(a.startedAt)}`
+                  : `run ${a.id} · started ${formatDateTime(a.startedAt)}`
+              }
+            >
+              {a.label}
             </span>
           ),
         }))}
