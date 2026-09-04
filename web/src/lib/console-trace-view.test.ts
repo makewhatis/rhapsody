@@ -606,7 +606,8 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
 describe("attemptBucket — the single-row breakpoint the header publishes (STUDIO-763)", () => {
   // The stylesheet grants the one-row header per count because the width it costs is not a
   // constant: the selector grows ~110px per attempt while every other member is fixed. These are
-  // the four thresholds `console-trace.css` is written against — 1160 / 1280 / 1400 / 1700.
+  // the four thresholds `console-trace.css` is written against — 1100 / 1280 / 1400 / 1700, where
+  // 1100 is the desktop window's own default width (`desktop/src-tauri/tauri.conf.json`).
   it("names one bucket per measured breakpoint", () => {
     expect(attemptBucket(1)).toBe("1");
     expect(attemptBucket(2)).toBe("2");

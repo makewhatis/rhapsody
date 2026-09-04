@@ -2037,7 +2037,7 @@ describe("the single header row is built out of what it says it is (STUDIO-763)"
     // The selector grows ~110px per attempt while every other member is fixed, so one threshold
     // either denies the row to a ticket that had room or grants it to one that has to crush every
     // label to a glyph. These four are the measured widths — see the block comment.
-    expect(traceCss).toContain("@media (min-width: 1160px)");
+    expect(traceCss).toContain("@media (min-width: 1100px)");
     for (const [width, bucket] of [
       ["1279.98", '.trhd:not([data-attempts="1"])'],
       ["1399.98", '.trhd[data-attempts="3"]'],
@@ -2050,6 +2050,36 @@ describe("the single header row is built out of what it says it is (STUDIO-763)"
     expect(traceCss).toMatch(
       /\n\.rh-console \.trhd\[data-attempts="many"\] \{[^}]*flex-wrap: wrap/,
     );
+  });
+
+  it("sheds the one-attempt selector where it would render as a stub, not a label", () => {
+    // Under 1200 the selector is the only member with anywhere left to give (the title is on its
+    // floor), so it absorbs the whole squeeze — measured 21px at 1100, a button with no glyph in
+    // it. A group of ONE selects nothing and its teammate is already the assignee slot beside it,
+    // so the single-attempt ticket drops it rather than showing a stub. It returns at 1200.
+    expect(traceCss).toContain("@media (min-width: 1100px) and (max-width: 1199.98px)");
+    expect(traceCss).toContain(
+      '.rh-console .trhd[data-attempts="1"]:not(:has(.acterr)) .trattempts { display: none; }',
+    );
+    // Only that bucket: every other count has wrapped again by 1280, and a wrapped row has the
+    // room to keep its selector — as does a header wrapped by an inline error, hence the `:not`.
+    expect(traceCss).not.toMatch(/\.trhd\[data-attempts="(2|3|few|many)"\][^{]*\.trattempts \{[^}]*display: none/);
+  });
+
+  it("gates the whole single-row block on the `:has()` it depends on", () => {
+    // The block's inline-error rule is what stops a header carrying a failed Stop from pushing the
+    // page sideways (§3C), and it has no `:has()`-free spelling. An engine that applied the nowrap
+    // row but skipped that one rule would scroll sideways, so such an engine gets none of the
+    // block and keeps today's wrapped header. Every engine this ships to has `:has()`.
+    const at = traceCss.indexOf("@supports selector(:has(*)) {");
+    expect(at, "the single-row block is not gated").toBeGreaterThan(-1);
+    // The gate is around the media query, not inside it — a gate the block's own rules sit beside
+    // would leave the nowrap row applying on an engine that dropped the error rule.
+    expect(traceCss.slice(at)).toMatch(/^@supports selector\(:has\(\*\)\) \{\n {2}@media \(min-width: 1100px\) \{/);
+    // …and the two braces that close it, which is the pair a hand-indented block loses first.
+    const block = traceCss.slice(at, traceCss.indexOf("\n}\n", at) + 3);
+    expect(block).toContain(".rh-console .trhd:has(.acterr) { flex-wrap: wrap;");
+    expect(block.trimEnd().endsWith("}\n}")).toBe(true);
   });
 
   // The addendum, and the twin of STUDIO-771's jobs-list fix. `.rh-console .now` is the Jobs-home
