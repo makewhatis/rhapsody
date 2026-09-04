@@ -324,6 +324,17 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(vitals).toContain("symphony/STUDIO-654");
   });
 
+  // The branch is the only header vital the Result card's receipt does not repeat, and the first
+  // one the wide-view row ellipsizes when it is squeezed (STUDIO-763) — so it names itself.
+  it("keeps the branch recoverable from its own tooltip once the row ellipsizes it", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() =>
+      expect(document.querySelector(".trvitals .mono")?.getAttribute("title")).toBe(
+        "symphony/STUDIO-654",
+      ),
+    );
+  });
+
   // Every real row leaves `branch` empty, so reading it alone made this vital a permanent dash.
   it("names the ticket's own branch on a row the daemon left branchless — the real shape", async () => {
     mountDetail([run({ id: 547 })]);

@@ -564,7 +564,9 @@ function TraceHeader({
         <span>
           <b>{vitals.tokens}</b> tokens
         </span>
-        <Mono>{vitals.branch}</Mono>
+        {/* The one vital the Result card's receipt does NOT repeat, and the first thing the
+            wide-view row gives up when it is squeezed — so it carries itself in a tooltip. */}
+        <Mono title={vitals.branch}>{vitals.branch}</Mono>
       </div>
       <HeaderActions
         run={run}
