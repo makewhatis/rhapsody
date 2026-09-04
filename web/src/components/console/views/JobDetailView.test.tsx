@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { LogEntry, RunDetail, RunMessage, RunSummary, StateResponse } from "@/lib/api";
@@ -308,7 +308,8 @@ describe("zone A — the sticky header (§3A)", () => {
     const hd = document.querySelector(".trhd") as HTMLElement;
     expect(hd.querySelector(".k")?.textContent).toBe("STUDIO-654");
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Attach a photo in chat");
-    expect(hd.querySelector(".pill")?.textContent).toContain("completed");
+    // The prototype's own word for a clean run, not the daemon's `runs.outcome` column value.
+    expect(hd.querySelector(".pill")?.textContent).toContain("done");
     await waitFor(() => expect(hd.querySelector(".who2")?.textContent).toContain("alice"));
   });
 
@@ -331,6 +332,17 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(vitals).toContain("symphony/STUDIO-654");
   });
 
+  // The branch is the only header vital the Result card's receipt does not repeat, and the first
+  // one the wide-view row ellipsizes when it is squeezed (STUDIO-763) — so it names itself.
+  it("keeps the branch recoverable from its own tooltip once the row ellipsizes it", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() =>
+      expect(document.querySelector(".trvitals .mono")?.getAttribute("title")).toBe(
+        "symphony/STUDIO-654",
+      ),
+    );
+  });
+
   // Every real row leaves `branch` empty, so reading it alone made this vital a permanent dash.
   it("names the ticket's own branch on a row the daemon left branchless — the real shape", async () => {
     mountDetail([run({ id: 547 })]);
@@ -344,6 +356,33 @@ describe("zone A — the sticky header (§3A)", () => {
     await waitFor(() => expect(document.querySelector(".trvitals")?.textContent).toContain("~38.0k"));
   });
 
+  // The stylesheet's single-row rules are keyed to these two hooks, and jsdom does no layout, so
+  // this is the only thing in CI that can see them at all: the header must PUBLISH its attempt
+  // count, and the three receipt-duplicated vitals must be shed-able as one group.
+  it("publishes its attempt count for the single-row breakpoint", async () => {
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ]);
+    await waitFor(() =>
+      expect(document.querySelector(".trhd")?.getAttribute("data-attempts")).toBe("2"),
+    );
+  });
+
+  // Duration, turns and tokens all repeat verbatim in the Result card's receipt ~8px below, so the
+  // squeezed row drops them and keeps the branch, which the receipt does NOT carry. Grouping them
+  // is what lets the stylesheet drop all three and only those three.
+  it("groups the receipt-duplicated vitals apart from the branch", async () => {
+    mountDetail([run({ id: 547, turns: 3 })]);
+    await waitFor(() => expect(document.querySelector(".trvitals .trdup")).toBeTruthy());
+    const shed = document.querySelector(".trvitals .trdup")?.textContent ?? "";
+    expect(shed).toContain("3 turns");
+    expect(shed).toContain("38.0k");
+    // The branch is outside the group the row sheds — that is the whole point of the grouping.
+    expect(shed).not.toContain("symphony/STUDIO-654");
+    expect(document.querySelector(".trvitals .mono")?.textContent).toBe("symphony/STUDIO-654");
+  });
+
   it("navigates back to Jobs from the breadcrumb and the back control", async () => {
     const onNavigate = mountDetail([run({ id: 1 })]);
     fireEvent.click(await screen.findByText("Jobs"));
@@ -351,27 +390,89 @@ describe("zone A — the sticky header (§3A)", () => {
   });
 
   // The daemon increments `attempt` only on the retry path, so a re-summoned ticket records every
-  // one of its runs as attempt 0 — 432 of 441 real rows. Labelling by attempt gave a five-run
-  // ticket five identical buttons; the run id is the daemon's own handle and is always distinct.
-  it("tells the attempts apart by run id, on rows that all record the same attempt", async () => {
+  // one of its runs as attempt 0 — 432 of 441 real rows. Labelling by that gave a five-run ticket
+  // five identical buttons; the ORDINAL below is the ticket's own run order instead (STUDIO-763).
+  it("labels each attempt by the ticket's run order, on rows that all record attempt 0", async () => {
     mountDetail([
       run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
       run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
       run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
     ]);
+    // The labels wait on the durable routing search, exactly as the header assignee does: until it
+    // has answered, an attempt is known only by its id.
     await waitFor(() => expect(document.querySelectorAll(".trattempts button")).toHaveLength(3));
-    expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual([
-      "run 547",
-      "run 545",
-      "run 522",
-    ]);
-    // The attempt and the start time are real data too — they ride along in the tooltip.
-    expect(document.querySelector(".trattempts button span")?.getAttribute("title")).toContain(
-      "attempt 0 · started ",
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · alice", "attempt 1 · alice"],
+      ),
+    );
+    // The run id is the daemon's own handle on an attempt and the ordinal is not, so it rides
+    // along in the tooltip with the start time — and so does the label, which a narrow window
+    // clips.
+    expect(document.querySelector(".trattempts button span")?.getAttribute("title")).toMatch(
+      /^attempt 3 · alice · run 547 · started /,
     );
     // Newest first AND newest selected — its transcript is the one fetched.
-    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe("run 547");
+    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe(
+      "attempt 3 · alice",
+    );
     await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547));
+  });
+
+  // The acceptance's two degradations, which are DIFFERENT answers about the same absence.
+  it("degrades to the run id, or to a dash, only where no identity resolves", async () => {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [{ ...teammate("alice"), tickets: [] }], // nobody holds the ticket now
+    });
+    h.fetchRunIdentityEvents.mockResolvedValue([
+      // 547 routed to alice; 545 recorded that it routed to NOBODY; 522 has no row at all.
+      { run_id: 547, issue_identifier: "STUDIO-654", seq: 1, at: "", kind: "teams.route", tool: "", text: "identity=alice reason=label" },
+      { run_id: 545, issue_identifier: "STUDIO-654", seq: 1, at: "", kind: "teams.unrouted", tool: "", text: "reason=solo" },
+    ]);
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+      run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
+    ]);
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · —", "run 522"],
+      ),
+    );
+    // A fallback label already IS the run id, so its tooltip does not say it twice.
+    const last = document.querySelectorAll(".trattempts button span")[2];
+    expect(last?.getAttribute("title")).toMatch(/^run 522 · started /);
+  });
+
+  // The single-row header sheds the one-attempt selector at the desktop default width, and that
+  // selector's tooltip was the ONLY place in the whole Trace view rendering either fact — the
+  // route is keyed by ticket, and the Result card's receipt carries neither. So they live on the
+  // outcome pill, which no breakpoint sheds and no squeeze shrinks (STUDIO-763).
+  it("keeps the run id and start time on a header member the single row never sheds", async () => {
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ]);
+    // The shape, not just "something follows `started`": `formatDateTime` degrades an unparseable
+    // timestamp to a dash, and an assertion loose enough to accept that would pass over a tooltip
+    // saying "started —". The timezone suffix is the viewer's, so it is matched but not named.
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 547 · started \d\d\/\d\d \d\d:\d\d \S/,
+      ),
+    );
+    // And it names the attempt being READ, not the ticket's newest run — the pill describes this
+    // run, so switching attempts has to move it exactly as it moves the pill's own state word.
+    fireEvent.click(await screen.findByRole("button", { name: "attempt 1 · alice" }));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 522 · started \d\d\/\d\d \d\d:\d\d \S/,
+      ),
+    );
   });
 
   it("renders one attempt's trace at a time, fetching only that attempt's transcript", async () => {
@@ -387,7 +488,7 @@ describe("zone A — the sticky header (§3A)", () => {
     await waitFor(() => expect(screen.getByText(/echo run 547/)).toBeTruthy());
     expect(screen.queryByText(/echo run 522/)).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() => expect(screen.getByText(/echo run 522/)).toBeTruthy());
     expect(h.fetchRunTranscript).toHaveBeenCalledWith(522);
     expect(screen.queryByText(/echo run 547/)).toBeNull();
@@ -1262,7 +1363,7 @@ describe("Messages — the composer and its timeline (§3C)", () => {
       target: { value: "btw the branch moved" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    fireEvent.click(screen.getByRole("button", { name: /attempt 1 · alice/i }));
     await waitFor(() =>
       expect(
         (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
@@ -1474,7 +1575,7 @@ describe("the ask dock (§6)", () => {
     });
     expect(document.querySelector(".askex .qb")?.textContent).toBe("why?");
 
-    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    fireEvent.click(screen.getByRole("button", { name: /attempt 1 · alice/i }));
     await waitFor(() =>
       expect((screen.getByLabelText(/ask about this run/i) as HTMLInputElement).value).toBe(""),
     );
@@ -1938,6 +2039,109 @@ describe("the ask card and the dock read as one control (STUDIO-733)", () => {
   });
 });
 
+// jsdom does no layout, so nothing in CI can see the single header row itself — the widths in
+// `console-trace.css`'s own comment are the only record of what it was measured to do. What CAN be
+// held is the handful of declarations the row is built out of, each of which was a real bug when
+// it was missing, and the class names, which is where the playhead's collision lived.
+describe("the single header row is built out of what it says it is (STUDIO-763)", () => {
+  const traceCss = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+  const themeDir = path.resolve(__dirname, "../../../theme");
+
+  it("floors the vitals, so the branch and its tooltip cannot be squeezed to nothing", () => {
+    // `min-width: 0` here let the group reach 0px, which took the branch AND the `title` that was
+    // supposed to recover it — a 0px box has no hover target.
+    expect(traceCss).toMatch(/\.trhd \.trvitals \{[^}]*min-width: 19ch/);
+  });
+
+  it("sheds the three receipt-duplicated vitals as a group rather than clipping them", () => {
+    // `contents` while it is kept, so grouping them costs the vitals row no layout of its own.
+    expect(traceCss).toMatch(/\.trvitals \.trdup \{[^}]*display: contents/);
+    expect(traceCss).toMatch(/\.trhd \.trdup \{[^}]*display: none/);
+  });
+
+  it("ellipsizes a clipped attempt label, with a pixel of slack against sub-pixel rounding", () => {
+    const label = traceCss.slice(traceCss.indexOf(".rh-console .trhd .trattempts button > span {"));
+    const block = label.slice(0, label.indexOf("}"));
+    // Without the ellipsis a cut label is SILENT — "attempt 5 · a" reads as complete.
+    expect(block).toMatch(/text-overflow: ellipsis/);
+    // Without the slack it fires on a button that rounded a fraction of a pixel under its text.
+    expect(block).toMatch(/padding-right: 1px/);
+  });
+
+  it("draws the single-row breakpoint per attempt count, not once for every ticket", () => {
+    // The selector grows ~110px per attempt while every other member is fixed, so one threshold
+    // either denies the row to a ticket that had room or grants it to one that has to crush every
+    // label to a glyph. These four are the measured widths — see the block comment.
+    //
+    // The trailing brace is load-bearing, and 1100 is the number David's decision turns on: the
+    // shed rule below opens `@media (min-width: 1100px) and (max-width: 1199.98px)`, which CONTAINS
+    // the bare prefix — so without the brace this assertion passed with the single-row block back
+    // at 1160, guarding nothing. Only the block that opens on 1100 alone has the brace next to it.
+    expect(traceCss).toContain("@media (min-width: 1100px) {");
+    for (const [width, bucket] of [
+      ["1279.98", '.trhd:not([data-attempts="1"])'],
+      ["1399.98", '.trhd[data-attempts="3"]'],
+      ["1699.98", '.trhd[data-attempts="few"]'],
+    ] as const) {
+      expect(traceCss).toContain(`@media (max-width: ${width}px)`);
+      expect(traceCss).toContain(bucket);
+    }
+    // Six or more gets no threshold at all — no width fits it, so the rule carries no media query.
+    expect(traceCss).toMatch(
+      /\n\.rh-console \.trhd\[data-attempts="many"\] \{[^}]*flex-wrap: wrap/,
+    );
+  });
+
+  it("sheds the one-attempt selector where it would render as a stub, not a label", () => {
+    // Under 1200 the selector is the only member with anywhere left to give (the title is on its
+    // floor), so it absorbs the whole squeeze — measured 21px at 1100, a button with no glyph in
+    // it. A group of ONE selects nothing and its teammate is already the assignee slot beside it,
+    // so the single-attempt ticket drops it rather than showing a stub. It returns at 1200.
+    expect(traceCss).toContain("@media (min-width: 1100px) and (max-width: 1199.98px)");
+    expect(traceCss).toContain(
+      '.rh-console .trhd[data-attempts="1"]:not(:has(.acterr)) .trattempts { display: none; }',
+    );
+    // Only that bucket: every other count has wrapped again by 1280, and a wrapped row has the
+    // room to keep its selector — as does a header wrapped by an inline error, hence the `:not`.
+    expect(traceCss).not.toMatch(/\.trhd\[data-attempts="(2|3|few|many)"\][^{]*\.trattempts \{[^}]*display: none/);
+  });
+
+  it("gates the whole single-row block on the `:has()` it depends on", () => {
+    // The block's inline-error rule is what stops a header carrying a failed Stop from pushing the
+    // page sideways (§3C), and it has no `:has()`-free spelling. An engine that applied the nowrap
+    // row but skipped that one rule would scroll sideways, so such an engine gets none of the
+    // block and keeps today's wrapped header. Every engine this ships to has `:has()`.
+    const at = traceCss.indexOf("@supports selector(:has(*)) {");
+    expect(at, "the single-row block is not gated").toBeGreaterThan(-1);
+    // The gate is around the media query, not inside it — a gate the block's own rules sit beside
+    // would leave the nowrap row applying on an engine that dropped the error rule.
+    expect(traceCss.slice(at)).toMatch(/^@supports selector\(:has\(\*\)\) \{\n {2}@media \(min-width: 1100px\) \{/);
+    // …and the two braces that close it, which is the pair a hand-indented block loses first.
+    const block = traceCss.slice(at, traceCss.indexOf("\n}\n", at) + 3);
+    expect(block).toContain(".rh-console .trhd:has(.acterr) { flex-wrap: wrap;");
+    expect(block.trimEnd().endsWith("}\n}")).toBe(true);
+  });
+
+  // The addendum, and the twin of STUDIO-771's jobs-list fix. `.rh-console .now` is the Jobs-home
+  // banner card and `.rh-console .trstep` is equal specificity to it, so the playhead had to move.
+  it("names the spine playhead `ph`, and `ph` collides with nothing", () => {
+    expect(traceCss).toMatch(/\.rh-console \.trstep\.ph \.g \{[^}]*color: var\(--operator\)/);
+    expect(traceCss).toMatch(/\.rh-console \.trstep\.ph \.stt \{[^}]*color: var\(--operator\)/);
+    expect(traceCss).not.toContain(".trstep.now");
+    // Every theme stylesheet, not just this one: they are emitted into a SINGLE index-*.css, so a
+    // bare `.rh-console .ph` rule in any of them would reach the spine exactly as `.now` did.
+    // Reading one file is what let STUDIO-771's first guard pass green over a live collision.
+    for (const file of readdirSync(themeDir).filter((f) => f.endsWith(".css"))) {
+      const sheet = readFileSync(path.join(themeDir, file), "utf8");
+      expect(sheet, `${file} declares a bare .ph rule`).not.toMatch(/\.rh-console \.ph[\s.,:{]/);
+      expect(sheet, `${file} declares a bare .playhead rule`).not.toMatch(/\.playhead[\s.,:{]/);
+    }
+    // And the banner card this moved away from is untouched.
+    const consoleCss = readFileSync(path.join(themeDir, "console.css"), "utf8");
+    expect(consoleCss).toMatch(/\.rh-console \.now \{[^}]*margin-bottom: 16px/);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Acceptance 6 — wide content (code) scrolls in its own box; the page never scrolls sideways.
 // ---------------------------------------------------------------------------------------------
@@ -2034,9 +2238,9 @@ function selectedStep(): string {
   return document.querySelector('.trstep[aria-pressed="true"] .stt')?.textContent ?? "";
 }
 
-/** The step the playhead's `now` badge marks; "" when the spine marks none. */
+/** The step the playhead marks; "" when the spine marks none. See `playheadIsNotTheNowCard`. */
 function nowStep(): string {
-  return document.querySelector(".trstep.now .stt")?.textContent ?? "";
+  return document.querySelector(".trstep.ph .stt")?.textContent ?? "";
 }
 
 /** The spine's grep field. */
@@ -2084,7 +2288,12 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     expect(spineTitles()).toEqual(["Oriented", "Implemented"]);
     // A finished run opens on its FIRST step — you read a trace forwards. A live one does not.
     expect(selectedStep()).toBe("Implemented");
-    expect(document.querySelector(".trstep.now")).toBeTruthy();
+    expect(document.querySelector(".trstep.ph")).toBeTruthy();
+    // NOT `now`: `.rh-console .now` (console.css) is the Jobs-home banner CARD and is the same
+    // 0,0,2 specificity as `.rh-console .trstep`, so a step marked `now` wore that card's border,
+    // gradient and 16px bottom margin as well as the playhead treatment. Twin of STUDIO-771's
+    // jobs-list fix; jsdom does no layout, so the class name is the only thing CI can hold.
+    expect(document.querySelector(".trstep.now")).toBeNull();
   });
 
   it("advances the playhead when the transcript poll brings a newer phase", async () => {
@@ -2278,7 +2487,7 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     // while the page is not following, the operator's position is still theirs. The page is tall
     // only while the head is VISIBLE (the `now` badge is on the spine) — exactly when follow can
     // be on — so the growth and the follow-flip land in ONE commit, the way a real poll does.
-    sizePage(() => (document.querySelector(".trstep.now") === null ? 2000 : 3000));
+    sizePage(() => (document.querySelector(".trstep.ph") === null ? 2000 : 3000));
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
@@ -2312,7 +2521,7 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     mountDetail([run({ id: 547 })]);
     await settleTrace();
     expect(selectedStep()).toBe("Oriented");
-    expect(document.querySelector(".trstep.now")).toBeNull();
+    expect(document.querySelector(".trstep.ph")).toBeNull();
     scrollUp(600);
     expect(document.querySelector(".trlatest")).toBeNull();
   });
@@ -2569,7 +2778,7 @@ describe("the attempt relay — the handoff baton (§3C/§6)", () => {
     );
     expect(document.querySelector(".trbaton.out")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() => expect(document.querySelector(".trbaton.out")).toBeTruthy());
     expect(document.querySelector(".trbaton.out")?.textContent).toContain("run 522 → run 547");
     expect(document.querySelector(".trbaton.in")).toBeNull();
@@ -2720,7 +2929,7 @@ describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => 
     );
     expect(document.querySelector(".trhd .who2")?.textContent).toContain("jimmy");
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() =>
       expect(document.querySelector(".trbaton.out")?.textContent).toContain("alice → jimmy"),
     );
