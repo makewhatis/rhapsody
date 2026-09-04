@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -775,16 +775,28 @@ describe("the row trace-sparkline (§6)", () => {
     expect(row("A-1").querySelector(".spark")?.getAttribute("aria-label")).toContain("Running now");
   });
 
+  // Every file under `src/theme/` is imported somewhere in the console tree, so all of them land
+  // in the one emitted `index-*.css` and a bare `.rh-console .<class>` rule in ANY of them is
+  // equally live against the strip. Read the DIRECTORY rather than a hand-listed set: `console.css`
+  // alone leaves the sparkline's OWN stylesheet unchecked — `console-views.css` claims `.lead`,
+  // `.ghost`, `.crumbs`, `.head` and `.build` — and a hand-listed set silently stops covering the
+  // day file thirteen arrives.
+  const themeDir = path.resolve(__dirname, "../../../theme");
+  const themeCss = readdirSync(themeDir)
+    .filter((f) => f.endsWith(".css"))
+    .map((f) => readFileSync(path.join(themeDir, f), "utf8"))
+    .join("\n");
+
   // STUDIO-771. The playhead used to carry the BARE class `now`, and `console.css` styles
   // `.rh-console .now` — the "Now working" banner CARD (padding, border, rounded corners, a bottom
   // margin). That descendant selector matched the glyph too, and because `.spark .gly` sets no
   // padding or margin of its own there was nothing to override them: a 19px glyph inflated into a
   // big cyan play-button card. The defect is not the styling, it is the SHARED NAME, so that is
-  // what this pins — every class the playhead carries must be private to the sparkline, unclaimed
-  // by any `.rh-console .<class>` rule in the layout stylesheet. Reintroducing `now`, or reaching
-  // for another layout primitive's name (`mate`, `stat`, `tags`), fails here rather than in a
-  // screenshot someone happens to look at.
-  it("gives the playhead a class no layout rule in console.css claims", async () => {
+  // what this pins — every class EVERY glyph in the strip carries must be private to the sparkline,
+  // unclaimed by any `.rh-console .<class>` rule anywhere in the theme. Reintroducing `now`, or
+  // reaching for another layout primitive's name (`lead`, `ghost`, `mate`, `stat`), fails here
+  // rather than in a screenshot someone happens to look at.
+  it("gives every glyph in the strip a class no layout rule in the theme claims", async () => {
     await mountLiveRow();
     // Found by its GLYPH, never by the class under test — selecting on `.ph` would make this pass
     // the moment the class exists, which is the one thing it must not assume.
@@ -794,13 +806,15 @@ describe("the row trace-sparkline (§6)", () => {
       ).toBe(true),
     );
 
-    const playhead = [...row("A-1").querySelectorAll(".spark .gly")].find(
-      (el) => el.textContent === LIVE_GLYPH,
-    ) as HTMLElement;
-    const layoutCss = readFileSync(path.resolve(__dirname, "../../../theme/console.css"), "utf8");
-    expect(playhead.classList.length).toBeGreaterThan(0);
-    for (const cls of playhead.classList) {
-      expect(layoutCss).not.toMatch(new RegExp(`\\.rh-console \\.${cls}\\b`));
+    // The whole strip, not just the playhead: the other five glyphs carry `off` and `wt-*`, which
+    // are exposed to the same collision and were previously unchecked.
+    const glyphs = [...row("A-1").querySelectorAll<HTMLElement>(".spark .gly")];
+    expect(glyphs.length).toBe(SPARK_KINDS.length + 1);
+    for (const glyph of glyphs) {
+      expect(glyph.classList.length).toBeGreaterThan(0);
+      for (const cls of glyph.classList) {
+        expect(themeCss).not.toMatch(new RegExp(`\\.rh-console \\.${cls}\\b`));
+      }
     }
   });
 });
