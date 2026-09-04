@@ -115,10 +115,11 @@ import "@/theme/console-trace.css";
 // oldest→newest `LogEntry` list. The folding is a documented heuristic — a debugger is never
 // trapped inside it.
 //
-// Slice 4 (STUDIO-745) adds §3C's watch-tabs rail under the inspector — Diff / Review / Room /
-// Memory / Messages — which is where the §4 side cards that used to sit in their own row below the
-// trace now live, joined by the run's operator-message timeline and an "Ask about this run" dock
-// that posts to the room refed to the run (§6).
+// Slice 4 (STUDIO-745) adds §3C's watch-tabs rail — Diff / Review / Room / Memory / Messages,
+// promoted by STUDIO-766 out of the inspector's column into its own full-width zone below the
+// Split — which is where the §4 side cards that used to sit in their own row below the trace now
+// live, joined by the run's operator-message timeline and an "Ask about this run" dock that posts
+// to the room refed to the run (§6).
 //
 // Slice 5 (STUDIO-746) wires the DURABLE per-run identity through all of it: the header keeps a
 // finished run's assignee once its teammate has left the live roster, the spine signs the steps
@@ -1277,9 +1278,12 @@ const WATCH_PANEL_ID = "trwatch-panel";
 /**
  * Zone D: five tabs below the Split, and the one panel they switch between.
  *
- * Every one of them is scoped to the whole RUN, unlike the inspector above, which is scoped to
- * the step the spine has selected. The eyebrow states that in words rather than leaving the
- * operator to discover it by clicking a step and watching the tabs not move (STUDIO-766).
+ * The five do NOT share one scope: only Messages is scoped to the run (`runId={run.id}`), while
+ * Diff, Review, Room and Memory are all scoped to the TICKET, built to the last one on
+ * `run.issue_identifier`. What they do have in common is the negative — none of them follows the
+ * spine, unlike the inspector above, which is scoped to the step the spine has selected. So the
+ * eyebrow states that negation, "Not this step", rather than a positive scope that would be false
+ * about part of the rail; the JSX comment on it carries the per-tab audit (STUDIO-766).
  *
  * Only the SELECTED panel is mounted, which is what keeps the rail's cost honest — a run detail
  * that polled the room, the reviews and the message list all at once, for four surfaces nobody was

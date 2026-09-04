@@ -878,7 +878,8 @@ describe("the raw-transcript escape hatch (§4)", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// Slice 4 (STUDIO-745) — the watch-tabs rail under the inspector (§3C), and the ask dock (§6).
+// Slice 4 (STUDIO-745) — the watch-tabs rail (§3C), in its own zone below the Split since
+// STUDIO-766, and the ask dock (§6).
 // ---------------------------------------------------------------------------------------------
 
 /** The rail's tab buttons, by label, in the order they render. */

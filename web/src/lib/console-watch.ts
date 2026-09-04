@@ -1,6 +1,6 @@
 import type { ReviewJob, RunMessage, RunSummary, TeamsRoomMessage } from "@/lib/api";
 
-// console-watch — the model behind the watch-tabs rail under the inspector (design record
+// console-watch — the model behind the watch-tabs rail (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3C "a thin watch-tabs rail (Diff·dep / Review /
 // Room / Memory / Messages)"; slice 4 of its §9 plan).
 //

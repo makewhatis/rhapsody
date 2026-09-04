@@ -230,8 +230,10 @@
 .rh-console .trwatch .tab { font: inherit; font-size: 12px; padding: 7px 12px; color: var(--ink-3); background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer; display: flex; align-items: center; }
 .rh-console .trwatch .tab:hover { color: var(--ink); }
 .rh-console .trwatch .tab.on { color: var(--ink); border-bottom-color: var(--operator); font-weight: 600; }
-/* No `min-width: 0` here: it did something only while the rail was a child of the split's grid,
-   and the zone's own `overflow: hidden` is what contains a wide panel now. */
+/* No `min-width: 0` here: `.tabbody` is a plain block child, never a flex or grid ITEM, so the
+   declaration was always the initial value spelled out — inert under the old layout too, where
+   `.trright` was the grid item and `.trwatch` the flex one. The zone's own `overflow: hidden` is
+   what contains a wide panel. */
 .rh-console .trwatch .tabbody { padding: 14px 18px; }
 .rh-console .trwatch .memprev { padding: 0; }
 .rh-console .trwatchfoot { display: flex; justify-content: flex-end; margin-top: 10px; }
