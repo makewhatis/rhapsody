@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueRun, StateResponse } from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
-import { SPARK_KINDS } from "@/lib/console-trace-spark";
+import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
 
 // STUDIO-681 §10, sub-ticket 2 — the Jobs worklist's acceptance boxes 2.6, 2.7 and 2.8,
 // driven through the real view against the endpoints §9 has: /api/v1/state for the live
@@ -732,7 +732,8 @@ describe("the row trace-sparkline (§6)", () => {
     expect(h.fetchRunTranscript).not.toHaveBeenCalled();
   });
 
-  it("marks a live run with the playhead", async () => {
+  /** Mounts a single RUNNING row and points at it, so its strip draws the playhead. */
+  async function mountLiveRow() {
     h.fetchState.mockResolvedValue({
       ...EMPTY_STATE,
       running: [
@@ -765,10 +766,42 @@ describe("the row trace-sparkline (§6)", () => {
     h.fetchRunTranscript.mockResolvedValue(TRANSCRIPT);
     mount();
     await waitFor(() => expect(rowKeys()).toEqual(["A-1"]));
-
     fireEvent.focus(row("A-1"));
-    await waitFor(() => expect(row("A-1").querySelector(".spark .gly.now")).not.toBeNull());
+  }
+
+  it("marks a live run with the playhead", async () => {
+    await mountLiveRow();
+    await waitFor(() => expect(row("A-1").querySelector(".spark .gly.ph")).not.toBeNull());
     expect(row("A-1").querySelector(".spark")?.getAttribute("aria-label")).toContain("Running now");
+  });
+
+  // STUDIO-771. The playhead used to carry the BARE class `now`, and `console.css` styles
+  // `.rh-console .now` — the "Now working" banner CARD (padding, border, rounded corners, a bottom
+  // margin). That descendant selector matched the glyph too, and because `.spark .gly` sets no
+  // padding or margin of its own there was nothing to override them: a 19px glyph inflated into a
+  // big cyan play-button card. The defect is not the styling, it is the SHARED NAME, so that is
+  // what this pins — every class the playhead carries must be private to the sparkline, unclaimed
+  // by any `.rh-console .<class>` rule in the layout stylesheet. Reintroducing `now`, or reaching
+  // for another layout primitive's name (`mate`, `stat`, `tags`), fails here rather than in a
+  // screenshot someone happens to look at.
+  it("gives the playhead a class no layout rule in console.css claims", async () => {
+    await mountLiveRow();
+    // Found by its GLYPH, never by the class under test — selecting on `.ph` would make this pass
+    // the moment the class exists, which is the one thing it must not assume.
+    await waitFor(() =>
+      expect(
+        [...row("A-1").querySelectorAll(".spark .gly")].some((el) => el.textContent === LIVE_GLYPH),
+      ).toBe(true),
+    );
+
+    const playhead = [...row("A-1").querySelectorAll(".spark .gly")].find(
+      (el) => el.textContent === LIVE_GLYPH,
+    ) as HTMLElement;
+    const layoutCss = readFileSync(path.resolve(__dirname, "../../../theme/console.css"), "utf8");
+    expect(playhead.classList.length).toBeGreaterThan(0);
+    for (const cls of playhead.classList) {
+      expect(layoutCss).not.toMatch(new RegExp(`\\.rh-console \\.${cls}\\b`));
+    }
   });
 });
 
@@ -782,7 +815,7 @@ describe("the §6 additions are painted, not just classed", () => {
 
   it("styles the sparkline's glyph and its playhead", () => {
     expect(viewsCss).toMatch(/\.spark \.gly \{/);
-    expect(viewsCss).toMatch(/\.spark \.gly\.now \{[^}]*color: var\(--operator\)/);
+    expect(viewsCss).toMatch(/\.spark \.gly\.ph \{[^}]*color: var\(--operator\)/);
   });
 
   // A reserved slot with no rule of its own is indistinguishable from a kind the run DID reach,
