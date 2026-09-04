@@ -91,11 +91,12 @@
    viewport at which each count still fits one 62px row with nothing clipped, the branch whole,
    and no sideways page scroll:
 
-     1 attempt   1160      3 attempts   1400
-     2 attempts  1280      4 or more    1700
+     1 attempt   1160      4-5 attempts  1700
+     2 attempts  1280      6 or more     never — see the last rule in this section
+     3 attempts  1400
 
    So a one-attempt ticket — 432 of the 441 rows the store has ever written — is one row at the
-   desktop default plus 60px, and every count is one row on a 1728 display. 1100 exactly is 47px
+   desktop default plus 60px, and up to five attempts is one row on a 1728 display. 1100 is 47px
    short for one attempt: back 11 + title 110 + assignee 54 + pill 59 + selector 110 + branch 126
    + actions 346 + six 10px gaps = 876 against 829px of content width. Closing that last 47px
    means giving something up that is not this ticket's to give — the "Open ticket" action §3A
