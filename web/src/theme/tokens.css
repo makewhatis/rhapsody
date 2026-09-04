@@ -61,6 +61,11 @@
   --alice: #e79457;
   --jimmy: #7fa7e6;
   --info: #7fa7e6;
+  /* The Trace Result card's done tone (§3B, STUDIO-763). Its own token rather than `--info`: the
+     prototype's `--done` is #5b8def, a richer blue than the #7fa7e6 the card shipped with, and
+     #7fa7e6 is also `--jimmy` and so a TEAMMATE ramp colour — the two cannot share one value
+     without an outcome accent following whoever sits second on the roster. */
+  --done: #5b8def;
 
   /* ---- ticket keys ---- */
   --ticket: #93a0c8;
