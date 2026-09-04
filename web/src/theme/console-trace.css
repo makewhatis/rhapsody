@@ -111,10 +111,13 @@
    already on its floor), so it absorbs the whole squeeze: 110px natural at 1200, 76 at 1160, and
    21 at 1100 — a stub with no glyph in it, which is precisely the "names nobody" failure below.
    But a one-attempt selector is a group of ONE: §3A defines it as the implement→review relay's
-   linked siblings, and with one sibling it can switch to nothing, while its only other content —
-   the teammate — is the assignee slot 10px to its left. So under 1200 the single-attempt ticket
-   drops it and keeps every member that carries something, and the row at the desktop default is
-   whole rather than squeezed. It comes back at 1200, the width its label is intact at.
+   linked siblings, and with one sibling it can switch to nothing, while its visible content — the
+   teammate — is the assignee slot 10px to its left. Its TOOLTIP carried more than that: the run's
+   id and start time, which nothing else on the page renders. Those moved to the outcome pill,
+   which this block never sheds and never shrinks, so the shed now costs the header nothing at all.
+   With that done, under 1200 the single-attempt ticket drops the selector and keeps every member
+   that carries something, and the row at the desktop default is whole rather than squeezed. It
+   comes back at 1200, the width its label is intact at.
 
    Below its own threshold a ticket wraps exactly as it did before, and takes its shed vitals back
    with it. That is the honest answer rather than a fallback: granting the row anyway crushed five
@@ -355,12 +358,16 @@
 
    `ph`, not `now`. `.rh-console .now` (console.css) is the Jobs-home banner CARD, and it is 0,0,2
    specificity — the same as `.rh-console .trstep` — so a step marked `now` matched it too. What
-   that actually cost, measured rather than assumed: `margin-bottom: 16px`, and only that. The
-   banner's other four properties (padding, border, border-radius, background) are each re-declared
-   by `.trstep` itself, which is emitted later in the single bundle and so wins them at equal
-   specificity; `margin-bottom` is the one the step never declares, so it was the one that landed —
-   a stray 16px gap under whichever step happened to be playing. The banner rule is legitimate and
-   untouched; the spine's own marker moved instead
+   that actually cost, measured rather than assumed: `margin-bottom: 16px` and `flex-wrap: wrap`,
+   and only those two. The banner declares EIGHT properties, and six of them — display, gap,
+   padding, border, border-radius, background — are re-declared by `.trstep` itself, which is
+   emitted later in the single bundle and so wins them at equal specificity. The two the step never
+   declares are the two that landed: a stray 16px gap under whichever step happened to be playing,
+   and — the one that was not merely cosmetic — `flex-wrap: wrap`, which let the playing step's own
+   children break onto further lines instead of staying on one, so the step could stand taller than
+   its neighbours as well as sit further from them. Both were measured in Chrome over the built
+   bundle, three steps side by side: `now` reported `wrap`/`16px`, `ph` and a plain step
+   `nowrap`/`0px`. The banner rule is legitimate and untouched; the spine's own marker moved instead
    (STUDIO-763 addendum, the twin of STUDIO-771's jobs-list fix). `ph` collides with nothing:
    no `.ph` or `.playhead` rule exists in any of the theme stylesheets, and they all land in one
    emitted file, so any of them would have counted. */

@@ -440,6 +440,30 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(last?.getAttribute("title")).toMatch(/^run 522 · started /);
   });
 
+  // The single-row header sheds the one-attempt selector at the desktop default width, and that
+  // selector's tooltip was the ONLY place in the whole Trace view rendering either fact — the
+  // route is keyed by ticket, and the Result card's receipt carries neither. So they live on the
+  // outcome pill, which no breakpoint sheds and no squeeze shrinks (STUDIO-763).
+  it("keeps the run id and start time on a header member the single row never sheds", async () => {
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ]);
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 547 · started \S/,
+      ),
+    );
+    // And it names the attempt being READ, not the ticket's newest run — the pill describes this
+    // run, so switching attempts has to move it exactly as it moves the pill's own state word.
+    fireEvent.click(await screen.findByRole("button", { name: "attempt 1 · alice" }));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 522 · started \S/,
+      ),
+    );
+  });
+
   it("renders one attempt's trace at a time, fetching only that attempt's transcript", async () => {
     h.fetchRunTranscript.mockImplementation(async (id: number) => ({
       run_id: id,
@@ -2037,7 +2061,12 @@ describe("the single header row is built out of what it says it is (STUDIO-763)"
     // The selector grows ~110px per attempt while every other member is fixed, so one threshold
     // either denies the row to a ticket that had room or grants it to one that has to crush every
     // label to a glyph. These four are the measured widths — see the block comment.
-    expect(traceCss).toContain("@media (min-width: 1100px)");
+    //
+    // The trailing brace is load-bearing, and 1100 is the number David's decision turns on: the
+    // shed rule below opens `@media (min-width: 1100px) and (max-width: 1199.98px)`, which CONTAINS
+    // the bare prefix — so without the brace this assertion passed with the single-row block back
+    // at 1160, guarding nothing. Only the block that opens on 1100 alone has the brace next to it.
+    expect(traceCss).toContain("@media (min-width: 1100px) {");
     for (const [width, bucket] of [
       ["1279.98", '.trhd:not([data-attempts="1"])'],
       ["1399.98", '.trhd[data-attempts="3"]'],

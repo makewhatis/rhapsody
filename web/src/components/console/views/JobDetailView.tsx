@@ -521,8 +521,27 @@ function TraceHeader({
       )}
       {/* The outcome pill, in the prototype's own vocabulary rather than the daemon's column
           value — "done", not "completed" (§3A). `runOutcomeLabel` translates only the three
-          states the prototype names and passes anything else through. */}
-      <Pill variant={runOutcomePill(run.outcome)}>{runOutcomeLabel(run.outcome)}</Pill>
+          states the prototype names and passes anything else through.
+
+          It also carries the run's id and start time, which are the two facts NOTHING else on this
+          page renders: the route is `#job/<TICKET-KEY>`, the receipt carries neither, and the id
+          is the daemon's own handle — what `/api/v1/runs/{id}`, `symphony_run_status` and the logs
+          are keyed by. They used to live only in the attempt selector's tooltip, and the
+          single-row header sheds that selector on a one-attempt ticket at the desktop default
+          width (see `console-trace.css`), which would have taken both with it.
+
+          The pill is where they belong rather than merely where they fit: it is the one header
+          member that describes this RUN and not the ticket, so "which run, and when did it start"
+          is the same question its state answers. It is never shed and `flex: none` in the single
+          row, so the hover target exists at every width. Unconditional, too — the width the
+          selector goes at lives in the stylesheet, and a copy of that breakpoint in TSX would be a
+          second source of truth for it, silently stale the next time the row is re-measured. */}
+      <Pill
+        variant={runOutcomePill(run.outcome)}
+        title={`run ${run.id} · started ${formatDateTime(run.started_at)}`}
+      >
+        {runOutcomeLabel(run.outcome)}
+      </Pill>
       {/* The live pulse (§3A). Decorative beside the outcome pill, which already says "running"
           in words — a screen reader that announced a second "live" would only repeat it. */}
       {inFlight ? <span className="trpulse" aria-hidden="true" /> : null}
