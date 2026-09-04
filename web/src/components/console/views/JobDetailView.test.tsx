@@ -2115,8 +2115,9 @@ describe("the watch-tabs zone is drawn as a zone of its own (STUDIO-766)", () =>
     expect(watch).toMatch(/border:\s*1px solid var\(--line\)/);
     expect(watch).toMatch(/border-radius:\s*var\(--r\)/);
     // The SURFACE is not the Result card's: `.trrc` is a gradient over `--panel-2`, this is the
-    // flat `--panel` the ticket specified. Border, radius, rhythm and eyebrow ink are the shared
-    // part, and the assertions here claim no more than that.
+    // flat `--panel` the ticket specified. Nor is the eyebrow INK, since STUDIO-763 made the
+    // card's an outcome colour — see below. Border, radius, rhythm and eyebrow TYPOGRAPHY are the
+    // shared part, and the assertions here claim no more than that.
     expect(watch).toMatch(/background:\s*var\(--panel\)/);
     // The same 18px that separates the Result card from the split above it.
     expect(watch).toMatch(/margin-bottom:\s*18px/);
