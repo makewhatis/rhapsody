@@ -3,6 +3,7 @@ import type { LogEntry, RunDetail, RunSummary } from "@/lib/api";
 import { buildResult, buildTrace } from "@/lib/trace-model";
 import {
   TRACE_FILTERS,
+  attemptOptions,
   cardLead,
   failingStep,
   filterPhases,
@@ -506,6 +507,92 @@ describe("runTeammate — who a run was, from the records the daemon actually ke
   // slicing from a `lastIndexOf` of -1 would render the whole coordinate as a teammate.
   it("names nobody for a `pr:` key carrying no reviewer at all", () => {
     expect(runTeammate(run({ issue_identifier: "pr:owner/repo#1" }), NONE, "alice")).toBe("");
+  });
+});
+
+describe("attemptOptions — the header selector's \"attempt N · teammate\" labels (STUDIO-763)", () => {
+  const a = run({ id: 522, started_at: "2026-09-03T08:00:00Z" });
+  const b = run({ id: 545, started_at: "2026-09-03T09:00:00Z" });
+  const c = run({ id: 547, started_at: "2026-09-03T10:00:00Z" });
+  const newestFirst = [c, b, a];
+  const NONE = new Map<number, string>();
+  const labels = (opts: readonly { label: string }[]) => opts.map((o) => o.label);
+
+  // The prototype's own selector reads "attempt 1 · alice / attempt 2 · jimmy", and STUDIO-746
+  // wired the per-run identity that makes the second half answerable.
+  it("labels each attempt with the teammate that attempt was dispatched as", () => {
+    const identities = new Map([
+      [522, "alice"],
+      [545, "jimmy"],
+      [547, "alice"],
+    ]);
+    expect(labels(attemptOptions(newestFirst, identities, ""))).toEqual([
+      "attempt 3 · alice",
+      "attempt 2 · jimmy",
+      "attempt 1 · alice",
+    ]);
+  });
+
+  // The ordinal is the ticket's OWN ordering of its runs, oldest first — not `runs.attempt`, which
+  // the daemon increments on the retry path only, so 432 of 441 recorded rows carry a 0 and an
+  // "attempt 0" label repeated three times names none of them.
+  it("numbers by the ticket's run order, not by the daemon's retry counter", () => {
+    const rows = [
+      run({ id: 547, attempt: 0, started_at: "2026-09-03T10:00:00Z" }),
+      run({ id: 545, attempt: 0, started_at: "2026-09-03T09:00:00Z" }),
+      run({ id: 522, attempt: 0, started_at: "2026-09-03T08:00:00Z" }),
+    ];
+    const identities = new Map([
+      [522, "alice"],
+      [545, "alice"],
+      [547, "alice"],
+    ]);
+    expect(labels(attemptOptions(rows, identities, ""))).toEqual([
+      "attempt 3 · alice",
+      "attempt 2 · alice",
+      "attempt 1 · alice",
+    ]);
+  });
+
+  // The two degradations the acceptance names, and they are DIFFERENT answers: a run whose ledger
+  // recorded "nobody" is not a run nothing has answered for yet.
+  it("says nobody for a run its own ledger recorded as unrouted", () => {
+    expect(labels(attemptOptions([c], new Map([[547, ""]]), "alice"))).toEqual(["attempt 1 · —"]);
+  });
+
+  it("falls back to the run id while no record and no roster can name the attempt", () => {
+    expect(labels(attemptOptions([c, a], NONE, ""))).toEqual(["run 547", "run 522"]);
+  });
+
+  // The live roster is the documented fallback for a run with no routing row at all, and the
+  // caller withholds it until the durable search has answered — so a name from it is a real one.
+  it("uses the live-roster fallback the same way the header assignee does", () => {
+    expect(labels(attemptOptions([c], NONE, "alice"))).toEqual(["attempt 1 · alice"]);
+  });
+
+  // A ticketless review run carries its reviewer IN ITS KEY, so it is named without any ledger.
+  it("names a ticketless review attempt from its own `pr:` key", () => {
+    const review = run({ id: 560, issue_identifier: "pr:makewhatis/rhapsody#12@jimmy" });
+    expect(labels(attemptOptions([review, c], NONE, ""))).toEqual([
+      "attempt 2 · jimmy",
+      "run 547",
+    ]);
+  });
+
+  // The run id is the daemon's own unambiguous handle on an attempt, and the ordinal is not: the
+  // history endpoint serves at most its newest 50 rows, so on a ticket that ran more the numbering
+  // is relative to that window. The handle stays reachable in the tooltip either way.
+  it("keeps the daemon's run id and start time on every option, whatever the label says", () => {
+    const identities = new Map([[547, "alice"]]);
+    expect(attemptOptions(newestFirst, identities, "")).toEqual([
+      { id: 547, ordinal: 3, label: "attempt 3 · alice", startedAt: "2026-09-03T10:00:00Z" },
+      { id: 545, ordinal: 2, label: "run 545", startedAt: "2026-09-03T09:00:00Z" },
+      { id: 522, ordinal: 1, label: "run 522", startedAt: "2026-09-03T08:00:00Z" },
+    ]);
+  });
+
+  it("survives a ticket with no runs at all", () => {
+    expect(attemptOptions([], NONE, "")).toEqual([]);
   });
 });
 
