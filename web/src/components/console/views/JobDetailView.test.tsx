@@ -30,6 +30,7 @@ const h = vi.hoisted(() => ({
   stopRun: vi.fn(),
   resumeRun: vi.fn(),
   fetchVersion: vi.fn(),
+  openExternal: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (orig) => {
@@ -53,6 +54,13 @@ vi.mock("@/lib/api", async (orig) => {
     resumeRun: h.resumeRun,
     fetchVersion: h.fetchVersion,
   };
+});
+
+// STUDIO-765 — the Trace's external links leave the app through the `openExternal` seam, so the
+// packaged desktop app hands them to the OS browser instead of dropping the click.
+vi.mock("@/lib/bindings", async (orig) => {
+  const actual = await orig<typeof import("@/lib/bindings")>();
+  return { ...actual, openExternal: h.openExternal };
 });
 
 const { JobDetailView } = await import("./JobDetailView");
@@ -3023,5 +3031,59 @@ describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => 
     await settleTrace();
     await waitFor(() => expect(spineTitles()).toContain("Coordinated"));
     expect(document.querySelector(".trstep .stwho")).toBeNull();
+  });
+});
+
+// Acceptance (STUDIO-765) — in the packaged app `<a target="_blank">` is a no-op, so every one of
+// the Trace's external links must reach `openExternal`. These click the real links rather than
+// re-asserting their hrefs, which the tests above already pin: an href was never the broken half.
+describe("external links leave the app through the openExternal seam (STUDIO-765)", () => {
+  /** Clicks cancellably, the way a real anchor click arrives, and reports whether it was let through. */
+  function clickLink(el: Element): boolean {
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(el, ev);
+    return !ev.defaultPrevented;
+  }
+
+  it("opens the ticket in the browser instead of dropping the click", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/open ticket/i)).toBeTruthy());
+    expect(clickLink(action(/open ticket/i))).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith("https://linear.app/studio49/issue/STUDIO-654");
+  });
+
+  it("opens the View PR search in the browser instead of dropping the click", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/view pr/i)).toBeTruthy());
+    expect(clickLink(action(/view pr/i))).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
+    );
+  });
+
+  it("opens the Diff panel's pull-request deep link in the browser", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+    const link = within(panel()).getByRole("link", { name: /pull request/i });
+    expect(clickLink(link)).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
+    );
+  });
+
+  it("opens a Review-panel pull-request link in the browser", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchReviews.mockResolvedValue({
+      enabled: true,
+      reviews: [reviewJob({ status: "reviewed", last_reviewed_sha: "e90ccc6457f" })],
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Review");
+    await waitFor(() => expect(panel().querySelector(".trrev .pr")).toBeTruthy());
+    expect(clickLink(panel().querySelector(".trrev .pr") as Element)).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith("https://github.com/makewhatis/rhapsody/pull/105");
   });
 });

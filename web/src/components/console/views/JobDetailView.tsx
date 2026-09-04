@@ -11,6 +11,7 @@ import {
 import {
   Button,
   Chip,
+  ExternalLink,
   Markdown,
   Mono,
   Pill,
@@ -676,9 +677,9 @@ function HeaderActions({
           Open ticket
         </DepButton>
       ) : (
-        <a className="btn sec" href={ticketHref} target="_blank" rel="noreferrer noopener">
+        <ExternalLink className="btn sec" href={ticketHref}>
           Open ticket
-        </a>
+        </ExternalLink>
       )}
       {/* No endpoint serves a PR number (design record §5), so this is a head-branch search on
           the run's own remote — it finds the branch's PR without the console asserting one. The
@@ -688,9 +689,9 @@ function HeaderActions({
           View PR
         </DepButton>
       ) : (
-        <a className="btn sec" href={prHref} target="_blank" rel="noreferrer noopener">
+        <ExternalLink className="btn sec" href={prHref}>
           View PR
-        </a>
+        </ExternalLink>
       )}
       <DepButton title="Merging needs the run-branch diff endpoint, deferred in the Trace plan.">
         Merge
@@ -1525,9 +1526,7 @@ function DiffPanel({ run }: { run: RunSummary }) {
             This run's remote is not on github.com, so there is no pull request to link to either.
           </span>
         ) : (
-          <a href={prHref} target="_blank" rel="noreferrer noopener">
-            Open this branch's pull request ↗
-          </a>
+          <ExternalLink href={prHref}>Open this branch's pull request ↗</ExternalLink>
         )}
       </div>
     </div>
@@ -1593,9 +1592,9 @@ function ReviewPanel({
               {row.job.reviewer}
             </span>
             <Pill variant={row.variant}>{row.label}</Pill>
-            <a className="pr" href={row.url} target="_blank" rel="noreferrer noopener">
+            <ExternalLink className="pr" href={row.url}>
               {row.pr} ↗
-            </a>
+            </ExternalLink>
             {row.reviewedShort === "" ? null : <Mono>read {row.reviewedShort}</Mono>}
           </div>
         ))}
