@@ -19,23 +19,27 @@ leave it and mention it in your handoff notes instead.
 
 ## Step 1 — scoped structural discovery
 
-Find the newest commit that touched any existing `CLAUDE.md`, then look at everything that changed
-since:
+Take the baseline from the **oldest** last-touch across the `CLAUDE.md` set, not the newest. Using
+the newest makes the diff empty right after a sweep commits its own updates, and hides every
+directory added before that commit:
 
 ```bash
-newest_commit=""
-newest_ts=0
-for f in $(git ls-files '*CLAUDE.md'); do
-	ts=$(git log -1 --format=%ct -- "$f")
-	if [ "$ts" -gt "$newest_ts" ]; then
-		newest_ts="$ts"
-		newest_commit=$(git log -1 --format=%H -- "$f")
-	fi
-done
-git diff "$newest_commit"..HEAD --stat
+cd "$(git rev-parse --show-toplevel)" || exit 1
+BASE=$(git ls-files '*CLAUDE.md' | while IFS= read -r f; do
+	git log -1 --format='%ct %H' -- "$f"
+done | sort -n | head -1 | cut -d' ' -f2)
+git diff --name-status "$BASE"..HEAD
 ```
 
-Read that diff's file list for two things:
+The diff catches recent structure. Sweep current coverage directly too, so a meaningful unit that
+predates every `CLAUDE.md` commit is still caught:
+
+```bash
+git ls-files '*CLAUDE.md' | while IFS= read -r f; do dirname "$f"; done | sort -u
+```
+
+Compare that covered-directory list against the tree as it stands, and read the diff's file list,
+for two things:
 
 - **New directories that now warrant a `CLAUDE.md`** — a new crate under `crates/`, a new top-level
   subsystem. Apply the original methodology's structure test: does this directory have enough
@@ -47,17 +51,26 @@ Read that diff's file list for two things:
 ## Step 2 — per-file drift check
 
 For every existing `CLAUDE.md`, diff its own directory since **that file's own** last commit — not
-the global newest from Step 1:
+Step 1's `$BASE`. A file updated last week is only asked about last week's changes:
 
 ```bash
-for f in $(git ls-files '*CLAUDE.md'); do
-	dir=$(dirname "$f")
+cd "$(git rev-parse --show-toplevel)" || exit 1
+git ls-files '*CLAUDE.md' | while IFS= read -r f; do
 	last=$(git log -1 --format=%H -- "$f")
-	if ! git diff --quiet "$last"..HEAD -- "$dir"; then
-		echo "DRIFTED: $f"
+	[ -z "$last" ] && continue
+	dir=$(dirname "$f")
+	if [ "$dir" = "." ]; then spec=":/"; else spec="$dir"; fi
+	changed=$(git diff --name-only "$last"..HEAD -- "$spec" | grep -v 'CLAUDE\.md$')
+	if [ -n "$changed" ]; then
+		printf 'DRIFTED: %s (since %s)\n%s\n' "$f" "$last" "$changed"
 	fi
 done
 ```
+
+Three details that matter: reading the file list with `while IFS= read -r` rather than
+`for f in $(...)` keeps paths containing spaces intact; the root `CLAUDE.md` (whose `dirname` is `.`)
+is scoped to the whole repo via `:/`; and filtering out `CLAUDE.md` paths stops a docs-only commit
+from flagging its own directory as drifted.
 
 A file with no output here is skipped entirely for the rest of the sweep. That is what keeps this
 targeted rather than a regeneration.
