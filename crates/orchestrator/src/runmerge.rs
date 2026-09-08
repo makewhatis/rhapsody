@@ -121,6 +121,30 @@ pub struct MergePlan {
     /// `required_pull_request_reviews`), so an armed auto-merge lands the moment the author's next
     /// push turns the checks green.
     pub changes_requested: Vec<i64>,
+    /// What the ticket-state gate needs in order to be asked, or `None` when this run's project
+    /// configures no `review_states` and the question does not arise (STUDIO-784).
+    ///
+    /// Resolved on the control task because the project resolution lives there; ANSWERED off-loop,
+    /// by [`crate::mergeconsole::ticket_not_waiting_in_review`], because answering it is a tracker
+    /// read. See that function for why the answer comes from the tracker rather than from the
+    /// poller's own snapshot.
+    pub review_gate: Option<TicketReviewGate>,
+}
+
+/// The ticket-state gate's raw material: which ticket to ask about, and which states count as
+/// waiting for review (STUDIO-784).
+///
+/// Both halves are daemon-derived — the id is `runs.issue_id`, written when the run started, and
+/// the states are the run's own project's configured set, normalized. Neither can come from a
+/// request body, so this carries no more authority than [`MergePlan`] itself does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketReviewGate {
+    /// The ticket's TRACKER id (`runs.issue_id`) — an opaque Linear id, not the `STUDIO-784`
+    /// identifier, because it is what the by-ids read filters on.
+    pub issue_id: String,
+    /// The states a ticket waits for review in, already normalized, so the answer is compared the
+    /// way every other state comparison in the daemon is.
+    pub states: std::collections::HashSet<String>,
 }
 
 /// What the operator is about to act on, or just did — the body of both the 409 `confirm_required`
@@ -606,6 +630,9 @@ mod tests {
             branch: "symphony/STUDIO-767".to_string(),
             watched: Vec::new(),
             changes_requested: Vec::new(),
+            // The `gh` half never reads it: the ticket-state gate is answered before this half
+            // runs at all (`mergeconsole::ticket_not_waiting_in_review`).
+            review_gate: None,
         }
     }
 

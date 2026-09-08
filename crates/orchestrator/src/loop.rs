@@ -371,7 +371,10 @@ pub enum Event {
     /// (STUDIO-767; NEW beyond Go v0.4.0). The reply is an acknowledgement, so the response is not
     /// written before the claim is gone.
     RunMergeSettle {
-        plan: crate::runmerge::MergePlan,
+        /// Boxed because it is much the largest thing any control event carries — the coordinate,
+        /// two review-number lists and the ticket-state gate's material — and every OTHER event
+        /// would otherwise be padded to its size for the life of the channel.
+        plan: Box<crate::runmerge::MergePlan>,
         outcome: crate::runmerge::MergeControlOutcome,
         reply: oneshot::Sender<()>,
     },
