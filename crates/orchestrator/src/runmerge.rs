@@ -77,10 +77,12 @@ pub struct MergeDeps {
 /// Everything the control task validated before the merge path was allowed to run, and everything
 /// the off-loop half is permitted to know.
 ///
-/// Every field is derived from the RUN ROW ([`rhapsody_store::RunSummary`]) — `repo` is written
-/// from the project's configured remote and never from an agent — so there is no client-supplied
-/// value anywhere in it. That is G1 expressed as a type: the absence of a `number` field is why
-/// no code path leads from a request body to `gh pr merge`.
+/// Every field is DAEMON-derived, never client-supplied: `repo` is written from the project's
+/// configured remote and never from an agent, and `branch` is the name the daemon's own branch
+/// naming determines for `issue` (see `mergeconsole::plan_run_merge` — `runs.branch` is unwritten,
+/// so a stored branch is only ever cross-checked against that name, never trusted in place of it).
+/// That is G1 expressed as a type: the absence of a `number` field is why no code path leads from
+/// a request body to `gh pr merge`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergePlan {
     pub run_id: i64,
@@ -88,7 +90,8 @@ pub struct MergePlan {
     pub issue: String,
     pub owner: String,
     pub repo: String,
-    /// The run's own branch, already cross-checked against `issue` on the control task.
+    /// The branch `issue` names, derived on the control task — and cross-checked there against a
+    /// stored `runs.branch` on the rare row that carries one.
     pub branch: String,
     /// Pull-request numbers in `owner/repo` that a LIVE Rhapsody review round is watching,
     /// snapshotted on the control task at plan time (§3/G2's review gate).

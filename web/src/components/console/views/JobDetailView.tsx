@@ -817,12 +817,17 @@ function MergeConfirm({
       const last = stops[stops.length - 1];
       // Wrap at both ends, and also when focus is somewhere outside the dialog entirely — which
       // is where it sits on the very first Tab, since the dialog box itself holds it to start.
-      if (e.shiftKey && (document.activeElement === first || !box.current?.contains(document.activeElement))) {
+      const outside = !box.current?.contains(document.activeElement);
+      const to = e.shiftKey
+        ? document.activeElement === first || outside
+          ? last
+          : null
+        : document.activeElement === last || outside
+          ? first
+          : null;
+      if (to !== null) {
         e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && (document.activeElement === last || !box.current?.contains(document.activeElement))) {
-        e.preventDefault();
-        first.focus();
+        to.focus();
       }
     };
     window.addEventListener("keydown", onKey);
