@@ -200,6 +200,7 @@ mod tests {
             head_sha: HEAD.to_string(),
             method: "squash".to_string(),
             auto: true,
+            merge_state: "CLEAN".to_string(),
             said: String::new(),
         }
     }

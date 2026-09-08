@@ -43,7 +43,8 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::ghsummons::{
-    HeadAllowlist, MergeMethod, MergeSource, OpenPrSource, PrLookup, PrStateSource, PrStatus,
+    BranchUpdateSource, HeadAllowlist, MERGE_STATE_BEHIND, MergeMethod, MergeSource,
+    MergeStateSource, OpenPrSource, PrLookup, PrStateSource, PrStatus,
 };
 use crate::teamsknow::parse_pr_ref;
 
@@ -69,6 +70,12 @@ pub struct MergeDeps {
     pub state: Arc<dyn PrStateSource>,
     /// Performs the merge itself.
     pub merger: Arc<dyn MergeSource>,
+    /// Asks GitHub whether this pull request can be merged at all — its `mergeStateStatus`
+    /// (STUDIO-784). Read on every attempt, and the answer rides on the receipt.
+    pub mergestate: Arc<dyn MergeStateSource>,
+    /// Asks whether the REPOSITORY updates a behind branch itself. Consulted only when the answer
+    /// above was [`MERGE_STATE_BEHIND`], so an ordinary merge pays for no extra round trip.
+    pub policy: Arc<dyn BranchUpdateSource>,
     /// Head repositories trusted besides the base's own owner. [`HeadAllowlist::none`] on the
     /// daemon — the watcher's default trust boundary, and widening it is a code change.
     pub allow: HeadAllowlist,
@@ -129,6 +136,14 @@ pub struct MergeReceipt {
     pub method: String,
     /// Whether GitHub's own auto-merge was armed rather than an immediate merge performed.
     pub auto: bool,
+    /// GitHub's own `mergeStateStatus` when the daemon resolved this pull request — `CLEAN`,
+    /// `BLOCKED`, `UNSTABLE`, `BEHIND` — or empty when GitHub stated none.
+    ///
+    /// It is on the receipt because an armed `--auto` merge is otherwise a silent promise: the
+    /// room line says *"queued for merge"* and nothing afterwards ever says whether it landed. This
+    /// is the one fact the console can show that separates a merge waiting on green checks from one
+    /// waiting on a human (STUDIO-784).
+    pub merge_state: String,
     /// `gh`'s own words about the merge. Empty on a `confirm_required` receipt — nothing has
     /// happened yet — and the audit record's evidence on an applied one.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -251,6 +266,47 @@ pub async fn resolve_and_merge(
         );
     }
 
+    // Can this merge ever land? `--auto` arms GitHub's own auto-merge, which is what keeps a red
+    // pull request from merging — but an armed auto-merge that GitHub will never fire is parked
+    // silently and forever, and the operator is told "queued for merge" for something that will
+    // not happen (STUDIO-784, gap 1). `main` requires branches to be up to date and does not
+    // update them itself, so BEHIND is exactly that state.
+    let merge_state = match deps
+        .mergestate
+        .merge_state(&plan.owner, &plan.repo, number)
+        .await
+    {
+        Ok(state) => state,
+        Err(e) => return MergeControlOutcome::Failed(e.to_string()),
+    };
+    if merge_state == MERGE_STATE_BEHIND {
+        // Only here, and only for this reason: with `allow_update_branch` on, GitHub's auto-merge
+        // brings the branch up to date itself and the merge lands, so refusing would be a false
+        // refusal. The repository setting is READ rather than assumed, because assuming it is how
+        // a gate goes wrong the day someone changes it.
+        match deps
+            .policy
+            .allows_branch_update(&plan.owner, &plan.repo)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    run = plan.run_id,
+                    issue = %plan.issue,
+                    pr = %pr,
+                    "console merge: the branch is behind its base and the repository will not \
+                     update it; refusing rather than arming an auto-merge that cannot fire"
+                );
+                return MergeControlOutcome::Refused(
+                    "this branch is behind its base and cannot update itself; push or update the \
+                     branch, then merge",
+                );
+            }
+            Err(e) => return MergeControlOutcome::Failed(e.to_string()),
+        }
+    }
+
     let receipt = MergeReceipt {
         run_id: plan.run_id,
         issue: plan.issue.clone(),
@@ -260,6 +316,7 @@ pub async fn resolve_and_merge(
         head_sha: snapshot.head_sha.clone(),
         method: MERGE_METHOD.name().to_string(),
         auto: MERGE_AUTO,
+        merge_state,
         said: String::new(),
     };
     // Constant-time comparison would be theatre here: the value being compared is a public commit
@@ -293,7 +350,10 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::ghsummons::{MergeResult, OpenPrResult, PrSnapshot, PrStateResult, PrStatus};
+    use crate::ghsummons::{
+        BranchUpdateResult, MergeResult, MergeStateResult, OpenPrResult, PrSnapshot, PrStateResult,
+        PrStatus,
+    };
 
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -435,6 +495,83 @@ mod tests {
         }
     }
 
+    /// A [`MergeStateSource`] answering one canned `mergeStateStatus`, or failing.
+    struct FakeMergeState {
+        state: Option<&'static str>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl FakeMergeState {
+        fn at(state: &'static str) -> Arc<FakeMergeState> {
+            Arc::new(FakeMergeState {
+                state: Some(state),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+        fn clean() -> Arc<FakeMergeState> {
+            FakeMergeState::at("CLEAN")
+        }
+        fn failing() -> Arc<FakeMergeState> {
+            Arc::new(FakeMergeState {
+                state: None,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl MergeStateSource for FakeMergeState {
+        async fn merge_state(&self, owner: &str, repo: &str, number: i64) -> MergeStateResult {
+            self.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("{owner}/{repo}#{number}"));
+            match self.state {
+                Some(s) => Ok(s.to_string()),
+                None => Err("gh pr view: HTTP 502".into()),
+            }
+        }
+    }
+
+    /// A [`BranchUpdateSource`] answering one canned repository policy, recording whether it was
+    /// asked at all — an ordinary merge must never pay for this call.
+    struct FakePolicy {
+        allows: Option<bool>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl FakePolicy {
+        fn answering(allows: bool) -> Arc<FakePolicy> {
+            Arc::new(FakePolicy {
+                allows: Some(allows),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+        fn failing() -> Arc<FakePolicy> {
+            Arc::new(FakePolicy {
+                allows: None,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    #[async_trait]
+    impl BranchUpdateSource for FakePolicy {
+        async fn allows_branch_update(&self, owner: &str, repo: &str) -> BranchUpdateResult {
+            self.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("{owner}/{repo}"));
+            match self.allows {
+                Some(a) => Ok(a),
+                None => Err("gh api repos/o/r: HTTP 403".into()),
+            }
+        }
+    }
+
     fn plan() -> MergePlan {
         MergePlan {
             run_id: 42,
@@ -446,11 +583,31 @@ mod tests {
         }
     }
 
+    /// The ordinary dependency set: a pull request GitHub says is `CLEAN`, on a repository that
+    /// would not update a behind branch anyway. Every pre-existing test wants exactly this.
     fn deps(prs: Arc<FakePrs>, state: Arc<FakeState>, merger: Arc<FakeMerger>) -> MergeDeps {
+        deps_with(
+            prs,
+            state,
+            merger,
+            FakeMergeState::clean(),
+            FakePolicy::answering(false),
+        )
+    }
+
+    fn deps_with(
+        prs: Arc<FakePrs>,
+        state: Arc<FakeState>,
+        merger: Arc<FakeMerger>,
+        mergestate: Arc<FakeMergeState>,
+        policy: Arc<FakePolicy>,
+    ) -> MergeDeps {
         MergeDeps {
             prs,
             state,
             merger,
+            mergestate,
+            policy,
             allow: HeadAllowlist::none(),
         }
     }
@@ -766,6 +923,156 @@ mod tests {
             matches!(got, MergeControlOutcome::Failed(ref e) if e.contains("merge conflicts")),
             "{got:?}"
         );
+    }
+
+    /// **STUDIO-784, gap 1.** `main` requires a branch to be up to date (`strict: true`) and will
+    /// not update one itself (`allow_update_branch: false`), so arming GitHub's auto-merge on a
+    /// BEHIND branch parks it forever: green, armed, and unlandable until a human pushes. Refusing
+    /// with a reason the operator can act on is the honest answer; reporting *"queued for merge"*
+    /// for something that will never happen is not.
+    #[tokio::test]
+    async fn a_behind_branch_that_cannot_update_itself_is_refused() {
+        let merger = FakeMerger::ok();
+        let policy = FakePolicy::answering(false);
+        let got = resolve_and_merge(
+            &plan(),
+            HEAD,
+            &deps_with(
+                FakePrs::at("https://github.com/o/r/pull/64"),
+                FakeState::open(),
+                Arc::clone(&merger),
+                FakeMergeState::at(MERGE_STATE_BEHIND),
+                Arc::clone(&policy),
+            ),
+        )
+        .await;
+        assert_eq!(
+            got,
+            MergeControlOutcome::Refused(
+                "this branch is behind its base and cannot update itself; push or update the \
+                 branch, then merge"
+            )
+        );
+        assert!(merger.calls().is_empty(), "nothing may be merged");
+        assert_eq!(
+            policy.asked(),
+            vec!["o/r".to_string()],
+            "the repository policy is what decides a BEHIND branch, so it must be asked"
+        );
+    }
+
+    /// The same BEHIND branch on a repository that DOES update pull-request branches merges
+    /// normally: GitHub's auto-merge brings it up to date and lands it, so refusing would be a
+    /// false refusal. The repository setting is read rather than assumed for exactly this reason.
+    #[tokio::test]
+    async fn a_behind_branch_the_repository_will_update_still_merges() {
+        let merger = FakeMerger::ok();
+        let got = resolve_and_merge(
+            &plan(),
+            HEAD,
+            &deps_with(
+                FakePrs::at("https://github.com/o/r/pull/64"),
+                FakeState::open(),
+                Arc::clone(&merger),
+                FakeMergeState::at(MERGE_STATE_BEHIND),
+                FakePolicy::answering(true),
+            ),
+        )
+        .await;
+        assert!(matches!(got, MergeControlOutcome::Applied(_)), "{got:?}");
+        assert_eq!(
+            merger.calls(),
+            vec![("o/r".to_string(), 64, MergeMethod::Squash, true)]
+        );
+    }
+
+    /// An ordinary merge never asks about the repository's branch policy at all — the question
+    /// only arises for a BEHIND branch, so the common path pays for one extra `gh` call and not
+    /// two.
+    #[tokio::test]
+    async fn a_clean_pull_request_never_asks_about_the_branch_policy() {
+        let policy = FakePolicy::answering(false);
+        let got = resolve_and_merge(
+            &plan(),
+            HEAD,
+            &deps_with(
+                FakePrs::at("https://github.com/o/r/pull/64"),
+                FakeState::open(),
+                FakeMerger::ok(),
+                FakeMergeState::clean(),
+                Arc::clone(&policy),
+            ),
+        )
+        .await;
+        assert!(matches!(got, MergeControlOutcome::Applied(_)), "{got:?}");
+        assert!(
+            policy.asked().is_empty(),
+            "a CLEAN pull request raises no branch-policy question"
+        );
+    }
+
+    /// Neither lookup may fail QUIETLY into a merge. A `mergeStateStatus` this daemon could not
+    /// read, or a repository policy it could not read, is `Failed` carrying `gh`'s own words —
+    /// because treating either as "not behind" arms the auto-merge this gate exists to prevent.
+    #[tokio::test]
+    async fn an_unreadable_merge_state_or_branch_policy_merges_nothing() {
+        for (mergestate, policy, want) in [
+            (
+                FakeMergeState::failing(),
+                FakePolicy::answering(false),
+                "502",
+            ),
+            (
+                FakeMergeState::at(MERGE_STATE_BEHIND),
+                FakePolicy::failing(),
+                "403",
+            ),
+        ] {
+            let merger = FakeMerger::ok();
+            let got = resolve_and_merge(
+                &plan(),
+                HEAD,
+                &deps_with(
+                    FakePrs::at("https://github.com/o/r/pull/64"),
+                    FakeState::open(),
+                    Arc::clone(&merger),
+                    mergestate,
+                    policy,
+                ),
+            )
+            .await;
+            assert!(
+                matches!(got, MergeControlOutcome::Failed(ref e) if e.contains(want)),
+                "want a Failed carrying gh's complaint, got {got:?}"
+            );
+            assert!(merger.calls().is_empty(), "nothing may be merged");
+        }
+    }
+
+    /// The receipt carries GitHub's mergeability on BOTH legs of the handshake, so the console's
+    /// confirm modal and its post-confirm line can say what the pull request is waiting on instead
+    /// of implying the merge is done (STUDIO-784).
+    #[tokio::test]
+    async fn the_receipt_carries_githubs_merge_state() {
+        for confirm in ["", HEAD] {
+            let got = resolve_and_merge(
+                &plan(),
+                confirm,
+                &deps_with(
+                    FakePrs::at("https://github.com/o/r/pull/64"),
+                    FakeState::open(),
+                    FakeMerger::ok(),
+                    FakeMergeState::at("BLOCKED"),
+                    FakePolicy::answering(false),
+                ),
+            )
+            .await;
+            let receipt = match got {
+                MergeControlOutcome::ConfirmRequired(r) | MergeControlOutcome::Applied(r) => r,
+                other => panic!("want a receipt, got {other:?}"),
+            };
+            assert_eq!(receipt.merge_state, "BLOCKED", "confirm={confirm:?}");
+        }
     }
 
     /// **G2, pinned at the call site.** The two constants this module merges with are the sign-off's
