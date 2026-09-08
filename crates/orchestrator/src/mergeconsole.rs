@@ -486,14 +486,15 @@ pub(crate) async fn ticket_not_waiting_in_review(
 impl ControlHandle {
     /// The operator's **merge** (`POST /api/v1/runs/{id}/merge`) — the whole action, end to end.
     ///
-    /// Three phases, and the middle one is why this lives on the handle rather than in the loop:
+    /// Four phases, and the middle two are why this lives on the handle rather than in the loop:
     ///
     /// 1. **Plan**, on the control task, where the run row and the watch set are.
-    /// 2. **Resolve and merge**, HERE — on the HTTP request's own task — because every step of it
-    ///    blocks ([`crate::runmerge`]'s module doc). A stalled `gh` parks this request and leaves
-    ///    the daemon ticking.
-    /// 3. **Settle**, back on the control task: release the claim, write the audit row, post the
-    ///    manager's room line.
+    /// 2. **Gate the ticket**, HERE — one tracker read, which the control task must not make.
+    /// 3. **Resolve and merge**, also here, because every step of it blocks
+    ///    ([`crate::runmerge`]'s module doc). A stalled `gh` parks this request and leaves the
+    ///    daemon ticking.
+    /// 4. **Settle**, back on the control task: release the claim, write the audit row, post the
+    ///    manager's room line — for whichever of the two middle phases produced the outcome.
     ///
     /// `confirm` is the head SHA the operator is confirming, or empty for the first leg of the
     /// handshake. It is the ONLY value from the request body that reaches any of this, and all it

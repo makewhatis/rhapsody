@@ -712,8 +712,8 @@ up to date and does not update them, so arming an auto-merge on one parks it for
 and unlandable until a human pushes — while reporting *"queued for merge"*. That check is a
 snapshot and not a guarantee: `--auto` is by definition the mode where the merge happens later, so
 a pull request that is clean when the operator clicks can fall behind afterwards when an unrelated
-one lands, and nothing polls an armed merge to notice. Closing that half needs a watcher, which is
-filed as follow-up work. When the branch is behind and the repository's policy cannot be read at
+one lands, and nothing polls an armed merge to notice. Closing that half needs a watcher, and is
+left as follow-up work. When the branch is behind and the repository's policy cannot be read at
 all — `allow_update_branch` is absent for a token without admin permission — the same refusal is
 given rather than an error, because it is true either way and the operator can act on it.
 
