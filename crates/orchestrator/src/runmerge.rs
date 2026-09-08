@@ -28,7 +28,7 @@
 //!   alone; nothing in it comes from a request body. There is no field on it, and no parameter
 //!   here, that a client could put a pull-request number in. The number is resolved from GitHub by
 //!   HEAD BRANCH ([`OpenPrSource::open_pr_for_branch`], which rejects a fork's pull request) and
-//!   then cross-checked back against the plan's own owner/repo before anything acts on it.
+//!   then cross-checked back against the plan's own account before anything acts on it.
 //! * **G2 — the daemon never overrides a gate.** The merge is [`MERGE_METHOD`] + [`MERGE_AUTO`],
 //!   i.e. `--squash --auto`: GitHub's own auto-merge, which lands the pull request only once the
 //!   required contexts pass. `--admin` cannot be reached from here — it is not a parameter of
@@ -167,9 +167,9 @@ pub enum MergeControlOutcome {
 ///    rejects a fork's pull request, so a stranger cannot get a coordinate in here by opening a
 ///    pull request whose head branch is named like this run's (STUDIO-674's fork hazard).
 /// 2. **Cross-check the URL back against the plan.** GitHub answered a query already scoped to
-///    `--repo owner/repo`, so a URL naming another repository means something is wrong with an
-///    assumption rather than with the operator; it is refused rather than followed. Only the
-///    NUMBER is taken from the URL — owner and repo stay the run row's, which is config-derived.
+///    `--repo owner/repo`, so a URL in another ACCOUNT means something is wrong with an assumption
+///    rather than with the operator; it is refused rather than followed. Only the NUMBER is taken
+///    from the URL — owner and repo stay the run row's, which is config-derived.
 /// 3. **Ask where the pull request stands.** `Gone` and `Untrusted` are refusals; `Merged` is a
 ///    refusal too, and deliberately an idempotent-feeling one rather than an error — clicking
 ///    Merge twice is a thing operators do.
@@ -199,16 +199,22 @@ pub async fn resolve_and_merge(
     let Some(found) = parse_pr_ref(&url) else {
         return MergeControlOutcome::Refused("the pull request's URL could not be read");
     };
-    if !found.owner.eq_ignore_ascii_case(&plan.owner)
-        || !found.repo.eq_ignore_ascii_case(&plan.repo)
-    {
+    // On the OWNER and not on the whole slug, for the reason `open_pr_for_branch` gives at length:
+    // a same-account fork is inside the trust boundary, and a whole-slug match would break on a
+    // repository RENAME — `gh` follows GitHub's redirect and answers under the canonical name while
+    // this daemon still asks under the stale one from config. Matching the slug here would
+    // re-introduce, one call later, exactly the fragility that helper avoids. What this check is
+    // for is a URL in someone ELSE's account, which no `--repo`-scoped query should ever produce.
+    if !found.owner.eq_ignore_ascii_case(&plan.owner) {
         tracing::warn!(
             run = plan.run_id,
             url = %url,
-            want = %format!("{}/{}", plan.owner, plan.repo),
-            "console merge: the resolved pull request is in another repository; refusing"
+            want = %plan.owner,
+            "console merge: the resolved pull request belongs to another account; refusing"
         );
-        return MergeControlOutcome::Refused("the resolved pull request is in another repository");
+        return MergeControlOutcome::Refused(
+            "the resolved pull request belongs to another account",
+        );
     }
     let number = found.number;
     let pr = format!("{}/{}#{number}", plan.owner, plan.repo);
@@ -465,11 +471,11 @@ mod tests {
     }
 
     /// **G1, on the resolution path.** The number comes from a URL GitHub answered for a query
-    /// already scoped to the run's own repository; a URL naming a DIFFERENT repository means an
+    /// already scoped to the run's own repository; a URL naming another ACCOUNT means an
     /// assumption has broken, and following it would be exactly the "a coordinate is trusted
     /// because of what it says about itself" mistake the review subsystem refuses to make.
     #[tokio::test]
-    async fn a_pull_request_resolved_in_another_repository_is_refused() {
+    async fn a_pull_request_resolved_in_another_account_is_refused() {
         let merger = FakeMerger::ok();
         let got = resolve_and_merge(
             &plan(),
@@ -483,9 +489,34 @@ mod tests {
         .await;
         assert_eq!(
             got,
-            MergeControlOutcome::Refused("the resolved pull request is in another repository")
+            MergeControlOutcome::Refused("the resolved pull request belongs to another account")
         );
         assert!(merger.calls().is_empty(), "nothing may be merged");
+    }
+
+    /// A repository RENAMED since the daemon's config was written still merges. `gh` follows
+    /// GitHub's redirect and answers under the canonical name, so a whole-slug cross-check here
+    /// would refuse every merge in a renamed repository — re-introducing one call later the exact
+    /// fragility `open_pr_for_branch` avoids by matching on the owner.
+    #[tokio::test]
+    async fn a_renamed_repository_still_merges() {
+        let merger = FakeMerger::ok();
+        let got = resolve_and_merge(
+            &plan(),
+            HEAD,
+            &deps(
+                FakePrs::at("https://github.com/o/renamed/pull/64"),
+                FakeState::open(),
+                Arc::clone(&merger),
+            ),
+        )
+        .await;
+        assert!(matches!(got, MergeControlOutcome::Applied(_)), "{got:?}");
+        assert_eq!(
+            merger.calls(),
+            vec![("o/r".to_string(), 64, MergeMethod::Squash, true)],
+            "and it merges at the coordinate CONFIG names, which gh redirects for us"
+        );
     }
 
     /// A URL with no readable pull-request number fails closed rather than guessing one.

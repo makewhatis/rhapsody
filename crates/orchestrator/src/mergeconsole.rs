@@ -119,9 +119,11 @@ impl Orchestrator {
             // `parse_repo` also refuses a look-alike host (`evilgithub.com`, `…/github.com/…`;
             // STUDIO-721), so this arm covers "no remote" and "a remote we will not vouch for"
             // alike — and the latter must never reach `gh`.
-            return MergePlanOutcome::Denied(MergeControlOutcome::Refused(
+            return self.deny(
+                run_id,
+                &run.issue_identifier,
                 "this run has no GitHub repository to merge in",
-            ));
+            );
         };
         let want = format!("symphony/{}", sanitize_key(&run.issue_identifier));
         if run.branch != want {
@@ -131,9 +133,11 @@ impl Orchestrator {
                 branch = %run.branch,
                 "console merge: this run's branch does not belong to its ticket; refusing"
             );
-            return MergePlanOutcome::Denied(MergeControlOutcome::Refused(
+            return self.deny(
+                run_id,
+                &run.issue_identifier,
                 "this run's branch does not belong to its ticket",
-            ));
+            );
         }
         // The review gate's raw material, read here because only the control task may read the
         // watch set (`reviewconsole`'s single-writer rule). Live rows only: a dropped or retired
@@ -177,6 +181,16 @@ impl Orchestrator {
         })
     }
 
+    /// A plan-time refusal, recorded on its way out. See [`Orchestrator::record_merge_attempt`]
+    /// for why these two arms are recorded and the in-flight one is not.
+    fn deny(&self, run_id: i64, issue: &str, why: &'static str) -> MergePlanOutcome {
+        let outcome = MergeControlOutcome::Refused(why);
+        if let Some(line) = attempt_line(issue, &outcome) {
+            self.record_merge_attempt(run_id, issue, &line);
+        }
+        MergePlanOutcome::Denied(outcome)
+    }
+
     /// Releases the single-flight claim and records what happened (§7 slice 4).
     ///
     /// Called for EVERY outcome the off-loop half returns, so the claim's lifetime is exactly the
@@ -189,11 +203,23 @@ impl Orchestrator {
         // Nothing was attempted: the operator has been shown the receipt and has not confirmed it.
         // Recording a "merge" here would put a row in the ledger for something that did not happen
         // and post a room line for a click nobody finished.
-        let Some(line) = attempt_line(plan, outcome) else {
+        let Some(line) = attempt_line(&plan.issue, outcome) else {
             return;
         };
-        self.record_merge_event(plan.run_id, &line);
-        self.post_merge_line(plan, &line);
+        self.record_merge_attempt(plan.run_id, &plan.issue, &line);
+    }
+
+    /// Both halves of the record, together: the audit row on the run and the manager's room line.
+    ///
+    /// Also called from [`Orchestrator::plan_run_merge`] for the refusals that never reach the
+    /// off-loop half, because those are the ones most worth having in the record: a run whose
+    /// branch does not belong to its own ticket, or whose remote this daemon will not vouch for,
+    /// is an anomaly somebody should see, and a click that was refused for one is not a click that
+    /// left no trace. The in-flight refusal is deliberately NOT recorded — nothing was attempted
+    /// that the first click is not already recording.
+    fn record_merge_attempt(&self, run_id: i64, issue: &str, line: &str) {
+        self.record_merge_event(run_id, line);
+        self.post_merge_line(run_id, issue, line);
     }
 
     /// The audit row: one `teams.merge` event on the run itself (§3/G4).
@@ -240,14 +266,14 @@ impl Orchestrator {
     /// command itself stays deterministic and host-side (§9.1: no LLM between the click and
     /// `main`). The room is advisory (§0.11.4: Linear is the ledger), so a room that cannot be
     /// written is logged and nothing else.
-    fn post_merge_line(&self, plan: &MergePlan, line: &str) {
+    fn post_merge_line(&self, run_id: i64, issue: &str, line: &str) {
         let Some(room) = self.teams_room.as_ref() else {
             return;
         };
         if let Err(e) = room.append(
-            &Message::room(MANAGER_IDENTITY, Utc::now(), line).with_refs([plan.issue.clone()]),
+            &Message::room(MANAGER_IDENTITY, Utc::now(), line).with_refs([issue.to_string()]),
         ) {
-            tracing::warn!(run = plan.run_id, err = %e, "console merge: the room line could not be posted");
+            tracing::warn!(run = run_id, err = %e, "console merge: the room line could not be posted");
         }
     }
 }
@@ -257,25 +283,23 @@ impl Orchestrator {
 /// Composed by the HOST from the daemon's own values — the ticket, the coordinate it resolved,
 /// `gh`'s own words — and never from anything a client sent, which is the trust line
 /// [`crate::quorum::review_description`] draws for every other host-composed line.
-fn attempt_line(plan: &MergePlan, outcome: &MergeControlOutcome) -> Option<String> {
+fn attempt_line(issue: &str, outcome: &MergeControlOutcome) -> Option<String> {
     let what = |r: &MergeReceipt| {
         let how = if r.auto {
             format!("{}, auto", r.method)
         } else {
             r.method.clone()
         };
-        format!("merged {} — {} ({how})", plan.issue, r.url)
+        format!("merged {issue} — {} ({how})", r.url)
     };
     match outcome {
         MergeControlOutcome::Applied(r) => Some(what(r)),
         MergeControlOutcome::Refused(why) => Some(format!(
-            "did not merge {} — {why} (asked from the console)",
-            plan.issue
+            "did not merge {issue} — {why} (asked from the console)"
         )),
-        MergeControlOutcome::Failed(err) => Some(format!(
-            "could not merge {} — GitHub refused: {err}",
-            plan.issue
-        )),
+        MergeControlOutcome::Failed(err) => {
+            Some(format!("could not merge {issue} — GitHub refused: {err}"))
+        }
         // Nothing happened: the handshake's first leg, or a state that never reached a plan.
         MergeControlOutcome::ConfirmRequired(_)
         | MergeControlOutcome::Dormant
@@ -528,7 +552,10 @@ mod tests {
             "symphony/STUDIO-999",
             "symphony/STUDIO-767-extra",
         ] {
+            let dir = TempDir::new();
+            let room = Arc::new(LocalRoom::new(dir.child("room")));
             let mut o = orch(true);
+            o.teams_room = Some(Arc::clone(&room));
             let run = run_row(&o, "STUDIO-767", branch, REPO_URL);
             assert_eq!(
                 o.plan_run_merge(run),
@@ -537,7 +564,41 @@ mod tests {
                 )),
                 "branch {branch:?}"
             );
+            // Recorded even though nothing reached GitHub: a run whose two independently stored
+            // fields disagree is an anomaly, and a click refused for one is not a click that left
+            // no trace.
+            assert_eq!(
+                audit(&o, run),
+                vec![
+                    "did not merge STUDIO-767 — this run's branch does not belong to its ticket \
+                     (asked from the console)"
+                        .to_string()
+                ],
+                "branch {branch:?}"
+            );
+            assert_eq!(room_lines(&room).len(), 1, "branch {branch:?}");
         }
+    }
+
+    /// The in-flight refusal is the one plan-time refusal that is NOT recorded: nothing was
+    /// attempted that the first click is not already recording, and a double-click would otherwise
+    /// put a second line in the room for one merge.
+    #[test]
+    fn a_second_click_leaves_no_second_record() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut o = orch(true);
+        o.teams_room = Some(Arc::clone(&room));
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+        ready(&mut o, run);
+
+        assert!(matches!(
+            o.plan_run_merge(run),
+            MergePlanOutcome::Denied(MergeControlOutcome::Refused(_))
+        ));
+
+        assert!(audit(&o, run).is_empty());
+        assert!(room_lines(&room).is_empty());
     }
 
     /// The healthy plan: every coordinate comes from the run row, and nothing on it could have
