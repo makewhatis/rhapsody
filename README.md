@@ -684,7 +684,7 @@ request itself and merges it. Design record: `~/.rhapsody/docs/STUDIO-767-consol
 | --- | --- | --- |
 | who merges | a human, in GitHub's UI or `gh` | the **daemon**, on the operator's click |
 | how the pull request is named | by hand | derived from the run row — never from the request |
-| what is run | — | one `gh pr merge <n> --repo <owner>/<repo> --squash --auto` |
+| what is run | — | reads of the pull request's state and merge state, then one `gh pr merge <n> --repo <owner>/<repo> --squash --auto` |
 | GitHub writes | none, plus STUDIO-723's `gh pr comment` | the above, plus one merge |
 
 **The request body carries no pull-request number, repository or branch.** The only client-supplied
@@ -704,6 +704,20 @@ pull request lands only once the four required contexts (`lint`, `test`, `web`, 
 daemon waits for nothing, holds no state and cannot merge a red pull request even by mistake. A
 merge GitHub refuses — a conflict, a branch behind `main` — is reported with `gh`'s own words, and
 the daemon never rebases, force-pushes or resolves a conflict.
+
+**Two refusals stand where GitHub enforces nothing (STUDIO-784).** A branch GitHub reports as
+`BEHIND` is refused rather than armed, unless the repository's `allow_update_branch` says GitHub
+will bring it up to date itself: `main` requires branches to be up to date and does not update
+them, so arming an auto-merge on one parks it forever — green, armed and unlandable until a human
+pushes — while reporting *"queued for merge"*. And a pull request whose newest completed Rhapsody
+review round posted findings is refused as a reviewer's explicit no; GitHub cannot hold that line
+here, because teammates post verdicts as pull-request COMMENTS (it refuses `REQUEST_CHANGES` from
+the account that opened the pull request) and `main` carries no `required_pull_request_reviews`.
+On top of both, the run's ticket must still be waiting in one of its project's `review_states` — a
+review that asks for changes routes it back out, and that is the only signal the daemon holds on an
+installation whose reviews are Linear review tickets rather than the ticketless watch set. The
+receipt carries GitHub's own `mergeStateStatus` so the console can say what an armed merge is
+waiting on instead of implying it landed.
 
 **Confirming is server-enforced, not a UI nicety.** The first POST resolves the pull request, merges
 nothing, and answers 409 `confirm_required` with a receipt naming the coordinate, the URL and the
