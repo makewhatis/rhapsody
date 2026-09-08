@@ -746,8 +746,14 @@ function HeaderActions({
       )}
       {merged ? (
         <span className="actok" role="status">
+          {/* gh's own words when it gave any — under `--auto` they say "will be automatically
+              merged", which is the honest thing. The fallback must not overstate it either: an
+              applied `--auto` merge ARMED auto-merge, and the pull request lands only if its
+              required checks pass. Same distinction the audit row draws (`attempt_line`). */}
           {merged.said === undefined || merged.said === ""
-            ? `merged ${merged.pr}`
+            ? merged.auto
+              ? `queued ${merged.pr} for merge`
+              : `merged ${merged.pr}`
             : merged.said}
         </span>
       ) : null}
@@ -755,6 +761,10 @@ function HeaderActions({
         <MergeConfirm
           receipt={confirming}
           busy={merge.isPending}
+          // The confirmed leg is the ONLY one the merge itself runs on, so this is where a
+          // conflict, a branch behind `main` or a review round that started between the legs
+          // arrives. `problem` renders it too, but in `.acts` — underneath this modal's veil.
+          error={merge.error?.message ?? ""}
           onConfirm={() => askMerge(confirming.head_sha)}
           onClose={() => setConfirming(null)}
         />
@@ -774,17 +784,46 @@ function HeaderActions({
 function MergeConfirm({
   receipt,
   busy,
+  error,
   onConfirm,
   onClose,
 }: {
   receipt: MergeReceipt;
   busy: boolean;
+  error: string;
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  // `aria-modal` is a CLAIM — it tells a screen reader everything outside this dialog is inert —
+  // and it is only true if focus is actually in here. Without this, a keyboard operator's focus is
+  // still on the Merge button behind the veil, so Enter re-fires the action the dialog exists to
+  // interrupt. Focus moves in on open, is trapped in the cycle, and returns whence it came.
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const from = document.activeElement as HTMLElement | null;
+    box.current?.focus();
+    return () => from?.focus?.();
+  }, []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const stops = box.current?.querySelectorAll<HTMLElement>("a[href], button:not([disabled])");
+      if (stops === undefined || stops.length === 0) return;
+      const first = stops[0];
+      const last = stops[stops.length - 1];
+      // Wrap at both ends, and also when focus is somewhere outside the dialog entirely — which
+      // is where it sits on the very first Tab, since the dialog box itself holds it to start.
+      if (e.shiftKey && (document.activeElement === first || !box.current?.contains(document.activeElement))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (document.activeElement === last || !box.current?.contains(document.activeElement))) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -796,13 +835,13 @@ function MergeConfirm({
         role="dialog"
         aria-modal="true"
         aria-label={`Merge ${receipt.pr}`}
+        ref={box}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="ttl">Merge {receipt.pr}?</div>
         <div className="fx">
-          <a href={receipt.url} target="_blank" rel="noreferrer noopener">
-            {receipt.url}
-          </a>
+          <ExternalLink href={receipt.url}>{receipt.url}</ExternalLink>
           <Mono>
             {receipt.head_sha.slice(0, 12)} · {receipt.method}
             {receipt.auto ? ", auto" : ""}
@@ -815,6 +854,11 @@ function MergeConfirm({
           Confirming merges the commit above — if it has been pushed to since, you will be asked
           again.
         </p>
+        {error === "" ? null : (
+          <p className="err" role="alert">
+            {error}
+          </p>
+        )}
         <div className="row">
           <Button variant="sec" onClick={onClose}>
             Cancel

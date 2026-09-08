@@ -483,4 +483,7 @@
 .rh-console .mgconf .fx { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; overflow-wrap: anywhere; }
 .rh-console .mgconf .fx a { color: var(--operator); }
 .rh-console .mgconf .sub { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--ink-3); }
+/* The confirmed leg is the only one the merge itself runs on, so its failures land HERE — the
+   header's own `.acterr` sits underneath `.mgveil` and would never be read. */
+.rh-console .mgconf .err { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--bad); overflow-wrap: anywhere; }
 .rh-console .mgconf .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }

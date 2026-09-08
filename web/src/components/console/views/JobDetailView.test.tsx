@@ -660,6 +660,73 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     expect(document.querySelector(".trhd .actok")).toBeNull();
   });
 
+  // The CONFIRMED leg is the only one the merge itself ever runs on: the daemon answers
+  // `confirm_required` before it ever calls `gh pr merge`. So every failure of the merge command —
+  // a conflict, a branch behind `main`, a review round that started between the two legs — can
+  // only arrive here. The header's own `.acterr` slot is underneath the modal's veil, so a reason
+  // rendered only there is a reason the operator cannot read.
+  it("shows a failure of the confirmed leg inside the dialog it happened in", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: RECEIPT })
+      .mockRejectedValueOnce(
+        new Error("GitHub refused: Pull request is not mergeable: the base branch has moved"),
+      );
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
+    // The dialog stays — the merge did not happen, so the decision is still open — and it now
+    // says why, rather than re-offering the identical failing POST with no explanation.
+    await waitFor(() =>
+      expect(screen.getByRole("dialog").textContent).toContain(
+        "the base branch has moved",
+      ),
+    );
+    expect(document.querySelector(".trhd .actok")).toBeNull();
+  });
+
+  // When gh said nothing quotable, the console still must not claim more than happened: under
+  // `--auto` the merge was ARMED, and the pull request lands only if its required checks pass.
+  it("says queued, not merged, when auto-merge was only armed", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: RECEIPT })
+      .mockResolvedValueOnce({ status: "merged", receipt: { ...RECEIPT, said: "" } });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .actok")?.textContent).toBe(
+        "queued makewhatis/rhapsody#64 for merge",
+      ),
+    );
+  });
+
+  // `aria-modal="true"` says everything behind the veil is inert. That is only true if focus is
+  // actually inside the dialog — otherwise a keyboard operator is still on the Merge button the
+  // dialog opened over, and Enter re-fires the very action the confirmation exists to interrupt.
+  it("takes focus into the confirmation and gives it back on close", async () => {
+    h.mergeRun.mockResolvedValue({ status: "confirm", receipt: RECEIPT });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    const merge = action(/^merge$/i);
+    merge.focus();
+    fireEvent.click(merge);
+
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // Back where it came from, rather than reset to the top of the document.
+    expect(document.activeElement).toBe(merge);
+  });
+
   it("surfaces the daemon's own refusal rather than pretending the merge happened", async () => {
     h.mergeRun.mockRejectedValue(
       new Error("a Rhapsody review of that pull request is still live"),
@@ -3330,6 +3397,36 @@ describe("external links leave the app through the openExternal seam (STUDIO-765
     expect(h.openExternal).toHaveBeenCalledWith(
       "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
     );
+  });
+
+  // The confirm modal's link is the operator's one chance to LOOK at the pull request before an
+  // irreversible click, from inside a dialog whose whole purpose is "look before you act". Dead in
+  // the packaged app, all that is left of it is a 12-character SHA prefix.
+  it("opens the merge confirmation's pull-request link in the browser", async () => {
+    h.mergeRun.mockResolvedValue({
+      status: "confirm",
+      receipt: {
+        run_id: 547,
+        issue: "STUDIO-654",
+        pr: "makewhatis/rhapsody#64",
+        url: "https://github.com/makewhatis/rhapsody/pull/64",
+        number: 64,
+        head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        method: "squash",
+        auto: true,
+        said: "",
+      },
+    });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    const link = within(screen.getByRole("dialog")).getByRole("link", {
+      name: /pull\/64/,
+    });
+    expect(clickLink(link)).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith("https://github.com/makewhatis/rhapsody/pull/64");
   });
 
   it("opens a Review-panel pull-request link in the browser", async () => {
