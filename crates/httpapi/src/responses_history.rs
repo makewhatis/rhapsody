@@ -11,7 +11,7 @@
 //! serializes an empty [`Vec`] as `[]` (never `null`) intrinsically — the guarantee Go must hand-write
 //! a `MarshalJSON` for on every list envelope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow};
@@ -193,6 +193,14 @@ pub(crate) fn history_response(runs: &[RunSummary], next_offset: Option<i64>) ->
 /// Pill from. Both are OMITTED rather than blanked when there is no answer, so "the daemon could not
 /// resolve this ticket" stays distinguishable from any state it could have resolved.
 ///
+/// It carries `review_ticket: true` when `reviews` holds the row's issue id (STUDIO-780): this
+/// ticket's own job is to review somebody else's work, which is what lets the console say
+/// "reviewing" where it would otherwise say "in review" — two different claims that read
+/// identically without it. Only the POSITIVE is serialized, and the omission is honest rather than
+/// lazy: the daemon cannot tell an ordinary ticket from one it could not resolve or one minted
+/// before the marker label existed, and all three mean the same thing to the client — paint this
+/// row exactly as it was painted before the field existed.
+///
 /// It carries `assignee` on the same terms when `assignees` names one (STUDIO-735): the teammate
 /// the ticket's newest run was dispatched under, which is what keeps a finished job attributed
 /// after its teammate has left the live roster. A ticket nobody was routed for — solo, unrouted, or
@@ -208,6 +216,7 @@ pub(crate) fn issue_runs_response(
     next_offset: Option<i64>,
     lifecycles: &HashMap<String, IssueLifecycleRow>,
     assignees: &HashMap<String, String>,
+    reviews: &HashSet<String>,
 ) -> Value {
     let issues: Vec<Value> = runs
         .iter()
@@ -222,6 +231,9 @@ pub(crate) fn issue_runs_response(
             }
             if let Some(name) = assignees.get(&r.issue_id).filter(|n| !n.is_empty()) {
                 obj.insert("assignee".to_string(), json!(name));
+            }
+            if reviews.contains(&r.issue_id) {
+                obj.insert("review_ticket".to_string(), json!(true));
             }
             row
         })

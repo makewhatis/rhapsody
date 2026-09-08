@@ -21,6 +21,7 @@ use rhapsody_httpapi::{
 };
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
+use rhapsody_orchestrator::runmerge::MergeControlOutcome;
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
     TeamsMemory, TeamsMemoryError, TeamsView,
@@ -151,6 +152,13 @@ impl StateProvider for DaemonState {
         self.handle.issue_lifecycles(ids).await
     }
 
+    async fn review_tickets(&self, ids: &[String]) -> std::collections::HashSet<String> {
+        // Off-loop and best-effort on the same terms (STUDIO-780): the handle resolves the review
+        // marker from its own TTL memo and the reads cell's tracker, and answers nothing for the
+        // rest — which the console reads exactly as "not a review ticket".
+        self.handle.review_tickets(ids).await
+    }
+
     fn run_transcript(&self, run_id: i64) -> Option<Vec<LogEntry>> {
         // Go's `([]agent.LogEntry, bool)` → `Option`: `found == false` (no such run row) is `None`.
         let (entries, found) = self.handle.run_transcript(run_id);
@@ -266,6 +274,14 @@ impl StateProvider for DaemonState {
 
     async fn review_dismiss(&self, pr: PrCoord) -> ReviewControlOutcome {
         self.handle.dismiss_review(pr).await
+    }
+
+    /// `POST /api/v1/runs/{id}/merge` (STUDIO-767). Unlike the three above it does NOT simply
+    /// round-trip the control task: the handle plans on the loop, performs the blocking `gh` half
+    /// HERE — on this HTTP task, so a stalled merge parks this request and the daemon keeps
+    /// ticking — and settles back on the loop.
+    async fn merge_run(&self, run_id: i64, confirm: &str) -> MergeControlOutcome {
+        self.handle.merge_run(run_id, confirm).await
     }
 
     fn teams_config_path(&self) -> &str {

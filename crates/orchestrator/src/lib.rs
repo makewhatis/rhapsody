@@ -46,6 +46,7 @@ pub mod handoff;
 pub mod issuelog;
 pub mod lifecycle;
 pub mod liveness;
+pub mod mergeconsole;
 pub mod message;
 pub mod obslog;
 pub mod orchestrator;
@@ -65,6 +66,7 @@ pub mod reviewconsole;
 pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewwatch;
+pub mod runmerge;
 pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;
@@ -107,7 +109,7 @@ pub use preflight::{
 };
 pub use quorum::{
     MAX_QUORUM_BACKOFF_MS, QUORUM_REQUESTED_LABEL, QuorumDeps, QuorumRequest, QuorumTarget,
-    run_quorum_task,
+    REVIEW_TICKET_LABEL, run_quorum_task,
 };
 pub use reads::{Identity, ProjectTracker, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};

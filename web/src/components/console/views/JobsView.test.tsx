@@ -387,6 +387,127 @@ describe("the filter bar and the table (§3)", () => {
   });
 });
 
+// STUDIO-780 — "in review" was doing double duty. Two things the list said with one word: an agent
+// whose whole job on a ticket IS to review a teammate's pull request, and a ticket whose work is
+// finished and is awaiting one. And a third confusion on top: the row painted the TICKET's state
+// while the run detail behind it painted the RUN's outcome, so a parked ticket read as a stuck run.
+describe("reviewing vs in review (§3)", () => {
+  const TEAMS = {
+    enabled: true,
+    manager_mode: "labels",
+    default_identity: "",
+    backend: "local",
+    roster: [],
+  };
+
+  function live(identifier: string, runId: number) {
+    return {
+      issue_id: `id-${identifier}`,
+      issue_identifier: identifier,
+      title: `${identifier} title`,
+      state: "In Progress",
+      project: "rhapsody",
+      repo: "",
+      run_id: runId,
+      turn_count: 1,
+      last_codex_event: "",
+      started_at: "2026-09-01T11:00:00Z",
+      last_event_at: "2026-09-01T11:00:00Z",
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+    };
+  }
+
+  /** The status cell's text for one ticket. */
+  function status(identifier: string): string {
+    const row = [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.querySelector(".ti")?.textContent?.startsWith(identifier),
+    )!;
+    return within(row as HTMLElement).getAllByRole("cell")[2].textContent ?? "";
+  }
+
+  async function mountBoth() {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [live("REVIEWER", 901), live("BUILDER", 902)],
+    });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        // The daemon's own marker — the reviewer's ticket is a REVIEW ticket (`review_ticket`).
+        run({ id: 901, issue_identifier: "REVIEWER", outcome: "running", review_ticket: true }),
+        run({ id: 902, issue_identifier: "BUILDER", outcome: "running" }),
+        // Finished work parked in the tracker's review state, awaiting a person.
+        run({ issue_identifier: "PARKED", outcome: "completed", lifecycle: "in_review" }),
+      ],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue(TEAMS);
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+  }
+
+  it("says reviewing for the agent doing a review, and in review for the work awaiting one", async () => {
+    await mountBoth();
+    expect(status("REVIEWER")).toContain("reviewing");
+    expect(status("BUILDER")).toContain("running");
+    expect(status("PARKED")).toContain("in review");
+  });
+
+  // The two claims must not read alike — a different word AND a different tone.
+  it("paints the two in different tones", async () => {
+    await mountBoth();
+    const pill = (id: string) =>
+      [...document.querySelectorAll(".jtbl tbody tr")]
+        .find((tr) => tr.querySelector(".ti")?.textContent?.startsWith(id))!
+        .querySelector(".pill")!;
+    expect(pill("REVIEWER").classList.contains("reviewing")).toBe(true);
+    expect(pill("PARKED").classList.contains("review")).toBe(true);
+    expect(pill("REVIEWER").className).not.toBe(pill("PARKED").className);
+  });
+
+  // Problem 2: the row states its own run's outcome beside the ticket's state, so clicking in
+  // confirms the list rather than contradicting it.
+  it("says the run is done on a ticket parked in review", async () => {
+    await mountBoth();
+    expect(status("PARKED")).toContain("in review · run done");
+  });
+
+  // `reviewing` has no Seg button: it is a kind of running, so "Running" holds it and "In review"
+  // — which means "parked, waiting on a person" — does not.
+  it("files a reviewing row under Running", async () => {
+    await mountBoth();
+    fireEvent.click(screen.getByRole("button", { name: "Running" }));
+    await waitFor(() => expect(rowKeys().sort()).toEqual(["BUILDER", "REVIEWER"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "In review" }));
+    await waitFor(() => expect(rowKeys()).toEqual(["PARKED"]));
+  });
+
+  // The signal is the daemon's marker, never the title — a hand-written ticket that opens with the
+  // word "Review:" is not a review ticket, and painting it as one would be a lie the console told
+  // itself forever.
+  it("does not read a review out of the title", async () => {
+    h.fetchState.mockResolvedValue({ ...EMPTY_STATE, running: [live("IMPL", 903)] });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({
+          id: 903,
+          issue_identifier: "IMPL",
+          outcome: "running",
+          title: "Review: STUDIO-1 the thing",
+        }),
+      ],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue(TEAMS);
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(1));
+    expect(status("IMPL")).toContain("running");
+    expect(status("IMPL")).not.toContain("reviewing");
+  });
+});
+
 // STUDIO-743 (design record §6) — the additive Jobs-home touch: the operator's own count on the
 // Now strip, and a per-row preview of each run's shape in the run detail's phase glyphs.
 describe("the Needs you count (§6)", () => {

@@ -244,6 +244,22 @@ The lookup shares the lifecycle decoration's shape exactly: off the control loop
 best-effort, and unable to fail the listing. Before it, the console read the assignee from the LIVE
 Teams roster, so the column went blank the moment a run finished.
 
+`GET /api/v1/history/issues` carries a fourth optional field, `review_ticket` — `true` when this
+ticket's own job is to REVIEW a teammate's pull request, rather than to produce work of its own
+(STUDIO-780). The console needs it to say "reviewing" where it would otherwise say "in review": a
+review ticket with an agent on it and an implementation ticket parked awaiting somebody's verdict
+are two different claims that read identically without it. The signal is a `rhapsody:review-ticket`
+marker label the review quorum writes onto every review ticket it MINTS — a fact recorded by the
+daemon, never the `Review: ` title prefix, which is a convention the quorum happens to follow and
+which would mislabel a hand-written ticket that opens with the word. Only the POSITIVE is
+serialized: an ordinary ticket, one the tracker could not be asked about, and a review ticket minted
+before the marker existed all carry no field, because all three mean the same thing to a client.
+The lookup shares the assignee decoration's shape exactly — the same by-id label read, off the
+control loop, TTL-cached, best-effort, unable to fail the listing — and costs at most one label
+batch per TTL window per page anyone is actually looking at. The marker is forward-only: nothing
+backfills a review ticket created before it, because the only way to identify one is the title
+heuristic this exists to avoid.
+
 The day boundary for `/history/summary` is **local, not UTC**: the caller sends its own local
 midnight as `since` (the dashboard does), and omitting it falls back to the daemon host's local
 midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would
@@ -673,3 +689,46 @@ ticketless`, and the task that posts it is spawned on the same condition — so 
 installation a review exit cannot represent a comment, let alone post one. The failed and
 `max_turns`-truncated exits notify nobody either: nothing was read, or the same head is re-armed for
 another round.
+
+### The console merges a run's pull request — `POST /api/v1/runs/{id}/merge` (STUDIO-767)
+
+Go v0.4.0 never writes to a repository's default branch, and this route is the only place Rhapsody
+does. The operator clicks **Merge** on a run's console header; the daemon resolves that run's pull
+request itself and merges it. Design record: `~/.rhapsody/docs/STUDIO-767-console-merge-action.md`.
+
+| Merging a finished run's work | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| who merges | a human, in GitHub's UI or `gh` | the **daemon**, on the operator's click |
+| how the pull request is named | by hand | derived from the run row — never from the request |
+| what is run | — | one `gh pr merge <n> --repo <owner>/<repo> --squash --auto` |
+| GitHub writes | none, plus STUDIO-723's `gh pr comment` | the above, plus one merge |
+
+**The request body carries no pull-request number, repository or branch.** The only client-supplied
+values are the `{id}` path segment and a confirmation token, so there is no code path from a
+client-supplied integer to `gh pr merge` — a property of the request TYPE rather than of a
+validation. The daemon derives `owner`/`repo` from `runs.repo` (written from the project's
+configured remote, never from an agent) through the same `parse_repo` that refuses look-alike hosts,
+takes the branch the run's own ticket names (`runs.branch` is unwritten on every row the daemon
+produces, so the branch is derived from the ticket the way the rest of the daemon derives it, and a
+row that ever does carry one must agree with it or the merge is refused), and resolves the pull
+request by HEAD BRANCH with `gh pr list`, which rejects a fork's.
+
+**`--admin` is never passed**, on any branch, and an argv test pins its absence: `main`'s protection
+runs with `enforce_admins: false` and the daemon's `gh` login holds `admin:org`, so `--admin` is the
+one argument that would let a click land red code. `--auto` arms GitHub's **own** auto-merge, so the
+pull request lands only once the four required contexts (`lint`, `test`, `web`, `desktop`) pass; the
+daemon waits for nothing, holds no state and cannot merge a red pull request even by mistake. A
+merge GitHub refuses — a conflict, a branch behind `main` — is reported with `gh`'s own words, and
+the daemon never rebases, force-pushes or resolves a conflict.
+
+**Confirming is server-enforced, not a UI nicety.** The first POST resolves the pull request, merges
+nothing, and answers 409 `confirm_required` with a receipt naming the coordinate, the URL and the
+head SHA; confirming means echoing that SHA back, so a push between the two legs invalidates it. One
+merge per pull-request coordinate is in flight at a time, and every attempt — applied, refused or
+failed — leaves a `teams.merge` event on the run and one room line from the manager.
+
+**Off is still off, and the room still cannot trigger it.** The seam is built only when
+`teams.enabled`, so every other installation answers `teams_disabled` and the console's Merge stays
+dependency-named. The trigger is this loopback endpoint and never a room post: a `from: operator`
+room line is forgeable by any local process, and `teamsears::Intent` — the closed room-action enum —
+deliberately gains **no** `Merge` variant.

@@ -357,6 +357,11 @@ pub struct Orchestrator {
     /// without a handle, so no boot can hold work for a manager that does not exist.
     pub teams_triage: Option<Arc<crate::triage::TriageHandle>>,
 
+    /// The `gh` seams the console's merge action drives (STUDIO-767). Built by the daemon when
+    /// Teams is on, and snapshotted onto [`crate::ControlHandle`] — never used from the control
+    /// task, which makes no network call. `None` ⇒ no merge path exists at all, and the endpoint
+    /// answers `teams_disabled`.
+    pub merge_deps: Option<std::sync::Arc<crate::runmerge::MergeDeps>>,
     /// The Rhapsody Teams **room** the dispatch path catches up from (STUDIO-650, T5; design
     /// record §0.5, §0.11.4). `None` whenever there is no room to read: Teams off, or no on-disk
     /// runtime home to anchor `~/.rhapsody/teams/room/` to.
@@ -469,6 +474,13 @@ pub struct Orchestrator {
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
     pub(crate) review_rounds: crate::reviewwatch::ReviewRounds,
+    /// Pull-request coordinates a console merge is currently attempting, and since when
+    /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
+    /// id, because two runs of one ticket share a branch and therefore share the pull request a
+    /// second click would merge twice. Written and read only by
+    /// [`Orchestrator::plan_run_merge`]/[`settle_run_merge`](Orchestrator::settle_run_merge), both
+    /// on the control task, which is what makes the check-then-claim atomic.
+    pub(crate) merge_inflight: HashMap<String, std::time::Instant>,
     /// Aggregate token + runtime accounting.
     pub totals: Totals,
 
@@ -662,6 +674,7 @@ impl Orchestrator {
             teams_bank: None,
             teams_prefetch: None,
             teams_triage: None,
+            merge_deps: None,
             teams_room: None,
             teams_cursors: None,
             issue_states: HashMap::new(),
@@ -678,6 +691,7 @@ impl Orchestrator {
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
+            merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
             store: Arc::new(store::Noop),

@@ -171,6 +171,15 @@ export interface IssueRun extends RunSummary {
   // a daemon that simply could not resolve one. The client must therefore treat absence as "ask the
   // live roster instead", not as "unassigned".
   assignee?: string;
+  // True when this ticket's own job is to REVIEW a teammate's pull request (STUDIO-780) — a ticket
+  // the daemon's review quorum minted and marked with `rhapsody:review-ticket`.
+  //
+  // Only the POSITIVE is ever sent. An ordinary ticket, a ticket the daemon could not classify, and
+  // a review ticket minted before the marker existed all carry NO field, because all three mean the
+  // same thing to a client: say about this row what you said before the field existed. That is why
+  // this one is not shaped like `lifecycle`/`assignee` above, where absence is a distinguishable
+  // third answer — here there is nothing a client could do differently.
+  review_ticket?: boolean;
 }
 
 // IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —
@@ -353,6 +362,56 @@ export function stopRun(runID: number): Promise<RunActionResult> {
 }
 export function resumeRun(runID: number): Promise<RunActionResult> {
   return postRunAction(runID, "resume");
+}
+
+// MergeReceipt is what POST /api/v1/runs/{id}/merge resolved: the pull request the DAEMON derived
+// from the run's own row (the console never names one — see the daemon's `handlers_runmerge`), its
+// head commit, and how it is being merged. `said` is gh's own words, present only once merged.
+export interface MergeReceipt {
+  run_id: number;
+  issue: string;
+  pr: string;
+  url: string;
+  number: number;
+  head_sha: string;
+  method: string;
+  auto: boolean;
+  said?: string;
+}
+
+// MergeRunResult is the two-legged confirm handshake as the console sees it. "confirm" is the
+// daemon's 409 `confirm_required` — it resolved the pull request and merged NOTHING — and the only
+// way past it is to re-POST the receipt's own head_sha, which the daemon re-resolves and compares.
+// So a stale confirmation (the author pushed in between) comes back as another "confirm".
+export type MergeRunResult = { status: "merged" | "confirm"; receipt: MergeReceipt };
+
+// mergeRun merges a run's pull request (STUDIO-767). `confirm` is the head SHA being confirmed, or
+// "" for the handshake's first leg. Every OTHER non-2xx — teams_disabled, merge_refused,
+// merge_failed, not_found — throws with the daemon's own message, because the reason a merge was
+// refused is the whole of what the operator needs to read.
+export async function mergeRun(runID: number, confirm = ""): Promise<MergeRunResult> {
+  const res = await fetch(`/api/v1/runs/${runID}/merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ confirm }),
+  });
+  const body = (await res.json().catch(() => null)) as
+    | MergeReceipt
+    | (ApiError & { receipt?: MergeReceipt })
+    | null;
+  // A 200 with no readable body would leave the console showing nothing at all for a merge that
+  // did happen — worse than an error, because the operator would click again. Say so instead.
+  if (res.ok) {
+    if (body === null || "error" in body) {
+      throw new Error("the daemon merged but returned no receipt");
+    }
+    return { status: "merged", receipt: body };
+  }
+  const err = body && "error" in body ? body : null;
+  if (err?.error.code === "confirm_required" && err.receipt) {
+    return { status: "confirm", receipt: err.receipt };
+  }
+  throw new Error(err ? err.error.message : `merge failed: ${res.status}`);
 }
 
 // RunMessage is one operator "btw" sent to a run's agent (INF-250). body is the operator's

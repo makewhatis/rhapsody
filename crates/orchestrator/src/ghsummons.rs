@@ -425,6 +425,143 @@ impl PrCommentSink for GH {
     }
 }
 
+/// How a pull request is merged — the three strategies `gh pr merge` offers, as a CLOSED enum.
+///
+/// A closed enum rather than a string is the point. The argv this feeds is assembled from these
+/// variants alone, so there is no spelling of a merge method that reaches `gh` from a caller —
+/// and in particular no way for a config key, a room post or a request body to grow into
+/// `--admin`, the one flag that would let this daemon land a pull request past its required
+/// checks (design record `~/.rhapsody/docs/STUDIO-767-console-merge-action.md` §3/G2).
+///
+/// Only [`MergeMethod::Squash`] is wired today: it is what the sign-off pinned, and it is the
+/// repo's own convention — the squash subject is the PR title release-please parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeMethod {
+    /// The `gh pr merge` flag this method is spelled as.
+    fn flag(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "--squash",
+            MergeMethod::Merge => "--merge",
+            MergeMethod::Rebase => "--rebase",
+        }
+    }
+
+    /// The method's name as an operator reads it, for a receipt or an audit line.
+    pub fn name(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "squash",
+            MergeMethod::Merge => "merge",
+            MergeMethod::Rebase => "rebase",
+        }
+    }
+}
+
+/// How much of `gh`'s own chatter a merge carries back into the audit record. A merge prints one
+/// or two lines; anything past this is not a report, and the record it lands in is a store event
+/// an operator reads.
+const MAX_MERGE_OUTPUT: usize = 2 << 10;
+
+/// The fallible result of a [`MergeSource`] merge: whatever `gh` said about it on success (bounded,
+/// for the audit record), or `gh`'s own complaint on failure.
+///
+/// There is no "nothing to do" case, unlike every read in this module and for
+/// [`PrCommentSink`]'s reason: a caller that asked for a merge either got one or did not. Whether
+/// the pull request was in a state worth merging at all is decided BEFORE this is called
+/// ([`crate::runmerge`]), because that decision needs the run row and this primitive has only a
+/// coordinate.
+pub type MergeResult = Result<String, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Merges one pull request (STUDIO-767, slice 1).
+///
+/// **No Go counterpart**, and the second `gh` seam in this module that writes — but where
+/// [`PrCommentSink`] writes a comment, this one moves `main`. Everything about its shape is that
+/// difference:
+///
+/// * It is a separate trait, so a task holding a read seam cannot merge anything and a task
+///   holding this one is visibly the merge path. The same argument [`OpenPrSource`] and
+///   [`PrCommentSink`] are kept apart by, with more riding on it.
+/// * The method is a closed [`MergeMethod`] and never a string, so the argv is not composable
+///   from outside this module (see that type).
+/// * **`--admin` is never passed.** Not as a parameter, not behind a config key, not behind a
+///   flag. `main`'s protection has `enforce_admins: false` and the daemon's `gh` login holds
+///   `admin:org`, so `--admin` is precisely the argument that turns an operator's click into a
+///   way to land red code past `lint`/`test`/`web`/`desktop`. Its ABSENCE is the load-bearing
+///   line of this feature, which is why it is pinned by an argv test rather than by prose
+///   (`merge_pr_never_passes_admin`).
+/// * `auto` arms GitHub's **own** auto-merge, so the pull request lands only when the required
+///   contexts pass and this daemon holds no state, waits for nothing, and cannot merge a red pull
+///   request even by mistake. That is the authorization boundary: GitHub's, not Rhapsody's.
+///
+/// Object-safe (held as `dyn MergeSource` by the off-loop merge path), so it is declared via
+/// `async_trait`.
+#[async_trait]
+pub trait MergeSource: Send + Sync {
+    async fn merge_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        method: MergeMethod,
+        auto: bool,
+    ) -> MergeResult;
+}
+
+#[async_trait]
+impl MergeSource for GH {
+    /// One `gh pr merge <number> --repo <owner>/<repo> <--squash|--merge|--rebase> [--auto]`, and
+    /// nothing else on the command line.
+    ///
+    /// An incomplete coordinate is an ERROR rather than a quiet nothing, following
+    /// [`PrCommentSink::post_pr_comment`]: a read at a coordinate that cannot exist has a true
+    /// answer, whereas being asked to merge one is a caller bug, and here it is a caller bug about
+    /// an irreversible action.
+    ///
+    /// Everything GitHub refuses — a conflict, a failing required check with `--auto` unavailable,
+    /// a branch behind `main`, a pull request already merged — comes back as an `Err` carrying
+    /// `gh`'s own words. The daemon never rebases, never force-pushes and never resolves a
+    /// conflict on the operator's behalf; a refusal is reported and the operator acts.
+    async fn merge_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        method: MergeMethod,
+        auto: bool,
+    ) -> MergeResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Err(
+                format!("gh pr merge: incomplete coordinate {owner}/{repo}#{number}").into(),
+            );
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let mut args = vec![
+            "pr",
+            "merge",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            method.flag(),
+        ];
+        if auto {
+            args.push("--auto");
+        }
+        let out = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("gh pr merge {num} --repo {slug}: {e}").into()
+        })?;
+        // Lossy, and bounded by characters rather than bytes so the cap cannot split one: this is
+        // `gh`'s console chatter on its way into an audit record, not a value anything parses.
+        let said = String::from_utf8_lossy(&out);
+        Ok(said.trim().chars().take(MAX_MERGE_OUTPUT).collect())
+    }
+}
+
 /// Where a pull request stands, as GitHub's GraphQL `PullRequestState` reports it. Three values,
 /// not two: the watcher retires a MERGED pull request and a CLOSED one for different reasons and
 /// records them differently, and `mergedAt` alone cannot be trusted to tell them apart.
@@ -1654,6 +1791,185 @@ mod tests {
         assert!(
             seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "no gh call should have been made"
+        );
+    }
+    // --- MergeSource (STUDIO-767, slice 1) --------------------------------------------------
+
+    /// A runner that FAILS every call with `err`, recording the argv it was asked to run. The
+    /// merge path's refusals all arrive this way — `gh` exits non-zero and says why.
+    fn run_failing(err: &'static str, seen: Arc<Mutex<Vec<String>>>) -> RunFn {
+        Box::new(move |args| {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(args.join(" "));
+            Err(err.into())
+        })
+    }
+
+    /// **The guardrail this whole feature rests on (design §3/G2).** `--admin` bypasses every
+    /// required status check, `main`'s protection has `enforce_admins: false`, and the daemon's
+    /// `gh` login holds `admin:org` — so its absence is what stands between an operator's click
+    /// and a merge of red code. Asserted on the argv, not on prose, and asserted for every
+    /// method/auto combination so no branch can grow one.
+    #[tokio::test]
+    async fn merge_pr_never_passes_admin() {
+        for method in [MergeMethod::Squash, MergeMethod::Merge, MergeMethod::Rebase] {
+            for auto in [true, false] {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+                src.merge_pr("o", "r", 64, method, auto)
+                    .await
+                    .expect("merge");
+                let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                for call in &calls {
+                    assert!(
+                        !call.contains("--admin"),
+                        "{method:?}/auto={auto} put --admin on the gh command line: {call}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The happy path, and the argv asserted IN FULL because it IS the contract with GitHub. The
+    /// signed-off default is `--squash --auto`: `--auto` arms GitHub's own auto-merge, so the pull
+    /// request lands only once `lint`, `test`, `web` and `desktop` pass and this daemon waits for
+    /// nothing. Losing `--auto` here would turn the feature into an immediate merge.
+    #[tokio::test]
+    async fn merge_pr_squash_auto_is_one_bounded_call() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                "  ✓ Pull request #64 will be automatically merged when all requirements are met\n",
+                Arc::clone(&seen),
+            )),
+        );
+
+        let said = src
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .await
+            .expect("merge");
+
+        assert_eq!(
+            said, "✓ Pull request #64 will be automatically merged when all requirements are met",
+            "gh's own words come back trimmed, for the audit record"
+        );
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr merge 64 --repo o/r --squash --auto".to_string()],
+            "exactly one gh call, and exactly these arguments"
+        );
+    }
+
+    /// Each method is spelled as its own `gh` flag, and `auto: false` simply omits `--auto` rather
+    /// than passing anything in its place.
+    #[tokio::test]
+    async fn merge_pr_spells_each_method_as_its_flag() {
+        for (method, want) in [
+            (MergeMethod::Squash, "pr merge 7 --repo o/r --squash"),
+            (MergeMethod::Merge, "pr merge 7 --repo o/r --merge"),
+            (MergeMethod::Rebase, "pr merge 7 --repo o/r --rebase"),
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+            src.merge_pr("o", "r", 7, method, false)
+                .await
+                .expect("merge");
+            assert_eq!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                vec![want.to_string()]
+            );
+        }
+    }
+
+    /// A conflict is `gh`'s refusal, carried back VERBATIM. The daemon does not rebase, does not
+    /// force-push and does not resolve it — the operator is told exactly what GitHub said.
+    #[tokio::test]
+    async fn merge_pr_carries_a_conflict_back_verbatim() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_failing(
+                "X Pull request #64 is not mergeable: the merge commit cannot be cleanly created.",
+                Arc::clone(&seen),
+            )),
+        );
+
+        let err = src
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .await
+            .expect_err("a conflict is an error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not mergeable"),
+            "gh's own complaint is what the operator reads: {msg}"
+        );
+        assert!(
+            msg.contains("gh pr merge 64 --repo o/r"),
+            "and it names the call that failed: {msg}"
+        );
+    }
+
+    /// Failing required checks with auto-merge unavailable is the same shape — an error carrying
+    /// GitHub's reason. Nothing here retries, and nothing here decides to merge anyway.
+    #[tokio::test]
+    async fn merge_pr_carries_red_checks_back_as_an_error() {
+        let src = GH::new(
+            "@symphony",
+            Some(run_failing(
+                "X Pull request #64 is not mergeable: 1 required status check is failing.",
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        let err = src
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .await
+            .expect_err("red checks are an error");
+        assert!(
+            err.to_string().contains("required status check is failing"),
+            "{err}"
+        );
+    }
+
+    /// A pull request that is not there is an error too, and deliberately NOT the quiet `Gone` the
+    /// reads in this module answer: a merge asked for at a coordinate GitHub cannot resolve means
+    /// the caller's coordinate is wrong, and silently reporting success would be the worst
+    /// possible answer for an irreversible action.
+    #[tokio::test]
+    async fn merge_pr_reports_a_missing_pull_request() {
+        let src = GH::new(
+            "@symphony",
+            Some(run_failing(
+                "GraphQL: Could not resolve to a PullRequest with the number of 64.",
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        );
+        let err = src
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .await
+            .expect_err("a missing PR is an error");
+        assert!(err.to_string().contains("Could not resolve"), "{err}");
+    }
+
+    /// An incomplete coordinate spawns no process and is an error — [`PrCommentSink`]'s rule, for
+    /// a stronger version of its reason: `gh pr merge 0 --repo o/` is not a merge anyone meant.
+    #[tokio::test]
+    async fn merge_pr_refuses_an_incomplete_coordinate_without_asking_github() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0), ("o", "r", -3)] {
+            assert!(
+                src.merge_pr(owner, repo, n, MergeMethod::Squash, true)
+                    .await
+                    .is_err(),
+                "{owner}/{repo}#{n} should be refused"
+            );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh process should have been spawned"
         );
     }
 }

@@ -14,8 +14,11 @@ import {
   mateStates,
   needsOperator,
   relativeSince,
+  reviewTicketIssues,
+  statusNote,
   ticketAssignees,
 } from "./console-jobs";
+import { runOutcomeLabel } from "./console-job-detail";
 
 const NOW = Date.parse("2026-09-01T12:00:00Z");
 
@@ -101,6 +104,124 @@ describe("consoleJobStatus", () => {
     expect(consoleJobStatus("completed", undefined)).toBe("review");
     expect(consoleJobStatus("completed", "")).toBe("review");
     expect(consoleJobStatus("completed", "some_future_state")).toBe("review");
+  });
+});
+
+// STUDIO-780 — "in review" was doing double duty: an agent whose whole job is to review a
+// teammate's pull request, and a ticket whose work is finished and is awaiting one. `reviewing` is
+// the first of those, and the signal is the daemon's `review_ticket` marker, never the title.
+describe("consoleJobStatus on a review ticket", () => {
+  it("says reviewing when an agent is actively reviewing", () => {
+    expect(consoleJobStatus("running", undefined, true)).toBe("reviewing");
+    // A mid-run handoff parks the ticket while the agent is still working; the run still wins.
+    expect(consoleJobStatus("running", "in_review", true)).toBe("reviewing");
+  });
+
+  // The whole point of the split: the two claims must not resolve to the same word.
+  it("still says in review for an implementation ticket awaiting one", () => {
+    expect(consoleJobStatus("running", undefined, false)).toBe("run");
+    expect(consoleJobStatus("completed", "in_review", false)).toBe("review");
+  });
+
+  // The marker changes the word for LIVE work only. A review ticket whose run is over is parked
+  // awaiting a person exactly as any other ticket in that state is, and terminal is terminal.
+  it("does not change any state but the live one", () => {
+    expect(consoleJobStatus("completed", "in_review", true)).toBe("review");
+    expect(consoleJobStatus("completed", "done", true)).toBe("done");
+    expect(consoleJobStatus("stopped", "open", true)).toBe("queued");
+    expect(consoleJobStatus("failed", "open", true)).toBe("blocked");
+  });
+
+  // A daemon that does not serve the field behaves exactly as it did before it existed.
+  it("defaults to the pre-existing mapping when nothing is known", () => {
+    expect(consoleJobStatus("running")).toBe("run");
+  });
+});
+
+describe("reviewTicketIssues", () => {
+  it("collects only the tickets the daemon marked", () => {
+    const got = reviewTicketIssues([
+      issueRow({ issue_identifier: "REVIEW", review_ticket: true }),
+      issueRow({ issue_identifier: "IMPL" }),
+      issueRow({ issue_identifier: "EXPLICIT", review_ticket: false }),
+    ]);
+    expect([...got]).toEqual(["REVIEW"]);
+  });
+
+  // The signal is the daemon's marker. A title is a convention, and a hand-written ticket that
+  // happens to open with the word is not a review ticket.
+  it("never reads the title", () => {
+    const got = reviewTicketIssues([
+      issueRow({ issue_identifier: "IMPL", title: "Review: STUDIO-1 do the thing" }),
+    ]);
+    expect(got.size).toBe(0);
+  });
+
+  it("ignores a row with no ticket key", () => {
+    expect(reviewTicketIssues([issueRow({ issue_identifier: "", review_ticket: true })]).size).toBe(
+      0,
+    );
+  });
+});
+
+// STUDIO-780 problem 2 — the row painted the TICKET's lifecycle, the run detail painted the RUN's
+// outcome, and with no cue which subject either word belonged to the list read as stuck: "they are
+// stuck in 'in review' in the dashboard, and when I click in, they are all done".
+describe("statusNote", () => {
+  it("states the run's own outcome beside a ticket parked in review", () => {
+    expect(statusNote("review", "completed", true)).toBe("run done");
+  });
+
+  it("uses the same word the run detail's header prints", () => {
+    expect(statusNote("review", "completed", true)).toBe(`run ${runOutcomeLabel("completed")}`);
+    expect(statusNote("done", "failed", true)).toBe(`run ${runOutcomeLabel("failed")}`);
+  });
+
+  // The status was inferred FROM the outcome, so the two are one fact and a note would only
+  // restate the pill in other words.
+  it("says nothing when the daemon never resolved a lifecycle", () => {
+    expect(statusNote("review", "completed", false)).toBeUndefined();
+  });
+
+  // A live run IS the row's status.
+  it("says nothing about a run still going", () => {
+    expect(statusNote("run", "running", true)).toBeUndefined();
+    expect(statusNote("blocked", "waiting", true)).toBeUndefined();
+  });
+
+  // Same subject, same word — nothing diverged, so nothing to reconcile.
+  it("says nothing when the two words agree", () => {
+    expect(statusNote("done", "completed", true)).toBeUndefined();
+  });
+
+  // A merged ticket whose run failed is the other direction of the same confusion.
+  it("states a failure the ticket's own state hides", () => {
+    expect(statusNote("done", "failed", true)).toBe("run failed");
+    expect(statusNote("review", "failed", true)).toBe("run failed");
+  });
+
+  it("says nothing about an outcome it has no word for", () => {
+    expect(statusNote("review", "", true)).toBeUndefined();
+  });
+});
+
+// The fourth condition, which lives in the builder: a failed row's `subLabel` IS the error, and
+// "blocked · run failed · <error>" spends a third of the pill restating what follows it.
+describe("statusNote on a row that already explains itself", () => {
+  it("leaves a failed row's error to speak for the run", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "BROKE", status: "failed", subLabel: "boom" })],
+      [issueRow({ issue_identifier: "BROKE", lifecycle: "done" })],
+      undefined,
+      NOW,
+    );
+    expect(rows[0]?.subLabel).toBe("boom");
+    expect(rows[0]?.statusNote).toBeUndefined();
+  });
+
+  // Without the guard the same row would carry both — this is what is being suppressed.
+  it("would otherwise have had one", () => {
+    expect(statusNote("done", "failed", true)).toBe("run failed");
   });
 });
 
@@ -426,6 +547,87 @@ describe("filterConsoleJobs", () => {
     for (const f of CONSOLE_JOB_FILTERS) {
       expect(() => filterConsoleJobs(rows, f.id, "")).not.toThrow();
     }
+  });
+
+  // STUDIO-780 — `reviewing` gets no Seg button of its own: it is a kind of RUNNING, so "Running"
+  // covers it and "In review" (which means "parked, waiting on a person") does not. A live row that
+  // answered to no button would vanish from every filter but "All".
+  describe("with a review ticket being reviewed", () => {
+    const withReviewing = buildConsoleJobs(
+      [
+        job({ issue: "A", status: "running" }),
+        job({ issue: "R", status: "running" }),
+        job({ issue: "B", status: "completed" }),
+      ],
+      [issueRow({ issue_identifier: "R", review_ticket: true })],
+      undefined,
+      NOW,
+    );
+
+    it("files reviewing under Running, not under In review", () => {
+      expect(filterConsoleJobs(withReviewing, "run", "").map((r) => r.issue).sort()).toEqual([
+        "A",
+        "R",
+      ]);
+      expect(filterConsoleJobs(withReviewing, "review", "").map((r) => r.issue)).toEqual(["B"]);
+    });
+
+    it("leaves no row unreachable from the Seg", () => {
+      const reachable = new Set(
+        CONSOLE_JOB_FILTERS.filter((f) => f.id !== "all").flatMap((f) =>
+          filterConsoleJobs(withReviewing, f.id, "").map((r) => r.issue),
+        ),
+      );
+      expect([...reachable].sort()).toEqual(["A", "B", "R"]);
+    });
+
+    it("counts reviewing as running in the Now strip", () => {
+      expect(consoleJobCounts(withReviewing).running).toBe(2);
+    });
+
+    // The pin exists to surface live work; a reviewing row is live work.
+    it("pins reviewing to the top beside running", () => {
+      expect(withReviewing.slice(0, 2).map((r) => r.status).sort()).toEqual([
+        "reviewing",
+        "run",
+      ]);
+    });
+
+    it("labels the reviewing row, and leaves an ordinary live row alone", () => {
+      const row = withReviewing.find((r) => r.issue === "R");
+      expect(row?.status).toBe("reviewing");
+      expect(row?.statusLabel).toBe("reviewing");
+      // "A" is running too, and is NOT a review ticket: the narrowing must not reach it.
+      const ordinary = withReviewing.find((r) => r.issue === "A");
+      expect(ordinary?.status).toBe("run");
+      expect(ordinary?.statusLabel).toBe("running");
+    });
+
+    // An agent has it, so it is not the operator's move.
+    it("does not bill a reviewing row to Needs you", () => {
+      expect(needsOperator("reviewing", "running")).toBe(false);
+    });
+  });
+
+  // STUDIO-780 problem 2, end to end through the builder.
+  describe("with a parked ticket whose run has finished", () => {
+    const parked = buildConsoleJobs(
+      [job({ issue: "PARKED", status: "completed" }), job({ issue: "GUESSED", status: "completed" })],
+      [issueRow({ issue_identifier: "PARKED", lifecycle: "in_review" })],
+      undefined,
+      NOW,
+    );
+    const row = (issue: string) => parked.find((r) => r.issue === issue);
+
+    it("says the run is done beside the ticket being in review", () => {
+      expect(row("PARKED")?.statusLabel).toBe("in review");
+      expect(row("PARKED")?.statusNote).toBe("run done");
+    });
+
+    it("adds nothing to a row whose status was only inferred from that same outcome", () => {
+      expect(row("GUESSED")?.statusLabel).toBe("in review");
+      expect(row("GUESSED")?.statusNote).toBeUndefined();
+    });
   });
 });
 

@@ -135,6 +135,13 @@ pub struct ControlHandle {
     /// what state a ticket is in shares one TTL window instead of each keeping its own
     /// (STUDIO-702). Read-only with respect to the control task, which never touches it.
     pub(crate) lifecycle: std::sync::Arc<crate::lifecycle::LifecycleCache>,
+    /// The `gh` seams the console's merge action drives (STUDIO-767), snapshotted from
+    /// [`Orchestrator::merge_deps`](crate::orchestrator::Orchestrator). It lives on the handle
+    /// rather than being reached through [`Self::events`] because every call it makes BLOCKS
+    /// ([`crate::runmerge`]'s module doc): they run on the HTTP request's own task, and only the
+    /// decisions either side of them round-trip the control task. `None` ⇒ Teams is off and there
+    /// is no merge path.
+    pub(crate) merge: Option<std::sync::Arc<crate::runmerge::MergeDeps>>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -160,6 +167,7 @@ impl crate::orchestrator::Orchestrator {
             quorum: self.quorum_tx.clone(),
             review_intro: self.review_intro_tx.clone(),
             lifecycle: std::sync::Arc::clone(&self.lifecycle),
+            merge: self.merge_deps.as_ref().map(std::sync::Arc::clone),
         }
     }
 }

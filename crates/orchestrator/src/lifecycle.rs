@@ -222,6 +222,17 @@ struct AssigneeEntry {
     at: Instant,
 }
 
+/// One cached review-ticket answer. `is_review: false` records "the tracker answered about this
+/// ticket and it carries no marker" and is cached exactly like a hit, so an ordinary ticket — which
+/// is nearly all of them — is not re-queried on every dashboard load.
+///
+/// Unlike [`AssigneeEntry`] it carries no `run_id`: what kind of ticket this is is a property of
+/// the TICKET, not of the run a row happens to display, so a re-run does not make the answer stale.
+struct ReviewEntry {
+    is_review: bool,
+    at: Instant,
+}
+
 #[derive(Default)]
 pub struct LifecycleCache {
     entries: Mutex<HashMap<String, Entry>>,
@@ -230,6 +241,11 @@ pub struct LifecycleCache {
     /// from different sources and must fail independently: a tracker that cannot say what state a
     /// ticket is in must not also erase who worked it, which the store alone can answer.
     assignees: Mutex<HashMap<String, AssigneeEntry>>,
+    /// The review-ticket memo (STUDIO-780), keyed by tracker issue id and bounded exactly as
+    /// `entries` is. A third map for the same reason there is a second one: it resolves from a
+    /// different record — the ticket's LABELS rather than its workflow state — and a tracker that
+    /// cannot say what state a ticket is in must not also erase what kind of ticket it is.
+    reviews: Mutex<HashMap<String, ReviewEntry>>,
 }
 
 impl LifecycleCache {
@@ -463,6 +479,88 @@ impl LifecycleCache {
         out
     }
 
+    /// Resolves which of `ids` are REVIEW TICKETS — tickets the quorum minted, whose whole job is
+    /// to review a teammate's pull request (STUDIO-780) — refreshing whatever has gone stale from
+    /// `tracker` first. The answer is the SET of ids that are; an id absent from it either is not
+    /// one or could not be resolved, and the console treats both the same way.
+    ///
+    /// The signal is [`crate::quorum::REVIEW_TICKET_LABEL`], read with the same
+    /// [`Tracker::fetch_issue_labels_by_ids`] the assignee decoration uses — which is why it
+    /// answers for a ticket that has already been merged, the case a status column most needs.
+    /// Nothing here infers review-ness from a title: `Review: ` is a convention this daemon happens
+    /// to follow when it MINTS one, and a hand-written ticket that opens with the word is not a
+    /// review ticket at all.
+    ///
+    /// `tracker` is `None` before the first config load, and the whole refresh is then skipped —
+    /// already-cached answers are still served, so a hot-reload gap degrades to staleness rather
+    /// than to blankness. Best-effort throughout, exactly like [`Self::resolve`]: a failed
+    /// round-trip leaves its ids untouched instead of caching "not a review ticket" over an answer
+    /// the console already had.
+    pub async fn resolve_reviews(
+        &self,
+        ids: &[String],
+        tracker: Option<Arc<dyn Tracker>>,
+        now: Instant,
+    ) -> HashSet<String> {
+        let (mut out, stale) = self.partition_reviews(ids, now);
+        let Some(tracker) = tracker else {
+            return out;
+        };
+        if stale.is_empty() {
+            return out;
+        }
+        let (issues, covered) = fetch_labels(
+            tracker.as_ref(),
+            &stale,
+            "review-ticket label lookup failed; serving cached ticket kinds",
+        )
+        .await;
+        let marked: HashSet<&str> = issues
+            .iter()
+            .filter(|iss| is_review_ticket(iss))
+            .map(|iss| iss.id.as_str())
+            .collect();
+        let mut guard = self.reviews.lock().unwrap_or_else(PoisonError::into_inner);
+        for id in stale.iter().filter(|id| covered.contains(*id)) {
+            let is_review = marked.contains(id.as_str());
+            if is_review {
+                out.insert(id.clone());
+            } else {
+                // A refresh that now says "not a review ticket" drops the stale answer rather than
+                // keep reporting a kind nothing confirms — the rule [`Self::resolve`] follows too.
+                out.remove(id);
+            }
+            guard.insert(id.clone(), ReviewEntry { is_review, at: now });
+        }
+        prune_reviews(&mut guard, now);
+        out
+    }
+
+    /// The review-ticket half of [`Self::partition`], following its two rules unchanged: a stale
+    /// answer is returned AS WELL AS re-queried (it is what the caller gets when the refresh fails),
+    /// and the refresh set is deduplicated and capped at [`MAX_LIFECYCLE_REFRESH`]. Blank ids are
+    /// dropped — there is nothing to look up and nothing to key an answer by.
+    fn partition_reviews(&self, ids: &[String], now: Instant) -> (HashSet<String>, Vec<String>) {
+        let mut cached = HashSet::new();
+        let mut stale = Vec::new();
+        let mut seen = HashSet::new();
+        let guard = self.reviews.lock().unwrap_or_else(PoisonError::into_inner);
+        for id in ids {
+            if id.is_empty() || !seen.insert(id.as_str()) {
+                continue;
+            }
+            let entry = guard.get(id);
+            if entry.is_some_and(|e| e.is_review) {
+                cached.insert(id.clone());
+            }
+            let fresh = entry.is_some_and(|e| now.duration_since(e.at) < LIFECYCLE_TTL);
+            if !fresh && stale.len() < MAX_LIFECYCLE_REFRESH {
+                stale.push(id.clone());
+            }
+        }
+        (cached, stale)
+    }
+
     /// The assignee half of [`Self::partition`], and it follows the same two rules: a stale answer
     /// is returned AS WELL AS re-queried (it is what the caller gets when the refresh fails), and
     /// the refresh set is deduplicated and capped at [`MAX_LIFECYCLE_REFRESH`].
@@ -600,27 +698,47 @@ async fn label_identities(
     tracker: &dyn Tracker,
     keys: &[IssueKey],
 ) -> (Vec<(String, String)>, HashSet<String>) {
+    let ids: Vec<String> = keys.iter().map(|k| k.id.clone()).collect();
+    let (issues, covered) = fetch_labels(
+        tracker,
+        &ids,
+        "assignee label lookup failed; serving cached ticket assignees",
+    )
+    .await;
+    let out = issues
+        .iter()
+        .filter_map(|iss| Some((iss.id.clone(), label_identity(iss)?)))
+        .collect();
+    (out, covered)
+}
+
+/// The labelled issues for `ids`, batched at [`LIFECYCLE_BATCH`], beside the set of ids a
+/// round-trip actually COVERED — which is not the same thing: a ticket the tracker answered about
+/// but that carries none of the labels a caller cares about is covered with no label, and that
+/// distinction is what lets a caller cache the negative without also caching it over a chunk that
+/// simply failed. A failed round-trip stops the refresh and is logged under `what`; it never
+/// propagates, because the listing being decorated has already succeeded.
+///
+/// Shared by the two decorations that read labels — the durable assignee (STUDIO-735) and the
+/// review-ticket marker (STUDIO-780) — so the batching, the covered-set rule and the
+/// failure-is-not-an-answer rule have one home rather than two that can drift.
+async fn fetch_labels(
+    tracker: &dyn Tracker,
+    ids: &[String],
+    what: &str,
+) -> (Vec<rhapsody_core::Issue>, HashSet<String>) {
     let mut out = Vec::new();
     let mut covered = HashSet::new();
-    for chunk in keys.chunks(LIFECYCLE_BATCH) {
-        let ids: Vec<String> = chunk.iter().map(|k| k.id.clone()).collect();
-        let issues = match tracker.fetch_issue_labels_by_ids(&ids).await {
+    for chunk in ids.chunks(LIFECYCLE_BATCH) {
+        let issues = match tracker.fetch_issue_labels_by_ids(chunk).await {
             Ok(issues) => issues,
             Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    ids = ids.len(),
-                    "assignee label lookup failed; serving cached ticket assignees",
-                );
+                tracing::warn!(error = %err, ids = chunk.len(), "{what}");
                 break;
             }
         };
-        out.extend(
-            issues
-                .iter()
-                .filter_map(|iss| Some((iss.id.clone(), label_identity(iss)?))),
-        );
-        covered.extend(ids);
+        out.extend(issues);
+        covered.extend(chunk.iter().cloned());
     }
     (out, covered)
 }
@@ -645,6 +763,30 @@ fn label_identity(iss: &rhapsody_core::Issue) -> Option<String> {
         .filter(|name| !name.is_empty())
         .min()
         .map(str::to_string)
+}
+
+/// Whether a ticket's labels carry the quorum's review marker (STUDIO-780).
+///
+/// The adapter normalizes label names to lowercase, and
+/// [`REVIEW_TICKET_LABEL`](crate::quorum::REVIEW_TICKET_LABEL) is already lowercase, so this is a
+/// plain equality rather than a case fold — the same comparison
+/// [`crate::teams::is_solo`] makes against its own marker.
+fn is_review_ticket(iss: &rhapsody_core::Issue) -> bool {
+    iss.labels
+        .iter()
+        .flatten()
+        .any(|l| l == crate::quorum::REVIEW_TICKET_LABEL)
+}
+
+/// [`prune`] for the review-ticket memo — same bound, same "expired first, then give up" rule.
+fn prune_reviews(entries: &mut HashMap<String, ReviewEntry>, now: Instant) {
+    if entries.len() <= MAX_CACHE_ENTRIES {
+        return;
+    }
+    entries.retain(|_, e| now.duration_since(e.at) < LIFECYCLE_TTL);
+    if entries.len() > MAX_CACHE_ENTRIES {
+        entries.clear();
+    }
 }
 
 /// [`prune`] for the assignee memo — same bound, same "expired first, then give up" rule.
@@ -681,6 +823,20 @@ impl ControlHandle {
     pub async fn issue_assignees(&self, keys: &[IssueKey]) -> HashMap<String, String> {
         self.lifecycle
             .resolve_assignees(keys, &self.store, self.reads_tracker(), Instant::now())
+            .await
+    }
+
+    /// The daemon's off-loop "which of these tickets are review tickets?" surface, backing the
+    /// `review_ticket` field on `GET /api/v1/history/issues` (STUDIO-780). Read-only and
+    /// infallible: an id the tracker could not answer about is simply absent from the set, and the
+    /// console then paints the row exactly as it did before the field existed.
+    ///
+    /// It takes the SAME account-level tracker as [`Self::issue_assignees`], for the same reason —
+    /// the label read filters on `id: { in: … }` and carries no project scope — and reads it from
+    /// the same hot-reloaded cell.
+    pub async fn review_tickets(&self, ids: &[String]) -> HashSet<String> {
+        self.lifecycle
+            .resolve_reviews(ids, self.reads_tracker(), Instant::now())
             .await
     }
 
@@ -1290,6 +1446,172 @@ mod tests {
             got.is_empty(),
             "no record anywhere must not invent one: {got:?}"
         );
+    }
+
+    // ─── review-ticket marker (STUDIO-780) ───────────────────────────────────────────────────────
+
+    // Acceptance: the marker the quorum mints is what says "this ticket's job is to review", and it
+    // answers whatever workflow state the ticket has reached.
+    #[tokio::test]
+    async fn the_marker_label_identifies_a_review_ticket() {
+        let mut f = Fake::default();
+        f.by_id.insert(
+            "a".into(),
+            labelled("a", &["rhapsody:@bob", crate::quorum::REVIEW_TICKET_LABEL]),
+        );
+        f.by_id
+            .insert("b".into(), labelled("b", &["rhapsody:@alice", "backend"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_reviews(
+                &["a".to_string(), "b".to_string()],
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(got.contains("a"), "the marked ticket is a review ticket");
+        assert!(
+            !got.contains("b"),
+            "an ordinary ticket is not, however it is otherwise labelled: {got:?}",
+        );
+    }
+
+    // The whole reason this reads a LABEL: a ticket whose title merely opens with the word is not a
+    // review ticket, and the console must not paint it as one.
+    #[tokio::test]
+    async fn a_title_that_reads_like_a_review_is_not_one() {
+        let mut f = Fake::default();
+        let mut titled = labelled("a", &["rhapsody:@bob"]);
+        titled.title = "Review: MT-1 do the thing".into();
+        f.by_id.insert("a".into(), titled);
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+
+        let got = cache
+            .resolve_reviews(
+                &["a".to_string()],
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            got.is_empty(),
+            "the title prefix is a convention, not a fact: {got:?}",
+        );
+    }
+
+    // The negative caches exactly like the positive: an ordinary ticket — nearly all of them — must
+    // not cost a round trip on every dashboard load.
+    #[tokio::test]
+    async fn a_resolved_answer_is_memoized_for_the_ttl() {
+        let mut f = Fake::default();
+        f.by_id.insert(
+            "a".into(),
+            labelled("a", &[crate::quorum::REVIEW_TICKET_LABEL]),
+        );
+        f.by_id.insert("b".into(), labelled("b", &["backend"]));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let now = Instant::now();
+        let ids = ["a".to_string(), "b".to_string()];
+
+        let first = cache
+            .resolve_reviews(&ids, Some(Arc::clone(&tr) as Arc<dyn Tracker>), now)
+            .await;
+        let second = cache
+            .resolve_reviews(&ids, Some(Arc::clone(&tr) as Arc<dyn Tracker>), now)
+            .await;
+
+        assert_eq!(first, second);
+        assert_eq!(tr.labels_by_id_calls(), 1, "the second read is memoized");
+
+        let later = cache
+            .resolve_reviews(
+                &ids,
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                now + LIFECYCLE_TTL,
+            )
+            .await;
+        assert_eq!(later, first);
+        assert_eq!(tr.labels_by_id_calls(), 2, "the TTL expiring re-queries");
+    }
+
+    // A failed round-trip is not an answer: it must leave a standing "this is a review ticket"
+    // alone rather than memoize the negative over it.
+    #[tokio::test]
+    async fn a_failed_lookup_keeps_the_answer_it_already_had() {
+        let mut f = Fake::default();
+        f.by_id.insert(
+            "a".into(),
+            labelled("a", &[crate::quorum::REVIEW_TICKET_LABEL]),
+        );
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let now = Instant::now();
+        let ids = ["a".to_string()];
+
+        let first = cache
+            .resolve_reviews(&ids, Some(Arc::clone(&tr) as Arc<dyn Tracker>), now)
+            .await;
+        assert!(first.contains("a"));
+
+        let mut broken = Fake::default();
+        broken.labels_by_id_err = Some(rhapsody_tracker::TrackerError::Other("linear down".into()));
+        let broken = Arc::new(broken);
+        let after = cache
+            .resolve_reviews(
+                &ids,
+                Some(Arc::clone(&broken) as Arc<dyn Tracker>),
+                now + LIFECYCLE_TTL,
+            )
+            .await;
+
+        assert!(
+            after.contains("a"),
+            "a tracker outage must not silently un-classify a ticket: {after:?}",
+        );
+    }
+
+    // Before the first config load there is no tracker to ask. Whatever is cached is still served,
+    // so a hot-reload gap degrades to staleness rather than to blankness.
+    #[tokio::test]
+    async fn no_tracker_serves_the_cache_and_asks_nothing() {
+        let mut f = Fake::default();
+        f.by_id.insert(
+            "a".into(),
+            labelled("a", &[crate::quorum::REVIEW_TICKET_LABEL]),
+        );
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let now = Instant::now();
+        let ids = ["a".to_string()];
+
+        cache
+            .resolve_reviews(&ids, Some(Arc::clone(&tr) as Arc<dyn Tracker>), now)
+            .await;
+        let got = cache.resolve_reviews(&ids, None, now + LIFECYCLE_TTL).await;
+
+        assert!(got.contains("a"), "the cached answer still serves: {got:?}");
+        assert_eq!(tr.labels_by_id_calls(), 1, "nothing was asked");
+    }
+
+    // A blank id has nothing to look up and nothing to key an answer by, and a repeated one is one
+    // question — the same two rules `partition` follows. Asserted on the refresh SET rather than on
+    // the fake's call count, which cannot tell three ids in one batch from one.
+    #[test]
+    fn blank_ids_are_dropped_from_the_refresh_and_repeats_deduplicated() {
+        let cache = LifecycleCache::default();
+        let (cached, stale) = cache.partition_reviews(
+            &[String::new(), "a".to_string(), "a".to_string()],
+            Instant::now(),
+        );
+
+        assert!(cached.is_empty(), "a cold memo knows nothing: {cached:?}");
+        assert_eq!(stale, vec!["a".to_string()]);
     }
 
     // The label answers where the events row cannot: `storage.retention_days` deletes run history
