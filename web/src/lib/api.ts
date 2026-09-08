@@ -390,7 +390,14 @@ export async function mergeRun(runID: number, confirm = ""): Promise<MergeRunRes
     | MergeReceipt
     | (ApiError & { receipt?: MergeReceipt })
     | null;
-  if (res.ok) return { status: "merged", receipt: body as MergeReceipt };
+  // A 200 with no readable body would leave the console showing nothing at all for a merge that
+  // did happen — worse than an error, because the operator would click again. Say so instead.
+  if (res.ok) {
+    if (body === null || "error" in body) {
+      throw new Error("the daemon merged but returned no receipt");
+    }
+    return { status: "merged", receipt: body };
+  }
   const err = body && "error" in body ? body : null;
   if (err?.error.code === "confirm_required" && err.receipt) {
     return { status: "confirm", receipt: err.receipt };
