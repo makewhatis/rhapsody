@@ -31,6 +31,7 @@ const h = vi.hoisted(() => ({
   fetchLinearIdentity: vi.fn(),
   stopRun: vi.fn(),
   resumeRun: vi.fn(),
+  mergeRun: vi.fn(),
   fetchVersion: vi.fn(),
   openExternal: vi.fn(),
 }));
@@ -54,6 +55,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchLinearIdentity: h.fetchLinearIdentity,
     stopRun: h.stopRun,
     resumeRun: h.resumeRun,
+    mergeRun: h.mergeRun,
     fetchVersion: h.fetchVersion,
   };
 });
@@ -289,6 +291,7 @@ afterEach(() => {
   // Same reason: `clearAllMocks` clears calls, not implementations, so a Teams-off version answer,
   // a review watch set or a message timeline would otherwise be handed to every test after it.
   h.fetchVersion.mockReset();
+  h.mergeRun.mockReset();
   h.fetchRunMessages.mockReset();
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
@@ -566,17 +569,200 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     expect(dep.getAttribute("title")).toMatch(/not on github\.com/i);
   });
 
-  it("names Merge's missing endpoint instead of offering a button that cannot merge", async () => {
+  // --- Merge (STUDIO-767) ----------------------------------------------------------------------
+
+  /** The receipt the daemon resolves from the RUN ROW — the console never names a pull request. */
+  const RECEIPT = {
+    run_id: 547,
+    issue: "STUDIO-654",
+    pr: "makewhatis/rhapsody#64",
+    url: "https://github.com/makewhatis/rhapsody/pull/64",
+    number: 64,
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    method: "squash",
+    auto: true,
+    said: "",
+  };
+
+  it("merges through the daemon's confirm handshake, echoing back the head it was shown", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: RECEIPT })
+      .mockResolvedValueOnce({
+        status: "merged",
+        receipt: { ...RECEIPT, said: "✓ #64 will be automatically merged" },
+      });
     mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+
+    // A real primary, not a dependency-named placeholder.
+    const merge = action(/^merge$/i);
+    expect(merge.className).toMatch(/\bpri\b/);
+    expect(merge.querySelector(".dep")).toBeNull();
+
+    // Leg one resolves and merges NOTHING.
+    fireEvent.click(merge);
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("aria-label")).toBe("Merge makewhatis/rhapsody#64");
+    expect(dialog.textContent).toContain("https://github.com/makewhatis/rhapsody/pull/64");
+    expect(dialog.textContent).toContain("aaaaaaaaaaaa");
+    expect(dialog.textContent).toMatch(/squash, auto/);
+    expect(dialog.textContent).toMatch(/only once its required checks pass/i);
+
+    // Leg two confirms with the receipt's own head SHA.
+    fireEvent.click(within(dialog).getByRole("button", { name: /^merge$/i }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(h.mergeRun.mock.calls).toEqual([
+      [547, ""],
+      [547, RECEIPT.head_sha],
+    ]);
+    // The console has no toast, so a merge that landed reports gh's own words or nothing at all.
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .actok")?.textContent).toBe(
+        "✓ #64 will be automatically merged",
+      ),
+    );
+  });
+
+  // The guardrail the daemon's request type enforces, asserted from this side too: the console
+  // has nothing to send but the run id and a confirmation, so it cannot name a pull request even
+  // by mistake (design §3/G1).
+  it("sends the run id and a confirmation, and never a pull request of its own", async () => {
+    h.mergeRun.mockResolvedValue({ status: "confirm", receipt: RECEIPT });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(h.mergeRun).toHaveBeenCalled());
+    for (const call of h.mergeRun.mock.calls) {
+      expect(call).toHaveLength(2);
+      expect(typeof call[0]).toBe("number");
+      expect(typeof call[1]).toBe("string");
+    }
+  });
+
+  // A push between the two legs invalidates the confirmation. The daemon answers `confirm` again
+  // with the NEW head, and the operator must re-read what they are about to merge.
+  it("re-asks, showing the new head, when the pull request moved under a confirmation", async () => {
+    const moved = { ...RECEIPT, head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: RECEIPT })
+      .mockResolvedValueOnce({ status: "confirm", receipt: moved });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("dialog").textContent).toContain("bbbbbbbbbbbb"),
+    );
+    expect(document.querySelector(".trhd .actok")).toBeNull();
+  });
+
+  // The CONFIRMED leg is the only one the merge itself ever runs on: the daemon answers
+  // `confirm_required` before it ever calls `gh pr merge`. So every failure of the merge command —
+  // a conflict, a branch behind `main`, a review round that started between the two legs — can
+  // only arrive here. The header's own `.acterr` slot is underneath the modal's veil, so a reason
+  // rendered only there is a reason the operator cannot read.
+  it("shows a failure of the confirmed leg inside the dialog it happened in", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: RECEIPT })
+      .mockRejectedValueOnce(
+        new Error("GitHub refused: Pull request is not mergeable: the base branch has moved"),
+      );
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
+    // The dialog stays — the merge did not happen, so the decision is still open — and it now
+    // says why, rather than re-offering the identical failing POST with no explanation.
+    await waitFor(() =>
+      expect(screen.getByRole("dialog").textContent).toContain(
+        "the base branch has moved",
+      ),
+    );
+    expect(document.querySelector(".trhd .actok")).toBeNull();
+  });
+
+  // When gh said nothing quotable, the console still must not claim more than happened: under
+  // `--auto` the merge was ARMED, and the pull request lands only if its required checks pass.
+  it("says queued, not merged, when auto-merge was only armed", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: RECEIPT })
+      .mockResolvedValueOnce({ status: "merged", receipt: { ...RECEIPT, said: "" } });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .actok")?.textContent).toBe(
+        "queued makewhatis/rhapsody#64 for merge",
+      ),
+    );
+  });
+
+  // `aria-modal="true"` says everything behind the veil is inert. That is only true if focus is
+  // actually inside the dialog — otherwise a keyboard operator is still on the Merge button the
+  // dialog opened over, and Enter re-fires the very action the confirmation exists to interrupt.
+  it("takes focus into the confirmation and gives it back on close", async () => {
+    h.mergeRun.mockResolvedValue({ status: "confirm", receipt: RECEIPT });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    const merge = action(/^merge$/i);
+    merge.focus();
+    fireEvent.click(merge);
+
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // Back where it came from, rather than reset to the top of the document.
+    expect(document.activeElement).toBe(merge);
+  });
+
+  it("surfaces the daemon's own refusal rather than pretending the merge happened", async () => {
+    h.mergeRun.mockRejectedValue(
+      new Error("a Rhapsody review of that pull request is still live"),
+    );
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .acterr")?.textContent).toBe(
+        "a Rhapsody review of that pull request is still live",
+      ),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.querySelector(".trhd .actok")).toBeNull();
+  });
+
+  it("names its dependency, and asks the daemon nothing, when Teams is off", async () => {
+    h.fetchVersion.mockResolvedValue({
+      version: "v0.4.0",
+      commit: "abc",
+      built_at: "",
+      teams_enabled: false,
+    });
+    mountDetail([run({ id: 547 })]);
+    // `/^merge/` and not `/^merge$/`: a DepButton's accessible name carries its own "dep" chip,
+    // which is exactly what distinguishes it from the real primary above.
     await waitFor(() => expect(action(/^merge/i)).toBeTruthy());
     const merge = action(/^merge/i);
     expect(merge.querySelector(".dep")?.textContent).toBe("dep");
-    expect(merge.getAttribute("title")).toMatch(/run-branch diff/i);
+    expect(merge.getAttribute("title")).toMatch(/teams is not enabled/i);
     // Inert, but NOT the `disabled` attribute: a disabled button fires no mouse events, so the
     // tooltip that names the dependency would never open — the control would be dead, not named.
     expect(merge.getAttribute("aria-disabled")).toBe("true");
     expect((merge as HTMLButtonElement).disabled).toBe(false);
-    expect(merge.getAttribute("href")).toBeNull();
+    fireEvent.click(merge);
+    expect(h.mergeRun).not.toHaveBeenCalled();
   });
 
   it("offers Stop only while the run is live, and Resume only once it has stopped", async () => {
@@ -3211,6 +3397,36 @@ describe("external links leave the app through the openExternal seam (STUDIO-765
     expect(h.openExternal).toHaveBeenCalledWith(
       "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
     );
+  });
+
+  // The confirm modal's link is the operator's one chance to LOOK at the pull request before an
+  // irreversible click, from inside a dialog whose whole purpose is "look before you act". Dead in
+  // the packaged app, all that is left of it is a 12-character SHA prefix.
+  it("opens the merge confirmation's pull-request link in the browser", async () => {
+    h.mergeRun.mockResolvedValue({
+      status: "confirm",
+      receipt: {
+        run_id: 547,
+        issue: "STUDIO-654",
+        pr: "makewhatis/rhapsody#64",
+        url: "https://github.com/makewhatis/rhapsody/pull/64",
+        number: 64,
+        head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        method: "squash",
+        auto: true,
+        said: "",
+      },
+    });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    const link = within(screen.getByRole("dialog")).getByRole("link", {
+      name: /pull\/64/,
+    });
+    expect(clickLink(link)).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith("https://github.com/makewhatis/rhapsody/pull/64");
   });
 
   it("opens a Review-panel pull-request link in the browser", async () => {

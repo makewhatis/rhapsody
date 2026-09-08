@@ -15,6 +15,7 @@ use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
+use rhapsody_orchestrator::runmerge::MergeControlOutcome;
 use rhapsody_orchestrator::{
     HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
     RetryRow, RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
@@ -98,6 +99,10 @@ pub(crate) struct FakeProvider {
     review_outcome: Option<ReviewControlOutcome>,
     review_rerun_pr: Mutex<Option<PrCoord>>,
     review_dismiss_pr: Mutex<Option<PrCoord>>,
+    /// The canned outcome `merge_run` returns, and what the last call was asked — how a test
+    /// asserts the handler forwarded only the run id and the confirmation (STUDIO-767).
+    merge_outcome: Option<MergeControlOutcome>,
+    merge_asked: Mutex<Option<(i64, String)>>,
 }
 
 impl FakeProvider {
@@ -143,6 +148,8 @@ impl FakeProvider {
             review_outcome: None,
             review_rerun_pr: Mutex::new(None),
             review_dismiss_pr: Mutex::new(None),
+            merge_outcome: None,
+            merge_asked: Mutex::new(None),
         }
     }
 
@@ -339,6 +346,20 @@ impl FakeProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Set the canned outcome `merge_run` returns. Unset ⇒ the trait's `Dormant`.
+    pub(crate) fn with_merge_outcome(mut self, outcome: MergeControlOutcome) -> Self {
+        self.merge_outcome = Some(outcome);
+        self
+    }
+
+    /// The `(run id, confirmation)` the last `merge_run` was called with.
+    pub(crate) fn merge_asked(&self) -> Option<(i64, String)> {
+        self.merge_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -515,6 +536,17 @@ impl StateProvider for FakeProvider {
         self.review_outcome
             .clone()
             .unwrap_or(ReviewControlOutcome::Dormant)
+    }
+
+    async fn merge_run(&self, run_id: i64, confirm: &str) -> MergeControlOutcome {
+        *self
+            .merge_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((run_id, confirm.to_string()));
+        self.merge_outcome
+            .clone()
+            .unwrap_or(MergeControlOutcome::Dormant)
     }
 
     async fn teams_recall(

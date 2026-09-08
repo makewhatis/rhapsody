@@ -1,5 +1,12 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { resumeRun, sendRunMessage, stopRun, type RunActionResult } from "@/lib/api";
+import {
+  mergeRun,
+  resumeRun,
+  sendRunMessage,
+  stopRun,
+  type MergeRunResult,
+  type RunActionResult,
+} from "@/lib/api";
 import { STATE_QUERY_KEY } from "@/hooks/useStateQuery";
 
 // useStopRun kills the agent for a run and moves its ticket to Backlog, then invalidates the
@@ -38,6 +45,23 @@ export function useSendRunMessage(runID: number) {
     mutationFn: (text: string) => sendRunMessage(runID, text),
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["run-messages", runID] });
+    },
+  });
+}
+
+// useMergeRun merges a run's pull request (STUDIO-767). The mutation variable is the CONFIRMATION —
+// "" for the handshake's first leg, then the receipt's own head SHA — and never a pull request: the
+// daemon derives the coordinate from the run row, and the console has no way to name one.
+//
+// It invalidates the live state and this run's detail on settle, because a merge changes what the
+// ticket's next poll will say about it.
+export function useMergeRun(runID: number) {
+  const qc = useQueryClient();
+  return useMutation<MergeRunResult, Error, string>({
+    mutationFn: (confirm: string) => mergeRun(runID, confirm),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: STATE_QUERY_KEY });
+      void qc.invalidateQueries({ queryKey: ["run-detail", runID] });
     },
   });
 }

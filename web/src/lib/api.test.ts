@@ -7,6 +7,7 @@ import {
   fetchState,
   fetchVersion,
   localDayStartISO,
+  mergeRun,
   resumeRun,
   sendRunMessage,
   stopRun,
@@ -323,5 +324,90 @@ describe("run identity events (STUDIO-746)", () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
     expect(await fetchRunIdentityEvents("STUDIO-746")).toEqual([]);
+  });
+});
+
+describe("mergeRun — the console merge action's confirm handshake (STUDIO-767)", () => {
+  const RECEIPT = {
+    run_id: 7,
+    issue: "STUDIO-767",
+    pr: "makewhatis/rhapsody#64",
+    url: "https://github.com/makewhatis/rhapsody/pull/64",
+    number: 64,
+    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    method: "squash",
+    auto: true,
+  };
+
+  // The 409 that is NOT an error: the daemon resolved the pull request, merged nothing, and is
+  // asking the operator to confirm the head it just found.
+  it("reads a 409 confirm_required as a receipt to confirm, not as a failure", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: { code: "confirm_required", message: "confirm the merge" },
+            receipt: RECEIPT,
+          }),
+          { status: 409 },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(mergeRun(7)).resolves.toEqual({ status: "confirm", receipt: RECEIPT });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("/api/v1/runs/7/merge");
+    expect(init.method).toBe("POST");
+    // The whole body: a confirmation and nothing else. There is no field here for a pull request,
+    // which is the client half of the daemon's G1 guardrail.
+    expect(JSON.parse(String(init.body))).toEqual({ confirm: "" });
+  });
+
+  it("sends the confirmation on the second leg and returns the merged receipt", async () => {
+    const merged = { ...RECEIPT, said: "✓ #64 will be automatically merged" };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(merged), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(mergeRun(7, RECEIPT.head_sha)).resolves.toEqual({
+      status: "merged",
+      receipt: merged,
+    });
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ confirm: RECEIPT.head_sha });
+  });
+
+  // Every OTHER refusal is the daemon's own sentence, and it reaches the operator unparaphrased.
+  it("throws the daemon's own reason on a refusal", async () => {
+    for (const [status, code, message] of [
+      [409, "merge_refused", "a Rhapsody review of that pull request is still live"],
+      [409, "teams_disabled", "Rhapsody Teams is not enabled on this daemon"],
+      [500, "merge_failed", "Pull request is not mergeable: merge conflicts"],
+      [404, "not_found", "no such run"],
+    ] as const) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(JSON.stringify({ error: { code, message } }), { status })),
+      );
+      await expect(mergeRun(7)).rejects.toThrow(message);
+    }
+  });
+
+  // A 409 that carries no receipt cannot be confirmed, so it is a refusal like any other rather
+  // than a modal with nothing in it.
+  it("treats a receiptless confirm_required as a refusal", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ error: { code: "confirm_required", message: "confirm the merge" } }),
+            { status: 409 },
+          ),
+      ),
+    );
+    await expect(mergeRun(7)).rejects.toThrow("confirm the merge");
+  });
+
+  it("does not claim a merge happened when a 200 carries no receipt", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 200 })));
+    await expect(mergeRun(7)).rejects.toThrow(/no receipt/i);
   });
 });
