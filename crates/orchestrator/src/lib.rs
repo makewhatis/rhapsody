@@ -46,6 +46,7 @@ pub mod handoff;
 pub mod issuelog;
 pub mod lifecycle;
 pub mod liveness;
+pub mod mergeconsole;
 pub mod message;
 pub mod obslog;
 pub mod orchestrator;
