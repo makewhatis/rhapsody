@@ -655,6 +655,9 @@ function HeaderActions({
   // the SAME pull request while that is in flight.
   const [confirming, setConfirming] = useState<MergeReceipt | null>(null);
   const merged = merge.data?.status === "merged" ? merge.data.receipt : null;
+  // What GitHub says the pull request is waiting on, once one has been armed (STUDIO-784). "" when
+  // GitHub stated no merge state, which is a real answer and not a reason to guess at one.
+  const mergedNote = merged === null ? "" : mergeStateNote(merged.merge_state);
   // The console has no toast surface, so a lifecycle action reports here or nowhere. Both halves
   // matter: the request can fail, and it can succeed while the ticket MOVE fails — a run killed
   // whose ticket stayed put is something the operator has to finish by hand. A refused merge lands
@@ -763,9 +766,9 @@ function HeaderActions({
           did, this one reports where GitHub says the pull request stands — and an armed `--auto`
           merge is otherwise one line followed by silence. Absent when GitHub stated no merge
           state, which is a real answer and not a reason to guess. */}
-      {merged === null || mergeStateNote(merged.merge_state) === "" ? null : (
+      {mergedNote === "" ? null : (
         <span className="actnote" role="status">
-          {mergeStateNote(merged.merge_state)}
+          {mergedNote}
         </span>
       )}
       {confirming === null ? null : (
