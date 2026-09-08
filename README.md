@@ -706,18 +706,30 @@ merge GitHub refuses — a conflict, a branch behind `main` — is reported with
 the daemon never rebases, force-pushes or resolves a conflict.
 
 **Two refusals stand where GitHub enforces nothing (STUDIO-784).** A branch GitHub reports as
-`BEHIND` is refused rather than armed, unless the repository's `allow_update_branch` says GitHub
-will bring it up to date itself: `main` requires branches to be up to date and does not update
-them, so arming an auto-merge on one parks it forever — green, armed and unlandable until a human
-pushes — while reporting *"queued for merge"*. And a pull request whose newest completed Rhapsody
-review round posted findings is refused as a reviewer's explicit no; GitHub cannot hold that line
-here, because teammates post verdicts as pull-request COMMENTS (it refuses `REQUEST_CHANGES` from
-the account that opened the pull request) and `main` carries no `required_pull_request_reviews`.
-On top of both, the run's ticket must still be waiting in one of its project's `review_states` — a
-review that asks for changes routes it back out, and that is the only signal the daemon holds on an
-installation whose reviews are Linear review tickets rather than the ticketless watch set. The
-receipt carries GitHub's own `mergeStateStatus` so the console can say what an armed merge is
-waiting on instead of implying it landed.
+`BEHIND` **at the moment of the click** is refused rather than armed, unless the repository's
+`allow_update_branch` says GitHub will bring it up to date itself: `main` requires branches to be
+up to date and does not update them, so arming an auto-merge on one parks it forever — green, armed
+and unlandable until a human pushes — while reporting *"queued for merge"*. That check is a
+snapshot and not a guarantee: `--auto` is by definition the mode where the merge happens later, so
+a pull request that is clean when the operator clicks can fall behind afterwards when an unrelated
+one lands, and nothing polls an armed merge to notice. Closing that half needs a watcher, which is
+filed as follow-up work. When the branch is behind and the repository's policy cannot be read at
+all — `allow_update_branch` is absent for a token without admin permission — the same refusal is
+given rather than an error, because it is true either way and the operator can act on it.
+
+And a pull request whose newest completed Rhapsody review round posted findings is refused as a
+reviewer's explicit no; GitHub cannot hold that line here, because teammates post verdicts as
+pull-request COMMENTS (it refuses `REQUEST_CHANGES` from the account that opened the pull request)
+and `main` carries no `required_pull_request_reviews`. On top of both, the run's ticket must still
+be waiting in one of its project's `review_states` — a review that asks for changes routes it back
+out, and that is the only signal the daemon holds on an installation whose reviews are Linear
+review tickets rather than the ticketless watch set. That last check reads the ticket from the
+**tracker, by id**, rather than from the poller's own per-tick snapshot: the snapshot holds only
+the candidate set, and under `claim_mode: pool` winning a claim assigns the ticket and drops it out
+of that set for good, so a snapshot-based check would refuse every console merge on a pool project
+permanently. The by-id read carries no project or assignee scope and so answers the same on every
+claim mode. The receipt carries GitHub's own `mergeStateStatus` so the console can say what an
+armed merge is waiting on instead of implying it landed.
 
 **Confirming is server-enforced, not a UI nicety.** The first POST resolves the pull request, merges
 nothing, and answers 409 `confirm_required` with a receipt naming the coordinate, the URL and the
