@@ -310,8 +310,12 @@ pub async fn resolve_and_merge(
     // formal review, and `main` requires no approving review — so the daemon's own ledger is the
     // only place the fact lives.
     if plan.changes_requested.contains(&number) {
+        // "has not pushed since" and not "has not been re-reviewed": a head advance RE-ARMS a
+        // `reviewed` row (`REVIEW_STATUS_REVIEWED`'s own doc), so the author's next push clears
+        // this block whether or not anyone read the new head. The refusal says what the ledger
+        // actually holds.
         return MergeControlOutcome::Refused(
-            "a Rhapsody review of that pull request asked for changes and has not re-reviewed it",
+            "a Rhapsody review of that pull request asked for changes and the author has not pushed since",
         );
     }
 
@@ -352,7 +356,27 @@ pub async fn resolve_and_merge(
                      branch, then merge",
                 );
             }
-            Err(e) => return MergeControlOutcome::Failed(e.to_string()),
+            // BEHIND plus an UNKNOWN policy is the one case where refusing beats reporting the
+            // fault. `allow_update_branch` is only in the repository payload for a token with
+            // admin permission, so a push-only token yields `null` and this read fails on a
+            // perfectly healthy repository — and the refusal below is true regardless of how the
+            // read went: the branch IS behind, and the only thing in doubt is whether GitHub would
+            // fix that itself. An operator can act on "push the branch"; they cannot act on a
+            // `gh` error. The fault still reaches the log rather than vanishing.
+            Err(e) => {
+                tracing::warn!(
+                    run = plan.run_id,
+                    issue = %plan.issue,
+                    pr = %pr,
+                    err = %e,
+                    "console merge: the branch is behind its base and the repository's \
+                     branch-update policy could not be read; refusing"
+                );
+                return MergeControlOutcome::Refused(
+                    "this branch is behind its base and cannot update itself; push or update the \
+                     branch, then merge",
+                );
+            }
         }
     }
 
@@ -872,7 +896,7 @@ mod tests {
         assert_eq!(
             got,
             MergeControlOutcome::Refused(
-                "a Rhapsody review of that pull request asked for changes and has not re-reviewed it"
+                "a Rhapsody review of that pull request asked for changes and the author has not pushed since"
             )
         );
         assert!(merger.calls().is_empty(), "nothing may be merged");
@@ -1113,42 +1137,58 @@ mod tests {
         );
     }
 
-    /// Neither lookup may fail QUIETLY into a merge. A `mergeStateStatus` this daemon could not
-    /// read, or a repository policy it could not read, is `Failed` carrying `gh`'s own words —
-    /// because treating either as "not behind" arms the auto-merge this gate exists to prevent.
+    /// Neither lookup may fail QUIETLY into a merge — but the two failures answer differently,
+    /// and deliberately.
+    ///
+    /// A `mergeStateStatus` this daemon could not read says nothing about the pull request at all,
+    /// so it is `Failed` carrying `gh`'s own words. An unreadable BRANCH POLICY is the one case
+    /// where a refusal is both safer and more useful: `allow_update_branch` is absent from the
+    /// repository payload for any token without admin permission, so this read fails on a healthy
+    /// repository — and the refusal is true either way, because the branch is behind and only the
+    /// question of who fixes that is unknown. Neither may merge anything.
     #[tokio::test]
     async fn an_unreadable_merge_state_or_branch_policy_merges_nothing() {
-        for (mergestate, policy, want) in [
-            (
+        let merger = FakeMerger::ok();
+        let got = resolve_and_merge(
+            &plan(),
+            HEAD,
+            &deps_with(
+                FakePrs::at("https://github.com/o/r/pull/64"),
+                FakeState::open(),
+                Arc::clone(&merger),
                 FakeMergeState::failing(),
                 FakePolicy::answering(false),
-                "502",
             ),
-            (
+        )
+        .await;
+        assert!(
+            matches!(got, MergeControlOutcome::Failed(ref e) if e.contains("502")),
+            "an unreadable merge state is a fault, not a refusal: {got:?}"
+        );
+        assert!(merger.calls().is_empty(), "nothing may be merged");
+
+        let merger = FakeMerger::ok();
+        let got = resolve_and_merge(
+            &plan(),
+            HEAD,
+            &deps_with(
+                FakePrs::at("https://github.com/o/r/pull/64"),
+                FakeState::open(),
+                Arc::clone(&merger),
                 FakeMergeState::at(MERGE_STATE_BEHIND),
                 FakePolicy::failing(),
-                "403",
             ),
-        ] {
-            let merger = FakeMerger::ok();
-            let got = resolve_and_merge(
-                &plan(),
-                HEAD,
-                &deps_with(
-                    FakePrs::at("https://github.com/o/r/pull/64"),
-                    FakeState::open(),
-                    Arc::clone(&merger),
-                    mergestate,
-                    policy,
-                ),
-            )
-            .await;
-            assert!(
-                matches!(got, MergeControlOutcome::Failed(ref e) if e.contains(want)),
-                "want a Failed carrying gh's complaint, got {got:?}"
-            );
-            assert!(merger.calls().is_empty(), "nothing may be merged");
-        }
+        )
+        .await;
+        assert_eq!(
+            got,
+            MergeControlOutcome::Refused(
+                "this branch is behind its base and cannot update itself; push or update the \
+                 branch, then merge"
+            ),
+            "a behind branch with an unreadable policy gets the actionable refusal"
+        );
+        assert!(merger.calls().is_empty(), "nothing may be merged");
     }
 
     /// The receipt carries GitHub's mergeability on BOTH legs of the handshake, so the console's

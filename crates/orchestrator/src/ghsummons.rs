@@ -678,9 +678,13 @@ impl BranchUpdateSource for GH {
     /// wants one boolean out of it.
     ///
     /// An answer that is neither `true` nor `false` is an ERROR and never a default. Defaulting
-    /// either way would be a guess about branch protection made silently on the merge path: `true`
-    /// would arm an auto-merge that cannot fire, and `false` would refuse a merge that would have
-    /// landed. `gh`'s own complaint reaches the operator instead.
+    /// either way would be a guess about branch protection made silently at the seam: `true` would
+    /// arm an auto-merge that cannot fire, and `false` would refuse a merge that would have
+    /// landed. What to DO about not knowing is the caller's decision, made once, in the open —
+    /// [`crate::runmerge::resolve_and_merge`] refuses the merge with the same actionable sentence
+    /// a `false` earns, because it only asks this at all once GitHub has already said BEHIND. The
+    /// commonest cause is a token without admin permission on the repository, for which
+    /// `allow_update_branch` is simply absent from the payload and `--jq` yields `null`.
     async fn allows_branch_update(&self, owner: &str, repo: &str) -> BranchUpdateResult {
         if owner.is_empty() || repo.is_empty() {
             return Err(format!("gh api repos: incomplete coordinate {owner}/{repo}").into());
