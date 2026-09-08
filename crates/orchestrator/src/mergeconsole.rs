@@ -96,11 +96,11 @@ impl Orchestrator {
     /// refused anyway never blocks the next one; and the coordinate is derived entirely from the
     /// run row before that, so what gets claimed is what will be merged.
     ///
-    /// The branch cross-check is the "this pull request belongs to this ticket" assertion, made
-    /// against two independently stored fields rather than assumed: `runs.repo` is written from
-    /// the project's configured remote (never from an agent) and `runs.branch` from the worktree
-    /// the daemon created, so a run whose branch is not the one its own ticket names is a row
-    /// nothing in this daemon should act on.
+    /// The branch cross-check is the "this pull request belongs to this ticket" assertion. Both
+    /// halves of the coordinate stay daemon-derived and neither is ever agent-supplied: `runs.repo`
+    /// is written from the project's configured remote, and the branch is the one the daemon's own
+    /// branch naming determines for this ticket — see the comment at the check itself for why it
+    /// is derived rather than read out of `runs.branch`, and why it stays a disagreement test.
     pub(crate) fn plan_run_merge(&mut self, run_id: i64) -> MergePlanOutcome {
         // §16's gate, and the same one every Rhapsody-additive write surface takes: with Teams off
         // there is no manager to act as, no room to report in, and the console renders Merge as
@@ -126,11 +126,26 @@ impl Orchestrator {
             );
         };
         let want = format!("symphony/{}", sanitize_key(&run.issue_identifier));
-        if run.branch != want {
+        // `runs.branch` is UNWRITTEN on every row this daemon has ever produced: `persist_start_run`
+        // (`persist.rs`) is the column's only writer and leaves it empty "for Phase 4", and nothing
+        // `UPDATE`s it afterwards. So the name the daemon's own branch naming determines for this
+        // ticket is the fact here, exactly as `quorum` and `reviewintro` already treat it, and as
+        // `runBranch` does in the console. Comparing the stored column for EQUALITY instead would
+        // refuse every merge in production while passing every test that fabricates it.
+        //
+        // The cross-check survives as a DISAGREEMENT test: a row that ever does carry a branch must
+        // agree with the one its own ticket names, so the §3/G1 step-3 assertion still holds for
+        // any future row that populates the column.
+        let branch = if run.branch.is_empty() {
+            want.clone()
+        } else {
+            run.branch.clone()
+        };
+        if branch != want {
             tracing::warn!(
                 run = run_id,
                 issue = %run.issue_identifier,
-                branch = %run.branch,
+                branch = %branch,
                 "console merge: this run's branch does not belong to its ticket; refusing"
             );
             return self.deny(
@@ -157,7 +172,7 @@ impl Orchestrator {
                 return MergePlanOutcome::Denied(MergeControlOutcome::Failed(e.to_string()));
             }
         };
-        let key = claim_key(&owner, &repo, &run.branch);
+        let key = claim_key(&owner, &repo, &branch);
         if let Some(since) = self.merge_inflight.get(&key) {
             if since.elapsed() < MERGE_CLAIM_TTL {
                 return MergePlanOutcome::Denied(MergeControlOutcome::Refused(
@@ -176,7 +191,7 @@ impl Orchestrator {
             issue: run.issue_identifier,
             owner,
             repo,
-            branch: run.branch,
+            branch,
             watched,
         })
     }
@@ -285,12 +300,17 @@ impl Orchestrator {
 /// [`crate::quorum::review_description`] draws for every other host-composed line.
 fn attempt_line(issue: &str, outcome: &MergeControlOutcome) -> Option<String> {
     let what = |r: &MergeReceipt| {
-        let how = if r.auto {
-            format!("{}, auto", r.method)
+        // "merged" only where the pull request actually landed. Under `--auto` (§9.2's method) an
+        // applied merge means GitHub's auto-merge was ARMED: if the required checks then fail, or
+        // someone pushes, or the branch falls behind `main`, it never lands — and this row and the
+        // room line would claim it did, permanently, in the one place §3/G4 wants a true record.
+        // §3/G4 pins the "merged …" sentence verbatim, but it was written before §9.2 settled on
+        // `--auto`; the record is corrected to match rather than the two left disagreeing.
+        if r.auto {
+            format!("queued {issue} for merge — {} ({}, auto)", r.url, r.method)
         } else {
-            r.method.clone()
-        };
-        format!("merged {issue} — {} ({how})", r.url)
+            format!("merged {issue} — {} ({})", r.url, r.method)
+        }
     };
     match outcome {
         MergeControlOutcome::Applied(r) => Some(what(r)),
@@ -541,17 +561,46 @@ mod tests {
         }
     }
 
+    /// **The row the daemon ACTUALLY writes must be mergeable.**
+    ///
+    /// `persist_start_run` (`persist.rs`) is the only production writer of a `runs` row and it
+    /// leaves `branch` at its default "for Phase 4"; nothing ever `UPDATE`s the column afterwards.
+    /// So a cross-check that compares `run.branch` for EQUALITY refuses every merge on a real
+    /// daemon while every test that fabricates the column passes — which is exactly what shipped
+    /// for review. This test builds the row the way the daemon's own writer builds it and asserts
+    /// the plan is reachable.
+    #[test]
+    fn the_row_the_daemon_actually_writes_is_mergeable() {
+        let mut o = orch(true);
+        // Deliberately NOT `run_row`: the fields `persist_start_run` fills, and only those, so the
+        // empty `branch` here is the production value rather than a test convenience.
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_id: "ID-767".to_string(),
+                issue_identifier: "STUDIO-767".to_string(),
+                repo: REPO_URL.to_string(),
+                // session_uuid/branch left empty, as `persist_start_run` leaves them.
+                ..RunStart::default()
+            })
+            .expect("start run");
+
+        let plan = ready(&mut o, run);
+        // And the branch it carries onward is the one the daemon's branch naming determines, so
+        // `open_pr_for_branch` searches for a branch that can exist.
+        assert_eq!(plan.branch, "symphony/STUDIO-767");
+    }
+
     /// **The "this pull request belongs to this ticket" check (§3/G1 step 3).** The branch is
-    /// compared against the one the run's OWN ticket names, so a row whose two independently
-    /// stored fields disagree is refused rather than merged.
+    /// compared against the one the run's OWN ticket names, so a row that DOES carry one and
+    /// disagrees with it is refused rather than merged.
+    ///
+    /// Note the empty string is absent from this list and belongs in
+    /// [`the_row_the_daemon_actually_writes_is_mergeable`] instead: an unwritten column is not a
+    /// disagreement, it is the daemon's normal state.
     #[test]
     fn a_run_whose_branch_is_not_its_tickets_is_refused() {
-        for branch in [
-            "",
-            "main",
-            "symphony/STUDIO-999",
-            "symphony/STUDIO-767-extra",
-        ] {
+        for branch in ["main", "symphony/STUDIO-999", "symphony/STUDIO-767-extra"] {
             let dir = TempDir::new();
             let room = Arc::new(LocalRoom::new(dir.child("room")));
             let mut o = orch(true);
@@ -698,38 +747,42 @@ mod tests {
     /// **The audit half of §3/G4.** An applied merge leaves a `teams.merge` row on the run naming
     /// the ticket, the pull request and how it was merged, and one manager room line saying the
     /// same thing to the team.
+    ///
+    /// The two arms say DIFFERENT things, and the difference is the point. Under `--auto` — §9.2's
+    /// method, and the one every console click takes — an applied merge means GitHub's auto-merge
+    /// was armed, not that the pull request landed; it lands only if the required checks pass, and
+    /// a record that said "merged" would keep saying so forever if they did not.
     #[test]
     fn an_applied_merge_is_recorded_on_the_run_and_in_the_room() {
-        let dir = TempDir::new();
-        let room = Arc::new(LocalRoom::new(dir.child("room")));
-        let mut o = orch(true);
-        o.teams_room = Some(Arc::clone(&room));
-        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
-        let plan = ready(&mut o, run);
+        for (auto, want) in [
+            (
+                true,
+                "queued STUDIO-767 for merge — \
+                 https://github.com/makewhatis/rhapsody/pull/64 (squash, auto)",
+            ),
+            (
+                false,
+                "merged STUDIO-767 — https://github.com/makewhatis/rhapsody/pull/64 (squash)",
+            ),
+        ] {
+            let dir = TempDir::new();
+            let room = Arc::new(LocalRoom::new(dir.child("room")));
+            let mut o = orch(true);
+            o.teams_room = Some(Arc::clone(&room));
+            let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+            let plan = ready(&mut o, run);
 
-        o.settle_run_merge(
-            &plan,
-            &MergeControlOutcome::Applied(receipt(
-                "https://github.com/makewhatis/rhapsody/pull/64",
-            )),
-        );
+            let mut r = receipt("https://github.com/makewhatis/rhapsody/pull/64");
+            r.auto = auto;
+            o.settle_run_merge(&plan, &MergeControlOutcome::Applied(r));
 
-        assert_eq!(
-            audit(&o, run),
-            vec![
-                "merged STUDIO-767 — https://github.com/makewhatis/rhapsody/pull/64 (squash, auto)"
-                    .to_string()
-            ]
-        );
-        assert_eq!(
-            room_lines(&room),
-            vec![
-                "@manager: merged STUDIO-767 — https://github.com/makewhatis/rhapsody/pull/64 \
-                 (squash, auto)"
-                    .to_string()
-            ],
-            "the team's lead reports the merge it performed"
-        );
+            assert_eq!(audit(&o, run), vec![want.to_string()], "auto {auto}");
+            assert_eq!(
+                room_lines(&room),
+                vec![format!("@manager: {want}")],
+                "the team's lead reports what it actually did (auto {auto})"
+            );
+        }
     }
 
     /// A refusal and a failure are recorded too — an operator's click that did NOT merge is

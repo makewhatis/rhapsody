@@ -692,7 +692,9 @@ values are the `{id}` path segment and a confirmation token, so there is no code
 client-supplied integer to `gh pr merge` — a property of the request TYPE rather than of a
 validation. The daemon derives `owner`/`repo` from `runs.repo` (written from the project's
 configured remote, never from an agent) through the same `parse_repo` that refuses look-alike hosts,
-cross-checks `runs.branch` against the branch the run's own ticket names, and resolves the pull
+takes the branch the run's own ticket names (`runs.branch` is unwritten on every row the daemon
+produces, so the branch is derived from the ticket the way the rest of the daemon derives it, and a
+row that ever does carry one must agree with it or the merge is refused), and resolves the pull
 request by HEAD BRANCH with `gh pr list`, which rejects a fork's.
 
 **`--admin` is never passed**, on any branch, and an argv test pins its absence: `main`'s protection
