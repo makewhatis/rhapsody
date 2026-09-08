@@ -769,8 +769,9 @@ fn label_identity(iss: &rhapsody_core::Issue) -> Option<String> {
 ///
 /// The adapter normalizes label names to lowercase, and
 /// [`REVIEW_TICKET_LABEL`](crate::quorum::REVIEW_TICKET_LABEL) is already lowercase, so this is a
-/// plain equality rather than a case fold — the same comparison
-/// [`crate::teams::is_solo`] makes against its own marker.
+/// plain equality rather than a case fold — the same exact match [`label_identity`] above makes
+/// against its own prefix. ([`crate::teams::is_solo`] case-folds against its own marker instead;
+/// with labels lowercased on read the two agree.)
 fn is_review_ticket(iss: &rhapsody_core::Issue) -> bool {
     iss.labels
         .iter()

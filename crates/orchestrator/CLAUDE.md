@@ -45,8 +45,8 @@ the `Orchestrator` struct itself. Concretely:
     DURABLE assignee (STUDIO-735) and of whether it is a REVIEW TICKET (STUDIO-780), read and
     written ENTIRELY on the HTTP task (they decorate
     `GET /api/v1/history/issues`). The control task never touches them, so it is a seam only in the
-    sense that the handle carries it; neither lock is held across the tracker `.await`, and the
-    state sets it classifies with are read through the `reads.rs` cell above rather than from
+    sense that the handle carries it; none of the three locks is held across the tracker `.await`,
+    and the state sets it classifies with are read through the `reads.rs` cell above rather than from
     loop-owned `Effective`. The assignee half also READS the store (the routing event a dispatch
     wrote into the DISPLAYED RUN's ledger — always scoped by `run_id`, never searched ticket-wide,
     because a ticket's runs can disagree about who ran them) — a read-only use of the same
