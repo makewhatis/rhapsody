@@ -321,7 +321,7 @@ function TraceSpark({ runId, live, armed }: { runId: number; live: boolean; arme
           key={step.kind}
           className={cn(
             "gly",
-            step.kind === "live" && "now",
+            step.kind === "live" && "ph",
             !step.present && "off",
             `wt-${step.weight}`,
           )}

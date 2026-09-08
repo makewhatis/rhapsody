@@ -125,7 +125,12 @@
 .rh-console .spark { display: inline-flex; gap: 3px; align-items: center; }
 .rh-console .spark.idle { font-family: var(--mono); font-size: 12px; color: var(--ink-4); letter-spacing: .08em; }
 .rh-console .spark .gly { width: 19px; height: 19px; border-radius: 5px; display: grid; place-items: center; font-size: 11px; background: var(--panel-2); border: 1px solid var(--line); color: var(--ink-3); }
-.rh-console .spark .gly.now { color: var(--operator); border-color: var(--operator); background: var(--operator-soft); }
+/* STUDIO-771 — `ph` (playhead), NOT `now`: `console.css` styles `.rh-console .now` as the "Now
+   working" banner CARD, and that descendant selector matched this glyph too. `.spark .gly` sets no
+   padding or margin, so the card's `padding: 12px 14px` and `margin-bottom: 16px` came through
+   unopposed and blew the 19px glyph up into a giant cyan play button. Keep this modifier private
+   to the sparkline — a bare name a layout primitive already owns will collide again. */
+.rh-console .spark .gly.ph { color: var(--operator); border-color: var(--operator); background: var(--operator-soft); }
 /* STUDIO-743 — the strip is a CHECKLIST: a kind the run never reached keeps its column as an empty,
    dashed slot, and a kind it did reach is weighted by how much of it there was. */
 .rh-console .spark .gly.off { color: var(--ink-4); background: none; border-style: dashed; opacity: .5; }

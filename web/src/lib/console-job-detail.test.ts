@@ -4,6 +4,7 @@ import {
   checksSummary,
   clockTime,
   mergeNote,
+  runOutcomeLabel,
   runOutcomePill,
   runsNewestFirst,
   type PullRequestView,
@@ -72,6 +73,29 @@ describe("runOutcomePill", () => {
     expect(runOutcomePill("stopped")).toBe("queued");
     expect(runOutcomePill("interrupted")).toBe("queued");
     expect(runOutcomePill("")).toBe("queued");
+  });
+});
+
+// STUDIO-763: the header pill shipped carrying the daemon's raw column value ("completed"), which
+// the prototype's own `.hd` never shows — its PILL map reads "done" / "running" / "failed".
+describe("runOutcomeLabel", () => {
+  it("speaks the prototype's vocabulary rather than the daemon's column value", () => {
+    expect(runOutcomeLabel("completed")).toBe("done");
+    expect(runOutcomeLabel("running")).toBe("running");
+    expect(runOutcomeLabel("failed")).toBe("failed");
+  });
+
+  // The prototype has no state for these, and inventing one would be a claim about the run that
+  // the daemon never made. A word the console does not know is passed through verbatim.
+  it("passes through an outcome the prototype has no word for, rather than inventing one", () => {
+    expect(runOutcomeLabel("stopped")).toBe("stopped");
+    expect(runOutcomeLabel("waiting")).toBe("waiting");
+    expect(runOutcomeLabel("interrupted")).toBe("interrupted");
+  });
+
+  // An empty outcome is a run the store has no answer for — which is not the same as "done".
+  it("names an absent outcome as unknown", () => {
+    expect(runOutcomeLabel("")).toBe("unknown");
   });
 });
 

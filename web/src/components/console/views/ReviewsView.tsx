@@ -2,6 +2,7 @@ import * as React from "react";
 import {
   Button,
   Card,
+  ExternalLink,
   Mono,
   Note,
   NowStats,
@@ -259,9 +260,9 @@ function ReviewsRow({
   return (
     <tr>
       <td>
-        <a className="ti" href={row.url} target="_blank" rel="noreferrer">
+        <ExternalLink className="ti" href={row.url}>
           <TicketChip variant="pr">{row.pr}</TicketChip>
-        </a>
+        </ExternalLink>
         <div className="pj">{row.job.introduced_by === "" ? "" : row.job.introduced_by}</div>
       </td>
       <td>{row.job.reviewer === "" ? "—" : row.job.reviewer}</td>

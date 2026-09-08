@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { LogEntry, RunDetail, RunMessage, RunSummary, StateResponse } from "@/lib/api";
@@ -10,8 +10,10 @@ import { MEMORY_EMPTY_NOTE, ROOM_WATCH_WINDOW } from "@/lib/console-watch";
 // STUDIO-742 — the "Trace" run detail's three zones (design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3), replacing STUDIO-683's summary strip and
 // flat runs list — plus the states of slice 3 (STUDIO-744) and the watch-tabs rail of slice 4
-// (STUDIO-745), which is where §4's side cards moved: Diff / Review / Room / Memory / Messages,
-// under the inspector, with an "Ask about this run" dock beneath the split.
+// (STUDIO-745), which is where §4's side cards moved: Diff / Review / Room / Memory / Messages.
+// STUDIO-766 then lifted that rail out of the split's right column into a zone D of its own, so
+// the running order below the header is Result card, split, watch-tabs, "Ask about this run" dock
+// — the last three all full-width siblings.
 
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
@@ -31,6 +33,7 @@ const h = vi.hoisted(() => ({
   resumeRun: vi.fn(),
   mergeRun: vi.fn(),
   fetchVersion: vi.fn(),
+  openExternal: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (orig) => {
@@ -55,6 +58,13 @@ vi.mock("@/lib/api", async (orig) => {
     mergeRun: h.mergeRun,
     fetchVersion: h.fetchVersion,
   };
+});
+
+// STUDIO-765 — the Trace's external links leave the app through the `openExternal` seam, so the
+// packaged desktop app hands them to the OS browser instead of dropping the click.
+vi.mock("@/lib/bindings", async (orig) => {
+  const actual = await orig<typeof import("@/lib/bindings")>();
+  return { ...actual, openExternal: h.openExternal };
 });
 
 const { JobDetailView } = await import("./JobDetailView");
@@ -303,7 +313,8 @@ describe("zone A — the sticky header (§3A)", () => {
     const hd = document.querySelector(".trhd") as HTMLElement;
     expect(hd.querySelector(".k")?.textContent).toBe("STUDIO-654");
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Attach a photo in chat");
-    expect(hd.querySelector(".pill")?.textContent).toContain("completed");
+    // The prototype's own word for a clean run, not the daemon's `runs.outcome` column value.
+    expect(hd.querySelector(".pill")?.textContent).toContain("done");
     await waitFor(() => expect(hd.querySelector(".who2")?.textContent).toContain("alice"));
   });
 
@@ -326,6 +337,17 @@ describe("zone A — the sticky header (§3A)", () => {
     expect(vitals).toContain("symphony/STUDIO-654");
   });
 
+  // The branch is the only header vital the Result card's receipt does not repeat, and the first
+  // one the wide-view row ellipsizes when it is squeezed (STUDIO-763) — so it names itself.
+  it("keeps the branch recoverable from its own tooltip once the row ellipsizes it", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() =>
+      expect(document.querySelector(".trvitals .mono")?.getAttribute("title")).toBe(
+        "symphony/STUDIO-654",
+      ),
+    );
+  });
+
   // Every real row leaves `branch` empty, so reading it alone made this vital a permanent dash.
   it("names the ticket's own branch on a row the daemon left branchless — the real shape", async () => {
     mountDetail([run({ id: 547 })]);
@@ -339,6 +361,33 @@ describe("zone A — the sticky header (§3A)", () => {
     await waitFor(() => expect(document.querySelector(".trvitals")?.textContent).toContain("~38.0k"));
   });
 
+  // The stylesheet's single-row rules are keyed to these two hooks, and jsdom does no layout, so
+  // this is the only thing in CI that can see them at all: the header must PUBLISH its attempt
+  // count, and the three receipt-duplicated vitals must be shed-able as one group.
+  it("publishes its attempt count for the single-row breakpoint", async () => {
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ]);
+    await waitFor(() =>
+      expect(document.querySelector(".trhd")?.getAttribute("data-attempts")).toBe("2"),
+    );
+  });
+
+  // Duration, turns and tokens all repeat verbatim in the Result card's receipt ~8px below, so the
+  // squeezed row drops them and keeps the branch, which the receipt does NOT carry. Grouping them
+  // is what lets the stylesheet drop all three and only those three.
+  it("groups the receipt-duplicated vitals apart from the branch", async () => {
+    mountDetail([run({ id: 547, turns: 3 })]);
+    await waitFor(() => expect(document.querySelector(".trvitals .trdup")).toBeTruthy());
+    const shed = document.querySelector(".trvitals .trdup")?.textContent ?? "";
+    expect(shed).toContain("3 turns");
+    expect(shed).toContain("38.0k");
+    // The branch is outside the group the row sheds — that is the whole point of the grouping.
+    expect(shed).not.toContain("symphony/STUDIO-654");
+    expect(document.querySelector(".trvitals .mono")?.textContent).toBe("symphony/STUDIO-654");
+  });
+
   it("navigates back to Jobs from the breadcrumb and the back control", async () => {
     const onNavigate = mountDetail([run({ id: 1 })]);
     fireEvent.click(await screen.findByText("Jobs"));
@@ -346,27 +395,89 @@ describe("zone A — the sticky header (§3A)", () => {
   });
 
   // The daemon increments `attempt` only on the retry path, so a re-summoned ticket records every
-  // one of its runs as attempt 0 — 432 of 441 real rows. Labelling by attempt gave a five-run
-  // ticket five identical buttons; the run id is the daemon's own handle and is always distinct.
-  it("tells the attempts apart by run id, on rows that all record the same attempt", async () => {
+  // one of its runs as attempt 0 — 432 of 441 real rows. Labelling by that gave a five-run ticket
+  // five identical buttons; the ORDINAL below is the ticket's own run order instead (STUDIO-763).
+  it("labels each attempt by the ticket's run order, on rows that all record attempt 0", async () => {
     mountDetail([
       run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
       run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
       run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
     ]);
+    // The labels wait on the durable routing search, exactly as the header assignee does: until it
+    // has answered, an attempt is known only by its id.
     await waitFor(() => expect(document.querySelectorAll(".trattempts button")).toHaveLength(3));
-    expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual([
-      "run 547",
-      "run 545",
-      "run 522",
-    ]);
-    // The attempt and the start time are real data too — they ride along in the tooltip.
-    expect(document.querySelector(".trattempts button span")?.getAttribute("title")).toContain(
-      "attempt 0 · started ",
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · alice", "attempt 1 · alice"],
+      ),
+    );
+    // The run id is the daemon's own handle on an attempt and the ordinal is not, so it rides
+    // along in the tooltip with the start time — and so does the label, which a narrow window
+    // clips.
+    expect(document.querySelector(".trattempts button span")?.getAttribute("title")).toMatch(
+      /^attempt 3 · alice · run 547 · started /,
     );
     // Newest first AND newest selected — its transcript is the one fetched.
-    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe("run 547");
+    expect(document.querySelector('.trattempts button[aria-pressed="true"]')?.textContent).toBe(
+      "attempt 3 · alice",
+    );
     await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(547));
+  });
+
+  // The acceptance's two degradations, which are DIFFERENT answers about the same absence.
+  it("degrades to the run id, or to a dash, only where no identity resolves", async () => {
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [{ ...teammate("alice"), tickets: [] }], // nobody holds the ticket now
+    });
+    h.fetchRunIdentityEvents.mockResolvedValue([
+      // 547 routed to alice; 545 recorded that it routed to NOBODY; 522 has no row at all.
+      { run_id: 547, issue_identifier: "STUDIO-654", seq: 1, at: "", kind: "teams.route", tool: "", text: "identity=alice reason=label" },
+      { run_id: 545, issue_identifier: "STUDIO-654", seq: 1, at: "", kind: "teams.unrouted", tool: "", text: "reason=solo" },
+    ]);
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+      run({ id: 545, started_at: "2026-09-01T16:54:00Z" }),
+    ]);
+    await waitFor(() =>
+      expect([...document.querySelectorAll(".trattempts button")].map((b) => b.textContent)).toEqual(
+        ["attempt 3 · alice", "attempt 2 · —", "run 522"],
+      ),
+    );
+    // A fallback label already IS the run id, so its tooltip does not say it twice.
+    const last = document.querySelectorAll(".trattempts button span")[2];
+    expect(last?.getAttribute("title")).toMatch(/^run 522 · started /);
+  });
+
+  // The single-row header sheds the one-attempt selector at the desktop default width, and that
+  // selector's tooltip was the ONLY place in the whole Trace view rendering either fact — the
+  // route is keyed by ticket, and the Result card's receipt carries neither. So they live on the
+  // outcome pill, which no breakpoint sheds and no squeeze shrinks (STUDIO-763).
+  it("keeps the run id and start time on a header member the single row never sheds", async () => {
+    mountDetail([
+      run({ id: 522, started_at: "2026-08-30T20:21:00Z" }),
+      run({ id: 547, started_at: "2026-09-01T19:11:00Z" }),
+    ]);
+    // The shape, not just "something follows `started`": `formatDateTime` degrades an unparseable
+    // timestamp to a dash, and an assertion loose enough to accept that would pass over a tooltip
+    // saying "started —". The timezone suffix is the viewer's, so it is matched but not named.
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 547 · started \d\d\/\d\d \d\d:\d\d \S/,
+      ),
+    );
+    // And it names the attempt being READ, not the ticket's newest run — the pill describes this
+    // run, so switching attempts has to move it exactly as it moves the pill's own state word.
+    fireEvent.click(await screen.findByRole("button", { name: "attempt 1 · alice" }));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .pill")?.getAttribute("title")).toMatch(
+        /^run 522 · started \d\d\/\d\d \d\d:\d\d \S/,
+      ),
+    );
   });
 
   it("renders one attempt's trace at a time, fetching only that attempt's transcript", async () => {
@@ -382,7 +493,7 @@ describe("zone A — the sticky header (§3A)", () => {
     await waitFor(() => expect(screen.getByText(/echo run 547/)).toBeTruthy());
     expect(screen.queryByText(/echo run 522/)).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() => expect(screen.getByText(/echo run 522/)).toBeTruthy());
     expect(h.fetchRunTranscript).toHaveBeenCalledWith(522);
     expect(screen.queryByText(/echo run 547/)).toBeNull();
@@ -995,7 +1106,8 @@ describe("the raw-transcript escape hatch (§4)", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// Slice 4 (STUDIO-745) — the watch-tabs rail under the inspector (§3C), and the ask dock (§6).
+// Slice 4 (STUDIO-745) — the watch-tabs rail (§3C), in its own zone below the Split since
+// STUDIO-766, and the ask dock (§6).
 // ---------------------------------------------------------------------------------------------
 
 /** The rail's tab buttons, by label, in the order they render. */
@@ -1039,15 +1151,25 @@ function runMessage(over: Partial<RunMessage> = {}): RunMessage {
 }
 
 describe("the watch-tabs rail (§3C)", () => {
-  it("puts the five tabs under the inspector, with Diff the only one marked a dependency", async () => {
+  it("gives the five tabs their own zone below the split, with Diff the only one marked a dependency", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
 
-    // Inside the split's right column, under the inspector — not a row of its own below the trace.
-    const right = document.querySelector(".trsplit .trright") as HTMLElement;
-    expect(right.querySelector(".trinsp")).toBeTruthy();
-    expect(right.querySelector(".trwatch")).toBeTruthy();
+    // Zone D (STUDIO-766): the tabs do not follow the spine, so they are a full-width sibling
+    // BELOW the split rather than a strip welded under the step-scoped inspector in its column.
+    const split = document.querySelector(".trsplit") as HTMLElement;
+    const watch = document.querySelector(".trwatch") as HTMLElement;
+    expect(split.querySelector(".trright .trinsp")).toBeTruthy();
+    expect(split.querySelector(".trwatch")).toBeNull();
+    expect(watch.parentElement).toBe(split.parentElement);
+    expect(split.compareDocumentPosition(watch) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // And it SAYS its scope rather than leaving the operator to infer it from position. The label
+    // has to be true of all five tabs: only Messages is run-scoped (`runId`), while Diff, Review,
+    // Room and Memory are ticket-scoped (every one of them built on `run.issue_identifier`), so a
+    // label naming EITHER of those two scopes would promise the other's tabs a change they never
+    // make — the very defect, one zone up, that moving this rail was meant to remove.
+    expect(watch.querySelector(".eyebrow")?.textContent).toBe("Not this step");
 
     expect(tabLabels()).toEqual(["Diffdep", "Review", "Room", "Memory", "Messages"]);
     expect(screen.getByRole("tab", { name: /^room/i }).getAttribute("aria-selected")).toBe("true");
@@ -1056,6 +1178,32 @@ describe("the watch-tabs rail (§3C)", () => {
       expect(tab.getAttribute("aria-controls")).toBe("trwatch-panel");
     }
     expect(panel().getAttribute("aria-labelledby")).toBe("trtab-room");
+  });
+
+  // The whole point of the split zones: the inspector answers "this step" and the rail answers
+  // anything but. Clicking a step must move the first and leave the second alone — including
+  // anything half-written in it, which is the loudest way a false step-scope would show.
+  it("is untouched when the spine's selected step changes", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    await openTab("Messages");
+    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
+      target: { value: "btw the branch moved" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Implemented/ }));
+    await waitFor(() =>
+      expect(document.querySelector(".trinsp h4")?.textContent).toContain("Implemented"),
+    );
+
+    expect(screen.getByRole("tab", { name: /^messages/i }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    expect(panel().getAttribute("aria-labelledby")).toBe("trtab-messages");
+    expect(
+      (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
+    ).toBe("btw the branch moved");
   });
 
   // `role="tablist"` is a promise about the keyboard, not only about the screen reader: an
@@ -1373,12 +1521,41 @@ describe("Messages — the composer and its timeline (§3C)", () => {
       target: { value: "btw the branch moved" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    fireEvent.click(screen.getByRole("button", { name: /attempt 1 · alice/i }));
     await waitFor(() =>
       expect(
         (screen.getByLabelText(/message the running agent/i) as HTMLTextAreaElement).value,
       ).toBe(""),
     );
+  });
+
+  // The draft above is dropped by `selectRun`, which is code anyone can read. The send FAILURE is
+  // not: it lives in `MessagesPanel`'s own `useState`, and the only thing that clears it across an
+  // attempt switch is the rail's `key={`watch:${run.id}`}` remounting the panel. That key came for
+  // free from `TraceSplit` until STUDIO-766 moved the rail out, and an explicit key on a
+  // non-list element is exactly what a later tidy-up deletes — so pin the behaviour, not the key.
+  it("drops a refused send when the operator switches attempt", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.sendRunMessage.mockRejectedValue(new Error("too many pending operator messages for this run"));
+    mountDetail([run({ ...LIVE }), run({ id: 522, outcome: "completed" })]);
+    await settleTrace();
+    await openTab("Messages");
+    fireEvent.change(await screen.findByLabelText(/message the running agent/i), {
+      target: { value: "btw the branch moved" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^send$/i }));
+    const failure = /too many pending operator messages/;
+    await waitFor(() => expect(document.querySelector(".trwatch")?.textContent).toMatch(failure));
+
+    // A failure reported against the attempt being LEFT must not follow the operator to the one
+    // they arrive at, where it would read as that run having refused a message nobody sent it.
+    fireEvent.click(screen.getByRole("button", { name: /attempt 1 · alice/i }));
+    await waitFor(() =>
+      expect(document.querySelector(".trwatch")?.textContent).not.toMatch(failure),
+    );
+    // ...because the panel was REMOUNTED, not because it went away: a rail that unmounted the
+    // Messages tab would satisfy the line above while proving nothing about the cleared state.
+    expect(screen.getByLabelText(/message the running agent/i)).toBeTruthy();
   });
 });
 
@@ -1585,7 +1762,7 @@ describe("the ask dock (§6)", () => {
     });
     expect(document.querySelector(".askex .qb")?.textContent).toBe("why?");
 
-    fireEvent.click(screen.getByRole("button", { name: /run 522/i }));
+    fireEvent.click(screen.getByRole("button", { name: /attempt 1 · alice/i }));
     await waitFor(() =>
       expect((screen.getByLabelText(/ask about this run/i) as HTMLInputElement).value).toBe(""),
     );
@@ -2049,6 +2226,174 @@ describe("the ask card and the dock read as one control (STUDIO-733)", () => {
   });
 });
 
+// The rail reads as a zone of its own, on the Result card's treatment, rather than as a strip
+// welded to the bottom of the inspector (STUDIO-766).
+describe("the watch-tabs zone is drawn as a zone of its own (STUDIO-766)", () => {
+  const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+
+  function rule(selector: string): string {
+    const at = css.indexOf(`${selector} {`);
+    expect(at, `${selector} is not declared`).toBeGreaterThan(-1);
+    return css.slice(at, css.indexOf("}", at));
+  }
+
+  it("gives the rail the Result card's border, radius and rhythm", () => {
+    const watch = rule(".rh-console .trwatch");
+    expect(watch).toMatch(/border:\s*1px solid var\(--line\)/);
+    expect(watch).toMatch(/border-radius:\s*var\(--r\)/);
+    // The SURFACE is not the Result card's: `.trrc` is a gradient over `--panel-2`, this is the
+    // flat `--panel` the ticket specified. Nor is the eyebrow INK, since STUDIO-763 made the
+    // card's an outcome colour — see below. Border, radius, rhythm and eyebrow TYPOGRAPHY are the
+    // shared part, and the assertions here claim no more than that.
+    expect(watch).toMatch(/background:\s*var\(--panel\)/);
+    // The same 18px that separates the Result card from the split above it.
+    expect(watch).toMatch(/margin-bottom:\s*18px/);
+  });
+
+  // A scope label nobody can read states nothing: `--ink-4`, which the inspector's own heading
+  // uses, sits at roughly 2:1 on `--panel`, while `--info` clears 7:1. The TYPEFACE is the Result
+  // card's, so the two zones that state something about the whole run speak in one voice.
+  it("gives the scope label the Result card's eyebrow typography", () => {
+    const mine = rule(".rh-console .trwatch .eyebrow");
+    const card = rule(".rh-console .trrc .eyebrow");
+    for (const decl of ["text-transform: uppercase", "font-weight: 600", "font-size: 11px"]) {
+      expect(card, `.trrc .eyebrow no longer declares ${decl}`).toContain(decl);
+      expect(mine).toContain(decl);
+    }
+  });
+
+  // The INK, though, is deliberately NOT the card's — and this is the half that changed under us.
+  // STUDIO-766 first copied `--info` from `.trrc .eyebrow`; STUDIO-763 then moved that eyebrow
+  // into the OUTCOME family, `--done` with `.fail`/`.stop` overriding it, so the card's eyebrow
+  // ink now means "how the run ended". "Not this step" is a statement of SCOPE and ends nothing,
+  // so tracking that ink would paint a scope label in a success colour and recolour it on a run
+  // that failed. It keeps the neutral informational ink instead, which is also what makes it
+  // legible — the point of the label.
+  it("does not take the Result card's outcome ink for a scope label", () => {
+    expect(rule(".rh-console .trwatch .eyebrow")).toContain("color: var(--info)");
+    // The card's ink varies with the outcome, which is precisely why it is the wrong thing to
+    // follow. If these three ever collapse to one fixed colour, re-open the question above.
+    expect(rule(".rh-console .trrc .eyebrow")).toContain("color: var(--done)");
+    expect(rule(".rh-console .trrc.fail .eyebrow")).toContain("color: var(--bad)");
+    expect(rule(".rh-console .trrc.stop .eyebrow")).toContain("color: var(--warn)");
+    // And never the faint heading ink that made the label unreadable in the first place.
+    expect(rule(".rh-console .trwatch .eyebrow")).not.toContain("var(--ink-4)");
+  });
+
+  it("drops the weld that made the rail look like part of the inspector", () => {
+    const watch = rule(".rh-console .trwatch");
+    // `border-top` alone was the whole visual join, and `margin-top: auto` floated the rail to a
+    // different height on every step — both belong to the old in-column rail.
+    expect(watch).not.toMatch(/border-top:/);
+    expect(watch).not.toMatch(/margin-top:\s*auto/);
+    // The right track holds only the inspector now, so it has no column to lay out.
+    expect(rule(".rh-console .trright")).not.toMatch(/flex-direction:\s*column/);
+  });
+});
+
+// jsdom does no layout, so nothing in CI can see the single header row itself — the widths in
+// `console-trace.css`'s own comment are the only record of what it was measured to do. What CAN be
+// held is the handful of declarations the row is built out of, each of which was a real bug when
+// it was missing, and the class names, which is where the playhead's collision lived.
+describe("the single header row is built out of what it says it is (STUDIO-763)", () => {
+  const traceCss = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+  const themeDir = path.resolve(__dirname, "../../../theme");
+
+  it("floors the vitals, so the branch and its tooltip cannot be squeezed to nothing", () => {
+    // `min-width: 0` here let the group reach 0px, which took the branch AND the `title` that was
+    // supposed to recover it — a 0px box has no hover target.
+    expect(traceCss).toMatch(/\.trhd \.trvitals \{[^}]*min-width: 19ch/);
+  });
+
+  it("sheds the three receipt-duplicated vitals as a group rather than clipping them", () => {
+    // `contents` while it is kept, so grouping them costs the vitals row no layout of its own.
+    expect(traceCss).toMatch(/\.trvitals \.trdup \{[^}]*display: contents/);
+    expect(traceCss).toMatch(/\.trhd \.trdup \{[^}]*display: none/);
+  });
+
+  it("ellipsizes a clipped attempt label, with a pixel of slack against sub-pixel rounding", () => {
+    const label = traceCss.slice(traceCss.indexOf(".rh-console .trhd .trattempts button > span {"));
+    const block = label.slice(0, label.indexOf("}"));
+    // Without the ellipsis a cut label is SILENT — "attempt 5 · a" reads as complete.
+    expect(block).toMatch(/text-overflow: ellipsis/);
+    // Without the slack it fires on a button that rounded a fraction of a pixel under its text.
+    expect(block).toMatch(/padding-right: 1px/);
+  });
+
+  it("draws the single-row breakpoint per attempt count, not once for every ticket", () => {
+    // The selector grows ~110px per attempt while every other member is fixed, so one threshold
+    // either denies the row to a ticket that had room or grants it to one that has to crush every
+    // label to a glyph. These four are the measured widths — see the block comment.
+    //
+    // The trailing brace is load-bearing, and 1100 is the number David's decision turns on: the
+    // shed rule below opens `@media (min-width: 1100px) and (max-width: 1199.98px)`, which CONTAINS
+    // the bare prefix — so without the brace this assertion passed with the single-row block back
+    // at 1160, guarding nothing. Only the block that opens on 1100 alone has the brace next to it.
+    expect(traceCss).toContain("@media (min-width: 1100px) {");
+    for (const [width, bucket] of [
+      ["1279.98", '.trhd:not([data-attempts="1"])'],
+      ["1399.98", '.trhd[data-attempts="3"]'],
+      ["1699.98", '.trhd[data-attempts="few"]'],
+    ] as const) {
+      expect(traceCss).toContain(`@media (max-width: ${width}px)`);
+      expect(traceCss).toContain(bucket);
+    }
+    // Six or more gets no threshold at all — no width fits it, so the rule carries no media query.
+    expect(traceCss).toMatch(
+      /\n\.rh-console \.trhd\[data-attempts="many"\] \{[^}]*flex-wrap: wrap/,
+    );
+  });
+
+  it("sheds the one-attempt selector where it would render as a stub, not a label", () => {
+    // Under 1200 the selector is the only member with anywhere left to give (the title is on its
+    // floor), so it absorbs the whole squeeze — measured 21px at 1100, a button with no glyph in
+    // it. A group of ONE selects nothing and its teammate is already the assignee slot beside it,
+    // so the single-attempt ticket drops it rather than showing a stub. It returns at 1200.
+    expect(traceCss).toContain("@media (min-width: 1100px) and (max-width: 1199.98px)");
+    expect(traceCss).toContain(
+      '.rh-console .trhd[data-attempts="1"]:not(:has(.acterr)) .trattempts { display: none; }',
+    );
+    // Only that bucket: every other count has wrapped again by 1280, and a wrapped row has the
+    // room to keep its selector — as does a header wrapped by an inline error, hence the `:not`.
+    expect(traceCss).not.toMatch(/\.trhd\[data-attempts="(2|3|few|many)"\][^{]*\.trattempts \{[^}]*display: none/);
+  });
+
+  it("gates the whole single-row block on the `:has()` it depends on", () => {
+    // The block's inline-error rule is what stops a header carrying a failed Stop from pushing the
+    // page sideways (§3C), and it has no `:has()`-free spelling. An engine that applied the nowrap
+    // row but skipped that one rule would scroll sideways, so such an engine gets none of the
+    // block and keeps today's wrapped header. Every engine this ships to has `:has()`.
+    const at = traceCss.indexOf("@supports selector(:has(*)) {");
+    expect(at, "the single-row block is not gated").toBeGreaterThan(-1);
+    // The gate is around the media query, not inside it — a gate the block's own rules sit beside
+    // would leave the nowrap row applying on an engine that dropped the error rule.
+    expect(traceCss.slice(at)).toMatch(/^@supports selector\(:has\(\*\)\) \{\n {2}@media \(min-width: 1100px\) \{/);
+    // …and the two braces that close it, which is the pair a hand-indented block loses first.
+    const block = traceCss.slice(at, traceCss.indexOf("\n}\n", at) + 3);
+    expect(block).toContain(".rh-console .trhd:has(.acterr) { flex-wrap: wrap;");
+    expect(block.trimEnd().endsWith("}\n}")).toBe(true);
+  });
+
+  // The addendum, and the twin of STUDIO-771's jobs-list fix. `.rh-console .now` is the Jobs-home
+  // banner card and `.rh-console .trstep` is equal specificity to it, so the playhead had to move.
+  it("names the spine playhead `ph`, and `ph` collides with nothing", () => {
+    expect(traceCss).toMatch(/\.rh-console \.trstep\.ph \.g \{[^}]*color: var\(--operator\)/);
+    expect(traceCss).toMatch(/\.rh-console \.trstep\.ph \.stt \{[^}]*color: var\(--operator\)/);
+    expect(traceCss).not.toContain(".trstep.now");
+    // Every theme stylesheet, not just this one: they are emitted into a SINGLE index-*.css, so a
+    // bare `.rh-console .ph` rule in any of them would reach the spine exactly as `.now` did.
+    // Reading one file is what let STUDIO-771's first guard pass green over a live collision.
+    for (const file of readdirSync(themeDir).filter((f) => f.endsWith(".css"))) {
+      const sheet = readFileSync(path.join(themeDir, file), "utf8");
+      expect(sheet, `${file} declares a bare .ph rule`).not.toMatch(/\.rh-console \.ph[\s.,:{]/);
+      expect(sheet, `${file} declares a bare .playhead rule`).not.toMatch(/\.playhead[\s.,:{]/);
+    }
+    // And the banner card this moved away from is untouched.
+    const consoleCss = readFileSync(path.join(themeDir, "console.css"), "utf8");
+    expect(consoleCss).toMatch(/\.rh-console \.now \{[^}]*margin-bottom: 16px/);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Acceptance 6 — wide content (code) scrolls in its own box; the page never scrolls sideways.
 // ---------------------------------------------------------------------------------------------
@@ -2080,12 +2425,19 @@ describe("wide content is contained (STUDIO-681's layout rule)", () => {
     // A CSS grid track is `min-width: auto` by default, which means "as wide as the content" —
     // the one way a fenced code block inside the inspector can push the whole page sideways.
     expect(rule(".rh-console .trsplit")).toMatch(/grid-template-columns:\s*264px minmax\(0, 1fr\)/);
-    // `.trright` is the grid CHILD now — the inspector and the watch rail share that column — so
-    // it is the one that has to carry the zero minimum; `.trinsp` alone would not save the page.
+    // `.trright` is the grid CHILD, wrapping the inspector it now holds alone, so it is the one
+    // that has to carry the zero minimum; `.trinsp` alone would not save the page.
     expect(rule(".rh-console .trright")).toMatch(/min-width:\s*0/);
     expect(rule(".rh-console .trinsp")).toMatch(/min-width:\s*0/);
-    expect(rule(".rh-console .trwatch .tabbody")).toMatch(/min-width:\s*0/);
     expect(rule(".rh-console .trrc .body")).toMatch(/min-width:\s*0/);
+  });
+
+  // STUDIO-766 moved the watch-tabs out of that grid, and a zero minimum means nothing outside
+  // one: the rail is an ordinary block whose width comes from the page, so what stops a panel too
+  // wide for it from widening the page is the zone's own clip. Asserting the old `min-width: 0`
+  // on `.tabbody` here would be asserting a no-op.
+  it("clips a too-wide panel inside the watch-tabs zone instead of widening the page", () => {
+    expect(rule(".rh-console .trwatch")).toMatch(/overflow:\s*hidden/);
   });
 
   it("wraps an operator message body rather than widening the rail", () => {
@@ -2145,9 +2497,9 @@ function selectedStep(): string {
   return document.querySelector('.trstep[aria-pressed="true"] .stt')?.textContent ?? "";
 }
 
-/** The step the playhead's `now` badge marks; "" when the spine marks none. */
+/** The step the playhead marks; "" when the spine marks none. See `playheadIsNotTheNowCard`. */
 function nowStep(): string {
-  return document.querySelector(".trstep.now .stt")?.textContent ?? "";
+  return document.querySelector(".trstep.ph .stt")?.textContent ?? "";
 }
 
 /** The spine's grep field. */
@@ -2195,7 +2547,12 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     expect(spineTitles()).toEqual(["Oriented", "Implemented"]);
     // A finished run opens on its FIRST step — you read a trace forwards. A live one does not.
     expect(selectedStep()).toBe("Implemented");
-    expect(document.querySelector(".trstep.now")).toBeTruthy();
+    expect(document.querySelector(".trstep.ph")).toBeTruthy();
+    // NOT `now`: `.rh-console .now` (console.css) is the Jobs-home banner CARD and is the same
+    // 0,0,2 specificity as `.rh-console .trstep`, so a step marked `now` wore that card's border,
+    // gradient and 16px bottom margin as well as the playhead treatment. Twin of STUDIO-771's
+    // jobs-list fix; jsdom does no layout, so the class name is the only thing CI can hold.
+    expect(document.querySelector(".trstep.now")).toBeNull();
   });
 
   it("advances the playhead when the transcript poll brings a newer phase", async () => {
@@ -2389,7 +2746,7 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     // while the page is not following, the operator's position is still theirs. The page is tall
     // only while the head is VISIBLE (the `now` badge is on the spine) — exactly when follow can
     // be on — so the growth and the follow-flip land in ONE commit, the way a real poll does.
-    sizePage(() => (document.querySelector(".trstep.now") === null ? 2000 : 3000));
+    sizePage(() => (document.querySelector(".trstep.ph") === null ? 2000 : 3000));
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
@@ -2423,7 +2780,7 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     mountDetail([run({ id: 547 })]);
     await settleTrace();
     expect(selectedStep()).toBe("Oriented");
-    expect(document.querySelector(".trstep.now")).toBeNull();
+    expect(document.querySelector(".trstep.ph")).toBeNull();
     scrollUp(600);
     expect(document.querySelector(".trlatest")).toBeNull();
   });
@@ -2680,7 +3037,7 @@ describe("the attempt relay — the handoff baton (§3C/§6)", () => {
     );
     expect(document.querySelector(".trbaton.out")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() => expect(document.querySelector(".trbaton.out")).toBeTruthy());
     expect(document.querySelector(".trbaton.out")?.textContent).toContain("run 522 → run 547");
     expect(document.querySelector(".trbaton.in")).toBeNull();
@@ -2831,7 +3188,7 @@ describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => 
     );
     expect(document.querySelector(".trhd .who2")?.textContent).toContain("jimmy");
 
-    fireEvent.click(screen.getByRole("button", { name: "run 522" }));
+    fireEvent.click(screen.getByRole("button", { name: "attempt 1 · alice" }));
     await waitFor(() =>
       expect(document.querySelector(".trbaton.out")?.textContent).toContain("alice → jimmy"),
     );
@@ -2933,5 +3290,59 @@ describe("persistent assignee + attribution (STUDIO-746, §3A/§3C/§6)", () => 
     await settleTrace();
     await waitFor(() => expect(spineTitles()).toContain("Coordinated"));
     expect(document.querySelector(".trstep .stwho")).toBeNull();
+  });
+});
+
+// Acceptance (STUDIO-765) — in the packaged app `<a target="_blank">` is a no-op, so every one of
+// the Trace's external links must reach `openExternal`. These click the real links rather than
+// re-asserting their hrefs, which the tests above already pin: an href was never the broken half.
+describe("external links leave the app through the openExternal seam (STUDIO-765)", () => {
+  /** Clicks cancellably, the way a real anchor click arrives, and reports whether it was let through. */
+  function clickLink(el: Element): boolean {
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(el, ev);
+    return !ev.defaultPrevented;
+  }
+
+  it("opens the ticket in the browser instead of dropping the click", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/open ticket/i)).toBeTruthy());
+    expect(clickLink(action(/open ticket/i))).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith("https://linear.app/studio49/issue/STUDIO-654");
+  });
+
+  it("opens the View PR search in the browser instead of dropping the click", async () => {
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/view pr/i)).toBeTruthy());
+    expect(clickLink(action(/view pr/i))).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
+    );
+  });
+
+  it("opens the Diff panel's pull-request deep link in the browser", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+    const link = within(panel()).getByRole("link", { name: /pull request/i });
+    expect(clickLink(link)).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith(
+      "https://github.com/makewhatis/rhapsody/pulls?q=is%3Apr%20head%3Asymphony%2FSTUDIO-654",
+    );
+  });
+
+  it("opens a Review-panel pull-request link in the browser", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchReviews.mockResolvedValue({
+      enabled: true,
+      reviews: [reviewJob({ status: "reviewed", last_reviewed_sha: "e90ccc6457f" })],
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Review");
+    await waitFor(() => expect(panel().querySelector(".trrev .pr")).toBeTruthy());
+    expect(clickLink(panel().querySelector(".trrev .pr") as Element)).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith("https://github.com/makewhatis/rhapsody/pull/105");
   });
 });

@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueRun, StateResponse } from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
-import { SPARK_KINDS } from "@/lib/console-trace-spark";
+import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
 
 // STUDIO-681 §10, sub-ticket 2 — the Jobs worklist's acceptance boxes 2.6, 2.7 and 2.8,
 // driven through the real view against the endpoints §9 has: /api/v1/state for the live
@@ -732,7 +732,8 @@ describe("the row trace-sparkline (§6)", () => {
     expect(h.fetchRunTranscript).not.toHaveBeenCalled();
   });
 
-  it("marks a live run with the playhead", async () => {
+  /** Mounts a single RUNNING row and points at it, so its strip draws the playhead. */
+  async function mountLiveRow() {
     h.fetchState.mockResolvedValue({
       ...EMPTY_STATE,
       running: [
@@ -765,10 +766,56 @@ describe("the row trace-sparkline (§6)", () => {
     h.fetchRunTranscript.mockResolvedValue(TRANSCRIPT);
     mount();
     await waitFor(() => expect(rowKeys()).toEqual(["A-1"]));
-
     fireEvent.focus(row("A-1"));
-    await waitFor(() => expect(row("A-1").querySelector(".spark .gly.now")).not.toBeNull());
+  }
+
+  it("marks a live run with the playhead", async () => {
+    await mountLiveRow();
+    await waitFor(() => expect(row("A-1").querySelector(".spark .gly.ph")).not.toBeNull());
     expect(row("A-1").querySelector(".spark")?.getAttribute("aria-label")).toContain("Running now");
+  });
+
+  // Every file under `src/theme/` is imported somewhere in the console tree, so all of them land
+  // in the one emitted `index-*.css` and a bare `.rh-console .<class>` rule in ANY of them is
+  // equally live against the strip. Read the DIRECTORY rather than a hand-listed set: `console.css`
+  // alone leaves the sparkline's OWN stylesheet unchecked — `console-views.css` claims `.lead`,
+  // `.ghost`, `.crumbs`, `.head` and `.build` — and a hand-listed set silently stops covering the
+  // day file thirteen arrives.
+  const themeDir = path.resolve(__dirname, "../../../theme");
+  const themeCss = readdirSync(themeDir)
+    .filter((f) => f.endsWith(".css"))
+    .map((f) => readFileSync(path.join(themeDir, f), "utf8"))
+    .join("\n");
+
+  // STUDIO-771. The playhead used to carry the BARE class `now`, and `console.css` styles
+  // `.rh-console .now` — the "Now working" banner CARD (padding, border, rounded corners, a bottom
+  // margin). That descendant selector matched the glyph too, and because `.spark .gly` sets no
+  // padding or margin of its own there was nothing to override them: a 19px glyph inflated into a
+  // big cyan play-button card. The defect is not the styling, it is the SHARED NAME, so that is
+  // what this pins — every class EVERY glyph in the strip carries must be private to the sparkline,
+  // unclaimed by any `.rh-console .<class>` rule anywhere in the theme. Reintroducing `now`, or
+  // reaching for another layout primitive's name (`lead`, `ghost`, `mate`, `stat`), fails here
+  // rather than in a screenshot someone happens to look at.
+  it("gives every glyph in the strip a class no layout rule in the theme claims", async () => {
+    await mountLiveRow();
+    // Found by its GLYPH, never by the class under test — selecting on `.ph` would make this pass
+    // the moment the class exists, which is the one thing it must not assume.
+    await waitFor(() =>
+      expect(
+        [...row("A-1").querySelectorAll(".spark .gly")].some((el) => el.textContent === LIVE_GLYPH),
+      ).toBe(true),
+    );
+
+    // The whole strip, not just the playhead: the other five glyphs carry `off` and `wt-*`, which
+    // are exposed to the same collision and were previously unchecked.
+    const glyphs = [...row("A-1").querySelectorAll<HTMLElement>(".spark .gly")];
+    expect(glyphs.length).toBe(SPARK_KINDS.length + 1);
+    for (const glyph of glyphs) {
+      expect(glyph.classList.length).toBeGreaterThan(0);
+      for (const cls of glyph.classList) {
+        expect(themeCss).not.toMatch(new RegExp(`\\.rh-console \\.${cls}\\b`));
+      }
+    }
   });
 });
 
@@ -782,7 +829,7 @@ describe("the §6 additions are painted, not just classed", () => {
 
   it("styles the sparkline's glyph and its playhead", () => {
     expect(viewsCss).toMatch(/\.spark \.gly \{/);
-    expect(viewsCss).toMatch(/\.spark \.gly\.now \{[^}]*color: var\(--operator\)/);
+    expect(viewsCss).toMatch(/\.spark \.gly\.ph \{[^}]*color: var\(--operator\)/);
   });
 
   // A reserved slot with no rule of its own is indistinguishable from a kind the run DID reach,

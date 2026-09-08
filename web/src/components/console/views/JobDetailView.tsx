@@ -11,6 +11,7 @@ import {
 import {
   Button,
   Chip,
+  ExternalLink,
   Markdown,
   Mono,
   Pill,
@@ -34,13 +35,15 @@ import { useReviews } from "@/hooks/useReviews";
 import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
 import { useTicketFacts } from "@/hooks/useTicketFacts";
 import { ticketAssignees } from "@/lib/console-jobs";
-import { clockTime, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
+import { clockTime, runOutcomeLabel, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
 import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
   OUTCOME_RUNNING,
   TRACE_FILTERS,
   TRACE_FILTER_LABELS,
+  attemptBucket,
+  attemptOptions,
   cardLead,
   failingStep,
   filterPhases,
@@ -56,6 +59,7 @@ import {
   runTeammate,
   runVitals,
   ticketUrl,
+  type AttemptOption,
   type Baton,
   type FailingStep,
   type RelayBatons,
@@ -121,10 +125,11 @@ import "@/theme/console-trace.css";
 // oldest→newest `LogEntry` list. The folding is a documented heuristic — a debugger is never
 // trapped inside it.
 //
-// Slice 4 (STUDIO-745) adds §3C's watch-tabs rail under the inspector — Diff / Review / Room /
-// Memory / Messages — which is where the §4 side cards that used to sit in their own row below the
-// trace now live, joined by the run's operator-message timeline and an "Ask about this run" dock
-// that posts to the room refed to the run (§6).
+// Slice 4 (STUDIO-745) adds §3C's watch-tabs rail — Diff / Review / Room / Memory / Messages,
+// promoted by STUDIO-766 out of the inspector's column into its own full-width zone below the
+// Split — which is where the §4 side cards that used to sit in their own row below the trace now
+// live, joined by the run's operator-message timeline and an "Ask about this run" dock that posts
+// to the room refed to the run (§6).
 //
 // Slice 5 (STUDIO-746) wires the DURABLE per-run identity through all of it: the header keeps a
 // finished run's assignee once its teammate has left the live roster, the spine signs the steps
@@ -284,6 +289,12 @@ function RunTrace({
     () => relayBatons(runs, run, identities, assignee),
     [runs, run, identities, assignee],
   );
+  // The selector's labels, resolved from the same three inputs the batons are — so an option, the
+  // baton beside it and the header assignee can never name different teammates for one attempt.
+  const attempts = useMemo(
+    () => attemptOptions(runs, identities, assignee),
+    [runs, identities, assignee],
+  );
   // Resolved ONCE, so the header's avatar, the spine's signed steps and the inspector's
   // "what <who> did" can never disagree about whose run this is — they did while only the header
   // knew about a review key.
@@ -334,7 +345,7 @@ function RunTrace({
       <TraceHeader
         ref={headerRef}
         run={live}
-        runs={runs}
+        attempts={attempts}
         who={who}
         resolvingWho={identityRead.isPending}
         roster={roster}
@@ -392,25 +403,34 @@ function RunTrace({
             live={inFlight}
             batons={batons}
             jump={jump}
-            watch={
-              <WatchTabsRail tab={tab} onSelect={setTab}>
-                <WatchPanel
-                  tab={tab}
-                  run={live}
-                  inFlight={inFlight}
-                  roster={roster}
-                  rosterRead={rosterRead}
-                  teamsEnabled={teamsEnabled}
-                  draft={draft}
-                  onDraft={setDraft}
-                  focusComposer={focusMessage}
-                  onComposerFocused={takeMessageFocus}
-                  onOpenMemory={onOpenMemory}
-                  onOpenRoom={onOpenRoom}
-                />
-              </WatchTabsRail>
-            }
           />
+          {/* Zone D (STUDIO-766): the rail is not step-scoped — the same five surfaces whichever
+              step the spine has selected — so it is a full-width sibling of the Split, on the
+              Result card's border, radius and rhythm, rather than a strip welded under the
+              STEP-scoped inspector inside the Split's right column. There it read as though it
+              should change per step. (What the five ARE scoped to is stated by the rail's own
+              eyebrow, and is not one single scope; see `WatchTabsRail`.)
+              Keyed per attempt, as it was implicitly while it rode inside the Split's key: the
+              mounted panel keeps state of its own (the Messages composer's send error), and a
+              failure reported against the attempt being LEFT must not follow the operator to the
+              one they switched to. The key is its own — two siblings sharing one is a collision
+              React resolves by dropping a sibling, which is why AskDock's is prefixed too. */}
+          <WatchTabsRail key={`watch:${run.id}`} tab={tab} onSelect={setTab}>
+            <WatchPanel
+              tab={tab}
+              run={live}
+              inFlight={inFlight}
+              roster={roster}
+              rosterRead={rosterRead}
+              teamsEnabled={teamsEnabled}
+              draft={draft}
+              onDraft={setDraft}
+              focusComposer={focusMessage}
+              onComposerFocused={takeMessageFocus}
+              onOpenMemory={onOpenMemory}
+              onOpenRoom={onOpenRoom}
+            />
+          </WatchTabsRail>
           {/* §6's "Ask about this run": a room post refed to the run TODAY, which upgrades to the
               answering-manager Answer path when one is served. It needs a room to post into, so
               a daemon with Teams off gets no dock rather than a control that cannot act. */}
@@ -458,7 +478,7 @@ function useStickyHeaderHeight(ref: RefObject<HTMLDivElement | null>): number {
 function TraceHeader({
   ref,
   run,
-  runs,
+  attempts,
   who,
   resolvingWho,
   roster,
@@ -471,7 +491,8 @@ function TraceHeader({
 }: {
   ref: RefObject<HTMLDivElement | null>;
   run: RunSummary;
-  runs: readonly RunSummary[];
+  /** Every attempt the ticket has, newest first, already labelled — see `attemptOptions`. */
+  attempts: readonly AttemptOption[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
   /** Whether the durable routing search may still name one — see the assignee slot below. */
@@ -487,7 +508,10 @@ function TraceHeader({
 }) {
   const workspaceURLKey = useLinearIdentity().data?.workspace_url_key ?? "";
   return (
-    <div className="trhd" ref={ref}>
+    // `data-attempts` is for the stylesheet, not for anyone reading the DOM: the width one header
+    // row costs grows with the attempt selector, so `console-trace.css` sets the single-row
+    // breakpoint per bucket rather than once for every ticket. See `attemptBucket`.
+    <div className="trhd" data-attempts={attemptBucket(attempts.length)} ref={ref}>
       <button type="button" className="back" aria-label="Back to Jobs" onClick={onBack}>
         ‹
       </button>
@@ -506,7 +530,8 @@ function TraceHeader({
           never reaches this. */}
       {who !== "" ? (
         <span className="who2">
-          <TeammateAvatar color={teammateColor(roster, who)} size={7} />
+          {/* The prototype's `.who` — a 20px avatar carrying the initial, then the name (§3A). */}
+          <TeammateAvatar color={teammateColor(roster, who)} size={20} name={who} />
           {who}
         </span>
       ) : resolvingWho ? (
@@ -516,8 +541,28 @@ function TraceHeader({
       ) : (
         <span className="who2 none">—</span>
       )}
-      <Pill variant={runOutcomePill(run.outcome)}>
-        {run.outcome === "" ? "unknown" : run.outcome}
+      {/* The outcome pill, in the prototype's own vocabulary rather than the daemon's column
+          value — "done", not "completed" (§3A). `runOutcomeLabel` translates only the three
+          states the prototype names and passes anything else through.
+
+          It also carries the run's id and start time, which are the two facts NOTHING else on this
+          page renders: the route is `#job/<TICKET-KEY>`, the receipt carries neither, and the id
+          is the daemon's own handle — what `/api/v1/runs/{id}`, `symphony_run_status` and the logs
+          are keyed by. They used to live only in the attempt selector's tooltip, and the
+          single-row header sheds that selector on a one-attempt ticket at the desktop default
+          width (see `console-trace.css`), which would have taken both with it.
+
+          The pill is where they belong rather than merely where they fit: it is the one header
+          member that describes this RUN and not the ticket, so "which run, and when did it start"
+          is the same question its state answers. It is never shed and `flex: none` in the single
+          row, so the hover target exists at every width. Unconditional, too — the width the
+          selector goes at lives in the stylesheet, and a copy of that breakpoint in TSX would be a
+          second source of truth for it, silently stale the next time the row is re-measured. */}
+      <Pill
+        variant={runOutcomePill(run.outcome)}
+        title={`run ${run.id} · started ${formatDateTime(run.started_at)}`}
+      >
+        {runOutcomeLabel(run.outcome)}
       </Pill>
       {/* The live pulse (§3A). Decorative beside the outcome pill, which already says "running"
           in words — a screen reader that announced a second "live" would only repeat it. */}
@@ -526,20 +571,28 @@ function TraceHeader({
           spine and the header's assignee to that run, and the spine draws the handoff baton
           either side of it (`relayBatons`), naming each attempt's own teammate.
 
-          Labelled by RUN ID, not by `attempt`: the daemon only increments `attempt` on the retry
-          path, so a ticket re-summoned or re-dispatched records every one of its runs as attempt
-          0 — 432 of the 441 rows the store has ever written — and an "attempt 0" label repeated
-          five times names none of them. The run id is the daemon's own handle on a run and is
-          always distinct. The attempt and the start time are real data too, so they ride along
-          in the tooltip rather than being dropped. */}
+          Labelled "attempt N · <teammate>", as the prototype's `.hd` labels it (STUDIO-763), from
+          the durable per-run identity STUDIO-746 wired. `attemptOptions` owns both halves — see it
+          for why the ordinal is the ticket's own run order rather than `runs.attempt`, and for the
+          two degradations when nothing can name an attempt. The run id is the daemon's own handle
+          and the ordinal is not, so it rides along in the tooltip with the start time. */}
       <Seg
         className="trattempts"
         aria-label="Attempt"
-        options={runs.map((r) => ({
-          value: String(r.id),
+        options={attempts.map((a) => ({
+          value: String(a.id),
           label: (
-            <span title={`attempt ${r.attempt} · started ${formatDateTime(r.started_at)}`}>
-              run {r.id}
+            // The label itself rides in the tooltip too: on a narrow wide-view window a long
+            // attempt list is clipped, and the teammate is exactly what must stay reachable. A
+            // fallback label already IS the run id, so the tooltip does not repeat it.
+            <span
+              title={
+                a.named
+                  ? `${a.label} · run ${a.id} · started ${formatDateTime(a.startedAt)}`
+                  : `run ${a.id} · started ${formatDateTime(a.startedAt)}`
+              }
+            >
+              {a.label}
             </span>
           ),
         }))}
@@ -547,16 +600,25 @@ function TraceHeader({
         onChange={(v) => onSelectRun(Number(v))}
       />
       <div className="trvitals">
-        <span>
-          <b>{vitals.duration}</b>
+        {/* Duration, turns and tokens, grouped because they leave together: all three are repeated
+            verbatim in the Result card's receipt ~8px below (§3B), so the single-row header sheds
+            them rather than squeezing the branch, which the receipt does NOT carry. The wrapper is
+            `display: contents` until it is shed, so grouping them costs the row no layout. */}
+        <span className="trdup">
+          <span>
+            <b>{vitals.duration}</b>
+          </span>
+          <span>
+            <b>{vitals.turns}</b>
+          </span>
+          <span>
+            <b>{vitals.tokens}</b> tokens
+          </span>
         </span>
-        <span>
-          <b>{vitals.turns}</b>
-        </span>
-        <span>
-          <b>{vitals.tokens}</b> tokens
-        </span>
-        <Mono>{vitals.branch}</Mono>
+        {/* The one vital the Result card's receipt does NOT repeat, so it is the member the row
+            keeps and floors — and it carries itself in a tooltip for a branch long enough to
+            ellipsize anyway. */}
+        <Mono title={vitals.branch}>{vitals.branch}</Mono>
       </div>
       <HeaderActions
         run={run}
@@ -653,9 +715,9 @@ function HeaderActions({
           Open ticket
         </DepButton>
       ) : (
-        <a className="btn sec" href={ticketHref} target="_blank" rel="noreferrer noopener">
+        <ExternalLink className="btn sec" href={ticketHref}>
           Open ticket
-        </a>
+        </ExternalLink>
       )}
       {/* No endpoint serves a PR number (design record §5), so this is a head-branch search on
           the run's own remote — it finds the branch's PR without the console asserting one. The
@@ -665,9 +727,9 @@ function HeaderActions({
           View PR
         </DepButton>
       ) : (
-        <a className="btn sec" href={prHref} target="_blank" rel="noreferrer noopener">
+        <ExternalLink className="btn sec" href={prHref}>
           View PR
-        </a>
+        </ExternalLink>
       )}
       {/* The real green primary (design §5). Every refusal — no open pull request on the branch,
           a live Rhapsody review round, an already-merged or closed one, a merge already in flight
@@ -890,7 +952,6 @@ function TraceSplit({
   live,
   batons,
   jump,
-  watch,
 }: {
   phases: readonly TracePhase[];
   /** The teammate this attempt is attributed to; "" when none resolves. */
@@ -901,8 +962,6 @@ function TraceSplit({
   live: boolean;
   batons: RelayBatons;
   jump: { step: FailingStep; nonce: number } | null;
-  /** §3C's watch-tabs rail, which sits under the inspector in the same column. */
-  watch: ReactNode;
 }) {
   const [filter, setFilter] = useState<TraceFilter>("all");
   const [query, setQuery] = useState("");
@@ -995,8 +1054,9 @@ function TraceSplit({
           <div className="empty">No step matches.</div>
         ) : null}
       </div>
-      {/* The inspector and the rail share the right column: the rail is what the SELECTED frame
-          is watched against, so it sits under it rather than beside the spine. */}
+      {/* The right column holds the inspector alone — everything in the Split is scoped to the
+          step the spine has selected. The watch-tabs, which follow no step, are zone D below
+          the Split (STUDIO-766). */}
       <div className="trright">
         <div className="trinsp">
           {selected === undefined ? null : (
@@ -1008,7 +1068,6 @@ function TraceSplit({
             />
           )}
         </div>
-        {watch}
       </div>
       {/* Only while the run is LIVE: on a finished trace there is no "latest" to fall behind. */}
       {behind ? (
@@ -1185,7 +1244,11 @@ function SpineStep({
   return (
     <button
       type="button"
-      className={`trstep${phase.failed ? " err" : ""}${playing ? " now" : ""}`}
+      // `ph`, not `now`: `.rh-console .now` (console.css) is the Jobs-home banner CARD, equal
+      // specificity to `.rh-console .trstep`, so a step marked `now` inherited that card's border,
+      // gradient and 16px bottom margin on top of the playhead treatment (STUDIO-763 addendum, the
+      // twin of STUDIO-771's jobs-list fix).
+      className={`trstep${phase.failed ? " err" : ""}${playing ? " ph" : ""}`}
       aria-pressed={selected}
       onClick={onSelect}
     >
@@ -1387,7 +1450,14 @@ function RawTranscript({ entries, pending }: { entries: readonly LogEntry[]; pen
 const WATCH_PANEL_ID = "trwatch-panel";
 
 /**
- * The rail: five tabs under the inspector, and the one panel they switch between.
+ * Zone D: five tabs below the Split, and the one panel they switch between.
+ *
+ * The five do NOT share one scope: only Messages is scoped to the run (`runId={run.id}`), while
+ * Diff, Review, Room and Memory are all scoped to the TICKET, built to the last one on
+ * `run.issue_identifier`. What they do have in common is the negative — none of them follows the
+ * spine, unlike the inspector above, which is scoped to the step the spine has selected. So the
+ * eyebrow states that negation, "Not this step", rather than a positive scope that would be false
+ * about part of the rail; the JSX comment on it carries the per-tab audit (STUDIO-766).
  *
  * Only the SELECTED panel is mounted, which is what keeps the rail's cost honest — a run detail
  * that polled the room, the reviews and the message list all at once, for four surfaces nobody was
@@ -1406,6 +1476,17 @@ function WatchTabsRail({
 }) {
   return (
     <div className="trwatch">
+      {/* What the five tabs are scoped to, STATED rather than left to be inferred from position —
+          the whole point of pulling this zone out from under the step-scoped inspector.
+          It is a negation because every positive label is a lie about part of the rail: only
+          Messages is scoped to the run (`runId={run.id}`). Diff, Review, Room and Memory are all
+          scoped to the TICKET — `runBranch`/`prSearchUrl`, `reviewsForRun`, `roomPostsFor` and
+          `useTicketFacts` are built on `run.issue_identifier` to the last one — so switching
+          attempt leaves those four byte-identical. "This whole run" would therefore promise a
+          scope change four of the five tabs never make, which is the same defect this ticket
+          exists to remove, moved one zone up. "Not this step" is true of all five, and it draws
+          the contrast with zone C that this label is here for. */}
+      <div className="eyebrow">Not this step</div>
       {/* The ARIA roles below are a promise about the keyboard as much as about the screen
           reader, and `shell/tabs` is the repo's own answer to it — the same wire-up the Settings
           rail uses, so the two tablists behave alike. */}
@@ -1588,9 +1669,7 @@ function DiffPanel({ run }: { run: RunSummary }) {
             This run's remote is not on github.com, so there is no pull request to link to either.
           </span>
         ) : (
-          <a href={prHref} target="_blank" rel="noreferrer noopener">
-            Open this branch's pull request ↗
-          </a>
+          <ExternalLink href={prHref}>Open this branch's pull request ↗</ExternalLink>
         )}
       </div>
     </div>
@@ -1656,9 +1735,9 @@ function ReviewPanel({
               {row.job.reviewer}
             </span>
             <Pill variant={row.variant}>{row.label}</Pill>
-            <a className="pr" href={row.url} target="_blank" rel="noreferrer noopener">
+            <ExternalLink className="pr" href={row.url}>
               {row.pr} ↗
-            </a>
+            </ExternalLink>
             {row.reviewedShort === "" ? null : <Mono>read {row.reviewedShort}</Mono>}
           </div>
         ))}

@@ -1,4 +1,5 @@
 import { memo, useMemo, type ReactNode } from "react";
+import { ExternalLink } from "./ExternalLink";
 import { parseMarkdown, type MdBlock, type MdInline, type MdList } from "@/lib/markdown";
 import "@/theme/markdown.css";
 
@@ -127,11 +128,13 @@ function Inline({ node }: { node: MdInline }) {
       );
     default:
       // The parser only builds a link for an http/https/mailto href; every other scheme
-      // arrives here as text. `noreferrer` keeps the console out of the target's referrer.
+      // arrives here as text. `ExternalLink` keeps the console out of the target's referrer
+      // and hands an http(s) click to the OS browser (STUDIO-765) — a `mailto:` stays a
+      // plain anchor there, since the host command opens web URLs only.
       return (
-        <a href={node.href} target="_blank" rel="noreferrer noopener">
+        <ExternalLink href={node.href}>
           <Inlines nodes={node.children} />
-        </a>
+        </ExternalLink>
       );
   }
 }

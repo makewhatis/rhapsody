@@ -1,15 +1,27 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { Markdown } from "./Markdown";
+
+const h = vi.hoisted(() => ({ openExternal: vi.fn() }));
+
+// STUDIO-765 — a room or memory body's links leave the app through the `openExternal` seam.
+vi.mock("@/lib/bindings", async (orig) => {
+  const actual = await orig<typeof import("@/lib/bindings")>();
+  return { ...actual, openExternal: h.openExternal };
+});
+
+const { Markdown } = await import("./Markdown");
 
 // STUDIO-739 — the renderer half. The parser's tests pin what the tree says; these pin what
 // reaches the DOM: real elements for the subset, plain text for everything an agent could use
 // to inject markup, and a code block that scrolls inside its own box.
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  h.openExternal.mockClear();
+});
 
 const css = readFileSync(path.resolve(__dirname, "../../theme/markdown.css"), "utf8");
 
@@ -72,6 +84,27 @@ describe("Markdown", () => {
     expect(anchor?.getAttribute("href")).toBe("https://example.com/pr/1");
     expect(anchor?.getAttribute("rel")).toContain("noreferrer");
     expect(anchor?.getAttribute("target")).toBe("_blank");
+  });
+
+  // STUDIO-765 — the href above was never the broken half: in the packaged app the CLICK was.
+  it("hands a body link to the OS browser, so the desktop app's click is not swallowed", () => {
+    const { container } = render(<Markdown source="see [the PR](https://example.com/pr/1)" />);
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(container.querySelector("a") as Element, ev);
+    expect(h.openExternal).toHaveBeenCalledWith("https://example.com/pr/1");
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  // The host's `open_external` refuses a non-web scheme, so routing a mailto through it would
+  // trade a dead click for a rejected invoke. It stays an ordinary anchor.
+  it("leaves a mailto body link to the browser rather than to the host command", () => {
+    const { container } = render(<Markdown source="[mail](mailto:a@b.c)" />);
+    const anchor = container.querySelector("a");
+    expect(anchor?.getAttribute("href")).toBe("mailto:a@b.c");
+    const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+    fireEvent(anchor as Element, ev);
+    expect(h.openExternal).not.toHaveBeenCalled();
+    expect(ev.defaultPrevented).toBe(false);
   });
 
   // --- the injection acceptance (STUDIO-739): agent text is DATA -----------------------------

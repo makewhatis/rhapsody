@@ -5,6 +5,7 @@ import {
   buildResult,
   buildTrace,
   parseToolArgs,
+  sectionLabel,
   toolPhaseKind,
 } from "@/lib/trace-model";
 
@@ -435,6 +436,24 @@ describe("buildTrace — side effects", () => {
   });
 });
 
+// Dogfooding rc.13: a run headed its verification block "What I checked", the past tense missed
+// the pattern, and the card printed NOTES twice — once for it and once for the run's genuine notes
+// block. The corpus writes "check" and "checks" but also "checked", which the bare stem missed;
+// "checking" is covered for symmetry rather than because the corpus has reached for it yet.
+describe("sectionLabel", () => {
+  it("reads the verification heading in the tenses a run writes it", () => {
+    expect(sectionLabel("What I checked")).toBe("How verified");
+    expect(sectionLabel("What I am checking")).toBe("How verified");
+    expect(sectionLabel("Checks")).toBe("How verified");
+    expect(sectionLabel("The check")).toBe("How verified");
+  });
+
+  it("does not read a longer word that merely opens with `check`", () => {
+    expect(sectionLabel("Checkout flow")).toBe("Notes");
+    expect(sectionLabel("Checklist")).toBe("Notes");
+  });
+});
+
 describe("buildResult", () => {
   it("extracts a headline and the sectioned body from a handoff", () => {
     const card = buildResult(realisticTranscript(), run());
@@ -483,6 +502,29 @@ describe("buildResult", () => {
       "Follow-ups",
       "Notes",
     ]);
+  });
+
+  // The reported card: two blocks, both labelled NOTES. Only the SECOND heading is genuinely
+  // unclassified — the first is the verification block, written in the past tense.
+  it("labels a past-tense verification heading apart from a genuine notes block", () => {
+    seq = 0;
+    const card = buildResult(
+      [
+        say(
+          [
+            "Fixed the mislabelled block.",
+            "",
+            "## What I checked",
+            "- `npm test` green.",
+            "",
+            "## Two things I dug up along the way",
+            "- the list inset is markdown, not CSS",
+          ].join("\n"),
+        ),
+      ],
+      run(),
+    );
+    expect(card.sections.map((s) => s.label)).toEqual(["How verified", "Notes"]);
   });
 
   it("does not split on a heading inside a fenced code block", () => {

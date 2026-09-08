@@ -112,7 +112,7 @@ if [ -n "$conflicts" ]; then
 fi
 
 cat <<EOF
-  depends_on macos: :catalina
+  depends_on macos: :big_sur
 
   app "Rhapsody.app"
 

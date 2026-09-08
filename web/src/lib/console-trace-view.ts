@@ -448,6 +448,96 @@ export function runTeammate(
   return assignee.trim();
 }
 
+/** One option in the header's attempt selector (§3A). */
+export interface AttemptOption {
+  /** The run this option selects — the daemon's own handle on the attempt. */
+  id: number;
+  /** The attempt's place in the ticket's run order, oldest = 1. See [`attemptOptions`]. */
+  ordinal: number;
+  /** What the button reads: "attempt 2 · jimmy", "attempt 2 · —", or "run 545". */
+  label: string;
+  /**
+   * Whether the label names the attempt (an ordinal, and a teammate or a dash) rather than being
+   * the bare run-id fallback. The view reads it to decide whether the tooltip still has to supply
+   * the run id — on a fallback label the id is already on the button.
+   */
+  named: boolean;
+  /** The run's `started_at`, verbatim — the view formats it for the tooltip. */
+  startedAt: string;
+}
+
+/**
+ * The header's attempt selector, labelled the way the prototype's `.hd` labels it — "attempt 1 ·
+ * alice / attempt 2 · jimmy" (STUDIO-763) — rather than by the raw run ids it shipped with.
+ *
+ * `runs` is newest-first, as `runsNewestFirst` orders it, so the ORDINAL counts up from the end:
+ * the oldest run the ticket has is attempt 1. It is deliberately not `runs.attempt`, which the
+ * daemon increments on the retry path alone — every re-summoned or re-dispatched run records
+ * attempt 0, which is 432 of the 441 rows the store has ever written, and a selector reading
+ * "attempt 0" five times names none of its five choices. It is also not a claim the daemon makes:
+ * `GET /issues/{id}/history` serves at most its newest 50 rows, so on a ticket that ran more than
+ * that the numbering is relative to the window the console was given. The run id — which IS the
+ * daemon's unambiguous handle — therefore stays on every option, for the view to put in the
+ * tooltip.
+ *
+ * The teammate resolves through [`runTeammate`], so an option can never disagree with the header
+ * assignee or the spine's baton about whose attempt it was. Its tri-state is what the two
+ * degradations are drawn from, and they are different answers:
+ *
+ * - a run that resolves to a NAME reads "attempt N · alice";
+ * - a run whose own ledger recorded that it routed to nobody reads "attempt N · —" — the ticket
+ *   asked for a dash there, and it is an answer the run itself gave;
+ * - a run nothing has answered for — no routing row, no live-roster fallback, or a durable search
+ *   the caller is still withholding — falls back to "run N", the label that shipped. That is the
+ *   one case where the console knows nothing about the attempt but its id, and naming an ordinal
+ *   beside nothing would read as an attribution it does not have.
+ */
+export function attemptOptions(
+  runs: readonly RunSummary[],
+  identities: ReadonlyMap<number, string>,
+  assignee: string,
+): AttemptOption[] {
+  return runs.map((run, index) => {
+    const ordinal = runs.length - index;
+    const who = runTeammate(run, identities, assignee);
+    // "" from the map is the run's OWN answer that it routed to nobody; an absent key is no
+    // answer at all. Only the first earns an ordinal-and-dash label.
+    const recordedNobody = who === "" && identities.get(run.id) === "";
+    const label =
+      who !== ""
+        ? `attempt ${ordinal} · ${who}`
+        : recordedNobody
+          ? `attempt ${ordinal} · —`
+          : `run ${run.id}`;
+    return { id: run.id, ordinal, label, named: who !== "" || recordedNobody, startedAt: run.started_at };
+  });
+}
+
+/**
+ * How many attempts the header's selector is carrying, in the buckets its single-row breakpoints
+ * are written against (STUDIO-763). The view publishes it as `data-attempts` on `.trhd`.
+ *
+ * The stylesheet needs it because the width one header row costs is not a constant: every member
+ * but the attempt selector has a fixed natural width, and the selector grows ~110px per attempt.
+ * A single viewport breakpoint therefore either denies the row to a one-attempt ticket that had
+ * room for it, or grants it to a five-attempt ticket that has to crush every label to a glyph to
+ * keep it — which is the failure [`attemptOptions`] exists to end. A media query cannot read the
+ * count on its own, so the view hands it over and `console-trace.css` sets a threshold per bucket.
+ *
+ * Five buckets, not the raw count. Four of them name a measured width; `many` names the absence
+ * of one. Measured in Chrome, a five-attempt selector is the widest that fits a 1728px display
+ * whole — at six every label ellipsizes at every width tested up to 1920, so no threshold exists
+ * to grant, and the stylesheet keeps those tickets on the wrapped header at any size rather than
+ * buying one row with six labels that name nobody.
+ */
+export function attemptBucket(count: number): "1" | "2" | "3" | "few" | "many" {
+  if (count <= 1) return "1";
+  if (count === 2) return "2";
+  if (count === 3) return "3";
+  if (count <= 5) return "few";
+  return "many";
+}
+
 /** One handoff baton — the relay between two of a ticket's runs (design record §3C/§6). */
 export interface Baton {
   /** The teammate who handed off; "" when none resolves. */

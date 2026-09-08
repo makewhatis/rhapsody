@@ -848,8 +848,11 @@ const SECTION_PATTERNS: { label: ResultSectionLabel; re: RegExp }[] = [
     re: /follow[-\s]?ups?|next steps?|remaining|left (undone|out|to do)|not fixed|flag(ged)?\b|todo|deferred|open questions?|out of scope|carried|handoff (notes|steps)|worth (your attention|flagging|knowing)|to flag|you should know|to know/i,
   },
   {
+    // The verification stem carries its whole tense family. Over the same corpus the vocabulary
+    // above was measured on, headings write "check" 6 times and "checks" twice — but "checked" 5,
+    // and the bare `checks?` stem filed every one of those (e.g. "What I checked") under Notes.
     label: "How verified",
-    re: /verif|\btests?\b|evidence|how (i )?(verified|tested)|proof|\bci\b|\bgreen\b|\bchecks?\b|\blint\b/i,
+    re: /verif|\btests?\b|evidence|how (i )?(verified|tested)|proof|\bci\b|\bgreen\b|\bcheck(ed|ing|s)?\b|\blint\b/i,
   },
   {
     label: "What changed",

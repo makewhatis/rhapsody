@@ -283,6 +283,35 @@ describe("layout primitives (§1.4)", () => {
     expect((container.querySelector(".av") as HTMLElement).style.background).toBe("var(--mate-2)");
   });
 
+  // STUDIO-763 — the prototype's `.av` is a filled disc carrying the teammate's INITIAL, which is
+  // what the run-detail header shows beside the name. Without a name it stays the plain disc every
+  // table row uses.
+  it("carries a teammate's initial when one is given, and stays a plain disc when not", () => {
+    const { container } = render(<TeammateAvatar color="var(--mate-1)" size={20} name="alice" />);
+    const av = container.querySelector(".av") as HTMLElement;
+    expect(av.textContent).toBe("A");
+    expect(av.classList.contains("ini")).toBe(true);
+    // NOT `.mate`: the Now strip's teammate chip owns that class, and its pill border and padding
+    // would swallow the disc.
+    expect(av.classList.contains("mate")).toBe(false);
+    // Decorative: the name it abbreviates is rendered beside it in full.
+    expect(av.getAttribute("aria-hidden")).toBe("true");
+
+    const plain = render(<TeammateAvatar color="var(--mate-1)" />).container;
+    expect((plain.querySelector(".av") as HTMLElement).textContent).toBe("");
+    expect((plain.querySelector(".av") as HTMLElement).classList.contains("ini")).toBe(false);
+  });
+
+  // A name the roster serves with stray whitespace, or an empty one, must not render a blank disc
+  // with a phantom letter in it.
+  it("abbreviates a padded name, and shows no letter for a name that has none", () => {
+    const padded = render(<TeammateAvatar color="var(--mate-1)" name="  jimmy " />).container;
+    expect((padded.querySelector(".av") as HTMLElement).textContent).toBe("J");
+    const blank = render(<TeammateAvatar color="var(--mate-1)" name="   " />).container;
+    expect((blank.querySelector(".av") as HTMLElement).textContent).toBe("");
+    expect((blank.querySelector(".av") as HTMLElement).classList.contains("ini")).toBe(false);
+  });
+
   it("renders mono spans for ids and timestamps (§1.2)", () => {
     const { container } = render(
       <>

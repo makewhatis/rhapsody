@@ -96,17 +96,36 @@ export interface TeammateAvatarProps {
   /** A CSS color, normally `teammateColor(roster, name)` from theme/teammates.ts (§1.5). */
   color: string;
   size?: number;
+  /**
+   * The teammate this stands for. Supplying one turns the disc into the prototype's `.av` — a
+   * filled circle carrying their INITIAL (STUDIO-763) — which is what the run-detail header shows
+   * beside the full name. Omit it for the plain disc a table row or a summary cell uses.
+   */
+  name?: string;
   className?: string;
 }
 
 /** The small color disc that identifies a teammate in a table row or summary cell. */
-export function TeammateAvatar({ color, size = 8, className }: TeammateAvatarProps) {
+export function TeammateAvatar({ color, size = 8, name, className }: TeammateAvatarProps) {
+  // A roster name arrives from `teams.yaml` and from a route event's text, so it can carry
+  // whitespace; a name that is nothing but whitespace has no initial and stays the plain disc
+  // rather than rendering an empty lettered circle.
+  const initial = (name ?? "").trim().charAt(0).toUpperCase();
   return (
     <span
-      className={cn("av", className)}
+      // `.ini` is what the stylesheet keys the lettered variant's grid centring and type off.
+      // NOT `.mate`, which the Now strip's teammate CHIP already owns (`console.css`) — sharing it
+      // would wrap the avatar in that chip's pill border and padding.
+      className={cn("av", initial !== "" && "ini", className)}
+      // Decorative either way: the lettered variant abbreviates a name that is rendered in full
+      // beside it, so announcing the letter would only repeat it.
       aria-hidden="true"
-      style={{ display: "inline-block", flex: "none", width: size, height: size, borderRadius: "50%", background: color }}
-    />
+      // `grid` for the lettered variant so the initial centres; the plain disc stays inline-block,
+      // which is what every table row and summary cell already lays out against.
+      style={{ display: initial === "" ? "inline-block" : "grid", flex: "none", width: size, height: size, borderRadius: "50%", background: color }}
+    >
+      {initial === "" ? null : initial}
+    </span>
   );
 }
 

@@ -62,6 +62,35 @@ export function runOutcomePill(outcome: string): ConsoleJobStatus {
   }
 }
 
+/**
+ * The WORD that Pill carries in the run detail's header (§3A, STUDIO-763).
+ *
+ * The prototype's `.hd` labels its outcome pill from a fixed map — "running" / "done" / "failed"
+ * — and never shows `runs.outcome` raw, which is why the shipped header read "completed" where the
+ * mockup reads "done". Only the three the prototype names are translated.
+ *
+ * Everything else passes through VERBATIM rather than being folded into one of those three. A
+ * `stopped` run is not done and not failed, and [`runOutcomePill`] already paints it grey; giving
+ * it one of the prototype's words would state something about the run that the daemon never did.
+ * The same holds for any outcome a newer daemon adds — the console would rather show a word it
+ * does not know than the wrong one it does. An EMPTY outcome is the one case with no word at all,
+ * and "unknown" is what the header said before this existed.
+ */
+export function runOutcomeLabel(outcome: string): string {
+  switch (outcome) {
+    case "running":
+      return "running";
+    case "completed":
+      return "done";
+    case "failed":
+      return "failed";
+    case "":
+      return "unknown";
+    default:
+      return outcome;
+  }
+}
+
 // --- Pull request card (§4) ---------------------------------------------------------------
 // Rendered from data a caller supplies. NO endpoint serves it yet — see the DEPENDENCY note.
 
