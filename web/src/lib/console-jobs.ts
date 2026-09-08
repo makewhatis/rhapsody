@@ -273,13 +273,6 @@ export interface ConsoleJobRow {
   /** Whether the ticket's next move is the OPERATOR's — the Now strip's "Needs you" (§6). */
   needsYou: boolean;
   /**
-   * Whether this ticket's own job is to REVIEW a teammate's pull request (STUDIO-780), as the
-   * daemon's `review_ticket` field reports it. Already folded into `status` — it is what makes a
-   * live run read `reviewing` — and carried separately so a view can say what KIND of ticket a row
-   * is in the states where the status word cannot, e.g. a parked one reading "in review".
-   */
-  reviewTicket: boolean;
-  /**
    * Whether the daemon actually answered a tracker lifecycle for this ticket on THIS request.
    *
    * Not a property of the ticket — `issue_lifecycles` resolves per request off a TTL cache, so
@@ -468,7 +461,6 @@ export function buildConsoleJobs(
           ? statusNote(status, job.status, ticket !== undefined)
           : undefined,
       needsYou: needsOperator(status, job.status),
-      reviewTicket,
       lifecycleResolved: ticket !== undefined,
     };
   });

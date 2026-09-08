@@ -593,12 +593,14 @@ describe("filterConsoleJobs", () => {
       ]);
     });
 
-    it("labels the row and flags its kind", () => {
+    it("labels the reviewing row, and leaves an ordinary live row alone", () => {
       const row = withReviewing.find((r) => r.issue === "R");
       expect(row?.status).toBe("reviewing");
       expect(row?.statusLabel).toBe("reviewing");
-      expect(row?.reviewTicket).toBe(true);
-      expect(withReviewing.find((r) => r.issue === "A")?.reviewTicket).toBe(false);
+      // "A" is running too, and is NOT a review ticket: the narrowing must not reach it.
+      const ordinary = withReviewing.find((r) => r.issue === "A");
+      expect(ordinary?.status).toBe("run");
+      expect(ordinary?.statusLabel).toBe("running");
     });
 
     // An agent has it, so it is not the operator's move.
