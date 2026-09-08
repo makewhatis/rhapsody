@@ -240,7 +240,11 @@ impl Orchestrator {
     ) -> Result<Option<TicketReviewGate>, &'static str> {
         let Some(eff) = self.eff.as_ref() else {
             // No config has loaded yet, so there is no configured review workflow to assert
-            // against — the same pre-load silence every other off-loop reader reports.
+            // against. This asserts NOTHING where the off-loop half's own pre-load arm refuses,
+            // and the two only look inconsistent: `plan_run_merge` has already required
+            // `teams.enabled`, which is itself read from a loaded config, so a caller cannot reach
+            // here with `eff` unset. It stays an `Ok(None)` rather than a refusal because a state
+            // the daemon cannot enter needs no message written for it.
             return Ok(None);
         };
         // The run's OWN project, exactly as `review_handoff_state` resolves it; the legacy
