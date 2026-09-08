@@ -33,7 +33,9 @@
 //!   i.e. `--squash --auto`: GitHub's own auto-merge, which lands the pull request only once the
 //!   required contexts pass. `--admin` cannot be reached from here — it is not a parameter of
 //!   [`MergeSource::merge_pr`] at all. On top of that, a pull request a live Rhapsody review round
-//!   is still watching is refused ([`MergePlan::watched`]).
+//!   is still watching is refused ([`MergePlan::watched`]), one whose newest completed round asked
+//!   for changes is refused ([`MergePlan::changes_requested`]), and one GitHub reports as BEHIND on
+//!   a repository that will not update the branch is refused rather than armed to never fire.
 //! * **G3 — the confirm handshake is server-enforced.** An unconfirmed request is answered with
 //!   the receipt and NOTHING is merged; confirming means echoing back the head SHA the daemon
 //!   itself just resolved, so a stale confirmation after a push is refused.
@@ -109,6 +111,16 @@ pub struct MergePlan {
     /// exists to stop a merge racing a review already in progress, and `--auto` means even a
     /// missed one cannot land red code.
     pub watched: Vec<i64>,
+    /// Pull-request numbers in `owner/repo` whose newest COMPLETED Rhapsody review round posted
+    /// findings — the reviewer asked for changes and no later round has approved it (STUDIO-784).
+    ///
+    /// Separate from [`watched`](Self::watched) because it is the more dangerous of the two and
+    /// earns its own refusal. A round still in flight is a race; a round that FINISHED by
+    /// requesting changes is a reviewer's explicit no, and `--auto` does not save us from it —
+    /// GitHub enforces nothing here (teammates post verdicts as PR comments, and `main` has no
+    /// `required_pull_request_reviews`), so an armed auto-merge lands the moment the author's next
+    /// push turns the checks green.
+    pub changes_requested: Vec<i64>,
 }
 
 /// What the operator is about to act on, or just did — the body of both the 409 `confirm_required`
@@ -192,7 +204,11 @@ pub enum MergeControlOutcome {
 ///    refusal too, and deliberately an idempotent-feeling one rather than an error — clicking
 ///    Merge twice is a thing operators do.
 /// 4. **The review gate.** A pull request a live Rhapsody review round is watching is refused
-///    (§9.3: "refuse while a live review round is watching the PR").
+///    (§9.3: "refuse while a live review round is watching the PR"), and so is one whose newest
+///    completed round asked for changes (STUDIO-784 gap 2) — the more dangerous of the two, since
+///    that is a reviewer's explicit no GitHub enforces nothing about. Then the MERGEABILITY gate:
+///    a branch GitHub reports as BEHIND, on a repository that will not update it, is refused
+///    rather than armed to never fire (STUDIO-784 gap 1).
 /// 5. **The confirm handshake**, against the head SHA resolved in step 3 and never against one the
 ///    caller supplied for itself.
 /// 6. **The merge**, at last, as `--squash --auto` and nothing else.
@@ -263,6 +279,15 @@ pub async fn resolve_and_merge(
     if plan.watched.contains(&number) {
         return MergeControlOutcome::Refused(
             "a Rhapsody review of that pull request is still live",
+        );
+    }
+    // The reviewer's explicit no, and the one the design's liveness-only gate let through
+    // (STUDIO-784 gap 2). GitHub cannot hold this line for us — the verdict is a PR COMMENT, not a
+    // formal review, and `main` requires no approving review — so the daemon's own ledger is the
+    // only place the fact lives.
+    if plan.changes_requested.contains(&number) {
+        return MergeControlOutcome::Refused(
+            "a Rhapsody review of that pull request asked for changes and has not re-reviewed it",
         );
     }
 
@@ -580,6 +605,7 @@ mod tests {
             repo: "r".to_string(),
             branch: "symphony/STUDIO-767".to_string(),
             watched: Vec::new(),
+            changes_requested: Vec::new(),
         }
     }
 
@@ -778,6 +804,55 @@ mod tests {
         // A review of some OTHER pull request in the same repository is not this one's business.
         let elsewhere = MergePlan {
             watched: vec![63, 65],
+            ..plan()
+        };
+        let merger = FakeMerger::ok();
+        let got = resolve_and_merge(
+            &elsewhere,
+            HEAD,
+            &deps(
+                FakePrs::at("https://github.com/o/r/pull/64"),
+                FakeState::open(),
+                Arc::clone(&merger),
+            ),
+        )
+        .await;
+        assert!(matches!(got, MergeControlOutcome::Applied(_)), "{got:?}");
+    }
+
+    /// **STUDIO-784, gap 2 — the refusal the design's liveness-only gate let through.** A round
+    /// that FINISHED by requesting changes is a reviewer's explicit no, and it is the most
+    /// dangerous state of all: GitHub enforces nothing here (a teammate's verdict is a PR comment,
+    /// not a formal review, and `main` requires no approving review), so an armed auto-merge lands
+    /// the moment the author's next push turns the checks green.
+    #[tokio::test]
+    async fn a_finished_review_round_that_asked_for_changes_refuses_the_merge() {
+        let merger = FakeMerger::ok();
+        let blocked = MergePlan {
+            changes_requested: vec![64],
+            ..plan()
+        };
+        let got = resolve_and_merge(
+            &blocked,
+            HEAD,
+            &deps(
+                FakePrs::at("https://github.com/o/r/pull/64"),
+                FakeState::open(),
+                Arc::clone(&merger),
+            ),
+        )
+        .await;
+        assert_eq!(
+            got,
+            MergeControlOutcome::Refused(
+                "a Rhapsody review of that pull request asked for changes and has not re-reviewed it"
+            )
+        );
+        assert!(merger.calls().is_empty(), "nothing may be merged");
+
+        // A requested change on some OTHER pull request in the same repository is not this one's.
+        let elsewhere = MergePlan {
+            changes_requested: vec![63, 65],
             ..plan()
         };
         let merger = FakeMerger::ok();
