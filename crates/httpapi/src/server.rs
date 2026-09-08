@@ -106,6 +106,19 @@ pub trait StateProvider: Send + Sync {
         std::collections::HashMap::new()
     }
 
+    /// Which of `ids` (tracker issue ids) are REVIEW TICKETS — tickets minted so that a teammate
+    /// reviews somebody else's pull request — what decorates `GET /api/v1/history/issues` with the
+    /// `review_ticket` field (STUDIO-780). An id that is not one, or that the daemon could not
+    /// resolve, is simply absent from the set.
+    ///
+    /// Infallible for the reason [`Self::issue_lifecycles`] is, and best-effort in the same way: a
+    /// missing tracker, a failed round-trip and a ticket minted before the marker existed are all
+    /// "no answer", and the console then paints the row exactly as it did before the field existed.
+    /// Rhapsody-only (no Go v0.4.0 counterpart); the default answers nothing.
+    async fn review_tickets(&self, _ids: &[String]) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     /// The humanized per-run transcript for a run id (the concrete `*.jsonl` recorded on the run row),
     /// feeding `GET /api/v1/runs/{id}/transcript`. `None` ⇒ no such run row (→ 404); `Some(entries)`
     /// ⇒ a found run (its transcript file missing/pruned yields an empty `entries`, → 200 `entries:[]`).

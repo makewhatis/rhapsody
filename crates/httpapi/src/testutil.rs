@@ -2,7 +2,7 @@
 //! server spawner, and `Snapshot` builders. The Rust analog of `server_test.go`'s `fakeProvider` +
 //! `testServer` + `sampleSnapshot` helpers, narrowed to the H1 surface.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -86,6 +86,11 @@ pub(crate) struct FakeProvider {
     /// how a test sees that it passed the identifier along as well as the id.
     issue_assignees: HashMap<String, String>,
     issue_assignees_asked: Mutex<Vec<IssueKey>>,
+    /// The canned review-ticket markers the issue listing is decorated with (STUDIO-780), as a set
+    /// of tracker issue ids. Empty ⇒ the trait default: nothing is a review ticket, which is what a
+    /// daemon with no tracker — or one that has only ever seen ordinary tickets — reports.
+    review_tickets: HashSet<String>,
+    review_tickets_asked: Mutex<Vec<String>>,
     /// The canned `GET /api/v1/reviews` view (STUDIO-722). Unset ⇒ the trait's default, which is a
     /// DORMANT surface — exactly what a daemon with Teams off or the mode not `ticketless` serves.
     reviews: Option<ReviewsView>,
@@ -136,6 +141,8 @@ impl FakeProvider {
             teams_config_path: String::new(),
             issue_lifecycles: HashMap::new(),
             issue_lifecycles_asked: Mutex::new(Vec::new()),
+            review_tickets: HashSet::new(),
+            review_tickets_asked: Mutex::new(Vec::new()),
             issue_assignees: HashMap::new(),
             issue_assignees_asked: Mutex::new(Vec::new()),
             reviews: None,
@@ -176,6 +183,21 @@ impl FakeProvider {
     /// The issue keys the last `issue_assignees` call forwarded, in order.
     pub(crate) fn issue_assignees_asked(&self) -> Vec<IssueKey> {
         self.issue_assignees_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Canned review-ticket markers for the issue listing's `review_ticket` field (STUDIO-780), as
+    /// a set of tracker issue ids. Ids absent from `ids` are not review tickets.
+    pub(crate) fn with_review_tickets(mut self, ids: HashSet<String>) -> Self {
+        self.review_tickets = ids;
+        self
+    }
+
+    /// The issue ids the last `review_tickets` call forwarded, in order.
+    pub(crate) fn review_tickets_asked(&self) -> Vec<String> {
+        self.review_tickets_asked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -361,6 +383,17 @@ impl StateProvider for FakeProvider {
                     .get(id)
                     .map(|r| (id.clone(), r.clone()))
             })
+            .collect()
+    }
+
+    async fn review_tickets(&self, ids: &[String]) -> HashSet<String> {
+        *self
+            .review_tickets_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ids.to_vec();
+        ids.iter()
+            .filter(|id| self.review_tickets.contains(*id))
+            .cloned()
             .collect()
     }
 

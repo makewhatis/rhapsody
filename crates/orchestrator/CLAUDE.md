@@ -41,8 +41,9 @@ the `Orchestrator` struct itself. Concretely:
     `RunningEntry::event_seq`). That round-trip is best-effort by construction — the post is
     already in the log — so a gone loop costs nothing.
   - `lifecycle.rs`'s `LifecycleCache` (`Orchestrator::lifecycle: Arc<LifecycleCache>`,
-    STUDIO-702) — two `Mutex`-guarded TTL memos, of each ticket's CURRENT tracker state and of its
-    DURABLE assignee (STUDIO-735), read and written ENTIRELY on the HTTP task (they decorate
+    STUDIO-702) — three `Mutex`-guarded TTL memos, of each ticket's CURRENT tracker state, of its
+    DURABLE assignee (STUDIO-735) and of whether it is a REVIEW TICKET (STUDIO-780), read and
+    written ENTIRELY on the HTTP task (they decorate
     `GET /api/v1/history/issues`). The control task never touches them, so it is a seam only in the
     sense that the handle carries it; neither lock is held across the tracker `.await`, and the
     state sets it classifies with are read through the `reads.rs` cell above rather than from

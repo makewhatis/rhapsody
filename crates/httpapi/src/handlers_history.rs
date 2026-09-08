@@ -88,9 +88,11 @@ pub(crate) async fn handle_issue_runs(
     // exactly the rows this page returned, and both are best-effort: a row with no answer carries
     // no field and renders as it did before the fields existed.
     //
-    // The two are decorations of the same page but NOT one lookup: they resolve from different
+    // The three are decorations of the same page but NOT one lookup: they resolve from different
     // records and are cached separately, so a tracker that cannot say what state a ticket is in
-    // must not also erase who worked it.
+    // must not also erase who worked it — nor what KIND of ticket it is, which is the third
+    // (STUDIO-780): a review ticket, whose own job is to review a teammate's pull request, so the
+    // console can say "reviewing" where it would otherwise say "in review".
     let ids: Vec<String> = runs.iter().map(|r| r.issue_id.clone()).collect();
     let keys: Vec<IssueKey> = runs
         .iter()
@@ -101,9 +103,10 @@ pub(crate) async fn handle_issue_runs(
             run_id: r.id,
         })
         .collect();
-    let (lifecycles, assignees) = tokio::join!(
+    let (lifecycles, assignees, reviews) = tokio::join!(
         provider.issue_lifecycles(&ids),
-        provider.issue_assignees(&keys)
+        provider.issue_assignees(&keys),
+        provider.review_tickets(&ids)
     );
     write_json(
         StatusCode::OK,
@@ -112,6 +115,7 @@ pub(crate) async fn handle_issue_runs(
             next_offset(runs.len(), offset, effective_limit),
             &lifecycles,
             &assignees,
+            &reviews,
         ),
     )
 }
@@ -957,6 +961,46 @@ mod tests {
         assert!(
             row.get("tracker_state").is_none(),
             "no answer => no field: {row}"
+        );
+    }
+
+    // STUDIO-780 — the issue listing says which rows are REVIEW TICKETS, so the console can tell
+    // "an agent is reviewing somebody's work" from "this work is awaiting a reviewer". Only the
+    // positive is serialized: an ordinary ticket and one the daemon could not classify are the same
+    // answer to the client, and both must render as they did before the field existed.
+    #[tokio::test]
+    async fn issue_runs_mark_a_review_ticket() {
+        let store = mem_store();
+        seed_run_for("iss_review", "MT-1", "2026-08-01T00:00:00Z", &store);
+        seed_run_for("iss_impl", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_review_tickets(std::collections::HashSet::from(["iss_review".to_string()])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let by_ident: std::collections::HashMap<&str, &Value> = body["issues"]
+            .as_array()
+            .expect("issues array")
+            .iter()
+            .map(|r| (r["issue_identifier"].as_str().unwrap_or_default(), r))
+            .collect();
+        assert_eq!(by_ident["MT-1"]["review_ticket"], true);
+        assert!(
+            by_ident["MT-2"].get("review_ticket").is_none(),
+            "an ordinary ticket carries no field, never a false: {}",
+            by_ident["MT-2"],
+        );
+
+        let mut asked = provider.review_tickets_asked();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec!["iss_impl".to_string(), "iss_review".to_string()],
+            "the handler asks about exactly the page it served",
         );
     }
 
