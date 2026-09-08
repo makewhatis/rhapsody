@@ -20,8 +20,16 @@
  * receipt crosses a process boundary and `api.ts` casts the daemon's JSON rather than validating
  * it. A display helper that throws takes the whole run-detail header down with it; saying nothing
  * is the right failure.
+ *
+ * `armed` says which side of the click the note is being read on, and it changes exactly one
+ * answer. Before the click the note describes what the operator is about to act on, and `CLEAN`
+ * means "nothing is in the way". AFTER it, `gh pr merge --auto` has already landed a `CLEAN` pull
+ * request — so "GitHub reports it ready to merge" beside "queued … for merge" would read as though
+ * it were still waiting. There is nothing left for it to wait on, so the note says nothing. The
+ * states that DO still hold it up — BLOCKED, BEHIND, DIRTY — are the ones worth reading there, and
+ * they are unchanged.
  */
-export function mergeStateNote(state: string | undefined): string {
+export function mergeStateNote(state: string | undefined, armed = false): string {
   const value = (state ?? "").trim().toUpperCase();
   switch (value) {
     case "":
@@ -29,7 +37,7 @@ export function mergeStateNote(state: string | undefined): string {
       // GitHub computes mergeability lazily and says nothing while it does. Silence beats a guess.
       return "";
     case "CLEAN":
-      return "GitHub reports it ready to merge.";
+      return armed ? "" : "GitHub reports it ready to merge.";
     case "BLOCKED":
       // The ORDINARY state at arming time: the required contexts have not passed yet, which is
       // precisely what `--auto` exists to wait for.

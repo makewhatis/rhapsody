@@ -31,4 +31,21 @@ describe("mergeStateNote — what an armed auto-merge is waiting on (STUDIO-784)
   it("passes an unrecognised state through rather than hiding it", () => {
     expect(mergeStateNote("SOMETHING_NEW")).toContain("SOMETHING_NEW");
   });
+
+  // `--auto` merges a CLEAN pull request outright, so after the click there is nothing left for it
+  // to be waiting on. "GitHub reports it ready to merge" printed beside "queued … for merge" reads
+  // as though it had NOT landed, which is the opposite of the truth.
+  it("says nothing about a CLEAN pull request once the merge is armed", () => {
+    expect(mergeStateNote("CLEAN")).toMatch(/ready to merge/i);
+    expect(mergeStateNote("CLEAN", true)).toBe("");
+  });
+
+  // The states that still hold a merge up are exactly the ones the armed receipt exists to show,
+  // so arming must not silence them too.
+  it("still says what an armed merge is stuck on", () => {
+    for (const state of ["BLOCKED", "BEHIND", "DIRTY", "SOMETHING_NEW"]) {
+      expect(mergeStateNote(state, true)).toBe(mergeStateNote(state));
+      expect(mergeStateNote(state, true)).not.toBe("");
+    }
+  });
 });

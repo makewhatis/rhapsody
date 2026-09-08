@@ -756,6 +756,28 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     expect(document.querySelector(".trhd .actnote")).toBeNull();
   });
 
+  // A CLEAN pull request is merged outright by `gh pr merge --auto`, so once the click has landed
+  // there is nothing left for it to wait on. "GitHub reports it ready to merge" printed beside
+  // "queued … for merge" would read as though it had NOT merged — the one state where the note is
+  // worse than silence. Before the click it is still the right thing to say.
+  it("drops the ready-to-merge note once the merge is armed, but not before", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: { ...RECEIPT, merge_state: "CLEAN" } })
+      .mockResolvedValueOnce({
+        status: "merged",
+        receipt: { ...RECEIPT, merge_state: "CLEAN", said: "" },
+      });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    expect(screen.getByRole("dialog").textContent).toMatch(/ready to merge/i);
+
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+    await waitFor(() => expect(document.querySelector(".trhd .actok")).toBeTruthy());
+    expect(document.querySelector(".trhd .actnote")).toBeNull();
+  });
+
   // A refusal the daemon makes reaches the operator verbatim — including the two STUDIO-784 ones,
   // which the console cannot derive for itself and must not try to. Nothing is merged and no
   // success line appears.
