@@ -16,9 +16,14 @@ afterEach(cleanup);
 
 const consoleCss = readFileSync(path.resolve(__dirname, "../../theme/console.css"), "utf8");
 
-/** The spec's §1.3 variant → token mapping: green / amber / grey / blue / red. */
+/**
+ * The spec's §1.3 variant → token mapping: green / amber / grey / blue / red, plus the violet
+ * STUDIO-780 adds for `reviewing` — an agent DOING a review, which must read as neither of the
+ * two it sits between.
+ */
 const EXPECTED: Record<PillVariant, string> = {
   run: "var(--ok)",
+  reviewing: "var(--reviewing)",
   review: "var(--accent)",
   queued: "var(--ink-3)",
   done: "var(--info)",

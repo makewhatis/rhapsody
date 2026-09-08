@@ -252,10 +252,17 @@ function JobsRow({
         )}
       </td>
       {/* The Pill shows the normalized status; the tracker's own state name is the ground truth
-          behind it, so it hovers (STUDIO-702). "" when the daemon had no answer for this ticket. */}
+          behind it, so it hovers (STUDIO-702). "" when the daemon had no answer for this ticket.
+
+          `statusNote` is the row's own RUN, stated beside the TICKET's state when the two are
+          different facts (STUDIO-780) — "in review · run done". Without it the pill's one word
+          stood for both subjects and a parked ticket read as a stuck run. It and `subLabel` cannot
+          both be present: `subLabel` belongs to a held or failed row, which is never one whose run
+          has ended into a state the ticket disagrees with. */}
       <td title={row.trackerState === "" ? undefined : row.trackerState}>
         <Pill variant={row.status}>
           {row.statusLabel}
+          {row.statusNote === undefined ? "" : ` · ${row.statusNote}`}
           {row.subLabel === undefined ? "" : ` · ${row.subLabel}`}
         </Pill>
       </td>

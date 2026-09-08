@@ -5,14 +5,15 @@
 // folds the live snapshot (`/api/v1/state`), the pending retries and the issue-level history
 // (`/api/v1/history/issues`) into one row per ticket, and it is the tested source of a job's
 // status. This module is the console's PRESENTATION layer over that: it renames the daemon's
-// run-centric statuses into the five the spec's Pill speaks, and derives the Now-strip counts,
-// the two filters and the project list from them.
+// run-centric statuses into the ones the spec's Pill speaks — its five, plus STUDIO-780's
+// `reviewing` — and derives the Now-strip counts, the two filters and the project list from them.
 //
 // DEPENDENCY (§9/§11): the spec maps this view to `GET /api/v1/issues`, which the daemon does
 // not serve. There is therefore no assignee and no PR link per ticket. What is used instead,
 // and what it costs:
 //   - Status  — the TICKET's lifecycle when the daemon resolved one (STUDIO-702), else the
-//               daemon's own job status. See `consoleJobStatus`.
+//               daemon's own job status, narrowed to `reviewing` when a live run is on a REVIEW
+//               ticket (STUDIO-780). See `consoleJobStatus`.
 //   - Assignee— the DURABLE assignee the daemon resolves per history row (STUDIO-735), falling
 //               back to the Teams roster's LIVE tickets (`GET /api/v1/teams`) only for a row that
 //               has none — a run that started before its routing record landed. See
@@ -20,11 +21,30 @@
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
 import type { IssueLifecycle, IssueRun, RunSummary, TeamsOverview } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
+// The run detail's own vocabulary, imported rather than restated: `statusNote` exists to make the
+// worklist and the run detail AGREE about a run, and two copies of "completed reads done" is the
+// disagreement it is fixing. `console-job-detail` imports only TYPES back from here, so this is not
+// a runtime cycle.
+import { runOutcomeLabel } from "@/lib/console-job-detail";
 
-/** The five states the console's Pill paints (§1.3). */
-export type ConsoleJobStatus = "run" | "review" | "queued" | "done" | "blocked";
+/**
+ * The states the console's Pill paints (§1.3), plus `reviewing` (STUDIO-780).
+ *
+ * `reviewing` and `review` are the two things "in review" used to stand for at once, and they are
+ * different claims about different subjects: `reviewing` says an agent is DOING a review right now
+ * — the ticket's own job is to review a teammate's pull request, and a run is live on it — while
+ * `review` says this ticket's work is finished and is AWAITING somebody's review. A worklist that
+ * spells both "in review" is not ambiguous by accident; it is asserting they are the same state.
+ */
+export type ConsoleJobStatus = "run" | "reviewing" | "review" | "queued" | "done" | "blocked";
 
-export type ConsoleJobFilterId = "all" | ConsoleJobStatus;
+/**
+ * The Seg's ids. `reviewing` is deliberately NOT one of them: it is a kind of RUNNING — an agent
+ * has the ticket and is working — so "Running" covers it (see [`matchConsoleFilter`]). A sibling
+ * button would split the live set in two and leave the strip's four buckets no longer partitioning
+ * the worklist, which is the one property the Seg has.
+ */
+export type ConsoleJobFilterId = "all" | Exclude<ConsoleJobStatus, "reviewing">;
 
 /** The status Seg of §3, in the prototype's order. */
 export const CONSOLE_JOB_FILTERS: readonly { id: ConsoleJobFilterId; label: string }[] = [
@@ -38,6 +58,7 @@ export const CONSOLE_JOB_FILTERS: readonly { id: ConsoleJobFilterId; label: stri
 /** The Pill's text per status — the prototype's wording. */
 export const CONSOLE_STATUS_LABELS: Record<ConsoleJobStatus, string> = {
   run: "running",
+  reviewing: "reviewing",
   review: "in review",
   queued: "queued",
   done: "done",
@@ -72,7 +93,8 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
 }
 
 /**
- * The row's status: the TICKET's lifecycle when the daemon resolved one, else the run outcome.
+ * The row's status: the TICKET's lifecycle when the daemon resolved one, else the run outcome —
+ * and, when a live run is on a REVIEW ticket, `reviewing` rather than `run`.
  *
  * The ticket's state is the truer signal and outranks the outcome, because an outcome never
  * expires. Every completed run used to read "in review" for as long as the store kept it, so the
@@ -87,10 +109,25 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  *
  * An absent or unrecognized `lifecycle` falls back to the outcome mapping unchanged, so a console
  * talking to a daemon that predates the field behaves exactly as it did before.
+ *
+ * The third rule is `reviewTicket`, and it narrows the LIVE arm only (STUDIO-780). A review ticket
+ * carrying a live run is an agent doing a review, which is what `reviewing` says; the same ticket
+ * parked in the tracker's review state is not — its run is over and a person owes it a read, which
+ * is exactly what `review` already says and what it says for every other ticket in that state. So
+ * the flag changes the WORD for live work and nothing else: it never promotes a queued, blocked or
+ * terminal row, and it cannot make a row claim an agent is working when none is.
+ *
+ * It defaults to `false` on the same terms as `lifecycle` defaults to absent — a daemon that does
+ * not serve `review_ticket`, a ticket minted before the marker label existed, and a tracker that
+ * could not be asked are all the same answer, and all three read exactly as they did before.
  */
-export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJobStatus {
+export function consoleJobStatus(
+  status: string,
+  lifecycle?: string,
+  reviewTicket = false,
+): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
-  if (fromRun === "run") return "run";
+  if (fromRun === "run") return reviewTicket ? "reviewing" : "run";
   switch (lifecycle) {
     case "done":
     case "canceled":
@@ -102,6 +139,41 @@ export function consoleJobStatus(status: string, lifecycle?: string): ConsoleJob
     default:
       return fromRun;
   }
+}
+
+/**
+ * What the row's own RUN did, when that is a different fact from the status beside it (STUDIO-780).
+ *
+ * The bug this closes is a reading, not a wrong value: both halves were already true and the
+ * worklist stated only one of them. A row painted from the TICKET's lifecycle says "in review",
+ * the run detail behind it says "done", and with no cue which subject either word belongs to the
+ * list reads as stale — the operator's report was *"they are stuck in 'in review' in the dashboard,
+ * and when I click in, they are all done"*. So the row says both: `in review · run done`. Opening
+ * it then confirms the row instead of contradicting it.
+ *
+ * Three conditions, and each one is what keeps the note from being noise:
+ *
+ *   - `lifecycleResolved` — the status really IS the ticket's. When the daemon could not resolve a
+ *     lifecycle the status was inferred FROM the run outcome, so the two are one fact and a note
+ *     would restate the pill in different words.
+ *   - the run has ENDED. A live run is the row's status, and "running · run running" says nothing.
+ *   - the two words DIFFER. A `done` ticket whose run completed reads "done" either way, and the
+ *     note is for the rows where the subjects diverge — a merged ticket whose run failed, a parked
+ *     ticket whose run is over.
+ *
+ * The word comes from [`runOutcomeLabel`], which is the one the run detail's header prints, so the
+ * two surfaces cannot drift into naming the same outcome differently.
+ */
+export function statusNote(
+  status: ConsoleJobStatus,
+  runStatus: string,
+  lifecycleResolved: boolean,
+): string | undefined {
+  if (!lifecycleResolved) return undefined;
+  if (runStatus === "running" || runStatus === "waiting") return undefined;
+  const ran = runOutcomeLabel(runStatus);
+  if (ran === "" || ran === "unknown" || ran === CONSOLE_STATUS_LABELS[status]) return undefined;
+  return `run ${ran}`;
 }
 
 /**
@@ -185,8 +257,21 @@ export interface ConsoleJobRow {
   updatedAtMs: number;
   /** Held/failed detail, e.g. "waiting on STUDIO-1 · In Progress". */
   subLabel?: string;
+  /**
+   * What this row's own RUN did, when the status beside it is the TICKET's and the two are
+   * different facts — "run done" on a ticket parked in review (STUDIO-780). See [`statusNote`].
+   * Absent when the row's status already says everything there is to say.
+   */
+  statusNote?: string;
   /** Whether the ticket's next move is the OPERATOR's — the Now strip's "Needs you" (§6). */
   needsYou: boolean;
+  /**
+   * Whether this ticket's own job is to REVIEW a teammate's pull request (STUDIO-780), as the
+   * daemon's `review_ticket` field reports it. Already folded into `status` — it is what makes a
+   * live run read `reviewing` — and carried separately so a view can say what KIND of ticket a row
+   * is in the states where the status word cannot, e.g. a parked one reading "in review".
+   */
+  reviewTicket: boolean;
   /**
    * Whether the daemon actually answered a tracker lifecycle for this ticket on THIS request.
    *
@@ -238,6 +323,27 @@ export function lifecycleByIssue(rows: readonly IssueRun[]): Map<string, TicketL
     });
   }
   return byIssue;
+}
+
+/**
+ * The tickets the daemon says are REVIEW TICKETS, from the issue-level listing's `review_ticket`
+ * field (STUDIO-780) — tickets whose own job is to review a teammate's pull request.
+ *
+ * The daemon serializes only the POSITIVE, and this mirrors that exactly: an ordinary ticket, a
+ * ticket the tracker could not be asked about, and a review ticket minted before the marker label
+ * existed are all simply absent, because all three mean the same thing to this view — say about
+ * this row what was said before the field existed.
+ *
+ * Nothing here reads the title. `"Review: "` is a convention the daemon happens to follow when it
+ * MINTS one, not a fact about a ticket, and a hand-written ticket that opens with the word would be
+ * mislabelled silently and forever.
+ */
+export function reviewTicketIssues(rows: readonly IssueRun[]): Set<string> {
+  const out = new Set<string>();
+  for (const r of rows) {
+    if (r.issue_identifier !== "" && r.review_ticket === true) out.add(r.issue_identifier);
+  }
+  return out;
 }
 
 /**
@@ -322,10 +428,12 @@ export function buildConsoleJobs(
   const live = ticketAssignees(overview);
   const activity = lastActivityByIssue(issueRows);
   const lifecycles = lifecycleByIssue(issueRows);
+  const reviewTickets = reviewTicketIssues(issueRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
-    const status = consoleJobStatus(job.status, ticket?.lifecycle);
+    const reviewTicket = reviewTickets.has(job.issue);
+    const status = consoleJobStatus(job.status, ticket?.lifecycle, reviewTicket);
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     return {
       key: job.key,
@@ -346,23 +454,42 @@ export function buildConsoleJobs(
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
+      statusNote: statusNote(status, job.status, ticket !== undefined),
       needsYou: needsOperator(status, job.status),
+      reviewTicket,
       lifecycleResolved: ticket !== undefined,
     };
   });
 
   out.sort((a, b) => {
-    const ar = a.status === "run" ? 0 : 1;
-    const br = b.status === "run" ? 0 : 1;
+    // `reviewing` pins beside `run` because it IS a live run — a review ticket with an agent on it.
+    // Sorting it down among the parked rows would hide the one thing the pin exists to surface.
+    const ar = isLive(a.status) ? 0 : 1;
+    const br = isLive(b.status) ? 0 : 1;
     if (ar !== br) return ar - br;
     return b.updatedAtMs - a.updatedAtMs;
   });
   return out;
 }
 
-/** §10 box 2.7 — the status Seg. */
+/**
+ * §10 box 2.7 — the status Seg.
+ *
+ * "Running" covers `reviewing` as well as `run` (STUDIO-780): both mean an agent has the ticket and
+ * is working it, and the Seg's buckets partition the worklist — a live row that answered to no
+ * button would simply vanish from every filter but "All". "In review" deliberately does NOT cover
+ * it: that button's whole job is "what is parked and waiting on a person", and a ticket an agent is
+ * actively reviewing is the opposite of parked.
+ */
 export function matchConsoleFilter(row: ConsoleJobRow, filter: ConsoleJobFilterId): boolean {
-  return filter === "all" || row.status === filter;
+  if (filter === "all") return true;
+  if (filter === "run") return isLive(row.status);
+  return row.status === filter;
+}
+
+/** Whether a status means an agent is working the ticket right now — `run` or `reviewing`. */
+function isLive(status: ConsoleJobStatus): boolean {
+  return status === "run" || status === "reviewing";
 }
 
 /** §10 box 2.7 — the status Seg and the project Select, applied together. */
@@ -396,6 +523,7 @@ export function filterConsoleJobs(
  * What was dropped is the second pill, not the number.
  */
 export interface ConsoleJobCounts {
+  /** Rows an agent is working right now — `run` AND `reviewing` (STUDIO-780). */
   running: number;
   /** Rows reading in-review. Still counted, no longer painted — see the note above. */
   review: number;
@@ -430,7 +558,7 @@ export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCoun
   let needsYou = 0;
   let heard = false;
   for (const row of rows) {
-    if (row.status === "run") counts.running += 1;
+    if (isLive(row.status)) counts.running += 1;
     else if (row.status === "review") counts.review += 1;
     else if (row.status === "queued") counts.queued += 1;
     else if (row.status === "blocked") counts.blocked += 1;

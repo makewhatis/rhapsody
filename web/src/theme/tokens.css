@@ -54,6 +54,14 @@
   --warn-soft: #2a2312;
   --bad: #e0685f;
   --bad-soft: #2a1414;
+  /* The `reviewing` status tone (STUDIO-780) — a live run on a REVIEW ticket, i.e. an agent whose
+     whole job on this ticket is to review a teammate's pull request. Its own hue because the five
+     tones above are all spoken for and the console's one rule for status colour is that no two
+     statuses read alike: green would collide with `run`, amber with `review` — and those are
+     precisely the two it has to be told apart from. Teal was the other free hue and is not
+     available: `--operator` owns it as the operator's VOICE, and a status pill is not a voice. */
+  --reviewing: #a98be0;
+  --reviewing-soft: #221b30;
 
   /* ---- the two named teammate colors the prototype ships, plus info ----
      Kept because §1.1 lists them; NOTHING assigns a teammate color from these by
