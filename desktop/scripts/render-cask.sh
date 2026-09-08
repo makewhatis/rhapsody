@@ -127,7 +127,7 @@ fi
 # Nobody is running a supported brew under 11, so this excludes nobody who could have installed via
 # brew in the first place. It could not say 10.15 anyway: MacOSRequirement::DISABLED_MACOS_VERSIONS
 # disables :catalina and everything older, leaving :big_sur the oldest symbol still accepted — older
-# ones still parse, they are rejected afterwards as disabled (STUDIO-777, where :catalina broke `brew`
+# ones still parse but are rejected afterwards as disabled (STUDIO-777, where :catalina broke `brew`
 # here).
 #
 # `Cask::Audit#audit_min_os` does read the app bundle's real LSMinimumSystemVersion and complain when
