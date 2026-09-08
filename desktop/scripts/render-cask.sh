@@ -111,18 +111,30 @@ if [ -n "$conflicts" ]; then
   printf '%s\n' "$conflicts"
 fi
 
-# `depends_on macos:` tracks HOMEBREW's oldest expressible version, not the app's own floor: it
-# deliberately differs from tauri.conf.json's `minimumSystemVersion` (10.15) because the two answer
-# different questions — what the brew CHANNEL supports vs what the shipped binary supports — so do
-# NOT "fix" either number to match the other. Homebrew cannot express 10.15 at all any more:
-# MacOSRequirement::DISABLED_MACOS_VERSIONS disables :catalina and everything older, which leaves
-# :big_sur ("11") the oldest symbol that still parses (STUDIO-777, where :catalina broke `brew` here).
-# The divergence is audit-EXEMPT rather than merely tolerated: `Cask::Audit#audit_min_os` does read
-# the app bundle's real LSMinimumSystemVersion and complain when the cask disagrees, but it returns
-# early while that floor is <= HOMEBREW_MACOS_OLDEST_ALLOWED ("11"). Revisit if the app floor rises
-# ABOVE 11 (the audit starts caring, so this must then track `minimumSystemVersion`), or when
-# Homebrew disables :big_sur the way it disabled :catalina — its own RELEASES table already schedules
-# that for September 2027 or later.
+# `depends_on macos:` tracks HOMEBREW's oldest expressible version, not the app's own floor — but do
+# NOT "fix" the apparent mismatch with tauri.conf.json's `minimumSystemVersion` (10.15): the two
+# floors already agree in practice. Rhapsody ships Apple-Silicon-only (see desktop/README.md), and no
+# Apple Silicon Mac ever ran 10.15 — Big Sur 11.0 was the first OS on that hardware — so the shipped
+# binary's real floor is 11 too, exactly what this line declares. That 10.15 is an inert scaffold
+# value from TRA-231 which has never been revisited; raising it to "11.0" would settle the confusion
+# permanently, but that changes the shipped bundle, so it was considered and declined here (STUDIO-781
+# scoped it out) rather than overlooked.
+#
+# :big_sur is also the durable answer to the question a reader actually arrives with — "are we cutting
+# off older users?" — because Homebrew does not RUN below macOS 11 at all: brew.sh sets
+# HOMEBREW_MACOS_OLDEST_ALLOWED="11", and under it `brew` refuses outright with "too old to run
+# Homebrew!". So this excludes nobody who could have installed via brew in the first place. It could
+# not say 10.15 anyway: MacOSRequirement::DISABLED_MACOS_VERSIONS disables :catalina and everything
+# older, leaving :big_sur the oldest symbol that still parses (STUDIO-777, where :catalina broke
+# `brew` here).
+#
+# `Cask::Audit#audit_min_os` does read the app bundle's real LSMinimumSystemVersion and complain when
+# the cask disagrees, but it returns early while that floor is <= HOMEBREW_MACOS_OLDEST_ALLOWED — and
+# both it and `cask_bundle_min_os` open with `return unless online?`, so a plain `brew audit` never
+# reaches the check at all. Revisit when the plist string is finally raised above 11 (the audit then
+# starts caring, and compares exact SYMBOLS, so a floor of "12.3" would need :monterey here, not a
+# version string), or when Homebrew disables :big_sur the way it disabled :catalina — its own RELEASES
+# table already schedules that for September 2027 or later.
 cat <<EOF
   depends_on macos: :big_sur
 
