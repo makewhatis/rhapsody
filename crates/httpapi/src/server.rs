@@ -13,6 +13,7 @@ use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
+use rhapsody_orchestrator::runmerge::MergeControlOutcome;
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
     TeamsMemoryError, TeamsView,
@@ -35,6 +36,7 @@ use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_reviews::{handle_review_dismiss, handle_review_rerun, handle_reviews};
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
+use crate::handlers_runmerge::handle_run_merge;
 use crate::handlers_teams::{
     handle_run_post, handle_run_retain, handle_teams, handle_teams_config, handle_teams_invalidate,
     handle_teams_recall, handle_teams_reinstate, handle_teams_room, handle_teams_roster,
@@ -344,6 +346,17 @@ pub trait StateProvider: Send + Sync {
     async fn review_dismiss(&self, _pr: PrCoord) -> ReviewControlOutcome {
         ReviewControlOutcome::Dormant
     }
+
+    /// `POST /api/v1/runs/{id}/merge` — the operator merging a run's pull request from the console
+    /// (STUDIO-767). `confirm` is the head SHA being confirmed, empty for the handshake's first
+    /// leg; it is the ONLY value the request body contributes, and the coordinate is derived from
+    /// the run row on the control task.
+    ///
+    /// Defaults to `Dormant` for the review console's reason: a provider that predates the merge
+    /// action behaves exactly as a daemon with Teams off, which is a surface that offers no merge.
+    async fn merge_run(&self, _run_id: i64, _confirm: &str) -> MergeControlOutcome {
+        MergeControlOutcome::Dormant
+    }
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -521,6 +534,10 @@ where
         // dispatches them ahead of the catch-all runs/{id} detail route regardless of order.
         .route("/api/v1/runs/{id}/stop", any(handle_run_stop))
         .route("/api/v1/runs/{id}/resume", any(handle_run_resume))
+        // The console's merge action (STUDIO-767): POST-only, more-specific than runs/{id}. The
+        // body carries no pull-request coordinate — see `handlers_runmerge` for why that absence
+        // is the guardrail rather than a validation.
+        .route("/api/v1/runs/{id}/merge", any(handle_run_merge))
         // Daemon-mediated review handoff (TRA-242): move a live run's ticket to the review state so it
         // leaves the active set and the run cleanly ends. POST-only; more-specific than runs/{id}.
         .route("/api/v1/runs/{id}/handoff", any(handle_run_handoff))

@@ -355,6 +355,26 @@ pub enum Event {
         pr: crate::prstate::PrCoord,
         reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
     },
+    /// The operator asking, from the console, to merge a run's pull request — phase 1, the
+    /// control task's verdict on the request (STUDIO-767; NEW beyond Go v0.4.0).
+    ///
+    /// It carries the RUN ID and nothing else. That is guardrail G1 expressed in the event type:
+    /// there is no pull-request number, repository or branch on it, so no client-supplied
+    /// coordinate can travel to `gh pr merge` — the daemon derives all three from the run row on
+    /// the control task ([`crate::mergeconsole`]).
+    RunMergePlan {
+        run_id: i64,
+        reply: oneshot::Sender<crate::mergeconsole::MergePlanOutcome>,
+    },
+    /// The same merge, phase 3: the off-loop half reporting what happened so the control task can
+    /// release its single-flight claim, write the audit row and post the manager's room line
+    /// (STUDIO-767; NEW beyond Go v0.4.0). The reply is an acknowledgement, so the response is not
+    /// written before the claim is gone.
+    RunMergeSettle {
+        plan: crate::runmerge::MergePlan,
+        outcome: crate::runmerge::MergeControlOutcome,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// How long [`ControlHandle::record_teams_post`] waits for the control task to report back on a
@@ -622,6 +642,17 @@ impl Orchestrator {
             }
             Event::ReviewDismiss { pr, reply } => {
                 let _ = reply.send(self.handle_review_dismiss(&pr));
+            }
+            Event::RunMergePlan { run_id, reply } => {
+                let _ = reply.send(self.plan_run_merge(run_id));
+            }
+            Event::RunMergeSettle {
+                plan,
+                outcome,
+                reply,
+            } => {
+                self.settle_run_merge(&plan, &outcome);
+                let _ = reply.send(());
             }
         }
     }

@@ -21,6 +21,7 @@ use rhapsody_httpapi::{
 };
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
+use rhapsody_orchestrator::runmerge::MergeControlOutcome;
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
     TeamsMemory, TeamsMemoryError, TeamsView,
@@ -273,6 +274,14 @@ impl StateProvider for DaemonState {
 
     async fn review_dismiss(&self, pr: PrCoord) -> ReviewControlOutcome {
         self.handle.dismiss_review(pr).await
+    }
+
+    /// `POST /api/v1/runs/{id}/merge` (STUDIO-767). Unlike the three above it does NOT simply
+    /// round-trip the control task: the handle plans on the loop, performs the blocking `gh` half
+    /// HERE — on this HTTP task, so a stalled merge parks this request and the daemon keeps
+    /// ticking — and settles back on the loop.
+    async fn merge_run(&self, run_id: i64, confirm: &str) -> MergeControlOutcome {
+        self.handle.merge_run(run_id, confirm).await
     }
 
     fn teams_config_path(&self) -> &str {

@@ -389,7 +389,19 @@ mod tests {
     /// Its single sweep call site is inside `run_review_watch_task`, which takes no `Orchestrator`
     /// — so if you add a call, check which half you are adding it to; this list can no longer tell
     /// you apart.
-    const OFF_LOOP_CALLERS: &[&str] = &["prstate.rs", "ghsummons.rs", "reviewwatch.rs"];
+    ///
+    /// `runmerge.rs` (STUDIO-767) is the console merge action's off-loop half, and it is the one
+    /// entry here that needs no such care: it holds no `Orchestrator` AT ALL — that is its module
+    /// doc's central claim — and its loop-side decisions live in `mergeconsole.rs`, which appears
+    /// on neither list because it makes no `gh` call. Its caller is a `ControlHandle` method
+    /// running on the HTTP request's own task, so a stalled `gh pr merge` parks that request and
+    /// leaves the control task ticking.
+    const OFF_LOOP_CALLERS: &[&str] = &[
+        "prstate.rs",
+        "ghsummons.rs",
+        "reviewwatch.rs",
+        "runmerge.rs",
+    ];
 
     /// The control task's own modules, named so that widening [`OFF_LOOP_CALLERS`] to include one
     /// still fails. `loop.rs` IS the control loop; `dispatch.rs`, `select.rs` and `orchestrator.rs`
