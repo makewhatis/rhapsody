@@ -581,6 +581,9 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     method: "squash",
     auto: true,
+    // The ordinary state at arming time — `--auto` exists to wait for the required contexts, so
+    // GitHub is holding the pull request when the receipt is written (STUDIO-784).
+    merge_state: "BLOCKED",
     said: "",
   };
 
@@ -706,6 +709,71 @@ describe("zone A — the header's actions are real or dependency-named, never fa
       ),
     );
   });
+
+  // STUDIO-784 — an armed `--auto` merge is one line and then silence: the operator is told
+  // "queued for merge" and never learns whether it landed, or that it never can. The receipt
+  // carries GitHub's own merge state so the header says what the pull request is waiting on.
+  it("says what the armed merge is waiting on, beside the line saying it was queued", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: RECEIPT })
+      .mockResolvedValueOnce({ status: "merged", receipt: { ...RECEIPT, said: "" } });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    // The confirmation shows it too, so the operator confirms against the pull request's real
+    // state rather than the hope of one.
+    expect(screen.getByRole("dialog").textContent).toMatch(/required checks/i);
+
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .actnote")?.textContent).toMatch(/required checks/i),
+    );
+    // And it is its OWN element: the `.actok` line reports what the daemon did, this reports where
+    // GitHub says the pull request stands. Collapsing them would make one of the two a lie.
+    expect(document.querySelector(".trhd .actok")?.textContent).toBe(
+      "queued makewhatis/rhapsody#64 for merge",
+    );
+  });
+
+  // A daemon that stated no merge state has said nothing, and the console says nothing back —
+  // rather than rendering an empty note, or guessing at "ready".
+  it("shows no mergeability note when GitHub stated no merge state", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: { ...RECEIPT, merge_state: "" } })
+      .mockResolvedValueOnce({
+        status: "merged",
+        receipt: { ...RECEIPT, merge_state: "", said: "" },
+      });
+    mountDetail([run({ id: 547 })]);
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
+    await waitFor(() => expect(document.querySelector(".trhd .actok")).toBeTruthy());
+    expect(document.querySelector(".trhd .actnote")).toBeNull();
+  });
+
+  // A refusal the daemon makes reaches the operator verbatim — including the two STUDIO-784 ones,
+  // which the console cannot derive for itself and must not try to. Nothing is merged and no
+  // success line appears.
+  for (const why of [
+    "a Rhapsody review of that pull request asked for changes and has not re-reviewed it",
+    "this branch is behind its base and cannot update itself; push or update the branch, then merge",
+  ]) {
+    it(`renders the daemon's refusal verbatim: ${why.slice(0, 32)}…`, async () => {
+      h.mergeRun.mockRejectedValue(new Error(why));
+      mountDetail([run({ id: 547 })]);
+      await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+      fireEvent.click(action(/^merge$/i));
+
+      await waitFor(() => expect(document.querySelector(".trhd .acterr")?.textContent).toBe(why));
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(document.querySelector(".trhd .actok")).toBeNull();
+    });
+  }
 
   // `aria-modal="true"` says everything behind the veil is inert. That is only true if focus is
   // actually inside the dialog — otherwise a keyboard operator is still on the Merge button the

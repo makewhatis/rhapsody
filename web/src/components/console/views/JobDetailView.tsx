@@ -36,6 +36,7 @@ import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "
 import { useTicketFacts } from "@/hooks/useTicketFacts";
 import { ticketAssignees } from "@/lib/console-jobs";
 import { clockTime, runOutcomeLabel, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
+import { mergeStateNote } from "@/lib/console-merge";
 import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
@@ -757,6 +758,16 @@ function HeaderActions({
             : merged.said}
         </span>
       ) : null}
+      {/* What the armed merge is WAITING on (STUDIO-784). Its own element rather than a suffix on
+          the line above, because the two say different things: that one reports what the daemon
+          did, this one reports where GitHub says the pull request stands — and an armed `--auto`
+          merge is otherwise one line followed by silence. Absent when GitHub stated no merge
+          state, which is a real answer and not a reason to guess. */}
+      {merged === null || mergeStateNote(merged.merge_state) === "" ? null : (
+        <span className="actnote" role="status">
+          {mergeStateNote(merged.merge_state)}
+        </span>
+      )}
       {confirming === null ? null : (
         <MergeConfirm
           receipt={confirming}
@@ -859,6 +870,11 @@ function MergeConfirm({
           Confirming merges the commit above — if it has been pushed to since, you will be asked
           again.
         </p>
+        {/* Where GitHub says the pull request stands right now, so the operator confirms against
+            its real state rather than against the hope of one (STUDIO-784). */}
+        {mergeStateNote(receipt.merge_state) === "" ? null : (
+          <p className="sub">{mergeStateNote(receipt.merge_state)}</p>
+        )}
         {error === "" ? null : (
           <p className="err" role="alert">
             {error}

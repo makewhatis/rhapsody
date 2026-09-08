@@ -337,6 +337,9 @@ describe("mergeRun — the console merge action's confirm handshake (STUDIO-767)
     head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     method: "squash",
     auto: true,
+    // The ordinary state at arming time: `--auto` exists precisely to wait for the required
+    // contexts, so GitHub is holding the pull request when the receipt is written (STUDIO-784).
+    merge_state: "BLOCKED",
   };
 
   // The 409 that is NOT an error: the daemon resolved the pull request, merged nothing, and is
