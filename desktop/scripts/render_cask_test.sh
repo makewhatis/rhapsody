@@ -85,7 +85,7 @@ cask "rhapsody" do
   homepage "https://github.com/makewhatis/rhapsody"
 
   auto_updates true
-  depends_on macos: :catalina
+  depends_on macos: :big_sur
 
   app "Rhapsody.app"
 
@@ -115,7 +115,7 @@ cask "rhapsody@rc" do
 
   auto_updates true
   conflicts_with cask: "rhapsody"
-  depends_on macos: :catalina
+  depends_on macos: :big_sur
 
   app "Rhapsody.app"
 
@@ -139,7 +139,7 @@ assert_contains "$out" 'name "Rhapsody"'                                       '
 assert_contains "$out" 'desc "Supervises the rhapsodyd daemon and shows its dashboard"' 'emits the desc'
 assert_contains "$out" 'homepage "https://github.com/makewhatis/rhapsody"'     'emits the homepage'
 assert_contains "$out" 'auto_updates true'                                     'declares auto_updates (P11 in-app updater coexistence)'
-assert_contains "$out" 'depends_on macos: :catalina'                           'depends on macOS Catalina or later'
+assert_contains "$out" 'depends_on macos: :big_sur'                            'depends on macOS Big Sur or later'
 assert_contains "$out" 'app "Rhapsody.app"'                                    'installs Rhapsody.app'
 assert_contains "$out" 'end'                                                   'closes the cask block'
 
@@ -221,8 +221,8 @@ assert_eq "$rc" "$RC_GOLDEN"                                                   '
 rc_from_stable="$(printf '%s\n' "$STABLE_GOLDEN" \
   | sed -e 's/^cask "rhapsody" do$/cask "rhapsody@rc" do/' \
         -e "s/^  version \"$VERSION\"\$/  version \"$RC_VERSION\"/" \
-        -e 's|^  depends_on macos: :catalina$|  conflicts_with cask: "rhapsody"\
-  depends_on macos: :catalina|')"
+        -e 's|^  depends_on macos: :big_sur$|  conflicts_with cask: "rhapsody"\
+  depends_on macos: :big_sur|')"
 assert_eq "$rc" "$rc_from_stable"                                              'rc: differs from stable ONLY by the token, the version and the conflicts_with stanza'
 
 # --- channel validation (STUDIO-648) ------------------------------------------
