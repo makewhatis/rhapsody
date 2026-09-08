@@ -29,7 +29,7 @@ import {
   useTranscript,
 } from "@/hooks/useRunDetail";
 import { useLinearIdentity } from "@/hooks/useConfig";
-import { useResumeRun, useSendRunMessage, useStopRun } from "@/hooks/useRunActions";
+import { useMergeRun, useResumeRun, useSendRunMessage, useStopRun } from "@/hooks/useRunActions";
 import { useReviews } from "@/hooks/useReviews";
 import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
 import { useTicketFacts } from "@/hooks/useTicketFacts";
@@ -93,7 +93,13 @@ import {
   type SaidBlock,
   type TracePhase,
 } from "@/lib/trace-model";
-import type { LogEntry, RunSummary, TeamsFact, TeamsRoomMessage } from "@/lib/api";
+import type {
+  LogEntry,
+  MergeReceipt,
+  RunSummary,
+  TeamsFact,
+  TeamsRoomMessage,
+} from "@/lib/api";
 import "@/theme/console-trace.css";
 
 // Job detail — the "Trace" run detail (STUDIO-742), the three zones of the design record
@@ -125,11 +131,16 @@ import "@/theme/console-trace.css";
 // that changed something the team can see, and the baton names each attempt's own teammate so a
 // multi-agent ticket reads as a real relay (§3A/§3C/§6). Its source is `lib/run-identity`.
 //
+// Slice 5's sibling (STUDIO-767) makes the header's Merge a REAL action: the operator clicks it,
+// the daemon resolves the run's own pull request and merges it. The console never names a pull
+// request — see `handlers_runmerge` for why that absence is the guardrail — so all this sends is
+// the run id and, on the second leg of the confirm handshake, the head SHA the daemon just showed
+// it (design record `~/.rhapsody/docs/STUDIO-767-console-merge-action.md` §3/G1, §3/G3).
+//
 // The model behind all three zones is `lib/trace-model` (slice 1) and `lib/console-trace-view`;
 // the rail's own is `lib/console-watch`. Nothing here re-derives them. What no endpoint serves is
 // still not invented: there is no PR number (§5), so "View PR" resolves through a head-branch
-// search, "Merge" names the daemon endpoint it is waiting on, and the Diff tab is a dependency
-// card with a deep link rather than a diff nobody served.
+// search, and the Diff tab is a dependency card with a deep link rather than a diff nobody served.
 
 export function JobDetailView({
   issue,
@@ -573,16 +584,33 @@ function HeaderActions({
 }) {
   const stop = useStopRun(run.id);
   const resume = useResumeRun(run.id);
+  const merge = useMergeRun(run.id);
+  const teamsEnabled = useTeamsEnabled();
   const prHref = prSearchUrl(run);
+  // The receipt the daemon is asking the operator to confirm (STUDIO-767). Held here rather than
+  // read off `merge.data`, because confirming re-runs the mutation and the modal must keep showing
+  // the SAME pull request while that is in flight.
+  const [confirming, setConfirming] = useState<MergeReceipt | null>(null);
+  const merged = merge.data?.status === "merged" ? merge.data.receipt : null;
   // The console has no toast surface, so a lifecycle action reports here or nowhere. Both halves
   // matter: the request can fail, and it can succeed while the ticket MOVE fails — a run killed
-  // whose ticket stayed put is something the operator has to finish by hand.
+  // whose ticket stayed put is something the operator has to finish by hand. A refused merge lands
+  // here too: `merge_refused` carries the daemon's own reason, and it is the whole of what the
+  // operator needs to read.
   const problem =
     stop.error?.message ??
     resume.error?.message ??
+    merge.error?.message ??
     stop.data?.move_error ??
     resume.data?.move_error ??
     "";
+  // Both legs of the handshake go through here, so the modal opens on a `confirm` answer whichever
+  // leg produced it — which is what makes a STALE confirmation (the author pushed in between) show
+  // the operator the new head instead of merging code they never saw.
+  const askMerge = (confirm: string) =>
+    merge.mutate(confirm, {
+      onSuccess: (res) => setConfirming(res.status === "confirm" ? res.receipt : null),
+    });
   return (
     <div className="acts">
       {problem === "" ? null : (
@@ -641,9 +669,99 @@ function HeaderActions({
           View PR
         </a>
       )}
-      <DepButton title="Merging needs the run-branch diff endpoint, deferred in the Trace plan.">
-        Merge
-      </DepButton>
+      {/* The real green primary (design §5). Every refusal — no open pull request on the branch,
+          a live Rhapsody review round, an already-merged or closed one, a merge already in flight
+          — is the DAEMON's to make and arrives as a message in `problem`, because the console
+          cannot know any of them without asking and must not guess at one. */}
+      {teamsEnabled ? (
+        <Button variant="pri" onClick={() => askMerge("")} disabled={merge.isPending}>
+          Merge
+        </Button>
+      ) : (
+        <DepButton title="Rhapsody Teams is not enabled on this daemon, so it has no merge path.">
+          Merge
+        </DepButton>
+      )}
+      {merged ? (
+        <span className="actok" role="status">
+          {merged.said === undefined || merged.said === ""
+            ? `merged ${merged.pr}`
+            : merged.said}
+        </span>
+      ) : null}
+      {confirming === null ? null : (
+        <MergeConfirm
+          receipt={confirming}
+          busy={merge.isPending}
+          onConfirm={() => askMerge(confirming.head_sha)}
+          onClose={() => setConfirming(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The merge confirmation (design §3/G3). It renders the receipt the DAEMON resolved — the pull
+ * request, its head commit, and how it will be merged — and confirming re-POSTs that head SHA.
+ *
+ * The confirmation is server-enforced, so this modal is not the guard: a forged POST simply skips
+ * it, and the daemon still refuses unless the SHA matches the one it re-resolves. What the modal
+ * is for is the other failure mode — an operator merging the wrong thing by clicking.
+ */
+function MergeConfirm({
+  receipt,
+  busy,
+  onConfirm,
+  onClose,
+}: {
+  receipt: MergeReceipt;
+  busy: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="mgveil" role="presentation" onClick={onClose}>
+      <div
+        className="mgconf"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Merge ${receipt.pr}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="ttl">Merge {receipt.pr}?</div>
+        <div className="fx">
+          <a href={receipt.url} target="_blank" rel="noreferrer noopener">
+            {receipt.url}
+          </a>
+          <Mono>
+            {receipt.head_sha.slice(0, 12)} · {receipt.method}
+            {receipt.auto ? ", auto" : ""}
+          </Mono>
+        </div>
+        <p className="sub">
+          {receipt.auto
+            ? "GitHub's own auto-merge is armed: the pull request lands only once its required checks pass, and never before."
+            : "The pull request is merged immediately."}{" "}
+          Confirming merges the commit above — if it has been pushed to since, you will be asked
+          again.
+        </p>
+        <div className="row">
+          <Button variant="sec" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="pri" onClick={onConfirm} disabled={busy}>
+            {busy ? "Merging…" : "Merge"}
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

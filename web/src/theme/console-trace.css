@@ -269,3 +269,18 @@
 .rh-console .askex .qq .qb { min-width: 0; font-size: 12.5px; color: var(--ink); overflow-wrap: anywhere; }
 .rh-console .askex .pending { font-size: 11.5px; color: var(--ink-3); }
 .rh-console .askex .pending .link { font-size: 11.5px; }
+
+/* STUDIO-767 — the merge action. `.actok` is the header's positive counterpart to `.acterr`: a
+   merge that landed (or armed GitHub's auto-merge) reports gh's own words, since the console has
+   no toast surface and an action that silently succeeded reads as one that did nothing. */
+.rh-console .trhd .acts .actok { font-size: 11.5px; color: var(--ok); max-width: 44ch; }
+
+/* The confirm modal (§3/G3). Deliberately plain: it exists to show the operator the pull request
+   the DAEMON resolved before an irreversible click, not to be a surface of its own. */
+.rh-console .mgveil { position: fixed; inset: 0; z-index: 500; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; }
+.rh-console .mgconf { width: 460px; max-width: 90vw; background: var(--panel); border: 1px solid var(--line-strong, var(--line)); border-radius: var(--r); padding: 20px 22px; display: flex; flex-direction: column; gap: 12px; }
+.rh-console .mgconf .ttl { font-size: 15px; font-weight: 600; color: var(--ink); }
+.rh-console .mgconf .fx { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; overflow-wrap: anywhere; }
+.rh-console .mgconf .fx a { color: var(--operator); }
+.rh-console .mgconf .sub { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--ink-3); }
+.rh-console .mgconf .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
