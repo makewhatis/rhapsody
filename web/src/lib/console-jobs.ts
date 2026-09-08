@@ -163,6 +163,11 @@ export function consoleJobStatus(
  *
  * The word comes from [`runOutcomeLabel`], which is the one the run detail's header prints, so the
  * two surfaces cannot drift into naming the same outcome differently.
+ *
+ * The caller adds a fourth condition it can see and this cannot: a row that already carries a
+ * `subLabel` gets no note. `subLabel` is the held/failed detail, and on a failed row it is the
+ * error itself — "blocked · run failed · <error>" spends a third of the pill restating what the
+ * next clause says better. See [`buildConsoleJobs`].
  */
 export function statusNote(
   status: ConsoleJobStatus,
@@ -172,7 +177,9 @@ export function statusNote(
   if (!lifecycleResolved) return undefined;
   if (runStatus === "running" || runStatus === "waiting") return undefined;
   const ran = runOutcomeLabel(runStatus);
-  if (ran === "" || ran === "unknown" || ran === CONSOLE_STATUS_LABELS[status]) return undefined;
+  // "unknown" is what an EMPTY outcome renders as — the daemon said nothing about how this run
+  // ended, which is not a fact worth putting beside the ticket's state.
+  if (ran === "unknown" || ran === CONSOLE_STATUS_LABELS[status]) return undefined;
   return `run ${ran}`;
 }
 
@@ -454,7 +461,12 @@ export function buildConsoleJobs(
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
-      statusNote: statusNote(status, job.status, ticket !== undefined),
+      // Not when the row already has a `subLabel`: that is the held/failed detail, and on a failed
+      // row it IS the error, which says more than "run failed" does. See [`statusNote`].
+      statusNote:
+        job.subLabel === undefined
+          ? statusNote(status, job.status, ticket !== undefined)
+          : undefined,
       needsYou: needsOperator(status, job.status),
       reviewTicket,
       lifecycleResolved: ticket !== undefined,

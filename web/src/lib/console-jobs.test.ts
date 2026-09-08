@@ -205,6 +205,26 @@ describe("statusNote", () => {
   });
 });
 
+// The fourth condition, which lives in the builder: a failed row's `subLabel` IS the error, and
+// "blocked · run failed · <error>" spends a third of the pill restating what follows it.
+describe("statusNote on a row that already explains itself", () => {
+  it("leaves a failed row's error to speak for the run", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "BROKE", status: "failed", subLabel: "boom" })],
+      [issueRow({ issue_identifier: "BROKE", lifecycle: "done" })],
+      undefined,
+      NOW,
+    );
+    expect(rows[0]?.subLabel).toBe("boom");
+    expect(rows[0]?.statusNote).toBeUndefined();
+  });
+
+  // Without the guard the same row would carry both — this is what is being suppressed.
+  it("would otherwise have had one", () => {
+    expect(statusNote("done", "failed", true)).toBe("run failed");
+  });
+});
+
 describe("relativeSince", () => {
   it("renders each magnitude", () => {
     expect(relativeSince(NOW - 30_000, NOW)).toBe("just now");

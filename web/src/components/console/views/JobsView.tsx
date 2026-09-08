@@ -256,9 +256,9 @@ function JobsRow({
 
           `statusNote` is the row's own RUN, stated beside the TICKET's state when the two are
           different facts (STUDIO-780) — "in review · run done". Without it the pill's one word
-          stood for both subjects and a parked ticket read as a stuck run. It and `subLabel` cannot
-          both be present: `subLabel` belongs to a held or failed row, which is never one whose run
-          has ended into a state the ticket disagrees with. */}
+          stood for both subjects and a parked ticket read as a stuck run. It and `subLabel` are
+          never both present — `buildConsoleJobs` suppresses the note on a row that has one, because
+          a failed row's `subLabel` is the error itself and says more than "run failed" does. */}
       <td title={row.trackerState === "" ? undefined : row.trackerState}>
         <Pill variant={row.status}>
           {row.statusLabel}
