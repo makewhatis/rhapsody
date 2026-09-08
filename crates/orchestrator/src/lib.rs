@@ -65,6 +65,7 @@ pub mod reviewconsole;
 pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewwatch;
+pub mod runmerge;
 pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;

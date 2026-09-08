@@ -451,6 +451,15 @@ impl MergeMethod {
             MergeMethod::Rebase => "--rebase",
         }
     }
+
+    /// The method's name as an operator reads it, for a receipt or an audit line.
+    pub fn name(self) -> &'static str {
+        match self {
+            MergeMethod::Squash => "squash",
+            MergeMethod::Merge => "merge",
+            MergeMethod::Rebase => "rebase",
+        }
+    }
 }
 
 /// How much of `gh`'s own chatter a merge carries back into the audit record. A merge prints one
