@@ -275,6 +275,37 @@ where
         spawn_triage(install_probe, &teams_cfg).then(|| Arc::new(TriageHandle::new()));
     o.teams_triage = triage_seam.clone();
 
+    // --- the console merge action (STUDIO-767; design record
+    // ~/.rhapsody/docs/STUDIO-767-console-merge-action.md §3) ---
+    //
+    // The three `gh` seams `POST /api/v1/runs/{id}/merge` drives, built HERE so `o.control()`
+    // below snapshots them onto the handle that serves the endpoint. One `GH` fills all three:
+    // they are separate TRAITS so that a task holding only reads cannot merge anything, not
+    // because the daemon needs three objects.
+    //
+    // Built only when Teams is on, which is the whole gate — with Teams off `merge_deps` stays
+    // `None`, the endpoint answers `teams_disabled`, and the console's Merge is dependency-named.
+    // The summon token is the only construction input `GH::new` takes and none of these three
+    // queries uses it, so a daemon with no readable workflow still merges.
+    o.merge_deps = teams_cfg.enabled.then(|| {
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            &resolved
+                .as_ref()
+                .map(|c| c.tracker.summon_token.clone())
+                .unwrap_or_default(),
+            None,
+        ));
+        Arc::new(rhapsody_orchestrator::runmerge::MergeDeps {
+            prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::OpenPrSource>,
+            state: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
+            merger: gh as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
+            // The base repository's own owner and nothing else — the watcher's default trust
+            // boundary. There is no config key to widen it, so widening is a code change a
+            // reviewer sees.
+            allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+        })
+    });
+
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
 
