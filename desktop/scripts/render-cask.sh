@@ -111,6 +111,18 @@ if [ -n "$conflicts" ]; then
   printf '%s\n' "$conflicts"
 fi
 
+# `depends_on macos:` tracks HOMEBREW's oldest expressible version, not the app's own floor: it
+# deliberately differs from tauri.conf.json's `minimumSystemVersion` (10.15) because the two answer
+# different questions — what the brew CHANNEL supports vs what the shipped binary supports — so do
+# NOT "fix" either number to match the other. Homebrew cannot express 10.15 at all any more:
+# MacOSRequirement::DISABLED_MACOS_VERSIONS disables :catalina and everything older, which leaves
+# :big_sur ("11") the oldest symbol that still parses (STUDIO-777, where :catalina broke `brew` here).
+# The divergence is audit-EXEMPT rather than merely tolerated: `Cask::Audit#audit_min_os` does read
+# the app bundle's real LSMinimumSystemVersion and complain when the cask disagrees, but it returns
+# early while that floor is <= HOMEBREW_MACOS_OLDEST_ALLOWED ("11"). Revisit if the app floor rises
+# ABOVE 11 (the audit starts caring, so this must then track `minimumSystemVersion`), or when
+# Homebrew disables :big_sur the way it disabled :catalina — its own RELEASES table already schedules
+# that for September 2027 or later.
 cat <<EOF
   depends_on macos: :big_sur
 
