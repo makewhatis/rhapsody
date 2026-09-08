@@ -109,7 +109,7 @@ pub use preflight::{
 };
 pub use quorum::{
     MAX_QUORUM_BACKOFF_MS, QUORUM_REQUESTED_LABEL, QuorumDeps, QuorumRequest, QuorumTarget,
-    run_quorum_task,
+    REVIEW_TICKET_LABEL, run_quorum_task,
 };
 pub use reads::{Identity, ProjectTracker, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};
