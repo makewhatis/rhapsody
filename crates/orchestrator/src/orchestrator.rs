@@ -479,6 +479,21 @@ pub struct Orchestrator {
     pub claimed: HashSet<String>,
     /// Scheduled retries, keyed by opaque issue id (or identifier for boot-recovered entries).
     pub retry_attempts: HashMap<String, RetryEntry>,
+    /// How many candidates the last selection pass **withheld** for each teammate because that
+    /// teammate was at their `max_concurrent` (STUDIO-802; design record
+    /// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.5). Derived per tick — cleared at the
+    /// top of every tick's dispatch and refilled by the pass, so it is never older than the tick
+    /// reading it even when the candidate fetch fails. There is no durable queue and no stable
+    /// queue position (D4): a teammate who frees up simply stops appearing here on the next tick.
+    ///
+    /// Keyed by identity from the outset because that is its final shape: the console renders a
+    /// per-teammate count, so a scalar would have to be widened again a ticket later. Empty
+    /// whenever Teams is off, which is what lets a later re-arm keep costing a Teams-off daemon
+    /// nothing (D5).
+    ///
+    /// Loop-confined, like every other scheduling map here: the ladder takes `&self` and returns
+    /// this tally, and the `&mut self` caller stores it.
+    pub(crate) held_for_capacity: HashMap<String, i64>,
     /// Issue ids whose work has completed this process lifetime, a set.
     pub completed: HashSet<String>,
     /// Graphite-mode stacking facts carried from the auto-promote pass to the next tick's dispatch
@@ -707,6 +722,7 @@ impl Orchestrator {
             running: HashMap::new(),
             claimed: HashSet::new(),
             retry_attempts: HashMap::new(),
+            held_for_capacity: HashMap::new(),
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),

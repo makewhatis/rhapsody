@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_agent as agent;
+use rhapsody_config::teams::{Identity, Teams};
 use rhapsody_config::workflow::{Definition, YamlMap};
 use rhapsody_config::{Config, decode, resolve};
 use rhapsody_core::{BlockerRef, Issue, normalize_state};
@@ -331,6 +332,39 @@ pub(crate) fn orch_with_store() -> (Orchestrator, Arc<dyn Store + Send + Sync>) 
     let mut o = Orchestrator::new("WORKFLOW.md");
     o.set_store(Arc::clone(&store));
     (o, store)
+}
+
+/// A single-project select orchestrator with Teams ON and a roster built from `(name,
+/// max_concurrent)` pairs — the fixture for the capacity ladder (STUDIO-802; design record
+/// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.1).
+///
+/// Deliberately **not** called `orch_with_teams`: that name belongs to `teams.rs`'s helper, which
+/// takes an already-built [`Teams`] and returns a tuple.
+///
+/// No triage handle is wired, so [`Orchestrator::teams_awaiting_assignment`] holds nothing and the
+/// only reason a candidate can be withheld is the capacity gate under test. The global slot budget
+/// is deliberately generous for the same reason.
+pub(crate) fn orch_with_capped_roster(roster: &[(&str, i64)]) -> Orchestrator {
+    let mut o = Orchestrator::new("WORKFLOW.md");
+    let mut eff = empty_effective(Arc::new(Fake::new()));
+    eff.active_states = active_set();
+    eff.terminal_states = terminal_set();
+    eff.max_concurrent = 10;
+    o.eff = Some(eff);
+    o.teams = Some(Teams {
+        enabled: true,
+        roster: roster
+            .iter()
+            .map(|(name, max_concurrent)| Identity {
+                name: (*name).to_string(),
+                profile: "swe".to_string(),
+                max_concurrent: *max_concurrent,
+                ..Identity::default()
+            })
+            .collect(),
+        ..Teams::disabled()
+    });
+    o
 }
 
 /// Seeds one completed run whose `started_at` is `ended_at - 1m` (Go `seedRun`), the summons-

@@ -283,6 +283,33 @@ impl LoadSnapshot {
         self.implementation.get(name).copied().unwrap_or(0)
     }
 
+    /// This snapshot advanced by the admits a selection pass has already made, so that a pass
+    /// holding `&self` can route its LATER candidates against the load its OWN earlier ones
+    /// created (STUDIO-802).
+    ///
+    /// `tally` is the ladder's pass-local implementation count per identity — seeded from
+    /// [`impl_live`](Self::impl_live) and incremented once per admit — so `tally - impl_live` is
+    /// exactly how many runs the pass has admitted for that identity, and each of those is one
+    /// more live run as well as one more implementation run. **Both halves are advanced**, because
+    /// [`route`] reads both: `at_capacity` reads the implementation count, and
+    /// `best_by_label_overlap`'s fewest-live-runs tiebreak reads the all-runs count. Advancing only
+    /// the first would still leave the ladder's answer differing from the dispatch loop's, which
+    /// re-routes per issue with `running` genuinely advanced (`retry.rs:349` then `:444`).
+    ///
+    /// An identity the pass has not touched is absent from `tally` and is copied through unchanged.
+    pub(crate) fn advanced_by(&self, tally: &HashMap<String, i64>) -> Self {
+        let mut next = self.clone();
+        for (name, counted) in tally {
+            let admitted = counted - self.impl_live(name);
+            if admitted <= 0 {
+                continue;
+            }
+            *next.all.entry(name.clone()).or_default() += admitted;
+            next.implementation.insert(name.clone(), *counted);
+        }
+        next
+    }
+
     /// The raw per-identity ALL-runs counts, for the reviewer ranking in
     /// [`crate::quorum::rank_reviewers`] — which is shared with the quorum's own `rhapsody:@` label
     /// load and therefore takes the map rather than this wrapper (STUDIO-721).
@@ -457,9 +484,24 @@ fn best_by_label_overlap(teams: &Teams, iss: &Issue, load: &LoadSnapshot) -> Opt
 /// which §0.11.1 makes authoritative ("a present label, whoever wrote it, is
 /// authoritative Tier 0", and the ticket's own decision order says Tier 0 "wins
 /// outright"), and never to `default_identity`, which is the never-refuse floor
-/// rather than a candidate. Capping either of those could only ever move an
-/// explicitly-assigned ticket to somebody else; it could never make the work
-/// wait, because there is no variant of [`Routed`] that can hold work.
+/// rather than a candidate. Capping either of those *here* could only ever move an
+/// explicitly-assigned ticket to somebody else, which is precisely what a present
+/// `rhapsody:@` label must never cause.
+///
+/// **Making the work WAIT is a different answer at a different layer**, and since
+/// STUDIO-802 it exists: there is still no variant of [`Routed`] that can hold work,
+/// but the select ladder takes routing's answer — from whichever tier produced it —
+/// and withholds the ticket for the tick when that teammate is at their cap
+/// ([`Orchestrator::at_cap`]; design record
+/// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.2). So this function's job is
+/// unchanged and deliberately narrow: it decides who is a *candidate*, never whether
+/// the work goes out now.
+///
+/// The two layers do not overlap: the ladder routes each candidate against a load already
+/// advanced by its own admits ([`LoadSnapshot::advanced_by`]), so a name THIS filter let
+/// through is a name that filter's caller then finds under its cap. The hold therefore
+/// falls only where §4.2 says it should — a Tier 0 label, `default_identity`, and the
+/// fallthrough where this filter has rejected every matching candidate.
 ///
 /// The cap counts IMPLEMENTATION runs only ([`LoadSnapshot::impl_live`]), so a review never
 /// consumes it: reviews draw from their own counter, and a teammate at their implementation cap
@@ -665,6 +707,70 @@ impl Orchestrator {
         )
         .reason
             == RouteReason::Unrouted
+    }
+
+    /// The identity this candidate WOULD be dispatched to, or `None` when the ladder has no
+    /// teammate to ask a capacity question about (STUDIO-802; design record
+    /// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.2).
+    ///
+    /// It is [`route_teams`](Self::route_teams)'s own answer minus the profile rendering and the
+    /// event row — the same [`route`] call and the same pending-assignment substitution. Routing
+    /// stays exactly as pure as D3 requires: this asks it a question, it gains no new behaviour and
+    /// no new variant.
+    ///
+    /// **`load` is the caller's, and it must be the load as of THIS candidate**, not as of the
+    /// start of the pass. The dispatch loop re-routes every issue with `running` advanced in
+    /// between (`dispatch_issue` routes at `retry.rs:349` and inserts at `:444`, and `loop.rs:834`
+    /// walks the picks sequentially), so a ladder that routed every candidate against the frozen
+    /// start-of-pass load would answer differently from the loop that actually dispatches them —
+    /// and would then hold a ticket for a teammate who was never going to take it. The ladder
+    /// passes [`LoadSnapshot::advanced_by`] over its pass-local tally for exactly that reason, so
+    /// the two agree and the fallback tier's own `at_capacity` filter (`teams.rs:424`) keeps doing
+    /// the reassignment the design record blesses: "Reassignment among *fallback* candidates is
+    /// right and stays" (§4.2). What is left for the ladder to hold is what §4.2 enumerates — an
+    /// explicit Tier 0 label on a busy teammate, a busy `default_identity`, and the fallthrough
+    /// where every matching candidate is saturated.
+    ///
+    /// `None` in exactly three cases, and every one of them must **dispatch**, never wait:
+    ///
+    /// * **Teams absent or `enabled: false`** (D5) — tested first, so a Teams-off daemon performs
+    ///   no routing call and consults no counter at all; it pays one `Option` test.
+    /// * **Nothing routes** — [`SOLO_LABEL`], `manager.mode: off` with no `default_identity`, or
+    ///   the unrouted floor. There is no teammate to be over cap.
+    /// * **The routed name is on no roster.** A hold released only by a teammate who does not
+    ///   exist is one nothing can ever release — the same hazard
+    ///   [`teams_awaiting_assignment`](Self::teams_awaiting_assignment) names for the triage hold,
+    ///   with a different trigger. [`route`] validates every tier against the roster today
+    ///   (`tier0` and `best_by_label_overlap` iterate it; `default_identity` and
+    ///   `apply_pending_assignment` re-check it), so this **pins** that property rather than
+    ///   closing a live gap — and it is precisely the check a future tier would forget.
+    pub(crate) fn planned_identity(&self, iss: &Issue, load: &LoadSnapshot) -> Option<String> {
+        let teams = self.teams.as_ref().filter(|t| t.enabled)?;
+        let routed = self.apply_pending_assignment(teams, iss, route(teams, iss, load));
+        let name = routed.identity?;
+        teams.roster.iter().any(|i| i.name == name).then_some(name)
+    }
+
+    /// Whether `name` has no implementation capacity left, given the pass-local `tally` of runs
+    /// already counted against each teammate this pass (STUDIO-802).
+    ///
+    /// The rule is [`at_capacity`]'s — `max_concurrent: 0` is unlimited (D1), and only
+    /// implementation runs count (D2) — but the COUNT is the caller's rather than a fresh
+    /// [`LoadSnapshot`] read, and that is the whole point. The ladder holds `&self`, so `running`
+    /// is frozen for its whole pass; asking the snapshot three times would answer the same number
+    /// three times and admit three tickets against a cap of one (design §4.4 fix 1). The caller
+    /// seeds each entry from [`LoadSnapshot::impl_live`] on first touch and increments it on admit.
+    ///
+    /// `false` whenever Teams is off (D5) or `name` is on no roster, so neither a Teams-off daemon
+    /// nor an unknown identity can be held here either.
+    pub(crate) fn at_cap(&self, name: &str, tally: &HashMap<String, i64>) -> bool {
+        let Some(teams) = self.teams.as_ref().filter(|t| t.enabled) else {
+            return false;
+        };
+        let Some(i) = teams.roster.iter().find(|i| i.name == name) else {
+            return false;
+        };
+        i.max_concurrent > 0 && tally.get(name).copied().unwrap_or(0) >= i.max_concurrent
     }
 
     /// Renders the routed identity's turn-1 section, resolving its profile
