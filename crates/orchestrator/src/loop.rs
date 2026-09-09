@@ -742,6 +742,14 @@ impl Orchestrator {
     /// legacy single-tracker path. Extracted from `on_tick` so the auto-promote pass always runs after
     /// it (INF-318). Mirrors Go `dispatchDecisions`.
     async fn dispatch_decisions(&mut self) {
+        // What a pass withheld is only ever true of THAT pass, so the tally is RESET here rather
+        // than merely overwritten at its one write site below (STUDIO-802). The single-project
+        // ladder is the only path that fills it, and that path sits behind the multi-project branch
+        // — which has no capacity gate — and two early returns, a missing tracker and a failed
+        // candidate fetch. Overwriting alone would therefore leave a Linear outage re-serving the
+        // last successful tick's answer for as long as the outage lasted, which matters once
+        // something re-arms the tick on a non-empty tally.
+        self.held_for_capacity.clear();
         let has_projects = self.eff.as_ref().is_some_and(|e| !e.projects.is_empty());
         if has_projects {
             let tagged = self.poll_all_projects().await;
@@ -819,8 +827,9 @@ impl Orchestrator {
         self.record_issue_states(issues.iter());
         self.record_quorum_state(issues.iter());
         let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
-        // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale,
-        // every pass, so a teammate who has since freed up cannot linger in it.
+        // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
+        // over the reset at the top of the tick, so a teammate who has since freed up cannot linger
+        // in it.
         self.held_for_capacity = held_for_capacity;
         if self
             .eff
@@ -1539,6 +1548,30 @@ mod tests {
     // dispatch span. Those spans + OTel span-links live in the reconcile / dispatch / worker tickets,
     // which deferred all telemetry to P6 (see `worker.rs` / `retry.rs` docs). Un-ignored when P6 wires
     // the OTel bridge + those spans.
+    /// The capacity tally is only ever true of the pass that produced it, so a tick whose
+    /// candidate fetch FAILS must not leave the previous tick's answer standing (STUDIO-802).
+    /// The single-project ladder is the only writer and it sits behind that early return, so
+    /// clearing at the write site alone would re-serve a stale map for the length of a Linear
+    /// outage — and a stale non-empty map is exactly what a later re-arm would keep firing on.
+    #[tokio::test]
+    async fn a_failed_candidate_fetch_clears_the_capacity_tally() {
+        let mut tr = Fake::new();
+        tr.candidates_err = Some(rhapsody_tracker::TrackerError::Other("linear down".into()));
+        let (mut o, _spawned) = new_loop_orch(tr, Duration::from_secs(3600));
+        o.ctx = Some(CancelWait::default());
+        o.held_for_capacity = [("alice".to_string(), 2)].into_iter().collect();
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+        assert!(
+            o.held_for_capacity.is_empty(),
+            "a tick that never reached the ladder still reset the tally: {:?}",
+            o.held_for_capacity
+        );
+    }
+
     #[tokio::test]
     #[ignore = "telemetry P6: symphony.reconcile/dispatch/run spans + OTel span-links (O2/O3/O5 deferred them)"]
     async fn control_loop_spans_full() {

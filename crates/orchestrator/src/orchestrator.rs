@@ -481,9 +481,10 @@ pub struct Orchestrator {
     pub retry_attempts: HashMap<String, RetryEntry>,
     /// How many candidates the last selection pass **withheld** for each teammate because that
     /// teammate was at their `max_concurrent` (STUDIO-802; design record
-    /// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.5). Derived per tick and overwritten
-    /// wholesale by the pass — there is no durable queue and no stable queue position (D4), so a
-    /// teammate who frees up simply stops appearing here on the next tick.
+    /// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.5). Derived per tick — cleared at the
+    /// top of every tick's dispatch and refilled by the pass, so it is never older than the tick
+    /// reading it even when the candidate fetch fails. There is no durable queue and no stable
+    /// queue position (D4): a teammate who frees up simply stops appearing here on the next tick.
     ///
     /// Keyed by identity from the outset because that is its final shape: the console renders a
     /// per-teammate count, so a scalar would have to be widened again a ticket later. Empty
