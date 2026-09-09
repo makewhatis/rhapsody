@@ -1332,12 +1332,17 @@ mod tests {
     /// `enabled: false`, every over-cap ticket dispatches and nothing is held.
     #[test]
     fn teams_off_or_disabled_dispatches_every_over_cap_ticket() {
-        for name in ["no teams.yaml at all", "teams present but enabled: false"] {
+        for (name, keep_teams) in [
+            ("no teams.yaml at all", false),
+            ("teams present but enabled: false", true),
+        ] {
             let mut o = orch_with_capped_roster(&[("alice", 1)]);
-            if name.starts_with("no ") {
+            if keep_teams {
+                if let Some(t) = o.teams.as_mut() {
+                    t.enabled = false;
+                }
+            } else {
                 o.teams = None;
-            } else if let Some(t) = o.teams.as_mut() {
-                t.enabled = false;
             }
             let (picked, _, held) = o.select_dispatch_with_reopens(vec![
                 teams_issue("1", "MT-1", &["rhapsody:@alice"]),
