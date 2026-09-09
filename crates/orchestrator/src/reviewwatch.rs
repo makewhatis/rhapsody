@@ -42,13 +42,16 @@
 //! when the ticket fan-out is off. Two pull requests introduced in one tick therefore name the same
 //! teammate. [`Orchestrator::choose_review_reviewer`] re-decides from a LIVE
 //! [`LoadSnapshot`](crate::teams::LoadSnapshot) over `running` — which counts review runs, since
-//! they are dispatched wearing the reviewer's identity — and honours each identity's
-//! `max_concurrent`.
+//! they are dispatched wearing the reviewer's identity. That load RANKS the candidates; it does not
+//! exclude any of them. An identity's `max_concurrent` is deliberately not consulted (design D2,
+//! "reviews are free"): it caps the implementation work a teammate is dispatched, never their
+//! availability to review, and gating reviews on it only bought review latency — a busy teammate
+//! deferred a round somebody else was waiting on (STUDIO-800).
 //!
 //! Decision B ("prefer the same reviewer on re-review") is honoured where it means something: a row
-//! that HAS a last round keeps its reviewer unless they are at capacity, because continuity is
-//! worth something only to somebody who read the previous round. A row that has never been reviewed
-//! has no continuity to preserve, so it is selected fresh.
+//! that HAS a last round keeps its reviewer, because continuity is worth something only to somebody
+//! who read the previous round. A row that has never been reviewed has no continuity to preserve,
+//! so it is selected fresh.
 //!
 //! # Off the loop, then back onto it (§5, F3)
 //!
@@ -82,7 +85,7 @@ use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
 use crate::review::{ReviewDispatchOutcome, ReviewRun, review_key};
 use crate::stop::ControlHandle;
-use crate::teams::{LoadSnapshot, at_capacity};
+use crate::teams::LoadSnapshot;
 
 /// How many review ROUNDS one pull request may be given, ever, in one daemon lifetime — the floor
 /// against force-push churn (§14.2, "no approval terminal → unbounded re-review").
@@ -114,9 +117,10 @@ pub struct ReviewSweepReport {
     /// (PR, reviewer) rows dropped out of the watch set — merged, closed, gone, or a head this
     /// daemon is not entitled to read.
     pub retired: usize,
-    /// Rows that WANT a review and did not get one: nobody was available under `max_concurrent`,
-    /// the pull request hit [`REVIEW_ROUNDS_PER_PR_CAP`], or the repository is no longer
-    /// configured. Every one of them is re-considered next tick.
+    /// Rows that WANT a review and did not get one: this pull request's other rows left no
+    /// eligible reviewer, the pull request hit [`REVIEW_ROUNDS_PER_PR_CAP`], or the repository is
+    /// no longer configured. Every one of them is re-considered next tick. A reviewer being at
+    /// their `max_concurrent` is NOT among the reasons — see [`Orchestrator::choose_review_reviewer`].
     pub deferred: usize,
     /// Rows re-armed to `requested` by the head-advance signal (design §14.1's in-process Event,
     /// standing in for the room post it forbids).
@@ -489,7 +493,7 @@ impl Orchestrator {
             let Some(chosen) = self.choose_review_reviewer(row, &peers, &load) else {
                 tracing::debug!(
                     pr = %pr, reviewer = %row.key.reviewer,
-                    "ticketless review: no teammate has capacity to review this pull request; \
+                    "ticketless review: no teammate is eligible to review this pull request; \
                      re-considered next tick"
                 );
                 report.deferred += 1;
@@ -542,7 +546,8 @@ impl Orchestrator {
                         // and nothing would ever ask for it again.
                         tracing::info!(
                             pr = %pr, from = %row.key.reviewer,
-                            "ticketless review: the round was reassigned — the incumbent was at capacity"
+                            "ticketless review: the round was reassigned — the incumbent was not \
+                             eligible for it"
                         );
                         if let Err(e) = self.store().drop_review_watch(&row.key) {
                             tracing::warn!(review = %id, err = %e, "ticketless review: retiring the reassigned watch row failed");
@@ -571,8 +576,13 @@ impl Orchestrator {
     }
 
     /// Who reviews this round: the incumbent where continuity means something, otherwise the
-    /// least-loaded available non-author. `None` when nobody can take it right now, which defers
-    /// the round rather than forcing it onto somebody at their cap.
+    /// least-loaded non-author. `None` when this pull request's remaining rows leave nobody
+    /// eligible, which defers the round rather than handing one teammate two of its reviews.
+    ///
+    /// **A teammate's `max_concurrent` is not consulted here** (design D2, "reviews are free"): it
+    /// caps the IMPLEMENTATION work they are dispatched, never their availability to read somebody
+    /// else's. `load` still ranks — the least-loaded eligible teammate goes first — it just no
+    /// longer excludes.
     ///
     /// `peers` are the reviewers of this pull request's OTHER rows, excluded so a substitution
     /// cannot hand one teammate two of the same pull request's required reviews.
@@ -589,20 +599,19 @@ impl Orchestrator {
     ) -> Option<String> {
         let teams = self.teams.as_ref()?;
         let incumbent = row.key.reviewer.as_str();
-        let has_capacity = |name: &str| {
-            teams
-                .roster
-                .iter()
-                .find(|i| i.name == name)
-                .is_some_and(|i| !at_capacity(i, load))
-        };
         if row.author.trim().is_empty() {
-            return has_capacity(incumbent).then(|| incumbent.to_string());
+            // Roster membership, and deliberately NOT capacity (D2): a reviewer who has left the
+            // roster since the row was written has no identity left to dispatch under, which is a
+            // reason to defer that survives. Being at their implementation cap is not.
+            let on_roster = teams.roster.iter().any(|i| i.name == incumbent);
+            return on_roster.then(|| incumbent.to_string());
         }
+        // `rank_reviewers` only ever names roster members, so `peers` is the whole filter — a
+        // teammate at their `max_concurrent` is a candidate like any other (D2).
         let candidates: Vec<String> =
             crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts())
                 .into_iter()
-                .filter(|name| !peers.contains(name.as_str()) && has_capacity(name))
+                .filter(|name| !peers.contains(name.as_str()))
                 .collect();
         // Decision B, applied where it earns its keep: a reviewer who READ the previous round knows
         // the pull request and their own findings, so they keep it unless they are at capacity. A
@@ -1126,12 +1135,18 @@ mod tests {
         );
     }
 
-    /// Acceptance: a capped / at-max reviewer is skipped to the next best. `bob` has read a round
-    /// already (decision B would keep him) but is at his `max_concurrent`, so the round is
-    /// reassigned — and the reassigned row leaves the watch set rather than sitting beside the
-    /// substitute's, which would make the pull request owe two reviews forever.
+    /// Acceptance: a capped / at-max reviewer KEEPS the round. This test used to assert the
+    /// opposite — that `bob`, at his `max_concurrent` and busy, was skipped to `carol` — and the
+    /// deliberate loosening in STUDIO-800 (design D2, "reviews are free") reverses it. Everything
+    /// that made `bob` the right reviewer still holds: he read the previous round, so decision B
+    /// prefers him, and his cap is a limit on the implementation work he is dispatched rather than
+    /// on his availability to read `alice`'s pull request. The load ranking would have put the
+    /// idle `carol` first; continuity outranks it, and capacity no longer overrides continuity.
+    ///
+    /// Because the round is NOT reassigned, `bob`'s row stays in the watch set — the retirement
+    /// this test used to check happens only on a substitution.
     #[test]
-    fn a_capped_reviewer_is_skipped_to_the_next_best() {
+    fn a_capped_reviewer_keeps_the_round_because_reviews_are_free() {
         let (mut o, dispatched) = orch(teams_with(
             true,
             ReviewMode::Ticketless,
@@ -1153,13 +1168,49 @@ mod tests {
         let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
 
         assert_eq!(report.dispatched, 1);
-        assert_eq!(reviewers_of(&dispatched), vec!["carol".to_string()]);
         assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["bob".to_string()],
+            "an implementation cap must not move the round off the reviewer who read the last one"
+        );
+        assert_ne!(
             watch_row(&o, 12, "bob").status,
             REVIEW_STATUS_DROPPED,
-            "the reassigned row must leave the watch set"
+            "nothing was reassigned, so the incumbent's row must stay in the watch set"
         );
-        assert_eq!(watch_row(&o, 12, "carol").requested_sha, HEAD_B);
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
+    }
+
+    /// Acceptance (D2, "reviews are free"): a teammate who is at their `max_concurrent` running
+    /// IMPLEMENTATION work is still chosen as a reviewer. `bob` is the only possible reviewer —
+    /// the row's author `alice` is not on this roster — and he is at his cap of one, so under the
+    /// old rule the round was deferred with nobody available. A cap is a limit on the work a
+    /// teammate is DISPATCHED, never on their availability to read somebody else's.
+    #[test]
+    fn a_reviewer_at_their_implementation_cap_is_still_chosen() {
+        let (mut o, dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![ident("bob", 1)],
+        ));
+        introduce(&o, row(1, "bob"));
+        let mut busy = RunningEntry::empty(rhapsody_core::Issue {
+            id: "iss-9".to_string(),
+            identifier: "STUDIO-999".to_string(),
+            ..Default::default()
+        });
+        busy.identity = "bob".to_string();
+        o.running.insert("iss-9".to_string(), busy);
+
+        let report = o.handle_review_sweep(&[open_at(1, HEAD_A)]);
+
+        assert_eq!(
+            reviewers_of(&dispatched),
+            vec!["bob".to_string()],
+            "an implementation cap must not withhold a reviewer (D2)"
+        );
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.deferred, 0);
     }
 
     /// Decision B: a reviewer who READ the previous round keeps the pull request while they have
@@ -1185,42 +1236,48 @@ mod tests {
         assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
     }
 
-    /// Everybody is at capacity: the round is DEFERRED, not forced onto somebody over their cap and
-    /// not silently lost — the next tick considers it again.
+    /// A round with no eligible reviewer is DEFERRED, not forced onto somebody and not silently
+    /// lost — the next tick considers it again.
+    ///
+    /// The lever used to be capacity; STUDIO-800 removed that as a deferral reason (D2), so this
+    /// pins the same behaviour on one that survives: the ranking has nobody to offer. `alice`
+    /// authored the pull request and is the only teammate left on the roster, and an author never
+    /// reviews their own work — so the round has no candidate at all. Deliberately ONE row and one
+    /// roster member, so the deferral can only have come from reviewer selection: with two rows a
+    /// downstream guard (an already-in-flight review key) reports the same counts, and the test
+    /// would pass for a reason it is not about.
     #[test]
     fn a_round_nobody_can_take_is_deferred_and_reconsidered() {
         let (mut o, dispatched) = orch(teams_with(
             true,
             ReviewMode::Ticketless,
-            vec![ident("alice", 0), ident("bob", 1)],
+            vec![ident("alice", 0)],
         ));
         introduce(&o, row(12, "bob"));
-        let mut busy = RunningEntry::empty(rhapsody_core::Issue {
-            id: "iss-9".to_string(),
-            identifier: "STUDIO-999".to_string(),
-            ..Default::default()
-        });
-        busy.identity = "bob".to_string();
-        o.running.insert("iss-9".to_string(), busy);
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         assert_eq!((report.dispatched, report.deferred), (0, 1));
         assert!(dispatched.lock().expect("lock").is_empty());
 
-        // bob frees up; the same row is picked up with no new introduction.
-        o.running.remove("iss-9");
+        // `bob` joins the roster; the same row is picked up with no new introduction.
+        o.teams = Some(ticketless(&["alice", "bob"]));
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
     }
 
     /// An author-less row (written before the column existed, or by a caller that supplied none)
     /// may only be serviced by its INCUMBENT: with no author to exclude, any substitution could
     /// hand a teammate their own pull request.
+    ///
+    /// The incumbent is unavailable here because `bob` has left the roster — after STUDIO-800 the
+    /// only thing this path still requires of him. `carol` is idle and eligible and must STILL not
+    /// be handed the round; the row waits for `bob` instead.
     #[test]
     fn an_author_less_row_never_substitutes() {
         let (mut o, dispatched) = orch(teams_with(
             true,
             ReviewMode::Ticketless,
-            vec![ident("alice", 0), ident("bob", 1), ident("carol", 0)],
+            vec![ident("alice", 0), ident("carol", 0)],
         ));
         introduce(
             &o,
@@ -1229,13 +1286,6 @@ mod tests {
                 ..row(12, "bob")
             },
         );
-        let mut busy = RunningEntry::empty(rhapsody_core::Issue {
-            id: "iss-9".to_string(),
-            identifier: "STUDIO-999".to_string(),
-            ..Default::default()
-        });
-        busy.identity = "bob".to_string();
-        o.running.insert("iss-9".to_string(), busy);
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         assert_eq!((report.dispatched, report.deferred), (0, 1));
@@ -1506,26 +1556,17 @@ mod tests {
         let (mut o, dispatched) = orch(teams_with(
             true,
             ReviewMode::Ticketless,
-            vec![
-                ident("alice", 0),
-                ident("bob", 1),
-                ident("dave", 1),
-                ident("carol", 0),
-                ident("erin", 0),
-            ],
+            vec![ident("alice", 0), ident("carol", 0), ident("erin", 0)],
         ));
         introduce(&o, row(12, "bob"));
         introduce(&o, row(12, "dave"));
-        // Both incumbents are at their cap, so both rounds must be reassigned. `erin` carries a
-        // standing load so that `carol` STAYS the least-loaded candidate even after taking the
-        // first round — without which the live load snapshot alone would separate the two, and
-        // this test would pass on the stale peer set it exists to catch.
-        for (n, who) in [
-            ("iss-1", "bob"),
-            ("iss-2", "dave"),
-            ("iss-3", "erin"),
-            ("iss-4", "erin"),
-        ] {
+        // Both incumbents have left the roster, so both rounds must be reassigned. (Until
+        // STUDIO-800 the lever here was their `max_concurrent`; capacity no longer moves a round,
+        // so this uses a reason that still does.) `erin` carries a standing load so that `carol`
+        // STAYS the least-loaded candidate even after taking the first round — without which the
+        // live load snapshot alone would separate the two, and this test would pass on the stale
+        // peer set it exists to catch.
+        for (n, who) in [("iss-3", "erin"), ("iss-4", "erin")] {
             let mut busy = RunningEntry::empty(rhapsody_core::Issue {
                 id: n.to_string(),
                 identifier: format!("STUDIO-{n}"),
