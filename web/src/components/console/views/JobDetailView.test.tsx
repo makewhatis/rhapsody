@@ -32,6 +32,7 @@ const h = vi.hoisted(() => ({
   stopRun: vi.fn(),
   resumeRun: vi.fn(),
   mergeRun: vi.fn(),
+  fetchRunMergeability: vi.fn(),
   fetchVersion: vi.fn(),
   openExternal: vi.fn(),
 }));
@@ -56,6 +57,7 @@ vi.mock("@/lib/api", async (orig) => {
     stopRun: h.stopRun,
     resumeRun: h.resumeRun,
     mergeRun: h.mergeRun,
+    fetchRunMergeability: h.fetchRunMergeability,
     fetchVersion: h.fetchVersion,
   };
 });
@@ -231,6 +233,12 @@ function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
   if (h.fetchReviews.getMockImplementation() === undefined) {
     h.fetchReviews.mockResolvedValue({ enabled: true, reviews: [] });
   }
+  // A mergeable verdict by default (STUDIO-790): the header's Merge only goes live once the daemon
+  // has said it would merge, so a test about the CLICK needs one. A test about a refusal, or about
+  // a verdict that could not be read, configures this before mounting.
+  if (h.fetchRunMergeability.getMockImplementation() === undefined) {
+    h.fetchRunMergeability.mockResolvedValue({ mergeable: true, receipt: MERGE_RECEIPT });
+  }
   // A test about a Teams-OFF daemon configures this before mounting; this is only the default.
   if (h.fetchVersion.getMockImplementation() === undefined) {
     h.fetchVersion.mockResolvedValue({
@@ -274,6 +282,26 @@ function spineTitles(): string[] {
 }
 
 /** An action in the header cluster, by its accessible name. */
+/**
+ * The receipt the daemon resolves from the RUN ROW — the console never names a pull request. Both
+ * the merge handshake (STUDIO-767) and the pre-click mergeability read (STUDIO-790) carry it, and
+ * they must carry the SAME one: it is the same resolution, read on either side of the click.
+ */
+const MERGE_RECEIPT = {
+  run_id: 547,
+  issue: "STUDIO-654",
+  pr: "makewhatis/rhapsody#64",
+  url: "https://github.com/makewhatis/rhapsody/pull/64",
+  number: 64,
+  head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  method: "squash",
+  auto: true,
+  // The ordinary state at arming time — `--auto` exists to wait for the required contexts, so
+  // GitHub is holding the pull request when the receipt is written (STUDIO-784).
+  merge_state: "BLOCKED",
+  said: "",
+};
+
 function action(name: string | RegExp): HTMLElement {
   return within(document.querySelector(".trhd .acts") as HTMLElement).getByRole(
     /view pr|open ticket/i.test(String(name)) ? "link" : "button",
@@ -292,6 +320,7 @@ afterEach(() => {
   // a review watch set or a message timeline would otherwise be handed to every test after it.
   h.fetchVersion.mockReset();
   h.mergeRun.mockReset();
+  h.fetchRunMergeability.mockReset();
   h.fetchRunMessages.mockReset();
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
@@ -572,20 +601,7 @@ describe("zone A — the header's actions are real or dependency-named, never fa
   // --- Merge (STUDIO-767) ----------------------------------------------------------------------
 
   /** The receipt the daemon resolves from the RUN ROW — the console never names a pull request. */
-  const RECEIPT = {
-    run_id: 547,
-    issue: "STUDIO-654",
-    pr: "makewhatis/rhapsody#64",
-    url: "https://github.com/makewhatis/rhapsody/pull/64",
-    number: 64,
-    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    method: "squash",
-    auto: true,
-    // The ordinary state at arming time — `--auto` exists to wait for the required contexts, so
-    // GitHub is holding the pull request when the receipt is written (STUDIO-784).
-    merge_state: "BLOCKED",
-    said: "",
-  };
+  const RECEIPT = MERGE_RECEIPT;
 
   it("merges through the daemon's confirm handshake, echoing back the head it was shown", async () => {
     h.mergeRun
@@ -833,6 +849,180 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     expect(document.querySelector(".trhd .actok")).toBeNull();
   });
 
+  // --- Merge, before the click (STUDIO-790) ----------------------------------------------------
+
+  // THE BUG. On STUDIO-784 — a done ticket whose pull request had already merged — the header
+  // still showed a live green Merge, because `merge.isPending` was the only thing that could
+  // disable it. The refusal existed; it was only reachable by clicking an irreversible-looking
+  // button. Now the daemon is asked first, and its own sentence is the tooltip.
+  it("does not offer a live Merge on a run whose pull request the daemon would refuse", async () => {
+    h.fetchRunMergeability.mockResolvedValue({
+      mergeable: false,
+      reason: "that pull request is already merged",
+    });
+    mountDetail([run({ id: 547 })]);
+
+    // `/^merge/` and not `/^merge$/`: a DepButton's accessible name carries its own "dep" chip.
+    // Waiting on the REASON and not merely on the control: the in-flight state is a DepButton too,
+    // so a bare presence check would pass before the daemon had answered anything.
+    await waitFor(() =>
+      expect(action(/^merge/i).getAttribute("title")).toContain("already merged"),
+    );
+    const merge = action(/^merge/i);
+    expect(merge.className).not.toMatch(/\bpri\b/);
+    expect(merge.querySelector(".dep")?.textContent).toBe("dep");
+    // Verbatim. The console derives no refusal of its own, so it can paraphrase none of them.
+    expect(merge.getAttribute("title")).toContain("that pull request is already merged");
+    // Inert the way every other unavailable action on this header is — named, not dead.
+    expect(merge.getAttribute("aria-disabled")).toBe("true");
+    expect((merge as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(merge);
+    expect(h.mergeRun).not.toHaveBeenCalled();
+    // And nothing was merged to learn that: the verdict is a READ of the run this header shows.
+    expect(h.fetchRunMergeability.mock.calls).toEqual([[547]]);
+  });
+
+  // Every refusal the daemon can make renders the same way, including the three the console
+  // cannot possibly derive for itself.
+  for (const reason of [
+    "no open pull request on this run's branch",
+    "that pull request is closed",
+    "a Rhapsody review of that pull request is still live",
+    "a Rhapsody review of that pull request asked for changes and the author has not pushed since",
+    "this branch is behind its base and cannot update itself; push or update the branch, then merge",
+    "this run's ticket is not waiting in review — a review that asked for changes moves it back",
+  ]) {
+    it(`names the reason before the click: ${reason.slice(0, 34)}…`, async () => {
+      h.fetchRunMergeability.mockResolvedValue({ mergeable: false, reason });
+      mountDetail([run({ id: 547 })]);
+      await waitFor(() => expect(action(/^merge/i).getAttribute("title")).toContain(reason));
+      expect(action(/^merge/i).className).not.toMatch(/\bpri\b/);
+    });
+  }
+
+  // The window the original bug lived in, one render earlier: a live primary must not appear
+  // while the answer is still in flight, or the header is briefly lying again.
+  it("does not go live before the daemon has answered", async () => {
+    let answer: (v: unknown) => void = () => {};
+    h.fetchRunMergeability.mockImplementation(
+      () => new Promise((resolve) => { answer = resolve; }),
+    );
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(action(/^merge/i)).toBeTruthy());
+    expect(action(/^merge/i).getAttribute("aria-disabled")).toBe("true");
+    expect(action(/^merge/i).getAttribute("title")).toMatch(/asking the daemon/i);
+
+    await act(async () => {
+      answer({ mergeable: true, receipt: MERGE_RECEIPT });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
+  });
+
+  // A verdict that could not be READ is not a refusal, and must not be rendered as one: a `gh`
+  // that would not answer is not the daemon saying no, and taking the control away on it would
+  // strand the operator. The click still refuses server-side if the real answer is no.
+  it("keeps Merge live, and says why it is unsure, when the verdict cannot be read", async () => {
+    h.fetchRunMergeability.mockRejectedValue(new Error("gh pr list: HTTP 502"));
+    h.mergeRun.mockResolvedValue({ status: "confirm", receipt: MERGE_RECEIPT });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    const merge = action(/^merge$/i);
+    expect(merge.className).toMatch(/\bpri\b/);
+    expect(merge.getAttribute("title")).toMatch(/could not be asked/i);
+    expect(merge.getAttribute("title")).toContain("gh pr list: HTTP 502");
+
+    fireEvent.click(merge);
+    await waitFor(() => expect(h.mergeRun).toHaveBeenCalledWith(547, ""));
+  });
+
+  // A live Merge now knows WHAT it would merge, so it says so.
+  it("names the pull request it would merge", async () => {
+    h.fetchRunMergeability.mockResolvedValue({
+      mergeable: true,
+      receipt: { ...MERGE_RECEIPT, merge_state: "CLEAN" },
+    });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
+    expect(action(/^merge$/i).getAttribute("title")).toContain("makewhatis/rhapsody#64");
+    expect(document.querySelector(".trhd .actok")).toBeNull();
+  });
+
+  // THE HEADER MUST NOT ARGUE WITH ITSELF. `mergeStateNote` is the ARMED reading — what a merge
+  // the operator already applied is waiting on — and the daemon refuses on none of the states it
+  // describes, so rendering it beside an unclicked control produces a second, independent verdict
+  // that can contradict the first. It did, in both directions: on DIRTY the note said "it cannot
+  // land" beside a live primary the daemon really would honour, and on BEHIND it said "push the
+  // branch" for a receipt that only exists because GitHub updates the branch itself.
+  //
+  // The pre-click channel is the control's own tooltip, carrying the daemon's verdict; GitHub's
+  // view of a pull request nobody has acted on yet is the confirm modal's to show, and it does.
+  for (const merge_state of ["CLEAN", "BLOCKED", "BEHIND", "DIRTY", "DRAFT", "UNSTABLE"]) {
+    it(`says nothing about GitHub's ${merge_state} beside a Merge nobody has clicked`, async () => {
+      h.fetchRunMergeability.mockResolvedValue({
+        mergeable: true,
+        receipt: { ...MERGE_RECEIPT, merge_state },
+      });
+      mountDetail([run({ id: 547 })]);
+
+      await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
+      // Whatever the header says about the merge, it is the daemon's verdict and only that.
+      expect(document.querySelector(".trhd .actnote")).toBeNull();
+      expect(document.querySelector(".trhd")?.textContent).not.toMatch(/cannot land/i);
+    });
+  }
+
+  // Asking the daemon what a merge WOULD do is not free — a tracker read, and two blocking `gh`
+  // calls on a ticket that is waiting in review — so the verdict is re-read when it can have
+  // moved and not merely when a button was pressed. The handshake's first leg merges nothing and
+  // changes nothing; only the confirmed one can make the next answer "already merged".
+  it("re-reads the verdict when a merge lands, and not when one is merely offered", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: MERGE_RECEIPT })
+      .mockResolvedValueOnce({ status: "merged", receipt: { ...MERGE_RECEIPT, said: "queued" } });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
+    expect(h.fetchRunMergeability.mock.calls).toEqual([[547]]);
+
+    // Leg one: the modal opens on a receipt the daemon resolved, having merged nothing.
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    expect(h.fetchRunMergeability.mock.calls).toEqual([[547]]);
+
+    // Leg two: the merge is applied, so the verdict really is stale now.
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+    await waitFor(() => expect(h.fetchRunMergeability.mock.calls).toHaveLength(2));
+  });
+
+  // The armed reading is where the note belongs, and the state STUDIO-784 built it for still
+  // reads: an armed `--auto` merge is one line followed by silence unless something says what
+  // GitHub is holding it on.
+  it("says what the merge it just armed is waiting on", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: MERGE_RECEIPT })
+      .mockResolvedValueOnce({
+        status: "merged",
+        receipt: { ...MERGE_RECEIPT, said: "will be automatically merged" },
+      });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
+    await waitFor(() =>
+      expect(document.querySelector(".trhd .actnote")?.textContent).toBe(
+        "GitHub is holding it until its required checks pass.",
+      ),
+    );
+  });
+
   it("names its dependency, and asks the daemon nothing, when Teams is off", async () => {
     h.fetchVersion.mockResolvedValue({
       version: "v0.4.0",
@@ -853,6 +1043,9 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     expect((merge as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(merge);
     expect(h.mergeRun).not.toHaveBeenCalled();
+    // Nor the verdict read: with no merge path there is nothing to ask about, and asking would
+    // spend `gh` round trips on a daemon that answers `teams_disabled` (STUDIO-790).
+    expect(h.fetchRunMergeability).not.toHaveBeenCalled();
   });
 
   it("offers Stop only while the run is live, and Resume only once it has stopped", async () => {

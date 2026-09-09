@@ -758,3 +758,38 @@ failed — leaves a `teams.merge` event on the run and one room line from the ma
 dependency-named. The trigger is this loopback endpoint and never a room post: a `from: operator`
 room line is forgeable by any local process, and `teamsears::Intent` — the closed room-action enum —
 deliberately gains **no** `Merge` variant.
+
+### The console reads that answer before the click — `GET /api/v1/runs/{id}/mergeability` (STUDIO-790)
+
+The refusals above were only discoverable **by clicking**: the header's Merge was gated on nothing
+but its own in-flight state, so it offered itself on a finished ticket whose pull request had
+already merged, and named the reason afterwards. This route serves the same verdict as a read, and
+the console renders the control from it — primary when the daemon would proceed, otherwise disabled
+and carrying the daemon's own refusal sentence in its tooltip.
+
+| Asking whether a merge is possible | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| what the console knows before the click | — (no console merge at all) | the whole verdict: the resolved receipt, or the refusal |
+| what is run | — | exactly the reads `POST …/merge` makes before it acts — `gh pr list` for the branch's open pull request, `gh pr view` for its state and head SHA, its `mergeStateStatus`, and the repository's branch-update policy only when that says `BEHIND` — and **not** `gh pr merge` |
+| GitHub writes | — | none |
+
+**It merges nothing, and that is structural.** The route is GET-only and takes no body, so there is
+no confirmation for one to arrive through; it calls `runmerge::resolve_pull_request`, which is
+steps 1–4 of the merge — resolve, cross-check the account, read the pull request's state, apply
+every refusal — and never touches the merge seam. A standing test asserts on that function's own
+source that it names neither `merger` nor `merge_pr`.
+
+**One ladder, not two.** The read and the click share `resolve_pull_request`, so the reason the
+header shows before the click is literally the same `&'static str` the click would have refused
+with, rather than a console-side re-derivation that could drift from it. The read is served on its
+own path rather than as a GET on `/merge`, so that route stays POST-only and stays checkable from
+the routing table alone.
+
+**A question leaves no trace.** The console refetches this read, so unlike a click it takes no
+single-flight claim — one would let the console refuse the operator's own next click, and would
+make the read's own refetch answer *"a merge of that pull request is already in flight"* — and it
+writes neither the `teams.merge` audit row nor the manager's room line, which record attempts
+somebody actually made. A refusal answers **200** with `{"mergeable": false, "reason": …}`, because
+on a read the refusal is the answer; only a question that could not be answered at all is an error
+(500 `mergeability_unavailable`), and the console keeps Merge live on that, since a `gh` it could
+not reach is not the daemon saying no.

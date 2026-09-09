@@ -30,7 +30,13 @@ import {
   useTranscript,
 } from "@/hooks/useRunDetail";
 import { useLinearIdentity } from "@/hooks/useConfig";
-import { useMergeRun, useResumeRun, useSendRunMessage, useStopRun } from "@/hooks/useRunActions";
+import {
+  useMergeRun,
+  useResumeRun,
+  useRunMergeability,
+  useSendRunMessage,
+  useStopRun,
+} from "@/hooks/useRunActions";
 import { useReviews } from "@/hooks/useReviews";
 import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
 import { useTicketFacts } from "@/hooks/useTicketFacts";
@@ -649,12 +655,24 @@ function HeaderActions({
   const resume = useResumeRun(run.id);
   const merge = useMergeRun(run.id);
   const teamsEnabled = useTeamsEnabled();
+  // What the daemon would say if Merge were clicked right now (STUDIO-790). Asked only where a
+  // merge path exists at all, because with Teams off the daemon serves `teams_disabled` and the
+  // control below is dependency-named without a round trip.
+  const verdict = useRunMergeability(run.id, teamsEnabled);
   const prHref = prSearchUrl(run);
   // The receipt the daemon is asking the operator to confirm (STUDIO-767). Held here rather than
   // read off `merge.data`, because confirming re-runs the mutation and the modal must keep showing
   // the SAME pull request while that is in flight.
   const [confirming, setConfirming] = useState<MergeReceipt | null>(null);
   const merged = merge.data?.status === "merged" ? merge.data.receipt : null;
+  // The pull request the daemon says a click would act on, or null when it refused, failed, or has
+  // not answered yet. It names the merge in the button's tooltip and NOTHING else: rendering the
+  // header's merge-state note from it too would put a second, independent sentence beside the
+  // control, and the two can disagree — a DIRTY receipt is not refused by the daemon, so the note
+  // would read "it cannot land" next to a live primary. The pre-click channel is the daemon's own
+  // verdict, on the control itself; GitHub's view of a pull request the operator has NOT acted on
+  // yet belongs in the confirm modal, which already carries it (STUDIO-790).
+  const resolved = verdict.data?.mergeable === true ? verdict.data.receipt : null;
   // What GitHub says the pull request is waiting on, once one has been armed (STUDIO-784). "" when
   // GitHub stated no merge state, which is a real answer and not a reason to guess at one.
   const mergedNote = merged === null ? "" : mergeStateNote(merged.merge_state, true);
@@ -735,18 +753,44 @@ function HeaderActions({
           View PR
         </ExternalLink>
       )}
-      {/* The real green primary (design §5). Every refusal — no open pull request on the branch,
-          a live Rhapsody review round, an already-merged or closed one, a merge already in flight
-          — is the DAEMON's to make and arrives as a message in `problem`, because the console
-          cannot know any of them without asking and must not guess at one. */}
-      {teamsEnabled ? (
-        <Button variant="pri" onClick={() => askMerge("")} disabled={merge.isPending}>
-          Merge
-        </Button>
-      ) : (
+      {/* The real green primary (design §5), rendered from the daemon's own verdict rather than
+          from its own in-flight state (STUDIO-790). Every refusal — no open pull request on the
+          branch, a live Rhapsody review round, one that asked for changes, an already-merged or
+          closed pull request, a branch behind its base, a ticket routed back out of review — is
+          still the DAEMON's to make; the console now READS it before the click instead of learning
+          it afterwards, and shows it the way every other unavailable action on this header does.
+          The console derives none of them: `reason` is the daemon's sentence, verbatim. */}
+      {!teamsEnabled ? (
         <DepButton title="Rhapsody Teams is not enabled on this daemon, so it has no merge path.">
           Merge
         </DepButton>
+      ) : verdict.isPending ? (
+        // Not a live primary yet: offering one before the answer arrives is the bug this fixes,
+        // one render earlier.
+        <DepButton title="Asking the daemon whether this run's pull request can be merged…">
+          Merge
+        </DepButton>
+      ) : verdict.data && !verdict.data.mergeable ? (
+        <DepButton title={`Rhapsody will not merge this run's pull request: ${verdict.data.reason}.`}>
+          Merge
+        </DepButton>
+      ) : (
+        <Button
+          variant="pri"
+          // Two states share this arm, and the title separates them. A resolved verdict names the
+          // pull request the click would act on. A verdict that could not be READ — a `gh` that
+          // would not answer — leaves the control live on purpose: nobody could ask is not the
+          // daemon saying no, and the click still refuses server-side if the answer is no.
+          title={
+            resolved
+              ? `Merge ${resolved.pr} — ${resolved.method}, with GitHub's own auto-merge.`
+              : `The daemon could not be asked whether this can be merged (${verdict.error?.message ?? "no answer"}). Clicking asks again and merges nothing before you confirm.`
+          }
+          onClick={() => askMerge("")}
+          disabled={merge.isPending}
+        >
+          Merge
+        </Button>
       )}
       {merged ? (
         <span className="actok" role="status">
