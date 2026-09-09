@@ -111,6 +111,32 @@ if [ -n "$conflicts" ]; then
   printf '%s\n' "$conflicts"
 fi
 
+# `depends_on macos:` tracks HOMEBREW's oldest expressible version, not the app's own floor — but do
+# NOT "fix" the apparent mismatch with tauri.conf.json's `minimumSystemVersion` (10.15): the two
+# floors already agree in practice. Rhapsody ships Apple-Silicon-only (see desktop/README.md), and no
+# Apple Silicon Mac ever ran 10.15 — Big Sur 11.0 was the first OS on that hardware — so the shipped
+# binary's real floor is 11 too, exactly what this line declares. That 10.15 is inert as a SUPPORT
+# CLAIM — a scaffold value from TRA-231 which has never been revisited — but it is not merely a plist
+# string: Tauri also feeds it to the compiler as MACOSX_DEPLOYMENT_TARGET, so raising it to "11.0"
+# would change the release binary's LC_BUILD_VERSION and its API weak-linking. That is a shipped-bundle
+# change, so it was considered and declined here (STUDIO-781 scoped it out) rather than overlooked.
+#
+# :big_sur is also the durable answer to the question a reader actually arrives with — "are we cutting
+# off older users?" — because Homebrew declares macOS 11 its oldest allowed version
+# (HOMEBREW_MACOS_OLDEST_ALLOWED="11" in brew.sh) and prints "too old to run Homebrew!" below it.
+# Nobody is running a supported brew under 11, so this excludes nobody who could have installed via
+# brew in the first place. It could not say 10.15 anyway: MacOSRequirement::DISABLED_MACOS_VERSIONS
+# disables :catalina and everything older, leaving :big_sur the oldest symbol still accepted — older
+# ones still parse but are rejected afterwards as disabled (STUDIO-777, where :catalina broke `brew`
+# here).
+#
+# `Cask::Audit#audit_min_os` does read the app bundle's real LSMinimumSystemVersion and complain when
+# the cask disagrees, but it returns early while that floor is <= HOMEBREW_MACOS_OLDEST_ALLOWED — and
+# both it and `cask_bundle_min_os` open with `return unless online?`, so a plain `brew audit` never
+# reaches the check at all. Revisit when the plist string is finally raised above 11 (the audit then
+# starts caring, and compares exact SYMBOLS, so a floor of "12.3" would need :monterey here, not a
+# version string), or when Homebrew disables :big_sur the way it disabled :catalina — its own RELEASES
+# table already schedules that for September 2027 or later.
 cat <<EOF
   depends_on macos: :big_sur
 
