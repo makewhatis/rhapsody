@@ -48,7 +48,9 @@ use rhapsody_workspace::sanitize_key;
 use crate::control_loop::Event;
 use crate::ghsummons::parse_repo;
 use crate::orchestrator::Orchestrator;
-use crate::runmerge::{MergeControlOutcome, MergePlan, MergeReceipt, TicketReviewGate};
+use crate::runmerge::{
+    MergeControlOutcome, MergePlan, MergeReceipt, MergeabilityOutcome, TicketReviewGate,
+};
 use crate::stop::ControlHandle;
 use crate::triage::MANAGER_IDENTITY;
 
@@ -68,6 +70,22 @@ pub const EVENT_MERGE: &str = "teams.merge";
 /// Two minutes is comfortably longer than the three bounded `gh` calls a merge makes and far
 /// shorter than an operator's patience with a button that does nothing.
 const MERGE_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Why a merge plan is being built: to ACT on, or to answer a question with (STUDIO-790).
+///
+/// The two must walk exactly the same gates — a console that showed a different set of refusals
+/// from the ones the click would hit would be the original bug wearing a tooltip — but they must
+/// leave different traces. A probe is a READ: it claims nothing, so it can neither block the click
+/// that follows it nor be blocked by one, and it records nothing, because the console refetches it
+/// and a `teams.merge` row plus a room line per refetch would bury the real attempts under a poll
+/// loop's noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeIntent {
+    /// `POST /api/v1/runs/{id}/merge` — take the single-flight claim, record every refusal.
+    Attempt,
+    /// `GET /api/v1/runs/{id}/mergeability` — the console asking what the daemon would say.
+    Probe,
+}
 
 /// What [`Orchestrator::plan_run_merge`] decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +123,7 @@ impl Orchestrator {
     /// is written from the project's configured remote, and the branch is the one the daemon's own
     /// branch naming determines for this ticket — see the comment at the check itself for why it
     /// is derived rather than read out of `runs.branch`, and why it stays a disagreement test.
-    pub(crate) fn plan_run_merge(&mut self, run_id: i64) -> MergePlanOutcome {
+    pub(crate) fn plan_run_merge(&mut self, run_id: i64, intent: MergeIntent) -> MergePlanOutcome {
         // §16's gate, and the same one every Rhapsody-additive write surface takes: with Teams off
         // there is no manager to act as, no room to report in, and the console renders Merge as
         // dependency-named rather than offering a control that would refuse.
@@ -124,6 +142,7 @@ impl Orchestrator {
             // STUDIO-721), so this arm covers "no remote" and "a remote we will not vouch for"
             // alike — and the latter must never reach `gh`.
             return self.deny(
+                intent,
                 run_id,
                 &run.issue_identifier,
                 "this run has no GitHub repository to merge in",
@@ -153,6 +172,7 @@ impl Orchestrator {
                 "console merge: this run's branch does not belong to its ticket; refusing"
             );
             return self.deny(
+                intent,
                 run_id,
                 &run.issue_identifier,
                 "this run's branch does not belong to its ticket",
@@ -165,7 +185,7 @@ impl Orchestrator {
         // here; the question itself is a tracker read and is asked off-loop.
         let review_gate = match self.ticket_review_gate(&run) {
             Ok(gate) => gate,
-            Err(why) => return self.deny(run_id, &run.issue_identifier, why),
+            Err(why) => return self.deny(intent, run_id, &run.issue_identifier, why),
         };
         // The review gate's raw material, read here because only the control task may read the
         // watch set (`reviewconsole`'s single-writer rule). Live rows only: a dropped or retired
@@ -202,20 +222,27 @@ impl Orchestrator {
                 return MergePlanOutcome::Denied(MergeControlOutcome::Failed(e.to_string()));
             }
         };
-        let key = claim_key(&owner, &repo, &branch);
-        if let Some(since) = self.merge_inflight.get(&key) {
-            if since.elapsed() < MERGE_CLAIM_TTL {
-                return MergePlanOutcome::Denied(MergeControlOutcome::Refused(
-                    "a merge of that pull request is already in flight",
-                ));
+        // Everything above is a gate a PROBE must report on too; the claim below is bookkeeping
+        // for an attempt a probe is not making. Claiming on a probe would make the console's own
+        // refetch answer "a merge of that pull request is already in flight" — a refusal the
+        // console itself caused — and would hold the claim against the operator's next click
+        // (STUDIO-790).
+        if intent == MergeIntent::Attempt {
+            let key = claim_key(&owner, &repo, &branch);
+            if let Some(since) = self.merge_inflight.get(&key) {
+                if since.elapsed() < MERGE_CLAIM_TTL {
+                    return MergePlanOutcome::Denied(MergeControlOutcome::Refused(
+                        "a merge of that pull request is already in flight",
+                    ));
+                }
+                tracing::warn!(
+                    run = run_id,
+                    pr = %key,
+                    "console merge: a stale in-flight claim was never settled; taking it over"
+                );
             }
-            tracing::warn!(
-                run = run_id,
-                pr = %key,
-                "console merge: a stale in-flight claim was never settled; taking it over"
-            );
+            self.merge_inflight.insert(key, Instant::now());
         }
-        self.merge_inflight.insert(key, Instant::now());
         MergePlanOutcome::Ready(MergePlan {
             run_id,
             issue: run.issue_identifier,
@@ -272,9 +299,19 @@ impl Orchestrator {
 
     /// A plan-time refusal, recorded on its way out. See [`Orchestrator::record_merge_attempt`]
     /// for why these two arms are recorded and the in-flight one is not.
-    fn deny(&self, run_id: i64, issue: &str, why: &'static str) -> MergePlanOutcome {
+    fn deny(
+        &self,
+        intent: MergeIntent,
+        run_id: i64,
+        issue: &str,
+        why: &'static str,
+    ) -> MergePlanOutcome {
         let outcome = MergeControlOutcome::Refused(why);
-        if let Some(line) = attempt_line(issue, &outcome) {
+        // A probe refused nothing: the operator has not clicked, and recording an attempt they
+        // never made would put a false row in the one ledger §3/G4 wants true (STUDIO-790).
+        if intent == MergeIntent::Attempt
+            && let Some(line) = attempt_line(issue, &outcome)
+        {
             self.record_merge_attempt(run_id, issue, &line);
         }
         MergePlanOutcome::Denied(outcome)
@@ -522,7 +559,7 @@ impl ControlHandle {
         let Some(deps) = self.merge.as_ref() else {
             return MergeControlOutcome::Dormant;
         };
-        let plan = match self.plan_merge(run_id).await {
+        let plan = match self.plan_merge(run_id, MergeIntent::Attempt).await {
             MergePlanOutcome::Ready(plan) => plan,
             MergePlanOutcome::Denied(outcome) => return outcome,
         };
@@ -540,16 +577,53 @@ impl ControlHandle {
         outcome
     }
 
+    /// The console asking what **Merge** would do (`GET /api/v1/runs/{id}/mergeability`), without
+    /// doing it (STUDIO-790).
+    ///
+    /// `merge_run`'s first two phases and neither of its last two: it plans (as a
+    /// [`MergeIntent::Probe`], so no claim is taken), asks the ticket-state gate, and resolves the
+    /// pull request — then stops. There is no settle, because there is nothing to release and
+    /// nothing happened worth recording.
+    ///
+    /// **It cannot merge.** This path hands on [`ResolveDeps`] and never the whole [`MergeDeps`],
+    /// so nothing it reaches — [`crate::runmerge::mergeability`],
+    /// [`crate::runmerge::resolve_pull_request`], any callee of theirs — has a
+    /// [`crate::ghsummons::MergeSource`] in scope to call; and there is no `confirm` on this path
+    /// for one to arrive through either. The guarantee is what the read half is HANDED rather than
+    /// a flag, which is the same way §3/G1 keeps a client-supplied coordinate out of `gh`.
+    ///
+    /// [`ResolveDeps`]: crate::runmerge::ResolveDeps
+    /// [`MergeDeps`]: crate::runmerge::MergeDeps
+    pub async fn run_mergeability(&self, run_id: i64) -> MergeabilityOutcome {
+        let Some(deps) = self.merge.as_ref() else {
+            return MergeabilityOutcome::Dormant;
+        };
+        let plan = match self.plan_merge(run_id, MergeIntent::Probe).await {
+            MergePlanOutcome::Ready(plan) => plan,
+            MergePlanOutcome::Denied(outcome) => return MergeabilityOutcome::from_denial(outcome),
+        };
+        // The same order the click uses, and for the same reason: a ticket a reviewer routed back
+        // should cost no GitHub round trip.
+        match ticket_not_waiting_in_review(self.reads_tracker(), &plan).await {
+            Some(refusal) => MergeabilityOutcome::from_denial(refusal),
+            None => crate::runmerge::mergeability(&plan, &deps.resolve).await,
+        }
+    }
+
     /// Phase 1: the control task's verdict on a merge request.
     ///
     /// A gone or cancelled control task answers `Dormant`, following
     /// [`ControlHandle::list_reviews`]: the daemon is shutting down, and a 500 would send the
     /// operator looking for a fault in the merge path.
-    async fn plan_merge(&self, run_id: i64) -> MergePlanOutcome {
+    async fn plan_merge(&self, run_id: i64, intent: MergeIntent) -> MergePlanOutcome {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .events
-            .send(Event::RunMergePlan { run_id, reply: tx })
+            .send(Event::RunMergePlan {
+                run_id,
+                intent,
+                reply: tx,
+            })
             .is_err()
         {
             return MergePlanOutcome::Denied(MergeControlOutcome::Dormant);
@@ -734,7 +808,7 @@ mod tests {
 
     /// The plan a healthy STUDIO-767 run produces, or a panic naming what was denied instead.
     fn ready(o: &mut Orchestrator, run_id: i64) -> MergePlan {
-        match o.plan_run_merge(run_id) {
+        match o.plan_run_merge(run_id, MergeIntent::Attempt) {
             MergePlanOutcome::Ready(plan) => plan,
             other => panic!("want Ready, got {other:?}"),
         }
@@ -783,7 +857,7 @@ mod tests {
         let mut o = orch(false);
         let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
         assert_eq!(
-            o.plan_run_merge(run),
+            o.plan_run_merge(run, MergeIntent::Attempt),
             MergePlanOutcome::Denied(MergeControlOutcome::Dormant)
         );
         assert!(
@@ -798,7 +872,7 @@ mod tests {
     fn a_run_that_does_not_exist_is_not_found() {
         let mut o = orch(true);
         assert_eq!(
-            o.plan_run_merge(4242),
+            o.plan_run_merge(4242, MergeIntent::Attempt),
             MergePlanOutcome::Denied(MergeControlOutcome::NotFound)
         );
     }
@@ -816,7 +890,7 @@ mod tests {
             let mut o = orch(true);
             let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", repo);
             assert_eq!(
-                o.plan_run_merge(run),
+                o.plan_run_merge(run, MergeIntent::Attempt),
                 MergePlanOutcome::Denied(MergeControlOutcome::Refused(
                     "this run has no GitHub repository to merge in"
                 )),
@@ -872,7 +946,7 @@ mod tests {
             o.teams_room = Some(Arc::clone(&room));
             let run = run_row(&o, "STUDIO-767", branch, REPO_URL);
             assert_eq!(
-                o.plan_run_merge(run),
+                o.plan_run_merge(run, MergeIntent::Attempt),
                 MergePlanOutcome::Denied(MergeControlOutcome::Refused(
                     "this run's branch does not belong to its ticket"
                 )),
@@ -907,12 +981,66 @@ mod tests {
         ready(&mut o, run);
 
         assert!(matches!(
-            o.plan_run_merge(run),
+            o.plan_run_merge(run, MergeIntent::Attempt),
             MergePlanOutcome::Denied(MergeControlOutcome::Refused(_))
         ));
 
         assert!(audit(&o, run).is_empty());
         assert!(room_lines(&room).is_empty());
+    }
+
+    /// **STUDIO-790.** A probe walks the same gates and reaches the same plan as a click, but it
+    /// leaves nothing behind: no single-flight claim, no `teams.merge` row, no room line. The
+    /// console refetches this read, so any of the three would turn a poll into noise the operator
+    /// has to read past — and a claim would let the console refuse the operator's own next click.
+    #[test]
+    fn a_probe_plans_like_a_click_but_claims_and_records_nothing() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut o = orch(true);
+        o.teams_room = Some(Arc::clone(&room));
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+
+        let probed = o.plan_run_merge(run, MergeIntent::Probe);
+        let clicked = o.plan_run_merge(run, MergeIntent::Attempt);
+
+        assert_eq!(
+            probed, clicked,
+            "the question and the click must be answered by the same gates"
+        );
+        assert_eq!(
+            o.merge_inflight.len(),
+            1,
+            "exactly one claim, and it is the CLICK's — a probe before it took none, or this \
+             click would have been refused as already in flight"
+        );
+        assert!(audit(&o, run).is_empty());
+        assert!(room_lines(&room).is_empty());
+    }
+
+    /// A probe's REFUSAL is not recorded either. The click's is (`a_refusal_and_a_failure_are_
+    /// recorded_as_attempts`), because a click is an attempt somebody made; opening a run detail
+    /// is not, and a ledger that says otherwise is a false record in the one place §3/G4 wants a
+    /// true one.
+    #[test]
+    fn a_probes_refusal_leaves_no_record() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut o = orch(true);
+        o.teams_room = Some(Arc::clone(&room));
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-790", REPO_URL);
+
+        assert_eq!(
+            o.plan_run_merge(run, MergeIntent::Probe),
+            MergePlanOutcome::Denied(MergeControlOutcome::Refused(
+                "this run's branch does not belong to its ticket"
+            )),
+            "the probe still gives the daemon's own reason, verbatim"
+        );
+
+        assert!(audit(&o, run).is_empty(), "nothing was attempted");
+        assert!(room_lines(&room).is_empty());
+        assert!(o.merge_inflight.is_empty());
     }
 
     /// The healthy plan: every coordinate comes from the run row, and nothing on it could have
@@ -1157,7 +1285,7 @@ mod tests {
             })
             .expect("start run");
         assert_eq!(
-            o.plan_run_merge(run),
+            o.plan_run_merge(run, MergeIntent::Attempt),
             MergePlanOutcome::Denied(MergeControlOutcome::Refused(
                 "this run has no tracker id for its ticket, so the daemon cannot check that its review is finished"
             ))
@@ -1274,12 +1402,14 @@ mod tests {
 
     fn silent_deps(gh: Arc<SilentGh>) -> Arc<crate::runmerge::MergeDeps> {
         Arc::new(crate::runmerge::MergeDeps {
-            prs: Arc::clone(&gh) as Arc<dyn crate::ghsummons::OpenPrSource>,
-            state: Arc::clone(&gh) as Arc<dyn crate::ghsummons::PrStateSource>,
-            merger: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeSource>,
-            mergestate: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeStateSource>,
-            policy: gh as Arc<dyn crate::ghsummons::BranchUpdateSource>,
-            allow: crate::ghsummons::HeadAllowlist::none(),
+            resolve: crate::runmerge::ResolveDeps {
+                prs: Arc::clone(&gh) as Arc<dyn crate::ghsummons::OpenPrSource>,
+                state: Arc::clone(&gh) as Arc<dyn crate::ghsummons::PrStateSource>,
+                mergestate: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeStateSource>,
+                policy: Arc::clone(&gh) as Arc<dyn crate::ghsummons::BranchUpdateSource>,
+                allow: crate::ghsummons::HeadAllowlist::none(),
+            },
+            merger: gh as Arc<dyn crate::ghsummons::MergeSource>,
         })
     }
 
@@ -1344,7 +1474,7 @@ mod tests {
         let plan = ready(&mut o, run);
 
         assert_eq!(
-            o.plan_run_merge(run),
+            o.plan_run_merge(run, MergeIntent::Attempt),
             MergePlanOutcome::Denied(MergeControlOutcome::Refused(
                 "a merge of that pull request is already in flight"
             ))
@@ -1353,7 +1483,7 @@ mod tests {
         // request a second click would merge is the same one.
         let retry = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
         assert_eq!(
-            o.plan_run_merge(retry),
+            o.plan_run_merge(retry, MergeIntent::Attempt),
             MergePlanOutcome::Denied(MergeControlOutcome::Refused(
                 "a merge of that pull request is already in flight"
             ))
@@ -1361,7 +1491,10 @@ mod tests {
 
         o.settle_run_merge(&plan, &MergeControlOutcome::ConfirmRequired(receipt("u")));
         assert!(o.merge_inflight.is_empty(), "settling releases the claim");
-        assert!(matches!(o.plan_run_merge(run), MergePlanOutcome::Ready(_)));
+        assert!(matches!(
+            o.plan_run_merge(run, MergeIntent::Attempt),
+            MergePlanOutcome::Ready(_)
+        ));
     }
 
     /// A claim whose HTTP task died before it could settle — the operator closed the tab — expires
@@ -1374,7 +1507,10 @@ mod tests {
         let key = claim_key("makewhatis", "rhapsody", "symphony/STUDIO-767");
         let stale = Instant::now() - MERGE_CLAIM_TTL - std::time::Duration::from_secs(1);
         o.merge_inflight.insert(key, stale);
-        assert!(matches!(o.plan_run_merge(run), MergePlanOutcome::Ready(_)));
+        assert!(matches!(
+            o.plan_run_merge(run, MergeIntent::Attempt),
+            MergePlanOutcome::Ready(_)
+        ));
     }
 
     /// **The audit half of §3/G4.** An applied merge leaves a `teams.merge` row on the run naming

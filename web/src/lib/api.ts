@@ -418,6 +418,51 @@ export async function mergeRun(runID: number, confirm = ""): Promise<MergeRunRes
   throw new Error(err ? err.error.message : `merge failed: ${res.status}`);
 }
 
+// RunMergeability is what the daemon would answer if Merge were clicked right now (STUDIO-790),
+// read from GET /api/v1/runs/{id}/mergeability. It merges nothing: the route is GET-only, and the
+// daemon's read path never reaches `gh pr merge`.
+//
+// A refusal is a 200, not an error — the console asked a question and the daemon answered it — so
+// `reason` is the daemon's own sentence and the header's disabled tooltip shows it verbatim. Only a
+// question that could NOT be answered (a `gh` that would not respond) throws, and the header keeps
+// Merge live on that, because nobody could ask is not the daemon saying no.
+export type RunMergeability =
+  | { mergeable: true; receipt: MergeReceipt }
+  | { mergeable: false; reason: string };
+
+// fetchRunMergeability asks whether this run's pull request would merge. `teams_disabled` (409) is
+// answered by the console's own Teams gate before this is ever called, so it throws like any other
+// unanswerable question rather than being modelled as a verdict.
+export async function fetchRunMergeability(runID: number): Promise<RunMergeability> {
+  const res = await fetch(`/api/v1/runs/${runID}/mergeability`, {
+    headers: { Accept: "application/json" },
+  });
+  // `typeof … === "object"` before any `in`: a body that parsed to a number or a string would make
+  // the `in` operator itself throw, turning an odd response into a TypeError the header then shows
+  // as its "could not be asked" reason. Narrow first, and say something true instead.
+  const parsed: unknown = await res.json().catch(() => null);
+  const body =
+    typeof parsed === "object" && parsed !== null
+      ? (parsed as { mergeable?: unknown; receipt?: MergeReceipt; reason?: unknown } & Partial<ApiError>)
+      : null;
+  if (!res.ok) {
+    throw new Error(body?.error?.message ?? `mergeability failed: ${res.status}`);
+  }
+  // A 200 the console cannot read is not a verdict. Saying so beats defaulting either way: a
+  // silent `false` would take the control away for a daemon that never refused anything, and a
+  // silent `true` would put the lie back.
+  if (body === null || typeof body.mergeable !== "boolean") {
+    throw new Error("the daemon answered no mergeability verdict");
+  }
+  if (body.mergeable) {
+    if (!body.receipt) {
+      throw new Error("the daemon called it mergeable but resolved no pull request");
+    }
+    return { mergeable: true, receipt: body.receipt };
+  }
+  return { mergeable: false, reason: typeof body.reason === "string" ? body.reason : "" };
+}
+
 // RunMessage is one operator "btw" sent to a run's agent (INF-250). body is the operator's
 // original text; status moves sent → delivered (delivered_turn set) | expired (run ended first).
 export interface RunMessage {

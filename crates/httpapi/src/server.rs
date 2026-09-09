@@ -13,7 +13,7 @@ use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
-use rhapsody_orchestrator::runmerge::MergeControlOutcome;
+use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeabilityOutcome};
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
     TeamsMemoryError, TeamsView,
@@ -36,7 +36,7 @@ use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_reviews::{handle_review_dismiss, handle_review_rerun, handle_reviews};
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
-use crate::handlers_runmerge::handle_run_merge;
+use crate::handlers_runmerge::{handle_run_merge, handle_run_mergeability};
 use crate::handlers_teams::{
     handle_run_post, handle_run_retain, handle_teams, handle_teams_config, handle_teams_invalidate,
     handle_teams_recall, handle_teams_reinstate, handle_teams_room, handle_teams_roster,
@@ -357,6 +357,16 @@ pub trait StateProvider: Send + Sync {
     async fn merge_run(&self, _run_id: i64, _confirm: &str) -> MergeControlOutcome {
         MergeControlOutcome::Dormant
     }
+
+    /// `GET /api/v1/runs/{id}/mergeability` — what [`StateProvider::merge_run`] would answer if it
+    /// were called right now, without calling it (STUDIO-790).
+    ///
+    /// The console renders the header's **Merge** from this, so the operator reads the daemon's
+    /// refusal before clicking rather than after. It merges nothing, records nothing and takes no
+    /// single-flight claim; a provider that predates it behaves as one with Teams off.
+    async fn run_mergeability(&self, _run_id: i64) -> MergeabilityOutcome {
+        MergeabilityOutcome::Dormant
+    }
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -538,6 +548,13 @@ where
         // body carries no pull-request coordinate — see `handlers_runmerge` for why that absence
         // is the guardrail rather than a validation.
         .route("/api/v1/runs/{id}/merge", any(handle_run_merge))
+        // The console asking what that POST would do (STUDIO-790). Its own path rather than a GET
+        // on the one above, so `/merge` stays POST-only and that stays a one-line invariant:
+        // a route nothing can reach with a GET cannot be merged from a link somebody clicks.
+        .route(
+            "/api/v1/runs/{id}/mergeability",
+            any(handle_run_mergeability),
+        )
         // Daemon-mediated review handoff (TRA-242): move a live run's ticket to the review state so it
         // leaves the active set and the run cleanly ends. POST-only; more-specific than runs/{id}.
         .route("/api/v1/runs/{id}/handoff", any(handle_run_handoff))

@@ -13,10 +13,16 @@
 //
 // DORMANT, deliberately: STUDIO-745 folded the §4 side cards into the run detail's watch-tabs
 // rail, and the Diff tab names that dependency now — so `PullRequestView`, `checksSummary` and
-// `mergeNote` below currently have NO consumer outside their own tests. They are kept rather than
-// deleted because slice 7 of the Trace plan (the run-branch diff endpoint plus a live Merge) is
-// what will supply the `PullRequestView` this was written for, and a Merge control cannot decide
-// anything without exactly these two rules. Delete them if that slice is ever dropped.
+// `mergeNote` below currently have NO consumer outside their own tests.
+//
+// The reason they are kept has NARROWED, and the half that is gone was the load-bearing one. This
+// note used to say a Merge control "cannot decide anything without exactly these two rules"; the
+// live Merge has since shipped (STUDIO-767) and decides nothing here. It reads the daemon's own
+// verdict — `GET /api/v1/runs/{id}/mergeability`, STUDIO-790 — precisely so the console never
+// re-derives a mergeability rule the daemon owns and can drift from it. So `checksSummary` and
+// `mergeNote` have no consumer left to wait for. What survives is `PullRequestView`: the run-branch
+// diff endpoint (STUDIO-749) is still deferred, and it is what would supply the §4 card this type
+// was written for. Delete all three if that endpoint is ever dropped.
 import type { RunSummary } from "@/lib/api";
 import type { ConsoleJobStatus } from "@/lib/console-jobs";
 

@@ -15,7 +15,7 @@ use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
-use rhapsody_orchestrator::runmerge::MergeControlOutcome;
+use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeabilityOutcome};
 use rhapsody_orchestrator::{
     HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
     RetryRow, RunMessageResult, RunningRow, Snapshot, StopResult, TokenCounts, Totals,
@@ -108,6 +108,10 @@ pub(crate) struct FakeProvider {
     /// asserts the handler forwarded only the run id and the confirmation (STUDIO-767).
     merge_outcome: Option<MergeControlOutcome>,
     merge_asked: Mutex<Option<(i64, String)>>,
+    /// The canned outcome `run_mergeability` returns, and the run id the last read asked about
+    /// (STUDIO-790).
+    mergeability_outcome: Option<MergeabilityOutcome>,
+    mergeability_asked: Mutex<Option<i64>>,
 }
 
 impl FakeProvider {
@@ -157,6 +161,8 @@ impl FakeProvider {
             review_dismiss_pr: Mutex::new(None),
             merge_outcome: None,
             merge_asked: Mutex::new(None),
+            mergeability_outcome: None,
+            mergeability_asked: Mutex::new(None),
         }
     }
 
@@ -382,6 +388,20 @@ impl FakeProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Set the canned outcome `run_mergeability` returns. Unset ⇒ the trait's `Dormant`.
+    pub(crate) fn with_mergeability(mut self, outcome: MergeabilityOutcome) -> Self {
+        self.mergeability_outcome = Some(outcome);
+        self
+    }
+
+    /// The run id the last `run_mergeability` read asked about.
+    pub(crate) fn mergeability_asked(&self) -> Option<i64> {
+        *self
+            .mergeability_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[async_trait]
@@ -580,6 +600,16 @@ impl StateProvider for FakeProvider {
         self.merge_outcome
             .clone()
             .unwrap_or(MergeControlOutcome::Dormant)
+    }
+
+    async fn run_mergeability(&self, run_id: i64) -> MergeabilityOutcome {
+        *self
+            .mergeability_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(run_id);
+        self.mergeability_outcome
+            .clone()
+            .unwrap_or(MergeabilityOutcome::Dormant)
     }
 
     async fn teams_recall(

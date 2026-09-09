@@ -16,18 +16,27 @@
  * An unrecognised value is passed through rather than swallowed. GitHub's vocabulary is its own and
  * has grown before, and a state this console has never heard of is exactly the one worth showing.
  *
+ * Every value reaching here comes off a `MergeReceipt`, so it has passed every refusal
+ * `runmerge::resolve_pull_request` makes. That is load-bearing for BEHIND below, whose reading
+ * depends on the gate the daemon already applied to it.
+ *
  * `undefined` is accepted even though the receipt types the field as a `string`, because the
  * receipt crosses a process boundary and `api.ts` casts the daemon's JSON rather than validating
  * it. A display helper that throws takes the whole run-detail header down with it; saying nothing
  * is the right failure.
  *
- * `armed` says which side of the click the note is being read on, and it changes exactly one
- * answer. Before the click the note describes what the operator is about to act on, and `CLEAN`
- * means "nothing is in the way". AFTER it, `gh pr merge --auto` has already landed a `CLEAN` pull
- * request — so "GitHub reports it ready to merge" beside "queued … for merge" would read as though
- * it were still waiting. There is nothing left for it to wait on, so the note says nothing. The
- * states that DO still hold it up — BLOCKED, BEHIND, DIRTY — are the ones worth reading there, and
- * they are unchanged.
+ * `armed` says which side of the merge the note is being read on, and it changes exactly one
+ * answer. Unarmed — in the confirm dialog, describing the pull request the operator is about to
+ * merge — `CLEAN` means "nothing is in the way". ARMED, `gh pr merge --auto` has already landed a
+ * `CLEAN` pull request, so "GitHub reports it ready to merge" beside "queued … for merge" would
+ * read as though it were still waiting. There is nothing left for it to wait on, so the note says
+ * nothing. The states that DO still hold it up — BLOCKED, DIRTY — are the ones worth reading
+ * there, and they are unchanged.
+ *
+ * Unarmed is the DIALOG's reading and not the header's. The header renders no note before a
+ * merge: its pre-click channel is the daemon's own verdict on the control itself (STUDIO-790),
+ * and a second sentence beside it, derived here from a receipt the daemon did NOT refuse, is one
+ * that can contradict it — which it did, on DIRTY.
  */
 export function mergeStateNote(state: string | undefined, armed = false): string {
   const value = (state ?? "").trim().toUpperCase();
@@ -45,7 +54,11 @@ export function mergeStateNote(state: string | undefined, armed = false): string
     case "UNSTABLE":
       return "GitHub reports a non-required check failing; the required ones still decide.";
     case "BEHIND":
-      return "The branch is behind its base — it cannot land until someone pushes.";
+      // NOT "push the branch". A receipt carrying BEHIND has already passed
+      // `runmerge::resolve_pull_request`'s branch-update gate, which refuses a behind branch on a
+      // repository that will not update one (STUDIO-784 gap 1) — so the only BEHIND that reaches
+      // this console is one GitHub brings up to date itself.
+      return "The branch is behind its base; GitHub will bring it up to date itself before merging.";
     case "DIRTY":
       return "The branch conflicts with its base — it cannot land until someone resolves that.";
     case "DRAFT":

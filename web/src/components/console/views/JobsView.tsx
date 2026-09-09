@@ -31,10 +31,10 @@ import { sparkSummary, traceSpark } from "@/lib/console-trace-spark";
 import { buildTrace } from "@/lib/trace-model";
 import { mergeJobs } from "@/lib/runs-model";
 import { useLinearProjects } from "@/hooks/useConfig";
-import { useIssueRuns } from "@/hooks/useHistory";
+import { useJobsFeed } from "@/hooks/useJobsFeed";
 import { useNow } from "@/hooks/useNow";
 import { useTranscript } from "@/hooks/useRunDetail";
-import { useRefresh, useStateQuery } from "@/hooks/useStateQuery";
+import { useRefresh } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview } from "@/hooks/useTeams";
 
 const ALL_PROJECTS = "";
@@ -62,13 +62,19 @@ export function JobsView({
   onLoadMore: () => void;
 }) {
   const nowMs = useNow(30_000);
-  const state = useStateQuery();
+  // One feed, not two independent reads. The Now strip's counts and the table's rows are both
+  // derived from `rows` below, so they are only ever as consistent as the two fetches feeding it —
+  // and until STUDIO-791 the second of those never refetched at all, leaving this surface reporting
+  // a run's state from whenever the page happened to be opened.
+  //
   // At the DEFAULT width we send no limit at all, which keeps this on the same `{}` cache entry the
   // rail's badge already holds — a distinct `{limit: 50}` key would fetch the identical 50 rows a
   // second time on every Jobs mount. Only a widened window opens a key of its own. The daemon
   // derives `next_offset` from the page size the store ACTUALLY applied rather than from what the
   // caller sent (handlers_history.rs), so an unsent limit still answers "is there more?".
-  const issueRuns = useIssueRuns(limit > JOBS_PAGE_SIZE ? { limit } : {});
+  // `useJobsFeed` polls the default window and refreshes a widened one off the live snapshot
+  // instead — its own doc comment carries the measurements behind that split.
+  const { state, issueRuns } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);

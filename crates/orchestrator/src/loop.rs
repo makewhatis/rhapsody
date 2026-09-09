@@ -364,6 +364,10 @@ pub enum Event {
     /// the control task ([`crate::mergeconsole`]).
     RunMergePlan {
         run_id: i64,
+        /// Whether the plan is for the operator's click or for the console's read of what that
+        /// click would do (STUDIO-790). It changes no gate — both walk the same ones — only
+        /// whether a single-flight claim is taken and a refusal recorded.
+        intent: crate::mergeconsole::MergeIntent,
         reply: oneshot::Sender<crate::mergeconsole::MergePlanOutcome>,
     },
     /// The same merge, phase 3: the off-loop half reporting what happened so the control task can
@@ -646,8 +650,12 @@ impl Orchestrator {
             Event::ReviewDismiss { pr, reply } => {
                 let _ = reply.send(self.handle_review_dismiss(&pr));
             }
-            Event::RunMergePlan { run_id, reply } => {
-                let _ = reply.send(self.plan_run_merge(run_id));
+            Event::RunMergePlan {
+                run_id,
+                intent,
+                reply,
+            } => {
+                let _ = reply.send(self.plan_run_merge(run_id, intent));
             }
             Event::RunMergeSettle {
                 plan,
