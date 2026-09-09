@@ -712,6 +712,14 @@ impl Orchestrator {
         self.publish_snapshot();
         if let Err(e) = self.validate() {
             tracing::error!(err = %e, "dispatch preflight validation failed; skipping dispatch");
+            // Both early returns below skip dispatch entirely, so the reset at the top of
+            // `dispatch_decisions` never runs and the last successful pass's tally would stand.
+            // Retire it here instead (STUDIO-805): unlike the tracker outage that reset covers,
+            // NEITHER of these clears up on its own — a bad config or a dead agent credential skips
+            // dispatch every tick until a human intervenes — so a survivor would render "N queued"
+            // indefinitely against a teammate who is neither queued nor running. This count exists
+            // to tell "queued" apart from "broken"; on these paths the honest answer is "broken".
+            self.set_held_for_capacity(HashMap::new());
             self.schedule_tick(poll);
             return;
         }
@@ -721,6 +729,7 @@ impl Orchestrator {
         // claimed); cached per TTL; logs the transition + rate-limits the steady-state repeat itself, so
         // this call site stays quiet rather than error-logging every 30s forever.
         if !self.credential_preflight().await {
+            self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;
         }
@@ -1678,6 +1687,82 @@ mod tests {
             mem.roster().expect("roster").roster[0].queued,
             0,
             "a stale count outlived the pass that produced it"
+        );
+    }
+
+    /// The two `on_tick` early returns that sit BEFORE `dispatch_decisions` — a failed preflight
+    /// `validate()` and the BO-59 dead-credential probe — retire the published count too. They are
+    /// worse than the candidate-fetch case, not milder: neither clears up on its own (a dead Claude
+    /// credential skips all dispatch until an operator re-authenticates), so a surviving count would
+    /// render "N queued" indefinitely while nothing is queued and nothing is running. That is this
+    /// surface's own purpose inverted — it exists to tell "queued" apart from "broken", and on these
+    /// paths the honest answer is "broken" (STUDIO-805, review round 2).
+    #[tokio::test]
+    async fn a_failed_preflight_validate_retires_the_published_count() {
+        let (mut o, _spawned) = new_loop_orch(Fake::new(), Duration::from_secs(3600));
+        o.ctx = Some(CancelWait::default());
+        // A tracker config with no api_key fails `validate()` at its first check, so the tick
+        // returns before it can ever reach the reset in `dispatch_decisions`.
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.tracker.api_key = String::new();
+        }
+        o.validate()
+            .expect_err("the empty api_key must fail dispatch preflight validation");
+        let mem = attach_capped_team(&mut o, &[("alice", 1)]);
+        mem.publish_held([("alice".to_string(), 2)].into_iter().collect());
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert!(
+            o.held_for_capacity.is_empty(),
+            "a tick that failed preflight left a tally standing: {:?}",
+            o.held_for_capacity
+        );
+        assert_eq!(
+            mem.roster().expect("roster").roster[0].queued,
+            0,
+            "a failed preflight left the last pass's count on the card, where it cannot self-clear"
+        );
+    }
+
+    /// The BO-59 credential preflight is the second early return, and the one that persists: a dead
+    /// login skips dispatch every tick until a human re-authenticates. See the sibling test above.
+    #[tokio::test]
+    async fn a_dead_credential_retires_the_published_count() {
+        struct DeadProbe;
+        #[async_trait::async_trait]
+        impl crate::preflight::CredentialProbe for DeadProbe {
+            async fn probe(
+                &self,
+                _req: &crate::preflight::ProbeRequest,
+            ) -> crate::preflight::ProbeOutcome {
+                crate::preflight::ProbeOutcome::Dead("expired login".to_string())
+            }
+        }
+
+        let (mut o, _spawned) = new_loop_orch(Fake::new(), Duration::from_secs(3600));
+        o.ctx = Some(CancelWait::default());
+        o.cred_probe = Some(Arc::new(DeadProbe));
+        let mem = attach_capped_team(&mut o, &[("alice", 1)]);
+        mem.publish_held([("alice".to_string(), 2)].into_iter().collect());
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert!(
+            o.held_for_capacity.is_empty(),
+            "a tick that skipped dispatch on a dead credential left a tally standing: {:?}",
+            o.held_for_capacity
+        );
+        assert_eq!(
+            mem.roster().expect("roster").roster[0].queued,
+            0,
+            "a dead credential renders \"2 queued\" until someone re-authenticates"
         );
     }
 
