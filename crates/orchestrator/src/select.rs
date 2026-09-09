@@ -1603,6 +1603,46 @@ mod tests {
         );
     }
 
+    /// **The protection the MULTI ladder exists to carry, pinned against the mutation that would
+    /// undo it.** The tally is keyed by IDENTITY, and this is the one pass where that is not the
+    /// only plausible reading — it walks candidates from every project in a single sweep, and a
+    /// tally scoped per project would look locally correct while re-admitting the same teammate
+    /// once per project they are eligible in.
+    ///
+    /// alice is capped at one and carries no live work; one of her tickets arrives from p1 and one
+    /// from p2 in the SAME pass. The seat she spends on MT-1 must still be spent when MT-2 is
+    /// considered under a different project. Verified by making exactly that mutation — scoping
+    /// `impl_tally` per `p.group` — which admits both and comes back with `held` empty. Neither
+    /// project budget binds here (both are 10), so the cap is the only thing that can decide.
+    #[test]
+    fn a_teammate_at_cap_in_one_project_is_still_at_cap_in_the_next() {
+        let o = multi_with_capped_roster(
+            &[("alice", 1)],
+            vec![
+                proj("p1", 10, HashMap::new()),
+                proj("p2", 10, HashMap::new()),
+            ],
+        );
+        let mut tagged = tag_for(0, vec![teams_issue("1", "MT-1", &["rhapsody:@alice"])]);
+        tagged.extend(tag_for(
+            1,
+            vec![teams_issue("2", "MT-2", &["rhapsody:@alice"])],
+        ));
+
+        let (picked, reopen, held) = o.select_dispatch_multi_with_reopens(tagged);
+        assert_eq!(
+            tagged_ids(&picked),
+            vec!["MT-1"],
+            "alice's one seat is spent in p1; p2 does not hand her a second one"
+        );
+        assert!(reopen.is_empty());
+        assert_eq!(
+            held.get("alice").copied(),
+            Some(1),
+            "and the hold is charged to alice once, across both projects"
+        );
+    }
+
     /// **The regression B1 shipped and then fixed, pinned for this ladder before the gate was
     /// written.** The load-balanced tier is the one whose answer depends on load, and it is the one
     /// with no natural coverage — every obvious test routes through Tier 0 (`rhapsody:@`) or a
