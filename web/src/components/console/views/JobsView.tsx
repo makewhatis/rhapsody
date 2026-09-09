@@ -29,10 +29,10 @@ import { sparkSummary, traceSpark } from "@/lib/console-trace-spark";
 import { buildTrace } from "@/lib/trace-model";
 import { mergeJobs } from "@/lib/runs-model";
 import { useLinearProjects } from "@/hooks/useConfig";
-import { useIssueRuns } from "@/hooks/useHistory";
+import { useJobsFeed } from "@/hooks/useJobsFeed";
 import { useNow } from "@/hooks/useNow";
 import { useTranscript } from "@/hooks/useRunDetail";
-import { useRefresh, useStateQuery } from "@/hooks/useStateQuery";
+import { useRefresh } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview } from "@/hooks/useTeams";
 
 const ALL_PROJECTS = "";
@@ -45,8 +45,11 @@ const ALL_PROJECTS = "";
 // costs against the `GET /api/v1/issues` the spec assumed.
 export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) {
   const nowMs = useNow(30_000);
-  const state = useStateQuery();
-  const issueRuns = useIssueRuns();
+  // One feed, not two independent reads. The Now strip's counts and the table's rows are both
+  // derived from `rows` below, so they are only ever as consistent as the two fetches feeding it —
+  // and until STUDIO-791 the second of those never refetched at all, leaving this surface reporting
+  // a run's state from whenever the page happened to be opened.
+  const { state, issueRuns } = useJobsFeed();
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
