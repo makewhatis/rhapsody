@@ -94,8 +94,7 @@ function Paged({ onOpenJob }: { onOpenJob: (issue: string) => void }) {
   );
 }
 
-function mount(onOpenJob = vi.fn()) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function mount(onOpenJob = vi.fn(), qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   render(
     <QueryClientProvider client={qc}>
       <Paged onOpenJob={onOpenJob} />
@@ -989,12 +988,12 @@ describe("the §6 additions are painted, not just classed", () => {
 // make the console use it and make the cut visible while it lasts.
 describe("paging past the first 50 (STUDIO-792)", () => {
   /** A page of `n` distinct issues, plus whether the daemon says there is more after it. */
-  function page(n: number, from: number, more: boolean) {
+  function page(n: number, more: boolean) {
     return {
       issues: Array.from({ length: n }, (_, i) =>
-        run({ issue_identifier: `T-${from + i}`, outcome: "completed", lifecycle: "done" }),
+        run({ issue_identifier: `T-${i}`, outcome: "completed", lifecycle: "done" }),
       ),
-      next_offset: more ? from + n : null,
+      next_offset: more ? n : null,
     };
   }
 
@@ -1004,7 +1003,7 @@ describe("paging past the first 50 (STUDIO-792)", () => {
 
   it("asks the daemon for the store's own page size rather than letting it default", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue(page(3, 0, false));
+    h.fetchIssueRuns.mockResolvedValue(page(3, false));
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(3));
     expect(h.fetchIssueRuns).toHaveBeenCalledWith({ limit: 50 });
@@ -1012,7 +1011,7 @@ describe("paging past the first 50 (STUDIO-792)", () => {
 
   it("says the list is complete when the daemon offers no further page", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue(page(3, 0, false));
+    h.fetchIssueRuns.mockResolvedValue(page(3, false));
     mount();
     await waitFor(() => expect(note()).toBe("Showing all 3 jobs."));
     expect(screen.queryByRole("button", { name: /load 50 more/i })).toBeNull();
@@ -1020,7 +1019,7 @@ describe("paging past the first 50 (STUDIO-792)", () => {
 
   it("says older jobs are unloaded, and offers them, while the daemon has more", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue(page(3, 0, true));
+    h.fetchIssueRuns.mockResolvedValue(page(3, true));
     mount();
     await waitFor(() =>
       expect(note()).toBe("Showing the 3 most recent jobs. Older jobs are not loaded yet."),
@@ -1034,7 +1033,7 @@ describe("paging past the first 50 (STUDIO-792)", () => {
     // live, so an accumulated `offset=50` would re-serve rows that had shifted down and drop the
     // ones they displaced. See the note on `onLoadMore` in ConsoleApp.
     h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) =>
-      f.limit === 50 ? page(50, 0, true) : page(62, 0, false),
+      f.limit === 50 ? page(50, true) : page(62, false),
     );
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(50));
@@ -1046,6 +1045,63 @@ describe("paging past the first 50 (STUDIO-792)", () => {
     expect(h.fetchIssueRuns).toHaveBeenCalledWith({ limit: 100 });
     expect(note()).toBe("Showing all 62 jobs.");
     expect(screen.queryByRole("button", { name: /load 50 more/i })).toBeNull();
+  });
+
+  // Self-review catch. The guard has to be "a WIDER page is in flight", not "a request is in
+  // flight": STUDIO-791 is about to give this query a 2s poll, and disabling on `isFetching`
+  // would leave the control dead for a beat on every tick — a button that ignores clicks at
+  // random is worse than no button.
+  it("disables the control only while the wider page is actually in flight", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    let releaseSecondPage = () => {};
+    const secondPage = new Promise<void>((res) => {
+      releaseSecondPage = res;
+    });
+    h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) => {
+      if (f.limit === 50) return page(50, true);
+      await secondPage;
+      return page(62, false);
+    });
+    mount();
+
+    const more = () => screen.getByRole("button", { name: /load 50 more/i }) as HTMLButtonElement;
+    await waitFor(() => expect(rowKeys()).toHaveLength(50));
+    // Settled on the page it holds: clickable, even though a poll could be running.
+    expect(more().disabled).toBe(false);
+
+    fireEvent.click(more());
+    await waitFor(() => expect(more().disabled).toBe(true));
+
+    releaseSecondPage();
+    await waitFor(() => expect(rowKeys()).toHaveLength(62));
+  });
+
+  // The discriminating half of the guard above, and the reason it is not `isFetching`: a
+  // background refetch of the page already held must leave the control alive. This drives the
+  // exact shape STUDIO-791's 2s poll will produce — same key, data on screen, request in flight.
+  it("stays clickable through a background refetch of the page it already holds", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    let releaseRefetch = () => {};
+    const refetched = new Promise<void>((res) => {
+      releaseRefetch = res;
+    });
+    let calls = 0;
+    h.fetchIssueRuns.mockImplementation(async () => {
+      calls += 1;
+      if (calls > 1) await refetched; // hold the refetch open so the in-flight state is observable
+      return page(50, true);
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mount(vi.fn(), qc);
+
+    const more = () => screen.getByRole("button", { name: /load 50 more/i }) as HTMLButtonElement;
+    await waitFor(() => expect(rowKeys()).toHaveLength(50));
+
+    void qc.invalidateQueries({ queryKey: ["history-issues"] });
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalledTimes(2));
+
+    expect(more().disabled).toBe(false);
+    releaseRefetch();
   });
 
   // The half that is easiest to get wrong: a filter runs over the LOADED rows only, so "Done · 3"
@@ -1095,7 +1151,7 @@ describe("paging past the first 50 (STUDIO-792)", () => {
         },
       ],
     });
-    h.fetchIssueRuns.mockResolvedValue(page(2, 0, true));
+    h.fetchIssueRuns.mockResolvedValue(page(2, true));
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(3));
     expect(note()).toBe("Showing the 3 most recent jobs. Older jobs are not loaded yet.");

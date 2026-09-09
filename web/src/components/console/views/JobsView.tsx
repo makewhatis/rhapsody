@@ -181,7 +181,11 @@ export function JobsView({
           <div className="jmore">
             <span className="note">{pageNote}</span>
             {hasMore ? (
-              <Chip onClick={onLoadMore} disabled={issueRuns.isFetching}>
+              // `isPlaceholderData`, not `isFetching`: it is true exactly while a WIDER page is in
+              // flight and the previous one is still on screen, and false during a background
+              // refetch of the page already held. Disabling on `isFetching` would make the
+              // control dead for a beat on every poll once STUDIO-791 gives this query one.
+              <Chip onClick={onLoadMore} disabled={issueRuns.isPlaceholderData}>
                 Load {JOBS_PAGE_SIZE} more
               </Chip>
             ) : null}
