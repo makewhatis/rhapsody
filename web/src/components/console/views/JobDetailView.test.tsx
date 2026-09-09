@@ -3839,10 +3839,11 @@ describe("the Result card matches the approved prototype through the cascade (ST
     // Proves the trace rule still matches this element, so the UNSET assertions below are about
     // the generic rule no longer matching — not about the accent having lost its own styling.
     expect(cs.height).toBe("3px");
-    // And the FILL, pinned separately: a 3px element with no background is an invisible accent,
-    // i.e. this symptom back, and `height` alone cannot see that. Every property this block
-    // guards is asserted at DECLARATION granularity — losing one line of a rule is at least as
-    // likely a future edit as losing the whole rule, and the fills are what the ticket is about.
+    // And the FILL, pinned separately from the geometry: a 3px element with no background is an
+    // invisible accent — this symptom back — and `height` alone cannot see that. Each of the
+    // three fills this card is judged on gets its own assertion, because a rule losing ONE
+    // declaration is at least as likely a future edit as a rule being removed or renamed, and
+    // the fills are the property the ticket was actually filed about.
     expect(cs.background).toBe("var(--done)");
     // The acceptance criteria, one property each: no padding, no radius, no margin, not sticky.
     expect(cs.padding).toBe(UNSET);
@@ -3871,12 +3872,24 @@ describe("the Result card matches the approved prototype through the cascade (ST
     expect(getComputedStyle(dot).borderRadius).toBe("50%");
     // The fill is the dot: an empty 6px element with no background renders as nothing at all, so
     // the "missing status dot" symptom would be back with the element still in the DOM and every
-    // other assertion here green. Read via `backgroundColor`, not the `background` shorthand:
-    // jsdom RESOLVES `currentColor` against the element's own computed `color`, which under the
-    // full theme is itself an unresolved `var()` — so the longhand reports that token and the
-    // shorthand, unable to reassemble itself from it, reports nothing. Asserting the dot's fill
-    // and the eyebrow's colour are the SAME value is what pins `currentColor` specifically: it is
-    // why `.trrc.fail` and `.trrc.stop` recolour the dot without a rule of their own.
+    // other assertion here green.
+    //
+    // Read through `backgroundColor`, NOT the `background` shorthand the two tests around this one
+    // use, because jsdom treats the two token forms differently — measured, not assumed:
+    //
+    //   background: var(--done)     ->  background=[var(--done)]  backgroundColor=[rgba(0,0,0,0)]
+    //   background: currentColor    ->  background=[]             backgroundColor=[var(--done)]
+    //
+    // `var()` is kept verbatim and the shorthand survives; `currentColor` is RESOLVED against the
+    // element's own computed `color`, which under the full theme is itself the unresolved
+    // `var(--done)` inherited from `.eyebrow` — so the longhand carries it and the shorthand,
+    // unable to reassemble itself from a component it cannot parse, comes back empty.
+    //
+    // The consequence is that this assertion also discriminates `currentColor` from a hard-coded
+    // `var(--done)`: swapping the declaration to the literal reds this test (it moves the value
+    // out of the longhand), which matters because `.trrc.fail` and `.trrc.stop` recolour the dot
+    // through `currentColor` alone, having no `.trdot` rule of their own. The equality is the
+    // readable half; the concrete token stops the pair passing vacuously if both sides were "".
     expect(getComputedStyle(dot).backgroundColor).toBe(getComputedStyle(eyebrow).color);
     expect(getComputedStyle(dot).backgroundColor).toBe("var(--done)");
     // The prototype's `.eyebrow{display:flex;align-items:center;gap:8px}` — the gap IS the spacing
