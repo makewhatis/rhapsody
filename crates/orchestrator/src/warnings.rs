@@ -221,8 +221,8 @@ impl WarningsState {
 
     /// The merged warnings for a group (empty when none): missing-prompt-file flags first, then the
     /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406), then the
-    /// enrichment-deferred warning (STUDIO-811). A fresh slice so
-    /// callers never alias the stored maps. Mirrors Go `projectWarningsFor`, plus the fetch producer.
+    /// enrichment-deferred warning (STUDIO-811). A fresh slice so callers never alias the stored
+    /// maps. Mirrors Go `projectWarningsFor`, plus the two Rhapsody-only producers.
     pub(crate) fn merged_for(&self, group: &str) -> Vec<String> {
         let m = self.maps.read().unwrap_or_else(|e| e.into_inner());
         let file = m.file.get(group);

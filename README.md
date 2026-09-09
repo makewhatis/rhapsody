@@ -818,9 +818,14 @@ when a project on it contributed a surviving candidate, and only once per tick �
 | | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
 | `gh` invocation | synchronous `exec` inline on the poll goroutine | `spawn_blocking`, so the awaits are real yield points and `GH_SUMMONS_TIMEOUT` actually fires |
-| Enrichment cost per tick | unbounded — 2 `gh` calls × every configured repo | at most `poll_interval / 2`, floored at one repo's own fetch bound |
+| Enrichment cost per tick | unbounded — 2 `gh` calls × every configured repo | at most `poll_interval / 2`, floored at one repo's own fetch bound (15s) |
 | Repos the budget does not reach | n/a (all are fetched, however long it takes) | deferred to the next tick, which a round-robin cursor starts at them |
 | A shortfall | silent | one `warn!` per tick, plus a per-project-group streak on `GET /api/v1/projects` after 3 consecutive ticks |
+
+The floor is not a rounding detail: below a 30s poll interval it wins, and a pathological `gh` can
+still hold a tick past the interval. That is deliberate — a budget no single fetch can complete
+inside would disable the feature rather than bound it, and an installation wanting both a sub-30s
+poll and summons enrichment needs the enrichment off the poll path, not a smaller number.
 
 Behaviour is unchanged for any installation whose enrichment already fits its poll interval, and
 byte-identical with `github_summons: false` (no repo is ever wanted, so both new passes are no-ops).

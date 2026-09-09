@@ -722,6 +722,12 @@ impl Orchestrator {
     /// would expire mid-fetch every tick, and the feature would never enrich anything rather than
     /// enrich a bounded share. It also keeps the test/legacy `poll_interval: 0` effectives — where
     /// half of zero is zero — enriching exactly as they did.
+    ///
+    /// So the ceiling is "half a poll interval, but never less than one fetch". Below a 30s poll
+    /// interval the floor wins and a pathological `gh` can hold a tick past the interval — that is
+    /// deliberate, because the only alternative is a budget no fetch can ever complete inside, which
+    /// disables the feature rather than bounding it. An installation that wants both a sub-30s poll
+    /// and summons enrichment needs enrichment off the poll path, not a smaller number here.
     fn gh_enrich_budget(&self) -> Duration {
         (self.poll_interval() / GH_ENRICH_BUDGET_DIVISOR).max(GH_SUMMONS_TIMEOUT)
     }
