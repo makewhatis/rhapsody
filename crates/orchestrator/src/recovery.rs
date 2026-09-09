@@ -140,6 +140,7 @@ impl Orchestrator {
                 project_slug: rr.project_slug,
                 project_repo: String::new(), // not persisted in retry_queue; re-derived on dispatch
                 issue: Issue::default(),
+                identity: String::new(), // not persisted; see `RetryEntry::identity` for the gap
                 recovered: true,
             },
         );
@@ -184,6 +185,7 @@ impl Orchestrator {
                 project_slug: prev.project_slug.clone(),
                 project_repo: prev.project_repo.clone(),
                 issue: Issue::default(),
+                identity: String::new(), // not persisted; see `RetryEntry::identity` for the gap
                 recovered: true,
             },
         );
@@ -218,6 +220,7 @@ impl Orchestrator {
                 project_slug: project_slug.to_string(),
                 project_repo: String::new(),
                 issue: Issue::default(),
+                identity: String::new(), // not persisted; see `RetryEntry::identity` for the gap
                 recovered: true,
             },
         );

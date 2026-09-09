@@ -520,6 +520,7 @@ pub(crate) fn retry_entry(issue_id: &str, identifier: &str, attempt: i64) -> Ret
         project_slug: String::new(),
         project_repo: String::new(),
         issue: Issue::default(),
+        identity: String::new(),
         due_at_ms: 0,
         recovered: false,
     }

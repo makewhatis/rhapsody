@@ -518,6 +518,11 @@ impl Orchestrator {
     /// [`RetryEntry`] (with the wall-clock due time + the last-known `iss`), keeps the claim, and
     /// persists the retry row + `claim=retry_queued` so a restart re-arms it. Mirrors Go
     /// `scheduleRetryFor` (the live timer is O7's, armed against `due_at_ms`).
+    ///
+    /// `identity` travels with `iss` and for the same reason: both are carried from the entry the
+    /// caller already holds, because nothing downstream can re-derive them. It is `""` on every
+    /// path with no teammate to name — Teams off, an unrouted run, a boot-recovered requeue — and
+    /// [`RetryEntry::identity`] documents what that costs.
     pub(crate) fn schedule_retry_for(
         &mut self,
         t: RetryTarget<'_>,
@@ -525,6 +530,7 @@ impl Orchestrator {
         delay_ms: i64,
         err_str: &str,
         iss: Issue,
+        identity: String,
     ) {
         self.clear_retry(t.id);
         self.claimed.insert(t.id.to_string()); // remain claimed while a retry is pending
@@ -542,6 +548,7 @@ impl Orchestrator {
                 project_slug: t.project_slug.to_string(),
                 project_repo: t.project_repo.to_string(),
                 issue: iss, // last-known full issue, so a later fire can re-locate in-flight work
+                identity,   // so the backoff window still spends its teammate's capacity
                 recovered: false,
             },
         );
@@ -658,6 +665,7 @@ impl Orchestrator {
                 CONTINUATION_DELAY_MS,
                 "",
                 re.issue.clone(),
+                re.identity.clone(),
             );
             return;
         }
@@ -686,6 +694,7 @@ impl Orchestrator {
             failure_backoff_ms(next, max_backoff),
             &reason,
             re.issue.clone(),
+            re.identity.clone(),
         );
     }
 
@@ -738,6 +747,7 @@ impl Orchestrator {
                         delay,
                         "continuation retry poll failed",
                         re.issue.clone(),
+                        re.identity.clone(),
                     );
                 } else {
                     self.schedule_retry_for(
@@ -746,6 +756,7 @@ impl Orchestrator {
                         backoff,
                         "retry poll failed",
                         re.issue.clone(),
+                        re.identity.clone(),
                     );
                 }
                 return;
@@ -792,6 +803,7 @@ impl Orchestrator {
                             delay,
                             "in-flight state recheck failed",
                             re.issue.clone(),
+                            re.identity.clone(),
                         );
                     }
                     return;
@@ -901,6 +913,7 @@ impl Orchestrator {
                     delay,
                     "no available orchestrator slots",
                     iss,
+                    re.identity.clone(),
                 );
                 return;
             }
@@ -912,6 +925,7 @@ impl Orchestrator {
                 failure_backoff_ms(attempt, cfg.max_retry_backoff_ms),
                 "no available orchestrator slots",
                 iss,
+                re.identity.clone(),
             );
             return;
         }
@@ -1422,6 +1436,50 @@ mod tests {
         assert!(
             o.totals.seconds_running > 0.0,
             "runtime should be accumulated"
+        );
+    }
+
+    /// The stamp itself (STUDIO-801). Without it `RetryEntry.identity` would be inert and the
+    /// capacity count that reads it would see an empty string on every parked run — a failure the
+    /// routing tests could not detect, because they build their entries by hand.
+    #[test]
+    fn a_scheduled_retry_carries_the_running_entrys_identity() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        o.running.get_mut("1").expect("running").identity = "alice".to_string();
+        let st = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: st,
+            err_msg: "boom".into(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+        });
+        assert_eq!(
+            o.retry_attempts.get("1").expect("backoff retry").identity,
+            "alice",
+            "the parked run is still alice's work"
+        );
+    }
+
+    /// A run nobody routed parks with no owner, so Teams-off installations count nothing.
+    #[test]
+    fn a_scheduled_retry_for_an_unrouted_run_names_nobody() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: st,
+            err_msg: "boom".into(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+        });
+        assert_eq!(
+            o.retry_attempts.get("1").expect("backoff retry").identity,
+            ""
         );
     }
 

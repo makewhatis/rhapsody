@@ -260,6 +260,7 @@ impl Orchestrator {
                 failure_backoff_ms(attempt, max_backoff),
                 "stalled",
                 re.issue.clone(),
+                re.identity.clone(),
             );
         }
     }
@@ -510,6 +511,56 @@ mod tests {
         assert_eq!(
             got.err, "no available orchestrator slots",
             "stall retry must use the failure backoff path"
+        );
+    }
+
+    /// STUDIO-801, and the premise the retry-side capacity count rests on. `reconcile_stalled` has
+    /// no review guard — it terminates and retries ANY wedged worker — so a TICKETLESS review run
+    /// really does land in `retry_attempts`, which is the door `on_review_exit` does not close
+    /// (STUDIO-716). Pinned end to end rather than assumed, because assuming the opposite is what
+    /// let the parked review be miscounted as implementation work: the reviewer's identity is
+    /// carried onto the parked entry, and the router's snapshot must still not charge them an
+    /// implementation slot for it (design §4.3, §4.4 fix 2 / D2).
+    #[tokio::test]
+    async fn a_wedged_ticketless_review_parks_without_spending_implementation_capacity() {
+        let mut f = Fake::new();
+        f.states_by_ids_func = Some(states_ok(vec![]));
+        let tr = Arc::new(f);
+        let (mut o, _dir) =
+            orch_for_reconcile(Arc::clone(&tr), std::time::Duration::from_millis(100));
+
+        let run = crate::review::ReviewRun {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 128,
+            reviewer: "alice".to_string(),
+            ..crate::review::ReviewRun::default()
+        };
+        let key = run.key();
+        let mut re = running_entry(run.synthetic_issue(), "", "");
+        re.started_at = Utc::now() - chrono::Duration::hours(1); // long-stale ⇒ wedged
+        re.identity = "alice".to_string();
+        re.review = Some(run);
+        o.running.insert(key.clone(), re);
+        o.claimed.insert(key.clone());
+
+        o.reconcile_stalled();
+
+        let parked = o
+            .retry_attempts
+            .get(&key)
+            .expect("a wedged review run IS parked in the retry queue");
+        assert_eq!(
+            parked.identity, "alice",
+            "the parked review is still alice's work"
+        );
+
+        let load =
+            crate::teams::LoadSnapshot::from_running_and_retries(&o.running, &o.retry_attempts);
+        assert_eq!(
+            load.impl_live("alice"),
+            0,
+            "D2: a stalled review must not spend alice's implementation slot"
         );
     }
 

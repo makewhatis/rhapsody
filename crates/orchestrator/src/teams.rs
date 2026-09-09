@@ -48,7 +48,7 @@ use rhapsody_config::teams::{Identity, ManagerMode, Teams};
 use rhapsody_core::Issue;
 use rhapsody_store as store;
 
-use crate::orchestrator::{Orchestrator, RunningEntry};
+use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
 use crate::teamscompose::{Prepend, catch_up, compose, recall_facts};
 
 /// The Tier-0 label prefix: `rhapsody:@alice` names an identity outright (§3.2).
@@ -178,9 +178,11 @@ impl Routed {
 }
 
 /// Live per-identity run counts, **derived at call time** from
-/// [`Orchestrator::running`] (§3.1). It is a read of Rhapsody's own state, never
-/// a copy the router owns and never a thing the router can mutate — the router
-/// "holds no idea of what is in flight" beyond this borrow.
+/// [`Orchestrator::running`] — and, for the router,
+/// [`Orchestrator::retry_attempts`] as well (§3.1, design §4.4 fix 2). It is a
+/// read of Rhapsody's own state, never a copy the router owns and never a thing
+/// the router can mutate — the router "holds no idea of what is in flight"
+/// beyond this borrow.
 ///
 /// TWO counts, partitioned rather than filtered. `all` counts every live run; `implementation`
 /// drops the review runs, so a teammate at their implementation cap can still be handed a review.
@@ -202,18 +204,71 @@ pub(crate) struct LoadSnapshot {
 impl LoadSnapshot {
     /// Counts the live runs already stamped with each identity. The run being
     /// dispatched is NOT in `running` yet, so it never counts itself.
+    ///
+    /// Deliberately still `running`-only. Its [`counts`](Self::counts) reach
+    /// [`crate::quorum::rank_reviewers`] through [`crate::reviewwatch`] and [`crate::reviewintro`],
+    /// whose ranking is a shipped invariant (STUDIO-721); widening what those two count is a
+    /// review-side behaviour change, and this ticket's mandate is the implementation ladder.
     pub(crate) fn from_running(running: &HashMap<String, RunningEntry>) -> Self {
+        Self::from_running_and_retries(running, &HashMap::new())
+    }
+
+    /// [`from_running`](Self::from_running) plus the runs parked in
+    /// [`retry_attempts`](Orchestrator::retry_attempts) — the snapshot the ROUTER reads.
+    ///
+    /// A teammate backing off after a failed turn is not idle: the work is still theirs and will
+    /// re-dispatch under the same identity. Counting `running` alone made the cap decorative in
+    /// exactly the window where work piles up, so every capacity question asks this (design §4.4
+    /// fix 2).
+    ///
+    /// **No run is counted twice.** Both paths that park a RUNNING entry — `on_worker_exit` and
+    /// `reconcile_run`'s wedged-worker sweep — remove it from `running` before scheduling, so a run
+    /// is in one map or the other and never in both. (`on_retry` also writes `retry_attempts`, but
+    /// it requeues an entry that is already parked and removes it first, so a firing retry counts
+    /// against neither map nor against its own re-dispatch.)
+    ///
+    /// **The review test differs from [`is_review_run`]'s, because a [`RetryEntry`] has no `review`
+    /// field to ask.** Both shapes of review can be parked here, and each needs its own half:
+    ///
+    /// * the QUORUM shape dispatches a real ticket, so it is identified from the last-known issue's
+    ///   label exactly as it is in `is_review_run`;
+    /// * the TICKETLESS shape carries no such label — a synthetic issue's labels are exactly
+    ///   `rhapsody:@<reviewer>` — so it is identified by its `pr:` id instead.
+    ///
+    /// The second half is not theoretical, and assuming it away is how D2 was first broken here:
+    /// `reconcile_stalled` has no review guard, so a WEDGED ticketless review is terminated and
+    /// parked like any other worker (the door `on_review_exit` does not close, STUDIO-716). Without
+    /// the id test it would read as implementation work and lock its reviewer out of the ladder for
+    /// the whole backoff window. Same edge as design §4.3, second location.
+    ///
+    /// Entries with an empty identity are skipped, which is what excludes every boot-recovered
+    /// retry until it re-dispatches ([`RetryEntry::identity`]).
+    pub(crate) fn from_running_and_retries(
+        running: &HashMap<String, RunningEntry>,
+        retries: &HashMap<String, RetryEntry>,
+    ) -> Self {
         let mut load = LoadSnapshot::default();
         for re in running.values() {
-            if re.identity.is_empty() {
-                continue;
-            }
-            *load.all.entry(re.identity.clone()).or_default() += 1;
-            if !is_review_run(re) {
-                *load.implementation.entry(re.identity.clone()).or_default() += 1;
-            }
+            load.add(&re.identity, is_review_run(re));
+        }
+        for re in retries.values() {
+            let review = crate::lifecycle::is_review_ticket(&re.issue)
+                || crate::review::is_review_key(&re.issue.id);
+            load.add(&re.identity, review);
         }
         load
+    }
+
+    /// Adds one run to the partition: always to `all`, and to `implementation` unless it is a
+    /// review. An identity-less run belongs to nobody and is counted nowhere.
+    fn add(&mut self, identity: &str, review: bool) {
+        if identity.is_empty() {
+            return;
+        }
+        *self.all.entry(identity.to_string()).or_default() += 1;
+        if !review {
+            *self.implementation.entry(identity.to_string()).or_default() += 1;
+        }
     }
 
     /// Live runs for `name`, review runs included; absent ⇒ 0.
@@ -488,7 +543,11 @@ impl Orchestrator {
         let routed = self.apply_pending_assignment(
             teams,
             iss,
-            route(teams, iss, &LoadSnapshot::from_running(&self.running)),
+            route(
+                teams,
+                iss,
+                &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
+            ),
         );
         let Some(identity) = routed.identity else {
             if routed.reason == RouteReason::Off {
@@ -599,7 +658,12 @@ impl Orchestrator {
         if crate::triage::has_any_identity_label(iss) {
             return false;
         }
-        route(teams, iss, &LoadSnapshot::from_running(&self.running)).reason
+        route(
+            teams,
+            iss,
+            &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
+        )
+        .reason
             == RouteReason::Unrouted
     }
 
@@ -1084,6 +1148,176 @@ mod tests {
             "a review must not spend alice's `max_concurrent: 1` implementation slot"
         );
         assert_eq!(r.reason, RouteReason::LabelOverlap);
+    }
+
+    /// A retry-parked run is its teammate's work, not idle time (design §4.4 fix 2). Counting only
+    /// `running` made the cap decorative in precisely the window where work piles up: a teammate
+    /// backing off after a failed turn read as free and could be handed a second ticket.
+    #[test]
+    fn a_parked_retry_counts_against_its_teammates_implementation_capacity() {
+        let mut parked = crate::testsupport::retry_entry("i1", "MT-1", 1);
+        parked.identity = "alice".to_string();
+        let retries: HashMap<String, RetryEntry> =
+            [("i1".to_string(), parked)].into_iter().collect();
+
+        let load = LoadSnapshot::from_running_and_retries(&HashMap::new(), &retries);
+
+        assert_eq!(
+            load.impl_live("alice"),
+            1,
+            "the backoff window is not idle time"
+        );
+        assert_eq!(
+            load.live("alice"),
+            1,
+            "and the all-runs count agrees, so `impl_live` can never exceed `live`"
+        );
+    }
+
+    /// D2 survives the retry queue. A quorum review ticket that failed and is backing off is still
+    /// a review, so it must not spend alice's implementation slot — the exact promise
+    /// [`a_review_does_not_consume_a_teammates_implementation_capacity`] makes for a LIVE review.
+    #[test]
+    fn a_parked_review_retry_does_not_consume_implementation_capacity() {
+        let mut parked = crate::testsupport::retry_entry("i1", "MT-1", 1);
+        parked.identity = "alice".to_string();
+        parked.issue = Issue {
+            labels: Some(vec![crate::quorum::REVIEW_TICKET_LABEL.to_string()]),
+            ..issue("i1", "MT-1", "Todo")
+        };
+        let retries: HashMap<String, RetryEntry> =
+            [("i1".to_string(), parked)].into_iter().collect();
+
+        let load = LoadSnapshot::from_running_and_retries(&HashMap::new(), &retries);
+
+        assert_eq!(load.impl_live("alice"), 0, "reviews are free (D2)");
+        assert_eq!(load.live("alice"), 1, "the all-runs count still sees it");
+    }
+
+    /// The TICKETLESS half of D2, which the quorum test above cannot reach — and the half a wedged
+    /// review actually takes. A review dispatched against a pull request carries no
+    /// `REVIEW_TICKET_LABEL`: its synthetic issue's labels are exactly `rhapsody:@<reviewer>`. A
+    /// [`RetryEntry`] has no `review` field either, so the union that identifies a LIVE review
+    /// ([`is_review_run`]) has no counterpart here and only the `pr:` id is left to test. Built from
+    /// the real [`crate::review::ReviewRun::synthetic_issue`] rather than a hand-rolled `Issue`, so
+    /// this fixture cannot drift from the shape the dispatch path parks.
+    #[test]
+    fn a_parked_ticketless_review_retry_does_not_consume_implementation_capacity() {
+        let run = crate::review::ReviewRun {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 128,
+            reviewer: "alice".to_string(),
+            ..crate::review::ReviewRun::default()
+        };
+        let iss = run.synthetic_issue();
+        assert!(
+            !crate::lifecycle::is_review_ticket(&iss),
+            "premise: a ticketless review is NOT identifiable by label"
+        );
+
+        let key = iss.id.clone();
+        let mut parked = crate::testsupport::retry_entry(&iss.id, &iss.identifier, 1);
+        parked.identity = "alice".to_string();
+        parked.issue = iss;
+        let retries: HashMap<String, RetryEntry> = [(key, parked)].into_iter().collect();
+
+        let load = LoadSnapshot::from_running_and_retries(&HashMap::new(), &retries);
+
+        assert_eq!(
+            load.impl_live("alice"),
+            0,
+            "a parked review is still a review (D2)"
+        );
+        assert_eq!(load.live("alice"), 1, "the all-runs count still sees it");
+    }
+
+    /// **This ticket is behaviour-changing, and this is the change.** Repointing the router's load
+    /// at the retry queue means Tier 3 now skips a teammate who is merely PARKED, handing the
+    /// ticket to the next-best candidate on a worse overlap. Same roster and same ticket as
+    /// [`max_concurrent_skips_to_the_next_best_and_never_queues`]; only the reason alice is busy
+    /// differs. Built through `from_running_and_retries` rather than [`load_of`] so the wiring is
+    /// under test and not just the arithmetic.
+    #[test]
+    fn best_by_label_overlap_skips_a_teammate_holding_a_parked_retry() {
+        let teams = teams_with(vec![
+            ident("alice", &["rust", "config"], 1),
+            ident("bob", &["rust"], 0),
+        ]);
+        let iss = with_labels(&["rust", "config"]);
+        let mut parked = crate::testsupport::retry_entry("i1", "MT-1", 1);
+        parked.identity = "alice".to_string();
+        let retries: HashMap<String, RetryEntry> =
+            [("i1".to_string(), parked)].into_iter().collect();
+
+        // Nothing parked: alice's better overlap wins.
+        let r = route(
+            &teams,
+            &iss,
+            &LoadSnapshot::from_running_and_retries(&HashMap::new(), &HashMap::new()),
+        );
+        assert_eq!(r.identity.as_deref(), Some("alice"));
+
+        let r = route(
+            &teams,
+            &iss,
+            &LoadSnapshot::from_running_and_retries(&HashMap::new(), &retries),
+        );
+        assert_eq!(
+            r.identity.as_deref(),
+            Some("bob"),
+            "alice is parked at her `max_concurrent: 1`, so the next-best candidate takes it"
+        );
+        assert_eq!(r.reason, RouteReason::LabelOverlap);
+    }
+
+    /// The same skip at the call site that actually dispatches, so the repointing of
+    /// `route_teams`'s own snapshot is under test and not merely the function it feeds.
+    #[test]
+    fn dispatch_routes_around_a_teammate_parked_in_the_retry_queue() {
+        let teams = teams_with(vec![
+            ident("alice", &["rust", "config"], 1),
+            ident("bob", &["rust"], 0),
+        ]);
+        let (mut o, _) = orch_with_teams(teams);
+        let mut parked = crate::testsupport::retry_entry("i9", "MT-9", 1);
+        parked.identity = "alice".to_string();
+        o.retry_attempts.insert("i9".to_string(), parked);
+
+        o.dispatch_issue(with_labels(&["rust", "config"]), None, None, String::new());
+
+        assert_eq!(
+            o.running["1"].identity, "bob",
+            "alice's parked retry spends her only implementation slot"
+        );
+    }
+
+    /// The other half of that behaviour change: when the parked teammate is the ticket's ONLY
+    /// candidate there is nobody to skip to, so routing answers `Unrouted` and the triage gate
+    /// holds the ticket for a tick rather than dispatching it identity-less (§A.3.1).
+    #[test]
+    fn a_ticket_whose_only_candidate_is_parked_is_held_for_triage() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 1)]);
+        let (mut o, _) = orch_with_teams(teams);
+        o.teams_triage = Some(Arc::new(crate::triage::TriageHandle::new()));
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..with_labels(&["rust"])
+        };
+
+        assert!(
+            !o.teams_awaiting_assignment(&iss),
+            "with alice idle the ticket routes to her and is never held"
+        );
+
+        let mut parked = crate::testsupport::retry_entry("i9", "MT-9", 1);
+        parked.identity = "alice".to_string();
+        o.retry_attempts.insert("i9".to_string(), parked);
+
+        assert!(
+            o.teams_awaiting_assignment(&iss),
+            "her only candidate parked, the ticket is held rather than dispatched unrouted"
+        );
     }
 
     /// §3.4 "fall back, never refuse": nobody overlaps ⇒ `default_identity`.
