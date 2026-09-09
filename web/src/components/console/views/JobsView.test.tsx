@@ -1166,6 +1166,36 @@ describe("paging past the first 50 (STUDIO-792)", () => {
   });
 });
 
+// The ↻ control, at a window that is no longer polled (STUDIO-792). While the worklist sits at the
+// default width this is invisible: the listing polls every 2s, so invalidating only `/api/v1/state`
+// still leaves the rows at most a tick behind. A WIDENED window is off that timer, so the operator's
+// explicit "tell me the truth now" gesture has to reach the rows itself — otherwise the button
+// refreshes the strip above the table and quietly does nothing to the table.
+describe("Refresh reaches the rows, not just the strip (STUDIO-792)", () => {
+  it("refetches a widened listing when the operator clicks Refresh", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: Array.from({ length: JOBS_PAGE_SIZE }, (_, i) =>
+        run({ issue_identifier: `R-${i}`, outcome: "completed", lifecycle: "done" }),
+      ),
+      next_offset: JOBS_PAGE_SIZE,
+    });
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
+
+    // Widen first — this is the state in which the listing has no interval of its own.
+    fireEvent.click(screen.getByRole("button", { name: `Load ${JOBS_PAGE_SIZE} more` }));
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalledWith({ limit: JOBS_PAGE_SIZE * 2 }));
+    const settled = h.fetchIssueRuns.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "↻ Refresh" }));
+
+    await waitFor(() => expect(h.fetchIssueRuns.mock.calls.length).toBeGreaterThan(settled));
+    // At the window the operator is holding — a Refresh must not quietly collapse them back to 50.
+    expect(h.fetchIssueRuns).toHaveBeenLastCalledWith({ limit: JOBS_PAGE_SIZE * 2 });
+  });
+});
+
 // STUDIO-791 — the list left open. Everything above mounts the view, settles it, and asserts a
 // still frame; this is the one that lets the daemon move underneath it. The bug it pins was not a
 // slow list but a static one: `useIssueRuns()` was called with no options and `useHistory`'s

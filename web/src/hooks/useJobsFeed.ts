@@ -56,7 +56,8 @@ import { LIVE_POLL_MS, useStateQuery } from "@/hooks/useStateQuery";
  * tracker state moving with no run in flight, which `JobsView`'s "moves a stored row and its count
  * when only the issue listing changed" pins. That is worth 2s at the default width. It is not worth
  * a 0.6s request every 2s across a window the operator widened, so a widened window waits for the
- * live set to move, for a Refresh, or for a remount. Capping how far the chip may reach was the
+ * live set to move, for the operator's own Refresh (`useRefresh` invalidates this family by prefix
+ * for exactly this reason), or for a remount. Capping how far the chip may reach was the
  * other way out and was rejected: it puts STUDIO-792's silent truncation back at a different number.
  *
  * One consequence, stated rather than left to be discovered: while the window is widened the rail's
