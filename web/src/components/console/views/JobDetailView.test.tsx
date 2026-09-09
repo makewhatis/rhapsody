@@ -3839,6 +3839,11 @@ describe("the Result card matches the approved prototype through the cascade (ST
     // Proves the trace rule still matches this element, so the UNSET assertions below are about
     // the generic rule no longer matching — not about the accent having lost its own styling.
     expect(cs.height).toBe("3px");
+    // And the FILL, pinned separately: a 3px element with no background is an invisible accent,
+    // i.e. this symptom back, and `height` alone cannot see that. Every property this block
+    // guards is asserted at DECLARATION granularity — losing one line of a rule is at least as
+    // likely a future edit as losing the whole rule, and the fills are what the ticket is about.
+    expect(cs.background).toBe("var(--done)");
     // The acceptance criteria, one property each: no padding, no radius, no margin, not sticky.
     expect(cs.padding).toBe(UNSET);
     expect(cs.borderRadius).toBe(UNSET);
@@ -3864,6 +3869,16 @@ describe("the Result card matches the approved prototype through the cascade (ST
     expect(dot.textContent).toBe("");
     expect(eyebrow.textContent).toBe("done · handed off");
     expect(getComputedStyle(dot).borderRadius).toBe("50%");
+    // The fill is the dot: an empty 6px element with no background renders as nothing at all, so
+    // the "missing status dot" symptom would be back with the element still in the DOM and every
+    // other assertion here green. Read via `backgroundColor`, not the `background` shorthand:
+    // jsdom RESOLVES `currentColor` against the element's own computed `color`, which under the
+    // full theme is itself an unresolved `var()` — so the longhand reports that token and the
+    // shorthand, unable to reassemble itself from it, reports nothing. Asserting the dot's fill
+    // and the eyebrow's colour are the SAME value is what pins `currentColor` specifically: it is
+    // why `.trrc.fail` and `.trrc.stop` recolour the dot without a rule of their own.
+    expect(getComputedStyle(dot).backgroundColor).toBe(getComputedStyle(eyebrow).color);
+    expect(getComputedStyle(dot).backgroundColor).toBe("var(--done)");
     // The prototype's `.eyebrow{display:flex;align-items:center;gap:8px}` — the gap IS the spacing
     // between dot and text, and the shipped rule had neither half.
     const cs = getComputedStyle(eyebrow);
@@ -3906,6 +3921,11 @@ describe("the Result card matches the approved prototype through the cascade (ST
 
     const cs = getComputedStyle(pressed);
     // jsdom keeps the unresolved token text, which names the winning declaration exactly.
+    // The FILL first: this is David's literal complaint ("the All, Edits, … items are white"), and
+    // it is the one property here with a LOSING declaration waiting underneath it — drop this one
+    // line from the override and `console.css`'s console-wide `var(--ink)` takes the element back,
+    // silently, with the border and text colour still teal. Nothing else in this test sees that.
+    expect(cs.background).toBe("var(--operator)");
     expect(cs.borderColor).toBe("var(--operator)");
     // The prototype's on-teal foreground, which the port publishes as a token.
     expect(cs.color).toBe("var(--operator-ink)");
@@ -3918,6 +3938,9 @@ describe("the Result card matches the approved prototype through the cascade (ST
     other.className = "chip";
     other.setAttribute("aria-pressed", "true");
     rc.append(other);
+    // The fill again, and here it is the property that proves `console.css:101` did NOT move —
+    // the decision this PR states in prose and which nothing else pins.
+    expect(getComputedStyle(other).background).toBe("var(--ink)");
     expect(getComputedStyle(other).borderColor).toBe("var(--ink)");
     expect(getComputedStyle(other).color).toBe("rgb(17, 17, 17)");
     other.remove();
