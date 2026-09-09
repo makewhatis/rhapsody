@@ -61,12 +61,18 @@ export function useMergeRun(runID: number) {
   const qc = useQueryClient();
   return useMutation<MergeRunResult, Error, string>({
     mutationFn: (confirm: string) => mergeRun(runID, confirm),
-    onSettled: () => {
+    onSettled: (data) => {
       void qc.invalidateQueries({ queryKey: STATE_QUERY_KEY });
       void qc.invalidateQueries({ queryKey: ["run-detail", runID] });
-      // The verdict the header renders Merge from is stale the moment a merge is attempted — an
-      // armed auto-merge makes the next answer "already merged" (STUDIO-790).
-      void qc.invalidateQueries({ queryKey: mergeabilityKey(runID) });
+      // The verdict the header renders Merge from is stale once a merge has ACTUALLY been applied
+      // — an armed auto-merge makes the next answer "already merged" (STUDIO-790). Only then: the
+      // handshake's first leg answers `confirm_required` having merged nothing and changed
+      // nothing, so re-resolving on it would spend a tracker read (and, on a review-state ticket,
+      // two blocking `gh` calls) to re-derive an answer that cannot have moved — while the
+      // operator is reading the modal.
+      if (data?.status === "merged") {
+        void qc.invalidateQueries({ queryKey: mergeabilityKey(runID) });
+      }
     },
   });
 }

@@ -18,9 +18,20 @@
 //! [`crate::prstate`]'s finding, and the reason its sweep is a free function too. The containment
 //! is therefore **structural**: this module takes no `Orchestrator`, sends no control event and
 //! holds no lock the control task takes, so a stalled `gh` parks the task that called it and
-//! nothing else. Its caller is [`crate::mergeconsole`]'s [`crate::ControlHandle`] method, which
-//! runs on the HTTP request's own task — so a hung merge delays that one request. `prstate`'s
+//! nothing else. Its callers are [`crate::mergeconsole`]'s [`crate::ControlHandle`] methods, which
+//! run on the HTTP request's own task — so a hung `gh` delays that one request. `prstate`'s
 //! standing `pr_state_is_never_called_from_the_control_loop` check knows this file by name.
+//!
+//! Two things about the READ half ([`mergeability`], STUDIO-790) sharpen that, and neither is a
+//! click: the console asks on every run-detail mount, and a question takes no single-flight claim
+//! (a probe must leave no trace, see [`crate::mergeconsole::MergeIntent`]) — so nothing bounds how
+//! many blocking `gh` resolutions can be in flight for one pull request at once. `rhapsodyd` is a
+//! multi-thread `#[tokio::main]` with no `spawn_blocking` on this path, so "parks the task" is
+//! really "parks a worker thread", from the pool the HTTP server and the control loop share.
+//! What keeps that small is the ORDER: `mergeconsole::ticket_not_waiting_in_review` runs before
+//! any `gh` and short-circuits every ticket not waiting in review, so an ordinary run detail costs
+//! one tracker read and zero GitHub round trips, and only a review-state ticket pays for
+//! `gh pr list` + `gh pr view`.
 //!
 //! The DECISIONS that need loop state — the run row, the single-flight claim, the live review
 //! snapshot, the audit record — are made in [`crate::mergeconsole`] on the control task and
@@ -67,16 +78,19 @@ pub const MERGE_METHOD: MergeMethod = MergeMethod::Squash;
 /// Flipping this to `false` would move the authorization boundary from GitHub into this daemon.
 pub const MERGE_AUTO: bool = true;
 
-/// The `gh` seams the merge path drives, and the trust boundary it drives them under. Mirrors
-/// [`crate::reviewwatch::ReviewWatchDeps`]: the daemon builds one [`crate::ghsummons::GH`] and
-/// hands it in as all three, and a test hands in three fakes.
-pub struct MergeDeps {
+/// The `gh` seams that RESOLVE a run's pull request and judge it — everything the answer needs,
+/// and no way to act on it.
+///
+/// It is split out from [`MergeDeps`] so that the read half is unable to merge rather than merely
+/// trusted not to (STUDIO-790). [`resolve_pull_request`] and [`mergeability`] take this and only
+/// this, so no branch of the code a GET reaches has a [`MergeSource`] in scope to call — the
+/// property is enforced by what those functions are handed, not by a convention a reviewer has to
+/// keep.
+pub struct ResolveDeps {
     /// Resolves the run's head branch to its open pull request — the ONLY way a number enters.
     pub prs: Arc<dyn OpenPrSource>,
     /// Resolves that number's head SHA and state, for the confirm handshake and the state gate.
     pub state: Arc<dyn PrStateSource>,
-    /// Performs the merge itself.
-    pub merger: Arc<dyn MergeSource>,
     /// Asks GitHub whether this pull request can be merged at all — its `mergeStateStatus`
     /// (STUDIO-784). Read on every attempt, and the answer rides on the receipt.
     pub mergestate: Arc<dyn MergeStateSource>,
@@ -86,6 +100,20 @@ pub struct MergeDeps {
     /// Head repositories trusted besides the base's own owner. [`HeadAllowlist::none`] on the
     /// daemon — the watcher's default trust boundary, and widening it is a code change.
     pub allow: HeadAllowlist,
+}
+
+/// The `gh` seams the merge path drives, and the trust boundary it drives them under. Mirrors
+/// [`crate::reviewwatch::ReviewWatchDeps`]: the daemon builds one [`crate::ghsummons::GH`] and
+/// hands it in as every seam, and a test hands in fakes.
+///
+/// The resolution seams and the merge seam are deliberately separate members: the resolve half
+/// takes [`ResolveDeps`] alone, so it cannot reach `merge_pr` even by mistake.
+pub struct MergeDeps {
+    /// Everything needed to resolve and judge the pull request, and nothing that can act on it.
+    pub resolve: ResolveDeps,
+    /// Performs the merge itself. Reachable only from [`resolve_and_merge`], past the confirm
+    /// handshake.
+    pub merger: Arc<dyn MergeSource>,
 }
 
 /// Everything the control task validated before the merge path was allowed to run, and everything
@@ -246,7 +274,7 @@ pub async fn resolve_and_merge(
     confirm: &str,
     deps: &MergeDeps,
 ) -> MergeControlOutcome {
-    let receipt = match resolve_pull_request(plan, deps).await {
+    let receipt = match resolve_pull_request(plan, &deps.resolve).await {
         MergeResolution::Resolved(receipt) => receipt,
         MergeResolution::Refused(why) => return MergeControlOutcome::Refused(why),
         MergeResolution::Failed(err) => return MergeControlOutcome::Failed(err),
@@ -296,11 +324,11 @@ pub enum MergeResolution {
 /// but NOT including the confirm handshake and the merge.
 ///
 /// **Nothing in this function can merge anything**, and that is the point rather than an accident:
-/// [`MergeDeps::merger`] is never touched here, so the read path that calls it
-/// ([`mergeability`], serving a GET) cannot reach `gh pr merge` down any branch. That is the same
-/// discipline §3/G1 applies to the request type — a property of the code's shape rather than of a
-/// flag someone has to pass correctly.
-pub async fn resolve_pull_request(plan: &MergePlan, deps: &MergeDeps) -> MergeResolution {
+/// it takes [`ResolveDeps`], which holds no [`MergeSource`], so the read path that calls it
+/// ([`mergeability`], serving a GET) has nothing to reach `gh pr merge` WITH, down any branch.
+/// That is the same discipline §3/G1 applies to the request type — a property of what the code is
+/// handed rather than of a flag someone has to pass correctly.
+pub async fn resolve_pull_request(plan: &MergePlan, deps: &ResolveDeps) -> MergeResolution {
     let url = match deps
         .prs
         .open_pr_for_branch(&plan.owner, &plan.repo, &plan.branch)
@@ -503,11 +531,11 @@ impl MergeabilityOutcome {
 /// on. So the console's disabled tooltip carries the daemon's own words rather than a second
 /// implementation of the same rules that could drift from them.
 ///
-/// It cannot merge anything, structurally: [`resolve_pull_request`] never touches
-/// [`MergeDeps::merger`], and there is no `confirm` parameter here for a caller to supply one
+/// It cannot merge anything, structurally: it is handed [`ResolveDeps`], which carries no
+/// [`MergeSource`] to call, and there is no `confirm` parameter here for a caller to supply one
 /// through. Its caller takes no single-flight claim and writes no audit record either — see
 /// [`crate::mergeconsole::MergeIntent`] for why a question must leave neither trace.
-pub async fn mergeability(plan: &MergePlan, deps: &MergeDeps) -> MergeabilityOutcome {
+pub async fn mergeability(plan: &MergePlan, deps: &ResolveDeps) -> MergeabilityOutcome {
     match resolve_pull_request(plan, deps).await {
         MergeResolution::Resolved(receipt) => MergeabilityOutcome::Mergeable(receipt),
         MergeResolution::Refused(why) => MergeabilityOutcome::Refused(why),
@@ -783,12 +811,14 @@ mod tests {
         policy: Arc<FakePolicy>,
     ) -> MergeDeps {
         MergeDeps {
-            prs,
-            state,
+            resolve: ResolveDeps {
+                prs,
+                state,
+                mergestate,
+                policy,
+                allow: HeadAllowlist::none(),
+            },
             merger,
-            mergestate,
-            policy,
-            allow: HeadAllowlist::none(),
         }
     }
 
@@ -1090,7 +1120,7 @@ mod tests {
             Arc::clone(&merger),
         );
 
-        let got = mergeability(&plan(), &deps).await;
+        let got = mergeability(&plan(), &deps.resolve).await;
 
         let MergeabilityOutcome::Mergeable(receipt) = got else {
             panic!("want Mergeable, got {got:?}");
@@ -1121,7 +1151,7 @@ mod tests {
             Arc::clone(&merger),
         );
 
-        let read = mergeability(&plan(), &deps).await;
+        let read = mergeability(&plan(), &deps.resolve).await;
         let clicked = resolve_and_merge(&plan(), HEAD, &deps).await;
 
         assert_eq!(
@@ -1146,7 +1176,7 @@ mod tests {
         let deps = deps(FakePrs::none(), FakeState::open(), Arc::clone(&merger));
 
         assert_eq!(
-            mergeability(&plan(), &deps).await,
+            mergeability(&plan(), &deps.resolve).await,
             MergeabilityOutcome::Refused("no open pull request on this run's branch")
         );
         assert_eq!(
@@ -1164,7 +1194,7 @@ mod tests {
         let merger = FakeMerger::ok();
         let got = mergeability(
             &plan(),
-            &deps(FakePrs::failing(), FakeState::open(), Arc::clone(&merger)),
+            &deps(FakePrs::failing(), FakeState::open(), Arc::clone(&merger)).resolve,
         )
         .await;
 
@@ -1175,24 +1205,42 @@ mod tests {
         assert!(merger.calls().is_empty());
     }
 
-    /// The read path cannot merge, and the reason is structural rather than a flag: nothing
-    /// reachable from [`mergeability`] mentions the merge seam. Asserted on this module's own
-    /// source, so wiring one in is a failing test rather than a review someone has to catch.
+    /// The read path cannot merge, and the reason is the TYPE rather than a flag or a convention:
+    /// [`resolve_pull_request`] and [`mergeability`] are handed [`ResolveDeps`], which holds no
+    /// [`MergeSource`], so neither they nor anything they call has one in scope. The compiler is
+    /// the real check — a `deps.merger` in there does not build — and these two assertions guard
+    /// the boundary that makes it work: that the read half still takes `ResolveDeps`, and that
+    /// `ResolveDeps` has not quietly grown a merge seam of its own.
+    ///
+    /// Both are read off this module's own source because neither can be asserted at run time: a
+    /// widening is a compiling change, and it should be a failing test rather than a review
+    /// someone has to catch.
     #[test]
-    fn the_resolve_half_never_reaches_the_merge_seam() {
+    fn the_resolve_half_is_never_handed_the_merge_seam() {
         let src = include_str!("runmerge.rs");
+        for signature in [
+            "pub async fn resolve_pull_request(plan: &MergePlan, deps: &ResolveDeps)",
+            "pub async fn mergeability(plan: &MergePlan, deps: &ResolveDeps)",
+        ] {
+            assert!(
+                src.contains(signature),
+                "`{signature}` is gone: the read a GET serves must be handed ResolveDeps and \
+                 never the whole MergeDeps, or it can reach `gh pr merge` (STUDIO-790)"
+            );
+        }
+
         let start = src
-            .find("pub async fn resolve_pull_request(")
-            .expect("the resolve half is still called resolve_pull_request");
+            .find("pub struct ResolveDeps {")
+            .expect("the resolve half's dependency set is still called ResolveDeps");
         let end = src[start..]
-            .find("\n/// What the daemon would answer")
-            .expect("the mergeability outcome still follows it");
+            .find("\n}")
+            .expect("ResolveDeps is still a braced struct");
         let body = &src[start..start + end];
-        for forbidden in ["merger", "merge_pr"] {
+        for forbidden in ["MergeSource", "merger"] {
             assert!(
                 !body.contains(forbidden),
-                "resolve_pull_request reached `{forbidden}`: the read that a GET serves must not \
-                 be able to merge anything (STUDIO-790)"
+                "ResolveDeps gained `{forbidden}`: the read that a GET serves must not be able to \
+                 merge anything (STUDIO-790)"
             );
         }
     }

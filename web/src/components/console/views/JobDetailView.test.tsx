@@ -976,6 +976,29 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     });
   }
 
+  // Asking the daemon what a merge WOULD do is not free — a tracker read, and two blocking `gh`
+  // calls on a ticket that is waiting in review — so the verdict is re-read when it can have
+  // moved and not merely when a button was pressed. The handshake's first leg merges nothing and
+  // changes nothing; only the confirmed one can make the next answer "already merged".
+  it("re-reads the verdict when a merge lands, and not when one is merely offered", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: MERGE_RECEIPT })
+      .mockResolvedValueOnce({ status: "merged", receipt: { ...MERGE_RECEIPT, said: "queued" } });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
+    expect(h.fetchRunMergeability.mock.calls).toEqual([[547]]);
+
+    // Leg one: the modal opens on a receipt the daemon resolved, having merged nothing.
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    expect(h.fetchRunMergeability.mock.calls).toEqual([[547]]);
+
+    // Leg two: the merge is applied, so the verdict really is stale now.
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+    await waitFor(() => expect(h.fetchRunMergeability.mock.calls).toHaveLength(2));
+  });
+
   // The armed reading is where the note belongs, and the state STUDIO-784 built it for still
   // reads: an armed `--auto` merge is one line followed by silence unless something says what
   // GitHub is holding it on.

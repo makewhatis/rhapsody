@@ -296,18 +296,23 @@ where
             None,
         ));
         Arc::new(rhapsody_orchestrator::runmerge::MergeDeps {
-            prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::OpenPrSource>,
-            state: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
-            merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
-            // The two STUDIO-784 reads: whether GitHub can land this pull request at all, and —
-            // only when it answers BEHIND — whether the repository updates the branch itself.
-            mergestate: Arc::clone(&gh)
-                as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
-            policy: gh as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdateSource>,
-            // The base repository's own owner and nothing else — the watcher's default trust
-            // boundary. There is no config key to widen it, so widening is a code change a
-            // reviewer sees.
-            allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+            // The seams that RESOLVE and judge the pull request. The read half takes this member
+            // alone, so what serves the GET has no merge seam in scope (STUDIO-790).
+            resolve: rhapsody_orchestrator::runmerge::ResolveDeps {
+                prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::OpenPrSource>,
+                state: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
+                // The two STUDIO-784 reads: whether GitHub can land this pull request at all, and
+                // — only when it answers BEHIND — whether the repository updates the branch itself.
+                mergestate: Arc::clone(&gh)
+                    as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
+                policy: Arc::clone(&gh)
+                    as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdateSource>,
+                // The base repository's own owner and nothing else — the watcher's default trust
+                // boundary. There is no config key to widen it, so widening is a code change a
+                // reviewer sees.
+                allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+            },
+            merger: gh as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
         })
     });
 

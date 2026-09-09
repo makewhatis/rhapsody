@@ -585,13 +585,15 @@ impl ControlHandle {
     /// pull request — then stops. There is no settle, because there is nothing to release and
     /// nothing happened worth recording.
     ///
-    /// **It cannot merge.** [`crate::runmerge::mergeability`] calls
-    /// [`crate::runmerge::resolve_pull_request`], which never touches [`MergeDeps::merger`], and
-    /// there is no `confirm` on this path for one to arrive through. The guarantee is the shape of
-    /// the call graph rather than a flag, which is the same way §3/G1 keeps a client-supplied
-    /// coordinate out of `gh`.
+    /// **It cannot merge.** This path hands on [`ResolveDeps`] and never the whole [`MergeDeps`],
+    /// so nothing it reaches — [`crate::runmerge::mergeability`],
+    /// [`crate::runmerge::resolve_pull_request`], any callee of theirs — has a
+    /// [`crate::ghsummons::MergeSource`] in scope to call; and there is no `confirm` on this path
+    /// for one to arrive through either. The guarantee is what the read half is HANDED rather than
+    /// a flag, which is the same way §3/G1 keeps a client-supplied coordinate out of `gh`.
     ///
-    /// [`MergeDeps::merger`]: crate::runmerge::MergeDeps::merger
+    /// [`ResolveDeps`]: crate::runmerge::ResolveDeps
+    /// [`MergeDeps`]: crate::runmerge::MergeDeps
     pub async fn run_mergeability(&self, run_id: i64) -> MergeabilityOutcome {
         let Some(deps) = self.merge.as_ref() else {
             return MergeabilityOutcome::Dormant;
@@ -604,7 +606,7 @@ impl ControlHandle {
         // should cost no GitHub round trip.
         match ticket_not_waiting_in_review(self.reads_tracker(), &plan).await {
             Some(refusal) => MergeabilityOutcome::from_denial(refusal),
-            None => crate::runmerge::mergeability(&plan, deps).await,
+            None => crate::runmerge::mergeability(&plan, &deps.resolve).await,
         }
     }
 
@@ -1400,12 +1402,14 @@ mod tests {
 
     fn silent_deps(gh: Arc<SilentGh>) -> Arc<crate::runmerge::MergeDeps> {
         Arc::new(crate::runmerge::MergeDeps {
-            prs: Arc::clone(&gh) as Arc<dyn crate::ghsummons::OpenPrSource>,
-            state: Arc::clone(&gh) as Arc<dyn crate::ghsummons::PrStateSource>,
-            merger: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeSource>,
-            mergestate: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeStateSource>,
-            policy: gh as Arc<dyn crate::ghsummons::BranchUpdateSource>,
-            allow: crate::ghsummons::HeadAllowlist::none(),
+            resolve: crate::runmerge::ResolveDeps {
+                prs: Arc::clone(&gh) as Arc<dyn crate::ghsummons::OpenPrSource>,
+                state: Arc::clone(&gh) as Arc<dyn crate::ghsummons::PrStateSource>,
+                mergestate: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeStateSource>,
+                policy: Arc::clone(&gh) as Arc<dyn crate::ghsummons::BranchUpdateSource>,
+                allow: crate::ghsummons::HeadAllowlist::none(),
+            },
+            merger: gh as Arc<dyn crate::ghsummons::MergeSource>,
         })
     }
 
