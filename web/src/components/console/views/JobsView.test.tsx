@@ -1001,12 +1001,15 @@ describe("paging past the first 50 (STUDIO-792)", () => {
     return document.querySelector(".jmore .note")?.textContent ?? "";
   }
 
-  it("asks the daemon for the store's own page size rather than letting it default", async () => {
+  // At the default width the view sends NO limit, so it stays on the `{}` cache entry the rail's
+  // badge already holds instead of fetching the same 50 rows again under a `{limit: 50}` key.
+  it("sends no limit until the operator asks for more", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
     h.fetchIssueRuns.mockResolvedValue(page(3, false));
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(3));
-    expect(h.fetchIssueRuns).toHaveBeenCalledWith({ limit: 50 });
+    expect(h.fetchIssueRuns).toHaveBeenCalledTimes(1);
+    expect(h.fetchIssueRuns).toHaveBeenCalledWith({});
   });
 
   it("says the list is complete when the daemon offers no further page", async () => {
@@ -1033,7 +1036,7 @@ describe("paging past the first 50 (STUDIO-792)", () => {
     // live, so an accumulated `offset=50` would re-serve rows that had shifted down and drop the
     // ones they displaced. See the note on `onLoadMore` in ConsoleApp.
     h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) =>
-      f.limit === 50 ? page(50, true) : page(62, false),
+      f.limit === undefined ? page(50, true) : page(62, false),
     );
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(50));
@@ -1058,7 +1061,7 @@ describe("paging past the first 50 (STUDIO-792)", () => {
       releaseSecondPage = res;
     });
     h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) => {
-      if (f.limit === 50) return page(50, true);
+      if (f.limit === undefined) return page(50, true);
       await secondPage;
       return page(62, false);
     });

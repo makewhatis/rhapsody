@@ -46,11 +46,11 @@ const ALL_PROJECTS = "";
 // `/api/v1/history/issues` for one row per ticket. `lib/console-jobs.ts` records what that
 // costs against the `GET /api/v1/issues` the spec assumed.
 //
-// PAGING (STUDIO-792). `limit` and `onLoadMore` are owned by the shell rather than by this view,
-// because the rail's Jobs badge counts the SAME query: two owners would let the badge say 50 while
-// the table showed 100. `/api/v1/history/issues` is paged by ISSUE, so widening the window can
-// never let one ticket's retry storm crowd the others out (TRA-320) — every page is still one row
-// per ticket.
+// PAGING (STUDIO-792). `limit` and `onLoadMore` are owned by the shell rather than by this view so
+// that the window outlives it: opening a row unmounts the worklist, and an operator who paged down
+// to the older tickets should not land back on the newest 50 on the way in and out of a job.
+// `/api/v1/history/issues` is paged by ISSUE, so widening the window can never let one ticket's
+// retry storm crowd the others out (TRA-320) — every page is still one row per ticket.
 export function JobsView({
   onOpenJob,
   limit,
@@ -63,7 +63,12 @@ export function JobsView({
 }) {
   const nowMs = useNow(30_000);
   const state = useStateQuery();
-  const issueRuns = useIssueRuns({ limit });
+  // At the DEFAULT width we send no limit at all, which keeps this on the same `{}` cache entry the
+  // rail's badge already holds — a distinct `{limit: 50}` key would fetch the identical 50 rows a
+  // second time on every Jobs mount. Only a widened window opens a key of its own. The daemon
+  // derives `next_offset` from the page size the store ACTUALLY applied rather than from what the
+  // caller sent (handlers_history.rs), so an unsent limit still answers "is there more?".
+  const issueRuns = useIssueRuns(limit > JOBS_PAGE_SIZE ? { limit } : {});
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);

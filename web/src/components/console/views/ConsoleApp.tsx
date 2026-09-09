@@ -50,15 +50,18 @@ export function ConsoleApp() {
   // unknown forever. See `useConsoleRoute` for why the difference matters.
   const teamsEnabled = version.data === undefined ? undefined : version.data.teams_enabled === true;
   const [route, navigate] = useConsoleRoute(teamsEnabled);
-  // How much of the job history is loaded (STUDIO-792). Owned here rather than in `JobsView`
-  // because the rail's badge counts the same query — see `useOpenJobCount`.
+  // How much of the job history is loaded (STUDIO-792). Owned by the shell so that the window
+  // OUTLIVES the view: opening a row navigates away from Jobs and unmounts it, and an operator who
+  // paged down to the older tickets should not land back on the newest 50 when they come back.
+  // It is the worklist's window and nothing else's — the rail's badge below deliberately does not
+  // read it.
   //
   // A WIDER window each step, not an accumulated `offset`. The worklist is live: rows arrive at
   // the top, so a second request at `offset=50` would re-serve rows that had shifted down and
   // silently drop the ones they displaced. One growing request is always a consistent snapshot,
   // and `next_offset` answers "is there more?" identically either way.
   const [jobsLimit, setJobsLimit] = useState(JOBS_PAGE_SIZE);
-  const openJobs = useOpenJobCount(jobsLimit);
+  const openJobs = useOpenJobCount();
   // ONE updater instance, owned by the shell and shared — the hook's own contract (P11 U3), and the
   // reason the Podium shell mounts it too. Here it feeds both the Settings "Updates" row's pending
   // badge and the Updates view itself, so the two can never disagree. Without the Tauri bridge every
@@ -180,8 +183,8 @@ function ConsoleBody({
   teamsEnabled: boolean | undefined;
   go: (name: ConsoleRouteName, key?: string) => void;
   updater: Updater;
-  // Threaded from `ConsoleApp` rather than held here (STUDIO-792): the rail's Jobs badge reads the
-  // same query, and this switch may not call a hook of its own.
+  // Threaded from `ConsoleApp` rather than held here (STUDIO-792), so the window survives opening
+  // a row and coming back; this switch may not call a hook of its own.
   jobsLimit: number;
   onLoadMoreJobs: () => void;
 }) {
@@ -269,14 +272,17 @@ function RailFoot({ version, teamsEnabled }: { version: string; teamsEnabled: bo
 /**
  * The Jobs nav count — tickets the daemon currently has work for.
  *
- * Takes the worklist's OWN page size (STUDIO-792) so the two read one query and one cache entry.
- * A separate default here would leave the badge counting the newest 50 while the table showed
- * everything the operator had loaded, which is a fresh version of the disagreement this ticket
- * exists to remove.
+ * It takes NO window (STUDIO-792), deliberately: what the badge answers is a property of the
+ * daemon, not of how far the operator has scrolled a table, so threading the worklist's `limit` in
+ * here would make a table control move a number in the nav rail. "How much of the list am I
+ * seeing?" is the worklist's own question and the footer in `JobsView` is where it is answered.
+ *
+ * Sending no limit also keeps the widened request off every non-Jobs route, since this hook is
+ * mounted by the shell.
  */
-function useOpenJobCount(limit: number): number {
+function useOpenJobCount(): number {
   const state = useStateQuery();
-  const issues = useIssueRuns({ limit });
+  const issues = useIssueRuns();
   const keys = new Set<string>();
   for (const r of state.data?.running ?? []) keys.add(r.issue_identifier);
   for (const r of state.data?.retrying ?? []) keys.add(r.issue_identifier);
