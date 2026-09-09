@@ -234,11 +234,22 @@ function TeamSwitcher({ count }: { count: number }) {
   );
 }
 
-/** What a teammate is doing right now: the tickets its live runs hold, or "idle". */
+/**
+ * What a teammate is doing right now: the tickets its live runs hold or "idle", plus how much work
+ * is waiting on it. Shared by the now strip's card and the roster table's "Now" column, so the two
+ * can never disagree.
+ *
+ * The queued suffix is the containment for per-role concurrency's main risk (STUDIO-805): work the
+ * select ladder held for a capped teammate produces NO Jobs row at all, so without this a queued
+ * teammate and a stopped daemon look identical. It is silent at zero, and it says "queued" only
+ * here — on the Jobs surface that word is already spent on "last run stopped".
+ */
 function mateTask(row: TeamsRosterRow): string {
-  if (row.live_runs === 0) return "idle";
   const tickets = row.tickets ?? [];
-  return tickets.length > 0 ? tickets.join(", ") : `${row.live_runs} live`;
+  const now =
+    row.live_runs === 0 ? "idle" : tickets.length > 0 ? tickets.join(", ") : `${row.live_runs} live`;
+  const queued = row.queued ?? 0;
+  return queued > 0 ? `${now} · ${queued} queued` : now;
 }
 
 function rosterSub(count: number, mode: string | undefined): string {

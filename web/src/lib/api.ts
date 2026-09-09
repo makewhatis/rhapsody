@@ -1030,6 +1030,12 @@ export interface TeamsRosterRow {
   live_runs: number;
   /** Which tickets those runs are working, sorted by the daemon for a stable response. */
   tickets: string[];
+  /**
+   * How many candidates the last selection pass withheld because this teammate was at their
+   * implementation cap. DERIVED per tick and republished wholesale, so it is what that pass held —
+   * not a durable queue, and it carries no position. A teammate freed since drops back to 0.
+   */
+  queued: number;
 }
 
 // TeamsOverview is GET /api/v1/teams: the roster plus the two settings that make it legible —
