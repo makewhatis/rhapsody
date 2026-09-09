@@ -95,7 +95,14 @@ the `Orchestrator` struct itself. Concretely:
   generation-counter guard against a slow pass clobbering a newer reload.
 - **GitHub summons integration**: `ghsummons.rs` (repo parsing + the `SummonSource` trait + the
   real `gh`-exec impl) and `ghenrich.rs` (fetch/apply the enrichment onto a candidate). Both are
-  Go `internal/orchestrator/*.go` ports, not to be confused with the next group.
+  Go `internal/orchestrator/*.go` ports, not to be confused with the next group. The fetch still
+  runs on the poll path, which is the head-of-line hazard this file warns about under `triage.rs`;
+  STUDIO-811 CONTAINED it rather than moved it — `GH::run_off_task` puts the `gh` exec on the
+  blocking pool so the timeout around it can fire at all, and `poll_all_projects` spends at most
+  `poll_interval / 2` on enrichment, round-robining the repos it could not reach onto the next tick
+  and reporting the shortfall (see the README divergence). Do not reintroduce a per-candidate lazy
+  fetch: the three-pass shape there (candidates → bounded fetch → pure apply) is what keeps the
+  cost bounded by wall clock rather than by repo count.
 - **Orchestrator-internal ports of dependency-free Go packages** (`internal/liveness`,
   `internal/obslog`; `internal/ghsummons` above is a third): `liveness.rs` and `obslog.rs`. These
   exist because the Go packages have no dedicated Rust crate and the orchestrator is their sole

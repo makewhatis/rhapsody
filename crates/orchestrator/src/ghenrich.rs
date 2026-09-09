@@ -38,7 +38,7 @@ use crate::ghsummons::{SummonHit, SummonSource};
 /// Bounds the `gh` exec per enrichment call. 15s is well under the 30s poll interval; a
 /// network-stalled `gh` subprocess cannot wedge the control loop longer than this. Mirrors Go
 /// `ghSummonsTimeout`.
-const GH_SUMMONS_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const GH_SUMMONS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Makes the source call for one repo and returns the per-PR summon hits (newest comment time +
 /// body). Best-effort: a `None` src / empty owner|repo / a source error or timeout all yield `None`
