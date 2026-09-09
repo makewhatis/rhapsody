@@ -71,7 +71,7 @@ export function useMergeRun(runID: number) {
   });
 }
 
-export function mergeabilityKey(runID: number) {
+function mergeabilityKey(runID: number) {
   return ["run-mergeability", runID] as const;
 }
 

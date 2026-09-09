@@ -437,25 +437,30 @@ export async function fetchRunMergeability(runID: number): Promise<RunMergeabili
   const res = await fetch(`/api/v1/runs/${runID}/mergeability`, {
     headers: { Accept: "application/json" },
   });
-  const body = (await res.json().catch(() => null)) as
-    | { mergeable?: boolean; receipt?: MergeReceipt; reason?: string }
-    | ApiError
-    | null;
+  // `typeof … === "object"` before any `in`: a body that parsed to a number or a string would make
+  // the `in` operator itself throw, turning an odd response into a TypeError the header then shows
+  // as its "could not be asked" reason. Narrow first, and say something true instead.
+  const parsed: unknown = await res.json().catch(() => null);
+  const body =
+    typeof parsed === "object" && parsed !== null
+      ? (parsed as { mergeable?: unknown; receipt?: MergeReceipt; reason?: unknown } & Partial<ApiError>)
+      : null;
   if (!res.ok) {
-    const err = body && "error" in body ? body : null;
-    throw new Error(err ? err.error.message : `mergeability failed: ${res.status}`);
+    throw new Error(body?.error?.message ?? `mergeability failed: ${res.status}`);
   }
   // A 200 the console cannot read is not a verdict. Saying so beats defaulting either way: a
   // silent `false` would take the control away for a daemon that never refused anything, and a
   // silent `true` would put the lie back.
-  if (body === null || "error" in body || typeof body.mergeable !== "boolean") {
+  if (body === null || typeof body.mergeable !== "boolean") {
     throw new Error("the daemon answered no mergeability verdict");
   }
   if (body.mergeable) {
-    if (!body.receipt) throw new Error("the daemon called it mergeable but resolved no pull request");
+    if (!body.receipt) {
+      throw new Error("the daemon called it mergeable but resolved no pull request");
+    }
     return { mergeable: true, receipt: body.receipt };
   }
-  return { mergeable: false, reason: body.reason ?? "" };
+  return { mergeable: false, reason: typeof body.reason === "string" ? body.reason : "" };
 }
 
 // RunMessage is one operator "btw" sent to a run's agent (INF-250). body is the operator's

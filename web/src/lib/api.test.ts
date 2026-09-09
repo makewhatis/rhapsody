@@ -471,7 +471,9 @@ describe("mergeRun — the console merge action's confirm handshake (STUDIO-767)
   // A 200 with no verdict in it is not a verdict. Defaulting either way would be a guess: `false`
   // takes the control away for a daemon that refused nothing, `true` puts the original lie back.
   it("refuses to invent a verdict from an unreadable 200", async () => {
-    for (const body of ["", JSON.stringify({}), JSON.stringify({ mergeable: "yes" })]) {
+    // `"5"` and `"null"` are the ones that matter: a bare `in` check against them throws a
+    // TypeError, which the header would then show to the operator as its reason.
+    for (const body of ["", "5", "null", '"no"', JSON.stringify({}), JSON.stringify({ mergeable: "yes" })]) {
       vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 200 })));
       await expect(fetchRunMergeability(7)).rejects.toThrow(/no mergeability verdict/i);
     }
@@ -481,5 +483,9 @@ describe("mergeRun — the console merge action's confirm handshake (STUDIO-767)
       vi.fn(async () => new Response(JSON.stringify({ mergeable: true }), { status: 200 })),
     );
     await expect(fetchRunMergeability(7)).rejects.toThrow(/resolved no pull request/i);
+    // And the same on the error side: a non-2xx whose body is not an envelope still says the
+    // status rather than throwing on the `in`.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("502", { status: 502 })));
+    await expect(fetchRunMergeability(7)).rejects.toThrow("mergeability failed: 502");
   });
 });
