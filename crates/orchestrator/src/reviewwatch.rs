@@ -118,9 +118,10 @@ pub struct ReviewSweepReport {
     /// daemon is not entitled to read.
     pub retired: usize,
     /// Rows that WANT a review and did not get one: this pull request's other rows left no
-    /// eligible reviewer, the pull request hit [`REVIEW_ROUNDS_PER_PR_CAP`], or the repository is
-    /// no longer configured. Every one of them is re-considered next tick. A reviewer being at
-    /// their `max_concurrent` is NOT among the reasons — see [`Orchestrator::choose_review_reviewer`].
+    /// eligible reviewer, an author-less row's incumbent has left the roster, the pull request hit
+    /// [`REVIEW_ROUNDS_PER_PR_CAP`], or the repository is no longer configured. Every one of them
+    /// is re-considered next tick. A reviewer being at their `max_concurrent` is NOT among the
+    /// reasons — see [`Orchestrator::choose_review_reviewer`].
     pub deferred: usize,
     /// Rows re-armed to `requested` by the head-advance signal (design §14.1's in-process Event,
     /// standing in for the room post it forbids).
@@ -577,7 +578,9 @@ impl Orchestrator {
 
     /// Who reviews this round: the incumbent where continuity means something, otherwise the
     /// least-loaded non-author. `None` when this pull request's remaining rows leave nobody
-    /// eligible, which defers the round rather than handing one teammate two of its reviews.
+    /// eligible — which defers the round rather than handing one teammate two of its reviews — or
+    /// when an author-less row's incumbent has left the roster, leaving no identity to dispatch
+    /// under.
     ///
     /// **A teammate's `max_concurrent` is not consulted here** (design D2, "reviews are free"): it
     /// caps the IMPLEMENTATION work they are dispatched, never their availability to read somebody
@@ -751,8 +754,10 @@ mod tests {
     }
 
     /// Teams on, `review.mode: ticketless`, an uncapped roster — everything the watcher gates on.
-    /// The `max_concurrent: 0` is now belt-and-braces for reviewer choice, which stopped consulting
-    /// capacity in STUDIO-800; it still matters to anything here that reaches the dispatch ladder.
+    /// The `max_concurrent: 0` is belt-and-braces, full stop: reviewer choice stopped consulting
+    /// capacity in STUDIO-800, and the dispatch below it routes at Tier 0 on the synthetic issue's
+    /// `rhapsody:@<reviewer>` label (`review.rs`), short-circuiting `best_by_label_overlap` — the
+    /// one caller of `at_capacity` this module could otherwise reach.
     fn ticketless(names: &[&str]) -> Teams {
         teams_with(
             true,
@@ -1547,6 +1552,39 @@ mod tests {
         let mut picked = reviewers_of(&dispatched);
         picked.sort();
         assert_eq!(picked, vec!["carol".to_string(), "dave".to_string()]);
+    }
+
+    /// A reassigned incumbent's row is RETIRED, not left standing beside the substitute's. It is
+    /// the SAME required review, and two rows would make the pull request owe two of them forever —
+    /// `review_round_due` would go on answering true for the incumbent at every head, for a reviewer
+    /// nobody is waiting on.
+    ///
+    /// This invariant used to ride as a second, unrelated assertion inside the capacity test that
+    /// STUDIO-800 re-levered, which is how it came within one `assert_ne!` of being lost: reversing
+    /// that test's SUBJECT reversed its passenger with it. It gets its own test here, named for the
+    /// branch it guards, so that deleting the `drop_review_watch` call under `if reassigned` reds a
+    /// test whose name says what broke.
+    #[test]
+    fn a_reassigned_incumbents_row_is_retired() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "carol"]));
+        // `bob` has left the roster, so the round cannot stay with him and must be reassigned.
+        introduce(&o, row(12, "bob"));
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(reviewers_of(&dispatched), vec!["carol".to_string()]);
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_DROPPED,
+            "a reassigned incumbent's row must leave the watch set, or the pull request owes \
+             bob's required review forever"
+        );
+        assert_eq!(
+            watch_row(&o, 12, "carol").requested_sha,
+            HEAD_A,
+            "and the substitute's row is the one now carrying the round"
+        );
     }
 
     /// Two rows of one pull request BOTH reassigned in the same tick must not land on the same
