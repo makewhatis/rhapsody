@@ -645,7 +645,8 @@ describe("the rail's Jobs badge is not a function of the table's window (STUDIO-
     h.fetchVersion.mockResolvedValue(version(true));
     h.getStatus.mockResolvedValue(status(true));
     // The badge sends no limit and must keep answering off THAT page; only the widened request
-    // carries one. Both pages are the same issues, so a moving badge can only be the coupling.
+    // carries one. The wider page is the same 50 issues plus 12 older ones, so the badge can only
+    // move by reading the table's window — nothing else here changes underneath it.
     h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) =>
       f.limit === undefined ? page(50, true) : page(62, false),
     );
