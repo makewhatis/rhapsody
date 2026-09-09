@@ -679,7 +679,35 @@ pub(crate) fn count_messages(events: &[CapturedEvent], message: &str) -> usize {
 
 static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// RAII temp directory mirroring Go's `t.TempDir()` (unique per pid+counter, auto-removed on drop).
+/// Claims `<root>/<prefix>-<n>` for the first `n` this process can create EXCLUSIVELY.
+///
+/// **`create_dir`, never `create_dir_all`** — that distinction is the whole point. `prefix` carries
+/// the pid, and pids are recycled (macOS wraps them just under 100_000), so a directory some earlier
+/// run left behind sits on the name this process is about to pick often enough to be seen in a
+/// single suite run. `create_dir_all` reports an existing directory as success and hands it back
+/// with its contents, so a `LocalRoom` built on it opens already holding another test's messages.
+/// That is STUDIO-788: the answering test read two replies where it had written one, and the extra
+/// one was a triage post from six days earlier. An exclusive create refuses an occupied name, so
+/// the counter moves past it and a claimed directory is always empty.
+fn claim_in(
+    root: &std::path::Path,
+    counter: &std::sync::atomic::AtomicU64,
+    prefix: &str,
+) -> String {
+    loop {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = root.join(format!("{prefix}-{n}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path.to_string_lossy().into_owned(),
+            // Left behind by a run that wore this pid before us. Skip it; never adopt it.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("create temp dir {}: {e}", path.display()),
+        }
+    }
+}
+
+/// RAII temp directory mirroring Go's `t.TempDir()` (unique per pid+counter, claimed exclusively
+/// via [`claim_in`] so a leftover is never adopted, auto-removed on drop).
 /// The O3 worker / obslog / workspace-GC tests provision real filesystem roots the way the Go tests
 /// do; the sibling crates roll the same tiny helper rather than take a `tempfile` dependency, so this
 /// matches the workspace crate's `testutil::TempDir`.
@@ -689,15 +717,12 @@ pub(crate) struct TempDir {
 
 impl TempDir {
     pub(crate) fn new() -> TempDir {
-        let n = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "rhapsody-orchestrator-{}-{}",
-            std::process::id(),
-            n
-        ));
-        std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir {
-            path: path.to_string_lossy().into_owned(),
+            path: claim_in(
+                &std::env::temp_dir(),
+                &TEST_DIR_COUNTER,
+                &format!("rhapsody-orchestrator-{}", std::process::id()),
+            ),
         }
     }
 
@@ -713,5 +738,46 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A claimed directory is always a fresh one, never a leftover another process wrote.**
+    ///
+    /// STUDIO-788: the answering test read two replies where it had written one, and the extra one
+    /// was a triage post from six days earlier — a directory an earlier run left behind, adopted
+    /// whole because the name matched. Names carry the pid, and pids are recycled, so the collision
+    /// is ordinary rather than exotic; what makes it a bug is adopting the name instead of skipping
+    /// it.
+    #[test]
+    fn a_claim_skips_a_leftover_directory_rather_than_adopting_it() {
+        let base = TempDir::new();
+        let root = std::path::Path::new(&base.path);
+        // What a previous process wearing this pid left on disk, room and all.
+        for n in 0..2 {
+            let stale = root.join(format!("cand-{n}"));
+            std::fs::create_dir(&stale).expect("seed leftover");
+            std::fs::write(stale.join("2026-09-03.jsonl"), "a stale room line\n")
+                .expect("seed stale room");
+        }
+
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let claimed = claim_in(root, &counter, "cand");
+
+        assert_eq!(
+            std::path::Path::new(&claimed)
+                .file_name()
+                .and_then(|n| n.to_str()),
+            Some("cand-2"),
+            "the occupied names are skipped, not adopted: {claimed}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&claimed).expect("read claimed").count(),
+            0,
+            "a claimed directory starts empty: {claimed}"
+        );
     }
 }
