@@ -1451,6 +1451,42 @@ mod tests {
         assert!(held.is_empty(), "{held:?}");
     }
 
+    /// **The fallback case the design record actually names** (§4.2): "a Tier 3 fallback where
+    /// *every* matching candidate is saturated (`best_by_label_overlap` returns `None`, routing
+    /// falls through to `default_identity`)" — reason `Default`, not `LabelOverlap`.
+    ///
+    /// alice and bob capped at 1, both carrying `rust`, alice the `default_identity`; three `rust`
+    /// tickets. The first two fill both seats through the load-balanced tier — MT-2 reaches bob
+    /// only because the pass routes it against its own admit. The third finds every candidate
+    /// saturated, falls through to `default_identity`, and is held **for alice**, who is who
+    /// dispatch would hand it to. This is the one place the hold and that tier meet, and the
+    /// attribution is the half Ticket E renders on the card.
+    #[test]
+    fn the_third_ticket_falls_through_to_a_saturated_default_and_is_held_for_them() {
+        let mut o = orch_with_capped_roster(&[("alice", 1), ("bob", 1)]);
+        if let Some(t) = o.teams.as_mut() {
+            for i in t.roster.iter_mut() {
+                i.labels = vec!["rust".to_string()];
+            }
+            t.manager.default_identity = "alice".to_string();
+        }
+        let (picked, _, held) = o.select_dispatch_with_reopens(vec![
+            teams_issue("1", "MT-1", &["rust"]),
+            teams_issue("2", "MT-2", &["rust"]),
+            teams_issue("3", "MT-3", &["rust"]),
+        ]);
+        assert_eq!(
+            ids(&picked),
+            vec!["MT-1", "MT-2"],
+            "both seats fill; only the third has nowhere to go"
+        );
+        assert_eq!(
+            held,
+            [("alice".to_string(), 1)].into_iter().collect(),
+            "held for the default identity, not for whoever the frozen load named"
+        );
+    }
+
     /// Polls a future once and reports whether it was already ready. Enough for `Notify`, whose
     /// `notified()` resolves immediately exactly when a permit is waiting — and it keeps these
     /// tests synchronous, like every other test in this module.
