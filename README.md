@@ -801,6 +801,39 @@ on a read the refusal is the answer; only a question that could not be answered 
 (500 `mergeability_unavailable`), and the console keeps Merge live on that, since a `gh` it could
 not reach is not the daemon saying no.
 
+### GitHub-summons enrichment is bounded and cannot starve dispatch (STUDIO-811)
+
+Go's `pollAllProjects` interleaves the summons fetch into the candidate loop: two `gh` calls per
+configured repo, sequentially, inside `symphony.fetch_candidates` — ahead of the select ladder, with
+no ceiling on the repo count. On an installation with six repos that phase outlasted the poll
+interval, so select never ran and correctly assigned, correctly labelled `Todo` tickets sat
+undispatched while the daemon looked healthy; nothing logged it, and turning `tracker.github_summons`
+off dispatched all of them on the next tick. Go's own `ghSummonsTimeout` could not contain it
+either: the runner is a synchronous `exec`, so the future it wraps never yields and the timeout has
+no poll at which to fire.
+
+Rhapsody keeps the fetch on the poll path and keeps the fetch SET identical — a repo is fetched only
+when a project on it contributed a surviving candidate, and only once per tick — but bounds it:
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `gh` invocation | synchronous `exec` inline on the poll goroutine | `spawn_blocking`, so the awaits are real yield points and `GH_SUMMONS_TIMEOUT` actually fires |
+| Enrichment cost per tick | unbounded — 2 `gh` calls × every configured repo | at most `poll_interval / 2`, floored at one repo's own fetch bound (15s) |
+| Repos the budget does not reach | n/a (all are fetched, however long it takes) | deferred to the next tick, which a round-robin cursor starts at the first of them — it advances by the repos a tick attempted, so a six-repo installation covering three per tick is fully covered every two ticks |
+| A shortfall | silent | one `warn!` per tick, plus a per-project-group streak on `GET /api/v1/projects` after 3 consecutive ticks, retracted as soon as a tick keeps up **or** the feature is switched off |
+
+The floor is not a rounding detail: below a 30s poll interval it wins, and a pathological `gh` can
+still hold a tick past the interval. That is deliberate — a budget no single fetch can complete
+inside would disable the feature rather than bound it, and an installation wanting both a sub-30s
+poll and summons enrichment needs the enrichment off the poll path, not a smaller number.
+
+Behaviour is unchanged for any installation whose enrichment already fits its poll interval, and
+byte-identical with `github_summons: false` (no repo is ever wanted, so both new passes are no-ops).
+The cost of the bound is staleness rather than loss: a deferred repo's summons is picked up on a
+later tick, inside the same sliding `now - 5m` lookback window. Moving enrichment fully off the poll
+path — the shape `triage.rs` already uses — remains the structurally correct end state and is not
+attempted here.
+
 ### A review run renders the daemon's own base prompt (STUDIO-798)
 
 Go v0.4.0 has one base prompt per run and renders whatever `prompt`/`prompt_file` names — on a real

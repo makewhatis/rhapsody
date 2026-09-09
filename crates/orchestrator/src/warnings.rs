@@ -38,6 +38,20 @@ const PROJECT_WARNING_TIMEOUT: Duration = Duration::from_secs(30);
 /// ride out a transient outage and short enough that a human sees the real thing within minutes.
 pub(crate) const FETCH_FAILURE_WARN_AFTER: u32 = 3;
 
+/// How many CONSECUTIVE ticks must fail to cover every configured GitHub-summons repo within the
+/// poll path's enrichment budget before it is surfaced as a warning (STUDIO-811). Its own constant
+/// rather than a second use of [`FETCH_FAILURE_WARN_AFTER`] because it counts a different thing — a
+/// tick that DEFERRED enrichment, not one whose candidate fetch failed — but the same value, for
+/// the same reason: one deferred tick is ordinary (a slow `gh`) and the round-robin picks the repo
+/// up next tick, whereas a streak means the installation's repo count has structurally outgrown
+/// what inline enrichment can cover.
+///
+/// The condition is a property of the TICK, not of one project: the round-robin deliberately moves
+/// which repos are deferred, so counting per-repo consecutive misses would reset every rotation and
+/// never reach any threshold. Every project the feature is on for therefore takes the same verdict,
+/// which is also what makes the advisory stable on the console instead of flapping between rows.
+pub(crate) const ENRICH_DEFERRED_WARN_AFTER: u32 = 3;
+
 /// The per-project snapshot the warning resolver works from, captured on the control task (from
 /// `eff.projects`) BEFORE the async resolver runs, so the resolver never reads loop-owned state
 /// off-loop. Mirrors Go `projectWarnInput`.
@@ -88,6 +102,10 @@ struct WarningMaps {
     /// tick's verdict directly, so it carries no generation guard (there is no slower-older-pass to
     /// lose a race to) and is keyed/cleared per group rather than replaced wholesale.
     fetch: HashMap<String, FetchFailure>,
+    /// Producer 4 (STUDIO-811) — the consecutive-tick streak of GitHub-summons enrichment DEFERRED
+    /// for want of the poll path's per-tick enrichment budget. Recorded directly by the poll loop,
+    /// exactly as `fetch` is, and for the same reason it carries no generation guard.
+    enrich: HashMap<String, EnrichDeferred>,
 }
 
 /// One project's live candidate-fetch failure streak.
@@ -99,6 +117,21 @@ struct FetchFailure {
     slug: String,
     /// The most recent error, quoted into the warning so the cause is visible without the log.
     err: String,
+}
+
+/// One project group's live enrichment-deferred streak (STUDIO-811).
+#[derive(Debug, Clone)]
+struct EnrichDeferred {
+    /// Consecutive ticks that could not cover every wanted repo inside the enrichment budget; reset
+    /// to 0 by the first tick that covers them all.
+    streak: u32,
+    /// How many distinct repos this tick's enrichment WANTED — a repo earns a fetch only once a
+    /// project on it has contributed a surviving candidate, so this is not the configured repo
+    /// count and the warning must not call it one — and how many of them it deferred. The two
+    /// numbers say how far behind the installation is, so the warning names the scale rather than
+    /// only the fact.
+    repos: usize,
+    deferred: usize,
 }
 
 impl WarningsState {
@@ -164,9 +197,34 @@ impl WarningsState {
         m.fetch.remove(group);
     }
 
+    /// Records one tick that could not cover all `repos` GitHub-summons repos inside its enrichment
+    /// budget (`deferred` of them went un-fetched), advancing the group's streak. Once the streak
+    /// reaches [`ENRICH_DEFERRED_WARN_AFTER`] the project carries a warning (see
+    /// [`merged_for`](WarningsState::merged_for)). STUDIO-811.
+    pub(crate) fn record_enrich_deferred(&self, group: &str, repos: usize, deferred: usize) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        let e = m.enrich.entry(group.to_string()).or_insert(EnrichDeferred {
+            streak: 0,
+            repos: 0,
+            deferred: 0,
+        });
+        e.streak = e.streak.saturating_add(1);
+        e.repos = repos;
+        e.deferred = deferred;
+    }
+
+    /// Clears a project group's enrichment-deferred streak — called on every tick whose enrichment
+    /// covered every wanted repo, so the advisory drops as soon as the daemon catches up.
+    /// STUDIO-811.
+    pub(crate) fn clear_enrich_deferred(&self, group: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        m.enrich.remove(group);
+    }
+
     /// The merged warnings for a group (empty when none): missing-prompt-file flags first, then the
-    /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406). A fresh slice so
-    /// callers never alias the stored maps. Mirrors Go `projectWarningsFor`, plus the fetch producer.
+    /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406), then the
+    /// enrichment-deferred warning (STUDIO-811). A fresh slice so callers never alias the stored
+    /// maps. Mirrors Go `projectWarningsFor`, plus the two Rhapsody-only producers.
     pub(crate) fn merged_for(&self, group: &str) -> Vec<String> {
         let m = self.maps.read().unwrap_or_else(|e| e.into_inner());
         let file = m.file.get(group);
@@ -185,6 +243,15 @@ impl WarningsState {
             out.push(format!(
                 "candidate fetch for slug {:?} has failed {} times in a row — no issue in this project can dispatch (last error: {})",
                 f.slug, f.streak, f.err
+            ));
+        }
+        // Appended after the fetch producer, for the same golden-ordering reason (STUDIO-811).
+        if let Some(e) = m.enrich.get(group)
+            && e.streak >= ENRICH_DEFERRED_WARN_AFTER
+        {
+            out.push(format!(
+                "github-summons enrichment has not covered all {} repos needing enrichment within its per-tick budget for {} ticks in a row ({} deferred on the last) — dispatch is kept on time by deferring them, so a summons on a pull request may take several poll intervals to re-engage its ticket",
+                e.repos, e.streak, e.deferred
             ));
         }
         out

@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -45,7 +46,9 @@ use tracing::Instrument;
 use crate::agentupdate::AgentUpdate;
 use crate::dispatch::dependency_mode_enabled;
 use crate::effective::{Effective, ResolvedProject};
-use crate::ghenrich::{apply_github_summons, enrich_with_github_summons, fetch_github_summons};
+use crate::ghenrich::{
+    GH_SUMMONS_TIMEOUT, apply_github_summons, enrich_with_github_summons, fetch_github_summons,
+};
 use crate::ghsummons::{self, GH, SummonHit};
 use crate::handoff::HandoffPlan;
 use crate::message::RunMessageResult;
@@ -191,6 +194,18 @@ impl Drop for WgGuard {
 /// generous overlap over the poll interval so a comment is never missed between adjacent ticks. A
 /// fixed default in the Go daemon; the enrichment passes `now - DEFAULT_GH_LOOKBACK` as the `since`.
 pub(crate) const DEFAULT_GH_LOOKBACK: Duration = Duration::from_secs(5 * 60);
+
+/// How much of ONE poll interval the whole GitHub-summons enrichment phase may spend (STUDIO-811):
+/// `poll_interval / GH_ENRICH_BUDGET_DIVISOR`, floored at one repo's own
+/// [`GH_SUMMONS_TIMEOUT`] so the round-robin always makes forward progress.
+///
+/// Enrichment runs INSIDE `fetch_candidates`, ahead of the select ladder, and costs two `gh` calls
+/// per configured repo. Nothing about adding a repo says it will stop dispatch, and on the reported
+/// installation six of them did exactly that: the tick never reached select, so correctly assigned
+/// Todo tickets sat undispatched while the daemon looked healthy. Half a poll interval leaves the
+/// other half for reconcile, select and dispatch, which is what makes "a Todo ticket dispatches
+/// within one poll interval" a property of the code rather than of the repo count.
+const GH_ENRICH_BUDGET_DIVISOR: u32 = 2;
 
 /// A control-loop message (Go's `event` interface + its `ev*` implementors). The single owning task
 /// selects these off the mpsc receiver and dispatches them in [`Orchestrator::handle`]; workers,
@@ -701,6 +716,23 @@ impl Orchestrator {
         (self.now)() - chrono::Duration::seconds(DEFAULT_GH_LOOKBACK.as_secs() as i64)
     }
 
+    /// The wall clock this tick's GitHub-summons enrichment phase may spend before it defers the
+    /// repos it has not reached to the next tick (STUDIO-811). See [`GH_ENRICH_BUDGET_DIVISOR`].
+    ///
+    /// The floor matters as much as the ceiling: a budget smaller than one repo's own fetch bound
+    /// would expire mid-fetch every tick, and the feature would never enrich anything rather than
+    /// enrich a bounded share. It also keeps the test/legacy `poll_interval: 0` effectives — where
+    /// half of zero is zero — enriching exactly as they did.
+    ///
+    /// So the ceiling is "half a poll interval, but never less than one fetch". Below a 30s poll
+    /// interval the floor wins and a pathological `gh` can hold a tick past the interval — that is
+    /// deliberate, because the only alternative is a budget no fetch can ever complete inside, which
+    /// disables the feature rather than bounding it. An installation that wants both a sub-30s poll
+    /// and summons enrichment needs enrichment off the poll path, not a smaller number here.
+    fn gh_enrich_budget(&self) -> Duration {
+        (self.poll_interval() / GH_ENRICH_BUDGET_DIVISOR).max(GH_SUMMONS_TIMEOUT)
+    }
+
     /// onTick: reconcile → preflight validate → fetch candidates → dispatch (upstream §8.1, §16.2),
     /// re-arming the poll timer at the end (Go's `defer scheduleTick`). Mirrors Go `onTick`.
     pub(crate) async fn on_tick(&mut self) {
@@ -769,9 +801,9 @@ impl Orchestrator {
     /// it (INF-318). Mirrors Go `dispatchDecisions`.
     async fn dispatch_decisions(&mut self) {
         // What a pass withheld is only ever true of THAT pass, so the tally is RESET here rather
-        // than merely overwritten at its one write site below (STUDIO-802). The single-project
-        // ladder is the only path that fills it, and that path sits behind the multi-project branch
-        // — which has no capacity gate — and two early returns, a missing tracker and a failed
+        // than merely overwritten at either write site below (STUDIO-802; STUDIO-803 added the
+        // multi-project one). Both ladders now fill it, but each sits behind a branch — and the
+        // single-project one behind two further early returns, a missing tracker and a failed
         // candidate fetch. Overwriting alone would therefore leave a Linear outage re-serving the
         // last successful tick's answer for as long as the outage lasted, which matters once
         // something re-arms the tick on a non-empty tally.
@@ -791,7 +823,11 @@ impl Orchestrator {
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
             // the quorum off (§0.12).
             self.record_quorum_state(tagged.iter().map(|t| &t.iss));
-            let (picked, reopen) = self.select_dispatch_multi_with_reopens(tagged);
+            let (picked, reopen, held_for_capacity) =
+                self.select_dispatch_multi_with_reopens(tagged);
+            // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
+            // the reset at the top of the tick exactly as the single-project path below does.
+            self.held_for_capacity = held_for_capacity;
             // Pool-mode picks (INF-477) win the single-claimant claim BEFORE dispatch; assignee-mode
             // picks dispatch immediately. Build owned routes before the `&mut self` dispatch.
             let mut pool_picks: Vec<TaggedIssue> = Vec::new();
@@ -908,8 +944,28 @@ impl Orchestrator {
     /// owning project index, and de-dups by issue ID (first project wins). A per-project fetch error is
     /// logged and that project is skipped this tick. github-summons enrichment (AIE-299) advances a
     /// kept issue's `latest_summon_at` against its project's repo, fetching each distinct repo at most
-    /// once per tick (a per-repo cache keeps GitHub usage flat per repo, O6 `ghenrich`). Mirrors Go
-    /// `pollAllProjects`.
+    /// once per tick. Mirrors Go `pollAllProjects`.
+    ///
+    /// **STUDIO-811 — the enrichment is a bounded, rotated PHASE rather than a lazy per-candidate
+    /// fetch.** Go interleaves the `gh` fetch into the candidate loop, so a tick's enrichment cost is
+    /// two `gh` calls per configured repo with no ceiling; six repos was enough for the reported
+    /// daemon to stop reaching the select ladder at all, and the only symptom was an idle-looking
+    /// daemon. The three passes below keep the fetch SET identical to Go's — a repo is fetched only
+    /// when a project on it contributed a surviving candidate, and only once — while making the cost
+    /// bounded and the shortfall visible:
+    ///
+    ///   1. candidates + dedup, with NO GitHub I/O, so a tick always has its full candidate set;
+    ///   2. the per-repo fetch, starting at [`Orchestrator::gh_enrich_cursor`] and stopping at
+    ///      [`gh_enrich_budget`](Orchestrator::gh_enrich_budget) — repos the budget does not reach are
+    ///      DEFERRED to the next tick, which the rotation starts at the first of them (the cursor
+    ///      advances by the repos this tick ATTEMPTED, so N ticks cover N repos' worth of budget
+    ///      rather than one new repo each), and are reported (a `warn!` plus a per-project-group
+    ///      streak on `GET /api/v1/projects`, never silence);
+    ///   3. the pure apply, over the same kept copies Go enriches.
+    ///
+    /// With the feature off (`gh_source` `None`, or every project's `github_summons` false) no repo is
+    /// ever wanted, so passes 2 and 3 do nothing and the result is byte-identical to before — and
+    /// any advisory a previously-on tick left behind is retracted rather than frozen.
     async fn poll_all_projects(&self) -> Vec<TaggedIssue> {
         struct ProjPoll {
             idx: usize,
@@ -920,6 +976,17 @@ impl Orchestrator {
             gh_summons: bool,
             gh_owner: String,
             gh_repo: String,
+        }
+        /// One project's resolved GitHub-summons coordinates, kept for the fetch + apply passes
+        /// (STUDIO-811). Built only for a project the enrichment gate admits, so its presence in
+        /// `targets` IS the gate.
+        struct EnrichTarget {
+            /// The per-tick fetch-cache key: `owner/repo` lowercased, because GitHub owner/repo are
+            /// case-insensitive (matching the case-folded guard in `apply_github_summons`).
+            key: String,
+            owner: String,
+            repo: String,
+            group: String,
         }
         let Some(eff) = self.eff.as_ref() else {
             return Vec::new();
@@ -943,16 +1010,48 @@ impl Orchestrator {
             .collect();
         let src = self.gh_source.as_deref();
         let since = self.gh_since();
+        let budget = self.gh_enrich_budget();
+        // Where this tick's rotation starts. It is advanced AFTER the fetch pass, by the number of
+        // repos that pass attempted, so the next tick starts at the first repo this one never got
+        // to; the modulus is taken below, where the repo count is known.
+        let rotate = self.gh_enrich_cursor.load(Ordering::Relaxed);
         // Shared with the off-loop resolver tasks; the poll loop records each project's fetch
         // verdict into it (STUDIO-406).
         let warnings = Arc::clone(&self.warnings);
         async {
+            // The enrichment gate, resolved once: a project index maps to a target exactly when the
+            // feature is on for it AND a source exists AND its owner/repo are known.
+            let targets: std::collections::HashMap<usize, EnrichTarget> = projs
+                .iter()
+                .filter(|p| src.is_some() && p.gh_summons && !p.gh_owner.is_empty() && !p.gh_repo.is_empty())
+                .map(|p| {
+                    (
+                        p.idx,
+                        EnrichTarget {
+                            key: format!("{}/{}", p.gh_owner, p.gh_repo).to_lowercase(),
+                            owner: p.gh_owner.clone(),
+                            repo: p.gh_repo.clone(),
+                            group: p.group.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+            // Every polled project's warning group, captured before pass 1 consumes `projs`. The
+            // enrichment advisory is CLEARED against this full set rather than against `targets`,
+            // which is empty the moment the feature goes off: a producer gated by the very
+            // condition it reports on can never retract its own warning, and switching
+            // `tracker.github_summons` off is the operator's escape hatch from this very bug.
+            let all_groups: std::collections::BTreeSet<String> =
+                projs.iter().map(|p| p.group.clone()).collect();
+
+            // --- Pass 1: candidates + dedup. No GitHub I/O at all. -------------------------------
             let mut tagged: Vec<TaggedIssue> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            // Per-repo summon cache, scoped to THIS tick (owner/repo lowercased — GitHub is
-            // case-insensitive), so multiple projects on one repo fetch it at most once.
-            let mut gh_cache: std::collections::HashMap<String, Option<std::collections::HashMap<i64, SummonHit>>> =
-                std::collections::HashMap::new();
+            // The distinct repos this tick actually needs, in config order: a repo earns a fetch only
+            // once a project on it has contributed a surviving candidate, which is exactly when Go's
+            // interleaved fetch fired.
+            let mut wanted: Vec<(String, String, String)> = Vec::new();
             for p in projs {
                 let issues = match p.tracker.fetch_candidate_issues().await {
                     Ok(i) => {
@@ -969,34 +1068,102 @@ impl Orchestrator {
                         continue;
                     }
                 };
-                for mut iss in issues {
+                for iss in issues {
                     if !seen.insert(iss.id.clone()) {
                         continue; // first project wins on duplicate issue IDs
                     }
-                    // Enrich the KEPT copy (after dedup) against its owning project's repo (AIE-299).
-                    if let Some(src) = src
-                        && p.gh_summons
-                        && !p.gh_owner.is_empty()
-                        && !p.gh_repo.is_empty()
+                    if let Some(t) = targets.get(&p.idx)
+                        && !wanted.iter().any(|(k, _, _)| *k == t.key)
                     {
-                        let key = format!("{}/{}", p.gh_owner, p.gh_repo).to_lowercase();
-                        if !gh_cache.contains_key(&key) {
-                            let hits =
-                                fetch_github_summons(Some(src), &p.gh_owner, &p.gh_repo, since).await;
-                            gh_cache.insert(key.clone(), hits);
-                        }
-                        if let Some(Some(by_pr)) = gh_cache.get(&key) {
-                            iss = apply_github_summons(vec![iss], by_pr, &p.gh_owner, &p.gh_repo)
-                                .into_iter()
-                                .next()
-                                .unwrap_or_default();
-                        }
+                        wanted.push((t.key.clone(), t.owner.clone(), t.repo.clone()));
                     }
                     tagged.push(TaggedIssue {
                         iss,
                         proj: Some(p.idx),
                     });
                 }
+            }
+
+            // --- Pass 2: the bounded, rotated per-repo fetch. ------------------------------------
+            let deadline = tokio::time::Instant::now() + budget;
+            let mut fetched: std::collections::HashMap<String, std::collections::HashMap<i64, SummonHit>> =
+                std::collections::HashMap::new();
+            let mut deferred: Vec<String> = Vec::new();
+            // Repos this tick STARTED a fetch for — what the cursor advances by, so the next tick
+            // resumes at the first repo this one never reached. Counting *attempted* rather than
+            // *covered* is the load-bearing half: a repo that burns the remaining budget on a
+            // timeout has still had its turn, and counting only successes would pin the cursor on it
+            // and starve every repo behind it for as long as it stays slow.
+            let mut attempted = 0usize;
+            let n = wanted.len();
+            for i in 0..n {
+                let (key, owner, repo) = &wanted[rotate.wrapping_add(i) % n];
+                // Clamped by what is LEFT of the budget, not only by `GH_SUMMONS_TIMEOUT`, so the
+                // phase as a whole cannot overrun by one repo's bound on its last fetch.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    deferred.extend((i..n).map(|j| wanted[rotate.wrapping_add(j) % n].0.clone()));
+                    break;
+                }
+                attempted += 1;
+                match tokio::time::timeout(
+                    remaining,
+                    fetch_github_summons(src, owner, repo, since),
+                )
+                .await
+                {
+                    Ok(Some(by_pr)) => {
+                        fetched.insert(key.clone(), by_pr);
+                    }
+                    // A `None` is a source error or its own timeout — already logged there, and NOT a
+                    // budget shortfall, so it must not feed the deferred streak.
+                    Ok(None) => {}
+                    Err(_elapsed) => deferred.push(key.clone()),
+                }
+            }
+            self.gh_enrich_cursor
+                .store(rotate.wrapping_add(attempted), Ordering::Relaxed);
+            if !deferred.is_empty() {
+                tracing::warn!(
+                    budget_ms = budget.as_millis() as u64,
+                    repos_wanted = n,
+                    deferred = deferred.len(),
+                    repos_deferred = %deferred.join(", "),
+                    "github-summons: enrichment hit its per-tick budget; dispatch proceeds without these repos this tick"
+                );
+            }
+            // The same verdict, surfaced on `GET /api/v1/projects` so a sustained shortfall is not
+            // only a log line. It is recorded against EVERY group the feature is on for, not only
+            // the ones deferred this tick: the rotation deliberately moves which repos go without,
+            // so a per-repo streak would reset every cycle and never reach a threshold, while the
+            // condition it is reporting — enrichment cannot cover the repos it wants — is true of
+            // the installation rather than of one project. A `BTreeSet` so a group named by several
+            // projects is written once.
+            let enrich_groups: std::collections::BTreeSet<&str> =
+                targets.values().map(|t| t.group.as_str()).collect();
+            for group in &all_groups {
+                // A group the feature is OFF for has nothing to defer, so it always clears — that
+                // is the retraction path, not an else-branch nicety.
+                if deferred.is_empty() || !enrich_groups.contains(group.as_str()) {
+                    warnings.clear_enrich_deferred(group);
+                } else {
+                    warnings.record_enrich_deferred(group, n, deferred.len());
+                }
+            }
+
+            // --- Pass 3: the pure apply, over the KEPT copies (after the dedup, as Go does). ------
+            for ti in tagged.iter_mut() {
+                let Some(t) = ti.proj.and_then(|idx| targets.get(&idx)) else {
+                    continue;
+                };
+                let Some(by_pr) = fetched.get(&t.key) else {
+                    continue;
+                };
+                let iss = std::mem::take(&mut ti.iss);
+                ti.iss = apply_github_summons(vec![iss], by_pr, &t.owner, &t.repo)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
             }
             tagged
         }
@@ -1576,9 +1743,12 @@ mod tests {
     // the OTel bridge + those spans.
     /// The capacity tally is only ever true of the pass that produced it, so a tick whose
     /// candidate fetch FAILS must not leave the previous tick's answer standing (STUDIO-802).
-    /// The single-project ladder is the only writer and it sits behind that early return, so
-    /// clearing at the write site alone would re-serve a stale map for the length of a Linear
-    /// outage — and a stale non-empty map is exactly what a later re-arm would keep firing on.
+    /// Every writer sits behind a branch a failing tick never reaches — the multi-project ladder
+    /// inside `has_projects` (STUDIO-803), the single-project one inside its `else` plus two
+    /// further early returns, a missing tracker and this failed fetch — so clearing at the write
+    /// sites alone would re-serve a stale map for the length of a Linear outage, and a stale
+    /// non-empty map is exactly what a later re-arm would keep firing on. This test drives the
+    /// single-project path, the only one whose early returns a failing fetch can reach.
     #[tokio::test]
     async fn a_failed_candidate_fetch_clears_the_capacity_tally() {
         let mut tr = Fake::new();

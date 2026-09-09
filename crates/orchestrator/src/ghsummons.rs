@@ -11,7 +11,7 @@
 //! constructs `GH::new(token, None)` as `o.gh_source`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -141,10 +141,15 @@ pub type RunResult = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
 /// `tokio::time::timeout` ([`crate::ghenrich`]).
 pub type RunFn = Box<dyn Fn(&[&str]) -> RunResult + Send + Sync>;
 
+/// The shared, `'static` form of [`RunFn`] a [`GH`] holds. Shared rather than owned so
+/// [`GH::run_off_task`] can move a handle to the runner onto tokio's blocking pool without
+/// borrowing `&self` across the `.await` (STUDIO-811).
+type SharedRun = Arc<dyn Fn(&[&str]) -> RunResult + Send + Sync>;
+
 /// A GitHub-backed [`SummonSource`]. Mirrors Go `ghsummons.GH`.
 pub struct GH {
     re: Option<Regex>,
-    run: RunFn,
+    run: SharedRun,
 }
 
 impl GH {
@@ -156,19 +161,43 @@ impl GH {
     pub fn new(token: &str, run: Option<RunFn>) -> GH {
         GH {
             re: compile_summon_matcher(token).ok(),
-            run: run.unwrap_or_else(|| Box::new(default_run)),
+            run: run.map_or_else(|| Arc::new(default_run) as SharedRun, SharedRun::from),
         }
+    }
+
+    /// Runs `gh` with `args` on tokio's BLOCKING pool and awaits the result (STUDIO-811).
+    ///
+    /// [`RunFn`] is synchronous — the real one shells out with [`std::process::Command`] — so calling
+    /// it inline made [`SummonSource::summons_since`] a future that never yields, and a future that
+    /// never yields cannot be cancelled: `ghenrich`'s surrounding [`tokio::time::timeout`] had no
+    /// poll at which to fire, and the control task that drove it stalled for however long `gh` took.
+    /// Handing the call to `spawn_blocking` and awaiting the join turns each `gh` invocation into a
+    /// real yield point, which is what makes that timeout — and the poll path's per-tick enrichment
+    /// budget — enforceable rather than advisory.
+    ///
+    /// A cancelled await abandons the join handle, not the thread: the `gh` process still runs to
+    /// completion on the blocking pool and its output is dropped. That is the only cancellation a
+    /// spawned OS process can have, and it is confined to the pool instead of the control task —
+    /// but it is a cost, not a free lunch: a `gh` that never returns holds a blocking-pool thread
+    /// per deferred fetch. It degrades visibly rather than silently (a saturated pool queues, the
+    /// per-tick enrichment budget expires, the deferred advisory fires) and never worse than the
+    /// inline call it replaced, which held the control task itself for the same duration.
+    async fn run_off_task(&self, args: Vec<String>) -> RunResult {
+        let run = Arc::clone(&self.run);
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            run(&refs)
+        })
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
     }
 }
 
 /// The default runner: `gh <args>`, returning stdout. A non-zero exit is an error (Go's
 /// `exec.Command(...).Output()` returns an `*ExitError`). Only used in production — every test
-/// injects its own runner. The exec is synchronous (Go's is too, run on a goroutine): it blocks the
-/// calling executor worker for the two `gh` calls. Enrichment runs at most once per project per tick
-/// and tokio's multi-worker runtime absorbs it, but because the call does not yield, `ghenrich`'s
-/// surrounding `tokio::time::timeout` cannot interrupt a hung `gh` mid-call — a fully non-blocking
-/// runner (`spawn_blocking` / `tokio::process`) is a daemon-wiring (F1) refinement when it first
-/// constructs `o.gh_source`.
+/// injects its own runner. The exec is synchronous (Go's is too, run on a goroutine), so it blocks
+/// whatever thread runs it for the duration of the `gh` call; [`GH::run_off_task`] is what keeps
+/// that thread a blocking-pool one rather than the control task's (STUDIO-811).
 fn default_run(args: &[&str]) -> RunResult {
     let out = std::process::Command::new("gh").args(args).output()?;
     if !out.status.success() {
@@ -998,11 +1027,17 @@ impl SummonSource for GH {
             format!("repos/{owner}/{repo}/pulls/comments?since={since_str}&per_page=100"),
         ];
         for ep in &endpoints {
-            let body = (self.run)(&["api", "--paginate", "--slurp", ep.as_str()]).map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
+            let body = self
+                .run_off_task(vec![
+                    "api".to_string(),
+                    "--paginate".to_string(),
+                    "--slurp".to_string(),
+                    ep.clone(),
+                ])
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("gh api {ep}: {e}").into()
-                },
-            )?;
+                })?;
             // `--slurp` wraps all pages into `[[page1…],[page2…]]`, even for a single page.
             let pages: Vec<Vec<serde_json::Value>> = serde_json::from_slice(&body).map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -2247,6 +2282,37 @@ mod tests {
         assert!(
             seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "no gh process should have been spawned"
+        );
+    }
+
+    // STUDIO-811: the enrichment's bound on a `gh` call must be REAL. The runner is synchronous, so
+    // calling it inline made `summons_since` a future with no yield point, and a future that never
+    // yields cannot be cancelled — `ghenrich`'s `tokio::time::timeout` had no poll at which to fire,
+    // and the control task driving it stalled for as long as `gh` took. That is what let six repos'
+    // worth of sequential `gh` calls hold the poll path past its own poll interval. With the call
+    // handed to the blocking pool the timeout fires on schedule, which is what the poll path's
+    // per-tick enrichment budget is built on.
+    #[tokio::test]
+    async fn a_blocking_gh_call_can_be_timed_out() {
+        // Blocks its thread for far longer than the timeout below — a stalled `gh`, in miniature.
+        let run: RunFn = Box::new(|_args| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(b"[[]]".to_vec())
+        });
+        let src = GH::new("@symphony", Some(run));
+
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            src.summons_since("o", "r", utc(2026, 8, 24, 21, 43, 53)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(out.is_err(), "the timeout must fire, not wait out the call");
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "the caller must be released at its own deadline, waited {elapsed:?}"
         );
     }
 }

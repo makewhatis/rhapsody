@@ -547,3 +547,265 @@ async fn github_summons_reopen_seeds_the_fresh_runs_mailbox() {
         "the seeded summons must advance the per-run delivery watermark"
     );
 }
+
+// --- STUDIO-811: the enrichment phase is bounded, rotated, and reported ------------------------
+
+/// A [`SummonSource`] that takes `delay` to answer, recording the `owner/repo` of every query in
+/// order. The delay is `tokio::time::sleep`, so under a paused clock the tests below advance time
+/// deterministically instead of waiting on one.
+struct SlowSrc {
+    delay: std::time::Duration,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl SummonSource for SlowSrc {
+    async fn summons_since(&self, owner: &str, repo: &str, _since: DateTime<Utc>) -> SummonResult {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{owner}/{repo}"));
+        tokio::time::sleep(self.delay).await;
+        Ok(HashMap::new())
+    }
+}
+
+/// A plain `Todo` candidate with no linked PR — the shape of the tickets that sat undispatched on
+/// the reported daemon. Eligible for dispatch on its own; it exists to prove the ladder was reached.
+fn todo_issue(id: &str, ident: &str) -> Issue {
+    Issue {
+        id: id.to_string(),
+        identifier: ident.to_string(),
+        title: "t".to_string(),
+        state: "Todo".to_string(),
+        ..Default::default()
+    }
+}
+
+/// The reported installation: `repos` projects, each on its OWN GitHub repo with github-summons on,
+/// each holding one dispatchable `Todo` ticket, polling every 30s. `delay` is what one repo's summon
+/// fetch costs.
+fn starved_orch(
+    repos: usize,
+    delay: std::time::Duration,
+) -> (
+    Orchestrator,
+    crate::testsupport::DispatchedEntries,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let projects: Vec<ResolvedProject> = (0..repos)
+        .map(|i| {
+            summon_project(
+                &format!("p{i}"),
+                "makewhatis",
+                &format!("r{i}"),
+                vec![todo_issue(&format!("iss-{i}"), &format!("X-{i}"))],
+            )
+        })
+        .collect();
+    let (mut o, spawned) = orch_for_retry_multi(projects, 100);
+    if let Some(eff) = o.eff.as_mut() {
+        eff.poll_interval = std::time::Duration::from_secs(30);
+    }
+    o.now = Box::new(fixed_now);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    o.gh_source = Some(Box::new(SlowSrc {
+        delay,
+        seen: Arc::clone(&seen),
+    }));
+    (o, spawned, seen)
+}
+
+/// The `owner/repo`s the source was asked for, in order.
+fn queried(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+// STUDIO-811 — THE property the ticket asks for: with six repos configured and github-summons on,
+// a Todo ticket assigned to a teammate dispatches within ONE poll interval. The source here never
+// answers inside a tick (60s per repo against a 30s poll), which is the pathological end of what
+// six sequential `gh` calls did on the reported daemon; enrichment must give way to the select
+// ladder rather than the other way round. Asserted on DISPATCH, not on enrichment completing.
+#[tokio::test(start_paused = true)]
+async fn six_repos_of_slow_enrichment_still_dispatch_within_one_poll_interval() {
+    let (mut o, spawned, seen) = starved_orch(6, std::time::Duration::from_secs(60));
+
+    let started = tokio::time::Instant::now();
+    o.on_tick().await;
+    let elapsed = started.elapsed();
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        entries.len(),
+        6,
+        "every eligible Todo ticket must dispatch; enrichment must not hold the ladder"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "the whole tick must fit inside one poll interval, took {elapsed:?}"
+    );
+    assert_eq!(
+        queried(&seen).len(),
+        1,
+        "the budget must stop the phase after the repo it could not finish, not run all six"
+    );
+}
+
+// STUDIO-811 — the deferred repos are not the same ones every tick. A tick that cannot reach every
+// repo must leave the next one starting where it stopped, or the repos late in config order would
+// never be enriched at all and their summons could never re-engage a ticket.
+#[tokio::test(start_paused = true)]
+async fn a_budget_exhausted_tick_rotates_the_next_ticks_starting_repo() {
+    // 20s per repo against a 15s budget: exactly one repo is attempted per tick.
+    let (o, _spawned, seen) = starved_orch(3, std::time::Duration::from_secs(20));
+
+    for _ in 0..3 {
+        let _ = o.poll_all_projects().await;
+    }
+
+    assert_eq!(
+        queried(&seen),
+        vec![
+            "makewhatis/r0".to_string(),
+            "makewhatis/r1".to_string(),
+            "makewhatis/r2".to_string()
+        ],
+        "each tick must start at the repo the previous one deferred"
+    );
+}
+
+// STUDIO-811 — "whatever lands, the silence must go". A sustained shortfall reaches the project
+// status (`GET /api/v1/projects`), not only the log, and clears the moment enrichment keeps up.
+#[tokio::test(start_paused = true)]
+async fn a_sustained_enrichment_shortfall_is_surfaced_on_the_project_status() {
+    let (mut o, _spawned, _seen) = starved_orch(3, std::time::Duration::from_secs(20));
+
+    // One deferred tick is ordinary — the rotation covers it — so nothing is surfaced yet.
+    let _ = o.poll_all_projects().await;
+    assert!(
+        o.project_warnings_for("p2").is_empty(),
+        "a single deferred tick must not raise a warning"
+    );
+
+    for _ in 0..crate::warnings::ENRICH_DEFERRED_WARN_AFTER {
+        let _ = o.poll_all_projects().await;
+    }
+    // Every project the feature is on for carries it: the shortfall is the installation's, and the
+    // rotation moves which repo goes without from tick to tick.
+    for group in ["p0", "p1", "p2"] {
+        let warns = o.project_warnings_for(group);
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected one warning on {group}, got {warns:?}"
+        );
+        assert!(
+            warns[0].contains("has not covered all 3 repos needing enrichment")
+                && warns[0].contains("2 deferred on the last"),
+            "the warning must name the scale of the shortfall, got {:?}",
+            warns[0]
+        );
+    }
+
+    // A source that answers instantly covers every repo, and the advisory clears.
+    let (src, _log) = fake_src(&[]);
+    o.gh_source = Some(src);
+    let _ = o.poll_all_projects().await;
+    for group in ["p0", "p1", "p2"] {
+        assert!(
+            o.project_warnings_for(group).is_empty(),
+            "the warning must clear on the first tick that covers every repo"
+        );
+    }
+}
+
+// STUDIO-811 (round 2) — the rotation must advance by every repo the tick ATTEMPTED, not by one.
+// `a_budget_exhausted_tick_rotates_the_next_ticks_starting_repo` above only ever covers ONE repo per
+// tick, so it is green under either rule; this is the case the reported installation is actually in.
+// Advancing by one would make the next tick re-fetch repos it just fetched and reach only one new
+// one, so the tail of the config order waits several extra poll intervals for its summons.
+#[tokio::test(start_paused = true)]
+async fn a_partly_covered_tick_rotates_past_every_repo_it_attempted() {
+    // 4s per repo against the 15s budget: r0/r1/r2 are covered, r3 is attempted and burns the last
+    // 3s of the budget on a timeout, r4/r5 are never started.
+    let (o, _spawned, seen) = starved_orch(6, std::time::Duration::from_secs(4));
+
+    let _ = o.poll_all_projects().await;
+    assert_eq!(
+        queried(&seen),
+        ["r0", "r1", "r2", "r3"].map(|r| format!("makewhatis/{r}")),
+        "the budget must stop the phase at the repo it could not finish"
+    );
+
+    let _ = o.poll_all_projects().await;
+    assert_eq!(
+        queried(&seen),
+        ["r0", "r1", "r2", "r3", "r4", "r5", "r0", "r1"].map(|r| format!("makewhatis/{r}")),
+        "tick 2 must start at r4 — the first repo tick 1 never attempted — so two ticks cover the \
+         whole installation; a timed-out repo counts as attempted, or one slow repo pins the cursor"
+    );
+}
+
+// STUDIO-811 (round 2) — the advisory must clear when github-summons is switched OFF, which is this
+// ticket's own operator workaround. The producer is gated by the very condition it reports on, so
+// driving the clear off the enrichment targets alone left a warning nothing could ever retract:
+// dispatch recovers, `GET /api/v1/projects` keeps saying enrichment is behind, forever.
+#[tokio::test(start_paused = true)]
+async fn the_enrichment_advisory_clears_when_github_summons_goes_away() {
+    let (mut o, _spawned, _seen) = starved_orch(3, std::time::Duration::from_secs(20));
+    for _ in 0..crate::warnings::ENRICH_DEFERRED_WARN_AFTER {
+        let _ = o.poll_all_projects().await;
+    }
+    assert_eq!(
+        o.project_warnings_for("p0").len(),
+        1,
+        "precondition: the shortfall is surfaced while the feature is on"
+    );
+
+    // What David did on the reported daemon: `tracker.github_summons: false`, hot-reloaded.
+    if let Some(eff) = o.eff.as_mut() {
+        for p in eff.projects.iter_mut() {
+            p.github_summons = false;
+        }
+    }
+    let _ = o.poll_all_projects().await;
+    for group in ["p0", "p1", "p2"] {
+        assert!(
+            o.project_warnings_for(group).is_empty(),
+            "the advisory must not survive the feature being turned off, got {:?}",
+            o.project_warnings_for(group)
+        );
+    }
+
+    // The same holds for the other way enrichment goes away: the source itself dropping to `None`
+    // (no token), which empties the targets by the identical gate.
+    if let Some(eff) = o.eff.as_mut() {
+        for p in eff.projects.iter_mut() {
+            p.github_summons = true;
+        }
+    }
+    for _ in 0..crate::warnings::ENRICH_DEFERRED_WARN_AFTER {
+        let _ = o.poll_all_projects().await;
+    }
+    assert_eq!(
+        o.project_warnings_for("p0").len(),
+        1,
+        "precondition: the streak rebuilds once the feature is back on"
+    );
+    o.gh_source = None;
+    let _ = o.poll_all_projects().await;
+    for group in ["p0", "p1", "p2"] {
+        assert!(
+            o.project_warnings_for(group).is_empty(),
+            "a source that goes away must retract the advisory too, got {:?}",
+            o.project_warnings_for(group)
+        );
+    }
+}

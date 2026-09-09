@@ -10,7 +10,7 @@
 //! the fields its behavior needs.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -614,6 +614,15 @@ pub struct Orchestrator {
     /// `eff` via [`new_github_summon_source`](Orchestrator::new_github_summon_source). Mirrors Go
     /// `ghSource` (O6's `ghsummons::GH` polling source). Control-task-owned.
     pub(crate) gh_source: Option<Box<dyn crate::ghsummons::SummonSource>>,
+    /// Where the poll path's bounded GitHub-summons enrichment starts its per-repo round-robin
+    /// (STUDIO-811). Advanced by the number of repos a poll ATTEMPTED, so the next tick starts at
+    /// the first repo the previous one never reached and no repo starves behind the config order.
+    /// Counting attempted rather than covered is deliberate: a repo that spends the rest of the
+    /// budget timing out has had its turn, and counting only successes would pin the cursor on it.
+    /// An [`AtomicUsize`] purely so
+    /// `poll_all_projects` can stay `&self`; it is control-task-owned like every field here and is
+    /// NOT a sixth off-loop seam.
+    pub(crate) gh_enrich_cursor: AtomicUsize,
     /// The effective `storage.retention_days` mirrored as an atomic so the daemon's prune scheduler
     /// (P6) reads it without racing the control task's reload (default 30 until the first reload).
     /// Mirrors Go `retentionDays`.
@@ -746,6 +755,7 @@ impl Orchestrator {
             retry_timers: HashMap::new(),
             wg: WaitGroup::new(),
             gh_source: None,
+            gh_enrich_cursor: AtomicUsize::new(0),
             retention_days: Arc::new(AtomicI64::new(DEFAULT_RETENTION_DAYS)),
             retention_loaded: Arc::new(AtomicBool::new(false)),
             warnings: Arc::new(WarningsState::default()),
