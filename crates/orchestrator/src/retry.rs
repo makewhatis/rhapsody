@@ -1646,10 +1646,15 @@ mod tests {
             failed: false,
             started_at: st,
             err_msg: String::new(),
-            last_state: "In Progress".into(),
+            last_state: "Done".into(),
             declared_handoff: true,
         });
 
+        assert!(
+            !o.retry_attempts.contains_key("1"),
+            "precondition: this exit must reach the RELEASING path, or the assertion below is \
+             vacuous — it would pass on a continuation whatever the guard does"
+        );
         assert!(
             o.tick_timer.is_none(),
             "nothing was held, so no tick may be armed"
