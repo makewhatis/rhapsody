@@ -391,9 +391,15 @@ fn attempt_line(issue: &str, outcome: &MergeControlOutcome) -> Option<String> {
         MergeControlOutcome::Refused(why) => Some(format!(
             "did not merge {issue} — {why} (asked from the console)"
         )),
-        MergeControlOutcome::Failed(err) => {
-            Some(format!("could not merge {issue} — GitHub refused: {err}"))
-        }
+        // Neutral about WHO refused, because not every failure on this path is GitHub's. Until
+        // STUDIO-784 every `Failed` reaching here came from a `gh` seam, so naming GitHub was
+        // simply true; the ticket-state gate runs BEFORE the `gh` half and fails on a tracker
+        // outage, which this sentence would then have recorded as a GitHub refusal — a false row
+        // in the one place §3/G4 wants a true one, and a false line in a room teammates read back.
+        // Attribution belongs to the producer instead: the `gh` seams prefix their own errors
+        // (`gh pr view …:`, `gh api …:` — see [`crate::ghsummons`]) and
+        // [`ticket_not_waiting_in_review`] names the tracker in as many words.
+        MergeControlOutcome::Failed(err) => Some(format!("could not merge {issue} — {err}")),
         // Nothing happened: the handshake's first leg, or a state that never reached a plan.
         MergeControlOutcome::ConfirmRequired(_)
         | MergeControlOutcome::Dormant
@@ -460,8 +466,14 @@ pub(crate) async fn ticket_not_waiting_in_review(
     {
         Ok(issues) => issues,
         // Carries the tracker's own words rather than a refusal the operator would act on
-        // pointlessly: nothing is known about the ticket, so nothing about it is asserted.
-        Err(e) => return Some(MergeControlOutcome::Failed(e.to_string())),
+        // pointlessly: nothing is known about the ticket, so nothing about it is asserted. It
+        // names the tracker because [`attempt_line`] does not name anyone — this is the one
+        // failure on the recorded path that GitHub was never asked about.
+        Err(e) => {
+            return Some(MergeControlOutcome::Failed(format!(
+                "the ticket's tracker could not be read: {e}"
+            )));
+        }
     };
     let Some(issue) = issues.iter().find(|i| i.id == gate.issue_id) else {
         tracing::info!(
@@ -1408,16 +1420,24 @@ mod tests {
 
     /// A refusal and a failure are recorded too — an operator's click that did NOT merge is
     /// exactly as worth having in the record as one that did.
+    ///
+    /// The failure case is a REAL `gh pr merge` complaint, prefix and all, because that prefix is
+    /// where the attribution now lives: the recorded sentence names no one, and each producer says
+    /// for itself who refused (STUDIO-784 round 3). See
+    /// [`a_tracker_outage_is_not_recorded_as_a_github_refusal`] for the other producer.
     #[test]
     fn a_refusal_and_a_failure_are_recorded_as_attempts() {
+        const GH_SAID: &str = "gh pr merge 64 --repo makewhatis/rhapsody: exited with exit status 1: \
+             Pull request is not mergeable: the merge commit cannot be cleanly created";
         for (outcome, want) in [
             (
                 MergeControlOutcome::Refused("that pull request is closed"),
-                "did not merge STUDIO-767 — that pull request is closed (asked from the console)",
+                "did not merge STUDIO-767 — that pull request is closed (asked from the console)"
+                    .to_string(),
             ),
             (
-                MergeControlOutcome::Failed("merge conflicts".to_string()),
-                "could not merge STUDIO-767 — GitHub refused: merge conflicts",
+                MergeControlOutcome::Failed(GH_SAID.to_string()),
+                format!("could not merge STUDIO-767 — {GH_SAID}"),
             ),
         ] {
             let dir = TempDir::new();
@@ -1427,10 +1447,55 @@ mod tests {
             let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
             let plan = ready(&mut o, run);
             o.settle_run_merge(&plan, &outcome);
-            assert_eq!(audit(&o, run), vec![want.to_string()]);
+            assert_eq!(audit(&o, run), vec![want.clone()]);
             assert_eq!(
                 room_lines(&room),
                 vec![format!("{MANAGER_IDENTITY}: {want}")]
+            );
+        }
+    }
+
+    /// **STUDIO-784 round 3.** A tracker outage is recorded and reported as a TRACKER failure.
+    ///
+    /// The gate this ticket added is the first `Failed` on the recorded path that GitHub was never
+    /// asked about — it runs before the `gh` half by design — and the sentence
+    /// [`attempt_line`] composed said "GitHub refused" for every failure. That put a false fact in
+    /// the audit row §3/G4 calls "the one place we want a true record", and in a room line that is
+    /// read back into teammates' prompts, sending whoever diagnoses the missing merge to inspect a
+    /// pull request that is fine.
+    ///
+    /// So this runs the whole chain rather than asserting on a hand-written payload: a real
+    /// tracker error through the real gate, that outcome through the real settle, and then the
+    /// sentence both halves actually hold.
+    #[tokio::test]
+    async fn a_tracker_outage_is_not_recorded_as_a_github_refusal() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut o = orch_reviewing();
+        o.teams_room = Some(Arc::clone(&room));
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+        let plan = ready(&mut o, run);
+
+        let mut down = Fake::new();
+        down.by_id_err = Some(rhapsody_tracker::TrackerError::Other(
+            "linear: HTTP 503 Service Unavailable".to_string(),
+        ));
+        let outcome = ticket_not_waiting_in_review(Some(Arc::new(down)), &plan)
+            .await
+            .expect("a tracker that cannot be read stops the merge");
+        o.settle_run_merge(&plan, &outcome);
+
+        let want = "could not merge STUDIO-767 — the ticket's tracker could not be read: \
+                    linear: HTTP 503 Service Unavailable";
+        assert_eq!(audit(&o, run), vec![want.to_string()]);
+        assert_eq!(
+            room_lines(&room),
+            vec![format!("{MANAGER_IDENTITY}: {want}")]
+        );
+        for said in [&audit(&o, run)[0], &room_lines(&room)[0]] {
+            assert!(
+                !said.contains("GitHub"),
+                "GitHub was never asked, so the record must not name it: {said}"
             );
         }
     }
