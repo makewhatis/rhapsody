@@ -28,16 +28,26 @@ export function useHistory(
   });
 }
 
+// The prefix every issue-listing query shares, whatever its filter. Exported so a caller that has
+// just learned the listing is out of date — `useJobsFeed`, off the live snapshot — can invalidate
+// the whole family without reconstructing each filter's key.
+export const HISTORY_ISSUES_QUERY_KEY = ["history-issues"] as const;
+
 // useIssueRuns fetches the ISSUE-level listing (GET /api/v1/history/issues) that backs the Jobs
 // list: one row per issue, paged by issue. This is what keeps a ticket in a retry loop from
 // crowding every other issue off the page — grouping a run-paged fetch client-side cannot, at any
 // page size. (TRA-320)
+//
+// `refetchInterval` still defaults to `false`, because a caller that renders the listing on its own
+// (a search, a one-shot page) genuinely wants one fetch. A caller that renders it NEXT TO the live
+// snapshot does not have that freedom: it must poll on `LIVE_POLL_MS`, and `useJobsFeed` is where
+// that pairing is made rather than left to each call site (STUDIO-791).
 export function useIssueRuns(
   filter: HistoryFilter = {},
   opts?: { enabled?: boolean; refetchInterval?: number | false },
 ) {
   return useQuery<IssueRunsResponse>({
-    queryKey: ["history-issues", filter],
+    queryKey: [...HISTORY_ISSUES_QUERY_KEY, filter],
     queryFn: () => fetchIssueRuns(filter),
     enabled: opts?.enabled ?? true,
     refetchInterval: opts?.refetchInterval ?? false,

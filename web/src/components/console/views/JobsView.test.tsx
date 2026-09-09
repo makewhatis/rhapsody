@@ -2,7 +2,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueRun, StateResponse } from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
@@ -964,5 +964,93 @@ describe("the §6 additions are painted, not just classed", () => {
 
   it("gives Needs you the operator's own colour", () => {
     expect(consoleCss).toMatch(/\.stat\.op \.n \{[^}]*color: var\(--operator\)/);
+  });
+});
+
+// STUDIO-791 — the list left open. Everything above mounts the view, settles it, and asserts a
+// still frame; this is the one that lets the daemon move underneath it. The bug it pins was not a
+// slow list but a static one: `useIssueRuns()` was called with no options and `useHistory`'s
+// `refetchInterval` defaults to `false`, so the table fetched once on mount and then never again
+// while the Now strip above it polled `/api/v1/state` every 2s. The two halves of the same screen
+// were being served at different freshness; the test below records which way that actually broke.
+describe("a Jobs list left open (STUDIO-791)", () => {
+  const LIVE = {
+    issue_id: "id-A-1",
+    issue_identifier: "A-1",
+    title: "A-1 title",
+    state: "In Progress",
+    project: "rhapsody",
+    repo: "",
+    run_id: 9,
+    turn_count: 1,
+    last_codex_event: "",
+    started_at: "2026-09-01T11:00:00Z",
+    last_event_at: "2026-09-01T11:00:00Z",
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+  };
+
+  function rowStatus(identifier: string): string {
+    const tr = [...document.querySelectorAll(".jtbl tbody tr")].find((el) =>
+      el.querySelector(".ti")?.textContent?.startsWith(identifier),
+    );
+    if (tr === undefined) return "<no row>";
+    return within(tr as HTMLElement).getAllByRole("cell")[2].textContent ?? "";
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // The acceptance criterion, end to end: a run finishes while nobody touches the page, and BOTH
+  // halves move. Measured against the pre-fix wiring, this test fails with the issue listing having
+  // been fetched exactly ONCE against two `/api/v1/state` polls, the strip still reading "1 running"
+  // and the row still reading "running" — a completed run reported as in flight for as long as the
+  // page stays open.
+  //
+  // Note which way that failure actually falls, because it is not the one the ticket predicted. The
+  // strip does not tick on ahead of the rows here: `consoleJobCounts` counts the SAME merged array
+  // the table renders, so a stale history row pins the header count as surely as it pins the row.
+  // Live and stored disagreeing is what produces the visible mess, and which half is wrong depends
+  // on the transition — a run STARTING shows up in the strip at once (the live snapshot carries it)
+  // while the row's stored columns lag, and a run FINISHING freezes both, as here.
+  it("moves its rows and its header together when a run finishes, with no Refresh click", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    h.fetchState.mockResolvedValue({ ...EMPTY_STATE, running: [LIVE] });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [run({ id: 9, issue_identifier: "A-1", outcome: "running" })],
+      next_offset: null,
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+
+    await waitFor(() => expect(stat("running")).toBe("1"));
+    expect(rowStatus("A-1")).toContain("running");
+
+    // The daemon now reports the run finished — it leaves the live snapshot and lands in the store
+    // with a terminal outcome. No click, no remount, no query invalidation from the test.
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [run({ id: 9, issue_identifier: "A-1", outcome: "completed" })],
+      next_offset: null,
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+
+    expect(stat("running")).toBe("0");
+    // "in review", not "completed": a completed run with no tracker lifecycle of its own means the
+    // ticket is now sitting on somebody's review, and that is the vocabulary the worklist speaks.
+    expect(rowStatus("A-1")).toContain("in review");
+    // And explicitly no longer the stale answer, which is the one the frozen table kept serving.
+    expect(rowStatus("A-1")).not.toContain("running");
   });
 });
