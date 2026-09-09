@@ -239,7 +239,14 @@ pub struct RetryEntry {
     /// carries, and stated rather than discovered. **A retry recovered after a daemon restart
     /// therefore does NOT count toward capacity until it re-dispatches**, because the identity was
     /// never persisted and re-deriving it by routing would be circular (routing needs the very load
-    /// snapshot being built). Bounded by one retry fire per recovered entry, and accepted.
+    /// snapshot being built).
+    ///
+    /// The gap closes on a SUCCESSFUL re-dispatch, not on one retry fire: every requeue path in
+    /// `on_retry` — continuation and backoff poll failure, in-flight state recheck failure, and
+    /// both "no available orchestrator slots" branches — re-schedules with the identity it just
+    /// took out, so an entry that keeps missing a slot or keeps hitting a flaky tracker carries the
+    /// empty string forward for as long as that lasts. Accepted: it is the pre-Teams behaviour, and
+    /// the alternative is persisting a routing decision that re-dispatch is entitled to revisit.
     pub identity: String,
 
     /// Phase 4 recovery bookkeeping. `due_at_ms` is the wall-clock unix-ms persisted due time (for

@@ -225,11 +225,19 @@ impl LoadSnapshot {
     /// `reconcile_run`'s wedged-worker sweep — remove the entry from `running` before scheduling
     /// it, so a run is in one map or the other and never in both.
     ///
-    /// **The review test differs from [`is_review_run`]'s, and only its label half survives.** A
-    /// ticketless review run schedules no retry at all — `on_review_exit` exists precisely so it
-    /// cannot (STUDIO-716) — so the `re.review` half has nothing to answer for here and the quorum
-    /// path, which dispatches a real ticket, is identified from the last-known issue exactly as it
-    /// is there.
+    /// **The review test differs from [`is_review_run`]'s, because a [`RetryEntry`] has no `review`
+    /// field to ask.** Both shapes of review can be parked here, and each needs its own half:
+    ///
+    /// * the QUORUM shape dispatches a real ticket, so it is identified from the last-known issue's
+    ///   label exactly as it is in `is_review_run`;
+    /// * the TICKETLESS shape carries no such label — a synthetic issue's labels are exactly
+    ///   `rhapsody:@<reviewer>` — so it is identified by its `pr:` id instead.
+    ///
+    /// The second half is not theoretical, and assuming it away is how D2 was first broken here:
+    /// `reconcile_stalled` has no review guard, so a WEDGED ticketless review is terminated and
+    /// parked like any other worker (the door `on_review_exit` does not close, STUDIO-716). Without
+    /// the id test it would read as implementation work and lock its reviewer out of the ladder for
+    /// the whole backoff window. Same edge as design §4.3, second location.
     ///
     /// Entries with an empty identity are skipped, which is what excludes every boot-recovered
     /// retry until it re-dispatches ([`RetryEntry::identity`]).
@@ -242,7 +250,9 @@ impl LoadSnapshot {
             load.add(&re.identity, is_review_run(re));
         }
         for re in retries.values() {
-            load.add(&re.identity, crate::lifecycle::is_review_ticket(&re.issue));
+            let review = crate::lifecycle::is_review_ticket(&re.issue)
+                || crate::review::is_review_key(&re.issue.id);
+            load.add(&re.identity, review);
         }
         load
     }
@@ -1179,6 +1189,44 @@ mod tests {
         let load = LoadSnapshot::from_running_and_retries(&HashMap::new(), &retries);
 
         assert_eq!(load.impl_live("alice"), 0, "reviews are free (D2)");
+        assert_eq!(load.live("alice"), 1, "the all-runs count still sees it");
+    }
+
+    /// The TICKETLESS half of D2, which the quorum test above cannot reach — and the half a wedged
+    /// review actually takes. A review dispatched against a pull request carries no
+    /// `REVIEW_TICKET_LABEL`: its synthetic issue's labels are exactly `rhapsody:@<reviewer>`. A
+    /// [`RetryEntry`] has no `review` field either, so the union that identifies a LIVE review
+    /// ([`is_review_run`]) has no counterpart here and only the `pr:` id is left to test. Built from
+    /// the real [`crate::review::ReviewRun::synthetic_issue`] rather than a hand-rolled `Issue`, so
+    /// this fixture cannot drift from the shape the dispatch path parks.
+    #[test]
+    fn a_parked_ticketless_review_retry_does_not_consume_implementation_capacity() {
+        let run = crate::review::ReviewRun {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 128,
+            reviewer: "alice".to_string(),
+            ..crate::review::ReviewRun::default()
+        };
+        let iss = run.synthetic_issue();
+        assert!(
+            !crate::lifecycle::is_review_ticket(&iss),
+            "premise: a ticketless review is NOT identifiable by label"
+        );
+
+        let mut parked = crate::testsupport::retry_entry(&iss.id, &iss.identifier, 1);
+        parked.identity = "alice".to_string();
+        parked.issue = iss;
+        let retries: HashMap<String, RetryEntry> =
+            [("i1".to_string(), parked)].into_iter().collect();
+
+        let load = LoadSnapshot::from_running_and_retries(&HashMap::new(), &retries);
+
+        assert_eq!(
+            load.impl_live("alice"),
+            0,
+            "a parked review is still a review (D2)"
+        );
         assert_eq!(load.live("alice"), 1, "the all-runs count still sees it");
     }
 
