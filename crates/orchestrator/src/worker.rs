@@ -340,11 +340,23 @@ pub async fn run_agent_attempt(
     }
     // Resolve the prompt template now the repo is checked out. Read ONCE; continuation turns keep
     // using CONTINUATION_GUIDANCE. A missing/unreadable/empty file fails the run before any agent work.
-    let (prompt_tmpl, warn) =
+    //
+    // A REVIEW run renders the HOST's base prompt instead, and never the configured one
+    // (STUDIO-798): the configured template is read out of the reviewed repository at run time, and
+    // Rhapsody's own says "You DO merge your own PR" — which is not a document the quorum's
+    // host-written "never merge" can safely be embedded inside. See [`crate::reviewprompt`]. This is
+    // inert for every implementation run, which takes the resolve path below byte-for-byte.
+    let (prompt_tmpl, warn) = if crate::reviewprompt::is_review_run(deps.review.as_ref(), &issue) {
+        (
+            crate::reviewprompt::REVIEW_BASE_PROMPT.to_string(),
+            String::new(),
+        )
+    } else {
         match resolve_prompt_template(&deps.prompt_tmpl, &deps.prompt_file, &ws.path) {
             Ok(v) => v,
             Err(e) => return (issue.state.clone(), false, Some(e.into())),
-        };
+        }
+    };
     // A soft fallback (relative prompt_file missing/empty) does not fail the run; surface it.
     if !warn.is_empty() {
         tracing::warn!(
@@ -878,7 +890,10 @@ mod tests {
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = fake_tracker_by_id(&[("pr:o/r#12@alice", "pr:o/r#12@alice", "Done")]);
         let (ws, root) = test_workspace(HookScripts::default());
-        let mut d = make_deps(Arc::clone(&ws), ag.clone(), tr, "p", 20);
+        // max_turns 1 so the agent's LAST prompt is its TURN-1 prompt, which is what the
+        // STUDIO-798 assertion below is about (a review run's per-turn refresh finds no tracker
+        // issue behind a `pr:` key, so the loop would otherwise run the full budget).
+        let mut d = make_deps(Arc::clone(&ws), ag.clone(), tr, "p", 1);
         d.repo_url = origin.path.clone();
         d.project_slug = "rhapsody".to_string();
         d.review = Some(crate::review::ReviewCheckout {
@@ -895,6 +910,13 @@ mod tests {
             ag.last_review_head(),
             Some(head.clone()),
             "the pinned head must reach the agent as its review head"
+        );
+        // STUDIO-798: a ticketless review is a review run too, so it renders the host's reviewer
+        // base prompt rather than the configured template ("p" here).
+        assert!(
+            ag.last_prompt().contains("**Never merge.**"),
+            "a review run must be handed the host reviewer prompt, got:\n{}",
+            ag.last_prompt()
         );
         let path = ws.path_for(&origin.path, "pr:o/r#12@alice");
         assert!(
@@ -921,6 +943,134 @@ mod tests {
             "the review worktree is on a branch, not detached"
         );
         drop(root);
+    }
+
+    /// STUDIO-798, the acceptance criterion, driven through the real turn: a QUORUM review ticket,
+    /// dispatched on an installation whose configured base prompt is THIS repository's own
+    /// implementer prompt, must reach the agent with no instruction to merge in the text it is
+    /// actually handed.
+    ///
+    /// `prompt_file` is set to an absolute path that does not exist, which hard-fails a run that
+    /// reads it (see `an_implementation_run_still_reads_the_configured_prompt_file`, the same deps
+    /// without the label). A review run completing at all is therefore proof that no repository
+    /// content was consulted for its prompt, not merely that the rendered text came out clean.
+    #[tokio::test]
+    async fn a_review_ticket_run_is_handed_no_instruction_to_merge() {
+        let implementer = repo_implementer_prompt();
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, &implementer, 20);
+        d.prompt_file = "/nonexistent/rhapsody/STUDIO-798/PROMPT.md".to_string();
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, review_ticket_issue(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains("**Never merge.**"),
+            "the host prohibition is missing from the reviewer's prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Never merge, and never push to the author's branch."),
+            "the quorum's own host-written instructions must still be there:\n{prompt}"
+        );
+        for leaked in [
+            "You DO merge your own PR",
+            "You are an autonomous staff engineer",
+            "Phase 6",
+        ] {
+            assert!(
+                !prompt.contains(leaked),
+                "the configured implementer prompt reached a reviewer ({leaked:?}):\n{prompt}"
+            );
+        }
+    }
+
+    /// The other half of the proof above: the same deps WITHOUT the review-ticket label do read the
+    /// configured `prompt_file`, and fail on it. Without this, the review test would pass just as
+    /// well if `prompt_file` were quietly dead for every run.
+    #[tokio::test]
+    async fn an_implementation_run_still_reads_the_configured_prompt_file() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.prompt_file = "/nonexistent/rhapsody/STUDIO-798/PROMPT.md".to_string();
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(
+            matches!(err, Some(WorkerError::PromptFile(_))),
+            "an implementation run must still hard-fail on an unreadable absolute prompt_file, got {err:?}"
+        );
+    }
+
+    /// STUDIO-798's third acceptance criterion: an implementation run's prompt is UNCHANGED — the
+    /// Phase 6 merge instruction is exactly where it was, because losing it would cost every
+    /// implementer the instruction the ticket explicitly protects.
+    #[tokio::test]
+    async fn an_implementation_run_keeps_its_merge_instruction() {
+        let implementer = repo_implementer_prompt();
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag.clone(), tr, &implementer, 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+
+        let prompt = ag.last_prompt();
+        assert!(
+            prompt.contains("You DO merge your own PR"),
+            "an implementation run must keep its Phase 6 instruction:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Standing rules for a review run"),
+            "the host review prompt must not reach an implementation run:\n{prompt}"
+        );
+    }
+
+    /// This repository's OWN configured base prompt, read from the worktree the test runs in.
+    ///
+    /// The collision STUDIO-798 fixes is not hypothetical and not synthetic: it is this exact file,
+    /// named by `~/.rhapsody/WORKFLOW.md`'s `prompt_file: .rhapsody/PROMPT.md`. Reading the real one
+    /// is what keeps the test honest — a hand-written stand-in would still pass if the shipped
+    /// prompt changed shape.
+    fn repo_implementer_prompt() -> String {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rhapsody/PROMPT.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(
+            text.contains("You DO merge your own PR"),
+            "{} no longer carries the merge instruction this test is about",
+            path.display()
+        );
+        text
+    }
+
+    /// A quorum review ticket as the fan-out mints it: the host-written description, and the label
+    /// that is the only thing distinguishing it from any other ticket at dispatch.
+    fn review_ticket_issue() -> Issue {
+        let req = crate::quorum::QuorumRequest {
+            pr_url: "https://github.com/makewhatis/rhapsody/pull/124".into(),
+            parent_identifier: "MT-2".into(),
+            parent_title: "page the Jobs list".into(),
+            author: "jimmy".into(),
+            summon_token: "@symphony".into(),
+            ..Default::default()
+        };
+        let mut iss = issue("1", "MT-1", "In Progress");
+        iss.title = "Review: MT-2 page the Jobs list".into();
+        iss.description = Some(crate::quorum::review_description(&req, "alice"));
+        iss.labels = Some(vec![
+            "rhapsody:@alice".into(),
+            crate::quorum::REVIEW_TICKET_LABEL.into(),
+        ]);
+        iss
     }
 
     /// The inertness half: with `review` unset — every run this slice ships — the worker takes the

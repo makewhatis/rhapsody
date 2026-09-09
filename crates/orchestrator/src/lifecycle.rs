@@ -772,7 +772,7 @@ fn label_identity(iss: &rhapsody_core::Issue) -> Option<String> {
 /// plain equality rather than a case fold — case-sensitive for the same reason [`label_identity`]
 /// above is, which matches its own prefix exactly. ([`crate::teams::is_solo`] case-folds against
 /// its own marker instead; with labels lowercased on read the two agree.)
-fn is_review_ticket(iss: &rhapsody_core::Issue) -> bool {
+pub(crate) fn is_review_ticket(iss: &rhapsody_core::Issue) -> bool {
     iss.labels
         .iter()
         .flatten()
