@@ -559,6 +559,29 @@ impl Orchestrator {
         self.persist_retry(t.identifier, attempt, due_at_ms, err_str, t.project_slug);
     }
 
+    /// Re-arms the poll tick NOW because this exit genuinely freed a slot and the last select pass
+    /// withheld work for want of one (design record
+    /// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.4 fix 3, STUDIO-804).
+    ///
+    /// Without it `schedule_tick` is reached only from `loop.rs` — boot and the poll reschedules —
+    /// so a teammate freed by a worker exit idles up to a full poll interval while their held
+    /// ticket sits, which reads to an operator as a stuck daemon rather than a working cap.
+    ///
+    /// A no-op unless the ladder actually held something. Only the Teams capacity gate writes
+    /// [`held_for_capacity`](Orchestrator::held_for_capacity) and it is cleared every pass, so a
+    /// Teams-off installation — where nothing can ever be held — arms no extra tick on any exit
+    /// (decision D5: the new paths must not execute at all, not merely reach a no-op).
+    ///
+    /// Deliberately NOT called on the two paths that park a retry. STUDIO-801 makes a parked retry
+    /// count against its teammate's capacity, so that slot is not free and the tick could admit
+    /// nothing.
+    fn rearm_tick_for_held_capacity(&mut self) {
+        if self.held_for_capacity.is_empty() {
+            return;
+        }
+        self.schedule_tick(std::time::Duration::ZERO);
+    }
+
     /// Converts a worker exit into a continuation or a backoff retry (upstream §16.6). A no-op if the
     /// entry was already terminated by reconcile, or if the exit is stale (its `started_at` doesn't
     /// match the live entry — an exit from a prior dispatch of a re-dispatched issue). Mirrors Go
@@ -601,6 +624,7 @@ impl Orchestrator {
         // path does the bookkeeping instead — for a failed exit as well as a clean one.
         if let Some(run) = re.review.as_ref() {
             self.on_review_exit(&re, run, &e);
+            self.rearm_tick_for_held_capacity();
             return;
         }
         if !e.failed {
@@ -647,6 +671,7 @@ impl Orchestrator {
                 self.persist_end_run(&re, &outcome, &reason);
                 self.persist_complete(&re.issue.identifier);
                 self.persist_totals();
+                self.rearm_tick_for_held_capacity();
                 return;
             }
             // Still active (per both samples) or unknown state: a continuation segment. The EndRun
@@ -1516,6 +1541,177 @@ mod tests {
         assert!(
             o.retry_attempts.is_empty(),
             "exit for a non-running issue (already terminated) must be a no-op"
+        );
+    }
+
+    // --- STUDIO-804: a worker exit that genuinely frees a slot re-arms the tick ------------------
+    //
+    // `schedule_tick` is otherwise called only from `loop.rs` (boot + the poll reschedules), so a
+    // teammate freed by a worker exit idled up to a full poll interval while their held work sat
+    // (design record `~/.rhapsody/docs/per-role-concurrency-design.md` §4.4 fix 3).
+
+    /// Puts the orchestrator on a LIVE control loop — `ctx` set, which is the gate `schedule_tick`'s
+    /// spawned timer selects against — and hands back the control-event receiver the loop would
+    /// otherwise own, so a test can observe what the re-arm posts.
+    ///
+    /// `recovery.rs` has a `live_loop` of its own shape; this ticket owns `retry.rs` only, so it
+    /// keeps its copy here rather than moving that one into `testsupport.rs` (STUDIO-804).
+    fn live_loop(o: &mut Orchestrator) -> tokio::sync::mpsc::UnboundedReceiver<Event> {
+        o.set_ctx(crate::control_loop::CancelWait::default());
+        o.take_events_rx().expect("control-event receiver")
+    }
+
+    /// The next `Event::Tick`, bounded: the bug this pins is "no tick is ever armed", which without a
+    /// timeout would hang the suite instead of failing it.
+    async fn next_tick(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a freed slot must re-arm the tick, but no control event arrived (STUDIO-804)")
+            .expect("control-event channel open");
+        assert!(
+            matches!(ev, Event::Tick),
+            "expected Event::Tick from the re-arm, got another control event"
+        );
+    }
+
+    /// A clean exit that RELEASES the claim frees the teammate's slot, so the tick that can hand
+    /// them their held ticket must run now rather than at the next poll.
+    #[tokio::test]
+    async fn a_releasing_exit_rearms_the_tick_when_work_is_held() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let mut rx = live_loop(&mut o);
+        o.held_for_capacity = [("alice".to_string(), 1)].into_iter().collect();
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+
+        // The ticket reached a terminal state → the classifier releases and returns, so the slot is
+        // genuinely free. (A declared hand-off with both samples still ACTIVE is a continuation.)
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: st,
+            err_msg: String::new(),
+            last_state: "Done".into(),
+            declared_handoff: true,
+        });
+
+        assert!(
+            !o.retry_attempts.contains_key("1"),
+            "precondition: a terminal exit releases rather than scheduling a continuation"
+        );
+        next_tick(&mut rx).await;
+    }
+
+    /// A review run's exit is the second genuinely-releasing path out of `on_worker_exit`: it
+    /// returns before the classifier and parks no retry, so it re-arms on the same terms.
+    #[tokio::test]
+    async fn a_review_exit_rearms_the_tick_when_work_is_held() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let mut rx = live_loop(&mut o);
+        o.held_for_capacity = [("alice".to_string(), 1)].into_iter().collect();
+        let started_at = (o.now)();
+        let mut re = RunningEntry::empty(issue("pr:rhapsody#1", "pr:rhapsody#1", ""));
+        re.started_at = started_at;
+        re.review = Some(crate::review::ReviewRun::default());
+        o.running.insert("pr:rhapsody#1".to_string(), re);
+
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "pr:rhapsody#1".into(),
+            failed: false,
+            started_at,
+            err_msg: String::new(),
+            last_state: String::new(),
+            declared_handoff: true,
+        });
+
+        assert!(
+            o.retry_attempts.is_empty(),
+            "precondition: a review exit takes its own path and parks no retry"
+        );
+        next_tick(&mut rx).await;
+    }
+
+    /// Decision D5: an installation that never holds anything — every Teams-off one — pays nothing.
+    /// Asserted as the ABSENCE of the work, not merely the sameness of the outcome (design §6).
+    #[tokio::test]
+    async fn a_releasing_exit_arms_no_tick_when_nothing_is_held() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let _rx = live_loop(&mut o);
+        assert!(o.held_for_capacity.is_empty(), "precondition: nothing held");
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: st,
+            err_msg: String::new(),
+            last_state: "In Progress".into(),
+            declared_handoff: true,
+        });
+
+        assert!(
+            o.tick_timer.is_none(),
+            "nothing was held, so no tick may be armed"
+        );
+    }
+
+    /// The continuation path parks a retry, and STUDIO-801 makes a parked retry count against its
+    /// teammate's capacity — so that slot is NOT free and a tick armed here could admit nothing.
+    #[tokio::test]
+    async fn a_continuation_exit_never_rearms_the_tick() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let _rx = live_loop(&mut o);
+        o.held_for_capacity = [("alice".to_string(), 1)].into_iter().collect();
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+
+        // Still active with no hand-off declared → a continuation segment.
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: st,
+            err_msg: String::new(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+        });
+
+        assert!(
+            o.retry_attempts.contains_key("1"),
+            "precondition: this exit parks a continuation retry"
+        );
+        assert!(
+            o.tick_timer.is_none(),
+            "a retry-parked slot is still busy, so no tick may be armed"
+        );
+    }
+
+    /// The failure path parks a backoff retry for the same reason the continuation path parks one,
+    /// so it re-arms nothing either — pinned separately because it is a different `return`.
+    #[tokio::test]
+    async fn a_failed_exit_never_rearms_the_tick() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let _rx = live_loop(&mut o);
+        o.held_for_capacity = [("alice".to_string(), 1)].into_iter().collect();
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: st,
+            err_msg: "boom".into(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+        });
+
+        assert!(
+            o.retry_attempts.contains_key("1"),
+            "precondition: this exit parks a backoff retry"
+        );
+        assert!(
+            o.tick_timer.is_none(),
+            "a retry-parked slot is still busy, so no tick may be armed"
         );
     }
 
