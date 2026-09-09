@@ -283,6 +283,33 @@ impl LoadSnapshot {
         self.implementation.get(name).copied().unwrap_or(0)
     }
 
+    /// This snapshot advanced by the admits a selection pass has already made, so that a pass
+    /// holding `&self` can route its LATER candidates against the load its OWN earlier ones
+    /// created (STUDIO-802).
+    ///
+    /// `tally` is the ladder's pass-local implementation count per identity — seeded from
+    /// [`impl_live`](Self::impl_live) and incremented once per admit — so `tally - impl_live` is
+    /// exactly how many runs the pass has admitted for that identity, and each of those is one
+    /// more live run as well as one more implementation run. **Both halves are advanced**, because
+    /// [`route`] reads both: `at_capacity` reads the implementation count, and
+    /// `best_by_label_overlap`'s fewest-live-runs tiebreak reads the all-runs count. Advancing only
+    /// the first would still leave the ladder's answer differing from the dispatch loop's, which
+    /// re-routes per issue with `running` genuinely advanced (`retry.rs:349` then `:444`).
+    ///
+    /// An identity the pass has not touched is absent from `tally` and is copied through unchanged.
+    pub(crate) fn advanced_by(&self, tally: &HashMap<String, i64>) -> Self {
+        let mut next = self.clone();
+        for (name, counted) in tally {
+            let admitted = counted - self.impl_live(name);
+            if admitted <= 0 {
+                continue;
+            }
+            *next.all.entry(name.clone()).or_default() += admitted;
+            next.implementation.insert(name.clone(), *counted);
+        }
+        next
+    }
+
     /// The raw per-identity ALL-runs counts, for the reviewer ranking in
     /// [`crate::quorum::rank_reviewers`] — which is shared with the quorum's own `rhapsody:@` label
     /// load and therefore takes the map rather than this wrapper (STUDIO-721).
@@ -469,6 +496,12 @@ fn best_by_label_overlap(teams: &Teams, iss: &Issue, load: &LoadSnapshot) -> Opt
 /// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.2). So this function's job is
 /// unchanged and deliberately narrow: it decides who is a *candidate*, never whether
 /// the work goes out now.
+///
+/// The two layers do not overlap: the ladder routes each candidate against a load already
+/// advanced by its own admits ([`LoadSnapshot::advanced_by`]), so a name THIS filter let
+/// through is a name that filter's caller then finds under its cap. The hold therefore
+/// falls only where §4.2 says it should — a Tier 0 label, `default_identity`, and the
+/// fallthrough where this filter has rejected every matching candidate.
 ///
 /// The cap counts IMPLEMENTATION runs only ([`LoadSnapshot::impl_live`]), so a review never
 /// consumes it: reviews draw from their own counter, and a teammate at their implementation cap
@@ -681,10 +714,22 @@ impl Orchestrator {
     /// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.2).
     ///
     /// It is [`route_teams`](Self::route_teams)'s own answer minus the profile rendering and the
-    /// event row — the same [`route`] call over the same load, and the same pending-assignment
-    /// substitution — so the ladder can never hold a ticket for one teammate and then dispatch it
-    /// to another. Routing stays exactly as pure as D3 requires: this asks it a question, it gains
-    /// no new behaviour and no new variant.
+    /// event row — the same [`route`] call and the same pending-assignment substitution. Routing
+    /// stays exactly as pure as D3 requires: this asks it a question, it gains no new behaviour and
+    /// no new variant.
+    ///
+    /// **`load` is the caller's, and it must be the load as of THIS candidate**, not as of the
+    /// start of the pass. The dispatch loop re-routes every issue with `running` advanced in
+    /// between (`dispatch_issue` routes at `retry.rs:349` and inserts at `:444`, and `loop.rs:834`
+    /// walks the picks sequentially), so a ladder that routed every candidate against the frozen
+    /// start-of-pass load would answer differently from the loop that actually dispatches them —
+    /// and would then hold a ticket for a teammate who was never going to take it. The ladder
+    /// passes [`LoadSnapshot::advanced_by`] over its pass-local tally for exactly that reason, so
+    /// the two agree and the fallback tier's own `at_capacity` filter (`teams.rs:424`) keeps doing
+    /// the reassignment the design record blesses: "Reassignment among *fallback* candidates is
+    /// right and stays" (§4.2). What is left for the ladder to hold is what §4.2 enumerates — an
+    /// explicit Tier 0 label on a busy teammate, a busy `default_identity`, and the fallthrough
+    /// where every matching candidate is saturated.
     ///
     /// `None` in exactly three cases, and every one of them must **dispatch**, never wait:
     ///
@@ -699,17 +744,9 @@ impl Orchestrator {
     ///   (`tier0` and `best_by_label_overlap` iterate it; `default_identity` and
     ///   `apply_pending_assignment` re-check it), so this **pins** that property rather than
     ///   closing a live gap — and it is precisely the check a future tier would forget.
-    pub(crate) fn planned_identity(&self, iss: &Issue) -> Option<String> {
+    pub(crate) fn planned_identity(&self, iss: &Issue, load: &LoadSnapshot) -> Option<String> {
         let teams = self.teams.as_ref().filter(|t| t.enabled)?;
-        let routed = self.apply_pending_assignment(
-            teams,
-            iss,
-            route(
-                teams,
-                iss,
-                &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
-            ),
-        );
+        let routed = self.apply_pending_assignment(teams, iss, route(teams, iss, load));
         let name = routed.identity?;
         teams.roster.iter().any(|i| i.name == name).then_some(name)
     }

@@ -87,9 +87,11 @@ impl Orchestrator {
         // The Teams CAPACITY gate's two maps (STUDIO-802), both pass-local. `impl_tally` is the
         // running implementation count per teammate — seeded lazily from `impl_load` on first touch
         // and incremented on every admit, so three tickets for one teammate see 0, 1, 2 rather than
-        // 0, 0, 0 (design §4.4 fix 1). `held_for_capacity` is what this pass withheld, returned to
-        // the caller. `impl_load` is built at most once per pass and NEVER with Teams off, because
-        // nothing asks for it before `planned_identity` has answered `Some` (D5).
+        // 0, 0, 0 (design §4.4 fix 1). It is also what each candidate's ROUTING is advanced by, so
+        // the ladder asks the question the dispatch loop will answer rather than a frozen one.
+        // `held_for_capacity` is what this pass withheld, returned to the caller. `impl_load` is
+        // the start-of-pass snapshot, built at most once and NEVER with Teams off — the gate below
+        // tests `enabled` before it asks for it (D5).
         let mut impl_load: Option<crate::teams::LoadSnapshot> = None;
         let mut impl_tally: HashMap<String, i64> = HashMap::new();
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
@@ -173,26 +175,46 @@ impl Orchestrator {
             // a reassignment: `rhapsody:@alice` means alice, and after this it means "alice, when
             // she is free" (§4.2, D3). Debug-level for the same reason the gate above is — a queued
             // ticket is a healthy state, not a fault.
-            let planned = self.planned_identity(&iss);
-            if let Some(name) = planned.as_deref() {
+            //
+            // Two candidates are exempt, and neither is a special case of this gate so much as a
+            // consequence of what it counts. A REVIEW ticket draws from the review counter, not
+            // this one (D2, design §6: "a teammate at their implementation cap can still be given
+            // a review"), so it is neither held here nor charged a seat. And with Teams off the
+            // whole block is skipped before any of its work is done (D5): no `LoadSnapshot` is
+            // built, no `route()` call is made, no counter is read.
+            let planned = if crate::lifecycle::is_review_ticket(&iss)
+                || !self.teams.as_ref().is_some_and(|t| t.enabled)
+            {
+                None
+            } else {
                 let load = impl_load.get_or_insert_with(|| {
                     crate::teams::LoadSnapshot::from_running_and_retries(
                         &self.running,
                         &self.retry_attempts,
                     )
                 });
-                impl_tally
-                    .entry(name.to_string())
-                    .or_insert_with(|| load.impl_live(name));
-                if self.at_cap(name, &impl_tally) {
-                    tracing::debug!(
-                        issue_identifier = %iss.identifier,
-                        identity = %name,
-                        "skipping dispatch: teammate at max_concurrent"
-                    );
-                    *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
-                    continue;
+                // Routed against the load THIS pass has already created, not the frozen
+                // start-of-pass load — the dispatch loop re-routes per issue with `running`
+                // advanced, so anything else answers a different question than the one that
+                // decides where the ticket actually goes.
+                let planned = self.planned_identity(&iss, &load.advanced_by(&impl_tally));
+                if let Some(name) = planned.as_deref() {
+                    impl_tally
+                        .entry(name.to_string())
+                        .or_insert_with(|| load.impl_live(name));
                 }
+                planned
+            };
+            if let Some(name) = planned.as_deref()
+                && self.at_cap(name, &impl_tally)
+            {
+                tracing::debug!(
+                    issue_identifier = %iss.identifier,
+                    identity = %name,
+                    "skipping dispatch: teammate at max_concurrent"
+                );
+                *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
+                continue;
             }
             if count(&state_counts, &st)
                 >= state_limit(&iss.state, &eff.per_state_limits, eff.max_concurrent)
@@ -1302,9 +1324,10 @@ mod tests {
         o.teams_triage = Some(Arc::clone(&handle));
         let iss = teams_issue("1", "MT-1", &["rhapsody:@alice"]);
         let over_cap: HashMap<String, i64> = [("alice".to_string(), 5)].into_iter().collect();
+        let idle = crate::teams::LoadSnapshot::default();
 
         assert_eq!(
-            o.planned_identity(&iss).as_deref(),
+            o.planned_identity(&iss, &idle).as_deref(),
             Some("alice"),
             "with Teams on, the routing call is made and answers"
         );
@@ -1314,7 +1337,7 @@ mod tests {
             t.enabled = false;
         }
         assert_eq!(
-            o.planned_identity(&iss),
+            o.planned_identity(&iss, &idle),
             None,
             "`enabled: false` short-circuits before any of the routing machinery runs"
         );
@@ -1324,7 +1347,11 @@ mod tests {
         );
 
         o.teams = None;
-        assert_eq!(o.planned_identity(&iss), None, "no teams.yaml, same answer");
+        assert_eq!(
+            o.planned_identity(&iss, &idle),
+            None,
+            "no teams.yaml, same answer"
+        );
         assert!(!o.at_cap("alice", &over_cap));
     }
 
@@ -1373,6 +1400,55 @@ mod tests {
             o.select_dispatch_with_reopens(vec![teams_issue("1", "MT-1", &["rhapsody:@who-left"])]);
         assert_eq!(ids(&picked), vec!["MT-1"], "nobody real is over cap here");
         assert!(held.is_empty());
+    }
+
+    /// **The load-balanced tier must not be held** (design record §4.2: "Reassignment among
+    /// *fallback* candidates is right and stays"). Two teammates capped at 1, both carrying
+    /// `rust`; two `rust` tickets with no `rhapsody:@` label, so `best_by_label_overlap` routes
+    /// them. Dispatch re-routes per issue with `running` advanced (`retry.rs:349` then `:444`), so
+    /// MT-2 goes to bob — and bob's seat is free. Neither teammate ever exceeds their cap, so
+    /// holding MT-2 would cost a poll interval of throughput and name the wrong teammate.
+    #[test]
+    fn a_load_balanced_pair_still_fills_both_free_seats() {
+        let mut o = orch_with_capped_roster(&[("alice", 1), ("bob", 1)]);
+        if let Some(t) = o.teams.as_mut() {
+            for i in t.roster.iter_mut() {
+                i.labels = vec!["rust".to_string()];
+            }
+        }
+        let (picked, _, held) = o.select_dispatch_with_reopens(vec![
+            teams_issue("1", "MT-1", &["rust"]),
+            teams_issue("2", "MT-2", &["rust"]),
+        ]);
+        assert_eq!(
+            ids(&picked),
+            vec!["MT-1", "MT-2"],
+            "bob has a free seat and is who MT-2 actually routes to at dispatch"
+        );
+        assert!(held.is_empty(), "nothing is over cap: {held:?}");
+    }
+
+    /// D2 at the ladder, for a review ticket the pass ADMITS rather than one already running: a
+    /// quorum review ticket is a real tracker ticket, so it reaches this gate like any other
+    /// candidate. It must neither be held by an implementation cap nor consume an implementation
+    /// seat — "a teammate at their implementation cap can still be given a review" (design §6).
+    #[test]
+    fn a_review_ticket_is_neither_held_nor_charged_to_an_implementation_seat() {
+        let o = orch_with_capped_roster(&[("alice", 1)]);
+        let (picked, _, held) = o.select_dispatch_with_reopens(vec![
+            teams_issue(
+                "1",
+                "MT-1",
+                &["rhapsody:@alice", crate::quorum::REVIEW_TICKET_LABEL],
+            ),
+            teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+        ]);
+        assert_eq!(
+            ids(&picked),
+            vec!["MT-1", "MT-2"],
+            "the review is free, and alice's one implementation seat is still hers to spend"
+        );
+        assert!(held.is_empty(), "{held:?}");
     }
 
     /// Polls a future once and reports whether it was already ready. Enough for `Notify`, whose
