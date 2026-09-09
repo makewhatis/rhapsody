@@ -344,7 +344,7 @@ pub async fn run_agent_attempt(
     // A REVIEW run renders the HOST's base prompt instead, and never the configured one
     // (STUDIO-798): the configured template is read out of the reviewed repository at run time, and
     // Rhapsody's own says "You DO merge your own PR" — which is not a document the quorum's
-    // host-written "never merge" can safely be embedded inside. See [`crate::reviewprompt`]. This is
+    // host-written "never merge" can safely be embedded inside. See `crate::reviewprompt`. This is
     // inert for every implementation run, which takes the resolve path below byte-for-byte.
     let (prompt_tmpl, warn) = if crate::reviewprompt::is_review_run(deps.review.as_ref(), &issue) {
         (

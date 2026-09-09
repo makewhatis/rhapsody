@@ -37,7 +37,7 @@ use crate::review::ReviewCheckout;
 /// It is a Liquid template rendered by the same strict-variables
 /// [`prompt::render`](rhapsody_config::prompt::render) every other prompt goes through, so it may
 /// only touch bound keys — and it must render cleanly for the ticketless review path's synthetic
-/// issue too, which carries an empty identifier-shaped key, no url and no description.
+/// issue too, which carries a `pr:`-shaped identifier, no url and no description at all.
 pub const REVIEW_BASE_PROMPT: &str = include_str!("reviewprompt/review-base.md");
 
 /// Reports whether this attempt is a REVIEW run — one whose whole job is to read a teammate's pull
@@ -120,9 +120,10 @@ mod tests {
         assert!(!is_review_run(None, &iss));
     }
 
-    /// The base prompt must survive strict-variables rendering for BOTH review shapes — including
-    /// the synthetic issue, which has no identifier-free fields to lean on: an unbound key would
-    /// fail the run outright rather than render an empty string.
+    /// The base prompt must survive strict-variables rendering for BOTH review shapes: an unbound
+    /// key fails the RUN, not just the assertion. The ticketless shape is the demanding one — its
+    /// synthetic issue has no url and no description — so the template's emptiness guards have to
+    /// leave a readable document rather than dangling structure.
     #[test]
     fn the_base_prompt_renders_for_both_review_shapes() {
         let rendered = prompt::render(REVIEW_BASE_PROMPT, &review_ticket(), None).expect("render");
@@ -147,29 +148,31 @@ mod tests {
             "a synthetic review issue must still name what is being reviewed:\n{rendered}"
         );
         assert!(
-            !rendered.contains("—\n"),
-            "an empty url must not leave a dangling heading:\n{rendered}"
+            rendered.contains("Review makewhatis/rhapsody#124 at 387a5f1\n\n# Standing rules"),
+            "an absent url and description must leave no dangling structure behind the \
+             heading:\n{rendered}"
         );
     }
 
-    /// The prohibition itself. Stated as an assertion rather than left to a reader because this is
-    /// the one sentence the whole module exists to deliver.
+    /// The prohibition itself, as an invariant over the whole file rather than a spot check: EVERY
+    /// line that mentions merging must be the one forbidding it.
+    ///
+    /// A future edit that adds any other sentence about merging — however well meant — fails here,
+    /// which is the property this file exists to hold. (It is a canary on text this repository
+    /// owns, not a filter on untrusted input; the safety of the prompt rests on it being compiled
+    /// in, not on this scan.)
     #[test]
-    fn the_base_prompt_forbids_merging_and_instructs_no_merge() {
-        assert!(
-            REVIEW_BASE_PROMPT.contains("**Never merge.**"),
-            "the prohibition is the point of this file"
+    fn every_mention_of_merging_in_the_base_prompt_forbids_it() {
+        let mentions: Vec<&str> = REVIEW_BASE_PROMPT
+            .lines()
+            .filter(|ln| ln.to_lowercase().contains("merg"))
+            .collect();
+        assert_eq!(
+            mentions,
+            vec![
+                "1. **Never merge.** Not this pull request, not any other, not \"once CI is green\"."
+            ],
+            "the reviewer's base prompt must say nothing about merging except that it must not"
         );
-        for banned in [
-            "gh pr merge",
-            "merge your own",
-            "you may merge",
-            "then merge",
-        ] {
-            assert!(
-                !REVIEW_BASE_PROMPT.to_lowercase().contains(banned),
-                "the reviewer's base prompt must not tell it to merge: {banned:?}"
-            );
-        }
     }
 }
