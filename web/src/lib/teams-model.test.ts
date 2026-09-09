@@ -31,7 +31,7 @@ function overview(over: Partial<TeamsOverview> = {}): TeamsOverview {
 }
 
 function row(name: string, live: number, tickets: string[] = []) {
-  return { name, profile: "swe", labels: [], bank: `agent-${name}`, max_concurrent: 0, live_runs: live, tickets };
+  return { name, profile: "swe", labels: [], bank: `agent-${name}`, max_concurrent: 0, live_runs: live, tickets, queued: 0 };
 }
 
 describe("teamsChip", () => {

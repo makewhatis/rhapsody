@@ -69,8 +69,19 @@ const overview: TeamsOverview = {
   default_identity: "alice",
   backend: "local",
   roster: [
-    { name: "alice", profile: "swe", labels: ["rust"], bank: "agent-alice", max_concurrent: 0, live_runs: 1, tickets: ["STUDIO-684"] },
-    { name: "jimmy", profile: "swe", labels: [], bank: "agent-jimmy", max_concurrent: 0, live_runs: 0, tickets: [] },
+    { name: "alice", profile: "swe", labels: ["rust"], bank: "agent-alice", max_concurrent: 0, live_runs: 1, tickets: ["STUDIO-684"], queued: 0 },
+    { name: "jimmy", profile: "swe", labels: [], bank: "agent-jimmy", max_concurrent: 0, live_runs: 0, tickets: [], queued: 0 },
+  ],
+};
+
+// The same roster after a tick that could not place everything: alice is capped and working one of
+// three, and jimmy has work held with nothing live — the case that reads as a stuck daemon unless
+// the card says otherwise (STUDIO-805).
+const heldOverview: TeamsOverview = {
+  ...overview,
+  roster: [
+    { ...overview.roster[0], max_concurrent: 1, queued: 2 },
+    { ...overview.roster[1], max_concurrent: 1, queued: 1 },
   ],
 };
 
@@ -138,13 +149,15 @@ interface Fixtures {
   /** What GET /api/v1/teams/room answers with; a rejection stands in for the daemon refusing. */
   room?: TeamsRoomResponse;
   roomError?: Error;
+  /** What GET /api/v1/teams answers with, for the roster states the default fixture does not hold. */
+  overview?: TeamsOverview;
 }
 
 function renderConsole(
   props: Partial<React.ComponentProps<typeof TeamsConsole>> = {},
   fixtures: Fixtures = {},
 ) {
-  h.fetchTeamsOverview.mockResolvedValue(overview);
+  h.fetchTeamsOverview.mockResolvedValue(fixtures.overview ?? overview);
   if (fixtures.roomError) h.fetchTeamsRoom.mockRejectedValue(fixtures.roomError);
   else h.fetchTeamsRoom.mockResolvedValue(fixtures.room ?? room);
   h.fetchTeamsRecall.mockResolvedValue(recall);
@@ -183,6 +196,28 @@ describe("3.1 — the now strip shows teammate states and the four stat pills", 
     expect(mates.getByText("alice")).toBeTruthy();
     // A teammate with a live run says what it is working; an idle one says idle.
     expect(mates.getByText("STUDIO-684")).toBeTruthy();
+    expect(mates.getByText("idle")).toBeTruthy();
+  });
+
+  // Held work that nothing reports is indistinguishable from a daemon that has stopped dispatching,
+  // which is why the design calls this count the containment for the feature's main risk, not
+  // polish. "Queued" is spent on the Jobs surface (it means "last run stopped") but reads
+  // unambiguously against a teammate, where a held ticket has no row of its own at all.
+  it("says how much work is waiting on a teammate the ladder held for", async () => {
+    renderConsole({}, { overview: heldOverview });
+    await ready();
+    const mates = within(document.querySelector(".now") as HTMLElement);
+    expect(mates.getByText("STUDIO-684 · 2 queued")).toBeTruthy();
+    // The one that matters most: nothing live, work waiting. A retry-parked run fills a seat
+    // without being a live binding, so an idle-looking teammate really can be holding work.
+    expect(mates.getByText("idle · 1 queued")).toBeTruthy();
+  });
+
+  it("says nothing about waiting work when the ladder held none", async () => {
+    renderConsole();
+    await ready();
+    expect(screen.queryByText(/queued/)).toBeNull();
+    const mates = within(document.querySelector(".now") as HTMLElement);
     expect(mates.getByText("idle")).toBeTruthy();
   });
 
