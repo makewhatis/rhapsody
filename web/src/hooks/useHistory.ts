@@ -39,9 +39,16 @@ export const HISTORY_ISSUES_QUERY_KEY = ["history-issues"] as const;
 // page size. (TRA-320)
 //
 // `refetchInterval` still defaults to `false`, because a caller that renders the listing on its own
-// (a search, a one-shot page) genuinely wants one fetch. A caller that renders it NEXT TO the live
-// snapshot does not have that freedom: it must poll on `LIVE_POLL_MS`, and `useJobsFeed` is where
-// that pairing is made rather than left to each call site (STUDIO-791).
+// (a search, a one-shot page) genuinely wants one fetch. A caller that renders it as ROWS beside the
+// live snapshot does not have that freedom: the two feed one merged array, so a half frozen at mount
+// makes the surface report a run's state from whenever the page was opened. `useJobsFeed` is where
+// that pairing is made, rather than left to each call site (STUDIO-791).
+//
+// `ConsoleApp`'s Jobs nav badge unions the same two sources and is deliberately NOT on that pairing:
+// it counts every issue in the listing page rather than open work, so its number is wrong by an
+// amount no cadence can fix, and polling it would put this endpoint on a 2s timer on every console
+// route to keep that number fresh. It refetches for free while `JobsView` is mounted — same query
+// key — and its real defect is a follow-up of its own.
 export function useIssueRuns(
   filter: HistoryFilter = {},
   opts?: { enabled?: boolean; refetchInterval?: number | false },
