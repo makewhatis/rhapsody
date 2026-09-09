@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import type { StateResponse } from "@/lib/api";
+import type { HistoryFilter, StateResponse } from "@/lib/api";
 import { HISTORY_ISSUES_QUERY_KEY, useIssueRuns } from "@/hooks/useHistory";
 import { LIVE_POLL_MS, useStateQuery } from "@/hooks/useStateQuery";
 
@@ -34,11 +34,49 @@ import { LIVE_POLL_MS, useStateQuery } from "@/hooks/useStateQuery";
  * the packaged app serves the dashboard over wry's fully-buffered custom protocol, which is why the
  * log tail already needs `desktop/src-tauri/src/logbridge.rs` to reach the webview at all (TRA-252).
  * That is a slice of its own, not a line in this one. The floor below is what landed.
+ *
+ * THE WINDOW, AND WHY ONLY THE DEFAULT ONE IS POLLED (STUDIO-792). The worklist can now widen its
+ * page past the newest 50, and that window arrives here as `filter`. It is deliberately NOT put on
+ * the cadence above. Measured against the operator's own daemon (389 issues), a full-width request
+ * took 0.63s and 0.88s warm and 3.63s on a cold lifecycle memo, against 1.6ms at the default width.
+ * A request of that size every 2s, for as long as the page stays open, is a large and permanent
+ * share of the daemon's history path spent on the rows least likely to have moved: the listing is
+ * ordered newest-first, so everything a widened window adds is the OLD tail.
+ *
+ * It costs nothing for the transition this hook exists to catch, and the daemon's own ordering is
+ * why rather than luck. `on_worker_exit` takes the run out of the live map and writes
+ * `store.end_run` synchronously within a single control-loop event (`orchestrator/src/retry.rs` ->
+ * `persist.rs`), and the loop republishes the snapshot `/api/v1/state` serves only AFTER that
+ * handler has returned (`orchestrator/src/loop.rs`). So the first snapshot in which a run has left
+ * the live set is already backed by a store that has recorded its end — the pull-forward below
+ * fires on exactly that snapshot, and the refetch it triggers reads the finished row. A run
+ * starting, a retry reaching a new attempt and a blocker clearing move the signature the same way.
+ *
+ * What the interval uniquely buys is a change the live snapshot cannot see at all: a ticket's
+ * tracker state moving with no run in flight, which `JobsView`'s "moves a stored row and its count
+ * when only the issue listing changed" pins. That is worth 2s at the default width. It is not worth
+ * a 0.6s request every 2s across a window the operator widened, so a widened window waits for the
+ * live set to move, for the operator's own Refresh (`useRefresh` invalidates this family by prefix
+ * for exactly this reason), or for a remount. Capping how far the chip may reach was the
+ * other way out and was rejected: it puts STUDIO-792's silent truncation back at a different number.
+ *
+ * One consequence, stated rather than left to be discovered: while the window is widened the rail's
+ * badge query (`useIssueRuns()`, the `{}` key) has no poller of its own, so it too falls back to the
+ * pull-forward. That covers the half of that number which actually moves — the live set. The other
+ * half, the page rows it also folds in, is the counting defect already noted on `useIssueRuns`, and
+ * no cadence was ever going to fix that one.
  */
-export function useJobsFeed() {
+export function useJobsFeed(filter: HistoryFilter = {}) {
   const qc = useQueryClient();
   const state = useStateQuery();
-  const issueRuns = useIssueRuns({}, { refetchInterval: LIVE_POLL_MS });
+  // An explicit `limit` is the signal, rather than "any filter at all": `JobsView` sends none until
+  // the operator has actually widened past the daemon's own default page, so its presence IS the
+  // widening. A filter that NARROWS instead — a project, an outcome — makes the request smaller, not
+  // larger, and has no reason to lose the cadence.
+  const widened = filter.limit !== undefined;
+  const issueRuns = useIssueRuns(filter, {
+    refetchInterval: widened ? false : LIVE_POLL_MS,
+  });
 
   // `null` until the first snapshot lands, so seeding the comparison is not mistaken for a change:
   // the listing has already fetched on mount and does not need a second identical request.

@@ -590,3 +590,63 @@ export function mateStates(overview: TeamsOverview | undefined): MateState[] {
     };
   });
 }
+
+/**
+ * How many issues one "Load more" step adds to the worklist's request (STUDIO-792).
+ *
+ * Deliberately the store's own `DEFAULT_RUN_LIMIT` (crates/store/src/sqlite.rs): the daemon's
+ * `next_offset` is derived from the page size it ACTUALLY applied, so stepping by anything else
+ * would put the console's idea of a page and the daemon's out of step at every boundary.
+ */
+export const JOBS_PAGE_SIZE = 50;
+
+/** What the worklist currently holds, for [`consoleJobsPageNote`]. */
+export interface ConsoleJobsPage {
+  /** Rows the table is built from, before the Seg/project filter — the live overlay included. */
+  loaded: number;
+  /** Rows the filter leaves on screen. */
+  visible: number;
+  /** The daemon offered a further page (`next_offset` is not null). */
+  hasMore: boolean;
+  /** A status or project filter is narrowing the loaded set. */
+  filtered: boolean;
+}
+
+/**
+ * The line under the worklist saying how much of the history it is actually showing — STUDIO-792.
+ *
+ * The daemon has always served paging and the console has never used it, so the list simply ended
+ * at the store's 50 newest and said nothing; on the operator's own daemon that hid 336 of 386
+ * tickets. A list that quietly stops is the same class of defect as a status that quietly lies, so
+ * this sentence is rendered whenever there are rows — including when nothing is truncated, because
+ * "all 386" is what tells the operator the end of the list is the end of the history.
+ *
+ * `loaded` is the TABLE's row count rather than the page size asked for, so it agrees with what is
+ * on screen by construction. The two differ whenever a live ticket is absent from the page being
+ * held, which is exactly the "52 for a moment, then back to 50" this ticket came from — see the
+ * `mergeJobs over a truncated issue page` reproduction in `runs-model.test.ts`. Counting the rows
+ * means the strip and the sentence can never disagree about the same list.
+ *
+ * The filtered wording is not decoration. A filter runs over the LOADED rows only, so "Done · 3"
+ * on a truncated list answers a question the operator did not ask — "3 of the newest 50", not "3
+ * in all" — and that has to be said out loud while the tail is missing.
+ *
+ * `hasMore` restates the daemon's own claim and inherits its one imprecision: a full page means
+ * "there may be more", so a history of exactly 50 offers a next page that turns out to be empty.
+ * The wording is therefore "not loaded yet" rather than an assertion that older jobs exist — one
+ * click settles it and the sentence becomes "Showing all 50 jobs."
+ */
+export function consoleJobsPageNote(page: ConsoleJobsPage): string {
+  if (page.loaded <= 0) return "";
+  const noun = page.loaded === 1 ? "job" : "jobs";
+  if (page.hasMore) {
+    const held = `the ${page.loaded} most recent ${noun}`;
+    const shown = page.filtered ? `Showing ${page.visible} of ${held}` : `Showing ${held}`;
+    const tail = page.filtered
+      ? "Older jobs are not loaded yet, so this filter has not been applied to them."
+      : "Older jobs are not loaded yet.";
+    return `${shown}. ${tail}`;
+  }
+  const held = `all ${page.loaded} ${noun}`;
+  return page.filtered ? `Showing ${page.visible} of ${held}.` : `Showing ${held}.`;
+}

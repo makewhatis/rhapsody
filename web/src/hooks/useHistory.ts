@@ -47,8 +47,11 @@ export const HISTORY_ISSUES_QUERY_KEY = ["history-issues"] as const;
 // `ConsoleApp`'s Jobs nav badge unions the same two sources and is deliberately NOT on that pairing:
 // it counts every issue in the listing page rather than open work, so its number is wrong by an
 // amount no cadence can fix, and polling it would put this endpoint on a 2s timer on every console
-// route to keep that number fresh. It refetches for free while `JobsView` is mounted — same query
-// key — and its real defect is a follow-up of its own.
+// route to keep that number fresh. It refetches for free while `JobsView` is mounted on the DEFAULT
+// window — same `{}` key. Once the operator widens the worklist's page (STUDIO-792) `JobsView` moves
+// to a key of its own, and the badge's refresh comes instead from `useJobsFeed`'s live-snapshot
+// pull-forward, which invalidates this whole family by prefix rather than one filter. Its real
+// defect — counting page rows rather than open work — is a follow-up of its own either way.
 export function useIssueRuns(
   filter: HistoryFilter = {},
   opts?: { enabled?: boolean; refetchInterval?: number | false },

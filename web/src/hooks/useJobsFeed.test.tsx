@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import type { RetryEntry, RunningSession, StateResponse } from "@/lib/api";
+import type { HistoryFilter, RetryEntry, RunningSession, StateResponse } from "@/lib/api";
 
 const h = vi.hoisted(() => ({ fetchState: vi.fn(), fetchIssueRuns: vi.fn() }));
 
@@ -95,12 +95,12 @@ describe("liveJobsSignature", () => {
 });
 
 describe("useJobsFeed", () => {
-  function mount() {
+  function mount(filter?: HistoryFilter) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={qc}>{children}</QueryClientProvider>
     );
-    return { qc, ...renderHook(() => useJobsFeed(), { wrapper }) };
+    return { qc, ...renderHook(() => useJobsFeed(filter), { wrapper }) };
   }
 
   beforeEach(() => {
@@ -176,6 +176,50 @@ describe("useJobsFeed", () => {
     const { result } = mount();
     await waitFor(() => expect(result.current.state.data).toBeDefined());
     expect(h.fetchIssueRuns).toHaveBeenCalledTimes(1);
+  });
+
+  // STUDIO-792 widened the worklist's page, and the window reaches this hook as `filter`. It is the
+  // interval that must not follow it there: on the operator's own daemon a full-width request
+  // measured 0.63s-0.88s warm and 3.63s cold against 1.6ms at the default width, so keeping one
+  // cadence would leave a request of that size firing every 2s for as long as the page stayed open.
+  it("does not put a widened window on that cadence", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mount({ limit: 400 });
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalledTimes(1));
+    // The window really is being sent — otherwise this box would pass on a hook that had quietly
+    // stopped paging at all, which is the cheap way to make a "no poll" assertion go green.
+    expect(h.fetchIssueRuns).toHaveBeenCalledWith({ limit: 400 });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS * 5);
+    });
+
+    expect(h.fetchIssueRuns).toHaveBeenCalledTimes(1);
+    // And the live snapshot is untouched by any of this: the strip keeps its own cadence, so what
+    // was taken off the timer is the wide listing request and nothing else.
+    expect(h.fetchState.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  // The other half of that trade, and the reason dropping the interval is not dropping freshness.
+  // Every transition the interval was there for changes `liveJobsSignature` first: the daemon
+  // removes a run from the live map and writes its end row inside ONE control-loop event, and only
+  // republishes the snapshot `/api/v1/state` serves once that handler has returned. So the snapshot
+  // that reports the run gone is already backed by a store that has recorded it, and the
+  // pull-forward carries the widened page just as it carries the default one — it invalidates the
+  // listing family by prefix, not one filter.
+  it("still refetches a widened window as soon as the live set changes", async () => {
+    const { qc, result } = mount({ limit: 400 });
+    await waitFor(() => expect(result.current.state.data).toBeDefined());
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalledTimes(1));
+
+    h.fetchState.mockResolvedValue(snapshot({ running: [running()] }));
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["state"] });
+    });
+
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalledTimes(2));
+    // Refetched at the window the operator is actually holding, not collapsed back to the default.
+    expect(h.fetchIssueRuns).toHaveBeenLastCalledWith({ limit: 400 });
   });
 
   // "No busy-loop" (the ticket's third acceptance point). react-query's `refetchIntervalInBackground`

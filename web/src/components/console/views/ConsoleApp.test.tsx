@@ -22,6 +22,7 @@ const h = vi.hoisted(() => {
   const downCbs = new Set<() => void>();
   return {
     fetchVersion: vi.fn(),
+    fetchIssueRuns: vi.fn(),
     getStatus: vi.fn(),
     hasOverlayTitlebar: vi.fn(() => false),
     credentialStatus: vi.fn(),
@@ -74,7 +75,7 @@ vi.mock("@/lib/api", async (orig) => {
       rate_limits: [],
       blocked: [],
     })),
-    fetchIssueRuns: vi.fn(async () => ({ issues: [], next_offset: null })),
+    fetchIssueRuns: h.fetchIssueRuns,
     fetchLinearProjects: vi.fn(async () => []),
     fetchTeamsOverview: vi.fn(async () => ({
       enabled: true,
@@ -164,6 +165,7 @@ beforeEach(() => {
     { id: "1", name: "Rhapsody", slug: "872639248532", team: "FND", color: "#10b981" },
   ]);
   h.probeTools.mockResolvedValue([]);
+  h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
 });
 
 afterEach(() => {
@@ -588,5 +590,74 @@ describe("desktop window chrome (STUDIO-701)", () => {
     expect(document.querySelector(".overlay-titlebar")).toBeNull();
     expect(document.querySelector("[data-tauri-drag-region]")).toBeNull();
     expect(document.querySelector(".rail")?.firstElementChild?.classList.contains("logo")).toBe(true);
+  });
+});
+
+// STUDIO-792 review catch (STUDIO-796). Paging the worklist widens ONE query; the rail's Jobs
+// badge reads the same endpoint, and the first version of this change threaded the table's window
+// into it — so clicking "Load 50 more" moved a number in the nav rail. On the operator's own
+// daemon (389 issues) paging to the end made the rail read 389 beside the word "Jobs".
+//
+// The badge's own defect — it counts every loaded issue, finished ones included, rather than the
+// tickets the daemon has work for — is older than this change and is a follow-up. What this box
+// pins is that the badge is STABLE: whatever it says, a table control must not change it. Nothing
+// in JobsView.test.tsx can pin this, because the badge lives in the shell.
+describe("the rail's Jobs badge is not a function of the table's window (STUDIO-792)", () => {
+  /** `n` finished issues, plus whether the daemon offers a further page. */
+  function page(n: number, more: boolean) {
+    return {
+      issues: Array.from({ length: n }, (_, i) => ({
+        id: 1000 + i,
+        issue_id: `id-T-${i}`,
+        issue_identifier: `T-${i}`,
+        title: `T-${i} title`,
+        attempt: 1,
+        session_uuid: "s",
+        branch: `symphony/T-${i}`,
+        project_slug: "rhapsody",
+        repo: "",
+        started_at: "2026-09-01T10:00:00Z",
+        ended_at: "2026-09-01T10:30:00Z",
+        turns: 1,
+        input_tokens: 1,
+        output_tokens: 1,
+        total_tokens: 2,
+        usage_estimated: false,
+        outcome: "completed",
+        lifecycle: "done",
+        error: "",
+        transcript_path: "",
+      })),
+      next_offset: more ? n : null,
+    };
+  }
+
+  /** The Jobs nav row's trailing count badge. */
+  function jobsBadge(): string {
+    return document.querySelector("[data-nav='jobs'] .ct")?.textContent ?? "";
+  }
+
+  function jobRows(): number {
+    return document.querySelectorAll(".jtbl tbody tr").length;
+  }
+
+  it("holds the badge steady across a Load-more that grows the table", async () => {
+    h.fetchVersion.mockResolvedValue(version(true));
+    h.getStatus.mockResolvedValue(status(true));
+    // The badge sends no limit and must keep answering off THAT page; only the widened request
+    // carries one. The wider page is the same 50 issues plus 12 older ones, so the badge can only
+    // move by reading the table's window — nothing else here changes underneath it.
+    h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) =>
+      f.limit === undefined ? page(50, true) : page(62, false),
+    );
+    mount();
+
+    await waitFor(() => expect(jobRows()).toBe(50));
+    expect(jobsBadge()).toBe("50");
+
+    fireEvent.click(screen.getByRole("button", { name: /load 50 more/i }));
+
+    await waitFor(() => expect(jobRows()).toBe(62));
+    expect(jobsBadge()).toBe("50");
   });
 });

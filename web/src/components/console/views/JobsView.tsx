@@ -17,9 +17,11 @@ import { cn } from "@/lib/utils";
 import { teammateColor } from "@/theme/teammates";
 import {
   CONSOLE_JOB_FILTERS,
+  JOBS_PAGE_SIZE,
   buildConsoleJobs,
   consoleJobCounts,
   consoleJobProjects,
+  consoleJobsPageNote,
   filterConsoleJobs,
   mateStates,
   type ConsoleJobFilterId,
@@ -43,13 +45,36 @@ const ALL_PROJECTS = "";
 // Its inputs are the endpoints §9 actually has — `/api/v1/state` for the live snapshot and
 // `/api/v1/history/issues` for one row per ticket. `lib/console-jobs.ts` records what that
 // costs against the `GET /api/v1/issues` the spec assumed.
-export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) {
+//
+// PAGING (STUDIO-792). `limit` and `onLoadMore` are owned by the shell rather than by this view so
+// that the window outlives it: opening a row unmounts the worklist, and an operator who paged down
+// to the older tickets should not land back on the newest 50 on the way in and out of a job.
+// `/api/v1/history/issues` is paged by ISSUE, so widening the window can never let one ticket's
+// retry storm crowd the others out (TRA-320) — every page is still one row per ticket.
+export function JobsView({
+  onOpenJob,
+  limit,
+  onLoadMore,
+}: {
+  onOpenJob: (issue: string) => void;
+  /** How many ISSUES to ask the daemon for. Grows by `JOBS_PAGE_SIZE` per "Load more". */
+  limit: number;
+  onLoadMore: () => void;
+}) {
   const nowMs = useNow(30_000);
   // One feed, not two independent reads. The Now strip's counts and the table's rows are both
   // derived from `rows` below, so they are only ever as consistent as the two fetches feeding it —
   // and until STUDIO-791 the second of those never refetched at all, leaving this surface reporting
   // a run's state from whenever the page happened to be opened.
-  const { state, issueRuns } = useJobsFeed();
+  //
+  // At the DEFAULT width we send no limit at all, which keeps this on the same `{}` cache entry the
+  // rail's badge already holds — a distinct `{limit: 50}` key would fetch the identical 50 rows a
+  // second time on every Jobs mount. Only a widened window opens a key of its own. The daemon
+  // derives `next_offset` from the page size the store ACTUALLY applied rather than from what the
+  // caller sent (handlers_history.rs), so an unsent limit still answers "is there more?".
+  // `useJobsFeed` polls the default window and refreshes a widened one off the live snapshot
+  // instead — its own doc comment carries the measurements behind that split.
+  const { state, issueRuns } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
@@ -75,6 +100,16 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
   const roster = mates.map((m) => m.name);
   const visible = filterConsoleJobs(rows, filter, project);
   const projectOptions = [{ value: ALL_PROJECTS, label: "All projects" }, ...consoleJobProjects(rows)];
+  // The daemon's own claim, restated verbatim: `next_offset` is non-null exactly when the store
+  // filled the page it was asked for, and it is derived from the size the store ACTUALLY applied,
+  // so it stays right even on a request that sent no limit at all.
+  const hasMore = (issueRuns.data?.next_offset ?? null) !== null;
+  const pageNote = consoleJobsPageNote({
+    loaded: rows.length,
+    visible: visible.length,
+    hasMore,
+    filtered: filter !== "all" || project !== ALL_PROJECTS,
+  });
 
   return (
     <section>
@@ -150,6 +185,23 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
           </tbody>
         </table>
         {visible.length === 0 ? <div className="empty">{emptyMessage(rows.length, issueRuns.isPending)}</div> : null}
+        {/* How much of the history this is (STUDIO-792). Rendered whenever there are rows, not
+            only when the list is cut: "Showing all 386 jobs" is what tells the operator the list
+            ended because the history did, and that is the fact the silent 50 used to withhold. */}
+        {pageNote === "" ? null : (
+          <div className="jmore">
+            <span className="note">{pageNote}</span>
+            {hasMore ? (
+              // `isPlaceholderData`, not `isFetching`: it is true exactly while a WIDER page is in
+              // flight and the previous one is still on screen, and false during a background
+              // refetch of the page already held. Disabling on `isFetching` would make the
+              // control dead for a beat on every poll once STUDIO-791 gives this query one.
+              <Chip onClick={onLoadMore} disabled={issueRuns.isPlaceholderData}>
+                Load {JOBS_PAGE_SIZE} more
+              </Chip>
+            ) : null}
+          </div>
+        )}
       </Card>
     </section>
   );

@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { HISTORY_ISSUES_QUERY_KEY } from "@/hooks/useHistory";
 import { fetchState, postRefresh, type StateResponse } from "@/lib/api";
 
 export const STATE_QUERY_KEY = ["state"] as const;
@@ -31,11 +32,24 @@ export function useStateQuery(opts?: { enabled?: boolean }) {
   });
 }
 
-// useRefresh POSTs /api/v1/refresh then invalidates the state query.
+// useRefresh POSTs /api/v1/refresh then invalidates the state query AND the issue listing.
+//
+// The listing half is not decoration (STUDIO-792). Its only caller is the Jobs worklist, whose ↻ is
+// the operator asking for the current truth about the surface in front of them — and that surface is
+// rows as much as it is the strip. It used to be moot: the listing polled every 2s, so refreshing
+// only the snapshot still left the rows no more than a tick behind. Once a WIDENED window comes off
+// that timer (see `useJobsFeed`), invalidating the snapshot alone would leave the button visibly
+// inert for the rows unless the refresh happened to change the live set — a control that reports
+// less than it appears to, which is the failure this ticket exists to remove.
+//
+// By prefix, so the widened page and the rail badge's `{}` entry are both covered.
 export function useRefresh() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: postRefresh,
-    onSettled: () => qc.invalidateQueries({ queryKey: STATE_QUERY_KEY }),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: STATE_QUERY_KEY });
+      void qc.invalidateQueries({ queryKey: HISTORY_ISSUES_QUERY_KEY });
+    },
   });
 }

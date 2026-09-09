@@ -51,6 +51,13 @@
 /* The assignee slot of a run nothing can name: kept, and dimmed, rather than omitted. */
 .rh-console .who2.none { color: var(--ink-4); }
 .rh-console .jtbl .up { font-family: var(--mono); font-size: 11px; color: var(--ink-4); }
+/* The worklist's footer (STUDIO-792): how much of the history is on screen, and the control that
+   asks for the next store page. Sits INSIDE the Card so it reads as the end of the list rather
+   than as a control floating beside it, and draws its OWN top rule — `.jtbl tr:last-child td`
+   strips the last row's border, so without one the sentence would sit flush against the table. */
+.rh-console .jmore { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 11px 14px; border-top: 1px solid var(--line-soft); }
+.rh-console .jmore .note { color: var(--ink-4); font-size: 11.5px; }
+.rh-console .jmore .chip { margin-left: auto; }
 
 /* ===== §4 job detail ===== */
 .rh-console .jobhd { display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }

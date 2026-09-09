@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueRun, StateResponse } from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
 import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
+import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
 
 // STUDIO-681 §10, sub-ticket 2 — the Jobs worklist's acceptance boxes 2.6, 2.7 and 2.8,
 // driven through the real view against the endpoints §9 has: /api/v1/state for the live
@@ -81,11 +83,26 @@ const EMPTY_STATE: StateResponse = {
   blocked: [],
 };
 
-function mount(onOpenJob = vi.fn()) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+// The worklist's page size is owned by the SHELL, not by the view (STUDIO-792), so that the window
+// OUTLIVES it: opening a row unmounts Jobs, and an operator who paged down to the older tickets
+// should not land back on the newest 50 on the way back out. This harness stands in for
+// `ConsoleApp`'s half of that. The rail's Jobs badge is deliberately NOT wired to this window —
+// `ConsoleApp.test.tsx` holds the box that keeps it out.
+function Paged({ onOpenJob }: { onOpenJob: (issue: string) => void }) {
+  const [limit, setLimit] = useState(JOBS_PAGE_SIZE);
+  return (
+    <JobsView
+      onOpenJob={onOpenJob}
+      limit={limit}
+      onLoadMore={() => setLimit((n) => n + JOBS_PAGE_SIZE)}
+    />
+  );
+}
+
+function mount(onOpenJob = vi.fn(), qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   render(
     <QueryClientProvider client={qc}>
-      <JobsView onOpenJob={onOpenJob} />
+      <Paged onOpenJob={onOpenJob} />
     </QueryClientProvider>,
   );
   return onOpenJob;
@@ -967,6 +984,215 @@ describe("the §6 additions are painted, not just classed", () => {
 
   it("gives Needs you the operator's own colour", () => {
     expect(consoleCss).toMatch(/\.stat\.op \.n \{[^}]*color: var\(--operator\)/);
+  });
+});
+
+// STUDIO-792 — the worklist used to stop at the store's 50 newest issues and say nothing about it.
+// On the operator's own daemon that hid 336 of 386 tickets. The daemon has served
+// `/api/v1/history/issues?limit=&offset=` with a `next_offset` all along; these are the boxes that
+// make the console use it and make the cut visible while it lasts.
+describe("paging past the first 50 (STUDIO-792)", () => {
+  /** A page of `n` distinct issues, plus whether the daemon says there is more after it. */
+  function page(n: number, more: boolean) {
+    return {
+      issues: Array.from({ length: n }, (_, i) =>
+        run({ issue_identifier: `T-${i}`, outcome: "completed", lifecycle: "done" }),
+      ),
+      next_offset: more ? n : null,
+    };
+  }
+
+  function note(): string {
+    return document.querySelector(".jmore .note")?.textContent ?? "";
+  }
+
+  // At the default width the view sends NO limit, so it stays on the `{}` cache entry the rail's
+  // badge already holds instead of fetching the same 50 rows again under a `{limit: 50}` key.
+  it("sends no limit until the operator asks for more", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue(page(3, false));
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    expect(h.fetchIssueRuns).toHaveBeenCalledTimes(1);
+    expect(h.fetchIssueRuns).toHaveBeenCalledWith({});
+  });
+
+  it("says the list is complete when the daemon offers no further page", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue(page(3, false));
+    mount();
+    await waitFor(() => expect(note()).toBe("Showing all 3 jobs."));
+    expect(screen.queryByRole("button", { name: /load 50 more/i })).toBeNull();
+  });
+
+  it("says older jobs are unloaded, and offers them, while the daemon has more", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue(page(3, true));
+    mount();
+    await waitFor(() =>
+      expect(note()).toBe("Showing the 3 most recent jobs. Older jobs are not loaded yet."),
+    );
+    expect(screen.getByRole("button", { name: /load 50 more/i })).toBeTruthy();
+  });
+
+  it("reaches the older rows on demand, one store page at a time", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    // The daemon is asked for a WIDER window each time, never for a second offset: the list is
+    // live, so an accumulated `offset=50` would re-serve rows that had shifted down and drop the
+    // ones they displaced. See the note on `onLoadMore` in ConsoleApp.
+    h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) =>
+      f.limit === undefined ? page(50, true) : page(62, false),
+    );
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(50));
+    expect(note()).toBe("Showing the 50 most recent jobs. Older jobs are not loaded yet.");
+
+    fireEvent.click(screen.getByRole("button", { name: /load 50 more/i }));
+
+    await waitFor(() => expect(rowKeys()).toHaveLength(62));
+    expect(h.fetchIssueRuns).toHaveBeenCalledWith({ limit: 100 });
+    expect(note()).toBe("Showing all 62 jobs.");
+    expect(screen.queryByRole("button", { name: /load 50 more/i })).toBeNull();
+  });
+
+  // Self-review catch. The guard has to be "a WIDER page is in flight", not "a request is in
+  // flight": STUDIO-791 is about to give this query a 2s poll, and disabling on `isFetching`
+  // would leave the control dead for a beat on every tick — a button that ignores clicks at
+  // random is worse than no button.
+  it("disables the control only while the wider page is actually in flight", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    let releaseSecondPage = () => {};
+    const secondPage = new Promise<void>((res) => {
+      releaseSecondPage = res;
+    });
+    h.fetchIssueRuns.mockImplementation(async (f: { limit?: number }) => {
+      if (f.limit === undefined) return page(50, true);
+      await secondPage;
+      return page(62, false);
+    });
+    mount();
+
+    const more = () => screen.getByRole("button", { name: /load 50 more/i }) as HTMLButtonElement;
+    await waitFor(() => expect(rowKeys()).toHaveLength(50));
+    // Settled on the page it holds: clickable, even though a poll could be running.
+    expect(more().disabled).toBe(false);
+
+    fireEvent.click(more());
+    await waitFor(() => expect(more().disabled).toBe(true));
+
+    releaseSecondPage();
+    await waitFor(() => expect(rowKeys()).toHaveLength(62));
+  });
+
+  // The discriminating half of the guard above, and the reason it is not `isFetching`: a
+  // background refetch of the page already held must leave the control alive. This drives the
+  // exact shape STUDIO-791's 2s poll will produce — same key, data on screen, request in flight.
+  it("stays clickable through a background refetch of the page it already holds", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    let releaseRefetch = () => {};
+    const refetched = new Promise<void>((res) => {
+      releaseRefetch = res;
+    });
+    let calls = 0;
+    h.fetchIssueRuns.mockImplementation(async () => {
+      calls += 1;
+      if (calls > 1) await refetched; // hold the refetch open so the in-flight state is observable
+      return page(50, true);
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mount(vi.fn(), qc);
+
+    const more = () => screen.getByRole("button", { name: /load 50 more/i }) as HTMLButtonElement;
+    await waitFor(() => expect(rowKeys()).toHaveLength(50));
+
+    void qc.invalidateQueries({ queryKey: ["history-issues"] });
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalledTimes(2));
+
+    expect(more().disabled).toBe(false);
+    releaseRefetch();
+  });
+
+  // The half that is easiest to get wrong: a filter runs over the LOADED rows only, so "Done · 3"
+  // on a truncated list is an answer to a question the operator did not ask.
+  it("says a filter has not been applied to the unloaded tail", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ issue_identifier: "DONE-1", outcome: "completed", lifecycle: "done" }),
+        run({ issue_identifier: "OPEN-1", outcome: "stopped", lifecycle: "open" }),
+      ],
+      next_offset: 2,
+    });
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(2));
+
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    await waitFor(() =>
+      expect(note()).toBe(
+        "Showing 1 of the 2 most recent jobs. Older jobs are not loaded yet, so this filter has not been applied to them.",
+      ),
+    );
+  });
+
+  // The sentence counts what is on screen, so it cannot drift from the table the way the run
+  // count did — a live ticket the held page does not carry is a row, and it is counted as one.
+  it("counts the live overlay the page does not carry", async () => {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-LIVE",
+          issue_identifier: "LIVE-1",
+          title: "live",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 9001,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    h.fetchIssueRuns.mockResolvedValue(page(2, true));
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    expect(note()).toBe("Showing the 3 most recent jobs. Older jobs are not loaded yet.");
+  });
+});
+
+// The ↻ control, at a window that is no longer polled (STUDIO-792). While the worklist sits at the
+// default width this is invisible: the listing polls every 2s, so invalidating only `/api/v1/state`
+// still leaves the rows at most a tick behind. A WIDENED window is off that timer, so the operator's
+// explicit "tell me the truth now" gesture has to reach the rows itself — otherwise the button
+// refreshes the strip above the table and quietly does nothing to the table.
+describe("Refresh reaches the rows, not just the strip (STUDIO-792)", () => {
+  it("refetches a widened listing when the operator clicks Refresh", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: Array.from({ length: JOBS_PAGE_SIZE }, (_, i) =>
+        run({ issue_identifier: `R-${i}`, outcome: "completed", lifecycle: "done" }),
+      ),
+      next_offset: JOBS_PAGE_SIZE,
+    });
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
+
+    // Widen first — this is the state in which the listing has no interval of its own.
+    fireEvent.click(screen.getByRole("button", { name: `Load ${JOBS_PAGE_SIZE} more` }));
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalledWith({ limit: JOBS_PAGE_SIZE * 2 }));
+    const settled = h.fetchIssueRuns.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "↻ Refresh" }));
+
+    await waitFor(() => expect(h.fetchIssueRuns.mock.calls.length).toBeGreaterThan(settled));
+    // At the window the operator is holding — a Refresh must not quietly collapse them back to 50.
+    expect(h.fetchIssueRuns).toHaveBeenLastCalledWith({ limit: JOBS_PAGE_SIZE * 2 });
   });
 });
 

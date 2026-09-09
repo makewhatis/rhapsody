@@ -16,6 +16,7 @@ import { useIssueRuns } from "@/hooks/useHistory";
 import { useStateQuery } from "@/hooks/useStateQuery";
 import { useReinstateFact, useVersionQuery } from "@/hooks/useTeams";
 import { useUpdater, type Updater } from "@/hooks/useUpdater";
+import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { viewForStatus } from "@/lib/daemon-status";
 import { FirstRunView, OnboardErrorBanner } from "./FirstRunView";
@@ -49,6 +50,17 @@ export function ConsoleApp() {
   // unknown forever. See `useConsoleRoute` for why the difference matters.
   const teamsEnabled = version.data === undefined ? undefined : version.data.teams_enabled === true;
   const [route, navigate] = useConsoleRoute(teamsEnabled);
+  // How much of the job history is loaded (STUDIO-792). Owned by the shell so that the window
+  // OUTLIVES the view: opening a row navigates away from Jobs and unmounts it, and an operator who
+  // paged down to the older tickets should not land back on the newest 50 when they come back.
+  // It is the worklist's window and nothing else's — the rail's badge below deliberately does not
+  // read it.
+  //
+  // A WIDER window each step, not an accumulated `offset`. The worklist is live: rows arrive at
+  // the top, so a second request at `offset=50` would re-serve rows that had shifted down and
+  // silently drop the ones they displaced. One growing request is always a consistent snapshot,
+  // and `next_offset` answers "is there more?" identically either way.
+  const [jobsLimit, setJobsLimit] = useState(JOBS_PAGE_SIZE);
   const openJobs = useOpenJobCount();
   // ONE updater instance, owned by the shell and shared — the hook's own contract (P11 U3), and the
   // reason the Podium shell mounts it too. Here it feeds both the Settings "Updates" row's pending
@@ -125,7 +137,14 @@ export function ConsoleApp() {
         overlayTitlebar={overlayTitlebar}
       >
         <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
-        <ConsoleBody route={route} teamsEnabled={teamsEnabled} go={go} updater={updater} />
+        <ConsoleBody
+          route={route}
+          teamsEnabled={teamsEnabled}
+          go={go}
+          updater={updater}
+          jobsLimit={jobsLimit}
+          onLoadMoreJobs={() => setJobsLimit((n) => n + JOBS_PAGE_SIZE)}
+        />
       </AppShell>
       {overlay}
     </>
@@ -157,11 +176,17 @@ function ConsoleBody({
   teamsEnabled,
   go,
   updater,
+  jobsLimit,
+  onLoadMoreJobs,
 }: {
   route: ConsoleRoute;
   teamsEnabled: boolean | undefined;
   go: (name: ConsoleRouteName, key?: string) => void;
   updater: Updater;
+  // Threaded from `ConsoleApp` rather than held here (STUDIO-792), so the window survives opening
+  // a row and coming back; this switch may not call a hook of its own.
+  jobsLimit: number;
+  onLoadMoreJobs: () => void;
 }) {
   // A teams-only route reached before the capability is known renders nothing rather than
   // guessing: one frame of blank beats a placeholder for a view that may be about to redirect.
@@ -217,7 +242,13 @@ function ConsoleBody({
     case "reviews":
       return <ReviewsView onNavigate={(to) => go(to)} />;
     default:
-      return <JobsView onOpenJob={(issue) => go("job", issue)} />;
+      return (
+        <JobsView
+          onOpenJob={(issue) => go("job", issue)}
+          limit={jobsLimit}
+          onLoadMore={onLoadMoreJobs}
+        />
+      );
   }
 }
 
@@ -238,7 +269,17 @@ function RailFoot({ version, teamsEnabled }: { version: string; teamsEnabled: bo
   );
 }
 
-/** The Jobs nav count — tickets the daemon currently has work for. */
+/**
+ * The Jobs nav count — tickets the daemon currently has work for.
+ *
+ * It takes NO window (STUDIO-792), deliberately: what the badge answers is a property of the
+ * daemon, not of how far the operator has scrolled a table, so threading the worklist's `limit` in
+ * here would make a table control move a number in the nav rail. "How much of the list am I
+ * seeing?" is the worklist's own question and the footer in `JobsView` is where it is answered.
+ *
+ * Sending no limit also keeps the widened request off every non-Jobs route, since this hook is
+ * mounted by the shell.
+ */
 function useOpenJobCount(): number {
   const state = useStateQuery();
   const issues = useIssueRuns();
