@@ -260,12 +260,18 @@ impl Orchestrator {
     /// global/per-project/per-state slot counters in ONE greedy pass. `picked` holds active-dispatch
     /// issues; `reopen` holds review-state issues (tagged with their project) the loop must promote
     /// before dispatching. Mirrors Go `selectDispatchMultiWithReopens`.
+    ///
+    /// `held_for_capacity` is the third return, carried out and stored by the `&mut self` caller
+    /// exactly as in [`Orchestrator::select_dispatch_with_reopens`] (STUDIO-803) — the capacity
+    /// hold applies to this pass too, and since this is the pass a multi-project installation
+    /// actually runs, it is the one the feature reaches most operators through. Always empty with
+    /// Teams off.
     pub fn select_dispatch_multi_with_reopens(
         &self,
         mut tagged: Vec<TaggedIssue>,
-    ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>) {
+    ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
         let Some(eff) = self.eff.as_ref() else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), HashMap::new());
         };
         sort_tagged_stable(&mut tagged);
 
@@ -274,10 +280,17 @@ impl Orchestrator {
         let mut per_project: HashMap<String, i64> = HashMap::new(); // group -> remaining slots this pass
         let mut state_counts = self.running_state_counts(); // normState -> running-in-state across ALL projects
         let recovered_claims = self.recovered_claim_identifiers();
+        // The Teams CAPACITY gate's two maps (STUDIO-803), both pass-local and both exactly as the
+        // single-project ladder builds them — see [`Orchestrator::select_dispatch_with_reopens`]
+        // for why the tally exists at all (the pass takes `&self`, so `running` is frozen for its
+        // whole duration) and why `impl_load` is built lazily (D5: never with Teams off).
+        let mut impl_load: Option<crate::teams::LoadSnapshot> = None;
+        let mut impl_tally: HashMap<String, i64> = HashMap::new();
 
         let mut picked = Vec::new();
         let mut reopen = Vec::new();
         let mut held_for_triage = false;
+        let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         for ti in tagged {
             if global_remaining <= 0 {
                 break;
@@ -352,6 +365,54 @@ impl Orchestrator {
                 held_for_triage = true;
                 continue;
             }
+            // The Teams CAPACITY gate (STUDIO-803), the single-project ladder's gate mirrored onto
+            // the pass a multi-project installation actually runs — without it the feature is
+            // silently absent for every such install. Same shape, same order, same exemptions;
+            // [`Orchestrator::select_dispatch_with_reopens`] carries the full rationale (§4.1–§4.2
+            // of `~/.rhapsody/docs/per-role-concurrency-design.md`) and this block deliberately does
+            // not restate it. The candidate is `ti.iss` — the tagged pass's issue.
+            //
+            // It sits BEFORE the per-project budget and the per-state cap, matching the
+            // single-project ladder. That ordering cannot change WHICH tickets are picked —
+            // `ensure_project_budget` only tests and memoizes, and the admit below is what
+            // decrements — but it does decide ATTRIBUTION: a ticket blocked by both its teammate's
+            // cap and its project's budget is reported as a capacity hold rather than skipped
+            // silently, which is what Ticket E renders on the teammate card. Nothing is reserved
+            // either way, because the hold is a `continue` like every other skip in this loop.
+            let planned = if crate::lifecycle::is_review_ticket(&ti.iss)
+                || !self.teams.as_ref().is_some_and(|t| t.enabled)
+            {
+                None
+            } else {
+                let load = impl_load.get_or_insert_with(|| {
+                    crate::teams::LoadSnapshot::from_running_and_retries(
+                        &self.running,
+                        &self.retry_attempts,
+                    )
+                });
+                // Routed against the load THIS pass has already created, not the frozen
+                // start-of-pass load — the dispatch loop re-routes per issue with `running`
+                // advanced, so anything else answers a different question than the one that
+                // decides where the ticket actually goes.
+                let planned = self.planned_identity(&ti.iss, &load.advanced_by(&impl_tally));
+                if let Some(name) = planned.as_deref() {
+                    impl_tally
+                        .entry(name.to_string())
+                        .or_insert_with(|| load.impl_live(name));
+                }
+                planned
+            };
+            if let Some(name) = planned.as_deref()
+                && self.at_cap(name, &impl_tally)
+            {
+                tracing::debug!(
+                    issue_identifier = %ti.iss.identifier,
+                    identity = %name,
+                    "skipping dispatch: teammate at max_concurrent"
+                );
+                *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
+                continue;
+            }
             if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
                 continue;
             }
@@ -368,10 +429,16 @@ impl Orchestrator {
             global_remaining -= 1;
             *per_project.entry(group).or_insert(0) -= 1;
             *state_counts.entry(st).or_insert(0) += 1;
+            // The routed teammate now owns one more run for the rest of this pass. Incremented HERE
+            // rather than at the gate so a ticket the project budget or the per-state cap turns
+            // away never consumes it.
+            if let Some(name) = planned {
+                *impl_tally.entry(name).or_insert(0) += 1;
+            }
             picked.push(ti);
         }
         self.kick_triage(held_for_triage);
-        (picked, reopen)
+        (picked, reopen, held_for_capacity)
     }
 
     /// The arrival kick (STUDIO-669; design record §A.3.2): when this pass held one or more
@@ -1485,6 +1552,241 @@ mod tests {
             [("alice".to_string(), 1)].into_iter().collect(),
             "held for the default identity, not for whoever the frozen load named"
         );
+    }
+
+    // --- the Teams capacity gate, multi-project ladder (STUDIO-803) ----------------------------
+
+    /// A capped roster on the MULTI-project path: [`orch_with_capped_roster`]'s teams and effective,
+    /// plus the resolved projects the tagged pass routes slot accounting through. The capacity gate
+    /// is per TEAMMATE, not per project, so one generous project is enough to isolate it from the
+    /// per-project budget — the tests that care about that interaction set their own cap.
+    fn multi_with_capped_roster(
+        roster: &[(&str, i64)],
+        projects: Vec<crate::effective::ResolvedProject>,
+    ) -> Orchestrator {
+        let mut o = orch_with_capped_roster(roster);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.projects = projects;
+        }
+        o
+    }
+
+    /// The admitted identifiers, in order — [`ids`] for the tagged pass.
+    fn tagged_ids(picks: &[TaggedIssue]) -> Vec<String> {
+        picks.iter().map(|t| t.iss.identifier.clone()).collect()
+    }
+
+    /// **The acceptance** (STUDIO-803): two tickets labelled for a teammate capped at one, one tick,
+    /// through the pass a multi-project installation actually runs. Without the gate mirrored here
+    /// the feature is silently absent for every such install — the ladder B1 fixed is not the one
+    /// they execute.
+    #[test]
+    fn two_tickets_for_a_capped_teammate_admit_one_in_the_multi_pass() {
+        let o = multi_with_capped_roster(&[("alice", 1)], vec![proj("p1", 10, HashMap::new())]);
+        let (picked, reopen, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![
+                teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+                teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+            ],
+        ));
+        assert_eq!(
+            tagged_ids(&picked),
+            vec!["MT-1"],
+            "one admit; the second waits for alice rather than being reassigned"
+        );
+        assert!(reopen.is_empty());
+        assert_eq!(
+            held.get("alice").copied(),
+            Some(1),
+            "and the pass reports what it withheld, per teammate"
+        );
+    }
+
+    /// **The regression B1 shipped and then fixed, pinned for this ladder before the gate was
+    /// written.** The load-balanced tier is the one whose answer depends on load, and it is the one
+    /// with no natural coverage — every obvious test routes through Tier 0 (`rhapsody:@`) or a
+    /// one-name roster, and passes whether or not routing sees the load the pass has created.
+    ///
+    /// Two teammates capped at 1, both carrying `rust`; two `rust` tickets and no `rhapsody:@`
+    /// label, so `best_by_label_overlap` routes them. Dispatch re-routes per issue with `running`
+    /// advanced (`retry.rs:349` then `:444`), so MT-2 goes to bob, whose seat is free. A gate that
+    /// routed against the frozen start-of-pass load would hold MT-2 and charge it to alice — a
+    /// teammate who was never going to take it (`picked=["MT-1"] held={"alice": 1}`).
+    #[test]
+    fn a_load_balanced_pair_still_fills_both_free_seats_in_the_multi_pass() {
+        let mut o = multi_with_capped_roster(
+            &[("alice", 1), ("bob", 1)],
+            vec![proj("p1", 10, HashMap::new())],
+        );
+        if let Some(t) = o.teams.as_mut() {
+            for i in t.roster.iter_mut() {
+                i.labels = vec!["rust".to_string()];
+            }
+        }
+        let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![
+                teams_issue("1", "MT-1", &["rust"]),
+                teams_issue("2", "MT-2", &["rust"]),
+            ],
+        ));
+        assert_eq!(
+            tagged_ids(&picked),
+            vec!["MT-1", "MT-2"],
+            "bob has a free seat and is who MT-2 actually routes to at dispatch"
+        );
+        assert!(held.is_empty(), "nothing is over cap: {held:?}");
+    }
+
+    /// **D5 at the multi ladder**: with Teams absent, and again with Teams present but
+    /// `enabled: false`, every over-cap ticket dispatches and nothing is held — the pass is
+    /// byte-identical to what a Teams-off install ran before this ticket. The absence of the *work*
+    /// (no `route()` call, no roster lookup, no `LoadSnapshot`) is asserted against the two
+    /// functions that carry the gate's whole cost, in
+    /// `teams_off_makes_no_routing_call_and_no_capacity_lookup`; both ladders call the same two.
+    #[test]
+    fn teams_off_or_disabled_dispatches_every_over_cap_ticket_in_the_multi_pass() {
+        for (name, keep_teams) in [
+            ("no teams.yaml at all", false),
+            ("teams present but enabled: false", true),
+        ] {
+            let mut o =
+                multi_with_capped_roster(&[("alice", 1)], vec![proj("p1", 10, HashMap::new())]);
+            if keep_teams {
+                if let Some(t) = o.teams.as_mut() {
+                    t.enabled = false;
+                }
+            } else {
+                o.teams = None;
+            }
+            let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+                0,
+                vec![
+                    teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+                    teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+                    teams_issue("3", "MT-3", &["rhapsody:@alice"]),
+                ],
+            ));
+            assert_eq!(tagged_ids(&picked), vec!["MT-1", "MT-2", "MT-3"], "{name}");
+            assert!(held.is_empty(), "{name}: no counter moved");
+        }
+    }
+
+    /// **The capacity gate is an ADDITIONAL skip, never a replacement** for the two budgets this
+    /// ladder already enforces, and a held ticket moves neither of them.
+    ///
+    /// One project capped at 1 and alice capped at 1, with alice already running one implementation
+    /// job: her ticket is held, and because a hold reserves nothing, the project's single slot is
+    /// still there for the `rhapsody:solo` ticket behind it. Written as a reservation instead of a
+    /// `continue`, the held ticket would spend that slot and MT-2 would be starved by a ticket that
+    /// never ran — verified by making that exact mutation (`[]` rather than `["MT-2"]`).
+    ///
+    /// Note this is NOT sensitive to where the gate sits relative to `ensure_project_budget`, which
+    /// only checks and memoizes and never decrements; `a_ticket_blocked_by_both_is_reported_as_a
+    /// _capacity_hold` pins that ordering instead.
+    #[test]
+    fn a_capacity_held_ticket_spends_no_project_slot() {
+        let mut o = multi_with_capped_roster(&[("alice", 1)], vec![proj("p1", 1, HashMap::new())]);
+        let mut live = running_entry(issue("live", "MT-9", "In Progress"), "", "");
+        live.identity = "alice".to_string();
+        o.running = [("live".to_string(), live)].into_iter().collect();
+
+        let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![
+                teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+                teams_issue("2", "MT-2", &["rhapsody:solo"]),
+            ],
+        ));
+        assert_eq!(
+            tagged_ids(&picked),
+            vec!["MT-2"],
+            "the project's one slot goes to the ticket that can actually run"
+        );
+        assert_eq!(held.get("alice").copied(), Some(1));
+    }
+
+    /// The per-project budget still binds on its own: alice is uncapped (D1), so the capacity gate
+    /// holds nothing and the project cap of 1 is the only thing deciding. Pins that mirroring the
+    /// gate in did not repoint or weaken `ensure_project_budget`.
+    #[test]
+    fn the_per_project_budget_still_binds_with_nothing_over_cap() {
+        let o = multi_with_capped_roster(&[("alice", 0)], vec![proj("p1", 1, HashMap::new())]);
+        let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![
+                teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+                teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+            ],
+        ));
+        assert_eq!(
+            tagged_ids(&picked),
+            vec!["MT-1"],
+            "the project cap turns MT-2 away"
+        );
+        assert!(
+            held.is_empty(),
+            "and it is NOT a capacity hold — nobody is over cap: {held:?}"
+        );
+    }
+
+    /// **What the gate's PLACEMENT actually decides.** The plan puts the capacity gate immediately
+    /// after the assignment gate, ahead of `ensure_project_budget` — but that budget check only
+    /// tests and memoizes, never decrementing (the admit does), so the ordering cannot change which
+    /// tickets are picked. The one thing it does change is ATTRIBUTION: for a ticket blocked by
+    /// BOTH its teammate's cap and its project's budget, the gate that runs first is the one that
+    /// gets to name a reason.
+    ///
+    /// Gate-first reports it as a capacity hold, which is what Ticket E renders on alice's card.
+    /// Placed after the budget check the ticket is skipped silently and `held` comes back empty —
+    /// verified by making that exact move. This test is the only one in this module that notices,
+    /// so it is what pins the placement the plan specifies.
+    #[test]
+    fn a_ticket_blocked_by_both_is_reported_as_a_capacity_hold() {
+        let mut o = multi_with_capped_roster(&[("alice", 1)], vec![proj("p1", 1, HashMap::new())]);
+        // alice is at her cap, AND that one live run is this project's only slot.
+        let mut live = running_entry(issue("live", "MT-9", "In Progress"), "", "");
+        live.identity = "alice".to_string();
+        live.project_group = "p1".to_string();
+        o.running = [("live".to_string(), live)].into_iter().collect();
+
+        let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![teams_issue("1", "MT-1", &["rhapsody:@alice"])],
+        ));
+        assert!(picked.is_empty(), "both budgets are spent");
+        assert_eq!(
+            held.get("alice").copied(),
+            Some(1),
+            "the capacity gate runs first, so the hold is attributed to alice rather than lost"
+        );
+    }
+
+    /// D2 at the multi ladder: a quorum review ticket is a real tracker ticket, so it reaches this
+    /// gate like any other candidate. It is neither held by an implementation cap nor charged an
+    /// implementation seat — "a teammate at their implementation cap can still be given a review"
+    /// (design §6). The exemption is duplicated into this pass, so it is pinned in this pass.
+    #[test]
+    fn a_review_ticket_is_exempt_in_the_multi_pass() {
+        let o = multi_with_capped_roster(&[("alice", 1)], vec![proj("p1", 10, HashMap::new())]);
+        let (picked, _, held) = o.select_dispatch_multi_with_reopens(tag_for(
+            0,
+            vec![
+                teams_issue(
+                    "1",
+                    "MT-1",
+                    &["rhapsody:@alice", crate::quorum::REVIEW_TICKET_LABEL],
+                ),
+                teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+            ],
+        ));
+        assert_eq!(
+            tagged_ids(&picked),
+            vec!["MT-1", "MT-2"],
+            "the review is free, and alice's one implementation seat is still hers to spend"
+        );
+        assert!(held.is_empty(), "{held:?}");
     }
 
     /// Polls a future once and reports whether it was already ready. Enough for `Notify`, whose

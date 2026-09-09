@@ -743,9 +743,9 @@ impl Orchestrator {
     /// it (INF-318). Mirrors Go `dispatchDecisions`.
     async fn dispatch_decisions(&mut self) {
         // What a pass withheld is only ever true of THAT pass, so the tally is RESET here rather
-        // than merely overwritten at its one write site below (STUDIO-802). The single-project
-        // ladder is the only path that fills it, and that path sits behind the multi-project branch
-        // — which has no capacity gate — and two early returns, a missing tracker and a failed
+        // than merely overwritten at either write site below (STUDIO-802; STUDIO-803 added the
+        // multi-project one). Both ladders now fill it, but each sits behind a branch — and the
+        // single-project one behind two further early returns, a missing tracker and a failed
         // candidate fetch. Overwriting alone would therefore leave a Linear outage re-serving the
         // last successful tick's answer for as long as the outage lasted, which matters once
         // something re-arms the tick on a non-empty tally.
@@ -765,7 +765,11 @@ impl Orchestrator {
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
             // the quorum off (§0.12).
             self.record_quorum_state(tagged.iter().map(|t| &t.iss));
-            let (picked, reopen) = self.select_dispatch_multi_with_reopens(tagged);
+            let (picked, reopen, held_for_capacity) =
+                self.select_dispatch_multi_with_reopens(tagged);
+            // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
+            // the reset at the top of the tick exactly as the single-project path below does.
+            self.held_for_capacity = held_for_capacity;
             // Pool-mode picks (INF-477) win the single-claimant claim BEFORE dispatch; assignee-mode
             // picks dispatch immediately. Build owned routes before the `&mut self` dispatch.
             let mut pool_picks: Vec<TaggedIssue> = Vec::new();
