@@ -743,9 +743,9 @@ impl Orchestrator {
     /// it (INF-318). Mirrors Go `dispatchDecisions`.
     async fn dispatch_decisions(&mut self) {
         // What a pass withheld is only ever true of THAT pass, so the tally is RESET here rather
-        // than merely overwritten at its one write site below (STUDIO-802). The single-project
-        // ladder is the only path that fills it, and that path sits behind the multi-project branch
-        // — which has no capacity gate — and two early returns, a missing tracker and a failed
+        // than merely overwritten at either write site below (STUDIO-802; STUDIO-803 added the
+        // multi-project one). Both ladders now fill it, but each sits behind a branch — and the
+        // single-project one behind two further early returns, a missing tracker and a failed
         // candidate fetch. Overwriting alone would therefore leave a Linear outage re-serving the
         // last successful tick's answer for as long as the outage lasted, which matters once
         // something re-arms the tick on a non-empty tally.
@@ -765,7 +765,11 @@ impl Orchestrator {
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
             // the quorum off (§0.12).
             self.record_quorum_state(tagged.iter().map(|t| &t.iss));
-            let (picked, reopen) = self.select_dispatch_multi_with_reopens(tagged);
+            let (picked, reopen, held_for_capacity) =
+                self.select_dispatch_multi_with_reopens(tagged);
+            // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
+            // the reset at the top of the tick exactly as the single-project path below does.
+            self.held_for_capacity = held_for_capacity;
             // Pool-mode picks (INF-477) win the single-claimant claim BEFORE dispatch; assignee-mode
             // picks dispatch immediately. Build owned routes before the `&mut self` dispatch.
             let mut pool_picks: Vec<TaggedIssue> = Vec::new();
@@ -1550,9 +1554,12 @@ mod tests {
     // the OTel bridge + those spans.
     /// The capacity tally is only ever true of the pass that produced it, so a tick whose
     /// candidate fetch FAILS must not leave the previous tick's answer standing (STUDIO-802).
-    /// The single-project ladder is the only writer and it sits behind that early return, so
-    /// clearing at the write site alone would re-serve a stale map for the length of a Linear
-    /// outage — and a stale non-empty map is exactly what a later re-arm would keep firing on.
+    /// Every writer sits behind a branch a failing tick never reaches — the multi-project ladder
+    /// inside `has_projects` (STUDIO-803), the single-project one inside its `else` plus two
+    /// further early returns, a missing tracker and this failed fetch — so clearing at the write
+    /// sites alone would re-serve a stale map for the length of a Linear outage, and a stale
+    /// non-empty map is exactly what a later re-arm would keep firing on. This test drives the
+    /// single-project path, the only one whose early returns a failing fetch can reach.
     #[tokio::test]
     async fn a_failed_candidate_fetch_clears_the_capacity_tally() {
         let mut tr = Fake::new();
