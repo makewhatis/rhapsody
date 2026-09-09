@@ -596,6 +596,42 @@ describe("failureSubLabel", () => {
   });
 });
 
+// STUDIO-792's "52 for a moment, then back to 50", reproduced as arithmetic. The Jobs list is the
+// UNION of two differently-bounded sets: the issue page, capped at the store's DEFAULT_RUN_LIMIT of
+// 50, and the live snapshot, which is capped by nothing. A ticket that is running but absent from
+// the page the client is holding therefore ADDS a row — and stops adding it the moment the run
+// ends, which is the flicker back down. Paging cannot remove this; it can only stop the truncation
+// underneath it being silent, which is what STUDIO-792 does.
+describe("mergeJobs over a truncated issue page", () => {
+  const page = Array.from({ length: 50 }, (_, i) =>
+    summary({
+      id: 1000 + i,
+      issue_identifier: `PAGE-${i}`,
+      outcome: "completed",
+      started_at: todayAt(9, i),
+    }),
+  );
+
+  it("floats above the page size for every live ticket the page does not carry", () => {
+    const s = state({
+      running: [
+        runningSession({ run_id: 5001, issue_identifier: "OLD-1" }),
+        runningSession({ run_id: 5002, issue_identifier: "OLD-2" }),
+      ],
+    });
+    // 50 stored rows + 2 live tickets that are not among them.
+    expect(mergeJobs(s, page, PROJECTS, NOW)).toHaveLength(52);
+    // Both runs end: they leave the live snapshot, and the stale page never carried them.
+    expect(mergeJobs(state(), page, PROJECTS, NOW)).toHaveLength(50);
+  });
+
+  it("stays at the page size once the page itself carries the live tickets", () => {
+    const s = state({ running: [runningSession({ run_id: 1049, issue_identifier: "PAGE-49" })] });
+    // The live row and the stored row are the same ticket, so the group collapses.
+    expect(mergeJobs(s, page, PROJECTS, NOW)).toHaveLength(50);
+  });
+});
+
 describe("matchFilter", () => {
   const rows = mergeJobs(
     state({ running: [runningSession({ run_id: 1, issue_identifier: "RUN-1" })] }),
