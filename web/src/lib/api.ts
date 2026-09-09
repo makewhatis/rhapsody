@@ -171,6 +171,15 @@ export interface IssueRun extends RunSummary {
   // a daemon that simply could not resolve one. The client must therefore treat absence as "ask the
   // live roster instead", not as "unassigned".
   assignee?: string;
+  // True when this ticket's own job is to REVIEW a teammate's pull request (STUDIO-780) — a ticket
+  // the daemon's review quorum minted and marked with `rhapsody:review-ticket`.
+  //
+  // Only the POSITIVE is ever sent. An ordinary ticket, a ticket the daemon could not classify, and
+  // a review ticket minted before the marker existed all carry NO field, because all three mean the
+  // same thing to a client: say about this row what you said before the field existed. That is why
+  // this one is not shaped like `lifecycle`/`assignee` above, where absence is a distinguishable
+  // third answer — here there is nothing a client could do differently.
+  review_ticket?: boolean;
 }
 
 // IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —

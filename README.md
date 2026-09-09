@@ -244,6 +244,22 @@ The lookup shares the lifecycle decoration's shape exactly: off the control loop
 best-effort, and unable to fail the listing. Before it, the console read the assignee from the LIVE
 Teams roster, so the column went blank the moment a run finished.
 
+`GET /api/v1/history/issues` carries a fourth optional field, `review_ticket` — `true` when this
+ticket's own job is to REVIEW a teammate's pull request, rather than to produce work of its own
+(STUDIO-780). The console needs it to say "reviewing" where it would otherwise say "in review": a
+review ticket with an agent on it and an implementation ticket parked awaiting somebody's verdict
+are two different claims that read identically without it. The signal is a `rhapsody:review-ticket`
+marker label the review quorum writes onto every review ticket it MINTS — a fact recorded by the
+daemon, never the `Review: ` title prefix, which is a convention the quorum happens to follow and
+which would mislabel a hand-written ticket that opens with the word. Only the POSITIVE is
+serialized: an ordinary ticket, one the tracker could not be asked about, and a review ticket minted
+before the marker existed all carry no field, because all three mean the same thing to a client.
+The lookup shares the assignee decoration's shape exactly — the same by-id label read, off the
+control loop, TTL-cached, best-effort, unable to fail the listing — and costs at most one label
+batch per TTL window per page anyone is actually looking at. The marker is forward-only: nothing
+backfills a review ticket created before it, because the only way to identify one is the title
+heuristic this exists to avoid.
+
 The day boundary for `/history/summary` is **local, not UTC**: the caller sends its own local
 midnight as `since` (the dashboard does), and omitting it falls back to the daemon host's local
 midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would

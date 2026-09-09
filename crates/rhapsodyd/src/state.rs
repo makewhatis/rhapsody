@@ -152,6 +152,13 @@ impl StateProvider for DaemonState {
         self.handle.issue_lifecycles(ids).await
     }
 
+    async fn review_tickets(&self, ids: &[String]) -> std::collections::HashSet<String> {
+        // Off-loop and best-effort on the same terms (STUDIO-780): the handle resolves the review
+        // marker from its own TTL memo and the reads cell's tracker, and answers nothing for the
+        // rest — which the console reads exactly as "not a review ticket".
+        self.handle.review_tickets(ids).await
+    }
+
     fn run_transcript(&self, run_id: i64) -> Option<Vec<LogEntry>> {
         // Go's `([]agent.LogEntry, bool)` → `Option`: `found == false` (no such run row) is `None`.
         let (entries, found) = self.handle.run_transcript(run_id);

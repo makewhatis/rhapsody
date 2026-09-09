@@ -118,6 +118,29 @@ use crate::triage::MANAGER_IDENTITY;
 /// documented silent no-op in the capabilities registry.
 pub const QUORUM_REQUESTED_LABEL: &str = "rhapsody:quorum-requested";
 
+/// The marker every review ticket the quorum MINTS carries, beside the `rhapsody:@<reviewer>` label
+/// that routes it (STUDIO-780).
+///
+/// It records a fact nothing else in the system records: that this ticket's whole job is to review
+/// somebody else's work. The console needs it to say "reviewing" where it would otherwise say
+/// "in review" — two different claims that read identically today — and the only alternative on
+/// offer was sniffing the `Review: ` title prefix, which is a CONVENTION this module happens to
+/// follow ([`review_title`]) and not a fact: a hand-written ticket whose title starts with that
+/// word would be mislabelled, silently and forever.
+///
+/// A LABEL for exactly [`QUORUM_REQUESTED_LABEL`]'s reasons — Linear is the ledger, labels are
+/// additive, and the record outlives the daemon that wrote it. It sits in the same `rhapsody:`
+/// namespace; `review-ticket` cannot collide with an identity (those carry the `@`) and an unknown
+/// `rhapsody:*` label is a documented silent no-op in the capabilities registry, so a daemon that
+/// predates this simply ignores it.
+///
+/// **Forward-only, deliberately.** It is written at creation, so review tickets minted before this
+/// existed carry nothing and the console reads them exactly as it did before — the same degradation
+/// every other best-effort decoration on that listing takes. Backfilling is not possible without the
+/// very title heuristic this exists to avoid; an operator who wants an old review ticket relabelled
+/// can add the label by hand.
+pub const REVIEW_TICKET_LABEL: &str = "rhapsody:review-ticket";
+
 /// The ceiling on the failure back-off, [`crate::triage::MAX_TRIAGE_BACKOFF_MS`]'s value and its
 /// reason: a tracker outage settles at one attempt per 15 minutes rather than a hot retry loop.
 pub const MAX_QUORUM_BACKOFF_MS: i64 = 15 * 60 * 1000;
@@ -461,7 +484,14 @@ where
             description: review_description(req, reviewer),
             state_name: req.state_name.clone(),
             assignee_id: assignee.clone(),
-            labels: vec![format!("{IDENTITY_LABEL_PREFIX}{reviewer}")],
+            // The identity label IS the assignment (§0.11.1); the marker records what KIND of
+            // ticket this is (STUDIO-780). Both go through `create_issue`'s all-or-nothing
+            // resolution, so a workspace that will not mint the marker refuses the whole ticket
+            // rather than producing one the console cannot classify.
+            labels: vec![
+                format!("{IDENTITY_LABEL_PREFIX}{reviewer}"),
+                REVIEW_TICKET_LABEL.to_string(),
+            ],
         };
         match tracker.create_issue(&spec).await {
             Ok(identifier) => {
@@ -1401,7 +1431,14 @@ mod tests {
                 s.assignee_id, "viewer-1",
                 "unassigned tickets are never picked up"
             );
-            assert_eq!(s.labels, vec![format!("rhapsody:@{reviewer}")]);
+            assert_eq!(
+                s.labels,
+                vec![
+                    format!("rhapsody:@{reviewer}"),
+                    REVIEW_TICKET_LABEL.to_string()
+                ],
+                "the reviewer's identity routes it; the marker says what kind of ticket it is",
+            );
             assert_eq!(s.title, "Review: MT-1 do the thing");
             assert!(
                 s.description.contains("https://github.com/o/r/pull/7"),

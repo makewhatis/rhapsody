@@ -143,6 +143,9 @@
 .rh-console .pill .d { width: 6px; height: 6px; border-radius: 50%; }
 .rh-console .pill.run { color: var(--ok); background: rgba(99, 192, 122, .12); }
 .rh-console .pill.run .d { background: var(--ok); }
+/* `reviewing` — an agent DOING a review, which is neither `run` nor `review` (STUDIO-780). */
+.rh-console .pill.reviewing { color: var(--reviewing); background: var(--reviewing-soft); }
+.rh-console .pill.reviewing .d { background: var(--reviewing); }
 .rh-console .pill.review { color: var(--accent); background: var(--accent-soft); }
 .rh-console .pill.review .d { background: var(--accent); }
 .rh-console .pill.queued { color: var(--ink-3); background: var(--panel-2); }
