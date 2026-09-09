@@ -3753,14 +3753,16 @@ describe("the Result card matches the approved prototype through the cascade (ST
   //     ignores specificity. Load them alphabetically and a rule that legitimately wins in every
   //     real engine can lose here, so the order has to mirror production or the test lies.
   //
-  // Taken from the emitted `crates/httpapi/web-dist/assets/index-*.css`: `main.tsx`'s own imports
-  // lead, then each view's in module-graph order. `tokens.css` is first and declares `:root` only.
+  // Taken by measuring each file's first uniquely-owned selector in the emitted
+  // `crates/httpapi/web-dist/assets/index-*.css`: `main.tsx`'s own imports lead, then each view's
+  // in module-graph order. `tokens.css` is first, and scopes its palette under `.rh-console`
+  // rather than `:root` so it cannot repaint the Podium screens (see that file's own header).
   const SHEETS = [
     "tokens.css",
     "console.css",
     "console-views.css",
-    "teams-console.css",
     "markdown.css",
+    "teams-console.css",
     "console-firstrun.css",
     "console-trace.css",
     "console-manage.css",
