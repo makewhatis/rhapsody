@@ -982,10 +982,17 @@ function ResultCardZone({
   const lead = cardLead(result);
   return (
     <div className={eyebrow.tone === "done" ? "trrc" : `trrc ${eyebrow.tone}`}>
-      <div className="bar" />
+      <div className="trbar" />
       <div className="in">
         <div className="body">
-          <div className="eyebrow">{eyebrow.text}</div>
+          <div className="eyebrow">
+            {/* The prototype's status dot. It is an ELEMENT drawn in CSS rather than a `●` typed
+                into the string, so the eyebrow's text stays exactly the outcome label: a glyph in
+                there would be read out as part of the accessible name and would break the
+                assertion that pins that label. */}
+            <span className="trdot" aria-hidden="true" />
+            {eyebrow.text}
+          </div>
           {/* §3B's failed/stopped banner. It comes off the RUN ROW, not the transcript, so it is
               the one thing this card can state before the transcript arrives — and the one thing
               it must not drop when a run hands off and only then dies. */}
@@ -1018,11 +1025,11 @@ function ResultCardZone({
               <h2>{result.headline}</h2>
               {lead === "" ? null : <Markdown source={lead} />}
               {result.sections.map((section, i) => (
-                <div className="sect" key={`${i}:${section.heading}`}>
+                <div className="trsect" key={`${i}:${section.heading}`}>
                   <div className="lab">{section.label}</div>
                   {/* The author's OWN heading beside the model's label: the label is this
                       console's reading of it, and the operator can see what was written. */}
-                  <div className="head">{section.heading}</div>
+                  <div className="trshd">{section.heading}</div>
                   <Markdown source={section.body} />
                 </div>
               ))}

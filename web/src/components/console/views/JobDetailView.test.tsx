@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -1113,25 +1113,25 @@ describe("zone B — the Result card (§3B)", () => {
   it("renders the hand-off body as markdown, in the model's labelled sub-blocks", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
     mountDetail([run({ id: 547 })]);
-    await waitFor(() => expect(document.querySelectorAll(".trrc .sect")).toHaveLength(3));
+    await waitFor(() => expect(document.querySelectorAll(".trrc .trsect")).toHaveLength(3));
     const rc = document.querySelector(".trrc") as HTMLElement;
 
     // The model's label, and beside it the author's own heading, kept verbatim.
-    expect([...rc.querySelectorAll(".sect .lab")].map((el) => el.textContent)).toEqual([
+    expect([...rc.querySelectorAll(".trsect .lab")].map((el) => el.textContent)).toEqual([
       "What changed",
       "How verified",
       "Follow-ups",
     ]);
-    expect([...rc.querySelectorAll(".sect .head")].map((el) => el.textContent)).toEqual([
+    expect([...rc.querySelectorAll(".trsect .trshd")].map((el) => el.textContent)).toEqual([
       "What changed",
       "Verification",
       "Follow-ups",
     ]);
 
     // Markdown, not its syntax: bold renders, the fence renders as a scrollable code box.
-    expect(rc.querySelector(".sect strong")?.textContent).toBe("thumbnails");
+    expect(rc.querySelector(".trsect strong")?.textContent).toBe("thumbnails");
     expect(rc.querySelector("pre.mdpre")?.textContent).toBe("cargo test --workspace");
-    expect(rc.querySelector(".sect li")?.textContent).toBe("HEIC is still unsupported");
+    expect(rc.querySelector(".trsect li")?.textContent).toBe("HEIC is still unsupported");
     expect(rc.textContent).not.toContain("**");
   });
 
@@ -1256,7 +1256,7 @@ describe("zone B — the Result card (§3B)", () => {
     });
     mountDetail([run({ id: 547 })]);
     await waitFor(() => expect(document.querySelector(".trrc h2")?.textContent).toBeTruthy());
-    expect(document.querySelector(".trrc .sect")).toBeNull();
+    expect(document.querySelector(".trrc .trsect")).toBeNull();
   });
 });
 
@@ -3724,5 +3724,243 @@ describe("external links leave the app through the openExternal seam (STUDIO-765
     await waitFor(() => expect(panel().querySelector(".trrev .pr")).toBeTruthy());
     expect(clickLink(panel().querySelector(".trrev .pr") as Element)).toBe(false);
     expect(h.openExternal).toHaveBeenCalledWith("https://github.com/makewhatis/rhapsody/pull/105");
+  });
+});
+
+// STUDIO-817 — the Result card against the approved prototype, read through the CASCADE.
+//
+// Every other CSS assertion in this file `readFileSync`s ONE theme file and matches its text, so
+// none of them can see what a DIFFERENT file also matches on the same element. That is exactly how
+// the bug this block pins shipped green: `.rh-console .trrc .bar` was individually correct, while
+// `memory.css`'s generic `.rh-console .bar` — the Memory page's sticky filter bar — put padding, a
+// border, a radius, a margin and `position: sticky` on the same 3px accent. `console-trace.css`
+// had already renamed `.trrc`, `.trfilter`, `.trbanner` and `.trskel` for this very reason.
+//
+// So these tests load the WHOLE theme layer into the document and assert COMPUTED style on the
+// really-rendered card. jsdom applies the cascade, which is what makes a cross-file collision
+// observable here and unobservable in a single-file string match. It does NOT resolve `var()`,
+// so a token-valued property reads back as its literal `var(--x)` text — which still names the
+// winning declaration, and that is all these assertions need.
+describe("the Result card matches the approved prototype through the cascade (STUDIO-817)", () => {
+  const styles: HTMLStyleElement[] = [];
+
+  // EVERY theme file, not just the card's own — the collision is by definition in what ELSE
+  // matches — and IN THE ORDER THE BUNDLE CONCATENATES THEM. Both halves matter:
+  //
+  //   * All of them, because `ConsoleApp` imports these views statically. One bundled stylesheet
+  //     carries every file below on every console page load; there is no build serving a subset.
+  //   * In this order, because jsdom's `getComputedStyle` cascades by DOCUMENT ORDER ALONE and
+  //     ignores specificity. Load them alphabetically and a rule that legitimately wins in every
+  //     real engine can lose here, so the order has to mirror production or the test lies.
+  //
+  // Taken by measuring each file's first uniquely-owned selector in the emitted
+  // `crates/httpapi/web-dist/assets/index-*.css`: `main.tsx`'s own imports lead, then each view's
+  // in module-graph order. `tokens.css` is first, and scopes its palette under `.rh-console`
+  // rather than `:root` so it cannot repaint the Podium screens (see that file's own header).
+  const SHEETS = [
+    "tokens.css",
+    "console.css",
+    "console-views.css",
+    "markdown.css",
+    "teams-console.css",
+    "console-firstrun.css",
+    "console-trace.css",
+    "console-manage.css",
+    "memory.css",
+    "console-reviews.css",
+    "console-settings-tabs.css",
+    "console-workflow.css",
+  ];
+
+  beforeAll(() => {
+    const dir = path.resolve(__dirname, "../../../theme");
+    // A theme file added later must not be silently dropped from the cascade under test — that
+    // would quietly restore exactly the blind spot this block exists to remove.
+    const onDisk = readdirSync(dir)
+      .filter((f) => f.endsWith(".css"))
+      .sort();
+    expect([...SHEETS].sort()).toEqual(onDisk);
+
+    for (const file of SHEETS) {
+      const el = document.createElement("style");
+      el.textContent = readFileSync(path.join(dir, file), "utf8");
+      document.head.append(el);
+      styles.push(el);
+    }
+    // The console scopes its whole theme under `.rh-console`; the test harness renders the view
+    // bare. Without this every rule below fails to match and every assertion passes vacuously.
+    document.body.classList.add("rh-console");
+  });
+
+  afterAll(() => {
+    for (const el of styles) el.remove();
+    styles.length = 0;
+    document.body.classList.remove("rh-console");
+  });
+
+  async function card(): Promise<HTMLElement> {
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 547,
+      generated_at: "",
+      // Plus the handoff call, so the eyebrow reads the full "done · handed off" label whose
+      // `textContent` this ticket's acceptance requires to survive the status dot landing.
+      entries: [
+        ...COMPLETED,
+        entry({ seq: 13, kind: "tool_use", tool: "mcp__symphony__symphony_handoff", text: "{}" }),
+      ],
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await waitFor(() => expect(document.querySelector(".trrc .eyebrow")).toBeTruthy());
+    return document.querySelector(".trrc") as HTMLElement;
+  }
+
+  // jsdom reports a property NO rule sets as the empty string — it does not synthesise CSS initial
+  // values. So `""` below is the strong form of the assertion: not "this element was reset back to
+  // the default", but "nothing in the entire theme layer declares this property on this element".
+  // It flips the moment a generic rule matches the element again, which is the regression guarded.
+  const UNSET = "";
+
+  // Guards the guard: if the theme never reached the element, everything below is vacuous.
+  it("has the theme layer actually applying to the rendered card", async () => {
+    const rc = await card();
+    // A property only `console-trace.css` sets on `.trrc`, with a literal value jsdom can report.
+    expect(getComputedStyle(rc).overflow).toBe("hidden");
+  });
+
+  // §1 of the ticket. `.rh-console .trrc .bar` (0,3,0) beat `.rh-console .bar` (0,2,0) on `height`
+  // and `background` only, so the accent still CLAIMED 3px while inheriting everything the generic
+  // rule set and it did not reset — including `position: sticky`, on a decorative 3px rule.
+  it("draws the accent as a 3px hairline flush to the card's top edge", async () => {
+    const rc = await card();
+    const accent = rc.firstElementChild as HTMLElement;
+    const cs = getComputedStyle(accent);
+
+    // Proves the trace rule still matches this element, so the UNSET assertions below are about
+    // the generic rule no longer matching — not about the accent having lost its own styling.
+    expect(cs.height).toBe("3px");
+    // And the FILL, pinned separately from the geometry: a 3px element with no background is an
+    // invisible accent — this symptom back — and `height` alone cannot see that. Each of the
+    // three fills this card is judged on gets its own assertion, because a rule losing ONE
+    // declaration is at least as likely a future edit as a rule being removed or renamed, and
+    // the fills are the property the ticket was actually filed about.
+    expect(cs.background).toBe("var(--done)");
+    // The acceptance criteria, one property each: no padding, no radius, no margin, not sticky.
+    expect(cs.padding).toBe(UNSET);
+    expect(cs.borderRadius).toBe(UNSET);
+    expect(cs.marginBottom).toBe(UNSET);
+    expect(cs.position).toBe(UNSET);
+    expect(cs.zIndex).toBe(UNSET);
+    // `.rh-console .bar` is `display:flex`; a plain div falls back to the UA stylesheet's block.
+    expect(cs.display).toBe("block");
+  });
+
+  // §2. The prototype puts the dot in the text (`"● done · handed off"`); doing that here would
+  // both break the `textContent` assertion above and push a decorative glyph into the accessible
+  // name. It is a separate `aria-hidden` element drawn in CSS instead, so the label stays clean.
+  it("renders the status dot beside the eyebrow without entering the accessible name", async () => {
+    const rc = await card();
+    const eyebrow = rc.querySelector(".eyebrow") as HTMLElement;
+    const dot = eyebrow.querySelector(".trdot") as HTMLElement;
+
+    expect(dot).toBeTruthy();
+    expect(dot.getAttribute("aria-hidden")).toBe("true");
+    // The dot is DRAWN, not typed: an empty element with a border-radius. This is what keeps
+    // `textContent` exactly the label, which the "says a run handed off" test above still pins.
+    expect(dot.textContent).toBe("");
+    expect(eyebrow.textContent).toBe("done · handed off");
+    expect(getComputedStyle(dot).borderRadius).toBe("50%");
+    // The fill is the dot: an empty 6px element with no background renders as nothing at all, so
+    // the "missing status dot" symptom would be back with the element still in the DOM and every
+    // other assertion here green.
+    //
+    // Read through `backgroundColor`, NOT the `background` shorthand the two tests around this one
+    // use, because jsdom treats the two token forms differently — measured, not assumed:
+    //
+    //   background: var(--done)     ->  background=[var(--done)]  backgroundColor=[rgba(0,0,0,0)]
+    //   background: currentColor    ->  background=[]             backgroundColor=[var(--done)]
+    //
+    // `var()` is kept verbatim and the shorthand survives; `currentColor` is RESOLVED against the
+    // element's own computed `color`, which under the full theme is itself the unresolved
+    // `var(--done)` inherited from `.eyebrow` — so the longhand carries it and the shorthand,
+    // unable to reassemble itself from a component it cannot parse, comes back empty.
+    //
+    // The consequence is that this assertion also discriminates `currentColor` from a hard-coded
+    // `var(--done)`: swapping the declaration to the literal reds this test (it moves the value
+    // out of the longhand), which matters because `.trrc.fail` and `.trrc.stop` recolour the dot
+    // through `currentColor` alone, having no `.trdot` rule of their own. The equality is the
+    // readable half; the concrete token stops the pair passing vacuously if both sides were "".
+    expect(getComputedStyle(dot).backgroundColor).toBe(getComputedStyle(eyebrow).color);
+    expect(getComputedStyle(dot).backgroundColor).toBe("var(--done)");
+    // The prototype's `.eyebrow{display:flex;align-items:center;gap:8px}` — the gap IS the spacing
+    // between dot and text, and the shipped rule had neither half.
+    const cs = getComputedStyle(eyebrow);
+    expect(cs.display).toBe("flex");
+    expect(cs.gap).toBe("8px");
+  });
+
+  // Same bug class as §1, found by the audit the ticket asks for, and IN this card: the hand-off
+  // body's `.sect`/`.head` collided with `console-manage.css`'s bare `.rh-console .sect` (a
+  // bordered 820px panel) and `console-views.css`'s bare `.rh-console .head` (a flex row).
+  it("keeps the hand-off sections free of the generic panel and header rules", async () => {
+    const rc = await card();
+    const sect = rc.querySelector(".trsect") as HTMLElement;
+    expect(sect).toBeTruthy();
+
+    const cs = getComputedStyle(sect);
+    // `.rh-console .sect` is a bordered, rounded, panel-filled, 820px-capped, clipped box.
+    expect(cs.maxWidth).toBe(UNSET);
+    expect(cs.borderRadius).toBe(UNSET);
+    expect(cs.overflow).toBe(UNSET);
+    expect(cs.marginBottom).toBe(UNSET);
+
+    // `.rh-console .head` is `display:flex;gap:14px` — on a one-line section heading.
+    const head = sect.querySelector(".trshd") as HTMLElement;
+    expect(head).toBeTruthy();
+    expect(getComputedStyle(head).display).toBe("block");
+    expect(getComputedStyle(head).gap).toBe(UNSET);
+    // The heading keeps its OWN rule, so the two assertions above are about the collision only.
+    expect(getComputedStyle(head).marginBottom).toBe("4px");
+  });
+
+  // §3, and the scope decision it demands. `.chip` is the console-wide primitive, and the shipped
+  // white pressed fill is the ACCEPTED STUDIO-681 shell's own design (that prototype renders the
+  // room's filter row with `aria-pressed="true"` and styles it `var(--ink)`). So the trace filter
+  // takes a scoped override to this view's prototype teal rather than the console-wide rule moving.
+  it("gives the pressed trace filter chip the accent, leaving the console-wide chip alone", async () => {
+    const rc = await card();
+    const pressed = document.querySelector('.trfilter .chip[aria-pressed="true"]') as HTMLElement;
+    expect(pressed).toBeTruthy();
+
+    const cs = getComputedStyle(pressed);
+    // jsdom keeps the unresolved token text, which names the winning declaration exactly.
+    // The FILL first: this is David's literal complaint ("the All, Edits, … items are white"), and
+    // it is the one property here with a LOSING declaration waiting underneath it — drop this one
+    // line from the override and `console.css`'s console-wide `var(--ink)` takes the element back,
+    // silently, with the border and text colour still teal. Nothing else in this test sees that.
+    expect(cs.background).toBe("var(--operator)");
+    expect(cs.borderColor).toBe("var(--operator)");
+    // The prototype's on-teal foreground, which the port publishes as a token.
+    expect(cs.color).toBe("var(--operator-ink)");
+    // Still bold: the override changes the three colour declarations, not the whole treatment.
+    expect(cs.fontWeight).toBe("600");
+
+    // The blast radius, asserted rather than assumed: a pressed chip that is NOT a trace filter
+    // must keep the console-wide white fill this ticket deliberately did not move.
+    const other = document.createElement("button");
+    other.className = "chip";
+    other.setAttribute("aria-pressed", "true");
+    rc.append(other);
+    // The fill again, and here it is the property that proves `console.css:101` did NOT move —
+    // the decision this PR states in prose and which nothing else pins.
+    expect(getComputedStyle(other).background).toBe("var(--ink)");
+    expect(getComputedStyle(other).borderColor).toBe("var(--ink)");
+    expect(getComputedStyle(other).color).toBe("rgb(17, 17, 17)");
+    other.remove();
+
+    // The unpressed chips are NOT white — the ticket's suspected "second, separate collision" does
+    // not exist. `console.css`'s `--ink-2` grey wins on them, with nothing else matching.
+    const off = document.querySelector('.trfilter .chip[aria-pressed="false"]') as HTMLElement;
+    expect(getComputedStyle(off).color).toBe("var(--ink-2)");
   });
 });
