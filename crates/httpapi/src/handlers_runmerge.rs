@@ -9,8 +9,9 @@
 //! reaches cannot be fired by a link somebody clicks, and `the_route_is_post_only` pins exactly
 //! that. Serving a GET there would move the guarantee from the routing table into the body of a
 //! handler someone has to read. The read's own safety is the same kind of statement one level
-//! down: it calls `run_mergeability`, whose whole call graph never touches the merge seam
-//! (`runmerge::resolve_pull_request`), so there is no branch through it that merges anything.
+//! down: it calls `run_mergeability`, which hands on `runmerge::ResolveDeps` and never the whole
+//! `MergeDeps` — so nothing in its call graph HAS a `MergeSource` to call, and there is no branch
+//! through it that merges anything.
 //!
 //! **No Go v0.4.0 counterpart, and no capture fixture** — the additive shape `/api/v1/reviews` and
 //! `/api/v1/teams/*` established. It IS a new served route, so it carries a README Divergences
