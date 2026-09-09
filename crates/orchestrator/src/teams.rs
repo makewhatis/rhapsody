@@ -181,33 +181,75 @@ impl Routed {
 /// [`Orchestrator::running`] (§3.1). It is a read of Rhapsody's own state, never
 /// a copy the router owns and never a thing the router can mutate — the router
 /// "holds no idea of what is in flight" beyond this borrow.
+///
+/// TWO counts, partitioned rather than filtered. `all` counts every live run; `implementation`
+/// drops the review runs, so a teammate at their implementation cap can still be handed a review.
+///
+/// The partition is **additive on purpose**. Both reviewer rankers read the all-runs count and say
+/// in their own doc comments that they depend on it — [`crate::reviewwatch`] ("a review dispatched
+/// a moment ago is already in `running`, so the SECOND round of this tick sees somebody else") and
+/// [`crate::reviewintro`] — because both feed [`crate::quorum::rank_reviewers`], which picks the
+/// least-loaded teammate. Filtering reviews out of the all-runs count in place would silently
+/// revert STUDIO-721 rather than fail loudly, so the review-free count lives beside it instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LoadSnapshot(HashMap<String, i64>);
+pub(crate) struct LoadSnapshot {
+    /// Every live run stamped with an identity, review runs included.
+    all: HashMap<String, i64>,
+    /// The same, less the runs [`is_review_run`] answers for.
+    implementation: HashMap<String, i64>,
+}
 
 impl LoadSnapshot {
     /// Counts the live runs already stamped with each identity. The run being
     /// dispatched is NOT in `running` yet, so it never counts itself.
     pub(crate) fn from_running(running: &HashMap<String, RunningEntry>) -> Self {
-        let mut counts: HashMap<String, i64> = HashMap::new();
+        let mut load = LoadSnapshot::default();
         for re in running.values() {
-            if !re.identity.is_empty() {
-                *counts.entry(re.identity.clone()).or_default() += 1;
+            if re.identity.is_empty() {
+                continue;
+            }
+            *load.all.entry(re.identity.clone()).or_default() += 1;
+            if !is_review_run(re) {
+                *load.implementation.entry(re.identity.clone()).or_default() += 1;
             }
         }
-        LoadSnapshot(counts)
+        load
     }
 
-    /// Live runs for `name`; absent ⇒ 0.
+    /// Live runs for `name`, review runs included; absent ⇒ 0.
     fn live(&self, name: &str) -> i64 {
-        self.0.get(name).copied().unwrap_or(0)
+        self.all.get(name).copied().unwrap_or(0)
     }
 
-    /// The raw per-identity counts, for the reviewer ranking in [`crate::quorum::rank_reviewers`]
-    /// — which is shared with the quorum's own `rhapsody:@` label load and therefore takes the map
-    /// rather than this wrapper (STUDIO-721).
-    pub(crate) fn counts(&self) -> &HashMap<String, i64> {
-        &self.0
+    /// Live IMPLEMENTATION runs for `name` — [`live`](Self::live) less the reviews; absent ⇒ 0.
+    /// This is the count the capacity gates read, so a review never consumes implementation
+    /// capacity.
+    pub(crate) fn impl_live(&self, name: &str) -> i64 {
+        self.implementation.get(name).copied().unwrap_or(0)
     }
+
+    /// The raw per-identity ALL-runs counts, for the reviewer ranking in
+    /// [`crate::quorum::rank_reviewers`] — which is shared with the quorum's own `rhapsody:@` label
+    /// load and therefore takes the map rather than this wrapper (STUDIO-721).
+    pub(crate) fn counts(&self) -> &HashMap<String, i64> {
+        &self.all
+    }
+}
+
+/// Whether this run is a REVIEW rather than implementation work.
+///
+/// The two review paths are distinguishable *differently*, so this is a union and checking either
+/// half alone miscounts the other path:
+///
+/// * `re.review` is `Some` only on the **ticketless** path ([`crate::review`], [`crate::retry`]),
+///   where no review ticket exists at all so no label could identify the run.
+/// * the **quorum** path dispatches a real tracker ticket carrying
+///   [`REVIEW_TICKET_LABEL`](crate::quorum::REVIEW_TICKET_LABEL).
+///
+/// The label half delegates to [`crate::lifecycle::is_review_ticket`] rather than re-spelling the
+/// comparison, so the two predicates cannot drift apart.
+pub(crate) fn is_review_run(re: &RunningEntry) -> bool {
+    re.review.is_some() || crate::lifecycle::is_review_ticket(&re.issue)
 }
 
 /// Routes one already-selected, already-slotted issue to a teammate (§3.1).
@@ -363,8 +405,12 @@ fn best_by_label_overlap(teams: &Teams, iss: &Issue, load: &LoadSnapshot) -> Opt
 /// rather than a candidate. Capping either of those could only ever move an
 /// explicitly-assigned ticket to somebody else; it could never make the work
 /// wait, because there is no variant of [`Routed`] that can hold work.
+///
+/// The cap counts IMPLEMENTATION runs only ([`LoadSnapshot::impl_live`]), so a review never
+/// consumes it: reviews draw from their own counter, and a teammate at their implementation cap
+/// can still be handed one.
 pub(crate) fn at_capacity(i: &Identity, load: &LoadSnapshot) -> bool {
-    i.max_concurrent > 0 && load.live(&i.name) >= i.max_concurrent
+    i.max_concurrent > 0 && load.impl_live(&i.name) >= i.max_concurrent
 }
 
 /// The one paragraph that teaches `teams_post` (STUDIO-675).
@@ -841,8 +887,16 @@ mod tests {
         }
     }
 
+    /// A load snapshot in which every teammate's runs are IMPLEMENTATION runs — the shape the
+    /// routing tests below mean, since the capacity gate reads the implementation count and the
+    /// overlap tie-break reads the all-runs one.
     fn load_of(counts: &[(&str, i64)]) -> LoadSnapshot {
-        LoadSnapshot(counts.iter().map(|(n, c)| ((*n).to_string(), *c)).collect())
+        let counts: HashMap<String, i64> =
+            counts.iter().map(|(n, c)| ((*n).to_string(), *c)).collect();
+        LoadSnapshot {
+            all: counts.clone(),
+            implementation: counts,
+        }
     }
 
     /// §3.2 Tier 0: a `rhapsody:@<name>` label naming a roster member wins
@@ -1000,6 +1054,38 @@ mod tests {
         assert_eq!(r.reason, RouteReason::Label);
     }
 
+    /// D2 at the gate the router actually consults, and the exact inverse of
+    /// [`max_concurrent_skips_to_the_next_best_and_never_queues`]: alice has the better overlap and
+    /// `max_concurrent: 1`, but her one live run is a REVIEW. Were it counted she would be filtered
+    /// out and bob would take the ticket on the worse overlap; because reviews are free she keeps
+    /// it. Built from `running` rather than [`load_of`] so the partition itself is under test.
+    #[test]
+    fn a_review_does_not_consume_a_teammates_implementation_capacity() {
+        let teams = teams_with(vec![
+            ident("alice", &["rust", "async"], 1),
+            ident("bob", &["rust"], 0),
+        ]);
+        let mut reviewing = RunningEntry::empty(issue("i1", "MT-1", "Todo"));
+        reviewing.identity = "alice".to_string();
+        reviewing.review = Some(crate::review::ReviewRun::default());
+        let running: HashMap<String, RunningEntry> =
+            [("i1".to_string(), reviewing)].into_iter().collect();
+        let load = LoadSnapshot::from_running(&running);
+
+        assert_eq!(
+            load.live("alice"),
+            1,
+            "the all-runs count still sees the review"
+        );
+        let r = route(&teams, &with_labels(&["rust", "async"]), &load);
+        assert_eq!(
+            r.identity.as_deref(),
+            Some("alice"),
+            "a review must not spend alice's `max_concurrent: 1` implementation slot"
+        );
+        assert_eq!(r.reason, RouteReason::LabelOverlap);
+    }
+
     /// §3.4 "fall back, never refuse": nobody overlaps ⇒ `default_identity`.
     #[test]
     fn nobody_fits_falls_back_to_the_default_identity() {
@@ -1149,6 +1235,47 @@ mod tests {
         assert_eq!(load.live("bob"), 1);
         assert_eq!(
             load.live("nobody"),
+            0,
+            "an unknown identity is 0, never a panic"
+        );
+    }
+
+    /// D2: a review draws from neither implementation counter, so a teammate at their cap can
+    /// still be handed one — while the ALL-runs count keeps seeing it, because two reviewer
+    /// rankers depend on that (STUDIO-721). Both review paths are covered: they are
+    /// distinguishable differently and checking either alone miscounts the other.
+    #[test]
+    fn impl_live_excludes_reviews_while_the_all_runs_count_still_includes_them() {
+        let mut impl_run = RunningEntry::empty(issue("i1", "MT-1", "Todo"));
+        impl_run.identity = "alice".to_string();
+
+        // The QUORUM path: a real review ticket, identified by its label.
+        let mut quorum_review = RunningEntry::empty(issue("i2", "MT-2", "Todo"));
+        quorum_review.identity = "alice".to_string();
+        quorum_review.issue.labels = Some(vec![crate::quorum::REVIEW_TICKET_LABEL.to_string()]);
+
+        // The TICKETLESS path: no review ticket exists at all, so no label could identify it.
+        let mut ticketless_review = RunningEntry::empty(issue("i3", "MT-3", "Todo"));
+        ticketless_review.identity = "alice".to_string();
+        ticketless_review.review = Some(crate::review::ReviewRun::default());
+
+        let running: HashMap<String, RunningEntry> = [
+            ("i1".to_string(), impl_run),
+            ("i2".to_string(), quorum_review),
+            ("i3".to_string(), ticketless_review),
+        ]
+        .into_iter()
+        .collect();
+        let load = LoadSnapshot::from_running(&running);
+
+        assert_eq!(load.impl_live("alice"), 1, "reviews are free (D2)");
+        assert_eq!(
+            load.live("alice"),
+            3,
+            "the all-runs count is a shipped invariant — reviewer ranking depends on it"
+        );
+        assert_eq!(
+            load.impl_live("nobody"),
             0,
             "an unknown identity is 0, never a panic"
         );
