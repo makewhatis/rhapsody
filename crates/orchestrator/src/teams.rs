@@ -221,9 +221,11 @@ impl LoadSnapshot {
     /// exactly the window where work piles up, so every capacity question asks this (design §4.4
     /// fix 2).
     ///
-    /// **No run is counted twice.** Both paths that park a retry — `on_worker_exit` and
-    /// `reconcile_run`'s wedged-worker sweep — remove the entry from `running` before scheduling
-    /// it, so a run is in one map or the other and never in both.
+    /// **No run is counted twice.** Both paths that park a RUNNING entry — `on_worker_exit` and
+    /// `reconcile_run`'s wedged-worker sweep — remove it from `running` before scheduling, so a run
+    /// is in one map or the other and never in both. (`on_retry` also writes `retry_attempts`, but
+    /// it requeues an entry that is already parked and removes it first, so a firing retry counts
+    /// against neither map nor against its own re-dispatch.)
     ///
     /// **The review test differs from [`is_review_run`]'s, because a [`RetryEntry`] has no `review`
     /// field to ask.** Both shapes of review can be parked here, and each needs its own half:
@@ -1214,11 +1216,11 @@ mod tests {
             "premise: a ticketless review is NOT identifiable by label"
         );
 
+        let key = iss.id.clone();
         let mut parked = crate::testsupport::retry_entry(&iss.id, &iss.identifier, 1);
         parked.identity = "alice".to_string();
         parked.issue = iss;
-        let retries: HashMap<String, RetryEntry> =
-            [("i1".to_string(), parked)].into_iter().collect();
+        let retries: HashMap<String, RetryEntry> = [(key, parked)].into_iter().collect();
 
         let load = LoadSnapshot::from_running_and_retries(&HashMap::new(), &retries);
 
