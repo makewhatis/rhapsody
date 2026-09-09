@@ -793,3 +793,38 @@ somebody actually made. A refusal answers **200** with `{"mergeable": false, "re
 on a read the refusal is the answer; only a question that could not be answered at all is an error
 (500 `mergeability_unavailable`), and the console keeps Merge live on that, since a `gh` it could
 not reach is not the daemon saying no.
+
+### A review run renders the daemon's own base prompt (STUDIO-798)
+
+Go v0.4.0 has one base prompt per run and renders whatever `prompt`/`prompt_file` names — on a real
+installation, a file inside the repository the agent is working in, read out of its own worktree at
+run time. That is right for an implementer and unsafe for a reviewer: Rhapsody mints review tickets
+whose description is written by the HOST specifically so *"Never merge, and never push to the
+author's branch"* cannot be authored or rewritten by an agent, and then renders that description
+inside `{{ issue.description }}` of a repo-authored template. This repository's own template says
+*"You DO merge your own PR"*, so the one prohibition the quorum design calls non-negotiable was
+arriving inside a longer, more emphatic document that contradicted it — with `gh pr merge` available
+in the reviewer's worktree, no `required_pull_request_reviews` on `main`, and (STUDIO-797) no
+daemon-side verdict gate behind it either.
+
+| Choosing a run's base prompt | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| implementation run | `prompt_file` if set, else the WORKFLOW.md `prompt` body | the same, unchanged |
+| review run | — (no review runs exist) | a base prompt `include_str!`d into the daemon; `prompt_file`/`prompt` are not read at all |
+
+A **review run** is either shape Rhapsody has: a quorum review TICKET (it carries
+`rhapsody:review-ticket`, and is otherwise an ordinary dispatch) or a ticketless PR review (the run
+carries the pull request's coordinates and its issue is synthetic). Either signal selects the host
+prompt; neither can be set by the repository under review.
+
+**What the reviewer is handed instead.** The host prompt states the standing rules of a review run —
+never merge, never push to the author's branch or commit in the workspace, say approve or request
+changes explicitly, read the diff before the summary — and renders the ticket's own
+`{{ issue.description }}` inside them, so a quorum review ticket still says everything it said
+before, now inside a document that agrees with it. Changing that text needs a merged pull request
+and a rebuilt daemon rather than a write into a worktree the agent already owns, which is the whole
+point: the prohibition stays on the trusted side of the line the quorum design drew.
+
+**Implementers are untouched.** The selection is false for every ticket that is not a review, so an
+implementation run reads its configured `prompt_file` exactly as before — including this
+repository's Phase 6 merge instruction, which a test asserts is still rendered.
