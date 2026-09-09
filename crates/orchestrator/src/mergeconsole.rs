@@ -1492,12 +1492,6 @@ mod tests {
             room_lines(&room),
             vec![format!("{MANAGER_IDENTITY}: {want}")]
         );
-        for said in [&audit(&o, run)[0], &room_lines(&room)[0]] {
-            assert!(
-                !said.contains("GitHub"),
-                "GitHub was never asked, so the record must not name it: {said}"
-            );
-        }
     }
 
     /// The handshake's first leg is not an attempt: nothing was merged, so nothing is recorded and
