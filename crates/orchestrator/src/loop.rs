@@ -1554,12 +1554,12 @@ mod tests {
     // the OTel bridge + those spans.
     /// The capacity tally is only ever true of the pass that produced it, so a tick whose
     /// candidate fetch FAILS must not leave the previous tick's answer standing (STUDIO-802).
-    /// Every writer sits behind a branch that such a tick never reaches — the multi-project ladder
-    /// behind `has_projects` (STUDIO-803), the single-project one behind that same branch plus two
-    /// early returns, a missing tracker and this failed fetch — so clearing at the write sites
-    /// alone would re-serve a stale map for the length of a Linear outage, and a stale non-empty
-    /// map is exactly what a later re-arm would keep firing on. This test drives the single-project
-    /// path, which is the one whose early returns are reachable with a failing fetch.
+    /// Every writer sits behind a branch a failing tick never reaches — the multi-project ladder
+    /// inside `has_projects` (STUDIO-803), the single-project one inside its `else` plus two
+    /// further early returns, a missing tracker and this failed fetch — so clearing at the write
+    /// sites alone would re-serve a stale map for the length of a Linear outage, and a stale
+    /// non-empty map is exactly what a later re-arm would keep firing on. This test drives the
+    /// single-project path, the only one whose early returns a failing fetch can reach.
     #[tokio::test]
     async fn a_failed_candidate_fetch_clears_the_capacity_tally() {
         let mut tr = Fake::new();
