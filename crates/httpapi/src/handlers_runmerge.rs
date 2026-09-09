@@ -200,6 +200,7 @@ mod tests {
             head_sha: HEAD.to_string(),
             method: "squash".to_string(),
             auto: true,
+            merge_state: "CLEAN".to_string(),
             said: String::new(),
         }
     }
@@ -390,8 +391,10 @@ mod tests {
         }
     }
 
-    /// A failed lookup or a merge GitHub refused is a 500 carrying `gh`'s own complaint — the
-    /// operator reads what GitHub said, not a paraphrase.
+    /// A failed lookup or a merge that could not be made is a 500 carrying the failing seam's own
+    /// complaint verbatim — the operator reads what the thing that refused said, not a paraphrase.
+    /// Which seam that is comes from the payload itself (`gh pr merge …:` here, the tracker's own
+    /// sentence on STUDIO-784's pre-`gh` gate); this handler adds no attribution of its own.
     #[tokio::test]
     async fn a_failure_is_a_500_carrying_githubs_complaint() {
         let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_merge_outcome(

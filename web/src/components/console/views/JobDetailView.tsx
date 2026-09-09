@@ -36,6 +36,7 @@ import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "
 import { useTicketFacts } from "@/hooks/useTicketFacts";
 import { ticketAssignees } from "@/lib/console-jobs";
 import { clockTime, runOutcomeLabel, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
+import { mergeStateNote } from "@/lib/console-merge";
 import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
@@ -654,6 +655,9 @@ function HeaderActions({
   // the SAME pull request while that is in flight.
   const [confirming, setConfirming] = useState<MergeReceipt | null>(null);
   const merged = merge.data?.status === "merged" ? merge.data.receipt : null;
+  // What GitHub says the pull request is waiting on, once one has been armed (STUDIO-784). "" when
+  // GitHub stated no merge state, which is a real answer and not a reason to guess at one.
+  const mergedNote = merged === null ? "" : mergeStateNote(merged.merge_state, true);
   // The console has no toast surface, so a lifecycle action reports here or nowhere. Both halves
   // matter: the request can fail, and it can succeed while the ticket MOVE fails — a run killed
   // whose ticket stayed put is something the operator has to finish by hand. A refused merge lands
@@ -757,6 +761,16 @@ function HeaderActions({
             : merged.said}
         </span>
       ) : null}
+      {/* What the armed merge is WAITING on (STUDIO-784). Its own element rather than a suffix on
+          the line above, because the two say different things: that one reports what the daemon
+          did, this one reports where GitHub says the pull request stands — and an armed `--auto`
+          merge is otherwise one line followed by silence. Absent when GitHub stated no merge
+          state, which is a real answer and not a reason to guess. */}
+      {mergedNote === "" ? null : (
+        <span className="actnote" role="status">
+          {mergedNote}
+        </span>
+      )}
       {confirming === null ? null : (
         <MergeConfirm
           receipt={confirming}
@@ -859,6 +873,11 @@ function MergeConfirm({
           Confirming merges the commit above — if it has been pushed to since, you will be asked
           again.
         </p>
+        {/* Where GitHub says the pull request stands right now, so the operator confirms against
+            its real state rather than against the hope of one (STUDIO-784). */}
+        {mergeStateNote(receipt.merge_state) === "" ? null : (
+          <p className="sub">{mergeStateNote(receipt.merge_state)}</p>
+        )}
         {error === "" ? null : (
           <p className="err" role="alert">
             {error}

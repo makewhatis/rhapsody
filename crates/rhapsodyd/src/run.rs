@@ -278,10 +278,10 @@ where
     // --- the console merge action (STUDIO-767; design record
     // ~/.rhapsody/docs/STUDIO-767-console-merge-action.md §3) ---
     //
-    // The three `gh` seams `POST /api/v1/runs/{id}/merge` drives, built HERE so `o.control()`
-    // below snapshots them onto the handle that serves the endpoint. One `GH` fills all three:
+    // The five `gh` seams `POST /api/v1/runs/{id}/merge` drives, built HERE so `o.control()`
+    // below snapshots them onto the handle that serves the endpoint. One `GH` fills all five:
     // they are separate TRAITS so that a task holding only reads cannot merge anything, not
-    // because the daemon needs three objects.
+    // because the daemon needs five objects.
     //
     // Built only when Teams is on, which is the whole gate — with Teams off `merge_deps` stays
     // `None`, the endpoint answers `teams_disabled`, and the console's Merge is dependency-named.
@@ -298,7 +298,12 @@ where
         Arc::new(rhapsody_orchestrator::runmerge::MergeDeps {
             prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::OpenPrSource>,
             state: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
-            merger: gh as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
+            merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
+            // The two STUDIO-784 reads: whether GitHub can land this pull request at all, and —
+            // only when it answers BEHIND — whether the repository updates the branch itself.
+            mergestate: Arc::clone(&gh)
+                as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
+            policy: gh as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdateSource>,
             // The base repository's own owner and nothing else — the watcher's default trust
             // boundary. There is no config key to widen it, so widening is a code change a
             // reviewer sees.

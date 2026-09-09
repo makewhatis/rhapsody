@@ -562,6 +562,148 @@ impl MergeSource for GH {
     }
 }
 
+/// GitHub's `mergeStateStatus` for a pull request whose head branch is behind its base.
+///
+/// The one value the merge path acts on, named rather than spelled inline: with `main`'s
+/// protection requiring branches to be up to date, `BEHIND` is a state GitHub's own auto-merge
+/// cannot clear by itself unless the repository is allowed to update the branch
+/// ([`BranchUpdateSource`]) — so arming a merge on it parks the pull request forever (STUDIO-784).
+pub const MERGE_STATE_BEHIND: &str = "BEHIND";
+
+/// The fallible result of a [`MergeStateSource`] lookup: GitHub's own `mergeStateStatus`
+/// upper-cased, or empty when GitHub states none.
+///
+/// A STRING and not a closed enum, unlike [`MergeMethod`] and [`PrStatus`], because the direction
+/// of the risk is the other way round here. `mergeStateStatus` is GitHub's own open vocabulary
+/// (`BEHIND`, `BLOCKED`, `CLEAN`, `DIRTY`, `DRAFT`, `HAS_HOOKS`, `UNKNOWN`, `UNSTABLE` today) and
+/// it has grown before; a value this daemon does not recognise must reach the operator's receipt
+/// verbatim rather than become an error that refuses a merge nothing is wrong with.
+pub type MergeStateResult = Result<String, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Where GitHub thinks a pull request stands with respect to being MERGED — its
+/// `mergeStateStatus`, and nothing else (STUDIO-784).
+///
+/// **Deliberately not folded into [`PrStateSource`].** That seam's argv is polled by the review
+/// watcher every two minutes for every watched pull request, and widening it would make every one
+/// of those polls pay for a field only the console's merge action reads. This one is asked once,
+/// by one operator click, on one pull request.
+///
+/// What the merge path does with the answer is refuse rather than arm an auto-merge that can never
+/// fire: `main` has `strict: true` (a branch must be up to date to merge) with
+/// `allow_update_branch: false` (GitHub will not update it either), so `BEHIND` is a refusal only
+/// a push can clear — and reporting it as *"queued for merge"* would be a report of something that
+/// will never happen.
+///
+/// Object-safe (held as `dyn MergeStateSource` by the off-loop merge path), so it is declared via
+/// `async_trait`.
+#[async_trait]
+pub trait MergeStateSource: Send + Sync {
+    async fn merge_state(&self, owner: &str, repo: &str, number: i64) -> MergeStateResult;
+}
+
+#[async_trait]
+impl MergeStateSource for GH {
+    /// One bounded `gh pr view <number> --repo <owner>/<repo> --json mergeStateStatus`.
+    ///
+    /// An incomplete coordinate is an ERROR rather than a quiet nothing, following
+    /// [`MergeSource::merge_pr`] rather than [`PrStateSource::pr_state`]: this seam exists only on
+    /// the merge path, where the coordinate has already been derived and validated, so a missing
+    /// half of it is a caller bug about an irreversible action rather than a true "there is
+    /// nothing here".
+    ///
+    /// A missing or non-string `mergeStateStatus` is EMPTY and not an error. GitHub computes
+    /// mergeability lazily and answers `UNKNOWN` — or, briefly, nothing — while it does, and the
+    /// merge path's rule is to act only on a value it positively recognises.
+    async fn merge_state(&self, owner: &str, repo: &str, number: i64) -> MergeStateResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Err(
+                format!("gh pr view: incomplete coordinate {owner}/{repo}#{number}").into(),
+            );
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let args = [
+            "pr",
+            "view",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--json",
+            "mergeStateStatus",
+        ];
+        let body = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("gh pr view {num} --repo {slug}: {e}").into()
+        })?;
+        let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr view {num} --repo {slug}: {e}").into()
+            },
+        )?;
+        Ok(pr
+            .get("mergeStateStatus")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase())
+    }
+}
+
+/// The fallible result of a [`BranchUpdateSource`] lookup: whether the repository updates a pull
+/// request's branch itself.
+pub type BranchUpdateResult = Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Whether a REPOSITORY will bring a pull request's branch up to date with its base on its own —
+/// the `allow_update_branch` setting (STUDIO-784).
+///
+/// It is the other half of the `BEHIND` question, and it is a repository fact rather than a pull
+/// request one, which is why it is its own seam: with it on, GitHub's auto-merge updates a behind
+/// branch and lands the pull request, so refusing would be a false refusal; with it off, nothing
+/// but a human push can clear the state.
+///
+/// The merge path asks this **only** when [`MergeStateSource`] answered [`MERGE_STATE_BEHIND`], so
+/// an ordinary merge pays for no extra round trip at all.
+///
+/// Object-safe (held as `dyn BranchUpdateSource` by the off-loop merge path), so it is declared
+/// via `async_trait`.
+#[async_trait]
+pub trait BranchUpdateSource: Send + Sync {
+    async fn allows_branch_update(&self, owner: &str, repo: &str) -> BranchUpdateResult;
+}
+
+#[async_trait]
+impl BranchUpdateSource for GH {
+    /// One bounded `gh api repos/<owner>/<repo> --jq .allow_update_branch`.
+    ///
+    /// `--jq` rather than decoding the repository object, because that object is large and this
+    /// wants one boolean out of it.
+    ///
+    /// An answer that is neither `true` nor `false` is an ERROR and never a default. Defaulting
+    /// either way would be a guess about branch protection made silently at the seam: `true` would
+    /// arm an auto-merge that cannot fire, and `false` would refuse a merge that would have
+    /// landed. What to DO about not knowing is the caller's decision, made once, in the open —
+    /// [`crate::runmerge::resolve_and_merge`] refuses the merge with the same actionable sentence
+    /// a `false` earns, because it only asks this at all once GitHub has already said BEHIND. The
+    /// commonest cause is a token without admin permission on the repository, for which
+    /// `allow_update_branch` is simply absent from the payload and `--jq` yields `null`.
+    async fn allows_branch_update(&self, owner: &str, repo: &str) -> BranchUpdateResult {
+        if owner.is_empty() || repo.is_empty() {
+            return Err(format!("gh api repos: incomplete coordinate {owner}/{repo}").into());
+        }
+        let ep = format!("repos/{owner}/{repo}");
+        let body = (self.run)(&["api", ep.as_str(), "--jq", ".allow_update_branch"]).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("gh api {ep}: {e}").into() },
+        )?;
+        match String::from_utf8_lossy(&body).trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(format!(
+                "gh api {ep} --jq .allow_update_branch: unrecognised answer {other:?}"
+            )
+            .into()),
+        }
+    }
+}
+
 /// Where a pull request stands, as GitHub's GraphQL `PullRequestState` reports it. Three values,
 /// not two: the watcher retires a MERGED pull request and a CLOSED one for different reasons and
 /// records them differently, and `mergedAt` alone cannot be trusted to tell them apart.
@@ -1966,6 +2108,141 @@ mod tests {
                     .is_err(),
                 "{owner}/{repo}#{n} should be refused"
             );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh process should have been spawned"
+        );
+    }
+
+    // --- MergeStateSource / BranchUpdateSource (STUDIO-784) ---------------------------------
+
+    /// The argv IS the contract, and it is deliberately narrower than the watcher's: one field.
+    /// Widening it here would widen nothing else, but folding this field into `pr_state` would put
+    /// it on every two-minute poll of every watched pull request.
+    #[tokio::test]
+    async fn merge_state_asks_for_one_field_and_upper_cases_the_answer() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"mergeStateStatus":"behind"}"#,
+                Arc::clone(&seen),
+            )),
+        );
+
+        let state = src.merge_state("o", "r", 117).await.expect("state");
+
+        assert_eq!(state, MERGE_STATE_BEHIND, "GitHub's own value, upper-cased");
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr view 117 --repo o/r --json mergeStateStatus".to_string()],
+            "exactly one gh call, and exactly these arguments"
+        );
+    }
+
+    /// GitHub computes mergeability lazily, so a pull request it has not judged yet answers with
+    /// no field at all. That is EMPTY and not an error: the merge path acts only on a value it
+    /// recognises, and erroring here would refuse a merge nothing is wrong with.
+    #[tokio::test]
+    async fn merge_state_treats_an_absent_field_as_unknown() {
+        for body in ["{}", r#"{"mergeStateStatus":null}"#] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert_eq!(
+                src.merge_state("o", "r", 1).await.expect("state"),
+                "",
+                "{body}"
+            );
+        }
+    }
+
+    /// A failed lookup is an error carrying `gh`'s own words — never a quiet "not behind", which
+    /// would arm an auto-merge on exactly the state this seam exists to catch.
+    #[tokio::test]
+    async fn merge_state_carries_a_failed_lookup_back_as_an_error() {
+        let src = GH::new(
+            "@symphony",
+            Some(run_failing("HTTP 502", Arc::new(Mutex::new(Vec::new())))),
+        );
+        let err = src
+            .merge_state("o", "r", 9)
+            .await
+            .expect_err("502 is an error");
+        assert!(err.to_string().contains("HTTP 502"), "{err}");
+        assert!(err.to_string().contains("gh pr view 9 --repo o/r"), "{err}");
+    }
+
+    /// An incomplete coordinate spawns no process, exactly as `merge_pr` refuses one: this seam
+    /// exists only on the merge path, where the coordinate was already derived and validated.
+    #[tokio::test]
+    async fn merge_state_refuses_an_incomplete_coordinate_without_asking_github() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("{}", Arc::clone(&seen))));
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0), ("o", "r", -3)] {
+            assert!(
+                src.merge_state(owner, repo, n).await.is_err(),
+                "{owner}/{repo}#{n} should be refused"
+            );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh process should have been spawned"
+        );
+    }
+
+    /// One boolean out of the repository object, asked for by `--jq` rather than decoded whole.
+    #[tokio::test]
+    async fn allows_branch_update_reads_one_repository_boolean() {
+        for (out, want) in [("true\n", true), ("false\n", false)] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let src = GH::new("@symphony", Some(run_recording(out, Arc::clone(&seen))));
+            assert_eq!(
+                src.allows_branch_update("o", "r").await.expect("policy"),
+                want
+            );
+            assert_eq!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                vec!["api repos/o/r --jq .allow_update_branch".to_string()]
+            );
+        }
+    }
+
+    /// Neither `true` nor `false` is an ERROR and never a default. Defaulting either way would be
+    /// a silent guess about branch protection on the merge path — one that arms an auto-merge
+    /// which cannot fire, or refuses a merge that would have landed.
+    #[tokio::test]
+    async fn allows_branch_update_refuses_to_guess() {
+        for out in ["null\n", "", "yes"] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(out, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert!(
+                src.allows_branch_update("o", "r").await.is_err(),
+                "{out:?} is not a boolean and must not be read as one"
+            );
+        }
+        let src = GH::new(
+            "@symphony",
+            Some(run_failing("HTTP 403", Arc::new(Mutex::new(Vec::new())))),
+        );
+        let err = src
+            .allows_branch_update("o", "r")
+            .await
+            .expect_err("403 is an error");
+        assert!(err.to_string().contains("HTTP 403"), "{err}");
+    }
+
+    /// An incomplete coordinate spawns no process here either.
+    #[tokio::test]
+    async fn allows_branch_update_refuses_an_incomplete_coordinate() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("true", Arc::clone(&seen))));
+        for (owner, repo) in [("", "r"), ("o", "")] {
+            assert!(src.allows_branch_update(owner, repo).await.is_err());
         }
         assert!(
             seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),

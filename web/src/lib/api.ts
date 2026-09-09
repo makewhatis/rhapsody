@@ -376,6 +376,10 @@ export interface MergeReceipt {
   head_sha: string;
   method: string;
   auto: boolean;
+  // GitHub's own `mergeStateStatus` when the daemon resolved the pull request — "" when GitHub
+  // stated none. Under `--auto` an applied merge is only ARMED, so this is the one fact that says
+  // what it is waiting on rather than letting the console imply it landed (STUDIO-784).
+  merge_state: string;
   said?: string;
 }
 

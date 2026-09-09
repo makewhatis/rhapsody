@@ -35,16 +35,20 @@
 //!
 //! [`Event`]: crate::Event
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
 use rhapsody_config::room::Message;
+use rhapsody_core::normalize_state;
+use rhapsody_store::{REVIEW_STATUS_APPROVED, REVIEW_STATUS_REVIEWED, RunSummary};
+use rhapsody_tracker::Tracker;
 use rhapsody_workspace::sanitize_key;
 
 use crate::control_loop::Event;
 use crate::ghsummons::parse_repo;
 use crate::orchestrator::Orchestrator;
-use crate::runmerge::{MergeControlOutcome, MergePlan, MergeReceipt};
+use crate::runmerge::{MergeControlOutcome, MergePlan, MergeReceipt, TicketReviewGate};
 use crate::stop::ControlHandle;
 use crate::triage::MANAGER_IDENTITY;
 
@@ -154,18 +158,44 @@ impl Orchestrator {
                 "this run's branch does not belong to its ticket",
             );
         }
+        // Is the ticket still waiting in review at all? (§5's "the run's ticket is not in a
+        // mergeable state"; STUDIO-784 gap 2.) This is the gate that catches the case the watch
+        // set structurally cannot on THIS installation — see
+        // [`ticket_not_waiting_in_review`] for the whole argument. Only its MATERIAL is gathered
+        // here; the question itself is a tracker read and is asked off-loop.
+        let review_gate = match self.ticket_review_gate(&run) {
+            Ok(gate) => gate,
+            Err(why) => return self.deny(run_id, &run.issue_identifier, why),
+        };
         // The review gate's raw material, read here because only the control task may read the
         // watch set (`reviewconsole`'s single-writer rule). Live rows only: a dropped or retired
         // review is not a review in flight.
-        let watched = match self.store().load_live_review_watch() {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|r| {
+        //
+        // Split by OUTCOME and not merely by liveness (STUDIO-784 gap 2). A round that FINISHED by
+        // posting findings is the most dangerous state there is — the reviewer said no and the
+        // author has not fixed it yet — and reading only "is a round in flight" lets exactly that
+        // one through. `approved` is the one status that bars nothing: the reviewer read this pull
+        // request and found nothing, and treating it as a blocker made an approved pull request
+        // permanently unmergeable from the console, because a live row is only dropped when the
+        // pull request is merged or closed.
+        let (watched, changes_requested) = match self.store().load_live_review_watch() {
+            Ok(rows) => {
+                let mut watched: Vec<i64> = Vec::new();
+                let mut changes_requested: Vec<i64> = Vec::new();
+                for r in rows.into_iter().filter(|r| {
                     r.key.owner.eq_ignore_ascii_case(&owner)
                         && r.key.repo.eq_ignore_ascii_case(&repo)
-                })
-                .map(|r| r.key.number)
-                .collect::<Vec<i64>>(),
+                }) {
+                    match r.status.as_str() {
+                        REVIEW_STATUS_APPROVED => {}
+                        REVIEW_STATUS_REVIEWED => changes_requested.push(r.key.number),
+                        // `requested`, `in_flight`, `truncated` — and any status this daemon does
+                        // not recognise, which fails closed onto the softer of the two refusals.
+                        _ => watched.push(r.key.number),
+                    }
+                }
+                (watched, changes_requested)
+            }
             // Fails closed on the gate rather than merging with it unchecked: an unreadable watch
             // set is not an empty one.
             Err(e) => {
@@ -193,7 +223,51 @@ impl Orchestrator {
             repo,
             branch,
             watched,
+            changes_requested,
+            review_gate,
         })
+    }
+
+    /// The ticket-state gate's material for this run, or `None` when the gate does not apply
+    /// (STUDIO-784 gap 2). `Err` is a plan-time refusal: the gate applies but cannot be built.
+    ///
+    /// Only the MATERIAL is resolved here, because only the control task can resolve a run's
+    /// project against the live `Effective`. The question it feeds is answered off-loop by
+    /// [`ticket_not_waiting_in_review`], which is where the argument for asking it at all lives.
+    fn ticket_review_gate(
+        &self,
+        run: &RunSummary,
+    ) -> Result<Option<TicketReviewGate>, &'static str> {
+        let Some(eff) = self.eff.as_ref() else {
+            // No config has loaded yet, so there is no configured review workflow to assert
+            // against. This asserts NOTHING where the off-loop half's own pre-load arm refuses,
+            // and the two only look inconsistent: `plan_run_merge` has already required
+            // `teams.enabled`, which is itself read from a loaded config, so a caller cannot reach
+            // here with `eff` unset. It stays an `Ok(None)` rather than a refusal because a state
+            // the daemon cannot enter needs no message written for it.
+            return Ok(None);
+        };
+        // The run's OWN project, exactly as `review_handoff_state` resolves it; the legacy
+        // single-project path carries an empty slug and resolves the top-level set.
+        let states = eff
+            .project_by_slug(&run.project_slug)
+            .map_or(&eff.review_states, |p| &p.review_states);
+        if states.is_empty() {
+            // Review handoff is not configured for this project, so there is no state a ticket is
+            // supposed to be waiting in and nothing here to assert.
+            return Ok(None);
+        }
+        if run.issue_id.is_empty() {
+            // The by-ids read filters on the tracker id, so without one the gate cannot be asked
+            // at all — and an un-checkable gate on an irreversible action is a refusal.
+            return Err(
+                "this run has no tracker id for its ticket, so the daemon cannot check that its review is finished",
+            );
+        }
+        Ok(Some(TicketReviewGate {
+            issue_id: run.issue_id.clone(),
+            states: states.clone(),
+        }))
     }
 
     /// A plan-time refusal, recorded on its way out. See [`Orchestrator::record_merge_attempt`]
@@ -317,9 +391,15 @@ fn attempt_line(issue: &str, outcome: &MergeControlOutcome) -> Option<String> {
         MergeControlOutcome::Refused(why) => Some(format!(
             "did not merge {issue} — {why} (asked from the console)"
         )),
-        MergeControlOutcome::Failed(err) => {
-            Some(format!("could not merge {issue} — GitHub refused: {err}"))
-        }
+        // Neutral about WHO refused, because not every failure on this path is GitHub's. Until
+        // STUDIO-784 every `Failed` reaching here came from a `gh` seam, so naming GitHub was
+        // simply true; the ticket-state gate runs BEFORE the `gh` half and fails on a tracker
+        // outage, which this sentence would then have recorded as a GitHub refusal — a false row
+        // in the one place §3/G4 wants a true one, and a false line in a room teammates read back.
+        // Attribution belongs to the producer instead: the `gh` seams prefix their own errors
+        // (`gh pr view …:`, `gh api …:` — see [`crate::ghsummons`]) and
+        // [`ticket_not_waiting_in_review`] names the tracker in as many words.
+        MergeControlOutcome::Failed(err) => Some(format!("could not merge {issue} — {err}")),
         // Nothing happened: the handshake's first leg, or a state that never reached a plan.
         MergeControlOutcome::ConfirmRequired(_)
         | MergeControlOutcome::Dormant
@@ -327,17 +407,110 @@ fn attempt_line(issue: &str, outcome: &MergeControlOutcome) -> Option<String> {
     }
 }
 
+/// Whether the run's ticket has left the states a pull request waits in for review, and why that
+/// refuses a merge (STUDIO-784 gap 2). `None` means it is waiting in review, or that the gate does
+/// not apply to this run at all.
+///
+/// Off-loop, on the HTTP request's own task, for [`crate::runmerge`]'s reason: this is a network
+/// read, and the control task must not make one. It runs BEFORE the `gh` half, so a ticket a
+/// reviewer routed back costs no GitHub round trip at all.
+///
+/// # Why the TICKET and not the review ledger
+///
+/// The design record's Rhapsody-side gate reads `rhapsody_review_watch`, and on the installation
+/// this bug was found on that table is **empty by construction**. Every write into it is gated on
+/// `review.mode: ticketless` (`reviewintro`'s three `review_ticketless_enabled()` checks), and the
+/// two review paths are mutually exclusive by design — an installation whose reviews are Linear
+/// review TICKETS (`quorum.enabled`) has no watch rows at all, so that gate can never refuse
+/// anything there. The ticket's own state is the fact the daemon holds on both paths: a review
+/// round that asks for changes routes the ticket back, and a merge clicked then is a merge of work
+/// a reviewer blocked.
+///
+/// # Why the TRACKER and not [`record_issue_states`](Orchestrator::record_issue_states)
+///
+/// Because the poller's snapshot cannot answer it on a `claim_mode: pool` project — permanently,
+/// not transiently. `issue_states` is replaced each tick from the candidate set; the candidate
+/// query is assignee-scoped and in pool mode narrows to `assignee: { null: true }`
+/// (`tracker::linear::query::query_candidates`); and winning a pool claim ASSIGNS the ticket
+/// (`claim::claim_pool`), which is precisely how the claim is made durable. So a claimed pool
+/// ticket leaves the candidate set for good and never appears in `issue_states` again — and a gate
+/// reading that map would refuse every console merge on such an installation forever.
+///
+/// [`Tracker::fetch_issue_states_by_ids`] has no such scope: it filters on `id: { in: … }` and
+/// carries neither a project nor an assignee clause, so it answers the same on every claim mode.
+/// (`lifecycle`'s `reads_lifecycle_target` documents that property, and why the STUDIO-671 wedge
+/// was specific to the project-FILTERED candidate query.) One tracker read on an operator's click,
+/// next to the two-to-three `gh` calls the same click already makes, is not the expensive part.
+///
+/// It remains a proxy for a verdict and is named as one: it reads the ticket's state, not a
+/// review's outcome, so a reviewer who asks for changes without the ticket moving is not caught.
+/// Making it exact needs the quorum to record its rounds' outcomes the way the ticketless path
+/// already does.
+///
+/// Every un-checkable case refuses rather than merges — no tracker yet, an unreadable tracker, an
+/// id the tracker does not know — because the action being gated is irreversible.
+pub(crate) async fn ticket_not_waiting_in_review(
+    tracker: Option<Arc<dyn Tracker>>,
+    plan: &MergePlan,
+) -> Option<MergeControlOutcome> {
+    let gate = plan.review_gate.as_ref()?;
+    let Some(tr) = tracker else {
+        // Before the first config load there is no tracker to ask. Transient, and it says so.
+        return Some(MergeControlOutcome::Refused(
+            "the daemon has not loaded its tracker yet, so it cannot check that this run's ticket is waiting in review",
+        ));
+    };
+    let issues = match tr
+        .fetch_issue_states_by_ids(std::slice::from_ref(&gate.issue_id))
+        .await
+    {
+        Ok(issues) => issues,
+        // Carries the tracker's own words rather than a refusal the operator would act on
+        // pointlessly: nothing is known about the ticket, so nothing about it is asserted. It
+        // names the tracker because [`attempt_line`] does not name anyone — this is the one
+        // failure on the recorded path that GitHub was never asked about.
+        Err(e) => {
+            return Some(MergeControlOutcome::Failed(format!(
+                "the ticket's tracker could not be read: {e}"
+            )));
+        }
+    };
+    let Some(issue) = issues.iter().find(|i| i.id == gate.issue_id) else {
+        tracing::info!(
+            run = plan.run_id,
+            issue = %plan.issue,
+            "console merge: the tracker does not know this run's ticket; refusing"
+        );
+        return Some(MergeControlOutcome::Refused(
+            "the tracker does not know this run's ticket, so the daemon cannot check that its review is finished",
+        ));
+    };
+    if gate.states.contains(&normalize_state(&issue.state)) {
+        return None;
+    }
+    tracing::info!(
+        run = plan.run_id,
+        issue = %plan.issue,
+        state = %issue.state,
+        "console merge: this run's ticket is not waiting in review; refusing"
+    );
+    Some(MergeControlOutcome::Refused(
+        "this run's ticket is not waiting in review — a review that asked for changes moves it back",
+    ))
+}
+
 impl ControlHandle {
     /// The operator's **merge** (`POST /api/v1/runs/{id}/merge`) — the whole action, end to end.
     ///
-    /// Three phases, and the middle one is why this lives on the handle rather than in the loop:
+    /// Four phases, and the middle two are why this lives on the handle rather than in the loop:
     ///
     /// 1. **Plan**, on the control task, where the run row and the watch set are.
-    /// 2. **Resolve and merge**, HERE — on the HTTP request's own task — because every step of it
-    ///    blocks ([`crate::runmerge`]'s module doc). A stalled `gh` parks this request and leaves
-    ///    the daemon ticking.
-    /// 3. **Settle**, back on the control task: release the claim, write the audit row, post the
-    ///    manager's room line.
+    /// 2. **Gate the ticket**, HERE — one tracker read, which the control task must not make.
+    /// 3. **Resolve and merge**, also here, because every step of it blocks
+    ///    ([`crate::runmerge`]'s module doc). A stalled `gh` parks this request and leaves the
+    ///    daemon ticking.
+    /// 4. **Settle**, back on the control task: release the claim, write the audit row, post the
+    ///    manager's room line — for whichever of the two middle phases produced the outcome.
     ///
     /// `confirm` is the head SHA the operator is confirming, or empty for the first leg of the
     /// handshake. It is the ONLY value from the request body that reaches any of this, and all it
@@ -353,7 +526,14 @@ impl ControlHandle {
             MergePlanOutcome::Ready(plan) => plan,
             MergePlanOutcome::Denied(outcome) => return outcome,
         };
-        let outcome = crate::runmerge::resolve_and_merge(&plan, confirm, deps).await;
+        // Phase 2a: the ticket-state gate, which is a TRACKER read and so cannot be asked on the
+        // control task (STUDIO-784). First, because a ticket a reviewer routed back should cost no
+        // GitHub round trip — and because a refusal here settles exactly as one from the `gh` half
+        // does, releasing the claim and landing on the record.
+        let outcome = match ticket_not_waiting_in_review(self.reads_tracker(), &plan).await {
+            Some(refusal) => refusal,
+            None => crate::runmerge::resolve_and_merge(&plan, confirm, deps).await,
+        };
         // Unconditional, and the claim's only reliable release: every arm above this line either
         // returned before a claim was taken or is on its way through here.
         self.settle_merge(plan, outcome.clone()).await;
@@ -391,7 +571,7 @@ impl ControlHandle {
         if self
             .events
             .send(Event::RunMergeSettle {
-                plan,
+                plan: Box::new(plan),
                 outcome,
                 reply: tx,
             })
@@ -418,7 +598,11 @@ mod tests {
 
     use rhapsody_config::room::{Cursor, LocalRoom};
     use rhapsody_config::teams::{Identity, Teams};
-    use rhapsody_store::{ReviewWatchKey, ReviewWatchRow, RunStart, Sqlite, StorePath};
+    use rhapsody_core::Issue;
+    use rhapsody_store::{
+        REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_TRUNCATED, ReviewWatchKey,
+        ReviewWatchRow, RunStart, Sqlite, StorePath,
+    };
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
@@ -456,10 +640,90 @@ mod tests {
         o
     }
 
+    /// An orchestrator whose project configures a review state, so the ticket-state gate applies.
+    /// Every test that does NOT call this exercises a project with no review handoff configured,
+    /// where there is no state a ticket is supposed to be waiting in.
+    fn orch_reviewing() -> Orchestrator {
+        let mut o = orch(true);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = set_of(&["in review"]);
+            for p in &mut eff.projects {
+                p.review_states = set_of(&["in review"]);
+            }
+        }
+        o
+    }
+
+    /// Snapshots one ticket's state the way the poller does, through the daemon's own recorder —
+    /// so what the gate reads is what a tick would actually have put there.
+    fn seen_in_state(o: &mut Orchestrator, identifier: &str, state: &str) {
+        o.record_issue_states(std::iter::once(&Issue {
+            id: format!("ID-{identifier}"),
+            identifier: identifier.to_string(),
+            state: state.to_string(),
+            ..Issue::default()
+        }));
+    }
+
+    /// A tracker that knows one ticket, in `state`, under the id [`run_row`] writes — so the
+    /// ticket-state gate resolves the same id the daemon's own run row carries.
+    fn tracker_in_state(identifier: &str, state: &str) -> Arc<dyn Tracker> {
+        let mut f = Fake::new();
+        f.by_id.insert(
+            format!("ID-{identifier}"),
+            Issue {
+                id: format!("ID-{identifier}"),
+                identifier: identifier.to_string(),
+                state: state.to_string(),
+                ..Issue::default()
+            },
+        );
+        Arc::new(f)
+    }
+
+    /// Seeds one watch row through the store's OWN methods, exactly as
+    /// [`crate::reviewconsole`]'s tests do: `save_review_watch` cannot move a SHA on an existing
+    /// row, `mark_review_requested` owns `requested_sha` and `mark_review_completed` owns
+    /// `last_reviewed_sha`, so writing the columns wholesale could seed a combination the daemon
+    /// can never actually reach.
+    fn watch(o: &Orchestrator, number: i64, status: &str) {
+        let key = ReviewWatchKey {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number,
+            reviewer: "bob".to_string(),
+        };
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                author: "alice".to_string(),
+                introduced_by: "handoff:STUDIO-767".to_string(),
+                status: REVIEW_STATUS_REQUESTED.to_string(),
+                open: true,
+                ..ReviewWatchRow::default()
+            })
+            .expect("seed the row");
+        match status {
+            REVIEW_STATUS_REQUESTED => {}
+            REVIEW_STATUS_IN_FLIGHT => o
+                .store()
+                .mark_review_requested(&key, HEAD)
+                .expect("requested"),
+            REVIEW_STATUS_TRUNCATED => o.store().mark_review_truncated(&key).expect("truncated"),
+            terminal => o
+                .store()
+                .mark_review_completed(&key, HEAD, terminal)
+                .expect("completed"),
+        }
+    }
+
     /// A finished run of `issue`, on `branch`, in `repo` — the row every decision is derived from.
     fn run_row(o: &Orchestrator, issue: &str, branch: &str, repo: &str) -> i64 {
         o.store()
             .start_run(RunStart {
+                // `persist_start_run` writes this from the ticket the run was dispatched for, so a
+                // real row always carries one — and the ticket-state gate reads it.
+                issue_id: format!("ID-{issue}"),
                 issue_identifier: issue.to_string(),
                 branch: branch.to_string(),
                 repo: repo.to_string(),
@@ -486,6 +750,7 @@ mod tests {
             head_sha: HEAD.to_string(),
             method: "squash".to_string(),
             auto: true,
+            merge_state: "CLEAN".to_string(),
             said: "✓ will be automatically merged".to_string(),
         }
     }
@@ -665,6 +930,9 @@ mod tests {
                 repo: "rhapsody".to_string(),
                 branch: "symphony/STUDIO-767".to_string(),
                 watched: Vec::new(),
+                changes_requested: Vec::new(),
+                // `orch` configures no `review_states`, so the ticket-state gate does not apply.
+                review_gate: None,
             }
         );
     }
@@ -700,6 +968,371 @@ mod tests {
             vec![64, 65],
             "the repository is matched case-insensitively, and another repo's review is not ours"
         );
+    }
+
+    /// **STUDIO-784, gap 2 — the review ledger's OUTCOME and not merely its liveness.**
+    ///
+    /// A round that finished by posting findings is the reviewer's explicit no, and it rides on the
+    /// plan separately from a round still in flight, because the two are different refusals. A
+    /// round that finished by APPROVING bars nothing at all — treating it as a blocker made an
+    /// approved pull request permanently unmergeable from the console, since a live row is only
+    /// dropped when the pull request is merged or closed.
+    #[test]
+    fn the_plan_separates_a_requested_change_from_a_round_in_flight() {
+        let mut o = orch(true);
+        watch(&o, 61, rhapsody_store::REVIEW_STATUS_REVIEWED);
+        watch(&o, 62, rhapsody_store::REVIEW_STATUS_APPROVED);
+        watch(&o, 63, REVIEW_STATUS_REQUESTED);
+        watch(&o, 64, REVIEW_STATUS_IN_FLIGHT);
+        watch(&o, 65, REVIEW_STATUS_TRUNCATED);
+
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+        let plan = ready(&mut o, run);
+
+        let mut watched = plan.watched;
+        watched.sort_unstable();
+        assert_eq!(
+            watched,
+            vec![63, 64, 65],
+            "requested, in_flight and truncated are rounds with no verdict yet"
+        );
+        assert_eq!(
+            plan.changes_requested,
+            vec![61],
+            "only the completed round that POSTED FINDINGS is a reviewer's no"
+        );
+        assert!(
+            !watched.contains(&62) && !plan.changes_requested.contains(&62),
+            "an approved pull request is not blocked by its own approval"
+        );
+    }
+
+    /// **STUDIO-784, gap 2 — the ticket-state gate.**
+    ///
+    /// The review round that requested changes routed the ticket back to an active state, and the
+    /// merge armed anyway. It refuses now, and settling that refusal records it and releases the
+    /// claim exactly as a refusal from the `gh` half does.
+    #[tokio::test]
+    async fn a_ticket_routed_back_out_of_review_is_refused() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut o = orch_reviewing();
+        o.teams_room = Some(Arc::clone(&room));
+        let run = run_row(&o, "STUDIO-780", "symphony/STUDIO-780", REPO_URL);
+        let plan = ready(&mut o, run);
+
+        let outcome = ticket_not_waiting_in_review(
+            Some(tracker_in_state("STUDIO-780", "In Progress")),
+            &plan,
+        )
+        .await
+        .expect("a ticket routed back out of review refuses the merge");
+        assert_eq!(
+            outcome,
+            MergeControlOutcome::Refused(
+                "this run's ticket is not waiting in review — a review that asked for changes moves it back"
+            )
+        );
+        o.settle_run_merge(&plan, &outcome);
+        assert!(o.merge_inflight.is_empty(), "settling releases the claim");
+        assert_eq!(audit(&o, run).len(), 1, "the refusal is on the record");
+        assert_eq!(room_lines(&room).len(), 1, "and in the room");
+    }
+
+    /// The state the console's Merge is FOR passes, whatever the state is spelled like: the
+    /// comparison is normalized, exactly as the poller's own state comparisons are.
+    #[tokio::test]
+    async fn a_ticket_waiting_in_review_passes_the_gate() {
+        for state in ["In Review", "in review", "IN REVIEW"] {
+            let mut o = orch_reviewing();
+            let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+            let plan = ready(&mut o, run);
+            assert_eq!(
+                ticket_not_waiting_in_review(Some(tracker_in_state("STUDIO-767", state)), &plan)
+                    .await,
+                None,
+                "state {state:?}"
+            );
+        }
+    }
+
+    /// **The pool-mode hole this gate was rewritten to close (STUDIO-784, round 2).**
+    ///
+    /// On a `claim_mode: pool` project the candidate query narrows to `assignee: { null: true }`
+    /// and winning a claim ASSIGNS the ticket — which is how the claim is made durable. So a
+    /// claimed pool ticket leaves the candidate set for good, and `record_issue_states`, which
+    /// REPLACES its map from that set each tick, never sees it again. A gate reading that map
+    /// refused every console merge on such an installation permanently.
+    ///
+    /// This pins the property that fixes it: a ticket the poller's snapshot does not contain, and
+    /// structurally never will, still merges when the tracker says it is waiting in review.
+    #[tokio::test]
+    async fn a_claimed_pool_ticket_the_poller_never_sees_again_still_merges() {
+        let mut o = orch_reviewing();
+        let run = run_row(&o, "STUDIO-780", "symphony/STUDIO-780", REPO_URL);
+        // A pool tick's candidate set: the unassigned pool, which the claimed ticket has left.
+        seen_in_state(&mut o, "STUDIO-999", "Todo");
+        assert!(
+            !o.issue_states.contains_key("STUDIO-780"),
+            "the premise: a claimed pool ticket is absent from the poller's snapshot"
+        );
+
+        let plan = ready(&mut o, run);
+        assert_eq!(
+            ticket_not_waiting_in_review(Some(tracker_in_state("STUDIO-780", "In Review")), &plan)
+                .await,
+            None,
+            "the gate must not refuse a ticket the poller structurally cannot see"
+        );
+        // …and it is still a GATE on that same invisible ticket, not a hole: the tracker, not the
+        // snapshot, is what decides, so the refusal still fires when the tracker says it should.
+        assert_eq!(
+            ticket_not_waiting_in_review(
+                Some(tracker_in_state("STUDIO-780", "In Progress")),
+                &plan
+            )
+            .await,
+            Some(MergeControlOutcome::Refused(
+                "this run's ticket is not waiting in review — a review that asked for changes moves it back"
+            )),
+            "a pool project must still get the gate, not an exemption from it"
+        );
+    }
+
+    /// An id the tracker does not know is refused rather than merged: the gate could not be
+    /// answered, and what it gates is irreversible. Distinct wording from the unloaded-tracker
+    /// refusal below, because only one of the two clears on its own.
+    #[tokio::test]
+    async fn a_ticket_the_tracker_does_not_know_is_refused() {
+        let mut o = orch_reviewing();
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+        let plan = ready(&mut o, run);
+        assert_eq!(
+            ticket_not_waiting_in_review(Some(Arc::new(Fake::new())), &plan).await,
+            Some(MergeControlOutcome::Refused(
+                "the tracker does not know this run's ticket, so the daemon cannot check that its review is finished"
+            ))
+        );
+    }
+
+    /// A tracker that has not loaded yet refuses; one that cannot be read FAILS with its own
+    /// words. Neither merges, and neither is silently treated as "the ticket is fine".
+    #[tokio::test]
+    async fn an_unloaded_or_unreadable_tracker_merges_nothing() {
+        let mut o = orch_reviewing();
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+        let plan = ready(&mut o, run);
+
+        assert_eq!(
+            ticket_not_waiting_in_review(None, &plan).await,
+            Some(MergeControlOutcome::Refused(
+                "the daemon has not loaded its tracker yet, so it cannot check that this run's ticket is waiting in review"
+            ))
+        );
+
+        let mut broken = Fake::new();
+        broken.by_id_err = Some(rhapsody_tracker::TrackerError::Other(
+            "linear: HTTP 503".to_string(),
+        ));
+        match ticket_not_waiting_in_review(Some(Arc::new(broken)), &plan).await {
+            Some(MergeControlOutcome::Failed(e)) => {
+                assert!(e.contains("HTTP 503"), "the tracker's own words: {e}");
+            }
+            other => panic!("want Failed, got {other:?}"),
+        }
+    }
+
+    /// A run row with no tracker id cannot be gated at all, so it is refused on the control task —
+    /// before a claim is taken and before anything off-loop is attempted.
+    #[test]
+    fn a_run_without_a_tracker_id_for_its_ticket_is_refused() {
+        let mut o = orch_reviewing();
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "STUDIO-767".to_string(),
+                branch: "symphony/STUDIO-767".to_string(),
+                repo: REPO_URL.to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        assert_eq!(
+            o.plan_run_merge(run),
+            MergePlanOutcome::Denied(MergeControlOutcome::Refused(
+                "this run has no tracker id for its ticket, so the daemon cannot check that its review is finished"
+            ))
+        );
+        assert!(o.merge_inflight.is_empty(), "a refusal claims nothing");
+    }
+
+    /// A project with no `review_states` configures no state a ticket is supposed to be waiting
+    /// in, so the gate asserts nothing — it must not invent a review workflow an installation did
+    /// not ask for, and it must not read the tracker to decide that.
+    #[tokio::test]
+    async fn a_project_without_review_states_asserts_nothing_about_the_ticket() {
+        let mut o = orch(true);
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+        let plan = ready(&mut o, run);
+        assert_eq!(plan.review_gate, None, "no gate material, no gate");
+        assert_eq!(
+            ticket_not_waiting_in_review(
+                Some(tracker_in_state("STUDIO-767", "In Progress")),
+                &plan
+            )
+            .await,
+            None
+        );
+    }
+
+    /// A whole `gh` layer that answers nothing and counts being asked.
+    ///
+    /// Its only assertion is the counter. A refusal the daemon can make from its own state must
+    /// not spend a GitHub round trip discovering it, and a merge seam that was reached at all on a
+    /// refused click is a merge that nearly happened.
+    #[derive(Default)]
+    struct SilentGh {
+        touched: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SilentGh {
+        fn touch(&self) {
+            self.touched
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn touched(&self) -> usize {
+            self.touched.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::OpenPrSource for SilentGh {
+        async fn open_pr_for_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+        ) -> crate::ghsummons::OpenPrResult {
+            self.touch();
+            Ok(None)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::PrStateSource for SilentGh {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _allow: &crate::ghsummons::HeadAllowlist,
+        ) -> crate::ghsummons::PrStateResult {
+            self.touch();
+            Err("pr_state must not be reached".into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::MergeSource for SilentGh {
+        async fn merge_pr(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _method: crate::ghsummons::MergeMethod,
+            _auto: bool,
+        ) -> crate::ghsummons::MergeResult {
+            self.touch();
+            Err("merge_pr must not be reached".into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::MergeStateSource for SilentGh {
+        async fn merge_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+        ) -> crate::ghsummons::MergeStateResult {
+            self.touch();
+            Err("merge_state must not be reached".into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::BranchUpdateSource for SilentGh {
+        async fn allows_branch_update(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> crate::ghsummons::BranchUpdateResult {
+            self.touch();
+            Err("allows_branch_update must not be reached".into())
+        }
+    }
+
+    fn silent_deps(gh: Arc<SilentGh>) -> Arc<crate::runmerge::MergeDeps> {
+        Arc::new(crate::runmerge::MergeDeps {
+            prs: Arc::clone(&gh) as Arc<dyn crate::ghsummons::OpenPrSource>,
+            state: Arc::clone(&gh) as Arc<dyn crate::ghsummons::PrStateSource>,
+            merger: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeSource>,
+            mergestate: Arc::clone(&gh) as Arc<dyn crate::ghsummons::MergeStateSource>,
+            policy: gh as Arc<dyn crate::ghsummons::BranchUpdateSource>,
+            allow: crate::ghsummons::HeadAllowlist::none(),
+        })
+    }
+
+    /// **The ticket-state gate is WIRED, and it costs no GitHub round trip.**
+    ///
+    /// The endpoint end to end, over a live control task: a ticket a review round routed back out
+    /// of review is refused by `merge_run` itself — not merely by a function a unit test calls —
+    /// before `gh` is touched at all, and the refusal settles like any other, releasing the claim
+    /// and landing on the record. Moving this gate off the control task is what made the wiring
+    /// worth pinning: nothing else fails if the call is dropped.
+    #[tokio::test]
+    async fn the_merge_endpoint_refuses_a_routed_back_ticket_without_touching_github() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut o = orch_reviewing();
+        o.teams_room = Some(Arc::clone(&room));
+        if let Some(eff) = o.eff.as_mut() {
+            // Effectively disable the auto-tick: this test drives the loop for one event.
+            eff.poll_interval = std::time::Duration::from_secs(3600);
+        }
+        // The tracker the OFF-LOOP half reads, published exactly as a config load publishes it.
+        o.set_reads_target(tracker_in_state("STUDIO-780", "In Progress"), "key");
+        let gh = Arc::new(SilentGh::default());
+        o.merge_deps = Some(silent_deps(Arc::clone(&gh)));
+        let run = run_row(&o, "STUDIO-780", "symphony/STUDIO-780", REPO_URL);
+
+        let signal = crate::control_loop::CancelSignal::new();
+        o.ctx = Some(signal.wait());
+        let handle = o.control();
+        let loop_ctx = signal.wait();
+        let task = tokio::spawn(async move {
+            let mut o = o;
+            o.run_loaded(loop_ctx).await;
+            o
+        });
+
+        let outcome = handle.merge_run(run, "").await;
+        assert_eq!(
+            outcome,
+            MergeControlOutcome::Refused(
+                "this run's ticket is not waiting in review — a review that asked for changes moves it back"
+            )
+        );
+        assert_eq!(
+            gh.touched(),
+            0,
+            "a refusal the daemon can make from its own state must not reach GitHub"
+        );
+
+        signal.cancel();
+        let o = task.await.expect("the control task");
+        assert!(o.merge_inflight.is_empty(), "the claim is released");
+        assert_eq!(audit(&o, run).len(), 1, "the refusal is on the record");
     }
 
     /// **Single-flight (§3/G4).** A second click while one merge is in flight is refused, and
@@ -787,16 +1420,24 @@ mod tests {
 
     /// A refusal and a failure are recorded too — an operator's click that did NOT merge is
     /// exactly as worth having in the record as one that did.
+    ///
+    /// The failure case is a REAL `gh pr merge` complaint, prefix and all, because that prefix is
+    /// where the attribution now lives: the recorded sentence names no one, and each producer says
+    /// for itself who refused (STUDIO-784 round 3). See
+    /// [`a_tracker_outage_is_not_recorded_as_a_github_refusal`] for the other producer.
     #[test]
     fn a_refusal_and_a_failure_are_recorded_as_attempts() {
+        const GH_SAID: &str = "gh pr merge 64 --repo makewhatis/rhapsody: exited with exit status 1: \
+             Pull request is not mergeable: the merge commit cannot be cleanly created";
         for (outcome, want) in [
             (
                 MergeControlOutcome::Refused("that pull request is closed"),
-                "did not merge STUDIO-767 — that pull request is closed (asked from the console)",
+                "did not merge STUDIO-767 — that pull request is closed (asked from the console)"
+                    .to_string(),
             ),
             (
-                MergeControlOutcome::Failed("merge conflicts".to_string()),
-                "could not merge STUDIO-767 — GitHub refused: merge conflicts",
+                MergeControlOutcome::Failed(GH_SAID.to_string()),
+                format!("could not merge STUDIO-767 — {GH_SAID}"),
             ),
         ] {
             let dir = TempDir::new();
@@ -806,12 +1447,51 @@ mod tests {
             let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
             let plan = ready(&mut o, run);
             o.settle_run_merge(&plan, &outcome);
-            assert_eq!(audit(&o, run), vec![want.to_string()]);
+            assert_eq!(audit(&o, run), vec![want.clone()]);
             assert_eq!(
                 room_lines(&room),
                 vec![format!("{MANAGER_IDENTITY}: {want}")]
             );
         }
+    }
+
+    /// **STUDIO-784 round 3.** A tracker outage is recorded and reported as a TRACKER failure.
+    ///
+    /// The gate this ticket added is the first `Failed` on the recorded path that GitHub was never
+    /// asked about — it runs before the `gh` half by design — and the sentence
+    /// [`attempt_line`] composed said "GitHub refused" for every failure. That put a false fact in
+    /// the audit row §3/G4 calls "the one place we want a true record", and in a room line that is
+    /// read back into teammates' prompts, sending whoever diagnoses the missing merge to inspect a
+    /// pull request that is fine.
+    ///
+    /// So this runs the whole chain rather than asserting on a hand-written payload: a real
+    /// tracker error through the real gate, that outcome through the real settle, and then the
+    /// sentence both halves actually hold.
+    #[tokio::test]
+    async fn a_tracker_outage_is_not_recorded_as_a_github_refusal() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let mut o = orch_reviewing();
+        o.teams_room = Some(Arc::clone(&room));
+        let run = run_row(&o, "STUDIO-767", "symphony/STUDIO-767", REPO_URL);
+        let plan = ready(&mut o, run);
+
+        let mut down = Fake::new();
+        down.by_id_err = Some(rhapsody_tracker::TrackerError::Other(
+            "linear: HTTP 503 Service Unavailable".to_string(),
+        ));
+        let outcome = ticket_not_waiting_in_review(Some(Arc::new(down)), &plan)
+            .await
+            .expect("a tracker that cannot be read stops the merge");
+        o.settle_run_merge(&plan, &outcome);
+
+        let want = "could not merge STUDIO-767 — the ticket's tracker could not be read: \
+                    linear: HTTP 503 Service Unavailable";
+        assert_eq!(audit(&o, run), vec![want.to_string()]);
+        assert_eq!(
+            room_lines(&room),
+            vec![format!("{MANAGER_IDENTITY}: {want}")]
+        );
     }
 
     /// The handshake's first leg is not an attempt: nothing was merged, so nothing is recorded and
