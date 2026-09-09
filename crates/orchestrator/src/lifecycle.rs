@@ -767,12 +767,15 @@ fn label_identity(iss: &rhapsody_core::Issue) -> Option<String> {
 
 /// Whether a ticket's labels carry the quorum's review marker (STUDIO-780).
 ///
+/// `pub(crate)` so [`crate::teams::is_review_run`] can reuse it for the quorum half of its
+/// predicate rather than re-spelling the comparison and letting the two drift.
+///
 /// The adapter normalizes label names to lowercase, and
 /// [`REVIEW_TICKET_LABEL`](crate::quorum::REVIEW_TICKET_LABEL) is already lowercase, so this is a
 /// plain equality rather than a case fold — case-sensitive for the same reason [`label_identity`]
 /// above is, which matches its own prefix exactly. ([`crate::teams::is_solo`] case-folds against
 /// its own marker instead; with labels lowercased on read the two agree.)
-fn is_review_ticket(iss: &rhapsody_core::Issue) -> bool {
+pub(crate) fn is_review_ticket(iss: &rhapsody_core::Issue) -> bool {
     iss.labels
         .iter()
         .flatten()

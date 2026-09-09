@@ -65,6 +65,7 @@ pub mod review;
 pub mod reviewconsole;
 pub mod reviewintro;
 pub mod reviewnotify;
+pub mod reviewprompt;
 pub mod reviewwatch;
 pub mod runmerge;
 pub mod select;
