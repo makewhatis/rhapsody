@@ -17,9 +17,11 @@ import { cn } from "@/lib/utils";
 import { teammateColor } from "@/theme/teammates";
 import {
   CONSOLE_JOB_FILTERS,
+  JOBS_PAGE_SIZE,
   buildConsoleJobs,
   consoleJobCounts,
   consoleJobProjects,
+  consoleJobsPageNote,
   filterConsoleJobs,
   mateStates,
   type ConsoleJobFilterId,
@@ -43,10 +45,25 @@ const ALL_PROJECTS = "";
 // Its inputs are the endpoints §9 actually has — `/api/v1/state` for the live snapshot and
 // `/api/v1/history/issues` for one row per ticket. `lib/console-jobs.ts` records what that
 // costs against the `GET /api/v1/issues` the spec assumed.
-export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) {
+//
+// PAGING (STUDIO-792). `limit` and `onLoadMore` are owned by the shell rather than by this view,
+// because the rail's Jobs badge counts the SAME query: two owners would let the badge say 50 while
+// the table showed 100. `/api/v1/history/issues` is paged by ISSUE, so widening the window can
+// never let one ticket's retry storm crowd the others out (TRA-320) — every page is still one row
+// per ticket.
+export function JobsView({
+  onOpenJob,
+  limit,
+  onLoadMore,
+}: {
+  onOpenJob: (issue: string) => void;
+  /** How many ISSUES to ask the daemon for. Grows by `JOBS_PAGE_SIZE` per "Load more". */
+  limit: number;
+  onLoadMore: () => void;
+}) {
   const nowMs = useNow(30_000);
   const state = useStateQuery();
-  const issueRuns = useIssueRuns();
+  const issueRuns = useIssueRuns({ limit });
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
@@ -72,6 +89,16 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
   const roster = mates.map((m) => m.name);
   const visible = filterConsoleJobs(rows, filter, project);
   const projectOptions = [{ value: ALL_PROJECTS, label: "All projects" }, ...consoleJobProjects(rows)];
+  // The daemon's own claim, restated verbatim: `next_offset` is non-null exactly when the store
+  // filled the page it was asked for, and it is derived from the size the store ACTUALLY applied,
+  // so it stays right even on a request that sent no limit at all.
+  const hasMore = (issueRuns.data?.next_offset ?? null) !== null;
+  const pageNote = consoleJobsPageNote({
+    loaded: rows.length,
+    visible: visible.length,
+    hasMore,
+    filtered: filter !== "all" || project !== ALL_PROJECTS,
+  });
 
   return (
     <section>
@@ -147,6 +174,19 @@ export function JobsView({ onOpenJob }: { onOpenJob: (issue: string) => void }) 
           </tbody>
         </table>
         {visible.length === 0 ? <div className="empty">{emptyMessage(rows.length, issueRuns.isPending)}</div> : null}
+        {/* How much of the history this is (STUDIO-792). Rendered whenever there are rows, not
+            only when the list is cut: "Showing all 386 jobs" is what tells the operator the list
+            ended because the history did, and that is the fact the silent 50 used to withhold. */}
+        {pageNote === "" ? null : (
+          <div className="jmore">
+            <span className="note">{pageNote}</span>
+            {hasMore ? (
+              <Chip onClick={onLoadMore} disabled={issueRuns.isFetching}>
+                Load {JOBS_PAGE_SIZE} more
+              </Chip>
+            ) : null}
+          </div>
+        )}
       </Card>
     </section>
   );

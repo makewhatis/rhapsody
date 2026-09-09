@@ -16,6 +16,7 @@ import { useIssueRuns } from "@/hooks/useHistory";
 import { useStateQuery } from "@/hooks/useStateQuery";
 import { useReinstateFact, useVersionQuery } from "@/hooks/useTeams";
 import { useUpdater, type Updater } from "@/hooks/useUpdater";
+import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { viewForStatus } from "@/lib/daemon-status";
 import { FirstRunView, OnboardErrorBanner } from "./FirstRunView";
@@ -49,7 +50,15 @@ export function ConsoleApp() {
   // unknown forever. See `useConsoleRoute` for why the difference matters.
   const teamsEnabled = version.data === undefined ? undefined : version.data.teams_enabled === true;
   const [route, navigate] = useConsoleRoute(teamsEnabled);
-  const openJobs = useOpenJobCount();
+  // How much of the job history is loaded (STUDIO-792). Owned here rather than in `JobsView`
+  // because the rail's badge counts the same query — see `useOpenJobCount`.
+  //
+  // A WIDER window each step, not an accumulated `offset`. The worklist is live: rows arrive at
+  // the top, so a second request at `offset=50` would re-serve rows that had shifted down and
+  // silently drop the ones they displaced. One growing request is always a consistent snapshot,
+  // and `next_offset` answers "is there more?" identically either way.
+  const [jobsLimit, setJobsLimit] = useState(JOBS_PAGE_SIZE);
+  const openJobs = useOpenJobCount(jobsLimit);
   // ONE updater instance, owned by the shell and shared — the hook's own contract (P11 U3), and the
   // reason the Podium shell mounts it too. Here it feeds both the Settings "Updates" row's pending
   // badge and the Updates view itself, so the two can never disagree. Without the Tauri bridge every
@@ -125,7 +134,14 @@ export function ConsoleApp() {
         overlayTitlebar={overlayTitlebar}
       >
         <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
-        <ConsoleBody route={route} teamsEnabled={teamsEnabled} go={go} updater={updater} />
+        <ConsoleBody
+          route={route}
+          teamsEnabled={teamsEnabled}
+          go={go}
+          updater={updater}
+          jobsLimit={jobsLimit}
+          onLoadMoreJobs={() => setJobsLimit((n) => n + JOBS_PAGE_SIZE)}
+        />
       </AppShell>
       {overlay}
     </>
@@ -157,11 +173,17 @@ function ConsoleBody({
   teamsEnabled,
   go,
   updater,
+  jobsLimit,
+  onLoadMoreJobs,
 }: {
   route: ConsoleRoute;
   teamsEnabled: boolean | undefined;
   go: (name: ConsoleRouteName, key?: string) => void;
   updater: Updater;
+  // Threaded from `ConsoleApp` rather than held here (STUDIO-792): the rail's Jobs badge reads the
+  // same query, and this switch may not call a hook of its own.
+  jobsLimit: number;
+  onLoadMoreJobs: () => void;
 }) {
   // A teams-only route reached before the capability is known renders nothing rather than
   // guessing: one frame of blank beats a placeholder for a view that may be about to redirect.
@@ -217,7 +239,13 @@ function ConsoleBody({
     case "reviews":
       return <ReviewsView onNavigate={(to) => go(to)} />;
     default:
-      return <JobsView onOpenJob={(issue) => go("job", issue)} />;
+      return (
+        <JobsView
+          onOpenJob={(issue) => go("job", issue)}
+          limit={jobsLimit}
+          onLoadMore={onLoadMoreJobs}
+        />
+      );
   }
 }
 
@@ -238,10 +266,17 @@ function RailFoot({ version, teamsEnabled }: { version: string; teamsEnabled: bo
   );
 }
 
-/** The Jobs nav count — tickets the daemon currently has work for. */
-function useOpenJobCount(): number {
+/**
+ * The Jobs nav count — tickets the daemon currently has work for.
+ *
+ * Takes the worklist's OWN page size (STUDIO-792) so the two read one query and one cache entry.
+ * A separate default here would leave the badge counting the newest 50 while the table showed
+ * everything the operator had loaded, which is a fresh version of the disagreement this ticket
+ * exists to remove.
+ */
+function useOpenJobCount(limit: number): number {
   const state = useStateQuery();
-  const issues = useIssueRuns();
+  const issues = useIssueRuns({ limit });
   const keys = new Set<string>();
   for (const r of state.data?.running ?? []) keys.add(r.issue_identifier);
   for (const r of state.data?.retrying ?? []) keys.add(r.issue_identifier);
