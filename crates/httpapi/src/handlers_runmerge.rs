@@ -1,5 +1,16 @@
 //! handlers_runmerge — the console's merge action: `POST /api/v1/runs/{id}/merge` (STUDIO-767;
-//! design record `~/.rhapsody/docs/STUDIO-767-console-merge-action.md`, §2, §3, §7 slice 3).
+//! design record `~/.rhapsody/docs/STUDIO-767-console-merge-action.md`, §2, §3, §7 slice 3), and
+//! the read that says what it would do: `GET /api/v1/runs/{id}/mergeability` (STUDIO-790).
+//!
+//! # Why the read has its own path
+//!
+//! The two are one route's worth of behaviour and could have shared a path by method. They do not,
+//! because `/merge` being **POST-only** is a one-line invariant anybody can check — a route no GET
+//! reaches cannot be fired by a link somebody clicks, and `the_route_is_post_only` pins exactly
+//! that. Serving a GET there would move the guarantee from the routing table into the body of a
+//! handler someone has to read. The read's own safety is the same kind of statement one level
+//! down: it calls `run_mergeability`, whose whole call graph never touches the merge seam
+//! (`runmerge::resolve_pull_request`), so there is no branch through it that merges anything.
 //!
 //! **No Go v0.4.0 counterpart, and no capture fixture** — the additive shape `/api/v1/reviews` and
 //! `/api/v1/teams/*` established. It IS a new served route, so it carries a README Divergences
@@ -39,10 +50,10 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
-use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeReceipt};
+use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeReceipt, MergeabilityOutcome};
 use serde::{Deserialize, Serialize};
 
-use crate::handlers::require_post;
+use crate::handlers::{require_get, require_post};
 use crate::handlers_runaction::parse_run_id;
 use crate::responses::{write_error, write_json};
 use crate::server::StateProvider;
@@ -169,6 +180,87 @@ fn render(outcome: MergeControlOutcome) -> Response {
         MergeControlOutcome::Failed(err) => {
             write_error(StatusCode::INTERNAL_SERVER_ERROR, "merge_failed", err, None)
         }
+    }
+}
+
+/// The mergeability verdict as the console reads it: a resolved receipt, or the daemon's own
+/// reason there will not be one.
+///
+/// A refusal is a 200 and not a 4xx, because on this route it is the ANSWER rather than an error:
+/// the console asked what would happen and the daemon said. Reserving the error envelope for the
+/// question that could not be answered at all is what lets the header distinguish *"the daemon
+/// says no, here is why"* from *"nobody could ask"* — and those two must render differently, since
+/// only the first justifies taking the control away.
+#[derive(Serialize)]
+struct MergeabilityJson<'a> {
+    mergeable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<&'a MergeReceipt>,
+    /// The daemon's refusal, verbatim. Empty when `mergeable`.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    reason: &'a str,
+}
+
+/// `GET /api/v1/runs/{id}/mergeability` — would this run's pull request merge? (STUDIO-790.)
+///
+/// | Outcome | Status | Body |
+/// |---|---|---|
+/// | it would merge | 200 | `{"mergeable": true, "receipt": {…}}` |
+/// | it would be refused | 200 | `{"mergeable": false, "reason": "<the daemon's own sentence>"}` |
+/// | Teams off | 409 | `teams_disabled` |
+/// | no such run, or a bad `{id}` | 404 | `not_found` |
+/// | the question could not be answered | 500 | `mergeability_unavailable` |
+///
+/// **This route merges nothing.** It is GET-only and takes no body, so there is no confirmation
+/// for one to arrive through, and the provider method it calls cannot reach `gh pr merge` down any
+/// branch.
+pub(crate) async fn handle_run_mergeability(
+    method: Method,
+    Path(id): Path<String>,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let run_id = match parse_run_id(&id) {
+        Ok(run_id) => run_id,
+        Err(resp) => return *resp,
+    };
+    match provider.run_mergeability(run_id).await {
+        MergeabilityOutcome::Mergeable(receipt) => write_json(
+            StatusCode::OK,
+            &MergeabilityJson {
+                mergeable: true,
+                receipt: Some(&receipt),
+                reason: "",
+            },
+        ),
+        MergeabilityOutcome::Refused(why) => write_json(
+            StatusCode::OK,
+            &MergeabilityJson {
+                mergeable: false,
+                receipt: None,
+                reason: why,
+            },
+        ),
+        MergeabilityOutcome::Dormant => write_error(
+            StatusCode::CONFLICT,
+            "teams_disabled",
+            "Rhapsody Teams is not enabled on this daemon",
+            None,
+        ),
+        MergeabilityOutcome::NotFound => {
+            write_error(StatusCode::NOT_FOUND, "not_found", "no such run", None)
+        }
+        // Deliberately NOT `merge_refused` and not `merge_failed`: nothing was merged and nothing
+        // was refused. The console keeps the Merge control live on this, because a `gh` that could
+        // not be reached is not the daemon saying no.
+        MergeabilityOutcome::Failed(err) => write_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "mergeability_unavailable",
+            err,
+            None,
+        ),
     }
 }
 
@@ -414,6 +506,127 @@ mod tests {
                 .contains("merge conflicts"),
             "{body}"
         );
+    }
+
+    /// **STUDIO-790's whole contract.** The read answers 200 with the receipt the click's first
+    /// leg would have carried, so the console can render a live Merge from a resolved pull request
+    /// rather than from hope.
+    #[tokio::test]
+    async fn the_mergeability_read_answers_the_receipt() {
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_mergeability(MergeabilityOutcome::Mergeable(receipt())),
+        );
+        let url = spawn(Arc::clone(&provider)).await;
+
+        let resp = reqwest::get(format!("{url}/api/v1/runs/7/mergeability"))
+            .await
+            .expect("GET");
+
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["mergeable"], true);
+        assert_eq!(body["receipt"]["pr"], "makewhatis/rhapsody#64");
+        assert_eq!(body["receipt"]["head_sha"], HEAD);
+        assert_eq!(body["receipt"]["merge_state"], "CLEAN");
+        assert!(body.get("reason").is_none(), "{body}");
+        assert_eq!(provider.mergeability_asked(), Some(7));
+        assert_eq!(
+            provider.merge_asked(),
+            None,
+            "reading whether a merge is possible must never attempt one"
+        );
+    }
+
+    /// A refusal is a **200**, not an error status: the console asked a question and the daemon
+    /// answered it. The reason crosses verbatim — it is what the disabled control's tooltip says.
+    #[tokio::test]
+    async fn a_refusal_is_the_answer_and_carries_the_daemons_own_words() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_mergeability(
+            MergeabilityOutcome::Refused("that pull request is already merged"),
+        ));
+        let url = spawn(Arc::clone(&provider)).await;
+
+        let resp = reqwest::get(format!("{url}/api/v1/runs/7/mergeability"))
+            .await
+            .expect("GET");
+
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["mergeable"], false);
+        assert_eq!(body["reason"], "that pull request is already merged");
+        assert!(body.get("receipt").is_none(), "{body}");
+        assert_eq!(provider.merge_asked(), None);
+    }
+
+    /// A question nobody could answer is NOT a refusal, and gets its own code so the console can
+    /// tell them apart: only a refusal justifies taking the Merge control away.
+    #[tokio::test]
+    async fn an_unanswerable_question_is_not_a_refusal() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_mergeability(
+            MergeabilityOutcome::Failed("gh pr list: HTTP 502".to_string()),
+        ));
+        let url = spawn(provider).await;
+
+        let resp = reqwest::get(format!("{url}/api/v1/runs/7/mergeability"))
+            .await
+            .expect("GET");
+
+        assert_eq!(resp.status(), 500);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "mergeability_unavailable");
+        assert_eq!(body["error"]["message"], "gh pr list: HTTP 502");
+    }
+
+    /// Teams off and a missing run answer exactly as the POST does, so the console needs no second
+    /// vocabulary for the read.
+    #[tokio::test]
+    async fn the_read_is_dormant_and_not_found_the_same_way_the_merge_is() {
+        let url = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
+        let resp = reqwest::get(format!("{url}/api/v1/runs/7/mergeability"))
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 409);
+        assert_eq!(body_json(resp).await["error"]["code"], "teams_disabled");
+
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_mergeability(MergeabilityOutcome::NotFound),
+        );
+        let url = spawn(Arc::clone(&provider)).await;
+        assert_eq!(
+            reqwest::get(format!("{url}/api/v1/runs/7/mergeability"))
+                .await
+                .expect("GET")
+                .status(),
+            404
+        );
+        for id in ["0", "-3", "abc"] {
+            assert_eq!(
+                reqwest::get(format!("{url}/api/v1/runs/{id}/mergeability"))
+                    .await
+                    .expect("GET")
+                    .status(),
+                404,
+                "run id {id:?}"
+            );
+        }
+    }
+
+    /// The read is GET-only. A POST to it must not become a second, unconfirmed way to ask the
+    /// merge path for anything — the write surface is `/merge`, and there is exactly one.
+    #[tokio::test]
+    async fn the_read_route_is_get_only() {
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_mergeability(MergeabilityOutcome::Mergeable(receipt())),
+        );
+        let url = spawn(Arc::clone(&provider)).await;
+
+        let resp = post(&format!("{url}/api/v1/runs/7/mergeability"), "").await;
+
+        assert_eq!(resp.status(), 405);
+        assert_eq!(provider.mergeability_asked(), None);
+        assert_eq!(provider.merge_asked(), None);
     }
 
     /// The route is POST-only, and says so in `Allow` — a GET must never be able to merge

@@ -2,6 +2,11 @@
 //! everything that should be refused, and perform the one bounded merge (STUDIO-767, slices 1–3 of
 //! the design record `~/.rhapsody/docs/STUDIO-767-console-merge-action.md`, §2/§3/§7).
 //!
+//! The refusals are also READ on their own, without merging, so the console can show one before
+//! the click instead of only after it ([`mergeability`], STUDIO-790). Both sides share
+//! [`resolve_pull_request`], which is what keeps the reason the header shows and the reason the
+//! merge would give from being two implementations that can disagree.
+//!
 //! **No Go v0.4.0 counterpart.** The frozen Symphony reference has no console merge; this is the
 //! additive Rhapsody surface the design record specifies, dormant unless Teams is on.
 //!
@@ -241,6 +246,61 @@ pub async fn resolve_and_merge(
     confirm: &str,
     deps: &MergeDeps,
 ) -> MergeControlOutcome {
+    let receipt = match resolve_pull_request(plan, deps).await {
+        MergeResolution::Resolved(receipt) => receipt,
+        MergeResolution::Refused(why) => return MergeControlOutcome::Refused(why),
+        MergeResolution::Failed(err) => return MergeControlOutcome::Failed(err),
+    };
+    // Constant-time comparison would be theatre here: the value being compared is a public commit
+    // SHA that `GET /api/v1/runs/{id}` neighbours already expose, and §3/G3 is explicit that the
+    // handshake is a speed bump against mistake and drive-by forgery, not a secret.
+    if confirm != receipt.head_sha {
+        return MergeControlOutcome::ConfirmRequired(receipt);
+    }
+    match deps
+        .merger
+        .merge_pr(
+            &plan.owner,
+            &plan.repo,
+            receipt.number,
+            MERGE_METHOD,
+            MERGE_AUTO,
+        )
+        .await
+    {
+        Ok(said) => {
+            tracing::info!(run = plan.run_id, issue = %plan.issue, pr = %receipt.pr, "console merge: merged");
+            MergeControlOutcome::Applied(MergeReceipt { said, ..receipt })
+        }
+        Err(e) => MergeControlOutcome::Failed(e.to_string()),
+    }
+}
+
+/// What resolving a run's pull request produced — the receipt, or the reason there will not be one.
+///
+/// It exists so that steps 1-4 above are written ONCE and read the same on both sides of the
+/// click. [`resolve_and_merge`] and [`mergeability`] share this function, so a refusal the console
+/// shows before the click is not a re-derivation of the daemon's rule but literally the same
+/// `&'static str` the merge would have refused with (STUDIO-790).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeResolution {
+    /// The pull request resolved and every refusal was passed. Nothing has been merged.
+    Resolved(MergeReceipt),
+    /// One of the refusals fired, and this is its sentence.
+    Refused(&'static str),
+    /// A `gh` seam could not answer, and this is its own complaint verbatim.
+    Failed(String),
+}
+
+/// Steps 1-4 of [`resolve_and_merge`]: resolve `plan`'s pull request and apply every refusal, up to
+/// but NOT including the confirm handshake and the merge.
+///
+/// **Nothing in this function can merge anything**, and that is the point rather than an accident:
+/// [`MergeDeps::merger`] is never touched here, so the read path that calls it
+/// ([`mergeability`], serving a GET) cannot reach `gh pr merge` down any branch. That is the same
+/// discipline §3/G1 applies to the request type — a property of the code's shape rather than of a
+/// flag someone has to pass correctly.
+pub async fn resolve_pull_request(plan: &MergePlan, deps: &MergeDeps) -> MergeResolution {
     let url = match deps
         .prs
         .open_pr_for_branch(&plan.owner, &plan.repo, &plan.branch)
@@ -248,14 +308,14 @@ pub async fn resolve_and_merge(
     {
         Ok(Some(url)) => url,
         Ok(None) => {
-            return MergeControlOutcome::Refused("no open pull request on this run's branch");
+            return MergeResolution::Refused("no open pull request on this run's branch");
         }
-        Err(e) => return MergeControlOutcome::Failed(e.to_string()),
+        Err(e) => return MergeResolution::Failed(e.to_string()),
     };
     // The number, and ONLY the number, is taken from GitHub's answer. `parse_pr_ref` fails closed
     // on anything that is not a positive number under a two-segment owner/repo path.
     let Some(found) = parse_pr_ref(&url) else {
-        return MergeControlOutcome::Refused("the pull request's URL could not be read");
+        return MergeResolution::Refused("the pull request's URL could not be read");
     };
     // On the OWNER and not on the whole slug, for the reason `open_pr_for_branch` gives at length:
     // a same-account fork is inside the trust boundary, and a whole-slug match would break on a
@@ -270,9 +330,7 @@ pub async fn resolve_and_merge(
             want = %plan.owner,
             "console merge: the resolved pull request belongs to another account; refusing"
         );
-        return MergeControlOutcome::Refused(
-            "the resolved pull request belongs to another account",
-        );
+        return MergeResolution::Refused("the resolved pull request belongs to another account");
     }
     let number = found.number;
     let pr = format!("{}/{}#{number}", plan.owner, plan.repo);
@@ -284,26 +342,22 @@ pub async fn resolve_and_merge(
     {
         Ok(PrLookup::Found(snap)) => snap,
         Ok(PrLookup::Gone) => {
-            return MergeControlOutcome::Refused("GitHub cannot resolve that pull request");
+            return MergeResolution::Refused("GitHub cannot resolve that pull request");
         }
         Ok(PrLookup::Untrusted) => {
-            return MergeControlOutcome::Refused(
-                "the pull request's head repository is not this one",
-            );
+            return MergeResolution::Refused("the pull request's head repository is not this one");
         }
-        Err(e) => return MergeControlOutcome::Failed(e.to_string()),
+        Err(e) => return MergeResolution::Failed(e.to_string()),
     };
     match snapshot.status {
         PrStatus::Merged => {
-            return MergeControlOutcome::Refused("that pull request is already merged");
+            return MergeResolution::Refused("that pull request is already merged");
         }
-        PrStatus::Closed => return MergeControlOutcome::Refused("that pull request is closed"),
+        PrStatus::Closed => return MergeResolution::Refused("that pull request is closed"),
         PrStatus::Open => {}
     }
     if plan.watched.contains(&number) {
-        return MergeControlOutcome::Refused(
-            "a Rhapsody review of that pull request is still live",
-        );
+        return MergeResolution::Refused("a Rhapsody review of that pull request is still live");
     }
     // The reviewer's explicit no, and the one the design's liveness-only gate let through
     // (STUDIO-784 gap 2). GitHub cannot hold this line for us — the verdict is a PR COMMENT, not a
@@ -314,7 +368,7 @@ pub async fn resolve_and_merge(
         // `reviewed` row (`REVIEW_STATUS_REVIEWED`'s own doc), so the author's next push clears
         // this block whether or not anyone read the new head. The refusal says what the ledger
         // actually holds.
-        return MergeControlOutcome::Refused(
+        return MergeResolution::Refused(
             "a Rhapsody review of that pull request asked for changes and the author has not pushed since",
         );
     }
@@ -330,7 +384,7 @@ pub async fn resolve_and_merge(
         .await
     {
         Ok(state) => state,
-        Err(e) => return MergeControlOutcome::Failed(e.to_string()),
+        Err(e) => return MergeResolution::Failed(e.to_string()),
     };
     if merge_state == MERGE_STATE_BEHIND {
         // Only here, and only for this reason: with `allow_update_branch` on, GitHub's auto-merge
@@ -351,7 +405,7 @@ pub async fn resolve_and_merge(
                     "console merge: the branch is behind its base and the repository will not \
                      update it; refusing rather than arming an auto-merge that cannot fire"
                 );
-                return MergeControlOutcome::Refused(
+                return MergeResolution::Refused(
                     "this branch is behind its base and cannot update itself; push or update the \
                      branch, then merge",
                 );
@@ -372,7 +426,7 @@ pub async fn resolve_and_merge(
                     "console merge: the branch is behind its base and the repository's \
                      branch-update policy could not be read; refusing"
                 );
-                return MergeControlOutcome::Refused(
+                return MergeResolution::Refused(
                     "this branch is behind its base and cannot update itself; push or update the \
                      branch, then merge",
                 );
@@ -383,7 +437,7 @@ pub async fn resolve_and_merge(
     let receipt = MergeReceipt {
         run_id: plan.run_id,
         issue: plan.issue.clone(),
-        pr: pr.clone(),
+        pr,
         url,
         number,
         head_sha: snapshot.head_sha.clone(),
@@ -392,23 +446,72 @@ pub async fn resolve_and_merge(
         merge_state,
         said: String::new(),
     };
-    // Constant-time comparison would be theatre here: the value being compared is a public commit
-    // SHA that `GET /api/v1/runs/{id}` neighbours already expose, and §3/G3 is explicit that the
-    // handshake is a speed bump against mistake and drive-by forgery, not a secret.
-    if confirm != snapshot.head_sha {
-        return MergeControlOutcome::ConfirmRequired(receipt);
-    }
+    MergeResolution::Resolved(receipt)
+}
 
-    match deps
-        .merger
-        .merge_pr(&plan.owner, &plan.repo, number, MERGE_METHOD, MERGE_AUTO)
-        .await
-    {
-        Ok(said) => {
-            tracing::info!(run = plan.run_id, issue = %plan.issue, pr = %pr, "console merge: merged");
-            MergeControlOutcome::Applied(MergeReceipt { said, ..receipt })
+/// What the daemon would answer if the operator clicked **Merge** right now (STUDIO-790).
+///
+/// A deliberately NARROWER type than [`MergeControlOutcome`]: it has no `Applied` arm and no
+/// `ConfirmRequired` arm, because the read that produces it never merges and never asks for a
+/// confirmation. The console renders a live Merge control from [`Mergeable`](Self::Mergeable) and
+/// a reason-bearing disabled one from [`Refused`](Self::Refused), so an answer this type cannot
+/// hold is an answer the header cannot claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeabilityOutcome {
+    /// Teams is off, so there is no merge path at all — [`MergeControlOutcome::Dormant`]'s twin.
+    Dormant,
+    /// No run has that id.
+    NotFound,
+    /// The daemon resolved this run's pull request and would proceed to the confirm handshake.
+    /// The receipt is the same one the handshake's first leg would carry.
+    Mergeable(MergeReceipt),
+    /// The daemon would refuse, and this is the sentence it would refuse with — the SAME
+    /// `&'static str`, not a console-side paraphrase of it.
+    Refused(&'static str),
+    /// The question could not be answered; the payload is the failing seam's own complaint.
+    Failed(String),
+}
+
+impl MergeabilityOutcome {
+    /// Reads a plan-time denial as an answer to the question instead of as a refused attempt.
+    ///
+    /// [`crate::mergeconsole::MergePlanOutcome::Denied`] is documented to carry only `Dormant`,
+    /// `NotFound`, `Refused` or `Failed` — nothing is resolved at plan time, so neither of the
+    /// other two can be built there. They are still mapped rather than unwrapped: a panic is not
+    /// how this daemon says "impossible" on a path an HTTP request drives.
+    pub fn from_denial(denial: MergeControlOutcome) -> Self {
+        match denial {
+            MergeControlOutcome::Dormant => Self::Dormant,
+            MergeControlOutcome::NotFound => Self::NotFound,
+            MergeControlOutcome::Refused(why) => Self::Refused(why),
+            MergeControlOutcome::Failed(err) => Self::Failed(err),
+            MergeControlOutcome::ConfirmRequired(_) | MergeControlOutcome::Applied(_) => {
+                Self::Failed(
+                    "the merge planner answered with a resolved pull request, which it cannot"
+                        .to_string(),
+                )
+            }
         }
-        Err(e) => MergeControlOutcome::Failed(e.to_string()),
+    }
+}
+
+/// Answers "could this run's pull request be merged?" without merging it (STUDIO-790).
+///
+/// The console needs the refusal BEFORE the click — a control that only learns it was impossible
+/// afterwards is the bug this exists to fix — and the daemon already knew: this is
+/// [`resolve_pull_request`], the very ladder the merge walks, read for its answer instead of acted
+/// on. So the console's disabled tooltip carries the daemon's own words rather than a second
+/// implementation of the same rules that could drift from them.
+///
+/// It cannot merge anything, structurally: [`resolve_pull_request`] never touches
+/// [`MergeDeps::merger`], and there is no `confirm` parameter here for a caller to supply one
+/// through. Its caller takes no single-flight claim and writes no audit record either — see
+/// [`crate::mergeconsole::MergeIntent`] for why a question must leave neither trace.
+pub async fn mergeability(plan: &MergePlan, deps: &MergeDeps) -> MergeabilityOutcome {
+    match resolve_pull_request(plan, deps).await {
+        MergeResolution::Resolved(receipt) => MergeabilityOutcome::Mergeable(receipt),
+        MergeResolution::Refused(why) => MergeabilityOutcome::Refused(why),
+        MergeResolution::Failed(err) => MergeabilityOutcome::Failed(err),
     }
 }
 
@@ -974,6 +1077,103 @@ mod tests {
         };
         assert_eq!(receipt.head_sha, HEAD, "the receipt carries the LIVE head");
         assert!(merger.calls().is_empty(), "nothing may be merged");
+    }
+
+    /// **STUDIO-790, the whole point.** The read answers with the receipt the click's first leg
+    /// would have asked the operator to confirm — and merges nothing on the way to saying so.
+    #[tokio::test]
+    async fn mergeability_answers_the_receipt_the_click_would_ask_to_confirm() {
+        let merger = FakeMerger::ok();
+        let deps = deps(
+            FakePrs::at("https://github.com/o/r/pull/64"),
+            FakeState::open(),
+            Arc::clone(&merger),
+        );
+
+        let got = mergeability(&plan(), &deps).await;
+
+        let MergeabilityOutcome::Mergeable(receipt) = got else {
+            panic!("want Mergeable, got {got:?}");
+        };
+        // The same receipt, field for field, that the handshake's first leg carries — so the
+        // console renders one thing before the click and confirms the same thing at it.
+        let MergeControlOutcome::ConfirmRequired(asked) =
+            resolve_and_merge(&plan(), "", &deps).await
+        else {
+            panic!("the unconfirmed click must still be a confirm_required");
+        };
+        assert_eq!(receipt, asked);
+        assert_eq!(receipt.head_sha, HEAD);
+        assert!(
+            merger.calls().is_empty(),
+            "asking whether a merge is possible must never perform one"
+        );
+    }
+
+    /// A refusal reaches the console VERBATIM, as the same `&'static str` the click would have been
+    /// refused with. If these two ever diverge the header starts telling its own story.
+    #[tokio::test]
+    async fn mergeability_gives_the_same_refusal_the_merge_would() {
+        let merger = FakeMerger::ok();
+        let deps = deps(
+            FakePrs::at("https://github.com/o/r/pull/64"),
+            FakeState::found(PrStatus::Merged, HEAD),
+            Arc::clone(&merger),
+        );
+
+        let read = mergeability(&plan(), &deps).await;
+        let clicked = resolve_and_merge(&plan(), HEAD, &deps).await;
+
+        assert_eq!(
+            read,
+            MergeabilityOutcome::Refused("that pull request is already merged")
+        );
+        assert_eq!(
+            clicked,
+            MergeControlOutcome::Refused("that pull request is already merged"),
+            "the reason shown before the click is the reason the click gives"
+        );
+        assert!(merger.calls().is_empty());
+    }
+
+    /// A `gh` seam that cannot answer is reported as a failure to ANSWER, never as a refusal — the
+    /// console must not print "the daemon says no" when what happened is that nobody could ask.
+    #[tokio::test]
+    async fn an_unanswerable_question_is_a_failure_and_not_a_refusal() {
+        let merger = FakeMerger::ok();
+        let got = mergeability(
+            &plan(),
+            &deps(FakePrs::failing(), FakeState::open(), Arc::clone(&merger)),
+        )
+        .await;
+
+        let MergeabilityOutcome::Failed(err) = got else {
+            panic!("want Failed, got {got:?}");
+        };
+        assert!(err.contains("gh pr list"), "{err}");
+        assert!(merger.calls().is_empty());
+    }
+
+    /// The read path cannot merge, and the reason is structural rather than a flag: nothing
+    /// reachable from [`mergeability`] mentions the merge seam. Asserted on this module's own
+    /// source, so wiring one in is a failing test rather than a review someone has to catch.
+    #[test]
+    fn the_resolve_half_never_reaches_the_merge_seam() {
+        let src = include_str!("runmerge.rs");
+        let start = src
+            .find("pub async fn resolve_pull_request(")
+            .expect("the resolve half is still called resolve_pull_request");
+        let end = src[start..]
+            .find("\n/// What the daemon would answer")
+            .expect("the mergeability outcome still follows it");
+        let body = &src[start..start + end];
+        for forbidden in ["merger", "merge_pr"] {
+            assert!(
+                !body.contains(forbidden),
+                "resolve_pull_request reached `{forbidden}`: the read that a GET serves must not \
+                 be able to merge anything (STUDIO-790)"
+            );
+        }
     }
 
     /// The happy path, end to end: one merge, at the coordinate this module resolved, as

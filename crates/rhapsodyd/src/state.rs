@@ -21,7 +21,7 @@ use rhapsody_httpapi::{
 };
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
-use rhapsody_orchestrator::runmerge::MergeControlOutcome;
+use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeabilityOutcome};
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
     TeamsMemory, TeamsMemoryError, TeamsView,
@@ -282,6 +282,13 @@ impl StateProvider for DaemonState {
     /// ticking — and settles back on the loop.
     async fn merge_run(&self, run_id: i64, confirm: &str) -> MergeControlOutcome {
         self.handle.merge_run(run_id, confirm).await
+    }
+
+    /// `GET /api/v1/runs/{id}/mergeability` (STUDIO-790) — the same journey minus its last two
+    /// steps: plan on the loop, resolve the pull request here, and stop. Nothing is merged, no
+    /// single-flight claim is taken and nothing is recorded, so the console may refetch it.
+    async fn run_mergeability(&self, run_id: i64) -> MergeabilityOutcome {
+        self.handle.run_mergeability(run_id).await
     }
 
     fn teams_config_path(&self) -> &str {
