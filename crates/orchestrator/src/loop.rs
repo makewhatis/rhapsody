@@ -712,8 +712,9 @@ impl Orchestrator {
         self.publish_snapshot();
         if let Err(e) = self.validate() {
             tracing::error!(err = %e, "dispatch preflight validation failed; skipping dispatch");
-            // Both early returns below skip dispatch entirely, so the reset at the top of
-            // `dispatch_decisions` never runs and the last successful pass's tally would stand.
+            // This early return and the credential preflight just below both skip dispatch
+            // entirely, so the reset at the top of `dispatch_decisions` never runs and the last
+            // successful pass's tally would stand.
             // Retire it here instead (STUDIO-805): unlike the tracker outage that reset covers,
             // NEITHER of these clears up on its own — a bad config or a dead agent credential skips
             // dispatch every tick until a human intervenes — so a survivor would render "N queued"
