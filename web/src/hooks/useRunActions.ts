@@ -1,11 +1,13 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  fetchRunMergeability,
   mergeRun,
   resumeRun,
   sendRunMessage,
   stopRun,
   type MergeRunResult,
   type RunActionResult,
+  type RunMergeability,
 } from "@/lib/api";
 import { STATE_QUERY_KEY } from "@/hooks/useStateQuery";
 
@@ -62,6 +64,35 @@ export function useMergeRun(runID: number) {
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: STATE_QUERY_KEY });
       void qc.invalidateQueries({ queryKey: ["run-detail", runID] });
+      // The verdict the header renders Merge from is stale the moment a merge is attempted — an
+      // armed auto-merge makes the next answer "already merged" (STUDIO-790).
+      void qc.invalidateQueries({ queryKey: mergeabilityKey(runID) });
     },
+  });
+}
+
+export function mergeabilityKey(runID: number) {
+  return ["run-mergeability", runID] as const;
+}
+
+// useRunMergeability asks what Merge would do BEFORE it is clicked (STUDIO-790): GET
+// /api/v1/runs/{id}/mergeability, which resolves the run's pull request and applies every refusal
+// without merging anything. The header renders a live primary from a `mergeable` verdict and a
+// reason-bearing disabled control from a refusal, so the daemon's answer is readable without an
+// irreversible-looking click.
+//
+// It does NOT poll. Each read costs the daemon a few bounded `gh` round trips, and the verdict only
+// moves on events the console already reacts to — a merge attempt invalidates it above, and
+// remounting the run detail refetches it. `enabled` carries the Teams gate: with Teams off the
+// daemon serves `teams_disabled` and the header is dependency-named without asking.
+export function useRunMergeability(runID: number, enabled: boolean) {
+  return useQuery<RunMergeability>({
+    queryKey: mergeabilityKey(runID),
+    queryFn: () => fetchRunMergeability(runID),
+    enabled: enabled && runID > 0,
+    refetchOnWindowFocus: false,
+    // One failing read must not become a retry storm against `gh`; the header stays usable on a
+    // failure anyway, because a question nobody could answer is not a refusal.
+    retry: false,
   });
 }

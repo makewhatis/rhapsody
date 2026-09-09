@@ -7,6 +7,7 @@ import {
   fetchState,
   fetchVersion,
   localDayStartISO,
+  fetchRunMergeability,
   mergeRun,
   resumeRun,
   sendRunMessage,
@@ -412,5 +413,73 @@ describe("mergeRun — the console merge action's confirm handshake (STUDIO-767)
   it("does not claim a merge happened when a 200 carries no receipt", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 200 })));
     await expect(mergeRun(7)).rejects.toThrow(/no receipt/i);
+  });
+
+  // STUDIO-790: the read the header renders itself from. A GET, and one that resolves the pull
+  // request the operator would be confirming.
+  it("reads the mergeable verdict and its receipt", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ mergeable: true, receipt: RECEIPT }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(fetchRunMergeability(7)).resolves.toEqual({ mergeable: true, receipt: RECEIPT });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit | undefined];
+    expect(url).toBe("/api/v1/runs/7/mergeability");
+    // No method and no body: nothing here can ask the daemon to merge anything.
+    expect(init?.method).toBeUndefined();
+    expect(init?.body).toBeUndefined();
+  });
+
+  // A refusal is a 200 and NOT a throw, because it is the answer: the header turns it into the
+  // disabled control's tooltip, in the daemon's own words.
+  it("reads a refusal as a verdict rather than as a failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ mergeable: false, reason: "that pull request is already merged" }),
+            { status: 200 },
+          ),
+      ),
+    );
+    await expect(fetchRunMergeability(7)).resolves.toEqual({
+      mergeable: false,
+      reason: "that pull request is already merged",
+    });
+  });
+
+  // A question nobody could answer throws, so the header can tell it apart from a refusal and keep
+  // Merge live — a `gh` that would not respond is not the daemon saying no.
+  it("throws when the question could not be answered at all", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: { code: "mergeability_unavailable", message: "gh pr list: HTTP 502" },
+            }),
+            { status: 500 },
+          ),
+      ),
+    );
+    await expect(fetchRunMergeability(7)).rejects.toThrow("gh pr list: HTTP 502");
+  });
+
+  // A 200 with no verdict in it is not a verdict. Defaulting either way would be a guess: `false`
+  // takes the control away for a daemon that refused nothing, `true` puts the original lie back.
+  it("refuses to invent a verdict from an unreadable 200", async () => {
+    for (const body of ["", JSON.stringify({}), JSON.stringify({ mergeable: "yes" })]) {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 200 })));
+      await expect(fetchRunMergeability(7)).rejects.toThrow(/no mergeability verdict/i);
+    }
+    // Called mergeable with nothing resolved is the same class of answer.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ mergeable: true }), { status: 200 })),
+    );
+    await expect(fetchRunMergeability(7)).rejects.toThrow(/resolved no pull request/i);
   });
 });
