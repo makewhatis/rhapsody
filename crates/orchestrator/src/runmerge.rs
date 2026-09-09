@@ -1136,6 +1136,27 @@ mod tests {
         assert!(merger.calls().is_empty());
     }
 
+    /// The refusal a REAL merged pull request produces, and the one STUDIO-790's own motivating
+    /// ticket will show. `open_pr_for_branch` filters `--state open`, so a merged pull request
+    /// drops out at resolution rather than reaching the `PrStatus::Merged` arm above — which is
+    /// why that arm's parity test is not the whole story and this one exists beside it.
+    #[tokio::test]
+    async fn a_branch_whose_pull_request_has_merged_is_refused_at_resolution() {
+        let merger = FakeMerger::ok();
+        let deps = deps(FakePrs::none(), FakeState::open(), Arc::clone(&merger));
+
+        assert_eq!(
+            mergeability(&plan(), &deps).await,
+            MergeabilityOutcome::Refused("no open pull request on this run's branch")
+        );
+        assert_eq!(
+            resolve_and_merge(&plan(), HEAD, &deps).await,
+            MergeControlOutcome::Refused("no open pull request on this run's branch"),
+            "and the click says exactly the same thing"
+        );
+        assert!(merger.calls().is_empty());
+    }
+
     /// A `gh` seam that cannot answer is reported as a failure to ANSWER, never as a refusal — the
     /// console must not print "the daemon says no" when what happened is that nobody could ask.
     #[tokio::test]
