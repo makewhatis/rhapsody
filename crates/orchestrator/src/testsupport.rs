@@ -334,9 +334,11 @@ pub(crate) fn orch_with_store() -> (Orchestrator, Arc<dyn Store + Send + Sync>) 
     (o, store)
 }
 
-/// A single-project select orchestrator with Teams ON and a roster built from `(name,
-/// max_concurrent)` pairs — the fixture for the capacity ladder (STUDIO-802; design record
-/// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.1).
+/// A select orchestrator with Teams ON and a roster built from `(name, max_concurrent)` pairs —
+/// the fixture for the capacity ladder (STUDIO-802; design record
+/// `~/.rhapsody/docs/per-role-concurrency-design.md` §4.1). It resolves no projects, so it drives
+/// the single-project pass as built; `select.rs`'s `multi_with_capped_roster` layers the resolved
+/// projects on top of it to drive the multi-project pass (STUDIO-803).
 ///
 /// Deliberately **not** called `orch_with_teams`: that name belongs to `teams.rs`'s helper, which
 /// takes an already-built [`Teams`] and returns a tuple.
