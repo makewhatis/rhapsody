@@ -1595,18 +1595,20 @@ mod tests {
         o: &mut Orchestrator,
         roster: &[(&str, i64)],
     ) -> Arc<crate::teamsmemory::TeamsMemory> {
-        let teams = rhapsody_config::teams::Teams {
+        use rhapsody_config::teams::{Identity, Teams};
+
+        let teams = Teams {
             enabled: true,
             roster: roster
                 .iter()
-                .map(|(name, max_concurrent)| rhapsody_config::teams::Identity {
+                .map(|(name, max_concurrent)| Identity {
                     name: (*name).to_string(),
                     profile: "swe".to_string(),
                     max_concurrent: *max_concurrent,
-                    ..rhapsody_config::teams::Identity::default()
+                    ..Identity::default()
                 })
                 .collect(),
-            ..rhapsody_config::teams::Teams::disabled()
+            ..Teams::disabled()
         };
         let mem = Arc::new(crate::teamsmemory::TeamsMemory::new(
             Arc::new(teams.clone()),
