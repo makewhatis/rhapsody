@@ -229,6 +229,19 @@ pub struct RetryEntry {
     /// work in flight. Zero-value (`id == ""`) for boot-recovered entries and legacy/test paths.
     pub issue: rhapsody_core::Issue,
 
+    /// The teammate this parked work belongs to (carried from the running entry at schedule time,
+    /// exactly like [`issue`](Self::issue) above), so a run backing off still counts against its
+    /// owner's implementation capacity in
+    /// [`LoadSnapshot::from_running_and_retries`](crate::teams::LoadSnapshot::from_running_and_retries)
+    /// instead of reading as idle for the whole backoff window.
+    ///
+    /// Zero-value (`""`) for boot-recovered entries and legacy/test paths — the same gap `issue`
+    /// carries, and stated rather than discovered. **A retry recovered after a daemon restart
+    /// therefore does NOT count toward capacity until it re-dispatches**, because the identity was
+    /// never persisted and re-deriving it by routing would be circular (routing needs the very load
+    /// snapshot being built). Bounded by one retry fire per recovered entry, and accepted.
+    pub identity: String,
+
     /// Phase 4 recovery bookkeeping. `due_at_ms` is the wall-clock unix-ms persisted due time (for
     /// `SaveRetry` + boot re-arm). `recovered` marks a boot-recovered entry keyed by IDENTIFIER
     /// (`issue_id == ""`); `on_retry` matches its candidate by `.identifier` and re-keys to the real

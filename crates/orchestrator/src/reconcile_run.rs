@@ -260,6 +260,7 @@ impl Orchestrator {
                 failure_backoff_ms(attempt, max_backoff),
                 "stalled",
                 re.issue.clone(),
+                re.identity.clone(),
             );
         }
     }
