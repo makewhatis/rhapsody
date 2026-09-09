@@ -614,9 +614,11 @@ impl Orchestrator {
                 .filter(|name| !peers.contains(name.as_str()))
                 .collect();
         // Decision B, applied where it earns its keep: a reviewer who READ the previous round knows
-        // the pull request and their own findings, so they keep it unless they are at capacity. A
-        // row with no last round has no such continuity, so it takes the ranking's answer — which
-        // is what makes two same-tick introductions land on two different reviewers.
+        // the pull request and their own findings, so they keep it as long as they are still a
+        // candidate — on the roster, not the author, not already holding another of this pull
+        // request's required reviews. A row with no last round has no such continuity, so it takes
+        // the ranking's answer — which is what makes two same-tick introductions land on two
+        // different reviewers.
         if !row.last_reviewed_sha.is_empty() && candidates.iter().any(|name| name == incumbent) {
             return Some(incumbent.to_string());
         }
@@ -748,8 +750,9 @@ mod tests {
         }
     }
 
-    /// Teams on, `review.mode: ticketless`, an unlimited-capacity roster — everything the watcher
-    /// gates on, with capacity out of the way unless a test puts it back.
+    /// Teams on, `review.mode: ticketless`, an uncapped roster — everything the watcher gates on.
+    /// The `max_concurrent: 0` is now belt-and-braces for reviewer choice, which stopped consulting
+    /// capacity in STUDIO-800; it still matters to anything here that reaches the dispatch ladder.
     fn ticketless(names: &[&str]) -> Teams {
         teams_with(
             true,
@@ -1213,8 +1216,8 @@ mod tests {
         assert_eq!(report.deferred, 0);
     }
 
-    /// Decision B: a reviewer who READ the previous round keeps the pull request while they have
-    /// capacity, even when somebody else is idler.
+    /// Decision B: a reviewer who READ the previous round keeps the pull request even when
+    /// somebody else is idler — continuity outranks the load ranking.
     #[test]
     fn a_re_review_prefers_the_reviewer_who_read_the_last_round() {
         let (mut o, dispatched) = orch(ticketless(&["alice", "bob", "carol"]));
