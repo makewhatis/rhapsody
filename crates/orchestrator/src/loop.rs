@@ -784,11 +784,14 @@ impl Orchestrator {
     /// Stores what a selection pass withheld for want of capacity, and PUBLISHES it to
     /// [`TeamsMemory`](crate::teamsmemory::TeamsMemory) so the roster can report it (STUDIO-805).
     ///
-    /// Every assignment to `held_for_capacity` goes through here, including the reset at the top of
-    /// a tick: the tally is loop-confined and `roster()` runs entirely on the HTTP task, so a store
-    /// that skipped the publish would leave the console reporting a pass that is over — exactly the
-    /// stale answer the reset exists to prevent. A pure map write, no I/O, no lock across an
-    /// `.await`, and the same shape as the `bind_run` / `release_run` seam it joins.
+    /// Every assignment to `held_for_capacity` goes through here — both ladders' stores and the
+    /// reset at the top of a tick: the tally is loop-confined and `roster()` runs entirely on the
+    /// HTTP task, so a store that skipped the publish would leave the console reporting a pass that
+    /// is over — exactly the stale answer the reset exists to prevent. Worse on the multi-project
+    /// ladder, which is the ONLY one a `projects:` install reaches: there the reset republishes
+    /// `{}` every tick with nothing to overwrite it, so the card reads a permanent zero while work
+    /// is genuinely held. A pure map write, no I/O, no lock across an `.await`, and the same shape
+    /// as the `bind_run` / `release_run` seam it joins.
     fn set_held_for_capacity(&mut self, counts: HashMap<String, i64>) {
         if let Some(mem) = self.teams_memory.as_ref() {
             mem.publish_held(counts.clone());
@@ -826,8 +829,10 @@ impl Orchestrator {
             let (picked, reopen, held_for_capacity) =
                 self.select_dispatch_multi_with_reopens(tagged);
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
-            // the reset at the top of the tick exactly as the single-project path below does.
-            self.held_for_capacity = held_for_capacity;
+            // the reset at the top of the tick exactly as the single-project path below does — and
+            // PUBLISHED through the same setter, because this is the only ladder a `projects:`
+            // install ever reaches (STUDIO-805).
+            self.set_held_for_capacity(held_for_capacity);
             // Pool-mode picks (INF-477) win the single-claimant claim BEFORE dispatch; assignee-mode
             // picks dispatch immediately. Build owned routes before the `&mut self` dispatch.
             let mut pool_picks: Vec<TaggedIssue> = Vec::new();
@@ -1833,6 +1838,52 @@ mod tests {
         assert_eq!(
             view.roster[0].queued, 1,
             "the roster the HTTP task serves never sees the tally unless the tick publishes it"
+        );
+    }
+
+    /// The same hand-off on the OTHER ladder. A `projects:` install never reaches the
+    /// single-project path above — `has_projects` routes it into
+    /// `select_dispatch_multi_with_reopens` — so a publish wired only into the single-project store
+    /// leaves that install rendering a permanent zero: the reset at the top of `dispatch_decisions`
+    /// republishes `{}` every tick and nothing ever overwrites it. That is this count's own purpose
+    /// inverted, on the shape the operator actually runs (STUDIO-805, review round 3, after B2
+    /// landed the multi-project hold in STUDIO-803). Reads `queued` back through `roster()` rather
+    /// than off the tally, because the tally being right is exactly what the defect looked like.
+    #[tokio::test]
+    async fn a_multi_project_pass_that_holds_work_publishes_the_count_to_the_roster() {
+        let mut ta = Fake::new();
+        ta.candidates = vec![
+            Issue {
+                team_id: "team-1".to_string(),
+                labels: Some(vec!["rhapsody:@alice".to_string()]),
+                ..issue("1", "MT-1", "todo")
+            },
+            Issue {
+                team_id: "team-1".to_string(),
+                labels: Some(vec!["rhapsody:@alice".to_string()]),
+                ..issue("2", "MT-2", "todo")
+            },
+        ];
+        let (mut o, _spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::new(ta), "p")], 10);
+        o.ctx = Some(CancelWait::default());
+        let mem = attach_capped_team(&mut o, &[("alice", 1)]);
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert_eq!(
+            o.held_for_capacity.get("alice").copied(),
+            Some(1),
+            "the multi ladder should have held one of alice's two tickets: she has one seat"
+        );
+        assert_eq!(
+            mem.roster().expect("roster").roster[0].queued,
+            1,
+            "the multi-project store bypassed the publish, so a `projects:` install renders a \
+             permanent zero while work is held"
         );
     }
 
