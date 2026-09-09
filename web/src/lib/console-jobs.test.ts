@@ -3,7 +3,9 @@ import type { IssueRun, TeamsOverview } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 import {
   CONSOLE_JOB_FILTERS,
+  JOBS_PAGE_SIZE,
   buildConsoleJobs,
+  consoleJobsPageNote,
   consoleJobCounts,
   consoleJobProjects,
   consoleJobStatus,
@@ -786,5 +788,54 @@ describe("the row's run identity", () => {
     expect(row("LIVE")).toMatchObject({ runId: 42, live: true });
     // Persistence off: no run to read a transcript from, and the row says so rather than guessing.
     expect(row("OFF")).toMatchObject({ runId: 0, live: false });
+  });
+});
+
+// STUDIO-792. The worklist is served one page at a time and used to end at 50 rows with nothing
+// on the page saying so. These are the sentences that make the cut visible — and, when there is
+// no cut, say that too, so a list that ends reads as finished rather than merely truncated.
+describe("consoleJobsPageNote", () => {
+  it("says older jobs are unloaded while the daemon offers another page", () => {
+    expect(consoleJobsPageNote({ loaded: 50, visible: 50, hasMore: true, filtered: false })).toBe(
+      "Showing the 50 most recent jobs. Older jobs are not loaded yet.",
+    );
+  });
+
+  // A filter applied to a truncated list is itself truncated, and that is the more dangerous half:
+  // "Done · 3 rows" over an unloaded tail reads as a complete answer to a question it never asked.
+  it("warns that a filter has not seen the unloaded tail", () => {
+    expect(consoleJobsPageNote({ loaded: 50, visible: 3, hasMore: true, filtered: true })).toBe(
+      "Showing 3 of the 50 most recent jobs. Older jobs are not loaded yet, so this filter has not been applied to them.",
+    );
+  });
+
+  it("says the list is complete once the daemon offers no further page", () => {
+    expect(consoleJobsPageNote({ loaded: 386, visible: 386, hasMore: false, filtered: false })).toBe(
+      "Showing all 386 jobs.",
+    );
+    expect(consoleJobsPageNote({ loaded: 386, visible: 12, hasMore: false, filtered: true })).toBe(
+      "Showing 12 of all 386 jobs.",
+    );
+  });
+
+  // The empty state has its own message in the table; a second one under it would be noise.
+  it("says nothing at all when there are no jobs", () => {
+    expect(consoleJobsPageNote({ loaded: 0, visible: 0, hasMore: false, filtered: false })).toBe("");
+    expect(consoleJobsPageNote({ loaded: 0, visible: 0, hasMore: true, filtered: false })).toBe("");
+  });
+
+  it("counts one job in the singular", () => {
+    expect(consoleJobsPageNote({ loaded: 1, visible: 1, hasMore: false, filtered: false })).toBe(
+      "Showing all 1 job.",
+    );
+    expect(consoleJobsPageNote({ loaded: 1, visible: 1, hasMore: true, filtered: false })).toBe(
+      "Showing the 1 most recent job. Older jobs are not loaded yet.",
+    );
+  });
+
+  // The page size the "Load more" step advances by has to be the store's own, or the first click
+  // would re-ask for rows already held (smaller) or skip the daemon's page boundary (larger).
+  it("steps by the store's own default page size", () => {
+    expect(JOBS_PAGE_SIZE).toBe(50);
   });
 });
