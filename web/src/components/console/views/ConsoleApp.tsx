@@ -13,7 +13,7 @@ import { hasOverlayTitlebar, onNavigate, onShuttingDown } from "@/lib/bindings";
 import { useConsoleRoute } from "@/hooks/useConsoleRoute";
 import { useDaemonStatus } from "@/hooks/useDaemonStatus";
 import { useIssueRuns } from "@/hooks/useHistory";
-import { LIVE_POLL_MS, useStateQuery } from "@/hooks/useStateQuery";
+import { useStateQuery } from "@/hooks/useStateQuery";
 import { useReinstateFact, useVersionQuery } from "@/hooks/useTeams";
 import { useUpdater, type Updater } from "@/hooks/useUpdater";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
@@ -241,11 +241,7 @@ function RailFoot({ version, teamsEnabled }: { version: string; teamsEnabled: bo
 /** The Jobs nav count — tickets the daemon currently has work for. */
 function useOpenJobCount(): number {
   const state = useStateQuery();
-  // Same cadence as the snapshot it is unioned with, for the same reason JobsView pairs them: a nav
-  // badge that mixed a live half with a half frozen at mount would disagree with the list it labels
-  // (STUDIO-791). It takes the cadence only — the live→listing pull-forward is `useJobsFeed`'s, and
-  // is left to the surface that renders the rows so one snapshot change cannot invalidate twice.
-  const issues = useIssueRuns({}, { refetchInterval: LIVE_POLL_MS });
+  const issues = useIssueRuns();
   const keys = new Set<string>();
   for (const r of state.data?.running ?? []) keys.add(r.issue_identifier);
   for (const r of state.data?.retrying ?? []) keys.add(r.issue_identifier);

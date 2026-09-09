@@ -105,7 +105,7 @@ describe("useJobsFeed", () => {
 
   beforeEach(() => {
     h.fetchState.mockResolvedValue(snapshot());
-    h.fetchIssueRuns.mockResolvedValue({ issues: [], total: 0 });
+    h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
   });
 
   afterEach(() => {

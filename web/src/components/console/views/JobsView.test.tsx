@@ -39,6 +39,9 @@ vi.mock("@/lib/api", async (orig) => {
 });
 
 const { JobsView } = await import("./JobsView");
+// The cadence the view is asserted to keep, read from where it is defined rather than retyped —
+// the same anti-drift reason `useJobsFeed` imports it instead of writing 2000 (STUDIO-791).
+const { LIVE_POLL_MS } = await import("@/hooks/useStateQuery");
 
 // Each history row gets a DISTINCT id unless the caller pins one. `mergeJobs` keys a history row
 // `hist-${id}`, so a shared id is a duplicate React key: the list renders correctly on first paint
@@ -1052,5 +1055,64 @@ describe("a Jobs list left open (STUDIO-791)", () => {
     expect(rowStatus("A-1")).toContain("in review");
     // And explicitly no longer the stale answer, which is the one the frozen table kept serving.
     expect(rowStatus("A-1")).not.toContain("running");
+  });
+
+  // The other half of the acceptance, and the half the test above does NOT cover: a stored row
+  // moving while the live set stands still. jimmy's review of PR #122 found that mutating
+  // `refetchInterval` back to `false` leaves the test above green, because a run FINISHING changes
+  // `liveJobsSignature` and the pull-forward alone carries it — so the interval, which is the
+  // mechanism this ticket is actually about, was pinned only by a call count on a mock.
+  //
+  // This is the case only the interval can serve. A run has already left the live snapshot; the
+  // signature has settled and will not move again. THEN the ticket goes to review — a change the
+  // daemon reports on `/api/v1/history/issues` and nowhere else. Nothing invalidates the listing,
+  // so if it is not polling, the row and the "needs you" count beside it both keep the answer they
+  // had when the page was opened, for as long as it stays open. That is the operator's report.
+  it("moves a stored row and its count when only the issue listing changed", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Static, and stays static: no running, retrying or blocked work for the whole test, so
+    // `liveJobsSignature` is the empty string at the first snapshot and at every one after it.
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({
+          id: 41,
+          issue_identifier: "B-2",
+          outcome: "completed",
+          lifecycle: "open",
+          tracker_state: "In Progress",
+        }),
+      ],
+      next_offset: null,
+    });
+    mount();
+
+    await waitFor(() => expect(rowKeys()).toContain("B-2"));
+    expect(rowStatus("B-2")).toContain("queued");
+    expect(stat("needs you")).toBe("0");
+
+    // Only the STORE moves — the agent handed the ticket off and the tracker now parks it in review.
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({
+          id: 41,
+          issue_identifier: "B-2",
+          outcome: "completed",
+          lifecycle: "in_review",
+          tracker_state: "In Review",
+        }),
+      ],
+      next_offset: null,
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 500);
+    });
+
+    // Both halves, together — which is the ticket's second acceptance clause. They cannot disagree
+    // by construction (`consoleJobCounts` folds the same merged array the table renders), so the
+    // point of asserting both is that ONE stale fetch freezes both, and only the poll thaws them.
+    expect(rowStatus("B-2")).toContain("in review");
+    expect(stat("needs you")).toBe("1");
   });
 });
