@@ -939,10 +939,8 @@ describe("zone A — the header's actions are real or dependency-named, never fa
     await waitFor(() => expect(h.mergeRun).toHaveBeenCalledWith(547, ""));
   });
 
-  // A live Merge now knows WHAT it would merge, so it says so — and says where GitHub reports the
-  // pull request standing, before the click rather than only after one (STUDIO-784's unarmed
-  // wording, which had no consumer until now).
-  it("names the pull request it would merge, and where GitHub says it stands", async () => {
+  // A live Merge now knows WHAT it would merge, so it says so.
+  it("names the pull request it would merge", async () => {
     h.fetchRunMergeability.mockResolvedValue({
       mergeable: true,
       receipt: { ...MERGE_RECEIPT, merge_state: "CLEAN" },
@@ -951,12 +949,55 @@ describe("zone A — the header's actions are real or dependency-named, never fa
 
     await waitFor(() => expect(action(/^merge$/i)).toBeTruthy());
     expect(action(/^merge$/i).getAttribute("title")).toContain("makewhatis/rhapsody#64");
+    expect(document.querySelector(".trhd .actok")).toBeNull();
+  });
+
+  // THE HEADER MUST NOT ARGUE WITH ITSELF. `mergeStateNote` is the ARMED reading — what a merge
+  // the operator already applied is waiting on — and the daemon refuses on none of the states it
+  // describes, so rendering it beside an unclicked control produces a second, independent verdict
+  // that can contradict the first. It did, in both directions: on DIRTY the note said "it cannot
+  // land" beside a live primary the daemon really would honour, and on BEHIND it said "push the
+  // branch" for a receipt that only exists because GitHub updates the branch itself.
+  //
+  // The pre-click channel is the control's own tooltip, carrying the daemon's verdict; GitHub's
+  // view of a pull request nobody has acted on yet is the confirm modal's to show, and it does.
+  for (const merge_state of ["CLEAN", "BLOCKED", "BEHIND", "DIRTY", "DRAFT", "UNSTABLE"]) {
+    it(`says nothing about GitHub's ${merge_state} beside a Merge nobody has clicked`, async () => {
+      h.fetchRunMergeability.mockResolvedValue({
+        mergeable: true,
+        receipt: { ...MERGE_RECEIPT, merge_state },
+      });
+      mountDetail([run({ id: 547 })]);
+
+      await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
+      // Whatever the header says about the merge, it is the daemon's verdict and only that.
+      expect(document.querySelector(".trhd .actnote")).toBeNull();
+      expect(document.querySelector(".trhd")?.textContent).not.toMatch(/cannot land/i);
+    });
+  }
+
+  // The armed reading is where the note belongs, and the state STUDIO-784 built it for still
+  // reads: an armed `--auto` merge is one line followed by silence unless something says what
+  // GitHub is holding it on.
+  it("says what the merge it just armed is waiting on", async () => {
+    h.mergeRun
+      .mockResolvedValueOnce({ status: "confirm", receipt: MERGE_RECEIPT })
+      .mockResolvedValueOnce({
+        status: "merged",
+        receipt: { ...MERGE_RECEIPT, said: "will be automatically merged" },
+      });
+    mountDetail([run({ id: 547 })]);
+
+    await waitFor(() => expect(action(/^merge$/i).className).toMatch(/\bpri\b/));
+    fireEvent.click(action(/^merge$/i));
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: /^merge$/i }));
+
     await waitFor(() =>
       expect(document.querySelector(".trhd .actnote")?.textContent).toBe(
-        "GitHub reports it ready to merge.",
+        "GitHub is holding it until its required checks pass.",
       ),
     );
-    expect(document.querySelector(".trhd .actok")).toBeNull();
   });
 
   it("names its dependency, and asks the daemon nothing, when Teams is off", async () => {

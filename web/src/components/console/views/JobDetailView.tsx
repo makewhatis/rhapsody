@@ -665,18 +665,17 @@ function HeaderActions({
   // the SAME pull request while that is in flight.
   const [confirming, setConfirming] = useState<MergeReceipt | null>(null);
   const merged = merge.data?.status === "merged" ? merge.data.receipt : null;
-  // What GitHub says the pull request is waiting on. After a click that is the ARMED reading of the
-  // receipt the merge returned (STUDIO-784); before one it is the same fact about the pull request
-  // the header is offering to merge, read unarmed (STUDIO-790) — `CLEAN` means "nothing is in the
-  // way" there, and means nothing left to wait on once armed. "" when GitHub stated no merge state,
-  // which is a real answer and not a reason to guess at one.
+  // The pull request the daemon says a click would act on, or null when it refused, failed, or has
+  // not answered yet. It names the merge in the button's tooltip and NOTHING else: rendering the
+  // header's merge-state note from it too would put a second, independent sentence beside the
+  // control, and the two can disagree — a DIRTY receipt is not refused by the daemon, so the note
+  // would read "it cannot land" next to a live primary. The pre-click channel is the daemon's own
+  // verdict, on the control itself; GitHub's view of a pull request the operator has NOT acted on
+  // yet belongs in the confirm modal, which already carries it (STUDIO-790).
   const resolved = verdict.data?.mergeable === true ? verdict.data.receipt : null;
-  const mergedNote =
-    merged !== null
-      ? mergeStateNote(merged.merge_state, true)
-      : resolved === null
-        ? ""
-        : mergeStateNote(resolved.merge_state, false);
+  // What GitHub says the pull request is waiting on, once one has been armed (STUDIO-784). "" when
+  // GitHub stated no merge state, which is a real answer and not a reason to guess at one.
+  const mergedNote = merged === null ? "" : mergeStateNote(merged.merge_state, true);
   // The console has no toast surface, so a lifecycle action reports here or nowhere. Both halves
   // matter: the request can fail, and it can succeed while the ticket MOVE fails — a run killed
   // whose ticket stayed put is something the operator has to finish by hand. A refused merge lands
@@ -806,12 +805,11 @@ function HeaderActions({
             : merged.said}
         </span>
       ) : null}
-      {/* Where GitHub says the pull request stands — before the click, and what the armed merge is
-          WAITING on after it (STUDIO-784, STUDIO-790). Its own element rather than a suffix on the
-          line above, because the two say different things: that one reports what the daemon did,
-          this one reports GitHub's view — and an armed `--auto` merge is otherwise one line
-          followed by silence. Absent when GitHub stated no merge state, which is a real answer and
-          not a reason to guess. */}
+      {/* What the armed merge is WAITING on (STUDIO-784). Its own element rather than a suffix on
+          the line above, because the two say different things: that one reports what the daemon
+          did, this one reports where GitHub says the pull request stands — and an armed `--auto`
+          merge is otherwise one line followed by silence. Absent when GitHub stated no merge
+          state, which is a real answer and not a reason to guess. */}
       {mergedNote === "" ? null : (
         <span className="actnote" role="status">
           {mergedNote}

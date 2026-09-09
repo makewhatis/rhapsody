@@ -16,6 +16,10 @@
  * An unrecognised value is passed through rather than swallowed. GitHub's vocabulary is its own and
  * has grown before, and a state this console has never heard of is exactly the one worth showing.
  *
+ * Every value reaching here comes off a `MergeReceipt`, so it has passed every refusal
+ * `runmerge::resolve_pull_request` makes. That is load-bearing for BEHIND below, whose reading
+ * depends on the gate the daemon already applied to it.
+ *
  * `undefined` is accepted even though the receipt types the field as a `string`, because the
  * receipt crosses a process boundary and `api.ts` casts the daemon's JSON rather than validating
  * it. A display helper that throws takes the whole run-detail header down with it; saying nothing
@@ -45,7 +49,11 @@ export function mergeStateNote(state: string | undefined, armed = false): string
     case "UNSTABLE":
       return "GitHub reports a non-required check failing; the required ones still decide.";
     case "BEHIND":
-      return "The branch is behind its base — it cannot land until someone pushes.";
+      // NOT "push the branch". A receipt carrying BEHIND has already passed
+      // `runmerge::resolve_pull_request`'s branch-update gate, which refuses a behind branch on a
+      // repository that will not update one (STUDIO-784 gap 1) — so the only BEHIND that reaches
+      // this console is one GitHub brings up to date itself.
+      return "The branch is behind its base; GitHub will bring it up to date itself before merging.";
     case "DIRTY":
       return "The branch conflicts with its base — it cannot land until someone resolves that.";
     case "DRAFT":
