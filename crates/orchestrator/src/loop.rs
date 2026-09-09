@@ -28,6 +28,7 @@
 //!     deferred them to P6 (see `worker.rs` / `retry.rs` module docs). The full `loop_spans_test` mirror
 //!     is `#[ignore]`d for P6.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -738,6 +739,21 @@ impl Orchestrator {
         self.schedule_tick(poll);
     }
 
+    /// Stores what a selection pass withheld for want of capacity, and PUBLISHES it to
+    /// [`TeamsMemory`](crate::teamsmemory::TeamsMemory) so the roster can report it (STUDIO-805).
+    ///
+    /// Every assignment to `held_for_capacity` goes through here, including the reset at the top of
+    /// a tick: the tally is loop-confined and `roster()` runs entirely on the HTTP task, so a store
+    /// that skipped the publish would leave the console reporting a pass that is over — exactly the
+    /// stale answer the reset exists to prevent. A pure map write, no I/O, no lock across an
+    /// `.await`, and the same shape as the `bind_run` / `release_run` seam it joins.
+    fn set_held_for_capacity(&mut self, counts: HashMap<String, i64>) {
+        if let Some(mem) = self.teams_memory.as_ref() {
+            mem.publish_held(counts.clone());
+        }
+        self.held_for_capacity = counts;
+    }
+
     /// The per-tick candidate fetch + dispatch + review-reopen for both the multi-project and the
     /// legacy single-tracker path. Extracted from `on_tick` so the auto-promote pass always runs after
     /// it (INF-318). Mirrors Go `dispatchDecisions`.
@@ -749,7 +765,7 @@ impl Orchestrator {
         // candidate fetch. Overwriting alone would therefore leave a Linear outage re-serving the
         // last successful tick's answer for as long as the outage lasted, which matters once
         // something re-arms the tick on a non-empty tally.
-        self.held_for_capacity.clear();
+        self.set_held_for_capacity(HashMap::new());
         let has_projects = self.eff.as_ref().is_some_and(|e| !e.projects.is_empty());
         if has_projects {
             let tagged = self.poll_all_projects().await;
@@ -830,7 +846,7 @@ impl Orchestrator {
         // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
         // over the reset at the top of the tick, so a teammate who has since freed up cannot linger
         // in it.
-        self.held_for_capacity = held_for_capacity;
+        self.set_held_for_capacity(held_for_capacity);
         if self
             .eff
             .as_ref()
@@ -1569,6 +1585,97 @@ mod tests {
             o.held_for_capacity.is_empty(),
             "a tick that never reached the ladder still reset the tally: {:?}",
             o.held_for_capacity
+        );
+    }
+
+    /// Attaches a Teams config with a capped roster plus the [`TeamsMemory`] the HTTP task serves
+    /// the roster from — the pair the queued count has to travel between, since the tally itself is
+    /// loop-confined and `roster()` never round-trips to the control task.
+    fn attach_capped_team(
+        o: &mut Orchestrator,
+        roster: &[(&str, i64)],
+    ) -> Arc<crate::teamsmemory::TeamsMemory> {
+        let teams = rhapsody_config::teams::Teams {
+            enabled: true,
+            roster: roster
+                .iter()
+                .map(|(name, max_concurrent)| rhapsody_config::teams::Identity {
+                    name: (*name).to_string(),
+                    profile: "swe".to_string(),
+                    max_concurrent: *max_concurrent,
+                    ..rhapsody_config::teams::Identity::default()
+                })
+                .collect(),
+            ..rhapsody_config::teams::Teams::disabled()
+        };
+        let mem = Arc::new(crate::teamsmemory::TeamsMemory::new(
+            Arc::new(teams.clone()),
+            Arc::new(rhapsody_config::memory::NoneBackend),
+        ));
+        o.teams = Some(teams);
+        o.teams_memory = Some(Arc::clone(&mem));
+        mem
+    }
+
+    /// A candidate labelled for a teammate whose only seat is taken: the ladder holds it, and the
+    /// hold is only VISIBLE if the control task publishes the tally (STUDIO-805, D4). Held work
+    /// nothing reports is indistinguishable from a stuck daemon, which is the whole point of the
+    /// count — so the hand-off from the loop-confined tally to the HTTP-task roster is pinned here.
+    #[tokio::test]
+    async fn a_pass_that_holds_work_publishes_the_count_to_the_roster() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![Issue {
+            team_id: "team-1".to_string(),
+            labels: Some(vec!["rhapsody:@alice".to_string()]),
+            ..issue("1", "MT-1", "todo")
+        }];
+        let (mut o, _spawned) = new_loop_orch(tr, Duration::from_secs(3600));
+        o.ctx = Some(CancelWait::default());
+        let mem = attach_capped_team(&mut o, &[("alice", 1)]);
+        let mut live = running_entry(issue("live", "MT-9", "in progress"), "", "");
+        live.identity = "alice".to_string();
+        o.running = [("live".to_string(), live)].into_iter().collect();
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert_eq!(
+            o.held_for_capacity.get("alice").copied(),
+            Some(1),
+            "the ladder should have held MT-1: alice's one seat is taken"
+        );
+        let view = mem.roster().expect("roster");
+        assert_eq!(view.roster[0].name, "alice");
+        assert_eq!(
+            view.roster[0].queued, 1,
+            "the roster the HTTP task serves never sees the tally unless the tick publishes it"
+        );
+    }
+
+    /// The published count is retired on the same terms as the tally itself: a tick that never
+    /// reached the ladder must not leave the last pass's answer on the roster, or a Linear outage
+    /// renders "1 queued" against a teammate who is idle for as long as the outage lasts
+    /// (STUDIO-802's reset, carried through the seam).
+    #[tokio::test]
+    async fn a_failed_candidate_fetch_retires_the_published_count() {
+        let mut tr = Fake::new();
+        tr.candidates_err = Some(rhapsody_tracker::TrackerError::Other("linear down".into()));
+        let (mut o, _spawned) = new_loop_orch(tr, Duration::from_secs(3600));
+        o.ctx = Some(CancelWait::default());
+        let mem = attach_capped_team(&mut o, &[("alice", 1)]);
+        mem.publish_held([("alice".to_string(), 2)].into_iter().collect());
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert_eq!(
+            mem.roster().expect("roster").roster[0].queued,
+            0,
+            "a stale count outlived the pass that produced it"
         );
     }
 

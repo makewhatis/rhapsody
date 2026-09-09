@@ -93,6 +93,11 @@ pub struct RosterRow {
     pub live_runs: i64,
     /// Which tickets those runs are working, sorted for a stable response.
     pub tickets: Vec<String>,
+    /// How many candidates the last selection pass withheld because this identity was at its
+    /// implementation cap (STUDIO-805, design D4). DERIVED per tick and republished wholesale by
+    /// the control task, so it is "what that pass held" and never a durable queue — there is no
+    /// position in it, and a teammate who has since freed up drops straight back to `0`.
+    pub queued: i64,
 }
 
 /// `GET /api/v1/teams/roster`.
@@ -292,6 +297,10 @@ pub struct TeamsMemory {
     /// room rather than an error: a room nobody has posted to and a room that cannot exist read
     /// the same, and neither is a failure.
     room: Option<Arc<dyn RoomLog>>,
+    /// identity → how many candidates the last pass withheld for want of that teammate's capacity.
+    /// The third control-side write of the same shape as `runs`: published by the control task at
+    /// the end of a selection pass, read by the HTTP task. Never held across an `.await`.
+    held: RwLock<HashMap<String, i64>>,
 }
 
 impl TeamsMemory {
@@ -319,6 +328,7 @@ impl TeamsMemory {
             bank_ids,
             runs: RwLock::new(HashMap::new()),
             room: None,
+            held: RwLock::new(HashMap::new()),
         }
     }
 
@@ -555,12 +565,25 @@ impl TeamsMemory {
         self.write_runs().remove(&run_id);
     }
 
+    /// Publishes what the last selection pass withheld for want of capacity, so the roster can
+    /// say a teammate has work waiting (STUDIO-805). Called by the control task wherever it
+    /// stores `Orchestrator::held_for_capacity`, and — like [`bind_run`](TeamsMemory::bind_run) —
+    /// it is a pure map write with no I/O and no lock held across an `.await`.
+    ///
+    /// The map REPLACES the last one rather than merging into it: the tally is only ever true of
+    /// the pass that produced it, so a pass that held nothing must publish an empty map and
+    /// retire every count (STUDIO-802). Keys no roster member matches are simply never read.
+    pub fn publish_held(&self, counts: HashMap<String, i64>) {
+        *self.write_held() = counts;
+    }
+
     /// The roster, with each identity's live runs derived from the bindings.
     pub fn roster(&self) -> Result<RosterView, TeamsMemoryError> {
         if !self.enabled() {
             return Err(TeamsMemoryError::Disabled);
         }
         let bound: Vec<RunProvenance> = self.read_runs().values().cloned().collect();
+        let held: HashMap<String, i64> = self.read_held().clone();
         let roster = self
             .teams
             .roster
@@ -580,6 +603,7 @@ impl TeamsMemory {
                     max_concurrent: i.max_concurrent,
                     live_runs: tickets.len() as i64,
                     tickets,
+                    queued: held.get(&i.name).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -789,6 +813,18 @@ impl TeamsMemory {
 
     fn write_runs(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<i64, RunProvenance>> {
         self.runs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn read_held(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, i64>> {
+        self.held
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_held(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, i64>> {
+        self.held
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1112,6 +1148,34 @@ mod tests {
 
         mem.release_run(1);
         assert_eq!(mem.roster().expect("roster").roster[0].live_runs, 1);
+    }
+
+    /// D4 — the queued count is DERIVED per tick and published control-side; the roster reads it
+    /// locally, exactly as it reads the live bindings. Without it a held ticket is invisible on
+    /// every surface and a queued teammate is indistinguishable from a stuck daemon (design §4.5).
+    #[tokio::test]
+    async fn the_roster_reports_what_the_ladder_held_per_teammate() {
+        let dir = TempDir::new();
+        let mem = local(&dir, teams_on(vec![ident("alice"), ident("bob")]));
+        mem.bind_run(1, bound("alice", "MT-1"));
+
+        // Nothing published yet: a daemon whose ladder never held reports nobody queued.
+        assert_eq!(mem.roster().expect("roster").roster[0].queued, 0);
+
+        mem.publish_held([("alice".to_string(), 2)].into_iter().collect());
+        let view = mem.roster().expect("roster");
+        assert_eq!(view.roster[0].name, "alice");
+        assert_eq!(view.roster[0].queued, 2);
+        assert_eq!(
+            view.roster[0].live_runs, 1,
+            "the hold is reported beside the live runs, not instead of them"
+        );
+        assert_eq!(view.roster[1].queued, 0, "the ladder held nothing for bob");
+
+        // A tally is only ever true of the pass that produced it, so the control task publishes
+        // wholesale over the last one (STUDIO-802). A pass that holds nothing clears the count.
+        mem.publish_held(HashMap::new());
+        assert_eq!(mem.roster().expect("roster").roster[0].queued, 0);
     }
 
     /// Invalidate stores the reason and takes the record out of recall,
