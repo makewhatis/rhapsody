@@ -818,7 +818,10 @@ impl Orchestrator {
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
         self.record_quorum_state(issues.iter());
-        let (active, reopen) = self.select_dispatch_with_reopens(issues);
+        let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
+        // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale,
+        // every pass, so a teammate who has since freed up cannot linger in it.
+        self.held_for_capacity = held_for_capacity;
         if self
             .eff
             .as_ref()

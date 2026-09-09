@@ -431,9 +431,16 @@ under `manager.mode: labels+model`, or deterministically (`default_identity`, el
 teammate) whenever no model can answer: `manager.mode: labels`, a model outage, a triage back-off, or
 an answer naming somebody who is not on the roster. Either way the room gets a `manager` post saying
 who took the ticket and why, marked `(deterministic)` when it was not the model's call, and the
-`rhapsody:@` label lands in Linear as the durable assignment. Work is never withheld: if even the
-label write fails, the assignment is held in memory, the run dispatches wearing it anyway, and the
-label reconciles on a later cycle.
+`rhapsody:@` label lands in Linear as the durable assignment. Work is never withheld for want of a
+label: if even the label write fails, the assignment is held in memory, the run dispatches wearing it
+anyway, and the label reconciles on a later cycle.
+
+**A teammate's `max_concurrent` is the one thing that does make work wait (STUDIO-802).** A ticket
+routed to a teammate already running that many implementation runs is held at selection and
+reconsidered on the next tick — never quietly handed to somebody else, so an explicit
+`rhapsody:@alice` label means alice, when she is free. Reviews draw from their own counter and never
+consume it. `max_concurrent: 0` is the default and means unlimited, so an unconfigured roster holds
+nothing and a daemon with Teams off never even asks the question.
 
 **`rhapsody:solo` is the one deliberate way around the team.** A ticket wearing it dispatches
 immediately as a plain identity-less run — for daemon-debugging work, or anything you want vanilla.

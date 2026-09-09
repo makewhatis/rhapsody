@@ -53,13 +53,22 @@ impl Orchestrator {
 
     /// One greedy pass over the sorted candidates, sharing the global/per-state slot counters between
     /// the active-dispatch picks and the review-reopen picks (so a tick cannot over-admit across both
-    /// paths). Returns `(active, reopen)`: `active` holds issues to dispatch as-is; `reopen` holds
-    /// review-state issues with a fresh summons the loop must promote before dispatching. With no
-    /// review states configured, `reopen` is always empty and the active path is byte-identical.
-    /// Mirrors Go `selectDispatchWithReopens`.
-    pub fn select_dispatch_with_reopens(&self, mut issues: Vec<Issue>) -> (Vec<Issue>, Vec<Issue>) {
+    /// paths). Returns `(active, reopen, held_for_capacity)`: `active` holds issues to dispatch as-is;
+    /// `reopen` holds review-state issues with a fresh summons the loop must promote before
+    /// dispatching. With no review states configured, `reopen` is always empty and the active path is
+    /// byte-identical. Mirrors Go `selectDispatchWithReopens`.
+    ///
+    /// `held_for_capacity` counts, per teammate, the candidates this pass withheld because that
+    /// teammate was at their `max_concurrent` (STUDIO-802). It is carried OUT rather than written to
+    /// [`Orchestrator::held_for_capacity`] here because the pass takes `&self` by design — the
+    /// `&mut self` caller stores it — and writing it through a new shared cell would be a sixth
+    /// state seam (`crates/orchestrator/CLAUDE.md`). Always empty with Teams off.
+    pub fn select_dispatch_with_reopens(
+        &self,
+        mut issues: Vec<Issue>,
+    ) -> (Vec<Issue>, Vec<Issue>, HashMap<String, i64>) {
         let Some(eff) = self.eff.as_ref() else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), HashMap::new());
         };
         crate::dispatch::sort_for_dispatch(&mut issues);
 
@@ -75,6 +84,15 @@ impl Orchestrator {
         let mut reopen = Vec::new();
         // Set by the Teams assignment gate below; drained into ONE kick after the pass (§A.3.2).
         let mut held_for_triage = false;
+        // The Teams CAPACITY gate's two maps (STUDIO-802), both pass-local. `impl_tally` is the
+        // running implementation count per teammate — seeded lazily from `impl_load` on first touch
+        // and incremented on every admit, so three tickets for one teammate see 0, 1, 2 rather than
+        // 0, 0, 0 (design §4.4 fix 1). `held_for_capacity` is what this pass withheld, returned to
+        // the caller. `impl_load` is built at most once per pass and NEVER with Teams off, because
+        // nothing asks for it before `planned_identity` has answered `Some` (D5).
+        let mut impl_load: Option<crate::teams::LoadSnapshot> = None;
+        let mut impl_tally: HashMap<String, i64> = HashMap::new();
+        let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         for iss in issues {
             if global_remaining <= 0 {
                 break;
@@ -146,6 +164,36 @@ impl Orchestrator {
                 held_for_triage = true;
                 continue;
             }
+            // The Teams CAPACITY gate (STUDIO-802; design record
+            // `~/.rhapsody/docs/per-role-concurrency-design.md` §4.1). The router has already
+            // answered WHO this ticket would go to; the ladder answers NOW OR LATER. If that
+            // teammate is at their `max_concurrent`, the ticket is not admitted this tick — the
+            // same shape as the assignment gate above and every other skip in this loop: no slot is
+            // reserved, no counter moves, and it is reconsidered next tick. It is deliberately NOT
+            // a reassignment: `rhapsody:@alice` means alice, and after this it means "alice, when
+            // she is free" (§4.2, D3). Debug-level for the same reason the gate above is — a queued
+            // ticket is a healthy state, not a fault.
+            let planned = self.planned_identity(&iss);
+            if let Some(name) = planned.as_deref() {
+                let load = impl_load.get_or_insert_with(|| {
+                    crate::teams::LoadSnapshot::from_running_and_retries(
+                        &self.running,
+                        &self.retry_attempts,
+                    )
+                });
+                impl_tally
+                    .entry(name.to_string())
+                    .or_insert_with(|| load.impl_live(name));
+                if self.at_cap(name, &impl_tally) {
+                    tracing::debug!(
+                        issue_identifier = %iss.identifier,
+                        identity = %name,
+                        "skipping dispatch: teammate at max_concurrent"
+                    );
+                    *held_for_capacity.entry(name.to_string()).or_insert(0) += 1;
+                    continue;
+                }
+            }
             if count(&state_counts, &st)
                 >= state_limit(&iss.state, &eff.per_state_limits, eff.max_concurrent)
             {
@@ -155,10 +203,15 @@ impl Orchestrator {
             running.insert(iss.id.clone());
             *state_counts.entry(st).or_insert(0) += 1;
             global_remaining -= 1;
+            // The routed teammate now owns one more run for the rest of this pass. Incremented HERE
+            // rather than at the gate so a ticket the per-state cap turns away never consumes it.
+            if let Some(name) = planned {
+                *impl_tally.entry(name).or_insert(0) += 1;
+            }
             active.push(iss);
         }
         self.kick_triage(held_for_triage);
-        (active, reopen)
+        (active, reopen, held_for_capacity)
     }
 
     /// Counts running issues currently owned by the given project GROUP. The per-project cap is
@@ -1145,6 +1198,176 @@ mod tests {
             "unassigned held, solo through"
         );
         assert!(futures_lite_ready(handle.kicked()));
+    }
+
+    // --- the Teams capacity gate (STUDIO-802) --------------------------------------------------
+
+    /// **The core acceptance** (design record §4.4 fix 1): three tickets explicitly labelled for a
+    /// teammate capped at one, all in a single tick. The pass takes `&self`, so `self.running` is
+    /// frozen for its whole duration and every ticket reads the same starting load — without a
+    /// pass-local tally all three dispatch and the cap is decorative.
+    #[test]
+    fn three_tickets_for_a_capped_teammate_admit_one() {
+        let o = orch_with_capped_roster(&[("alice", 1)]);
+        let (picked, reopen, held) = o.select_dispatch_with_reopens(vec![
+            teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+            teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+            teams_issue("3", "MT-3", &["rhapsody:@alice"]),
+        ]);
+        assert_eq!(
+            ids(&picked),
+            vec!["MT-1"],
+            "one admit; the rest wait for alice rather than being reassigned"
+        );
+        assert!(reopen.is_empty());
+        assert_eq!(
+            held.get("alice").copied(),
+            Some(2),
+            "and the pass reports what it withheld, per teammate"
+        );
+    }
+
+    /// The tally is SEEDED from what is already in flight, not merely incremented within the pass:
+    /// alice's one live run fills her cap on its own, so an otherwise-free tick admits nothing.
+    #[test]
+    fn a_teammate_already_running_at_their_cap_takes_nothing_new() {
+        let mut o = orch_with_capped_roster(&[("alice", 1)]);
+        let mut live = running_entry(issue("live", "MT-9", "In Progress"), "", "");
+        live.identity = "alice".to_string();
+        o.running = [("live".to_string(), live)].into_iter().collect();
+
+        let (picked, _, held) =
+            o.select_dispatch_with_reopens(vec![teams_issue("1", "MT-1", &["rhapsody:@alice"])]);
+        assert!(picked.is_empty(), "alice's one seat is taken");
+        assert_eq!(held.get("alice").copied(), Some(1));
+    }
+
+    /// D2 through the ladder: the gate reads the IMPLEMENTATION count, so alice's live review does
+    /// not fill her implementation seat. A review is free — this is the whole reason the count is
+    /// partitioned rather than filtered.
+    #[test]
+    fn a_live_review_does_not_fill_an_implementation_seat() {
+        let mut o = orch_with_capped_roster(&[("alice", 1)]);
+        let mut review = running_entry(issue("rev", "MT-9", "In Progress"), "", "");
+        review.identity = "alice".to_string();
+        review.issue.labels = Some(vec![crate::quorum::REVIEW_TICKET_LABEL.to_string()]);
+        o.running = [("rev".to_string(), review)].into_iter().collect();
+
+        let (picked, _, held) =
+            o.select_dispatch_with_reopens(vec![teams_issue("1", "MT-1", &["rhapsody:@alice"])]);
+        assert_eq!(
+            ids(&picked),
+            vec!["MT-1"],
+            "reviews draw from their own counter"
+        );
+        assert!(held.is_empty());
+    }
+
+    /// D1: `max_concurrent: 0` is unlimited and is the default, so an unconfigured roster behaves
+    /// exactly as it did before this gate existed — every ticket out on the same tick, nothing held.
+    #[test]
+    fn an_uncapped_teammate_is_never_held() {
+        let o = orch_with_capped_roster(&[("alice", 0)]);
+        let (picked, _, held) = o.select_dispatch_with_reopens(vec![
+            teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+            teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+            teams_issue("3", "MT-3", &["rhapsody:@alice"]),
+        ]);
+        assert_eq!(ids(&picked), vec!["MT-1", "MT-2", "MT-3"]);
+        assert!(held.is_empty());
+    }
+
+    /// **The D5 gate, asserted as the absence of the work rather than the sameness of the outcome.**
+    ///
+    /// Teams off dispatches all three tickets — but so does an uncapped roster, so the outcome
+    /// alone proves nothing about whether the work was skipped. The gate is made of exactly two
+    /// functions, and they are where its cost lives: [`Orchestrator::planned_identity`] performs
+    /// the second `route()` call of §4.1, and [`Orchestrator::at_cap`] performs the roster lookup.
+    /// Each answers "nothing to do" from the `enabled` flag alone, *before* doing any of it, and
+    /// the A/B here is exact — the same orchestrator, the same ticket, the same tally, one flag
+    /// flipped. The `LoadSnapshot` the ladder seeds from is never built either, because nothing
+    /// asks for it until `planned_identity` has answered `Some`.
+    ///
+    /// **A pending assignment is what makes the routing half an absence-of-work test rather than
+    /// another outcome test.** `route` carries its own defensive `enabled` guard, so simply
+    /// asserting `None` would pass whether or not it was called. `apply_pending_assignment`
+    /// substitutes AFTER `route` has answered, so it is the one routing answer that survives that
+    /// guard: with the `enabled` filter removed from `planned_identity`, this arm answers
+    /// `Some("alice")` — verified by making that exact mutation.
+    #[test]
+    fn teams_off_makes_no_routing_call_and_no_capacity_lookup() {
+        let mut o = orch_with_capped_roster(&[("alice", 1)]);
+        let handle = Arc::new(crate::TriageHandle::new());
+        handle.record_pending("1", "alice");
+        o.teams_triage = Some(Arc::clone(&handle));
+        let iss = teams_issue("1", "MT-1", &["rhapsody:@alice"]);
+        let over_cap: HashMap<String, i64> = [("alice".to_string(), 5)].into_iter().collect();
+
+        assert_eq!(
+            o.planned_identity(&iss).as_deref(),
+            Some("alice"),
+            "with Teams on, the routing call is made and answers"
+        );
+        assert!(o.at_cap("alice", &over_cap), "and the cap is consulted");
+
+        if let Some(t) = o.teams.as_mut() {
+            t.enabled = false;
+        }
+        assert_eq!(
+            o.planned_identity(&iss),
+            None,
+            "`enabled: false` short-circuits before any of the routing machinery runs"
+        );
+        assert!(
+            !o.at_cap("alice", &over_cap),
+            "and before the capacity lookup, though the tally says 5 against a cap of 1"
+        );
+
+        o.teams = None;
+        assert_eq!(o.planned_identity(&iss), None, "no teams.yaml, same answer");
+        assert!(!o.at_cap("alice", &over_cap));
+    }
+
+    /// The other half of D5, at the ladder: with Teams absent, and again with Teams present but
+    /// `enabled: false`, every over-cap ticket dispatches and nothing is held.
+    #[test]
+    fn teams_off_or_disabled_dispatches_every_over_cap_ticket() {
+        for name in ["no teams.yaml at all", "teams present but enabled: false"] {
+            let mut o = orch_with_capped_roster(&[("alice", 1)]);
+            if name.starts_with("no ") {
+                o.teams = None;
+            } else if let Some(t) = o.teams.as_mut() {
+                t.enabled = false;
+            }
+            let (picked, _, held) = o.select_dispatch_with_reopens(vec![
+                teams_issue("1", "MT-1", &["rhapsody:@alice"]),
+                teams_issue("2", "MT-2", &["rhapsody:@alice"]),
+                teams_issue("3", "MT-3", &["rhapsody:@alice"]),
+            ]);
+            assert_eq!(ids(&picked), vec!["MT-1", "MT-2", "MT-3"], "{name}");
+            assert!(held.is_empty(), "{name}: no counter moved");
+        }
+    }
+
+    /// **A hold nothing could release is never taken** — the hazard
+    /// `teams_awaiting_assignment`'s own doc comment names, with capacity as the trigger instead of
+    /// triage. A `rhapsody:@someone-who-left` label routes to a name no roster member matches, so
+    /// no cap could ever apply to it and no teammate's exit could ever free it. It dispatches.
+    ///
+    /// This **pins** a property rather than fixing a live bug: `route` validates every tier against
+    /// the roster today, so it cannot return a non-roster name. The test exists because a future
+    /// tier that forgot to would turn this ticket into one that silently never runs.
+    #[test]
+    fn a_label_naming_nobody_on_the_roster_dispatches_rather_than_holding() {
+        let mut o = orch_with_capped_roster(&[("alice", 1)]);
+        let mut live = running_entry(issue("live", "MT-9", "In Progress"), "", "");
+        live.identity = "alice".to_string();
+        o.running = [("live".to_string(), live)].into_iter().collect();
+
+        let (picked, _, held) =
+            o.select_dispatch_with_reopens(vec![teams_issue("1", "MT-1", &["rhapsody:@who-left"])]);
+        assert_eq!(ids(&picked), vec!["MT-1"], "nobody real is over cap here");
+        assert!(held.is_empty());
     }
 
     /// Polls a future once and reports whether it was already ready. Enough for `Notify`, whose
