@@ -8,6 +8,16 @@
    system's own `.card > .hd` and the jobs filter bar, so a bare port would
    restyle components this view does not own.
 
+   That prefixing was applied UNEVENLY, which is the bug STUDIO-817 fixed: the
+   prototype's `.bar`, `.sect` and `.head` were ported bare and were being
+   restyled by `memory.css`'s sticky filter bar, `console-manage.css`'s panel
+   and `console-views.css`'s page header respectively. They are now `.trbar`,
+   `.trsect` and `.trshd`. The hazard is one-directional and easy to miss:
+   scoping a rule as `.rh-console .trrc .bar` raises its specificity, so it wins
+   the properties it names and SILENTLY INHERITS every property it does not.
+   Adding resets is not the fix — the next property added to the other file
+   reopens it. Add generic-named classes here only `tr`-prefixed.
+
    The wide-content rule (STUDIO-681, and this ticket's acceptance): anything
    that can be arbitrarily wide — a tool result, a raw transcript line — scrolls
    or wraps INSIDE its own box, so the page body never scrolls sideways.
@@ -223,12 +233,24 @@
 
 /* ---- (B) the Result card ---- */
 .rh-console .trrc { border: 1px solid var(--line); border-radius: var(--r); background: linear-gradient(180deg, var(--panel-2), var(--panel)); overflow: hidden; margin-bottom: 18px; }
-.rh-console .trrc .bar { height: 3px; background: var(--done); }
-.rh-console .trrc.fail .bar { background: var(--bad); }
-.rh-console .trrc.stop .bar { background: var(--warn); }
+/* The accent hairline. `trbar`, not the prototype's bare `bar` (STUDIO-817): `memory.css` owns
+   `.rh-console .bar` as the Memory page's sticky FILTER BAR, and this rule's extra class only
+   won `height` and `background` — the accent silently inherited that bar's padding, border,
+   radius, margin and `position: sticky`. Resetting those here would have left the collision live
+   for the next property added over there, so the name moved instead. */
+.rh-console .trrc .trbar { height: 3px; background: var(--done); }
+.rh-console .trrc.fail .trbar { background: var(--bad); }
+.rh-console .trrc.stop .trbar { background: var(--warn); }
 .rh-console .trrc .in { padding: 18px 20px; display: flex; gap: 22px; flex-wrap: wrap; }
 .rh-console .trrc .body { flex: 1 1 380px; min-width: 0; }
-.rh-console .trrc .eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--done); font-weight: 600; margin-bottom: 6px; }
+/* The prototype's `.eyebrow{…display:flex;align-items:center;gap:8px}` — the gap is what sets the
+   status dot off from the label, so the two halves ship together or neither reads right. */
+.rh-console .trrc .eyebrow { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--done); font-weight: 600; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+/* The prototype types the dot into the string (`"● done · handed off"`). Here it is DRAWN, as an
+   empty `aria-hidden` element: the eyebrow's `textContent` stays exactly the label, so it is not
+   read out as "black circle" and the assertion pinning that label keeps protecting it.
+   `currentColor` makes the dot follow the tone rules below without restating any of them. */
+.rh-console .trrc .eyebrow .trdot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .rh-console .trrc.fail .eyebrow { color: var(--bad); }
 .rh-console .trrc.stop .eyebrow { color: var(--warn); }
 .rh-console .trrc h2 { font-size: 20px; font-weight: 700; margin: 0 0 6px; line-height: 1.25; text-wrap: balance; }
@@ -248,9 +270,14 @@
    empty box announces nothing on most screen readers. The bar carries the same "Loading transcript…"
    the Split shows in the open, hidden from sight but not from the accessibility tree. */
 .rh-console .trrc .trskel .vh { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
-.rh-console .trrc .sect { margin-top: 14px; }
-.rh-console .trrc .sect .lab { font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--accent); font-weight: 600; }
-.rh-console .trrc .sect .head { font-size: 12.5px; font-weight: 600; color: var(--ink); margin: 2px 0 4px; }
+/* `trsect`/`trshd`, not the prototype's `sect`/`head` (STUDIO-817): the same collision as the
+   accent bar above, found by that ticket's audit and living inside this same card.
+   `console-manage.css` owns `.rh-console .sect` (a bordered, rounded, panel-filled, 820px-capped
+   box) and `console-views.css` owns `.rh-console .head` (a `display:flex` row with a 14px gap) —
+   both of which were landing on the hand-off body's plain text sections. */
+.rh-console .trrc .trsect { margin-top: 14px; }
+.rh-console .trrc .trsect .lab { font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--accent); font-weight: 600; }
+.rh-console .trrc .trsect .trshd { font-size: 12.5px; font-weight: 600; color: var(--ink); margin: 2px 0 4px; }
 .rh-console .trreceipt { flex: 0 0 190px; border-left: 1px solid var(--line); padding-left: 18px; display: flex; flex-direction: column; gap: 9px; }
 .rh-console .trreceipt .rv { font-family: var(--mono); font-size: 12px; color: var(--ink-2); display: flex; justify-content: space-between; gap: 10px; }
 .rh-console .trreceipt .rv b { color: var(--ink-4); font-weight: 500; }
@@ -267,6 +294,15 @@
 .rh-console .trspine { border-right: 1px solid var(--line); padding: 10px; align-self: start; position: sticky; top: var(--trhd-h, 64px); }
 .rh-console .trfilter { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
 .rh-console .trfilter .chip { padding: 3px 9px; font-size: 11.5px; }
+/* The pressed filter chip, teal per this view's prototype (STUDIO-817). Scoped to `.trfilter`
+   rather than moving `console.css`'s console-wide `.chip[aria-pressed="true"]`, because that
+   white fill is not a porting slip: the ACCEPTED STUDIO-681 shell prototype renders the room's
+   filter row pressed and styles it `var(--ink)` itself. So the two designs genuinely differ and
+   only the trace filter follows this one — which also keeps it consistent with the selection
+   accent this file already uses for `.trstep` and the watch-tabs. The foreground is the prototype's
+   own on-teal ink, published as `--operator-ink` because this file admits no hex literal.
+   `font-weight` is deliberately left to the console-wide rule: only the colours differ. */
+.rh-console .trfilter .chip[aria-pressed="true"] { background: var(--operator); border-color: var(--operator); color: var(--operator-ink); }
 .rh-console .trspine .grep { width: 100%; font-size: 12px; padding: 6px 9px; margin-bottom: 8px; }
 .rh-console .trstep { display: flex; gap: 10px; width: 100%; text-align: left; font: inherit; padding: 10px 9px; border: 0; border-radius: var(--r-sm); background: none; color: inherit; cursor: pointer; position: relative; }
 .rh-console .trstep:hover { background: var(--panel-2); }

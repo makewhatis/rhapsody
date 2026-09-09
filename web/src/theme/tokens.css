@@ -43,6 +43,11 @@
   --accent-soft: #2a1d13;
   --operator: #57c3cc;
   --operator-soft: #0f2427;
+  /* Foreground ON an `--operator` fill (STUDIO-817). The console's prototypes carry a per-accent
+     dark ink rather than one shared black — `console.css` sets `#160c05` on `.btn.pri`'s amber
+     the same way — and this is the teal's, from the run-detail prototype's `.chip.on`/`.btn.pri`.
+     It lives here as a token because `console-trace.css`, which needs it, admits no hex literal. */
+  --operator-ink: #04110e;
   --handoff: #e79457;
 
   /* ---- status ---- */
