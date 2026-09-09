@@ -192,7 +192,7 @@ function detailOf(row: RunSummary, over: Partial<RunDetail> = {}): RunDetail {
 
 /** One roster row, as `/api/v1/teams` serves it. */
 function teammate(name: string) {
-  return { name, profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 0, tickets: ["STUDIO-654"] };
+  return { name, profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 0, tickets: ["STUDIO-654"], queued: 0 };
 }
 
 /** The client the last mount rendered under — how a test simulates a poll tick landing. */

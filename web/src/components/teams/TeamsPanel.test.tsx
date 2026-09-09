@@ -40,8 +40,8 @@ const overview: TeamsOverview = {
   default_identity: "",
   backend: "local",
   roster: [
-    { name: "alice", profile: "swe", labels: ["rust"], bank: "agent-alice", max_concurrent: 0, live_runs: 1, tickets: ["MT-9"] },
-    { name: "bob", profile: "reviewer", labels: [], bank: "agent-bob", max_concurrent: 0, live_runs: 0, tickets: [] },
+    { name: "alice", profile: "swe", labels: ["rust"], bank: "agent-alice", max_concurrent: 0, live_runs: 1, tickets: ["MT-9"], queued: 0 },
+    { name: "bob", profile: "reviewer", labels: [], bank: "agent-bob", max_concurrent: 0, live_runs: 0, tickets: [], queued: 0 },
   ],
 };
 

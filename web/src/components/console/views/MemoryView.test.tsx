@@ -56,6 +56,7 @@ function rosterRow(name: string): TeamsRosterRow {
     max_concurrent: 0,
     live_runs: 0,
     tickets: [],
+    queued: 0,
   };
 }
 

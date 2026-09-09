@@ -248,8 +248,8 @@ describe("ticketAssignees / mateStates", () => {
     default_identity: "",
     backend: "local",
     roster: [
-      { name: "alice", profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 1, tickets: ["STUDIO-1"] },
-      { name: "jimmy", profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 0, tickets: [] },
+      { name: "alice", profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 1, tickets: ["STUDIO-1"], queued: 0 },
+      { name: "jimmy", profile: "swe", labels: [], bank: "b", max_concurrent: 1, live_runs: 0, tickets: [], queued: 0 },
     ],
   };
 
@@ -434,7 +434,7 @@ describe("buildConsoleJobs", () => {
       default_identity: "",
       backend: "local",
       roster: [
-        { name: "jimmy", profile: "p", labels: [], bank: "b", max_concurrent: 1, live_runs: 2, tickets: ["FRESH", "DONE"] },
+        { name: "jimmy", profile: "p", labels: [], bank: "b", max_concurrent: 1, live_runs: 2, tickets: ["FRESH", "DONE"], queued: 0 },
       ],
     };
     const rows = buildConsoleJobs(
@@ -466,7 +466,7 @@ describe("buildConsoleJobs", () => {
       default_identity: "",
       backend: "local",
       roster: [
-        { name: "alice", profile: "p", labels: [], bank: "b", max_concurrent: 1, live_runs: 1, tickets: ["A"] },
+        { name: "alice", profile: "p", labels: [], bank: "b", max_concurrent: 1, live_runs: 1, tickets: ["A"], queued: 0 },
       ],
     };
     const rows = buildConsoleJobs(
