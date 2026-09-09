@@ -177,7 +177,11 @@ impl GH {
     ///
     /// A cancelled await abandons the join handle, not the thread: the `gh` process still runs to
     /// completion on the blocking pool and its output is dropped. That is the only cancellation a
-    /// spawned OS process can have, and it is confined to the pool instead of the control task.
+    /// spawned OS process can have, and it is confined to the pool instead of the control task —
+    /// but it is a cost, not a free lunch: a `gh` that never returns holds a blocking-pool thread
+    /// per deferred fetch. It degrades visibly rather than silently (a saturated pool queues, the
+    /// per-tick enrichment budget expires, the deferred advisory fires) and never worse than the
+    /// inline call it replaced, which held the control task itself for the same duration.
     async fn run_off_task(&self, args: Vec<String>) -> RunResult {
         let run = Arc::clone(&self.run);
         tokio::task::spawn_blocking(move || {

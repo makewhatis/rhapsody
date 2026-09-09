@@ -927,12 +927,15 @@ impl Orchestrator {
     ///   1. candidates + dedup, with NO GitHub I/O, so a tick always has its full candidate set;
     ///   2. the per-repo fetch, starting at [`Orchestrator::gh_enrich_cursor`] and stopping at
     ///      [`gh_enrich_budget`](Orchestrator::gh_enrich_budget) — repos the budget does not reach are
-    ///      DEFERRED to the next tick, which the rotation puts them at the front of, and are reported
-    ///      (a `warn!` plus a per-project-group streak on `GET /api/v1/projects`, never silence);
+    ///      DEFERRED to the next tick, which the rotation starts at the first of them (the cursor
+    ///      advances by the repos this tick ATTEMPTED, so N ticks cover N repos' worth of budget
+    ///      rather than one new repo each), and are reported (a `warn!` plus a per-project-group
+    ///      streak on `GET /api/v1/projects`, never silence);
     ///   3. the pure apply, over the same kept copies Go enriches.
     ///
     /// With the feature off (`gh_source` `None`, or every project's `github_summons` false) no repo is
-    /// ever wanted, so passes 2 and 3 do nothing and the result is byte-identical to before.
+    /// ever wanted, so passes 2 and 3 do nothing and the result is byte-identical to before — and
+    /// any advisory a previously-on tick left behind is retracted rather than frozen.
     async fn poll_all_projects(&self) -> Vec<TaggedIssue> {
         struct ProjPoll {
             idx: usize,
@@ -978,9 +981,10 @@ impl Orchestrator {
         let src = self.gh_source.as_deref();
         let since = self.gh_since();
         let budget = self.gh_enrich_budget();
-        // Advanced once per poll so a budget-exhausted tick's deferred repos lead the next one; the
-        // modulus is taken below, where the repo count is known.
-        let rotate = self.gh_enrich_cursor.fetch_add(1, Ordering::Relaxed);
+        // Where this tick's rotation starts. It is advanced AFTER the fetch pass, by the number of
+        // repos that pass attempted, so the next tick starts at the first repo this one never got
+        // to; the modulus is taken below, where the repo count is known.
+        let rotate = self.gh_enrich_cursor.load(Ordering::Relaxed);
         // Shared with the off-loop resolver tasks; the poll loop records each project's fetch
         // verdict into it (STUDIO-406).
         let warnings = Arc::clone(&self.warnings);
@@ -1002,6 +1006,14 @@ impl Orchestrator {
                     )
                 })
                 .collect();
+
+            // Every polled project's warning group, captured before pass 1 consumes `projs`. The
+            // enrichment advisory is CLEARED against this full set rather than against `targets`,
+            // which is empty the moment the feature goes off: a producer gated by the very
+            // condition it reports on can never retract its own warning, and switching
+            // `tracker.github_summons` off is the operator's escape hatch from this very bug.
+            let all_groups: std::collections::BTreeSet<String> =
+                projs.iter().map(|p| p.group.clone()).collect();
 
             // --- Pass 1: candidates + dedup. No GitHub I/O at all. -------------------------------
             let mut tagged: Vec<TaggedIssue> = Vec::new();
@@ -1047,6 +1059,12 @@ impl Orchestrator {
             let mut fetched: std::collections::HashMap<String, std::collections::HashMap<i64, SummonHit>> =
                 std::collections::HashMap::new();
             let mut deferred: Vec<String> = Vec::new();
+            // Repos this tick STARTED a fetch for — what the cursor advances by, so the next tick
+            // resumes at the first repo this one never reached. Counting *attempted* rather than
+            // *covered* is the load-bearing half: a repo that burns the remaining budget on a
+            // timeout has still had its turn, and counting only successes would pin the cursor on it
+            // and starve every repo behind it for as long as it stays slow.
+            let mut attempted = 0usize;
             let n = wanted.len();
             for i in 0..n {
                 let (key, owner, repo) = &wanted[rotate.wrapping_add(i) % n];
@@ -1057,6 +1075,7 @@ impl Orchestrator {
                     deferred.extend((i..n).map(|j| wanted[rotate.wrapping_add(j) % n].0.clone()));
                     break;
                 }
+                attempted += 1;
                 match tokio::time::timeout(
                     remaining,
                     fetch_github_summons(src, owner, repo, since),
@@ -1072,10 +1091,12 @@ impl Orchestrator {
                     Err(_elapsed) => deferred.push(key.clone()),
                 }
             }
+            self.gh_enrich_cursor
+                .store(rotate.wrapping_add(attempted), Ordering::Relaxed);
             if !deferred.is_empty() {
                 tracing::warn!(
                     budget_ms = budget.as_millis() as u64,
-                    repos = n,
+                    repos_wanted = n,
                     deferred = deferred.len(),
                     repos_deferred = %deferred.join(", "),
                     "github-summons: enrichment hit its per-tick budget; dispatch proceeds without these repos this tick"
@@ -1085,13 +1106,15 @@ impl Orchestrator {
             // only a log line. It is recorded against EVERY group the feature is on for, not only
             // the ones deferred this tick: the rotation deliberately moves which repos go without,
             // so a per-repo streak would reset every cycle and never reach a threshold, while the
-            // condition it is reporting — enrichment cannot cover the configured repos — is true of
+            // condition it is reporting — enrichment cannot cover the repos it wants — is true of
             // the installation rather than of one project. A `BTreeSet` so a group named by several
             // projects is written once.
             let enrich_groups: std::collections::BTreeSet<&str> =
                 targets.values().map(|t| t.group.as_str()).collect();
-            for group in enrich_groups {
-                if deferred.is_empty() {
+            for group in &all_groups {
+                // A group the feature is OFF for has nothing to defer, so it always clears — that
+                // is the retraction path, not an else-branch nicety.
+                if deferred.is_empty() || !enrich_groups.contains(group.as_str()) {
                     warnings.clear_enrich_deferred(group);
                 } else {
                     warnings.record_enrich_deferred(group, n, deferred.len());

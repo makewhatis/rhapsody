@@ -707,7 +707,7 @@ async fn a_sustained_enrichment_shortfall_is_surfaced_on_the_project_status() {
             "expected one warning on {group}, got {warns:?}"
         );
         assert!(
-            warns[0].contains("has not covered all 3 configured repos")
+            warns[0].contains("has not covered all 3 repos needing enrichment")
                 && warns[0].contains("2 deferred on the last"),
             "the warning must name the scale of the shortfall, got {:?}",
             warns[0]
@@ -722,6 +722,90 @@ async fn a_sustained_enrichment_shortfall_is_surfaced_on_the_project_status() {
         assert!(
             o.project_warnings_for(group).is_empty(),
             "the warning must clear on the first tick that covers every repo"
+        );
+    }
+}
+
+// STUDIO-811 (round 2) — the rotation must advance by every repo the tick ATTEMPTED, not by one.
+// `a_budget_exhausted_tick_rotates_the_next_ticks_starting_repo` above only ever covers ONE repo per
+// tick, so it is green under either rule; this is the case the reported installation is actually in.
+// Advancing by one would make the next tick re-fetch repos it just fetched and reach only one new
+// one, so the tail of the config order waits several extra poll intervals for its summons.
+#[tokio::test(start_paused = true)]
+async fn a_partly_covered_tick_rotates_past_every_repo_it_attempted() {
+    // 4s per repo against the 15s budget: r0/r1/r2 are covered, r3 is attempted and burns the last
+    // 3s of the budget on a timeout, r4/r5 are never started.
+    let (o, _spawned, seen) = starved_orch(6, std::time::Duration::from_secs(4));
+
+    let _ = o.poll_all_projects().await;
+    assert_eq!(
+        queried(&seen),
+        ["r0", "r1", "r2", "r3"].map(|r| format!("makewhatis/{r}")),
+        "the budget must stop the phase at the repo it could not finish"
+    );
+
+    let _ = o.poll_all_projects().await;
+    assert_eq!(
+        queried(&seen),
+        ["r0", "r1", "r2", "r3", "r4", "r5", "r0", "r1"].map(|r| format!("makewhatis/{r}")),
+        "tick 2 must start at r4 — the first repo tick 1 never attempted — so two ticks cover the \
+         whole installation; a timed-out repo counts as attempted, or one slow repo pins the cursor"
+    );
+}
+
+// STUDIO-811 (round 2) — the advisory must clear when github-summons is switched OFF, which is this
+// ticket's own operator workaround. The producer is gated by the very condition it reports on, so
+// driving the clear off the enrichment targets alone left a warning nothing could ever retract:
+// dispatch recovers, `GET /api/v1/projects` keeps saying enrichment is behind, forever.
+#[tokio::test(start_paused = true)]
+async fn the_enrichment_advisory_clears_when_github_summons_goes_away() {
+    let (mut o, _spawned, _seen) = starved_orch(3, std::time::Duration::from_secs(20));
+    for _ in 0..crate::warnings::ENRICH_DEFERRED_WARN_AFTER {
+        let _ = o.poll_all_projects().await;
+    }
+    assert_eq!(
+        o.project_warnings_for("p0").len(),
+        1,
+        "precondition: the shortfall is surfaced while the feature is on"
+    );
+
+    // What David did on the reported daemon: `tracker.github_summons: false`, hot-reloaded.
+    if let Some(eff) = o.eff.as_mut() {
+        for p in eff.projects.iter_mut() {
+            p.github_summons = false;
+        }
+    }
+    let _ = o.poll_all_projects().await;
+    for group in ["p0", "p1", "p2"] {
+        assert!(
+            o.project_warnings_for(group).is_empty(),
+            "the advisory must not survive the feature being turned off, got {:?}",
+            o.project_warnings_for(group)
+        );
+    }
+
+    // The same holds for the other way enrichment goes away: the source itself dropping to `None`
+    // (no token), which empties the targets by the identical gate.
+    if let Some(eff) = o.eff.as_mut() {
+        for p in eff.projects.iter_mut() {
+            p.github_summons = true;
+        }
+    }
+    for _ in 0..crate::warnings::ENRICH_DEFERRED_WARN_AFTER {
+        let _ = o.poll_all_projects().await;
+    }
+    assert_eq!(
+        o.project_warnings_for("p0").len(),
+        1,
+        "precondition: the streak rebuilds once the feature is back on"
+    );
+    o.gh_source = None;
+    let _ = o.poll_all_projects().await;
+    for group in ["p0", "p1", "p2"] {
+        assert!(
+            o.project_warnings_for(group).is_empty(),
+            "a source that goes away must retract the advisory too, got {:?}",
+            o.project_warnings_for(group)
         );
     }
 }

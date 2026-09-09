@@ -819,8 +819,8 @@ when a project on it contributed a surviving candidate, and only once per tick �
 | --- | --- | --- |
 | `gh` invocation | synchronous `exec` inline on the poll goroutine | `spawn_blocking`, so the awaits are real yield points and `GH_SUMMONS_TIMEOUT` actually fires |
 | Enrichment cost per tick | unbounded — 2 `gh` calls × every configured repo | at most `poll_interval / 2`, floored at one repo's own fetch bound (15s) |
-| Repos the budget does not reach | n/a (all are fetched, however long it takes) | deferred to the next tick, which a round-robin cursor starts at them |
-| A shortfall | silent | one `warn!` per tick, plus a per-project-group streak on `GET /api/v1/projects` after 3 consecutive ticks |
+| Repos the budget does not reach | n/a (all are fetched, however long it takes) | deferred to the next tick, which a round-robin cursor starts at the first of them — it advances by the repos a tick attempted, so a six-repo installation covering three per tick is fully covered every two ticks |
+| A shortfall | silent | one `warn!` per tick, plus a per-project-group streak on `GET /api/v1/projects` after 3 consecutive ticks, retracted as soon as a tick keeps up **or** the feature is switched off |
 
 The floor is not a rounding detail: below a 30s poll interval it wins, and a pathological `gh` can
 still hold a tick past the interval. That is deliberate — a budget no single fetch can complete

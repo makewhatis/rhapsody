@@ -125,9 +125,11 @@ struct EnrichDeferred {
     /// Consecutive ticks that could not cover every wanted repo inside the enrichment budget; reset
     /// to 0 by the first tick that covers them all.
     streak: u32,
-    /// How many distinct repos this tick's enrichment wanted, and how many of them it deferred —
-    /// the two numbers that say how far behind the installation is, so the warning names the scale
-    /// rather than only the fact.
+    /// How many distinct repos this tick's enrichment WANTED — a repo earns a fetch only once a
+    /// project on it has contributed a surviving candidate, so this is not the configured repo
+    /// count and the warning must not call it one — and how many of them it deferred. The two
+    /// numbers say how far behind the installation is, so the warning names the scale rather than
+    /// only the fact.
     repos: usize,
     deferred: usize,
 }
@@ -248,7 +250,7 @@ impl WarningsState {
             && e.streak >= ENRICH_DEFERRED_WARN_AFTER
         {
             out.push(format!(
-                "github-summons enrichment has not covered all {} configured repos within its per-tick budget for {} ticks in a row ({} deferred on the last) — dispatch is kept on time by deferring them, so a summons on a pull request may take several poll intervals to re-engage its ticket",
+                "github-summons enrichment has not covered all {} repos needing enrichment within its per-tick budget for {} ticks in a row ({} deferred on the last) — dispatch is kept on time by deferring them, so a summons on a pull request may take several poll intervals to re-engage its ticket",
                 e.repos, e.streak, e.deferred
             ));
         }

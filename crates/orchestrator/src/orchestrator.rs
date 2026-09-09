@@ -615,8 +615,11 @@ pub struct Orchestrator {
     /// `ghSource` (O6's `ghsummons::GH` polling source). Control-task-owned.
     pub(crate) gh_source: Option<Box<dyn crate::ghsummons::SummonSource>>,
     /// Where the poll path's bounded GitHub-summons enrichment starts its per-repo round-robin
-    /// (STUDIO-811). Advanced once per poll, so the repos a budget-exhausted tick could not reach
-    /// lead the next one and no repo starves behind the config order. An [`AtomicUsize`] purely so
+    /// (STUDIO-811). Advanced by the number of repos a poll ATTEMPTED, so the next tick starts at
+    /// the first repo the previous one never reached and no repo starves behind the config order.
+    /// Counting attempted rather than covered is deliberate: a repo that spends the rest of the
+    /// budget timing out has had its turn, and counting only successes would pin the cursor on it.
+    /// An [`AtomicUsize`] purely so
     /// `poll_all_projects` can stay `&self`; it is control-task-owned like every field here and is
     /// NOT a sixth off-loop seam.
     pub(crate) gh_enrich_cursor: AtomicUsize,
