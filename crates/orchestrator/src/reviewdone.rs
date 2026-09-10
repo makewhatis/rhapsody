@@ -40,6 +40,12 @@
 //! something needs picking up. So this module keys on [`PrStatus::Merged`](crate::ghsummons::PrStatus)
 //! alone; `Closed`, `Gone` and `Untrusted` retire the row and move nothing.
 //!
+//! The STATUS is the key, deliberately, and not [`PrSnapshot::merged_at`](crate::ghsummons::PrSnapshot):
+//! `Merged` can only come from GitHub answering `state: MERGED`, and an unrecognised state is an
+//! ERROR rather than a default, so the status cannot be arrived at by accident. `mergedAt` is
+//! best-effort parsed and is `None` on any timestamp that will not parse — requiring both would
+//! turn a formatting change at GitHub into a ticket that never closes and says nothing about why.
+//!
 //! # Off the loop
 //!
 //! The decision is made on the control task, where the watch set and the store are single-writer:
@@ -47,6 +53,12 @@
 //! rides back to the watcher task on [`ReviewSweepReport::done`](crate::reviewwatch::ReviewSweepReport::done).
 //! The tracker write — a Linear round-trip — happens out there, exactly as [`crate::handoff`]
 //! resolves its plan on the loop and moves the ticket off it.
+//!
+//! What that costs, stated plainly: the moves run before the watcher's next sleep, so a slow Linear
+//! delays the next PR-state sweep by however long it takes. That is the same containment the
+//! watcher already accepts for a slow `gh` — the delay lands on a task nobody is waiting on, and
+//! never on the control task — and it is bounded by one move per merged pull request per tick,
+//! which on any real installation is nought or one.
 
 use rhapsody_store::RunFilter;
 
@@ -106,6 +118,12 @@ impl Orchestrator {
     /// * no run row survives for that identifier — warned: the ticket is real but the daemon has
     ///   no opaque id to address the tracker with, and history retention is the usual reason;
     /// * the run row carries no issue or team id — warned, for the same reason.
+    ///
+    /// Called once per merged pull request per tick, and normally exactly once ever: the caller
+    /// retires the rows immediately afterwards and a retired pull request is never polled again. If
+    /// that retirement FAILS (a store error, which warns) the next tick observes the same merge and
+    /// plans it again — harmless, because the move is by NAME to a state the ticket is already in,
+    /// so a repeat is a redundant write rather than a wrong one.
     pub(crate) fn plan_review_done(
         &self,
         rows: &[rhapsody_store::ReviewWatchRow],
@@ -357,6 +375,33 @@ mod tests {
         let plan = o.plan_review_done(&rows, &coord(64)).expect("a plan");
         assert_eq!(plan.identifier, "STUDIO-712");
         assert_eq!(o.plan_review_done(&rows, &coord(12)), None);
+    }
+
+    /// An N-reviewer pull request has N watch rows naming the SAME ticket, and its merge must
+    /// finish that ticket ONCE. `retire_review_pr` has the sibling property (it drops every
+    /// reviewer's row); the difference is that here N moves would be N tracker writes for one
+    /// event, so the collapse is pinned rather than left to the shape of an iterator call.
+    #[test]
+    fn an_n_reviewer_pull_request_finishes_its_ticket_once() {
+        let o = orch(ticketless_done("Done"));
+        run_of(&o, "STUDIO-712", "ID-712", "TEAM-1");
+
+        let mut carol = row(64, "handoff:STUDIO-712");
+        carol.key.reviewer = "carol".to_string();
+        let rows = [row(64, "handoff:STUDIO-712"), carol];
+
+        // `plan_review_done` answers at most one plan by signature; the assertion that matters is
+        // that it is the shared ticket's, not one plan per row.
+        let plan = o.plan_review_done(&rows, &coord(64)).expect("a plan");
+        assert_eq!(plan.identifier, "STUDIO-712");
+        assert_eq!(
+            rows.iter()
+                .filter_map(|r| handoff_ticket(&r.introduced_by))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1,
+            "both rows name one ticket, so one move is the whole of the work"
+        );
     }
 
     /// A retried ticket has several runs; the LATEST one is read, which is what the daemon's own

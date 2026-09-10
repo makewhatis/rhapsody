@@ -888,12 +888,16 @@ mod tests {
         }
     }
 
-    /// One observation of a MERGED pull request at `head`.
+    /// One observation of a MERGED pull request at `head`. The timestamp is fixed rather than
+    /// `now()` and is never asserted on: the transition keys on the STATUS, and a merged pull
+    /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
     fn merged_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
             head_sha: head.to_string(),
             status: PrStatus::Merged,
-            merged_at: Some(chrono::Utc::now()),
+            merged_at: chrono::DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc)),
             head_repo: format!("{OWNER}/{REPO}"),
         })
     }
