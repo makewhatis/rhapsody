@@ -146,10 +146,30 @@ pub type RunFn = Box<dyn Fn(&[&str]) -> RunResult + Send + Sync>;
 /// borrowing `&self` across the `.await` (STUDIO-811).
 type SharedRun = Arc<dyn Fn(&[&str]) -> RunResult + Send + Sync>;
 
+/// How long ONE `gh` invocation may take before the caller stops waiting for it (STUDIO-829).
+///
+/// A backstop against a `gh` that never answers, not a latency budget. It is deliberately far above
+/// every operation-level bound in this crate — [`crate::ghenrich::GH_SUMMONS_TIMEOUT`] and
+/// `quorum`'s open-PR lookup are 15s each — so it never preempts one of those and never fires on a
+/// slow-but-working call: the longest exec here is `summons_since`'s `--paginate --slurp` over a
+/// busy repository's comments, which is many round trips inside one process.
+///
+/// It bounds the CALLER and not the process. When it fires the join handle is dropped, so `gh` runs
+/// to completion on a blocking-pool thread and its output is discarded — the only cancellation a
+/// spawned OS process has. That distinction matters most for the one seam that WRITES
+/// ([`MergeSource::merge_pr`]): a timeout there means *"unknown"*, not *"not merged"*. The console
+/// reports it as a failure to answer rather than as a refusal, and the merge-detection path
+/// (STUDIO-712) closes the loop from GitHub's side if the merge did in fact land.
+pub const GH_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A GitHub-backed [`SummonSource`]. Mirrors Go `ghsummons.GH`.
 pub struct GH {
     re: Option<Regex>,
     run: SharedRun,
+    /// Per-exec bound, [`GH_EXEC_TIMEOUT`] for every `GH` the daemon builds. A field rather than the
+    /// constant read directly so tests can assert the bound FIRES without waiting a real minute for
+    /// it; nothing outside `#[cfg(test)]` can set it to anything else.
+    exec_timeout: std::time::Duration,
 }
 
 impl GH {
@@ -162,7 +182,16 @@ impl GH {
         GH {
             re: compile_summon_matcher(token).ok(),
             run: run.map_or_else(|| Arc::new(default_run) as SharedRun, SharedRun::from),
+            exec_timeout: GH_EXEC_TIMEOUT,
         }
+    }
+
+    /// Shortens the per-exec bound so a test can observe it firing in milliseconds rather than in
+    /// [`GH_EXEC_TIMEOUT`]. Test-only by construction — production has one bound, the constant.
+    #[cfg(test)]
+    fn with_exec_timeout(mut self, bound: std::time::Duration) -> GH {
+        self.exec_timeout = bound;
+        self
     }
 
     /// Runs `gh` with `args` on tokio's BLOCKING pool and awaits the result (STUDIO-811,
@@ -184,21 +213,34 @@ impl GH {
     /// (the console merge path, review comment posting, the quorum's and the review watcher's
     /// lookups) were still inline until STUDIO-829 routed them here too.
     ///
+    /// The move is also where the bound is applied: every exec is capped at [`GH_EXEC_TIMEOUT`], so
+    /// a seam added later is bounded by existing here rather than by its author remembering to wrap
+    /// it. Callers that want a tighter or operation-wide bound still add their own on top — this is
+    /// the floor, not the policy.
+    ///
     /// A cancelled await abandons the join handle, not the thread: the `gh` process still runs to
     /// completion on the blocking pool and its output is dropped. That is the only cancellation a
     /// spawned OS process can have, and it is confined to the pool instead of the control task —
     /// but it is a cost, not a free lunch: a `gh` that never returns holds a blocking-pool thread
     /// per deferred fetch. It degrades visibly rather than silently (a saturated pool queues, the
     /// per-tick enrichment budget expires, the deferred advisory fires) and never worse than the
-    /// inline call it replaced, which held the control task itself for the same duration.
+    /// inline call it replaced, which held the control task itself for the same duration. The
+    /// timeout does not change that: it releases the CALLER, and says so in its message rather than
+    /// claiming the operation did not happen.
     async fn run_off_task(&self, args: Vec<String>) -> RunResult {
         let run = Arc::clone(&self.run);
-        tokio::task::spawn_blocking(move || {
+        let exec = tokio::task::spawn_blocking(move || {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             run(&refs)
-        })
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+        });
+        match tokio::time::timeout(self.exec_timeout, exec).await {
+            Ok(joined) => {
+                joined.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+            }
+            // Never phrased as a not-found: `is_gone_message` reads this text, and a bound that
+            // looked like GitHub's 404 would retire every watched pull request during an outage.
+            Err(_) => Err(format!("timed out after {:?}", self.exec_timeout).into()),
+        }
     }
 }
 
@@ -2395,5 +2437,88 @@ mod tests {
              that exec through the blocking-pool helper instead (STUDIO-829)",
             uses[0]
         );
+    }
+
+    /// A `gh` that never answers releases its caller at the bound instead of parking the task
+    /// forever (STUDIO-829).
+    ///
+    /// The seam under test is [`MergeSource::merge_pr`] deliberately: it is the one an OPERATOR
+    /// triggers by clicking Merge in the console, it runs on the HTTP request's own task, and it
+    /// had no bound of any kind before this ticket — `runmerge` places no `tokio::time::timeout`
+    /// around it, and one placed there would not have fired anyway while the exec was inline.
+    ///
+    /// The assertion is deliberately narrow: an ERROR, and one that arrives *before* the runner
+    /// answers. A test that merely accepted *some* error would have passed before this ticket too,
+    /// because every seam here already turns a `gh` failure into one. What is new is that the
+    /// caller is released while `gh` is still running.
+    #[tokio::test]
+    async fn a_gh_that_never_answers_releases_its_caller_at_the_bound() {
+        // Stands in for a hung `gh`: it holds its thread until the assertions below let it go, so
+        // "the call returned" can only mean the bound fired.
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Arc::clone(&released);
+        let run: RunFn = Box::new(move |_args| {
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(b"merged".to_vec())
+        });
+        let bound = std::time::Duration::from_millis(200);
+        let src = GH::new("@symphony", Some(run)).with_exec_timeout(bound);
+
+        let started = std::time::Instant::now();
+        let err = src
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .await
+            .expect_err("a gh that never answers must not be waited on forever");
+        let waited = started.elapsed();
+        released.store(true, Ordering::SeqCst);
+
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the caller must be released at its own deadline ({bound:?}), waited {waited:?}"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "the failure must name the bound rather than look like a gh error: {err}"
+        );
+    }
+
+    /// The bound is real on the READ half of the same operator click too, and a timed-out
+    /// [`PrStateSource::pr_state`] is an ERROR rather than [`PrLookup::Gone`].
+    ///
+    /// That second half is the one worth pinning: `pr_state` maps a not-found `gh` failure to
+    /// `Gone`, which RETIRES a watched pull request. A bound whose message drifted into
+    /// [`is_gone_message`]'s vocabulary would silently stop watching every pull request during a
+    /// GitHub outage.
+    #[tokio::test]
+    async fn a_timed_out_lookup_is_never_read_as_a_retired_pull_request() {
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Arc::clone(&released);
+        let run: RunFn = Box::new(move |_args| {
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(b"{}".to_vec())
+        });
+        let src = GH::new("@symphony", Some(run))
+            .with_exec_timeout(std::time::Duration::from_millis(200));
+
+        let got = src.pr_state("o", "r", 64, &HeadAllowlist::none()).await;
+        released.store(true, Ordering::SeqCst);
+
+        let err = got.expect_err("a bound that fired is not an answer about the pull request");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            !is_gone_message(&err.to_string()),
+            "a timed-out lookup must never retire a watched pull request: {err}"
+        );
+    }
+
+    /// Every `GH` the daemon builds carries [`GH_EXEC_TIMEOUT`]; the short bound above is a test
+    /// affordance and never the shipped policy.
+    #[test]
+    fn the_shipped_exec_bound_is_the_named_constant() {
+        assert_eq!(GH::new("@symphony", None).exec_timeout, GH_EXEC_TIMEOUT);
     }
 }
