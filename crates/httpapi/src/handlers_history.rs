@@ -4,22 +4,22 @@
 //! handler (also in that Go file) lands with the transcript surface in [`crate::handlers_history`]'s
 //! sibling addition below.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
-use rhapsody_orchestrator::{IssueKey, review};
-use rhapsody_store::{EventQuery, RunFilter, effective_run_limit};
+use rhapsody_orchestrator::{IssueKey, IssueLifecycleRow, review};
+use rhapsody_store::{EventQuery, OUTCOME_RUNNING, RunFilter, effective_run_limit};
 
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
 use crate::responses::{write_error, write_json};
 use crate::responses_history::{
-    event_search_response, history_response, history_summary_response, issue_history_response,
-    issue_runs_response, metrics_response, run_detail_from_running, run_detail_from_summary,
-    run_events_response, run_transcript_json,
+    IssueStatusKey, event_search_response, history_response, history_summary_response,
+    issue_counts_response, issue_history_response, issue_runs_response, metrics_response,
+    run_detail_from_running, run_detail_from_summary, run_events_response, run_transcript_json,
 };
 use crate::server::StateProvider;
 
@@ -141,6 +141,143 @@ pub(crate) async fn handle_issue_runs(
             &reviews,
         ),
     )
+}
+
+/// `GET /api/v1/history/issues/counts`: how many ISSUES in the whole store carry each distinct
+/// combination of status inputs — the figure behind the console's Now strip (STUDIO-828).
+///
+/// WHY THIS IS NOT A FIELD ON THE LISTING, AND NOT A FIELD ON `/history/summary`. The strip's
+/// counts used to be a fold over whatever page the console had fetched, so they grew when the
+/// operator clicked "see more" and could never report more than a window held — the defect this
+/// closes, and the second figure to hit the rule stated on [`handle_history_summary`] that a total
+/// is never a page. Hanging it on `/history/issues` would make every 2s poll of a 50-row page pay
+/// for a whole-store scan, and that response is also the rail badge's cache entry; hanging it on
+/// `/history/summary` would put a whole-store figure behind that endpoint's `since` day boundary,
+/// which is a different question with the same shape. So it is a route of its own, with no filters
+/// at all: the strip asks about the store, and the Seg/project filters it renders beside are
+/// explicitly scoped to the loaded rows (`consoleJobsPageNote`).
+///
+/// WHY IT COUNTS INPUTS RATHER THAN THE CONSOLE'S FIVE NUMBERS. The count has to be derived by the
+/// same rule the row's pill is, or the strip and the table disagree — which is worse than either
+/// being wrong alone. The cheapest way to guarantee one rule is to have exactly one implementation
+/// of it, and that implementation is the console's (`consoleJobStatus`/`needsOperator` in
+/// `web/src/lib/console-jobs.ts`), which owns the vocabulary. So the daemon does the half the
+/// client cannot — folding every issue rather than a page — and serves the same per-row facts the
+/// listing already serves, grouped. The client multiplies its own rule over the buckets.
+///
+/// The lifecycle/label lookups are asked only about the ids a TRACKER can answer for, filtered by
+/// [`review::is_review_key`] exactly as the listing filters them (STUDIO-831): a ticketless review
+/// run is dispatched under a synthetic `pr:<owner>/<repo>#<n>@<reviewer>` key, Linear validates
+/// `id: { in: … }` before serving it, and ONE such id used to fail the whole batch. That failure is
+/// silent — an empty result, not an error a console could show — which is why the filter is pinned
+/// by a test rather than left to be noticed.
+///
+/// THE LIVE OVERLAY. A ticket the daemon is holding for retry still reads "running" in the table
+/// (`runs-model.jobStatus` folds a pending retry into the live set), while its stored row's outcome
+/// is whatever the last attempt did. Counting the stored row alone would put that ticket in a
+/// different bucket from its own row, so the snapshot's `running` and `retrying` sets are folded in
+/// the same way the console folds them. The snapshot read is best-effort: losing it costs the
+/// overlay, not the tally, exactly as losing the tracker costs the lifecycles and not the rows.
+/// (Go's `state.blocked` held-dependent set has no Rhapsody counterpart — `Snapshot` carries no
+/// such field — so there is nothing to fold for it.)
+///
+/// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
+pub(crate) async fn handle_issue_counts(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    // Every issue in the store, deliberately unpaged: a tally that stopped at a page size would be
+    // the defect this endpoint exists to remove, one indirection further from the operator. The row
+    // set is bounded by the number of ISSUES the daemon has ever run (424 on the operator's own
+    // store when this landed), the same set `GET /api/v1/history/issues?limit=…` already lets any
+    // client ask for in one request, and the response it produces is O(1) in that number.
+    let runs = match provider.history().list_issue_runs(RunFilter {
+        limit: i64::MAX,
+        ..RunFilter::default()
+    }) {
+        Ok(runs) => runs,
+        Err(_) => return store_error("issue counts query failed"),
+    };
+    let ids: Vec<String> = runs
+        .iter()
+        .map(|r| r.issue_id.clone())
+        .filter(|id| !review::is_review_key(id))
+        .collect();
+    let (lifecycles, reviews, snap) = tokio::join!(
+        provider.issue_lifecycles(&ids),
+        provider.review_tickets(&ids),
+        tokio::time::timeout(SNAPSHOT_TIMEOUT, provider.snapshot()),
+    );
+    // (identifier, issue id) of the work the daemon has in flight or parked for retry. A snapshot
+    // that failed or timed out yields none of it, which degrades the tally to the stored outcomes
+    // rather than failing the request.
+    let mut live_work: Vec<(String, String)> = Vec::new();
+    if let Ok(Ok(snap)) = snap {
+        for r in &snap.running {
+            live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
+        }
+        for r in &snap.retrying {
+            live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
+        }
+    }
+    let live: HashSet<&str> = live_work
+        .iter()
+        .map(|(identifier, _)| identifier.as_str())
+        .filter(|identifier| !identifier.is_empty())
+        .collect();
+
+    let mut buckets: BTreeMap<IssueStatusKey, i64> = BTreeMap::new();
+    // Which identifiers a stored row already accounts for. The console groups by identifier and so
+    // does `list_issue_runs`, so a live run with a stored row is ONE row on both sides; an empty
+    // identifier never groups on either, so it never joins this set.
+    let mut counted: HashSet<&str> = HashSet::new();
+    for r in &runs {
+        if !r.issue_identifier.is_empty() {
+            counted.insert(r.issue_identifier.as_str());
+        }
+        let outcome = if live.contains(r.issue_identifier.as_str()) {
+            OUTCOME_RUNNING
+        } else {
+            r.outcome.as_str()
+        };
+        *buckets
+            .entry(status_key(&r.issue_id, outcome, &lifecycles, &reviews))
+            .or_insert(0) += 1;
+    }
+    // Live work with no stored row at all — a `--no-store` daemon, or a run dispatched between the
+    // store read and the snapshot read. The console draws such a ticket from the snapshot alone, so
+    // a tally that skipped it would be short by exactly the rows the operator is watching.
+    for (identifier, issue_id) in &live_work {
+        if identifier.is_empty() || !counted.insert(identifier.as_str()) {
+            continue;
+        }
+        *buckets
+            .entry(status_key(issue_id, OUTCOME_RUNNING, &lifecycles, &reviews))
+            .or_insert(0) += 1;
+    }
+    write_json(StatusCode::OK, &issue_counts_response(&buckets))
+}
+
+/// The status inputs of one issue, in the vocabulary [`issue_counts_response`] groups by. `review_run`
+/// is read off the id for the reason the listing reads it off the id: a review run announces itself
+/// in the key it was dispatched under, and never in a title the daemon happens to mint.
+fn status_key(
+    issue_id: &str,
+    outcome: &str,
+    lifecycles: &HashMap<String, IssueLifecycleRow>,
+    reviews: &HashSet<String>,
+) -> IssueStatusKey {
+    IssueStatusKey {
+        outcome: outcome.to_string(),
+        lifecycle: lifecycles
+            .get(issue_id)
+            .map(|life| life.lifecycle.as_str().to_string()),
+        review_ticket: reviews.contains(issue_id),
+        review_run: review::is_review_key(issue_id),
+    }
 }
 
 /// `GET /api/v1/history/summary?since=`: whole-store run/token/runtime totals over the runs that
@@ -515,7 +652,7 @@ fn parse_non_neg_int(raw: &str, field: &str) -> Result<i64, Box<Response>> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use super::{SUMMARY_RHYTHM_RUNS, local_day_start};
@@ -1142,6 +1279,239 @@ mod tests {
             by_ident[review_key],
         );
         assert_eq!(by_ident["MT-2"]["lifecycle"], "done");
+    }
+
+    // ---- GET /api/v1/history/issues/counts (STUDIO-828) ----
+
+    /// Collapse the counts payload into `bucket-key -> count`, so a test asserts on the tally
+    /// rather than on the array's order. The key is spelled the way the wire spells it: an absent
+    /// lifecycle is `-`, and the two markers only appear when true.
+    fn tally(body: &Value) -> std::collections::HashMap<String, i64> {
+        body["buckets"]
+            .as_array()
+            .expect("buckets array")
+            .iter()
+            .map(|b| {
+                let mut key = format!(
+                    "{}/{}",
+                    b["outcome"].as_str().unwrap_or_default(),
+                    b["lifecycle"].as_str().unwrap_or("-"),
+                );
+                if b.get("review_ticket").is_some() {
+                    key.push_str("/review_ticket");
+                }
+                if b.get("review_run").is_some() {
+                    key.push_str("/review_run");
+                }
+                (key, b["count"].as_i64().unwrap_or_default())
+            })
+            .collect()
+    }
+
+    // STUDIO-828 defect A, and the property the whole endpoint exists for: the tally is over the
+    // STORE, so it does not move when a client widens its page. Asserted as the ticket asks —
+    // against the same store, once with the default window and once with a wide one — because a
+    // test that fetches a single window and asserts a number passes on the defective code too.
+    //
+    // `DEFAULT_RUN_LIMIT + 7` issues, so the default page genuinely truncates: the old client-side
+    // fold answered 50 here and 57 after one "Load more".
+    #[tokio::test]
+    async fn issue_counts_tally_the_whole_store_at_every_page_width() {
+        let store = mem_store();
+        let total = DEFAULT_RUN_LIMIT + 7;
+        for i in 0..total {
+            seed_run_at(
+                &store,
+                &format!("MT-{i}"),
+                &format!("2026-08-01T00:{:02}:00Z", i % 60),
+            );
+        }
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        // What the listing serves at each width — the input the strip used to fold.
+        let (_, narrow) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        let (_, wide) = get_json(&format!("{base}/api/v1/history/issues?limit=500")).await;
+        assert_eq!(
+            narrow["issues"].as_array().expect("rows").len(),
+            DEFAULT_RUN_LIMIT as usize
+        );
+        assert_eq!(
+            wide["issues"].as_array().expect("rows").len(),
+            total as usize
+        );
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["issues"], total,
+            "the tally covers every issue in the store, not a page of them: {body}",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/-".to_string(), total)]),
+        );
+    }
+
+    // STUDIO-828 — the buckets carry the SAME per-row facts the listing carries, because the rule
+    // that turns them into a pill lives once, in the console. A lifecycle the daemon resolved is
+    // spelled exactly as the row spells it; one it could not resolve is absent from the key, which
+    // is how the client tells a healthy tally from the stripped one a cold cache serves.
+    #[tokio::test]
+    async fn issue_counts_carry_the_ticket_lifecycle_and_its_absence() {
+        let store = mem_store();
+        seed_run_for("iss_done", "MT-1", "2026-08-01T00:00:00Z", &store);
+        seed_run_for("iss_review", "MT-2", "2026-08-01T00:01:00Z", &store);
+        seed_run_for("iss_quiet", "MT-3", "2026-08-01T00:02:00Z", &store);
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([
+                    (
+                        "iss_done".to_string(),
+                        IssueLifecycleRow {
+                            state: "Done".into(),
+                            lifecycle: IssueLifecycle::Done,
+                        },
+                    ),
+                    (
+                        "iss_review".to_string(),
+                        IssueLifecycleRow {
+                            state: "In Review".into(),
+                            lifecycle: IssueLifecycle::InReview,
+                        },
+                    ),
+                ]))
+                .with_review_tickets(HashSet::from(["iss_review".to_string()])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["issues"], 3);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([
+                ("completed/done".to_string(), 1),
+                ("completed/in_review/review_ticket".to_string(), 1),
+                ("completed/-".to_string(), 1),
+            ]),
+            "a resolved lifecycle rides the key; an unresolved one is absent from it: {body}",
+        );
+    }
+
+    // STUDIO-828 inherits STUDIO-831 directly: the tally wants the same lifecycle data the listing
+    // does, so it can void the same batch. A ticketless review run's `pr:owner/repo#n@reviewer` key
+    // is not a tracker issue id and Linear validates `id: { in: … }` before serving it — ONE such
+    // element fails the whole request and every ordinary ticket loses its answer.
+    //
+    // The failure mode is a SILENTLY empty result rather than an error a console can show, which is
+    // why this is pinned rather than left to the filter's one-line obviousness: with the filter
+    // gone, nothing here would fail except this assertion.
+    #[tokio::test]
+    async fn issue_counts_keep_a_ticketless_review_id_out_of_the_tracker_batches() {
+        let store = mem_store();
+        let review_key = "pr:makewhatis/rhapsody#141@jimmy";
+        seed_run_for(review_key, review_key, "2026-08-01T00:00:00Z", &store);
+        seed_run_for("iss_impl", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_impl".to_string(),
+                    IssueLifecycleRow {
+                        state: "Done".into(),
+                        lifecycle: IssueLifecycle::Done,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            provider.issue_lifecycles_asked(),
+            vec!["iss_impl".to_string()],
+            "a `pr:` key has no lifecycle to look up and must never enter the batch",
+        );
+        assert_eq!(
+            provider.review_tickets_asked(),
+            vec!["iss_impl".to_string()],
+            "nor a label to look up: a ticketless review job has no ticket to carry one",
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([
+                ("completed/-/review_run".to_string(), 1),
+                ("completed/done".to_string(), 1),
+            ]),
+            "the review run is counted, marked as its own kind, and the ticket keeps its answer",
+        );
+    }
+
+    // STUDIO-828 — a ticket parked for retry reads "running" in the worklist (`runs-model.jobStatus`
+    // folds a pending retry into the live set) while its stored row still carries the last attempt's
+    // outcome. The tally folds the snapshot the same way, so the strip and the row it is counting
+    // can never be in two different buckets.
+    #[tokio::test]
+    async fn issue_counts_fold_the_live_and_retrying_sets_the_way_the_worklist_does() {
+        let store = mem_store();
+        // MT-1's newest attempt is over and the daemon is holding it for another one.
+        seed_run_for("iss_retry", "MT-1", "2026-08-01T00:00:00Z", &store);
+        seed_run_for("iss_idle", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let mut snap = empty_snapshot();
+        snap.retrying.push(retry_row("MT-1"));
+        let base = spawn(FakeProvider::ok(snap).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["issues"], 2,
+            "the overlay re-buckets a row, never adds one"
+        );
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([
+                ("running/-".to_string(), 1),
+                ("completed/-".to_string(), 1),
+            ]),
+        );
+    }
+
+    // STUDIO-828 — live work the store has no row for at all: a `--no-store` daemon, or a run
+    // dispatched between the two reads. The console draws such a ticket from the snapshot alone, so
+    // the tally must too, or it is short by exactly the rows the operator is watching.
+    #[tokio::test]
+    async fn issue_counts_include_live_work_with_no_stored_row() {
+        let mut snap = empty_snapshot();
+        snap.running.push(running_row("MT-9"));
+        // No `.with_history`, so the provider's store is the Noop a `--no-store` daemon runs.
+        let base = spawn(FakeProvider::ok(snap)).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["issues"], 1);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("running/-".to_string(), 1)]),
+        );
+    }
+
+    // STUDIO-828 — the snapshot read is best-effort, on the same terms the tracker reads are: the
+    // tally has already been computed from the store by the time it matters, so a failed snapshot
+    // costs the live overlay and not the request. (A 503 here would take the strip's four numbers
+    // out over a fact that only re-buckets one of them.)
+    #[tokio::test]
+    async fn issue_counts_survive_a_snapshot_failure() {
+        let store = mem_store();
+        seed_run_for("iss_1", "MT-1", "2026-08-01T00:00:00Z", &store);
+        let base = spawn(FakeProvider::failing("boom").with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/-".to_string(), 1)]),
+        );
     }
 
     // STUDIO-735 — the issue listing carries the ticket's DURABLE assignee, so a job that has left
