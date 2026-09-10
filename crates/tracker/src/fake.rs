@@ -83,6 +83,13 @@ pub struct CreateIssueCall {
 /// call, e.g. active-then-inactive). Takes precedence over `by_id`/`by_id_err` when set.
 type StatesByIdsFn = Box<dyn Fn(&[String]) -> Result<Vec<Issue>, TrackerError> + Send + Sync>;
 
+/// A programmable [`Tracker::fetch_issue_labels_by_ids`] override, the sibling of
+/// [`StatesByIdsFn`]. It exists so a test can reproduce the one behaviour a canned map cannot: a
+/// tracker that answers or REFUSES depending on what the batch contains — Linear validates
+/// `id: { in: … }` before it serves it, so a single element that is neither a UUID nor an issue
+/// identifier fails the whole request (STUDIO-831). Takes precedence over `by_id`/`labels_by_id_err`.
+type LabelsByIdsFn = Box<dyn Fn(&[String]) -> Result<Vec<Issue>, TrackerError> + Send + Sync>;
+
 /// A hook run INSIDE [`Tracker::move_issue_to_type`] after the call is recorded and before the
 /// return value is produced.
 type Hook = Box<dyn Fn() + Send + Sync>;
@@ -128,6 +135,9 @@ pub struct Fake {
 
     /// When set, overrides `fetch_issue_states_by_ids`. Takes precedence over `by_id`/`by_id_err`.
     pub states_by_ids_func: Option<StatesByIdsFn>,
+    /// When set, overrides `fetch_issue_labels_by_ids`. Takes precedence over
+    /// `by_id`/`labels_by_id_err`.
+    pub labels_by_ids_func: Option<LabelsByIdsFn>,
     /// When set, `fetch_issue_states_by_ids` AWAITS this gate (until it carries `true`) before it
     /// produces a result — an async stand-in for a slow Linear round-trip. It suspends the CALLING
     /// FUTURE rather than blocking its thread, which is what an in-flight network call really does,
@@ -384,6 +394,9 @@ impl Tracker for Fake {
             return Ok(Vec::new());
         }
         self.lock().labels_by_id_calls += 1;
+        if let Some(func) = &self.labels_by_ids_func {
+            return func(ids);
+        }
         if let Some(e) = &self.labels_by_id_err {
             return Err(e.clone());
         }

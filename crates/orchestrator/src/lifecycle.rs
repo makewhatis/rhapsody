@@ -79,6 +79,17 @@
 //!
 //! Nothing here consults the live roster, and nothing here can invent an assignee for a run that
 //! had none.
+//!
+//! **All three decorations resolve through ONE batched by-ids read, and that read is all-or-nothing
+//! server-side.** `id: { in: [...] }` is validated before Linear serves it, so a single element
+//! that is neither a UUID nor an issue identifier fails the entire request — every other id in the
+//! batch included. The list is assembled from RUN ROWS, and a run row's id is not always a tracker
+//! id: a ticketless review run carries the synthetic `pr:<owner>/<repo>#<n>@<reviewer>` key. That
+//! is STUDIO-831, and it is guarded in two places on purpose. The LISTING keeps those ids out of
+//! the batch, because the listing is the layer that knows a row is a review run; and
+//! [`fetch_by_ids`] isolates a refusal to the ids that caused it, so an unexpected shape reaching
+//! the batch in future costs those rows and not the page. The first is the instance, the second is
+//! the class.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -103,6 +114,19 @@ const LIFECYCLE_BATCH: usize = 100;
 /// can provoke, since `limit` on the listing endpoint is caller-supplied. Ids past it keep whatever
 /// they had cached (usually nothing), which reads as "no answer" and falls back.
 const MAX_LIFECYCLE_REFRESH: usize = 200;
+
+/// The most EXTRA tracker round-trips ONE lookup may spend isolating the ids a batch was refused
+/// over (STUDIO-831) — a ceiling on the work one refusal can provoke, in the same spirit as
+/// [`MAX_LIFECYCLE_REFRESH`]. Ids the budget does not reach stay unresolved, which reads as "no
+/// answer" and falls back exactly as an unreachable tracker always did.
+///
+/// The arithmetic: halving a full [`LIFECYCLE_BATCH`] to pin ONE refused id visits about
+/// `2·log2(100)` ≈ 14 sub-batches, so 32 isolates two or three of them and still bounds a
+/// pathological batch — one the tracker refuses every part of — at 32 wasted calls instead of one
+/// per id. This is a BACKSTOP and not the primary fix: the ids that provoked it are the synthetic
+/// `pr:` review keys, and the listing that knows a row is a review run keeps those out of the batch
+/// in the first place, so a healthy daemon never spends a single one of these.
+const MAX_ISOLATION_QUERIES: usize = 32;
 
 /// The most answers the cache retains. A memo that only ever grows is a leak on a daemon that runs
 /// for months while an operator pages through history, so once the map passes this the expired
@@ -254,8 +278,10 @@ impl LifecycleCache {
     ///
     /// `target` is `None` before the first config load, and the whole refresh is then skipped —
     /// already-cached rows are still served, so a hot-reload gap degrades to staleness rather than
-    /// to blankness. A tracker error stops the refresh and is logged; it never propagates, because
-    /// there is no caller who could act on it (the listing itself has already succeeded).
+    /// to blankness. A tracker error is logged and never propagates, because there is no caller who
+    /// could act on it (the listing itself has already succeeded); it costs the rows it could not
+    /// resolve rather than the whole page, which is [`fetch_by_ids`]'s contract and was the
+    /// STUDIO-831 defect when it was not.
     ///
     /// Two concurrent reads over the same cold ids can both fetch. That is deliberate: the
     /// alternative is holding a lock across a network round-trip, and a duplicate read-only query
@@ -273,45 +299,43 @@ impl LifecycleCache {
         if stale.is_empty() {
             return out;
         }
-        for chunk in stale.chunks(LIFECYCLE_BATCH) {
-            let issues = match tracker.fetch_issue_states_by_ids(chunk).await {
-                Ok(issues) => issues,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        ids = chunk.len(),
-                        "lifecycle lookup failed; serving cached ticket states",
-                    );
-                    break;
+        let (issues, covered) = fetch_by_ids(
+            tracker.as_ref(),
+            ByIds::States,
+            &stale,
+            "lifecycle lookup failed; serving cached ticket states",
+        )
+        .await;
+        let by_id: HashMap<&str, &str> = issues
+            .iter()
+            .map(|iss| (iss.id.as_str(), iss.state.as_str()))
+            .collect();
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        // Only the ids a round trip actually COVERED are concluded from, which is the rule the two
+        // label decorations already followed and the one this refresh was missing: an id the
+        // tracker refused, or one in a chunk that never ran, must keep whatever it had rather than
+        // be recorded as an answer nothing gave.
+        for id in stale.iter().filter(|id| covered.contains(*id)) {
+            let row = by_id.get(id.as_str()).and_then(|state| {
+                classify(state, &states).map(|lifecycle| IssueLifecycleRow {
+                    state: (*state).to_string(),
+                    lifecycle,
+                })
+            });
+            match &row {
+                // A refreshed answer replaces whatever stale one `partition` handed back.
+                Some(row) => {
+                    out.insert(id.clone(), row.clone());
                 }
-            };
-            let by_id: HashMap<&str, &str> = issues
-                .iter()
-                .map(|iss| (iss.id.as_str(), iss.state.as_str()))
-                .collect();
-            let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            for id in chunk {
-                let row = by_id.get(id.as_str()).and_then(|state| {
-                    classify(state, &states).map(|lifecycle| IssueLifecycleRow {
-                        state: (*state).to_string(),
-                        lifecycle,
-                    })
-                });
-                match &row {
-                    // A refreshed answer replaces whatever stale one `partition` handed back.
-                    Some(row) => {
-                        out.insert(id.clone(), row.clone());
-                    }
-                    // The tracker no longer knows this id: drop the stale answer rather than keep
-                    // reporting a state nothing confirms.
-                    None => {
-                        out.remove(id);
-                    }
+                // The tracker no longer knows this id: drop the stale answer rather than keep
+                // reporting a state nothing confirms.
+                None => {
+                    out.remove(id);
                 }
-                guard.insert(id.clone(), Entry { row, at: now });
             }
-            prune(&mut guard, now);
+            guard.insert(id.clone(), Entry { row, at: now });
         }
+        prune(&mut guard, now);
         out
     }
 
@@ -509,8 +533,9 @@ impl LifecycleCache {
         if stale.is_empty() {
             return out;
         }
-        let (issues, covered) = fetch_labels(
+        let (issues, covered) = fetch_by_ids(
             tracker.as_ref(),
+            ByIds::Labels,
             &stale,
             "review-ticket label lookup failed; serving cached ticket kinds",
         )
@@ -688,19 +713,26 @@ fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) 
     }
 }
 
-/// The `rhapsody:@<name>` label of each of `keys`, batched exactly as the lifecycle refresh batches
-/// its own lookup, beside the set of ids a round-trip actually COVERED — which is not the same
-/// thing: a ticket the tracker answered about but that carries no identity label is covered with no
-/// label, and that distinction is what lets the caller cache "nobody" without also caching it over
-/// a chunk that simply failed. A failed round-trip stops the refresh and is logged; it never
-/// propagates.
+/// The `rhapsody:@<name>` label of each of `keys`, through [`fetch_by_ids`] — so the batching, the
+/// covered-set rule and the isolation of a refused id are the same ones the lifecycle refresh
+/// follows. `covered` is the set of ids a round-trip actually answered ABOUT, which is not the set
+/// it named a teammate for: a ticket the tracker answered about but that carries no identity label
+/// is covered with no label, and that distinction is what lets the caller cache "nobody" without
+/// also caching it over a chunk that simply failed.
+///
+/// Every key here is passed through unfiltered, including a ticketless review run's synthetic `pr:`
+/// key, and that is deliberate rather than an oversight of STUDIO-831: this is the FALLBACK source,
+/// reached only for a run whose own routing ledger was silent, and a review run is routed under its
+/// reviewer's identity like any other dispatch — so in practice it answers from the store and never
+/// arrives here at all. If one ever does, [`fetch_by_ids`] isolates it instead of losing the batch.
 async fn label_identities(
     tracker: &dyn Tracker,
     keys: &[IssueKey],
 ) -> (Vec<(String, String)>, HashSet<String>) {
     let ids: Vec<String> = keys.iter().map(|k| k.id.clone()).collect();
-    let (issues, covered) = fetch_labels(
+    let (issues, covered) = fetch_by_ids(
         tracker,
+        ByIds::Labels,
         &ids,
         "assignee label lookup failed; serving cached ticket assignees",
     )
@@ -712,35 +744,196 @@ async fn label_identities(
     (out, covered)
 }
 
-/// The labelled issues for `ids`, batched at [`LIFECYCLE_BATCH`], beside the set of ids a
-/// round-trip actually COVERED — which is not the same thing: a ticket the tracker answered about
-/// but that carries none of the labels a caller cares about is covered with no label, and that
-/// distinction is what lets a caller cache the negative without also caching it over a chunk that
-/// simply failed. A failed round-trip stops the refresh and is logged under `what`; it never
-/// propagates, because the listing being decorated has already succeeded.
+/// Which of the tracker's two by-ids reads a batched lookup performs.
 ///
-/// Shared by the two decorations that read labels — the durable assignee (STUDIO-735) and the
-/// review-ticket marker (STUDIO-780) — so the batching, the covered-set rule and the
-/// failure-is-not-an-answer rule have one home rather than two that can drift.
-async fn fetch_labels(
+/// They share every rule [`fetch_by_ids`] states — the batching, the covered-set contract, the
+/// isolation of a refused id — because they are the same query SHAPE (`id: { in: [...] }`, filtered
+/// server-side, unpaginated) against the same all-or-nothing validation. A degradation that reached
+/// only one of them would leave the other holding the defect.
+#[derive(Clone, Copy)]
+enum ByIds {
+    /// [`Tracker::fetch_issue_states_by_ids`] — the lifecycle refresh (STUDIO-702).
+    States,
+    /// [`Tracker::fetch_issue_labels_by_ids`] — the assignee (STUDIO-735) and review-ticket
+    /// (STUDIO-780) refreshes.
+    Labels,
+}
+
+impl ByIds {
+    async fn fetch(
+        self,
+        tracker: &dyn Tracker,
+        ids: &[String],
+    ) -> Result<Vec<rhapsody_core::Issue>, rhapsody_tracker::TrackerError> {
+        match self {
+            ByIds::States => tracker.fetch_issue_states_by_ids(ids).await,
+            ByIds::Labels => tracker.fetch_issue_labels_by_ids(ids).await,
+        }
+    }
+}
+
+/// Whether `err` is the tracker REFUSING the ids it was handed rather than failing to serve them —
+/// the only failure an id-by-id isolation can make progress against.
+///
+/// Linear validates `id: { in: … }` BEFORE it runs the query and reports a rejected element as a
+/// top-level GraphQL error (`linear_graphql_errors: INVALID_INPUT`, "in must be either a valid UUID
+/// or issue identifier"). That category, and only that category, is a statement about the CONTENT
+/// of the batch, so it is the only one splitting the batch can answer. A transport failure, a
+/// non-200 or an undecodable body says nothing about any particular id: bisecting on one of those
+/// would multiply a dead round trip by the depth of the page and still resolve nothing, so those
+/// keep the wholesale degradation this lookup has always had.
+fn refuses_input(err: &rhapsody_tracker::TrackerError) -> bool {
+    matches!(
+        err,
+        rhapsody_tracker::TrackerError::Linear(e)
+            if e.kind == rhapsody_tracker::linear::LinearErrorKind::GraphqlErrors
+    )
+}
+
+/// What isolating ONE refused batch produced.
+struct Isolated {
+    /// The ids the tracker refused ON THEIR OWN — the batch's poison, pinned to individual ids so
+    /// the diagnostic can name them.
+    refused: Vec<String>,
+    /// How many ids the isolation gave up on: the budget ran out, or the tracker stopped answering
+    /// part-way. They are simply left unresolved, which is what every id in the batch was before.
+    abandoned: usize,
+    /// The tracker failed in a way that is NOT about the ids. Abandon the remaining chunks too.
+    stop: bool,
+}
+
+/// The issues the tracker knows for `ids`, batched at [`LIFECYCLE_BATCH`], beside the set of ids a
+/// round-trip actually COVERED — which is not the same thing: a ticket the tracker answered about
+/// but that carries none of what a caller is looking for is covered with no answer, and that
+/// distinction is what lets a caller cache the negative without also caching it over a chunk that
+/// simply failed.
+///
+/// **One refused id must not void the batch** (STUDIO-831). Linear's `id: { in: … }` filter is
+/// all-or-nothing over a list this daemon assembles from RUN ROWS, and a run row's id is not always
+/// a tracker issue id: a ticketless review run is dispatched under a synthetic
+/// `pr:<owner>/<repo>#<n>@<reviewer>` key, which is neither a UUID nor an issue identifier. Before
+/// this, one such element failed the whole request and every ordinary ticket batched with it lost
+/// its answer — 45 of 50 rows on the console's Jobs list, silently, until the daemon restarted and
+/// even the cached fallback was empty.
+///
+/// So a refusal is ISOLATED rather than absorbed: the batch is halved until each refusal is pinned
+/// to the individual ids that caused it, those ids are dropped, and everything else in the batch
+/// resolves. The cost is bounded by [`MAX_ISOLATION_QUERIES`] and paid only on the failure path.
+/// Two limits on that, both deliberate:
+///
+///   * Only a [`refuses_input`] error is isolated. Anything else keeps the wholesale degradation.
+///   * A refused id is NOT recorded as covered, so no caller memoizes it as an answer. It is
+///     re-asked on the next refresh, which costs one round trip per TTL window and is the right
+///     trade: the alternative caches "no such ticket" over what may have been a transient refusal.
+///
+/// Shared by all three decorations so the batching, the covered-set rule, the isolation and the
+/// failure-is-not-an-answer rule have one home rather than three that can drift. A failure never
+/// propagates — the listing being decorated has already succeeded — and `what` names the caller in
+/// the diagnostic.
+async fn fetch_by_ids(
     tracker: &dyn Tracker,
+    kind: ByIds,
     ids: &[String],
     what: &str,
 ) -> (Vec<rhapsody_core::Issue>, HashSet<String>) {
     let mut out = Vec::new();
     let mut covered = HashSet::new();
+    let mut budget = MAX_ISOLATION_QUERIES;
     for chunk in ids.chunks(LIFECYCLE_BATCH) {
-        let issues = match tracker.fetch_issue_labels_by_ids(chunk).await {
-            Ok(issues) => issues,
-            Err(err) => {
-                tracing::warn!(error = %err, ids = chunk.len(), "{what}");
-                break;
+        let err = match kind.fetch(tracker, chunk).await {
+            Ok(issues) => {
+                out.extend(issues);
+                covered.extend(chunk.iter().cloned());
+                continue;
             }
+            Err(err) => err,
         };
-        out.extend(issues);
-        covered.extend(chunk.iter().cloned());
+        if !refuses_input(&err) {
+            tracing::warn!(error = %err, ids = chunk.len(), "{what}");
+            break;
+        }
+        let iso = isolate(tracker, kind, chunk, &mut out, &mut covered, &mut budget).await;
+        // The ids, not a count of them. The pre-STUDIO-831 warning logged how many were in the
+        // batch beside Linear's own error text, leaving an operator to spot the odd element among a
+        // hundred — work the daemon has already done by the time it writes this line.
+        tracing::warn!(
+            error = %err,
+            refused = %iso.refused.join(" "),
+            resolved = chunk
+                .len()
+                .saturating_sub(iso.refused.len())
+                .saturating_sub(iso.abandoned),
+            unresolved = iso.abandoned,
+            lookup = what,
+            "tracker refused these ids; the rest of the batch resolved without them",
+        );
+        if iso.stop {
+            break;
+        }
     }
     (out, covered)
+}
+
+/// Halves a batch the tracker REFUSED until every refusal is pinned to individual ids, extending
+/// `out`/`covered` with everything that resolves along the way and spending at most `budget`
+/// further round trips (shared across the whole lookup, decremented in place).
+async fn isolate(
+    tracker: &dyn Tracker,
+    kind: ByIds,
+    chunk: &[String],
+    out: &mut Vec<rhapsody_core::Issue>,
+    covered: &mut HashSet<String>,
+    budget: &mut usize,
+) -> Isolated {
+    let mut done = Isolated {
+        refused: Vec::new(),
+        abandoned: 0,
+        stop: false,
+    };
+    // A batch of one needs no further query: the refusal already names its only element.
+    if chunk.len() == 1 {
+        done.refused.push(chunk[0].clone());
+        return done;
+    }
+    // An explicit stack rather than recursion — an `async fn` cannot recurse without boxing its own
+    // future — with each pair of halves pushed right-then-left so popping walks the batch left to
+    // right and `refused` comes out in the caller's own id order.
+    let (left, right) = chunk.split_at(chunk.len() / 2);
+    let mut todo: Vec<&[String]> = vec![right, left];
+    while let Some(part) = todo.pop() {
+        if *budget == 0 {
+            done.abandoned += part.len();
+            continue;
+        }
+        *budget -= 1;
+        match kind.fetch(tracker, part).await {
+            Ok(issues) => {
+                out.extend(issues);
+                covered.extend(part.iter().cloned());
+            }
+            // The tracker stopped answering mid-isolation. Nothing further can be concluded about
+            // any id, so give up on the rest rather than keep asking a tracker that is not there.
+            Err(err) if !refuses_input(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    ids = part.len(),
+                    "isolating a refused batch stopped: the tracker is no longer answering",
+                );
+                done.abandoned += part.len() + todo.iter().map(|p| p.len()).sum::<usize>();
+                done.stop = true;
+                break;
+            }
+            // A single id refused on its own IS the answer: this id is the one the tracker will not
+            // accept.
+            Err(_) if part.len() == 1 => done.refused.push(part[0].clone()),
+            Err(_) => {
+                let (l, r) = part.split_at(part.len() / 2);
+                todo.push(r);
+                todo.push(l);
+            }
+        }
+    }
+    done
 }
 
 /// The identity a ticket's labels name, or `None` for a ticket that names none.
@@ -1115,6 +1308,265 @@ mod tests {
         assert!(
             after.is_empty(),
             "a state nothing confirms must not survive: {after:?}"
+        );
+    }
+
+    // ─── one refused id must not void the batch (STUDIO-831) ────────────────────────────────────
+
+    /// Linear's `id: { in: … }` refusal, verbatim from the `v0.3.4-rc.19` daemon log — the error
+    /// this whole section exists for:
+    ///
+    /// ```text
+    /// linear_graphql_errors: INVALID_INPUT
+    ///   "in must be either a valid UUID or issue identifier (e.g. \"TEAM-123\")"
+    /// ```
+    fn invalid_input() -> rhapsody_tracker::TrackerError {
+        rhapsody_tracker::TrackerError::Linear(rhapsody_tracker::linear::LinearError::new(
+            rhapsody_tracker::linear::LinearErrorKind::GraphqlErrors,
+            "INVALID_INPUT: in must be either a valid UUID or issue identifier",
+        ))
+    }
+
+    /// A tracker that answers the way Linear does, which is the property a canned `by_id` map
+    /// cannot express: the query is VALIDATED before it is served, so a batch carrying any id the
+    /// server would reject fails WHOLE and none of its well-formed ids resolve either.
+    fn linear_shaped(known: &[(&str, &str)]) -> Arc<Fake> {
+        let known: Vec<(String, String)> = known
+            .iter()
+            .map(|(id, st)| ((*id).to_string(), (*st).to_string()))
+            .collect();
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(move |ids| {
+            if ids.iter().any(|id| crate::review::is_review_key(id)) {
+                return Err(invalid_input());
+            }
+            Ok(ids
+                .iter()
+                .filter_map(|id| known.iter().find(|(k, _)| k == id))
+                .map(|(id, st)| issue(id, st))
+                .collect())
+        }));
+        Arc::new(f)
+    }
+
+    // THE REPRODUCTION. A page holding BOTH ticketless review rows and ordinary ticket rows —
+    // which is every page since STUDIO-826 put `review_run` on this listing. The assertions are on
+    // the TICKET rows on purpose: the review rows read correctly either way (the console colours
+    // them from `review_run`), so a fixture of one kind, or assertions on the review rows, passes
+    // against the broken code and proves nothing.
+    #[tokio::test]
+    async fn a_refused_id_does_not_void_the_ticket_rows_it_was_batched_with() {
+        let tr = linear_shaped(&[
+            ("2cc5fcd2", "Done"),
+            ("ea98875b", "In Review"),
+            ("7f1c9a04", "Todo"),
+        ]);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = [
+            "pr:makewhatis/rhapsody#141@jimmy",
+            "2cc5fcd2",
+            "pr:makewhatis/rhapsody#138@alice",
+            "ea98875b",
+            "7f1c9a04",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let got = cache
+            .resolve(
+                &ids,
+                Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                Instant::now(),
+            )
+            .await;
+
+        assert_eq!(got["2cc5fcd2"].lifecycle, IssueLifecycle::Done);
+        assert_eq!(got["ea98875b"].lifecycle, IssueLifecycle::InReview);
+        assert_eq!(got["7f1c9a04"].lifecycle, IssueLifecycle::Open);
+        assert_eq!(
+            got.len(),
+            3,
+            "a key the tracker refuses has no lifecycle to report: {got:?}",
+        );
+    }
+
+    // The diagnostic has to name the ids it dropped. The pre-STUDIO-831 warning logged a COUNT
+    // beside Linear's own error text, leaving the reader to spot the odd element in a list of a
+    // hundred — which is exactly the work the daemon has already done by the time it logs.
+    #[tokio::test]
+    async fn the_warning_names_the_ids_the_tracker_refused() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = crate::testsupport::recording_subscriber();
+        let tr = linear_shaped(&[("2cc5fcd2", "Done"), ("ea98875b", "Todo")]);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = ["2cc5fcd2", "pr:makewhatis/rhapsody#141@jimmy", "ea98875b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            cache
+                .resolve(
+                    &ids,
+                    Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                    Instant::now(),
+                )
+                .await;
+        }
+
+        let events = events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let warn = events
+            .iter()
+            .find(|e| e.fields.contains_key("refused"))
+            .unwrap_or_else(|| panic!("no refusal diagnostic was logged: {events:?}"));
+        assert_eq!(warn.level, "WARN");
+        assert_eq!(
+            warn.fields.get("refused").map(String::as_str),
+            Some("pr:makewhatis/rhapsody#141@jimmy"),
+            "the log must say WHICH id it dropped: {warn:?}",
+        );
+        assert_eq!(
+            warn.fields.get("resolved").map(String::as_str),
+            Some("2"),
+            "and how much of the batch survived it: {warn:?}",
+        );
+    }
+
+    // Isolating a refusal is only sound because the tracker REFUSED THE INPUT — a statement about
+    // particular ids. A transport failure says nothing about any id, so splitting the batch would
+    // multiply one dead round trip by the depth of the page and still answer nothing.
+    #[tokio::test]
+    async fn a_tracker_that_is_down_is_not_bisected() {
+        let mut f = Fake::default();
+        f.by_id_err = Some(rhapsody_tracker::TrackerError::Linear(
+            rhapsody_tracker::linear::LinearError::new(
+                rhapsody_tracker::linear::LinearErrorKind::ApiRequest,
+                "connection refused",
+            ),
+        ));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = (0..64).map(|i| format!("i{i}")).collect();
+
+        let got = cache
+            .resolve(
+                &ids,
+                Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(got.is_empty(), "a failed lookup answers nothing: {got:?}");
+        assert_eq!(
+            tr.by_id_calls(),
+            1,
+            "one failed round trip must stay one, not become a bisection of it",
+        );
+    }
+
+    // Isolation is best-effort like every other read here, and BOUNDED: a batch the tracker refuses
+    // every part of must not turn one round trip into one per id on every dashboard load.
+    #[tokio::test]
+    async fn isolation_stays_inside_its_budget() {
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(|_| Err(invalid_input())));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = (0..LIFECYCLE_BATCH).map(|i| format!("i{i}")).collect();
+
+        let got = cache
+            .resolve(
+                &ids,
+                Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            got.is_empty(),
+            "nothing resolved, nothing invented: {got:?}"
+        );
+        assert!(
+            tr.by_id_calls() <= MAX_ISOLATION_QUERIES + 1,
+            "isolation must stay inside its budget; it spent {} round trips",
+            tr.by_id_calls(),
+        );
+    }
+
+    // A refused id must not be memoized as a MISS. A miss is "the tracker answered and does not
+    // know this id"; a refusal is the tracker declining to answer, and caching it would keep a
+    // legitimate id blank for the rest of the TTL window if the refusal were ever transient.
+    #[tokio::test]
+    async fn a_refused_id_is_not_cached_as_an_answer() {
+        let tr = linear_shaped(&[("2cc5fcd2", "Done")]);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = ["2cc5fcd2", "pr:makewhatis/rhapsody#141@jimmy"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let target = || Some((Arc::clone(&tr) as Arc<dyn Tracker>, states()));
+        let t0 = Instant::now();
+
+        cache.resolve(&ids, target(), t0).await;
+        let calls = tr.by_id_calls();
+        let again = cache.resolve(&ids, target(), t0).await;
+
+        assert_eq!(again["2cc5fcd2"].lifecycle, IssueLifecycle::Done);
+        assert!(
+            tr.by_id_calls() > calls,
+            "the resolved id is memoized, the refused one is re-asked",
+        );
+    }
+
+    // The same all-or-nothing `id: { in: … }` query backs the review-ticket marker, so the same
+    // degradation has to reach it: one refused id must not erase every other row's KIND either.
+    #[tokio::test]
+    async fn a_refused_id_does_not_void_the_review_ticket_batch() {
+        let mut f = Fake::default();
+        f.labels_by_ids_func = Some(Box::new(|ids| {
+            if ids.iter().any(|id| crate::review::is_review_key(id)) {
+                return Err(invalid_input());
+            }
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    let marks: &[&str] = if id == "a" {
+                        &[crate::quorum::REVIEW_TICKET_LABEL]
+                    } else {
+                        &["backend"]
+                    };
+                    labelled(id, marks)
+                })
+                .collect())
+        }));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = ["a", "pr:makewhatis/rhapsody#141@jimmy", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let got = cache
+            .resolve_reviews(
+                &ids,
+                Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                Instant::now(),
+            )
+            .await;
+
+        assert!(
+            got.contains("a"),
+            "the marked ticket survives the refusal: {got:?}"
+        );
+        assert!(
+            !got.contains("b"),
+            "and so does the ordinary one's answer: {got:?}"
         );
     }
 

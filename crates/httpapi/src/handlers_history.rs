@@ -11,7 +11,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
-use rhapsody_orchestrator::IssueKey;
+use rhapsody_orchestrator::{IssueKey, review};
 use rhapsody_store::{EventQuery, RunFilter, effective_run_limit};
 
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
@@ -93,7 +93,30 @@ pub(crate) async fn handle_issue_runs(
     // must not also erase who worked it — nor what KIND of ticket it is, which is the third
     // (STUDIO-780): a review ticket, whose own job is to review a teammate's pull request, so the
     // console can say "reviewing" where it would otherwise say "in review".
-    let ids: Vec<String> = runs.iter().map(|r| r.issue_id.clone()).collect();
+    //
+    // The two that reach the tracker BY ID are asked only about the rows a TRACKER can answer for
+    // (STUDIO-831). A ticketless review run is dispatched under a synthetic
+    // `pr:<owner>/<repo>#<n>@<reviewer>` key, which is neither a UUID nor an issue identifier, and
+    // Linear validates `id: { in: … }` before it serves it — so ONE such id failed the whole
+    // request and every ordinary ticket on the page lost its lifecycle with it. Those rows have no
+    // lifecycle and no ticket label to look up in the first place; `review_run` is what colours
+    // them, and it is read off the row itself (STUDIO-826).
+    //
+    // The filter lives HERE, in the listing, because the listing is the layer that knows a row is a
+    // review run — it already serves that fact. Filtering inside `LifecycleCache`, which sees only
+    // a `&[String]`, would make a run-id FORMAT into a contract of the lifecycle layer; that is the
+    // objection STUDIO-826 weighed when it chose a serialized field over sniffing the prefix, and
+    // it holds here too. (The lifecycle layer still degrades per-id if an unexpected shape ever
+    // reaches it — that is the class, this is the instance.)
+    let ids: Vec<String> = runs
+        .iter()
+        .map(|r| r.issue_id.clone())
+        .filter(|id| !review::is_review_key(id))
+        .collect();
+    // The assignee lookup is deliberately NOT filtered: its FIRST source is the daemon's own
+    // routing ledger, keyed by run id, which answers for a review run — routed under the reviewer's
+    // `rhapsody:@<name>` identity like any other dispatch — and needs no tracker at all. Dropping
+    // the key here would blank a column that is already correct.
     let keys: Vec<IssueKey> = runs
         .iter()
         .map(|r| IssueKey {
@@ -1042,6 +1065,83 @@ mod tests {
             "an ordinary run carries no field, never a false: {}",
             by_ident["MT-2"],
         );
+    }
+
+    // STUDIO-831 — a ticketless review run's id is a synthetic `pr:owner/repo#n@reviewer` key, not
+    // a tracker issue id, and Linear validates `id: { in: … }` before it serves it: ONE such
+    // element fails the whole request, so no id in the batch resolves. STUDIO-826 put those rows
+    // into this listing, and from that commit every ordinary ticket on the page lost its lifecycle.
+    //
+    // The LISTING is the layer that filters, because the listing is what knows a row is a review
+    // run — it is the same fact it already serves as `review_run`. Filtering inside the lifecycle
+    // cache instead would make a run-id FORMAT into a contract of the lifecycle layer, which is the
+    // objection STUDIO-826 itself weighed when it chose a serialized field over sniffing the prefix.
+    #[tokio::test]
+    async fn issue_runs_keep_a_ticketless_review_id_out_of_the_tracker_batches() {
+        let store = mem_store();
+        let review_key = "pr:makewhatis/rhapsody#141@jimmy";
+        let review_run = seed_run_for(review_key, review_key, "2026-08-01T00:00:00Z", &store);
+        let impl_run = seed_run_for("iss_impl", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(Arc::new(store))
+                .with_issue_lifecycles(HashMap::from([(
+                    "iss_impl".to_string(),
+                    IssueLifecycleRow {
+                        state: "Done".into(),
+                        lifecycle: IssueLifecycle::Done,
+                    },
+                )])),
+        );
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+
+        // The two decorations that reach the tracker BY ID see only ids a tracker could answer for.
+        assert_eq!(
+            provider.issue_lifecycles_asked(),
+            vec!["iss_impl".to_string()],
+            "a `pr:` key has no lifecycle to look up and must never enter the batch",
+        );
+        assert_eq!(
+            provider.review_tickets_asked(),
+            vec!["iss_impl".to_string()],
+            "nor a label to look up: a ticketless review job has no ticket to carry one",
+        );
+        // The assignee read is deliberately NOT filtered: its first source is the daemon's own
+        // routing ledger, keyed by RUN id, which answers for a review run and needs no tracker at
+        // all. Dropping the key here would lose the reviewer's name from a row that has one.
+        let mut asked = provider.issue_assignees_asked();
+        asked.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            asked,
+            vec![
+                IssueKey {
+                    id: "iss_impl".into(),
+                    run_id: impl_run,
+                },
+                IssueKey {
+                    id: review_key.into(),
+                    run_id: review_run,
+                },
+            ],
+        );
+
+        // STUDIO-826's behaviour is unchanged, and the ticket row gets what the refusal was eating.
+        let by_ident: std::collections::HashMap<&str, &Value> = body["issues"]
+            .as_array()
+            .expect("issues array")
+            .iter()
+            .map(|r| (r["issue_identifier"].as_str().unwrap_or_default(), r))
+            .collect();
+        assert_eq!(by_ident[review_key]["review_run"], true);
+        assert!(
+            by_ident[review_key].get("lifecycle").is_none(),
+            "a ticketless review row carries no lifecycle, exactly as before: {}",
+            by_ident[review_key],
+        );
+        assert_eq!(by_ident["MT-2"]["lifecycle"], "done");
     }
 
     // STUDIO-735 — the issue listing carries the ticket's DURABLE assignee, so a job that has left
