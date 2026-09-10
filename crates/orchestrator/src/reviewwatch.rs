@@ -110,7 +110,7 @@ pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
 /// What one watcher tick did, reported rather than logged-and-forgotten so a caller (and a test)
 /// can tell the four outcomes apart — they look identical in a silent no-op.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewSweepReport {
     /// Review runs dispatched this tick.
     pub dispatched: usize,
@@ -126,6 +126,12 @@ pub struct ReviewSweepReport {
     /// Rows re-armed to `requested` by the head-advance signal (design §14.1's in-process Event,
     /// standing in for the room post it forbids).
     pub armed: usize,
+    /// The implementation tickets whose pull request MERGED this tick, and the terminal state each
+    /// is going to (STUDIO-712). A work LIST rather than a count, because the move itself is a
+    /// tracker round-trip and must not happen on the control task: the loop resolves it, the
+    /// watcher task performs it. Empty on every installation that has not named
+    /// `teams.review.done_state`, and on every tick where nothing merged.
+    pub done: Vec<crate::reviewdone::ReviewDonePlan>,
 }
 
 /// Delivers the watcher's two control-task round-trips. A trait for [`ReviewIntroSink`]'s reason:
@@ -139,6 +145,13 @@ pub trait ReviewWatchSink: Send + Sync {
     async fn watched(&self) -> Vec<PrCoord>;
     /// Hands one tick's observations to the control task and reports what it decided.
     async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport;
+    /// Moves ONE merged pull request's implementation ticket to its terminal state (STUDIO-712).
+    ///
+    /// On the sink rather than inside [`Self::sweep`] because it is a TRACKER write, and the point
+    /// of the seam is that the network calls happen out here on the watcher's own task while the
+    /// control task only ever decides. Infallible by contract: a failed move is logged where it
+    /// happens and the ticket stays in review — there is no caller with anything to do about it.
+    async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan);
 }
 
 /// The production [`ReviewWatchSink`]: the control channel, through the same [`ControlHandle`] seam
@@ -160,6 +173,9 @@ impl ReviewWatchSink for ControlWatchSink {
     }
     async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
         self.control.review_sweep(observed).await
+    }
+    async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
+        self.control.finish_review_ticket(plan).await
     }
 }
 
@@ -235,8 +251,19 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 retired = report.retired,
                 deferred = report.deferred,
                 armed = report.armed,
+                done = report.done.len(),
                 "ticketless review watcher tick"
             );
+        }
+        // The auto-Done moves (STUDIO-712), out here because each is a tracker round-trip. Serially
+        // and with a cancellation check between them, for `sweep_pr_states`' reasons: a shutting-down
+        // daemon stops after at most one more call, and a merged pull request that goes unmoved leaves
+        // its ticket exactly where this feature found it.
+        for plan in report.done {
+            if ctx.is_cancelled() {
+                return;
+            }
+            deps.sink.finish(plan).await;
         }
     }
 }
@@ -359,7 +386,15 @@ impl Orchestrator {
                     report.retired += self.retire_review_pr(&obs.pr, "untrusted head repository")
                 }
                 PrLookup::Found(snap) if snap.status != PrStatus::Open => {
+                    // One drop, two different facts about the WORK — and only one of them says
+                    // the ticket is finished (STUDIO-712). A closed-unmerged pull request is
+                    // ABANDONED work whose ticket still needs a human; it is deliberately left
+                    // where it is rather than auto-Cancelled, because that would destroy the one
+                    // signal a maintainer has that something needs picking up. The ticket is
+                    // read off `rows` — this tick's in-memory snapshot — so the retirement below
+                    // cannot race it, whichever order the two run in.
                     let why = if snap.status == PrStatus::Merged {
+                        report.done.extend(self.plan_review_done(&rows, &obs.pr));
                         "merged"
                     } else {
                         "closed"
@@ -656,7 +691,7 @@ impl Orchestrator {
 
 /// Whether a watch row belongs to `pr`. Case-insensitive, because GitHub logins and repository
 /// names are.
-fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
+pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
     row.key.owner.eq_ignore_ascii_case(&pr.owner)
         && row.key.repo.eq_ignore_ascii_case(&pr.repo)
         && row.key.number == pr.number
@@ -813,8 +848,28 @@ mod tests {
         }
     }
 
+    /// [`ticketless`] with the STUDIO-712 auto-Done transition switched on.
+    fn ticketless_done(names: &[&str], state: &str) -> Teams {
+        let mut teams = ticketless(names);
+        teams.review.done_state = state.to_string();
+        teams
+    }
+
     fn introduce(o: &Orchestrator, r: ReviewWatchRow) {
         o.store().save_review_watch(r).expect("introduce");
+    }
+
+    /// A finished run of `issue` — the row the auto-Done transition reads the opaque tracker ids
+    /// off, written by `persist_start_run` in production.
+    fn run_of(o: &Orchestrator, issue: &str) {
+        o.store()
+            .start_run(rhapsody_store::RunStart {
+                issue_id: format!("ID-{issue}"),
+                issue_identifier: issue.to_string(),
+                team_id: "TEAM-1".to_string(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start run");
     }
 
     fn coord(number: i64) -> PrCoord {
@@ -832,6 +887,30 @@ mod tests {
                 head_repo: format!("{OWNER}/{REPO}"),
             }),
         }
+    }
+
+    /// One observation of a MERGED pull request at `head`. The timestamp is fixed rather than
+    /// `now()` and is never asserted on: the transition keys on the STATUS, and a merged pull
+    /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
+    fn merged_at(head: &str) -> PrLookup {
+        PrLookup::Found(PrSnapshot {
+            head_sha: head.to_string(),
+            status: PrStatus::Merged,
+            merged_at: chrono::DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc)),
+            head_repo: format!("{OWNER}/{REPO}"),
+        })
+    }
+
+    /// One observation of a pull request that was CLOSED without merging.
+    fn closed_at(head: &str) -> PrLookup {
+        PrLookup::Found(PrSnapshot {
+            head_sha: head.to_string(),
+            status: PrStatus::Closed,
+            merged_at: None,
+            head_repo: format!("{OWNER}/{REPO}"),
+        })
     }
 
     fn observed(number: i64, lookup: PrLookup) -> PrObservation {
@@ -1112,6 +1191,94 @@ mod tests {
                 .retired,
             0
         );
+    }
+
+    // --- auto-Done on merge (STUDIO-712) ----------------------------------------------------
+
+    /// Acceptance: a ticket in a review state whose pull request MERGES is moved to the configured
+    /// terminal state within one watch tick. The plan rides back on the report because the move
+    /// itself is a tracker round-trip the control task must not make.
+    #[test]
+    fn a_merged_pull_request_finishes_its_implementation_ticket() {
+        let (mut o, _d) = orch(ticketless_done(&["alice", "bob"], "Done"));
+        introduce(&o, row(64, "bob"));
+        run_of(&o, "STUDIO-721");
+
+        let report = o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert_eq!(
+            report.done,
+            vec![crate::reviewdone::ReviewDonePlan {
+                pr: format!("{OWNER}/{REPO}#64"),
+                issue_id: "ID-STUDIO-721".to_string(),
+                team_id: "TEAM-1".to_string(),
+                identifier: "STUDIO-721".to_string(),
+                state: "Done".to_string(),
+            }],
+        );
+        assert_eq!(report.retired, 1, "and the row still leaves the watch set");
+    }
+
+    /// Acceptance, the destructive half: a **closed-unmerged** pull request moves NOTHING. It is
+    /// abandoned work, its ticket still needs a human, and auto-Cancelling it would destroy the one
+    /// signal that says so. Neither does a pull request that is gone or whose head is untrusted.
+    #[test]
+    fn a_closed_unmerged_pull_request_finishes_nothing() {
+        for (n, lookup) in [
+            (64, closed_at(HEAD_A)),
+            (65, PrLookup::Gone),
+            (66, PrLookup::Untrusted),
+        ] {
+            let (mut o, _d) = orch(ticketless_done(&["alice", "bob"], "Done"));
+            introduce(&o, row(n, "bob"));
+            run_of(&o, "STUDIO-721");
+
+            let report = o.handle_review_sweep(&[observed(n, lookup.clone())]);
+
+            assert!(
+                report.done.is_empty(),
+                "pr #{n} ({lookup:?}) must move no ticket, and never auto-Cancel one"
+            );
+            assert_eq!(report.retired, 1, "pr #{n} still leaves the watch set");
+        }
+    }
+
+    /// One merge does not finish the OTHER watched pull requests' tickets — the plan is built from
+    /// the merged coordinate's own rows, out of a snapshot that holds every watched row.
+    #[test]
+    fn a_merge_finishes_only_its_own_ticket() {
+        let (mut o, _d) = orch(ticketless_done(&["alice", "bob"], "Done"));
+        introduce(&o, row(64, "bob"));
+        let mut other = row(65, "bob");
+        other.introduced_by = "handoff:STUDIO-999".to_string();
+        introduce(&o, other);
+        run_of(&o, "STUDIO-721");
+        run_of(&o, "STUDIO-999");
+
+        let report = o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert_eq!(
+            report
+                .done
+                .iter()
+                .map(|p| p.identifier.clone())
+                .collect::<Vec<_>>(),
+            vec!["STUDIO-721".to_string()]
+        );
+    }
+
+    /// The transition is a divergence and therefore OFF by default: the same merge on an
+    /// installation that never named a terminal state retires the row and moves nothing.
+    #[test]
+    fn an_unnamed_done_state_moves_nothing_on_a_merge() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(64, "bob"));
+        run_of(&o, "STUDIO-721");
+
+        let report = o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert!(report.done.is_empty(), "off by default");
+        assert_eq!(report.retired, 1);
     }
 
     // --- load-aware reviewer selection ------------------------------------------------------
@@ -1733,10 +1900,15 @@ mod tests {
     // --- the off-loop task --------------------------------------------------------------------
 
     /// A sink recording what the task asked for and handed back.
+    #[derive(Default)]
     struct FakeSink {
         watched: Vec<PrCoord>,
         seen: Arc<Mutex<Vec<Vec<PrObservation>>>>,
         done: Arc<tokio::sync::Notify>,
+        /// What the control task pretends to have decided, handed back from every `sweep`.
+        hand_back: ReviewSweepReport,
+        /// The auto-Done moves the task asked for, in order (STUDIO-712).
+        finished: Arc<Mutex<Vec<crate::reviewdone::ReviewDonePlan>>>,
     }
 
     #[async_trait]
@@ -1747,7 +1919,10 @@ mod tests {
         async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
             self.seen.lock().expect("seen lock").push(observed);
             self.done.notify_one();
-            ReviewSweepReport::default()
+            self.hand_back.clone()
+        }
+        async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
+            self.finished.lock().expect("finished lock").push(plan);
         }
     }
 
@@ -1786,6 +1961,7 @@ mod tests {
                 watched: vec![coord(12), coord(13)],
                 seen: Arc::clone(&seen),
                 done: Arc::clone(&done),
+                ..FakeSink::default()
             }),
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
@@ -1824,6 +2000,7 @@ mod tests {
                 watched: watched.clone(),
                 seen: Arc::clone(&seen),
                 done: Arc::clone(&done),
+                ..FakeSink::default()
             }),
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
@@ -1850,6 +2027,51 @@ mod tests {
         }
     }
 
+    /// STUDIO-712: the auto-Done moves the control task decided are performed out HERE, on the
+    /// watcher's own task, because each is a tracker round-trip. The loop decides, the task moves.
+    #[tokio::test(start_paused = true)]
+    async fn the_task_performs_the_moves_the_control_task_decided() {
+        let plan = crate::reviewdone::ReviewDonePlan {
+            pr: format!("{OWNER}/{REPO}#64"),
+            issue_id: "ID-STUDIO-712".to_string(),
+            team_id: "TEAM-1".to_string(),
+            identifier: "STUDIO-712".to_string(),
+            state: "Done".to_string(),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let signal = CancelSignal::new();
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(FakeSource)),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: Arc::new(FakeSink {
+                watched: vec![coord(64)],
+                seen: Arc::clone(&seen),
+                done: Arc::clone(&done),
+                hand_back: ReviewSweepReport {
+                    done: vec![plan.clone()],
+                    ..ReviewSweepReport::default()
+                },
+                finished: Arc::clone(&finished),
+            }),
+        };
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        done.notified().await;
+        // One more scheduling pass, so the move that follows the hand-back can run.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        assert_eq!(
+            finished.lock().expect("finished lock")[0],
+            plan,
+            "the plan the control task decided must reach the tracker unchanged"
+        );
+    }
+
     /// §16: with Teams off the task spawns no process at all — `sweep_pr_states` refuses — so it
     /// hands nothing back however many rows a stale watch set names.
     #[tokio::test(start_paused = true)]
@@ -1865,6 +2087,7 @@ mod tests {
                 watched: vec![coord(12)],
                 seen: Arc::clone(&seen),
                 done: Arc::clone(&done),
+                ..FakeSink::default()
             }),
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
