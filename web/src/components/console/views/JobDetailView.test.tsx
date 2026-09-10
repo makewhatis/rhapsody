@@ -3577,6 +3577,30 @@ describe("the step spine scrolls in place, not the page (STUDIO-821)", () => {
       expect(["hidden", "auto", "scroll"]).not.toContain(cs.overflow);
     });
 
+    it("lets no ancestor of the spine become a scroll container either", async () => {
+      // The generalisation of the test above, and the reason it is worth having twice: the sticky
+      // is defeated by the NEAREST scroll container, whichever ancestor that turns out to be. A
+      // future wrapper quietly given `overflow: hidden` to clip a corner would silently un-stick
+      // the spine again — the exact failure this ticket found, one level up.
+      //
+      // Bounded by what the harness renders: it mounts the run detail bare, so this walks
+      // `.trspine` → `.trsplit` → `.trrun` and no further. The console shell above it
+      // (`.rh-console .main`, `.app.rh-console`) carries no overflow of its own, checked by
+      // reading `console.css`; the walk covers everything this VIEW owns.
+      const spine = (await split()).querySelector(".trspine") as HTMLElement;
+      const seen: string[] = [];
+      for (let el = spine.parentElement; el !== null && el !== document.body; el = el.parentElement) {
+        const cs = getComputedStyle(el);
+        for (const axis of [cs.overflow, cs.overflowX, cs.overflowY]) {
+          expect(["hidden", "auto", "scroll"], `${el.className} scrolls`).not.toContain(axis);
+        }
+        seen.push(el.className);
+      }
+      // Not vacuous: the Split really is on the walk.
+      expect(seen).toContain("trsplit");
+      expect(seen).toContain("trrun");
+    });
+
     it("gives the inspector NO scroller of its own — the page still scrolls a long detail", async () => {
       // The examined decision (ticket §5). With the spine capped, a long detail is the tallest
       // thing in the row and the PAGE scrolls it. The alternative — a fixed two-pane layout where
