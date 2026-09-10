@@ -2753,11 +2753,12 @@ describe("wide content is contained (STUDIO-681's layout rule)", () => {
   /**
    * The declarations of one TOP-LEVEL selector's block.
    *
-   * Anchored on the newline, because a selector can be declared twice: STUDIO-821 overrides
-   * `.rh-console .trspine` inside the narrow `@media` block, and this file indents everything
-   * nested in one by two spaces while every top-level rule starts at column 0. A bare `indexOf`
-   * would return whichever came FIRST in the file — the media-query override — and quietly assert
-   * the narrow rule while claiming to assert the desktop one.
+   * Anchored on the newline, because a selector can be declared twice: STUDIO-821 declares
+   * `.rh-console .trspine` a second time inside the narrow `@media` block — the OVERRIDING one,
+   * which is why it sits after the top-level rule rather than before it. This file indents
+   * everything nested in a media query by two spaces while every top-level rule starts at column
+   * 0, so the newline pins the desktop declaration wherever the override happens to sit; a bare
+   * `indexOf` would depend on their order and silently return the wrong one if it ever changed.
    */
   function rule(selector: string): string {
     const at = css.indexOf(`\n${selector} {`);
@@ -3613,13 +3614,63 @@ describe("the step spine scrolls in place, not the page (STUDIO-821)", () => {
       expect(cs.maxHeight === "" || cs.maxHeight === "none").toBe(true);
     });
 
+    it("puts the narrow override where it WINS the cascade, not merely where it reads well", () => {
+      // The round-2 finding, and the hole the test below cannot cover on its own: that one
+      // asserts what the narrow block CONTAINS and never asks which declaration WINS. For the
+      // first version of this change the answer was "not that one" — the block sat ABOVE the
+      // top-level rule, so `position: static` and `max-height: 50vh` parsed, minified into the
+      // shipped bundle, and never once applied.
+      //
+      // This is asserted on the FILE, and unavoidably so. jsdom does not implement `@media` in
+      // the cascade AT ALL — a declaration inside one never reaches `getComputedStyle` even when
+      // the condition trivially matches the window (verified directly: a `@media (min-width: 1px)`
+      // block at `innerWidth: 1024` leaves the property at its initial value). So no amount of
+      // rendering can measure this here, and a test that appeared to would be reading the
+      // desktop value and reporting it as the narrow one.
+      //
+      // What is asserted instead is the complete set of inputs the cascade decides on for two
+      // rules of the same origin: specificity, importance, then source order. Pin all three and
+      // the outcome follows from the spec rather than from a renderer.
+      const raw = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+      // Comments in this file discuss `.rh-console .trspine` in prose, and prose is not a rule.
+      const css = raw.replace(/\/\*[\s\S]*?\*\//g, "");
+      const decls = [...css.matchAll(/(?:^|\n)([ \t]*)(\.rh-console \.trspine) \{([^}]*)\}/g)];
+
+      // The whole population is two — so "the later one" is unambiguous. (Nothing in any OTHER
+      // sheet in the layer names `.trspine` either; that half is the last test in this block.)
+      expect(decls, "the spine is no longer declared exactly twice").toHaveLength(2);
+      const [desktop, narrow] = decls;
+
+      // 1. SPECIFICITY: identical selector text, so identical (0,2,0). `@media` contributes none
+      //    of its own, which is the whole reason this ordering has to be deliberate.
+      expect(narrow[2]).toBe(desktop[2]);
+      // 2. IMPORTANCE: neither shouts, so `!important` does not decide it either.
+      expect(desktop[3]).not.toMatch(/!important/);
+      expect(narrow[3]).not.toMatch(/!important/);
+      // 3. SOURCE ORDER, which is therefore the only tie-break left: the override must come
+      //    second, and it must be the one nested in the narrow query. Swap the two blocks back
+      //    and this reds — which is what the original defect was.
+      const mediaOpen = css.indexOf("@media (max-width: 900px) {");
+      expect(mediaOpen, "the narrow media query is gone").toBeGreaterThan(-1);
+      expect(desktop.index, "the desktop rule no longer comes first").toBeLessThan(mediaOpen);
+      expect(mediaOpen, "the second declaration is not the narrow one").toBeLessThan(narrow.index);
+      // Belt and braces on which is which: this file indents a nested rule and starts every
+      // top-level one at column 0.
+      expect(desktop[1]).toBe("");
+      expect(narrow[1]).toBe("  ");
+    });
+
     it("states the narrow behaviour rather than letting it fall out of the desktop rule", () => {
-      // ASSERTED ON THE FILE, deliberately, and this is the one place in this block that is: jsdom
-      // evaluates `@media` against a window width it will not let a test change (re-assigning
-      // `innerWidth` does not re-evaluate), so a rule inside the narrow block is invisible to
-      // `getComputedStyle` here and a cascade assertion would read the DESKTOP value and pass
-      // while claiming otherwise. The collision risk that shape normally carries is covered
-      // directly by the test below: nothing else in the theme layer names `.trspine` at all.
+      // ASSERTED ON THE FILE, deliberately: jsdom does not implement `@media` in the cascade at
+      // all, so a declaration inside the narrow block never reaches `getComputedStyle` here no
+      // matter what width the window reports, and a rule-shaped assertion would silently read the
+      // DESKTOP value and pass while claiming otherwise. (The stronger-sounding "jsdom just will
+      // not let a test change the width" was this comment's first answer and it was wrong — the
+      // block is ignored even when its condition matches.) The collision risk that shape carries is covered
+      // directly by two other tests: nothing else in the theme layer names `.trspine` at all
+      // (below), and these declarations really do win the cascade (above). This one is about the
+      // WORDING only — on its own it would happily pass on a block that never applies, which is
+      // exactly what it did before the ordering test above was added.
       const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
       const block = css.indexOf("@media (max-width: 900px) {");
       expect(block, "the narrow media query is gone").toBeGreaterThan(-1);
