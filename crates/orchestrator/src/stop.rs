@@ -142,6 +142,13 @@ pub struct ControlHandle {
     /// decisions either side of them round-trip the control task. `None` ⇒ Teams is off and there
     /// is no merge path.
     pub(crate) merge: Option<std::sync::Arc<crate::runmerge::MergeDeps>>,
+    /// The `gh` seams the console's Diff tab reads through (STUDIO-749), snapshotted from
+    /// [`Orchestrator::diff_deps`](crate::orchestrator::Orchestrator). It lives on the handle for
+    /// [`Self::merge`]'s reason — every call it makes BLOCKS, so it runs on the HTTP request's own
+    /// task — and, unlike `merge`, needs no control round trip either side of it: a diff read
+    /// takes no claim and records nothing ([`crate::rundiff`]'s module doc). `None` ⇒ the daemon
+    /// was built with no GitHub access and the Diff tab has no answer to give.
+    pub(crate) diff: Option<std::sync::Arc<crate::rundiff::DiffDeps>>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -168,6 +175,7 @@ impl crate::orchestrator::Orchestrator {
             review_intro: self.review_intro_tx.clone(),
             lifecycle: std::sync::Arc::clone(&self.lifecycle),
             merge: self.merge_deps.as_ref().map(std::sync::Arc::clone),
+            diff: self.diff_deps.as_ref().map(std::sync::Arc::clone),
         }
     }
 }

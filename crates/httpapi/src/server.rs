@@ -13,6 +13,7 @@ use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
+use rhapsody_orchestrator::rundiff::DiffOutcome;
 use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeabilityOutcome};
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
@@ -36,6 +37,7 @@ use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
 use crate::handlers_reviews::{handle_review_dismiss, handle_review_rerun, handle_reviews};
 use crate::handlers_runaction::{handle_run_handoff, handle_run_resume, handle_run_stop};
+use crate::handlers_rundiff::handle_run_diff;
 use crate::handlers_runmerge::{handle_run_merge, handle_run_mergeability};
 use crate::handlers_teams::{
     handle_run_post, handle_run_retain, handle_teams, handle_teams_config, handle_teams_invalidate,
@@ -367,6 +369,19 @@ pub trait StateProvider: Send + Sync {
     async fn run_mergeability(&self, _run_id: i64) -> MergeabilityOutcome {
         MergeabilityOutcome::Dormant
     }
+
+    /// `GET /api/v1/runs/{id}/diff` — the unified diff this run produced on its branch, and the
+    /// pull request it produced it on (STUDIO-749).
+    ///
+    /// Read-only end to end: the diff path is handed five `gh` READ seams and no merge seam, so
+    /// nothing it reaches can act on the pull request it resolves.
+    ///
+    /// Defaults to `Unavailable` and NOT to an error, because a provider with no diff seams is a
+    /// daemon that genuinely has no diff to serve — the same true answer an unpushed branch gets —
+    /// and the console renders it as a panel that says so rather than as a fault.
+    async fn run_diff(&self, _run_id: i64) -> DiffOutcome {
+        DiffOutcome::Unavailable("this daemon cannot read a diff")
+    }
 }
 
 /// Why a candidate config would not load (the `Err` of [`StateProvider::validate_config`]). The
@@ -555,6 +570,10 @@ where
             "/api/v1/runs/{id}/mergeability",
             any(handle_run_mergeability),
         )
+        // The console's Diff tab (STUDIO-749): the diff a run produced on its branch. GET-only and
+        // more-specific than runs/{id}. It takes no body — the coordinate is derived from the run
+        // row — and it reaches no merge path; `handlers_rundiff` pins both.
+        .route("/api/v1/runs/{id}/diff", any(handle_run_diff))
         // Daemon-mediated review handoff (TRA-242): move a live run's ticket to the review state so it
         // leaves the active set and the run cleanly ends. POST-only; more-specific than runs/{id}.
         .route("/api/v1/runs/{id}/handoff", any(handle_run_handoff))

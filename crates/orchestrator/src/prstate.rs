@@ -396,11 +396,18 @@ mod tests {
     /// on neither list because it makes no `gh` call. Its caller is a `ControlHandle` method
     /// running on the HTTP request's own task, so a stalled `gh pr merge` parks that request and
     /// leaves the control task ticking.
+    /// `rundiff.rs` (STUDIO-749) is the console Diff tab's off-loop half, and it takes
+    /// `runmerge.rs`'s argument one step further: it holds no `Orchestrator` either, AND it has no
+    /// loop-side half at all — a diff read takes no single-flight claim, gates on no live loop
+    /// state and records nothing, so its `ControlHandle` method reads the run row straight off the
+    /// handle's own store and the control task is never involved. A stalled `gh pr diff` parks the
+    /// one HTTP request that asked for it.
     const OFF_LOOP_CALLERS: &[&str] = &[
         "prstate.rs",
         "ghsummons.rs",
         "reviewwatch.rs",
         "runmerge.rs",
+        "rundiff.rs",
     ];
 
     /// The control task's own modules, named so that widening [`OFF_LOOP_CALLERS`] to include one

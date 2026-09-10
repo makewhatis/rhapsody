@@ -801,6 +801,47 @@ on a read the refusal is the answer; only a question that could not be answered 
 (500 `mergeability_unavailable`), and the console keeps Merge live on that, since a `gh` it could
 not reach is not the daemon saying no.
 
+### The console shows the diff a run produced — `GET /api/v1/runs/{id}/diff` (STUDIO-749)
+
+The run-detail redesign's Diff tab was **dependency-named**: it said a run-branch unified diff
+needed a daemon endpoint nobody had written and deep-linked to the pull request instead, rather
+than reconstructing a diff from a transcript. This route is that endpoint. It answers what a run
+changed on its branch, plus the pull request it changed it on.
+
+| Reading a run's diff | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| the diff a run produced | — (no console run-detail at all) | the pull request's unified diff, bounded at 512 KiB and flagged when cut |
+| what is run | — | `gh pr list` for the branch's open pull request, `gh pr view` for its head SHA, its `mergeStateStatus` and its status-check rollup, then `gh pr diff --color never` |
+| GitHub writes | — | none |
+
+**The diff comes from the pull request, not from a worktree.** A finished run's worktree is removed
+when its ticket goes terminal, so a worktree-based read would answer nothing for exactly the runs an
+operator wants to read; and GitHub's pull-request diff is the three-dot `base...head` diff, which is
+"what this run produced" in the only sense that survives `main` moving underneath it.
+
+**The coordinate is derived, never supplied.** The route takes no body — the repository comes from
+the run row (written from the project's configured remote, never from an agent), the branch is
+derived from the run's ticket, and the pull-request number is resolved from GitHub by head branch,
+which rejects a fork's pull request. Same shape as the merge action's guardrail G1, for the same
+reason: no `gh` call the console can trigger should take its coordinate from something a caller
+wrote.
+
+**It refuses nothing, and it cannot merge.** Every gate on `POST …/merge` exists because a merge is
+irreversible; reading a diff is not, so an already-merged pull request, one under review, or one
+whose reviewer asked for changes all still have a diff worth reading and none of those gates is
+copied. Its dependencies are five `gh` READ seams with no merge seam among them, so nothing in its
+call graph can act on the pull request it resolves — asserted on the module's own source. It serves
+no mergeability **verdict** either: `GET …/mergeability` already does, from the daemon's one shared
+resolution, so what rides here is GitHub's own `merge_state` — a fact, not a second judgement that
+could disagree with the first.
+
+**Unlike the merge routes it is not gated on Teams.** Teams gates Rhapsody-additive *write*
+surfaces — a merge needs a manager to act as and a room to report in. This writes nothing, decides
+nothing and reports nowhere. "Nothing to show" (no open pull request on the branch, a remote that is
+not on GitHub, a head repository that is not this one) answers **200** with
+`{"available": false, "reason": …}`, because on a read that is the answer; only a question that
+could not be answered at all is an error (500 `diff_unavailable`).
+
 ### GitHub-summons enrichment is bounded and cannot starve dispatch (STUDIO-811)
 
 Go's `pollAllProjects` interleaves the summons fetch into the candidate loop: two `gh` calls per

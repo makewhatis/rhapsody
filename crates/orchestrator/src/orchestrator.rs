@@ -382,6 +382,16 @@ pub struct Orchestrator {
     /// task, which makes no network call. `None` ⇒ no merge path exists at all, and the endpoint
     /// answers `teams_disabled`.
     pub merge_deps: Option<std::sync::Arc<crate::runmerge::MergeDeps>>,
+    /// The `gh` seams the console's Diff tab reads through (STUDIO-749), snapshotted onto
+    /// [`crate::ControlHandle`] by [`Orchestrator::control`].
+    ///
+    /// **Not gated on Teams**, unlike [`Self::merge_deps`] beside it, and the contrast is the
+    /// point. Teams gates Rhapsody-additive WRITE surfaces — a merge needs a manager to act as and
+    /// a room to report in. A diff read writes nothing, decides nothing and reports nowhere; it
+    /// answers a question about a run this daemon already serves the transcript of, from a
+    /// coordinate it derived itself. Gating it would make the console's Diff tab dependency-named
+    /// on a daemon that can perfectly well answer it.
+    pub diff_deps: Option<std::sync::Arc<crate::rundiff::DiffDeps>>,
     /// The Rhapsody Teams **room** the dispatch path catches up from (STUDIO-650, T5; design
     /// record §0.5, §0.11.4). `None` whenever there is no room to read: Teams off, or no on-disk
     /// runtime home to anchor `~/.rhapsody/teams/room/` to.
@@ -719,6 +729,7 @@ impl Orchestrator {
             teams_prefetch: None,
             teams_triage: None,
             merge_deps: None,
+            diff_deps: None,
             teams_room: None,
             teams_cursors: None,
             issue_states: HashMap::new(),
