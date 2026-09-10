@@ -1085,7 +1085,7 @@ mod tests {
         };
         let mut iss = issue("1", "MT-1", "In Progress");
         iss.title = "Review: MT-2 page the Jobs list".into();
-        iss.description = Some(crate::quorum::review_description(&req, "alice"));
+        iss.description = Some(crate::quorum::review_description(&req, "alice", ""));
         iss.labels = Some(vec![
             "rhapsody:@alice".into(),
             crate::quorum::REVIEW_TICKET_LABEL.into(),

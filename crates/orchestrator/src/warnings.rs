@@ -52,6 +52,14 @@ pub(crate) const FETCH_FAILURE_WARN_AFTER: u32 = 3;
 /// which is also what makes the advisory stable on the console instead of flapping between rows.
 pub(crate) const ENRICH_DEFERRED_WARN_AFTER: u32 = 3;
 
+/// How many ABANDONED review fan-outs one project group keeps in its advisory (STUDIO-822). The
+/// most recent this many; an older one is dropped to make room.
+///
+/// Bounded because the list is never cleared automatically and a daemon that cannot reach Linear
+/// for an hour would otherwise grow one entry per handoff. Five is enough for an operator to see
+/// that it is happening repeatedly, which is the only thing more than one entry tells them.
+pub(crate) const LOST_REVIEW_WARN_CAP: usize = 5;
+
 /// The per-project snapshot the warning resolver works from, captured on the control task (from
 /// `eff.projects`) BEFORE the async resolver runs, so the resolver never reads loop-owned state
 /// off-loop. Mirrors Go `projectWarnInput`.
@@ -81,7 +89,7 @@ pub(crate) type PromptFileChecker = Box<dyn Fn(String, String) -> CheckFut + Sen
 /// `warningsGen` / `fileWarningsGen`). Held behind [`Arc`] so the resolver tasks store into it while
 /// the control task reads it.
 #[derive(Default)]
-pub(crate) struct WarningsState {
+pub struct WarningsState {
     /// Both maps under one lock (Go's single `warningsMu` guarding both). `slug` is INF-277, `file`
     /// is INF-279.
     maps: RwLock<WarningMaps>,
@@ -106,6 +114,27 @@ struct WarningMaps {
     /// for want of the poll path's per-tick enrichment budget. Recorded directly by the poll loop,
     /// exactly as `fetch` is, and for the same reason it carries no generation guard.
     enrich: HashMap<String, EnrichDeferred>,
+    /// Producer 5 (STUDIO-822) — the review fan-outs this daemon ATTEMPTED, retried and finally
+    /// gave up on, per project group. Recorded directly by the off-loop quorum task, so it carries
+    /// no generation guard for `fetch`'s reason.
+    ///
+    /// **Never cleared by a later success**, unlike every other producer here, and that is the
+    /// point. The others describe a live condition that self-heals: a project whose candidate fetch
+    /// recovers is healthy again. This one describes an EVENT with a permanent consequence — a
+    /// review round that will never happen, on a pull request the two-gate merge policy will
+    /// nonetheless report as reviewed — and clearing it on the next unrelated handoff is exactly
+    /// how it stayed invisible. It is capped instead ([`LOST_REVIEW_WARN_CAP`]) and a restart
+    /// forgets it, which is the operator saying they have seen it.
+    lost_review: HashMap<String, Vec<LostReview>>,
+}
+
+/// One review fan-out this daemon gave up on (STUDIO-822).
+#[derive(Debug, Clone)]
+struct LostReview {
+    /// The PARENT ticket whose round has no reviewer — the thing an operator has to act on.
+    identifier: String,
+    /// The last error, quoted into the advisory so the cause is visible without the log.
+    err: String,
 }
 
 /// One project's live candidate-fetch failure streak.
@@ -221,10 +250,31 @@ impl WarningsState {
         m.enrich.remove(group);
     }
 
+    /// Records a review fan-out this daemon retried to exhaustion and gave up on (STUDIO-822), so
+    /// the round that will never be reviewed is visible somewhere an operator looks instead of only
+    /// in a `WARN` line. Called from the off-loop quorum task.
+    ///
+    /// A LOCAL surface deliberately: the fan-out fails because the tracker is unreachable, so a
+    /// comment on the ticket — the other obvious place to put it — is the one write guaranteed to
+    /// fail for the same reason.
+    pub(crate) fn record_lost_review(&self, group: &str, identifier: &str, err: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        let e = m.lost_review.entry(group.to_string()).or_default();
+        e.push(LostReview {
+            identifier: identifier.to_string(),
+            err: err.to_string(),
+        });
+        // Oldest first out, so the advisory always names the most recent failures.
+        while e.len() > LOST_REVIEW_WARN_CAP {
+            e.remove(0);
+        }
+    }
+
     /// The merged warnings for a group (empty when none): missing-prompt-file flags first, then the
     /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406), then the
-    /// enrichment-deferred warning (STUDIO-811). A fresh slice so callers never alias the stored
-    /// maps. Mirrors Go `projectWarningsFor`, plus the two Rhapsody-only producers.
+    /// enrichment-deferred warning (STUDIO-811), then the abandoned review fan-outs (STUDIO-822).
+    /// A fresh slice so callers never alias the stored maps. Mirrors Go `projectWarningsFor`, plus
+    /// the Rhapsody-only producers.
     pub(crate) fn merged_for(&self, group: &str) -> Vec<String> {
         let m = self.maps.read().unwrap_or_else(|e| e.into_inner());
         let file = m.file.get(group);
@@ -252,6 +302,15 @@ impl WarningsState {
             out.push(format!(
                 "github-summons enrichment has not covered all {} repos needing enrichment within its per-tick budget for {} ticks in a row ({} deferred on the last) — dispatch is kept on time by deferring them, so a summons on a pull request may take several poll intervals to re-engage its ticket",
                 e.repos, e.streak, e.deferred
+            ));
+        }
+        // Appended after the enrichment producer, for the same golden-ordering reason (STUDIO-822).
+        // One line per abandoned fan-out rather than one summary line: the identifier is the whole
+        // actionable content, and collapsing them would name none of them.
+        for l in m.lost_review.get(group).into_iter().flatten() {
+            out.push(format!(
+                "the review fan-out for {} was abandoned after every retry failed (last error: {}) — that round has NO reviewer and nothing will ask again, so its pull request is unreviewed however the merge gate reads; request the review by hand",
+                l.identifier, l.err
             ));
         }
         out

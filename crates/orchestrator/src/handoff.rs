@@ -471,10 +471,13 @@ mod tests {
         let _ = task.await;
     }
 
-    // §0.12's "once per ticket": a re-handoff after review fixes fans out NOTHING, decided from the
-    // marker label the first fan-out wrote onto the parent.
+    // STUDIO-822 inverts §0.12's "once per ticket": a re-handoff after review fixes STILL sends a
+    // request, because the marker label says only "this ticket was reviewed once" and the rounds it
+    // used to refuse are exactly the rounds that exist because a reviewer found something. Whether
+    // anything is fanned OUT is now the off-loop task's per-head decision, which is the only place
+    // the head is known.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_parent_already_marked_requests_nothing() {
+    async fn a_parent_already_marked_still_requests_because_the_guard_is_per_head() {
         let tr = Arc::new(Fake::new());
         let mut parent = issue_with_pr("ID-1", "MT-1", "TEAM-1");
         parent.labels = Some(vec![crate::quorum::QUORUM_REQUESTED_LABEL.to_string()]);
@@ -492,10 +495,11 @@ mod tests {
             .await
             .expect("handoff_run");
         assert_eq!(res.moved_to, "In Review", "the handoff still succeeds");
-        assert!(
-            rx.try_recv().is_err(),
-            "a re-handoff of a marked parent fans out nothing"
+        let req = rx.try_recv().expect(
+            "the marker label must not refuse the request: it cannot carry a head, so it cannot \
+             tell a second round from a repeat of the first",
         );
+        assert_eq!(req.parent_identifier, "MT-1");
 
         signal.cancel();
         let _ = task.await;
@@ -653,31 +657,19 @@ mod tests {
         let _ = task.await;
     }
 
-    // The other three gates still refuse BEFORE the attachment question is reached, so an
-    // attachment-less ticket that fails one of them still costs no request at all: STUDIO-674
-    // widened exactly one gate and left the rest where they were.
+    // The gates that still refuse BEFORE the attachment question is reached, so an attachment-less
+    // ticket that fails one of them still costs no request at all: STUDIO-674 widened exactly one
+    // gate and left the rest where they were. The marker gate is no longer among them (STUDIO-822).
     #[tokio::test(flavor = "multi_thread")]
     async fn the_other_gates_still_refuse_an_attachment_less_ticket() {
-        for (why, teams, identity, mark) in [
-            (
-                "no identity ⇒ no quorum",
-                quorum_teams(&["alice", "bob", "carol"]),
-                "",
-                false,
-            ),
-            (
-                "already requested ⇒ no quorum",
-                quorum_teams(&["alice", "bob", "carol"]),
-                "alice",
-                true,
-            ),
-        ] {
+        for (why, teams, identity) in [(
+            "no identity ⇒ no quorum",
+            quorum_teams(&["alice", "bob", "carol"]),
+            "",
+        )] {
             let tr = Arc::new(Fake::new());
             let mut parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
             parent.title = "do the thing".into();
-            if mark {
-                parent.labels = Some(vec![crate::quorum::QUORUM_REQUESTED_LABEL.to_string()]);
-            }
             let snapshot = vec![parent.clone()];
             let (task, handle, mut rx, run_id, signal) =
                 quorum_harness(Arc::clone(&tr), teams, parent, identity, &snapshot);

@@ -212,11 +212,34 @@ fn default_run(args: &[&str]) -> RunResult {
     Ok(out.stdout)
 }
 
-/// The fallible result of an [`OpenPrSource`] query: the open PR's browser URL, `None` when the
+/// One open pull request, as [`OpenPrSource`] resolves it: the browser URL to review and the exact
+/// commit at its head.
+///
+/// `head_sha` is why this is a struct rather than the bare URL it used to be (STUDIO-822). The
+/// review quorum's "already reviewed" record is a property of a HEAD, not of a ticket — that is
+/// what [`crate::reviewwatch::review_round_due`] has always compared on the ticketless path — and
+/// neither the Linear GitHub attachment the URL used to come from nor the URL itself carries a
+/// commit. `gh pr list` already knows it (`headRefOid`), so it costs one more JSON field rather
+/// than a second call.
+///
+/// **Empty when GitHub answers without one, never an error.** A pull request that cannot be
+/// reviewed at all is a worse outcome than a review whose repeat-guard degrades to the
+/// per-pull-request granularity it had before, so the caller decides what an unknown head means
+/// rather than the lookup refusing on its behalf.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenPr {
+    /// The pull request's browser URL — what a reviewer is handed.
+    pub url: String,
+    /// `headRefOid`: the exact commit at the head of the pull request, or empty when GitHub did not
+    /// state one.
+    pub head_sha: String,
+}
+
+/// The fallible result of an [`OpenPrSource`] query: the open pull request, `None` when the
 /// branch has no open pull request, or an error when the lookup itself could not be made. The three
 /// cases are kept distinct because they mean different things to the quorum — "nothing to review",
 /// "nothing to review", and "we do not know" — and only the third is worth a warning.
-pub type OpenPrResult = Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+pub type OpenPrResult = Result<Option<OpenPr>, Box<dyn std::error::Error + Send + Sync>>;
 
 /// How many of a branch's open pull requests [`OpenPrSource::open_pr_for_branch`] inspects before
 /// giving up. Greater than one because the head filter matches on branch NAME across forks, so a
@@ -244,8 +267,11 @@ pub trait OpenPrSource: Send + Sync {
 #[async_trait]
 impl OpenPrSource for GH {
     /// One bounded `gh pr list --repo <owner>/<repo> --head <branch> --state open --json
-    /// url,headRepositoryOwner --limit <PR_LIST_LIMIT>`, answering the newest matching PR whose
-    /// head repository belongs to the account that was queried.
+    /// url,headRefOid,headRepositoryOwner --limit <PR_LIST_LIMIT>`, answering the newest matching
+    /// PR whose head repository belongs to the account that was queried.
+    ///
+    /// `headRefOid` is asked for beside the URL (STUDIO-822) and is the ONE field here that may
+    /// come back missing without disqualifying a candidate: see [`OpenPr::head_sha`].
     ///
     /// `--state open` is the whole unmerged/unclosed filter, so the caller needs no second check.
     /// An empty owner, repo or branch is not an error and not a query — there is simply nothing to
@@ -281,7 +307,7 @@ impl OpenPrSource for GH {
             "--state",
             "open",
             "--json",
-            "url,headRepositoryOwner",
+            "url,headRefOid,headRepositoryOwner",
             "--limit",
             PR_LIST_LIMIT,
         ];
@@ -302,9 +328,16 @@ impl OpenPrSource for GH {
                 .get("headRepositoryOwner")
                 .and_then(|o| o.get("login"))
                 .and_then(serde_json::Value::as_str)?;
-            head_owner
-                .eq_ignore_ascii_case(owner)
-                .then(|| url.to_string())
+            head_owner.eq_ignore_ascii_case(owner).then(|| OpenPr {
+                url: url.to_string(),
+                // Absent or null ⇒ empty, deliberately: an unknown head costs the caller its
+                // per-head granularity, while rejecting the candidate would cost the review.
+                head_sha: p
+                    .get("headRefOid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
         }))
     }
 }
@@ -1447,7 +1480,7 @@ mod tests {
 
     /// One open PR on the branch, opened from the queried repository itself.
     const PR_LIST_OWN: &str = r#"[{"url":"https://github.com/o/r/pull/64",
-        "headRepositoryOwner":{"login":"o"}}]"#;
+        "headRefOid":"6f1c0d5a","headRepositoryOwner":{"login":"o"}}]"#;
 
     /// A runner that records the argv it was handed and answers with `body`.
     fn run_recording(body: &'static str, seen: Arc<Mutex<Vec<String>>>) -> RunFn {
@@ -1463,7 +1496,7 @@ mod tests {
     // browser URL is read out of it. The argv is asserted in full because it IS the contract with
     // GitHub — a dropped `--state open` would hand a reviewer a merged PR.
     #[tokio::test]
-    async fn open_pr_for_branch_returns_the_open_prs_url() {
+    async fn open_pr_for_branch_returns_the_open_prs_url_and_head() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let src = GH::new(
             "@symphony",
@@ -1475,13 +1508,21 @@ mod tests {
             .await
             .expect("open_pr_for_branch");
 
-        assert_eq!(got.as_deref(), Some("https://github.com/o/r/pull/64"));
+        assert_eq!(
+            got,
+            Some(OpenPr {
+                url: "https://github.com/o/r/pull/64".to_string(),
+                // STUDIO-822: the head is read out beside the URL, because the quorum's
+                // repeat-guard compares heads and nothing else in its request carries one.
+                head_sha: "6f1c0d5a".to_string(),
+            })
+        );
         let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(
             calls,
             vec![
                 "pr list --repo o/r --head symphony/MT-1 --state open --json \
-                 url,headRepositoryOwner --limit 20"
+                 url,headRefOid,headRepositoryOwner --limit 20"
                     .to_string()
             ],
             "exactly one gh call, scoped to the repo and the head branch"
@@ -1600,9 +1641,9 @@ mod tests {
             "@symphony",
             Some(run_recording(
                 r#"[{"url":"https://github.com/stranger/r/pull/9",
-                     "headRepositoryOwner":{"login":"stranger"}},
+                     "headRefOid":"deadbeef","headRepositoryOwner":{"login":"stranger"}},
                     {"url":"https://github.com/o/r/pull/64",
-                     "headRepositoryOwner":{"login":"o"}}]"#,
+                     "headRefOid":"6f1c0d5a","headRepositoryOwner":{"login":"o"}}]"#,
                 Arc::clone(&seen),
             )),
         );
@@ -1610,8 +1651,8 @@ mod tests {
             src.open_pr_for_branch("o", "r", "symphony/MT-1")
                 .await
                 .expect("open_pr_for_branch")
-                .as_deref(),
-            Some("https://github.com/o/r/pull/64"),
+                .map(|p| p.url),
+            Some("https://github.com/o/r/pull/64".to_string()),
             "a newer fork PR must not hide the repository's own"
         );
     }
@@ -1645,7 +1686,7 @@ mod tests {
             "@symphony",
             Some(run_recording(
                 r#"[{"url":"https://github.com/MakeWhatIs/r/pull/64",
-                     "headRepositoryOwner":{"login":"MakeWhatIs"}}]"#,
+                     "headRefOid":"6f1c0d5a","headRepositoryOwner":{"login":"MakeWhatIs"}}]"#,
                 Arc::clone(&seen),
             )),
         );
@@ -1653,8 +1694,33 @@ mod tests {
             src.open_pr_for_branch("makewhatis", "r", "symphony/MT-1")
                 .await
                 .expect("open_pr_for_branch")
-                .as_deref(),
-            Some("https://github.com/MakeWhatIs/r/pull/64")
+                .map(|p| p.url),
+            Some("https://github.com/MakeWhatIs/r/pull/64".to_string())
+        );
+    }
+
+    // A pull request GitHub answers without a `headRefOid` is still returned — the quorum's
+    // repeat-guard degrades to the per-pull-request granularity it had before, which is a far
+    // cheaper failure than handing back no pull request at all (STUDIO-822).
+    #[tokio::test]
+    async fn open_pr_for_branch_tolerates_a_missing_head_ref_oid() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"[{"url":"https://github.com/o/r/pull/64",
+                     "headRepositoryOwner":{"login":"o"}}]"#,
+                Arc::clone(&seen),
+            )),
+        );
+        assert_eq!(
+            src.open_pr_for_branch("o", "r", "symphony/MT-1")
+                .await
+                .expect("open_pr_for_branch"),
+            Some(OpenPr {
+                url: "https://github.com/o/r/pull/64".to_string(),
+                head_sha: String::new(),
+            })
         );
     }
 

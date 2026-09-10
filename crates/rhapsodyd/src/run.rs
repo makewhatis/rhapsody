@@ -233,6 +233,10 @@ where
     // quorum is on: with `quorum.enabled: false` (the default) `o.quorum_tx` stays `None`, so a
     // handoff cannot even represent a fan-out. §0.12's cost control, enforced by construction.
     let quorum_rx = spawn_quorum(&teams_cfg).then(|| o.open_quorum_channel());
+    // Captured here because `o.control()` below consumes the orchestrator: the quorum task records
+    // a fan-out it gave up on against the owning project's advisories, which is the surface an
+    // operator reads (STUDIO-822).
+    let quorum_warnings = o.warnings_state();
 
     // --- ticketless review introduction (STUDIO-720, slice 6; design record
     // ~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md §14.1 F-SEC, §15-a) ---
@@ -646,6 +650,10 @@ where
                 None,
             ))),
             max_backoff_ms: rhapsody_orchestrator::MAX_QUORUM_BACKOFF_MS,
+            // STUDIO-822: where a fan-out retried to exhaustion is recorded. A LOCAL surface,
+            // deliberately — the fan-out fails because the tracker is unreachable, so a comment on
+            // the ticket is the one write guaranteed to fail for the same reason.
+            warnings: Some(quorum_warnings),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::run_quorum_task(quorum_ctx, deps, rx).await;
