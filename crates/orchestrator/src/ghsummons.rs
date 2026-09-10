@@ -838,6 +838,241 @@ impl BranchUpdateSource for GH {
     }
 }
 
+/// How much of a pull request's patch a diff read carries back (STUDIO-749).
+///
+/// A bound rather than a preference. `gh pr diff` will happily print a hundred megabytes for a
+/// vendored-dependency pull request, and every byte of it would be held in this process, encoded
+/// into a JSON response, and then parsed and rendered line by line by a browser — so an unbounded
+/// read turns one operator opening a tab into a daemon-sized allocation. 512 KiB is far past any
+/// diff a person reads and far short of anything that hurts.
+///
+/// The cut is reported ([`PrDiff::truncated`]) rather than hidden, because a diff that silently
+/// stops is a diff an operator would read as complete.
+pub const MAX_DIFF_BYTES: usize = 512 << 10;
+
+/// A pull request's unified diff, and whether [`MAX_DIFF_BYTES`] cut it short.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrDiff {
+    /// The unified diff exactly as `gh` printed it — `diff --git` headers, `@@` hunks and all.
+    pub patch: String,
+    /// Whether the patch above is only the head of the real one.
+    pub truncated: bool,
+}
+
+/// The fallible result of a [`PrDiffSource`] read.
+pub type PrDiffResult = Result<PrDiff, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Reads the unified diff of a pull request named by NUMBER (STUDIO-749; design record
+/// `~/.rhapsody/docs/console-run-detail-design.md` §5, §9 slice 7).
+///
+/// **No Go counterpart** — the console's Diff tab is a Rhapsody addition, and this is the one
+/// genuinely-new `gh` read the whole Trace plan asked for. It answers the question none of the
+/// other seams in this module can: [`OpenPrSource`] gives a URL, [`PrStateSource`] a head SHA and
+/// a state, [`MergeStateSource`] a word — none of them the change itself.
+///
+/// The diff is read from the PULL REQUEST rather than from the run's worktree on purpose. A
+/// finished run's worktree is removed (the daemon calls `remove_worktree` when its ticket goes
+/// terminal), so a worktree-based read would answer nothing for exactly the runs an operator wants
+/// to read; and GitHub's pull-request diff is the three-dot `base...head` diff, which is "what
+/// this run produced" in the only sense that survives `main` moving underneath it.
+///
+/// It is a READ and it writes nothing, so it is a separate trait from [`MergeSource`] for that
+/// trait's own reason, read the other way round: a task holding this one is visibly not the merge
+/// path.
+///
+/// Object-safe (held as `dyn PrDiffSource` by the off-loop diff path), so it is declared via
+/// `async_trait`.
+#[async_trait]
+pub trait PrDiffSource: Send + Sync {
+    async fn pr_diff(&self, owner: &str, repo: &str, number: i64) -> PrDiffResult;
+}
+
+#[async_trait]
+impl PrDiffSource for GH {
+    /// One bounded `gh pr diff <number> --repo <owner>/<repo> --color never`.
+    ///
+    /// `--color never` is pinned in the argv rather than left to `gh`'s tty detection. `gh`
+    /// colorizes when it thinks it is talking to a terminal, and the daemon's runner is a
+    /// [`RunFn`] whose real implementation is whatever the operator's environment makes of it — a
+    /// `CLICOLOR_FORCE` in the daemon's env would be enough. ANSI escapes crossing into a JSON
+    /// response and then into a browser is not a rendering nuisance, it is the console showing
+    /// control characters as content, so the flag is asserted by
+    /// `pr_diff_asks_gh_for_an_uncolored_diff`.
+    ///
+    /// An incomplete coordinate is an ERROR rather than a quiet empty diff, following
+    /// [`MergeStateSource::merge_state`]: this seam is reached only once the coordinate has been
+    /// derived from the run row and resolved against GitHub, so half a coordinate is a caller bug
+    /// and an empty patch would read as "this run changed nothing".
+    ///
+    /// The patch is cut at [`MAX_DIFF_BYTES`], and the cut lands on a LINE boundary. A unified
+    /// diff is parsed line by line by whatever renders it, so ending mid-line would hand the
+    /// console half a `@@` header to classify — the one place a bound could turn into a wrong
+    /// answer rather than a short one.
+    async fn pr_diff(&self, owner: &str, repo: &str, number: i64) -> PrDiffResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Err(
+                format!("gh pr diff: incomplete coordinate {owner}/{repo}#{number}").into(),
+            );
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let args = [
+            "pr",
+            "diff",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--color",
+            "never",
+        ];
+        let out = self
+            .run_off_task(args.iter().map(|a| (*a).to_string()).collect())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr diff {num} --repo {slug}: {e}").into()
+            })?;
+        // Lossy rather than strict: a diff carries whatever bytes the touched files carry, and a
+        // patch with one invalid sequence in it is still the change an operator wants to read.
+        let text = String::from_utf8_lossy(&out);
+        if text.len() <= MAX_DIFF_BYTES {
+            return Ok(PrDiff {
+                patch: text.into_owned(),
+                truncated: false,
+            });
+        }
+        // Back off to a char boundary first (the cap is a byte count and `text` is UTF-8), then
+        // back off again to the end of the last WHOLE line inside it. A patch with no newline at
+        // all in its first half-megabyte is not a diff anybody reads, and it degrades to the char
+        // boundary rather than to nothing.
+        let mut end = MAX_DIFF_BYTES;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let cut = text[..end].rfind('\n').map_or(end, |i| i + 1);
+        Ok(PrDiff {
+            patch: text[..cut].to_string(),
+            truncated: true,
+        })
+    }
+}
+
+/// One entry of a pull request's status-check rollup: what ran, and how it went.
+///
+/// Two fields, because two is what an operator reads off a checks row and everything else GitHub
+/// carries (started_at, the app that owns it, the run's URL) is a second surface's problem. Both
+/// are GitHub's own strings — this daemon classifies neither, for [`MergeStateResult`]'s reason:
+/// the vocabulary is GitHub's, it has grown before, and a check state this console has never heard
+/// of is exactly the one worth showing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CheckRun {
+    /// The check's name as GitHub reports it — `name` for a check run, `context` for the older
+    /// status contexts.
+    pub name: String,
+    /// The check's verdict, upper-cased: `SUCCESS`, `FAILURE`, `IN_PROGRESS`, `PENDING`, … Empty
+    /// when GitHub stated none.
+    pub state: String,
+}
+
+/// The fallible result of a [`PrChecksSource`] read.
+pub type PrChecksResult = Result<Vec<CheckRun>, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Reads a pull request's status-check rollup (STUDIO-749).
+///
+/// **No Go counterpart.** It exists because the design record's slice 7 asks the diff surface to
+/// carry "PR number / checks / mergeability where resolvable", and checks were the one of those
+/// three no seam in this module answered. Mergeability is NOT re-derived here: the daemon already
+/// serves its verdict on its own route, and a second implementation of the same judgement is the
+/// defect [`crate::runmerge`]'s shared `resolve_pull_request` exists to prevent.
+///
+/// Object-safe, so it is declared via `async_trait`.
+#[async_trait]
+pub trait PrChecksSource: Send + Sync {
+    async fn pr_checks(&self, owner: &str, repo: &str, number: i64) -> PrChecksResult;
+}
+
+#[async_trait]
+impl PrChecksSource for GH {
+    /// One bounded `gh pr view <number> --repo <owner>/<repo> --json statusCheckRollup`.
+    ///
+    /// The rollup is heterogeneous — modern `CheckRun` entries carry `name` + `status` +
+    /// `conclusion`, older `StatusContext` entries carry `context` + `state` — so this reads the
+    /// fields it wants wherever they are rather than branching on `__typename`. That is
+    /// deliberately tolerant: a third shape GitHub adds later still yields a name and a state if
+    /// it spells them the way the first two do, and yields nothing rather than an error if it does
+    /// not.
+    ///
+    /// A check with no name at all is DROPPED, because a nameless row tells an operator nothing
+    /// and cannot be looked up. A missing or absent rollup is an EMPTY list and not an error:
+    /// GitHub answers `null` for a pull request with no checks configured, which is a true answer.
+    ///
+    /// An incomplete coordinate is an error, for [`PrDiffSource::pr_diff`]'s reason.
+    async fn pr_checks(&self, owner: &str, repo: &str, number: i64) -> PrChecksResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Err(
+                format!("gh pr view: incomplete coordinate {owner}/{repo}#{number}").into(),
+            );
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let args = [
+            "pr",
+            "view",
+            num.as_str(),
+            "--repo",
+            slug.as_str(),
+            "--json",
+            "statusCheckRollup",
+        ];
+        let body = self
+            .run_off_task(args.iter().map(|a| (*a).to_string()).collect())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr view {num} --repo {slug}: {e}").into()
+            })?;
+        let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr view {num} --repo {slug}: {e}").into()
+            },
+        )?;
+        let Some(rollup) = pr
+            .get("statusCheckRollup")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(rollup
+            .iter()
+            .filter_map(|c| {
+                let name = str_field(c, "name")
+                    .or_else(|| str_field(c, "context"))
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    return None;
+                }
+                // `conclusion` first: a completed check run carries BOTH, and `status` would say
+                // `COMPLETED` for a failure. `state` is the status-context spelling of the same
+                // thing.
+                let state = str_field(c, "conclusion")
+                    .or_else(|| str_field(c, "status"))
+                    .or_else(|| str_field(c, "state"))
+                    .unwrap_or_default();
+                Some(CheckRun {
+                    name,
+                    state: state.to_ascii_uppercase(),
+                })
+            })
+            .collect())
+    }
+}
+
+/// A trimmed non-empty string field of a JSON object, or `None`. Written once because
+/// [`PrChecksSource::pr_checks`] reads five differently-spelled fields and an empty string must
+/// fall through to the next spelling rather than win.
+fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
+    let s = v.get(key).and_then(serde_json::Value::as_str)?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
 /// Where a pull request stands, as GitHub's GraphQL `PullRequestState` reports it. Three values,
 /// not two: the watcher retires a MERGED pull request and a CLOSED one for different reasons and
 /// records them differently, and `mergedAt` alone cannot be trusted to tell them apart.
@@ -2452,6 +2687,190 @@ mod tests {
             elapsed < std::time::Duration::from_millis(300),
             "the caller must be released at its own deadline, waited {elapsed:?}"
         );
+    }
+
+    // --- PrDiffSource / PrChecksSource (STUDIO-749) ------------------------------------------
+
+    /// The argv IS the contract, and `--color never` is the load-bearing half of it: `gh`
+    /// colorizes on a tty, and ANSI escapes in this answer would reach a browser as content.
+    #[tokio::test]
+    async fn pr_diff_asks_gh_for_an_uncolored_diff() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                "diff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-a\n+b\n",
+                Arc::clone(&seen),
+            )),
+        );
+
+        let got = src.pr_diff("o", "r", 64).await.expect("diff");
+
+        assert_eq!(got.patch, "diff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-a\n+b\n");
+        assert!(!got.truncated);
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr diff 64 --repo o/r --color never".to_string()],
+            "exactly one gh call, and exactly these arguments"
+        );
+    }
+
+    /// A patch past the cap is CUT rather than refused, the cut is reported, and it lands on a
+    /// line boundary — the console classifies this text line by line, so half a `@@` header would
+    /// be a wrong answer where a short one is merely a short one.
+    #[tokio::test]
+    async fn pr_diff_truncates_on_a_whole_line_and_says_so() {
+        // Each line is 64 bytes, so the cap lands well inside the body rather than at its end.
+        let line = format!("+{}\n", "x".repeat(62));
+        let huge: String = line.repeat(MAX_DIFF_BYTES / line.len() + 64);
+        let huge: &'static str = Box::leak(huge.into_boxed_str());
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(huge, Arc::new(Mutex::new(Vec::new())))),
+        );
+
+        let got = src.pr_diff("o", "r", 64).await.expect("diff");
+
+        assert!(got.truncated, "the cut must be reported");
+        assert!(got.patch.len() <= MAX_DIFF_BYTES, "{}", got.patch.len());
+        assert!(
+            got.patch.ends_with('\n'),
+            "the cut must land after a whole line, not inside one"
+        );
+        assert!(
+            got.patch.lines().all(|l| l.len() == 63),
+            "no line may be cut in half"
+        );
+    }
+
+    /// A patch whose bytes are not valid UTF-8 is still the change an operator wants to read, so
+    /// it is decoded lossily rather than refused — and the cap's char-boundary back-off must not
+    /// panic on it.
+    #[tokio::test]
+    async fn pr_diff_decodes_a_patch_lossily() {
+        let src = GH::new(
+            "@symphony",
+            Some(Box::new(|_: &[&str]| Ok(b"+\xff\xfe\n".to_vec()))),
+        );
+        let got = src.pr_diff("o", "r", 1).await.expect("diff");
+        assert!(got.patch.starts_with('+'), "{:?}", got.patch);
+        assert!(!got.truncated);
+    }
+
+    /// An incomplete coordinate spawns no process and is an error — [`MergeStateSource`]'s rule:
+    /// this seam is reached only past resolution, so half a coordinate is a caller bug, and an
+    /// empty patch would read as "this run changed nothing".
+    #[tokio::test]
+    async fn pr_diff_refuses_an_incomplete_coordinate_without_asking_github() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0), ("o", "r", -3)] {
+            assert!(
+                src.pr_diff(owner, repo, n).await.is_err(),
+                "{owner}/{repo}#{n} should be refused"
+            );
+        }
+        assert!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "no gh process should have been spawned"
+        );
+    }
+
+    /// The rollup is heterogeneous, and both of GitHub's spellings are read: a `CheckRun` names
+    /// itself with `name` and reports `conclusion`, an older `StatusContext` uses `context` and
+    /// `state`. `conclusion` must win over `status`, or every failed check would read `COMPLETED`.
+    #[tokio::test]
+    async fn pr_checks_reads_both_of_githubs_rollup_shapes() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                r#"{"statusCheckRollup":[
+                    {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"failure"},
+                    {"__typename":"CheckRun","name":"web","status":"in_progress","conclusion":null},
+                    {"__typename":"StatusContext","context":"ci/legacy","state":"success"}
+                ]}"#,
+                Arc::clone(&seen),
+            )),
+        );
+
+        let got = src.pr_checks("o", "r", 64).await.expect("checks");
+
+        assert_eq!(
+            got,
+            vec![
+                CheckRun {
+                    name: "test".to_string(),
+                    state: "FAILURE".to_string()
+                },
+                CheckRun {
+                    name: "web".to_string(),
+                    state: "IN_PROGRESS".to_string()
+                },
+                CheckRun {
+                    name: "ci/legacy".to_string(),
+                    state: "SUCCESS".to_string()
+                },
+            ]
+        );
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr view 64 --repo o/r --json statusCheckRollup".to_string()],
+            "exactly one gh call, and exactly these arguments"
+        );
+    }
+
+    /// A pull request with no checks configured answers `null`, and that is a TRUE answer rather
+    /// than a failure. A nameless entry is dropped, because a row an operator cannot read or look
+    /// up is worse than no row.
+    #[tokio::test]
+    async fn pr_checks_treats_an_absent_rollup_as_no_checks() {
+        for body in [
+            "{}",
+            r#"{"statusCheckRollup":null}"#,
+            r#"{"statusCheckRollup":[]}"#,
+            r#"{"statusCheckRollup":[{"state":"SUCCESS"},{"name":"  ","state":"SUCCESS"}]}"#,
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert_eq!(
+                src.pr_checks("o", "r", 1).await.expect("checks"),
+                Vec::new(),
+                "body {body}"
+            );
+        }
+    }
+
+    /// A `gh` that failed, or answered something that is not JSON, is an ERROR carrying its own
+    /// words — never an empty checks list, which the console would render as "nothing ran".
+    #[tokio::test]
+    async fn pr_checks_reports_a_failed_lookup_rather_than_an_empty_list() {
+        let src = GH::new(
+            "@symphony",
+            Some(Box::new(|_: &[&str]| Err("HTTP 502".into()))),
+        );
+        let err = src.pr_checks("o", "r", 1).await.expect_err("an error");
+        assert!(err.to_string().contains("HTTP 502"), "{err}");
+
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording("not json", Arc::new(Mutex::new(Vec::new())))),
+        );
+        assert!(src.pr_checks("o", "r", 1).await.is_err());
+    }
+
+    /// The read seams spawn nothing at an impossible coordinate — the same rule, asserted for
+    /// checks too so neither drifts.
+    #[tokio::test]
+    async fn pr_checks_refuses_an_incomplete_coordinate_without_asking_github() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0)] {
+            assert!(src.pr_checks(owner, repo, n).await.is_err());
+        }
+        assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
 
     /// STUDIO-829: every `gh` exec in this module reaches the subprocess through

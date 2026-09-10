@@ -68,6 +68,7 @@ pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewprompt;
 pub mod reviewwatch;
+pub mod rundiff;
 pub mod runmerge;
 pub mod select;
 pub mod snapshot;
