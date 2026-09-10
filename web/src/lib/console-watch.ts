@@ -29,13 +29,23 @@ export interface WatchTab {
 }
 
 /**
- * The rail. `Diff` is the one tab whose whole surface is a dependency — §5 defers the run-branch
- * diff endpoint to slice 7. `Review` is not marked, because its reviewer and status ARE served
- * (`GET /api/v1/reviews`); only the findings themselves live on the pull request, which the panel
- * says in its own words rather than by disowning the tab.
+ * The rail. **No tab is a dependency any more** (STUDIO-749).
+ *
+ * `Diff` was the one that was: §5 deferred the run-branch diff endpoint to slice 7, so the tab
+ * disowned itself before it was ever opened. Slice 7 built it (`GET /api/v1/runs/{id}/diff`), so
+ * the mark comes off — leaving it would tell an operator a served surface is missing.
+ *
+ * The flag STAYS on the type rather than being deleted with its last user, because what it means
+ * is still true of this rail: a tab whose whole surface waits on something the daemon does not
+ * serve should say so before it is opened, and the next such tab should not have to re-argue it.
+ * `Review` is still not marked, for the reason it never was — its reviewer and status ARE served
+ * (`GET /api/v1/reviews`) and only the findings live on the pull request, which its panel says in
+ * its own words rather than by disowning the tab. The Diff panel now says the same kind of thing
+ * the same way: when the daemon resolves no pull request it renders the daemon's own sentence,
+ * which is a statement about THIS run rather than about the console's reach.
  */
 export const WATCH_TABS: readonly WatchTab[] = [
-  { id: "diff", label: "Diff", dependency: true },
+  { id: "diff", label: "Diff", dependency: false },
   { id: "review", label: "Review", dependency: false },
   { id: "room", label: "Room", dependency: false },
   { id: "memory", label: "Memory", dependency: false },

@@ -38,10 +38,12 @@ import {
   useStopRun,
 } from "@/hooks/useRunActions";
 import { useReviews } from "@/hooks/useReviews";
+import { useRunDiff } from "@/hooks/useRunDiff";
 import { usePostToRoom, useTeamsEnabled, useTeamsOverview, useTeamsRoom } from "@/hooks/useTeams";
 import { useTicketFacts } from "@/hooks/useTicketFacts";
 import { ticketAssignees } from "@/lib/console-jobs";
 import { clockTime, runOutcomeLabel, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
+import { checksSummary, diffFiles, diffStat } from "@/lib/console-diff";
 import { mergeStateNote } from "@/lib/console-merge";
 import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
@@ -1788,21 +1790,129 @@ function TeamsPanel({
 }
 
 /**
- * The Diff tab — a dependency, and deliberately nothing else (design record §5, §9 slice 7).
+ * The Diff tab — the change a run produced on its branch (STUDIO-749; design record §5, §9 slice
+ * 7).
  *
- * No endpoint serves a run-branch unified diff, so there is no diff to show and none is invented:
- * the panel names the dependency and deep-links to where the change actually is. The link is the
- * same head-branch SEARCH the header's "View PR" uses, so it can never point at a pull request the
- * console guessed at.
+ * §5 deferred this as "the one real new endpoint", and until it existed the panel named its
+ * dependency and deep-linked to the pull request rather than reconstructing a diff from a
+ * transcript. `GET /api/v1/runs/{id}/diff` now serves one, so the panel renders it.
+ *
+ * **Three states, and they are deliberately three rather than two.** A diff the daemon SERVED, a
+ * daemon that says there is nothing to show (an unpushed branch, a merged-and-closed pull request,
+ * a non-GitHub remote — the ordinary life of a ticket, so it keeps the dependency card's calm
+ * treatment and adds the deep link, exactly as before), and a daemon that could not be ASKED. The
+ * third must not read as the second: "there is no diff" is a statement about the run, and "GitHub
+ * would not answer" is not.
+ *
+ * The console derives none of the reasons. `reason` is the daemon's own sentence, verbatim — the
+ * discipline the header's Merge already follows (STUDIO-790).
+ *
+ * **On the merge-state note.** `mergeStateNote`'s own doc warns against putting this sentence
+ * beside the header's Merge, because there it is a second reading of a question the daemon already
+ * answered on that control and the two contradicted each other on `DIRTY`. It is safe HERE for the
+ * reason that warning names: there is no Merge control in this zone for it to contradict. What it
+ * annotates is the pull request the operator is reading a diff of — GitHub's own state of it — and
+ * `merge_state` arrives as a raw `mergeStateStatus` rather than as a verdict the daemon reached,
+ * so it cannot disagree with one. The wording goes through the shared helper rather than being
+ * written again here, so the console has one sentence per GitHub state and not two.
  */
 function DiffPanel({ run }: { run: RunSummary }) {
+  const read = useRunDiff(run.id);
+  const answer = read.data;
+  const files = useMemo(
+    () => (answer?.available ? diffFiles(answer.diff.patch) : []),
+    [answer],
+  );
+
+  if (read.isPending) {
+    return <div className="empty">Reading this run's diff…</div>;
+  }
+  // A question nobody could answer. Kept apart from "nothing to show" and given the daemon's own
+  // complaint, because only the latter is the daemon reporting on this run.
+  if (read.isError || !answer) {
+    return (
+      <div className="trdep">
+        <b>The diff could not be read.</b> The daemon could not be asked what this run changed
+        {read.error ? `: ${read.error.message}` : ""}. That is not the same as this run having
+        changed nothing — reopening this tab asks again.
+      </div>
+    );
+  }
+  if (!answer.available) {
+    return <NoDiff run={run} reason={answer.reason} />;
+  }
+
+  const { diff } = answer;
+  const stat = diffStat(files);
+  const checks = checksSummary(diff.checks);
+  const state = mergeStateNote(diff.merge_state);
+  return (
+    <>
+      {/* What this diff is OF, before the diff itself. A patch with no coordinate cannot be told
+          apart from the same files read a push later, which is what `head_sha` is here for. */}
+      <div className="trdiffhead">
+        <ExternalLink className="pr" href={diff.url}>
+          {diff.pr} ↗
+        </ExternalLink>
+        <Mono>{diff.head_sha.slice(0, 7)}</Mono>
+        <span className="stat">
+          {stat.files} {stat.files === 1 ? "file" : "files"}
+          {" · "}
+          <span className="add">+{stat.added}</span> <span className="del">−{stat.removed}</span>
+        </span>
+        {checks === "" ? null : <span className="checks">{checks}</span>}
+        {state === "" ? null : <span className="state">{state}</span>}
+      </div>
+      {/* Its OWN scroll container (§5's "colorized, scrolls in its own box"), so a thousand-line
+          diff does not push the rail, the spine and the result card off the screen — the defect
+          STUDIO-821 fixed one zone up, not reintroduced here. */}
+      <div className="trdiff">
+        {files.map((file, i) => (
+          <div className="file" key={`${file.path}-${i}`}>
+            {file.path === "" ? null : (
+              <div className="path">
+                <Mono>{file.path}</Mono>
+              </div>
+            )}
+            <pre className="hunks">
+              {file.lines.map((line, j) => (
+                // `\u00a0` on an otherwise-empty line: a `pre` collapses a zero-height row, which
+                // would make an unchanged blank line vanish from a diff that contains one.
+                <span className={`l ${line.kind}`} key={j}>
+                  {line.text === "" ? "\u00a0" : line.text}
+                  {"\n"}
+                </span>
+              ))}
+            </pre>
+          </div>
+        ))}
+      </div>
+      {diff.truncated ? (
+        <div className="trdep">
+          <b>This diff was cut short.</b> The daemon serves at most 512 KiB of a patch, and this one
+          is longer. What is above is the head of it, whole lines only — the rest is on the pull
+          request.
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * The daemon saying there is no diff to show — which is an ANSWER, not a fault.
+ *
+ * Keeps the dependency card's calm treatment and its deep link, because that is exactly what this
+ * state was before the endpoint existed and it is still the useful thing to offer. What changed is
+ * that the sentence is now the DAEMON's, naming the actual reason, rather than the console naming
+ * a missing endpoint.
+ */
+function NoDiff({ run, reason }: { run: RunSummary; reason: string }) {
   const prHref = prSearchUrl(run);
   const branch = runBranch(run);
   return (
     <div className="trdep">
-      <b>The diff is a dependency.</b> A run-branch unified diff needs a daemon endpoint, deferred
-      to slice 7 of the Trace plan. Until it exists this panel shows no diff rather than a
-      reconstructed one.
+      <b>There is no diff to show.</b>{" "}
+      {reason === "" ? "The daemon resolved no pull request for this run's branch." : `${reason}.`}
       {branch === "" ? null : (
         <div className="row">
           <Mono>{branch}</Mono>

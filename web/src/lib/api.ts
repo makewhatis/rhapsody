@@ -463,6 +463,81 @@ export async function fetchRunMergeability(runID: number): Promise<RunMergeabili
   return { mergeable: false, reason: typeof body.reason === "string" ? body.reason : "" };
 }
 
+// RunCheck is one entry of a pull request's status-check rollup, as GitHub reports it (STUDIO-749).
+// `state` is GitHub's own vocabulary, upper-cased and NOT classified by the daemon — see
+// `console-diff`'s `checksSummary` for how the console reads it, and why an unrecognised state must
+// never count as a pass.
+export interface RunCheck {
+  name: string;
+  state: string;
+}
+
+// RunDiff is what a run changed on its branch, read from GET /api/v1/runs/{id}/diff (STUDIO-749).
+//
+// `patch` is the pull request's unified diff verbatim, `diff --git` headers and `@@` hunks and all;
+// `console-diff` parses it. `truncated` says the daemon's 512 KiB bound cut it — the console must
+// say so, because a diff that silently stops reads as a complete one.
+//
+// `merge_state` is GitHub's own `mergeStateStatus` and NOT a mergeability verdict: the daemon
+// serves that on its own route, from one shared resolution, and a second reading of the same
+// question here could disagree with the header's. Empty when GitHub stated none — and also empty
+// when the daemon could not read it, which is the same answer for the same reason (it is context on
+// a diff, not the diff, and losing the whole answer over it would be the wrong trade).
+export interface RunDiff {
+  run_id: number;
+  issue: string;
+  branch: string;
+  pr: string;
+  url: string;
+  number: number;
+  head_sha: string;
+  merge_state: string;
+  checks: RunCheck[];
+  patch: string;
+  truncated: boolean;
+}
+
+// RunDiffResult is the served union. "There is nothing to show" is a 200 carrying the daemon's own
+// sentence, not an error: an unpushed branch, a merged-and-closed pull request or a non-GitHub
+// remote are the ordinary life of a ticket, and rendering them red would be the console asserting
+// a fault that is not there. Only a question that could not be ASKED throws.
+export type RunDiffResult =
+  | { available: true; diff: RunDiff }
+  | { available: false; reason: string };
+
+// fetchRunDiff reads the diff a run produced on its branch. The route is GET-only and takes no
+// body: the console cannot name a pull request, because the daemon derives the coordinate from the
+// run's own row (see `handlers_rundiff`).
+export async function fetchRunDiff(runID: number): Promise<RunDiffResult> {
+  const res = await fetch(`/api/v1/runs/${runID}/diff`, {
+    headers: { Accept: "application/json" },
+  });
+  // Narrow to an object before any `in`: a body that parsed to a number or a string would make the
+  // `in` operator itself throw, turning an odd response into a TypeError the panel then shows as
+  // its reason. `fetchRunMergeability` guards the same class.
+  const parsed: unknown = await res.json().catch(() => null);
+  const body =
+    typeof parsed === "object" && parsed !== null
+      ? (parsed as { available?: unknown; reason?: unknown } & Partial<ApiError> & Partial<RunDiff>)
+      : null;
+  if (!res.ok) {
+    throw new Error(body?.error?.message ?? `diff failed: ${res.status}`);
+  }
+  // A 200 the console cannot read is not an answer. Saying so beats defaulting either way: a silent
+  // `false` would claim the run changed nothing, and a silent `true` would render an empty diff as
+  // one.
+  if (body === null || typeof body.available !== "boolean") {
+    throw new Error("the daemon answered no diff");
+  }
+  if (!body.available) {
+    return { available: false, reason: typeof body.reason === "string" ? body.reason : "" };
+  }
+  if (typeof body.patch !== "string") {
+    throw new Error("the daemon called the diff available but served no patch");
+  }
+  return { available: true, diff: body as RunDiff };
+}
+
 // RunMessage is one operator "btw" sent to a run's agent (INF-250). body is the operator's
 // original text; status moves sent → delivered (delivered_turn set) | expired (run ended first).
 export interface RunMessage {
