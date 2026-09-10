@@ -1,8 +1,10 @@
 //! warnings — parity port of Go `internal/orchestrator/warnings.go` (the two per-project advisory
-//! producers surfaced on `GET /api/v1/projects`).
+//! producers surfaced on `GET /api/v1/projects`), plus the Rhapsody-only producers added since:
+//! the candidate-fetch-failure streak (STUDIO-406), the GitHub-summons enrichment-deferred streak
+//! (STUDIO-811), and the abandoned review fan-out (STUDIO-822).
 //!
-//! Two producers with DIFFERENT trust domains, kept in separate maps so each refreshes independently
-//! and merges at read ([`WarningsState::merged_for`]):
+//! The two PORTED producers have DIFFERENT trust domains, kept in separate maps so each refreshes
+//! independently and merges at read ([`WarningsState::merged_for`]):
 //!   * **slug** (INF-277) — a configured project slug that matches no Linear project (its dispatch
 //!     query can never hit). Linear-gated: a transient `list_projects` failure PRESERVES the prior map.
 //!   * **file** (INF-279) — a repo-relative `prompt_file` absent from its synced mirror (the run soft-
@@ -133,8 +135,8 @@ struct WarningMaps {
 struct LostReview {
     /// The PARENT ticket whose round has no reviewer — the thing an operator has to act on.
     identifier: String,
-    /// The last error, quoted into the advisory so the cause is visible without the log.
-    err: String,
+    /// Why it failed, quoted into the advisory so the cause is visible without the log.
+    why: String,
 }
 
 /// One project's live candidate-fetch failure streak.
@@ -257,12 +259,12 @@ impl WarningsState {
     /// A LOCAL surface deliberately: the fan-out fails because the tracker is unreachable, so a
     /// comment on the ticket — the other obvious place to put it — is the one write guaranteed to
     /// fail for the same reason.
-    pub(crate) fn record_lost_review(&self, group: &str, identifier: &str, err: &str) {
+    pub(crate) fn record_lost_review(&self, group: &str, identifier: &str, why: &str) {
         let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
         let e = m.lost_review.entry(group.to_string()).or_default();
         e.push(LostReview {
             identifier: identifier.to_string(),
-            err: err.to_string(),
+            why: why.to_string(),
         });
         // Oldest first out, so the advisory always names the most recent failures.
         while e.len() > LOST_REVIEW_WARN_CAP {
@@ -309,8 +311,8 @@ impl WarningsState {
         // actionable content, and collapsing them would name none of them.
         for l in m.lost_review.get(group).into_iter().flatten() {
             out.push(format!(
-                "the review fan-out for {} was abandoned after every retry failed (last error: {}) — that round has NO reviewer and nothing will ask again, so its pull request is unreviewed however the merge gate reads; request the review by hand",
-                l.identifier, l.err
+                "the review fan-out for {} was abandoned after every retry failed — {}. That round has NO reviewer and nothing will ask again, so its pull request is unreviewed however the merge gate reads; request the review by hand",
+                l.identifier, l.why
             ));
         }
         out
