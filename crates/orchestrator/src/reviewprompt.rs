@@ -79,7 +79,7 @@ mod tests {
             id: "iss-1".into(),
             identifier: "STUDIO-801".into(),
             title: "Review: STUDIO-792 page the Jobs list".into(),
-            description: Some(review_description(&req, "alice")),
+            description: Some(review_description(&req, "alice", "")),
             url: Some("https://linear.app/studio49/issue/STUDIO-801".into()),
             labels: Some(vec!["rhapsody:@alice".into(), REVIEW_TICKET_LABEL.into()]),
             ..Issue::default()

@@ -41,17 +41,21 @@
 //! `attachments: []` — including long-shipped ones with merged PRs — so that gate refused every
 //! ticket and the quorum was structurally dead rather than merely quiet.
 //!
-//! So the attachment is a fast path, not the source of truth. When it is present it wins outright
-//! and costs no network call. When it is absent the request is built anyway, carrying the run's
-//! repo and the `symphony/<identifier>` branch its worktree pushed, and **the off-loop task** asks
-//! GitHub for the open PR on that branch ([`crate::ghsummons::OpenPrSource`]) — dropping the
-//! request there, having written nothing, if GitHub has none either.
+//! So the attachment is a fallback, not the source of truth. The request is built carrying the
+//! run's repo and the `symphony/<identifier>` branch its worktree pushed, and **the off-loop task**
+//! asks GitHub for the open PR on that branch ([`crate::ghsummons::OpenPrSource`]) — falling back
+//! to the attachment's URL when GitHub answers nothing, and dropping the request, having written
+//! nothing, when there is no attachment either.
 //!
-//! The split is the point: [`Orchestrator::plan_quorum`] still touches no network, because
-//! resolution needs only config it already holds (the branch name is a frozen contract and the repo
-//! is the one the run was dispatched against). A ticket that never gets a PR therefore costs one
-//! `gh` call per handoff and no writes, and its parent is deliberately left unmarked so a PR opened
-//! afterwards is still reviewable on the next handoff.
+//! **The lookup is made even when the attachment already carried a URL** (STUDIO-822). It used to
+//! be skipped there, and skipping it cost nothing while a URL was all the fan-out needed; the
+//! repeat guard below needs the pull request's HEAD, and no attachment carries one.
+//!
+//! The split is the point: [`Orchestrator::plan_quorum`] still touches no network, because building
+//! the request needs only config it already holds (the branch name is a frozen contract and the
+//! repo is the one the run was dispatched against). A handoff therefore costs one `gh` call, and a
+//! ticket that never gets a PR costs that and no writes — its parent recording no head, so a PR
+//! opened afterwards is still reviewable on the next handoff.
 //!
 //! # Off costs exactly nothing
 //!
@@ -62,15 +66,64 @@
 //! [`QuorumRequest`] is ever built, and no tracker method is called. That is the acceptance
 //! criterion, and it is enforced at four independent points rather than one.
 //!
+//! # "Already reviewed" is a property of a HEAD, not of a ticket (STUDIO-822)
+//!
+//! It used to be a property of a ticket, guarded twice — the `rhapsody:quorum-requested` label read
+//! on the control task, and a process-lifetime `HashSet` of settled parents in the task. Both said
+//! the same wrong thing: *this ticket has been reviewed once, so never again.* Review rounds 2, 3
+//! and 4 of a ticket therefore got no reviewer at all, and those are exactly the rounds that exist
+//! **because** a reviewer found something. Nothing an operator could edit in Linear reached the
+//! in-memory half, so there was no workaround short of restarting the daemon.
+//!
+//! There is now ONE condition, and it is the shape [`crate::reviewwatch::review_round_due`] has
+//! always used on the ticketless path: **fan out unless a quorum was already requested at THIS
+//! pull-request head.** The head is recorded when the fan-out is requested (reviewwatch's
+//! `requested_sha`, not its `last_reviewed_sha`), which is what makes a repeat handoff while a
+//! review of the same head is still in flight fan out nothing — the record is already there.
+//!
+//! A head GitHub could not be asked about is an UNKNOWN head, and it resolves toward whichever
+//! mistake is cheaper. With nothing on record it fans out: nobody has been asked, so refusing would
+//! lose the review outright, which is the very failure above. With a head already on record it
+//! refuses: a review WAS requested, and a duplicate wakes a real agent against a real pull request
+//! for no reason — and, worse, would replace the record with the unknown head so the next
+//! successful lookup fanned out a third time.
+//!
+//! The two paths cannot share the *function*, because they do not share a subject:
+//! [`review_round_due`](crate::reviewwatch::review_round_due) matches over a store-backed
+//! [`ReviewWatchRow`](rhapsody_store::ReviewWatchRow)'s `status`, and the ticket path has no watch
+//! set, no row and no completion signal to write a `last_reviewed_sha` from — a review ticket is an
+//! ordinary Rhapsody run whose exit this module never sees. What is shared is the rule.
+//!
+//! **The record is in memory, and a restart forgets it.** The marker label is still written, but as
+//! the operator-visible record it always was and as [`crate::teamsears`]'s own once-only guard —
+//! never again as this module's refusal, because a label cannot carry a commit and a per-head label
+//! would mint one Linear label per head forever. The cost of forgetting is at most one duplicate
+//! review of an unchanged head after a restart; the cost of the durable version was every round
+//! after the first, on every ticket, permanently. [`crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP`]
+//! makes the same trade for the same reason.
+//!
 //! # Every write is best-effort, and a partial fan-out is REPORTED, not retried
 //!
 //! The tradeoff, stated because it is a decision and not an accident: when 1 of 2 review tickets is
-//! created, the quorum **marks the parent anyway** and names the shortfall in the room post. The
-//! alternative — leaving the parent unmarked so a later handoff retries — would re-create the
+//! created, the quorum **records the head anyway** and names the shortfall in the room post. The
+//! alternative — leaving the head unrecorded so a later handoff retries — would re-create the
 //! ticket that already succeeded, and duplicate review tickets are worse than a stated gap: a human
 //! reading the room can create the missing one in seconds, while a duplicate wakes a real agent
-//! against a real PR for no reason. A fan-out that creates **nothing** does not mark the parent, so
-//! a later handoff of the same ticket may still try.
+//! against a real PR for no reason. A fan-out that creates **nothing** records no head, so a later
+//! handoff of the same ticket may still try.
+//!
+//! # A fan-out that FAILS is retried, and giving up is surfaced (STUDIO-822)
+//!
+//! A total failure — no tracker, no resolvable viewer, or every create refused — is retried up to
+//! [`QUORUM_FANOUT_ATTEMPTS`] times behind the same exponential back-off, because the failure that
+//! lost a real review round was a single connection error to Linear that nothing ever re-attempted.
+//! Only a TOTAL failure retries: a partial fan-out already created tickets, and re-running it would
+//! duplicate them.
+//!
+//! When the attempts run out the round is gone for good, so it is recorded on
+//! [`crate::warnings::WarningsState`] and surfaced on `GET /api/v1/projects` beside the other
+//! per-project advisories — a LOCAL surface, deliberately, because the fan-out fails when the
+//! tracker is unreachable and a comment on the ticket is the one write guaranteed to fail with it.
 //!
 //! # What this slice deliberately does not do
 //!
@@ -107,15 +160,21 @@ use crate::reads::ProjectTracker;
 use crate::teams::IDENTITY_LABEL_PREFIX;
 use crate::triage::MANAGER_IDENTITY;
 
-/// The idempotency record: the parent ticket gains this label when its quorum fires, and a ticket
-/// already carrying it never fans out again (§0.12's "once per ticket").
+/// The parent ticket gains this label when its quorum fires: the operator-visible record that this
+/// daemon has asked for a review of it at least once.
+///
+/// **It is no longer this module's refusal** (STUDIO-822). It was §0.12's "once per ticket"
+/// idempotency record, and once-per-ticket is the wrong granularity — see the module docs. A label
+/// cannot carry a commit, so it cannot express the head-aware rule that replaced it; making it
+/// per-head would mint a new Linear label per pushed head, forever. What still reads it is
+/// [`crate::teamsears`]'s manual "@manager review <ticket>" lever, whose own rule *is* once per
+/// ticket ("I asked once and I do not ask twice"), and which this ticket does not change.
 ///
 /// A LABEL rather than a database row for §0.11.1's reason: Linear is the ledger, labels are
-/// additive (adding one can never remove a ticket from candidacy), and the record therefore
-/// survives a daemon restart, a database wipe and a second daemon — none of which an in-memory set
-/// would. It sits in the same `rhapsody:` namespace as capabilities and identity labels; `quorum-`
-/// cannot collide with an identity (those carry the `@`) and an unknown `rhapsody:*` label is a
-/// documented silent no-op in the capabilities registry.
+/// additive (adding one can never remove a ticket from candidacy). It sits in the same `rhapsody:`
+/// namespace as capabilities and identity labels; `quorum-` cannot collide with an identity (those
+/// carry the `@`) and an unknown `rhapsody:*` label is a documented silent no-op in the
+/// capabilities registry.
 pub const QUORUM_REQUESTED_LABEL: &str = "rhapsody:quorum-requested";
 
 /// The marker every review ticket the quorum MINTS carries, beside the `rhapsody:@<reviewer>` label
@@ -145,18 +204,36 @@ pub const REVIEW_TICKET_LABEL: &str = "rhapsody:review-ticket";
 /// reason: a tracker outage settles at one attempt per 15 minutes rather than a hot retry loop.
 pub const MAX_QUORUM_BACKOFF_MS: i64 = 15 * 60 * 1000;
 
+/// How many times ONE fan-out is attempted before the round is given up on and surfaced
+/// (STUDIO-822).
+///
+/// Three, because the failure this exists for was a single `error sending request` to Linear — a
+/// connection blip that the next attempt would have ridden out — and because each attempt after the
+/// first is separated by the exponential back-off, so three attempts already spread across minutes
+/// rather than seconds. More would not rescue a real outage; it would only park this task, and with
+/// it every queued handoff behind it, for longer.
+///
+/// Only a TOTAL failure ([`FanOutcome::TrackerFailure`]) is retried. A partial fan-out created
+/// review tickets, and a retry would duplicate them.
+pub const QUORUM_FANOUT_ATTEMPTS: u32 = 3;
+
 /// Bounds the open-PR lookup (STUDIO-674), [`crate::ghenrich`]'s `GH_SUMMONS_TIMEOUT` and its
 /// reason: a network-stalled lookup must not park the fan-out indefinitely.
 ///
-/// Honest reach, because a bound that reads stronger than it is, is worse than none: against the
-/// PRODUCTION source it is currently INERT. [`crate::ghsummons::GH`] shells out through a
-/// synchronous `std::process::Command`, so its future has no await point and runs to completion in
-/// its first poll — `tokio::time::timeout` never gets to cancel it. The bound is real for any
-/// source that actually yields, which today means the tests. What makes it real everywhere is the
-/// non-blocking runner (`spawn_blocking` / `tokio::process`) already noted as a follow-up on
-/// `ghsummons::default_run`, and until then the containment is structural rather than temporal: a
-/// hung `gh` parks THIS task, which owns all of the quorum's network I/O and no lock the control
-/// task takes, and the daemon keeps ticking.
+/// Honest reach, because a bound that reads stronger than it is, is worse than none: this one is
+/// REAL against the production source as of STUDIO-829, and was inert before it.
+/// [`crate::ghsummons::GH`] shells out through a synchronous `std::process::Command`, so while that
+/// exec was inline its future had no await point and ran to completion in its first poll —
+/// `tokio::time::timeout` never got a poll at which to cancel it. Every exec now goes through
+/// `GH::run_off_task`, which hands it to tokio's blocking pool, so the await this bound wraps is a
+/// real yield point and 15s means 15s.
+///
+/// The containment is still structural as well as temporal, and the structural half is the one that
+/// keeps the daemon ticking: a hung `gh` parks THIS task, which owns all of the quorum's network
+/// I/O and no lock the control task takes. What the bound adds is that the task is released rather
+/// than parked forever. It stays tighter than `ghsummons::GH_EXEC_TIMEOUT`, the per-exec backstop
+/// underneath it, on purpose — a fan-out waiting on one lookup should give up well before the
+/// floor does.
 const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the per-tick candidate sweep learned about ONE ticket, so the handoff moment can decide
@@ -169,8 +246,6 @@ pub(crate) struct QuorumFacts {
     /// Unmerged, because a merged PR needs no review. Derived from the same Linear GitHub-attachment
     /// data `linked_pr` comes from, which is why it can be read off a candidate rather than fetched.
     pub pr_url: String,
-    /// Whether the ticket already carries [`QUORUM_REQUESTED_LABEL`].
-    pub already_requested: bool,
 }
 
 /// One fan-out, decided on the control task and handed to the off-loop task as plain owned data.
@@ -196,6 +271,11 @@ pub struct QuorumRequest {
     /// slug therefore means "use the account tracker", not "the project is unknown" — see
     /// [`tracker_for`].
     pub parent_project_slug: String,
+    /// The project GROUP the parent belongs to, so a fan-out this daemon gives up on can be
+    /// surfaced against that project on `GET /api/v1/projects` (STUDIO-822). Resolved on the
+    /// control task, where `eff` lives; empty when no project could be resolved, in which case the
+    /// advisory is recorded under the empty group and only the `WARN` line remains.
+    pub parent_project_group: String,
     /// The pull request under review, as read off the ticket's Linear GitHub attachment.
     ///
     /// **May be empty** (STUDIO-674). An installation whose Linear↔GitHub integration never
@@ -263,57 +343,99 @@ pub struct QuorumDeps<TF> {
     pub pr_source: Option<Arc<dyn OpenPrSource>>,
     /// The back-off ceiling; [`MAX_QUORUM_BACKOFF_MS`] in production, milliseconds in tests.
     pub max_backoff_ms: i64,
+    /// Where a fan-out this task gives up on is recorded so an operator can see it (STUDIO-822).
+    /// `None` writes nothing and leaves the `WARN` line as the only trace, which is the pre-
+    /// STUDIO-822 behaviour and what a test that does not care about the surface gets.
+    pub warnings: Option<Arc<crate::warnings::WarningsState>>,
 }
 
-/// What one fan-out did — the input to the back-off decision and to the once-per-ticket bookkeeping.
+/// What one fan-out did — the input to the back-off decision, to the retry decision and to the
+/// per-head bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FanOutcome {
     /// `created` review tickets were made out of `wanted`. `created > 0`; `created < wanted` is the
-    /// partial case, which still marks the parent and reports the shortfall.
+    /// partial case, which still records the head and reports the shortfall.
     Fanned { created: usize, wanted: usize },
     /// The roster had nobody to ask. Nothing was written; a loud room post was attempted.
     NoReviewers,
-    /// The tracker refused everything (no viewer to assign to, or every create failed). Back off,
-    /// and leave the parent UNMARKED so a later handoff may still try.
+    /// The tracker refused everything (no tracker at all, no viewer to assign to, or every create
+    /// failed). Retry, then back off, and record NO head so a later handoff may still try.
     TrackerFailure,
     /// Neither the Linear attachment nor GitHub itself yielded an open PR for the ticket's branch,
-    /// so there is nothing to review (STUDIO-674). Nothing was written; the parent is NOT settled,
+    /// so there is nothing to review (STUDIO-674). Nothing was written; no head is recorded,
     /// because a PR opened after this handoff should still be reviewable on the next one. Not a
     /// failure either — a ticket without a PR is a normal state, not an outage.
     NoPullRequest,
+    /// A quorum was already requested for this parent at THIS pull-request head, so this handoff is
+    /// the repeat one (STUDIO-822). Nothing was written and nothing is wrong: either a review of
+    /// this head is in flight, or one already finished and the author has pushed nothing since.
+    AlreadyRequestedAtHead,
 }
 
 impl FanOutcome {
-    /// Whether this outcome should extend the back-off.
+    /// Whether this outcome should extend the back-off — and, equivalently, whether it is worth
+    /// re-attempting. Only a total tracker failure is either.
     fn is_failure(self) -> bool {
         matches!(self, FanOutcome::TrackerFailure)
     }
 
-    /// Whether this outcome may clear a back-off earned by earlier failures. Everything except
-    /// [`FanOutcome::NoPullRequest`] may: it alone returns from [`fan_out`] above the `deps.target`
-    /// lookup, having neither reached the tracker nor learned anything about it, so reading it as a
-    /// success would let one attachment-less handoff during a Linear outage erase the back-off that
-    /// outage earned. It does not EXTEND the back-off either — a ticket without a PR is a normal
-    /// state, not an outage — so it simply leaves the counter where it found it.
+    /// Whether this outcome may clear a back-off earned by earlier failures. Only the outcomes that
+    /// actually REACHED the tracker may: [`FanOutcome::NoPullRequest`] and
+    /// [`FanOutcome::AlreadyRequestedAtHead`] both return from [`fan_out`] above the `deps.target`
+    /// lookup, having neither reached the tracker nor learned anything about it, so reading either
+    /// as a success would let one such handoff during a Linear outage erase the back-off that
+    /// outage earned. Neither EXTENDS the back-off either — a ticket without a PR, and a repeat
+    /// handoff at a head already under review, are both normal states rather than outages — so they
+    /// simply leave the counter where they found it.
     fn clears_the_backoff(self) -> bool {
-        !matches!(self, FanOutcome::NoPullRequest)
+        !matches!(
+            self,
+            FanOutcome::NoPullRequest | FanOutcome::AlreadyRequestedAtHead
+        )
     }
 
-    /// Whether the parent should be considered handled for this process's lifetime. Neither a total
-    /// failure nor a missing pull request settles anything: both leave the parent unmarked, and a
-    /// later handoff is the only thing that should ever ask again.
-    fn settles_the_parent(self) -> bool {
+    /// Whether this parent's head should be recorded as requested. Neither a total failure nor a
+    /// missing pull request records anything: both wrote nothing, and a later handoff is the only
+    /// thing that should ever ask again. [`FanOutcome::AlreadyRequestedAtHead`] does not either —
+    /// the head is already recorded, which is how it got here.
+    fn records_the_head(self) -> bool {
         matches!(self, FanOutcome::Fanned { .. } | FanOutcome::NoReviewers)
     }
+}
+
+/// One fan-out attempt's full answer: what happened, at which head, against which pull request,
+/// and the loud room post a failure wants made once its retries are exhausted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FanResult {
+    pub outcome: FanOutcome,
+    /// The pull request this attempt ran against, as [`resolve_open_pr`] resolved it — NOT
+    /// whatever the request arrived carrying. On an installation whose Linear holds no GitHub
+    /// attachments (STUDIO-674) the request's own `pr_url` is empty, so this is the only thing
+    /// [`give_up`] can name; it is carried out here because the resolved URL otherwise lives only
+    /// on [`fan_out`]'s local rebinding of the request. Empty only for
+    /// [`FanOutcome::NoPullRequest`], which is never a failure and is never abandoned.
+    pub pr_url: String,
+    /// The pull-request head this attempt ran against — what gets recorded when
+    /// [`FanOutcome::records_the_head`] says so. Empty when no pull request was resolved, and
+    /// empty-but-recorded when GitHub answered a pull request without a `headRefOid`: an unknown
+    /// head compares equal to the next unknown head, which degrades the guard to the per-ticket one
+    /// it replaced rather than fanning out on every handoff forever.
+    pub head: String,
+    /// Why a [`FanOutcome::TrackerFailure`] failed, as one operator-facing sentence fragment.
+    /// Carried out rather than posted inline so one outage costs ONE room post at exhaustion
+    /// instead of one per attempt (STUDIO-822), and so the same sentence backs both the room post
+    /// and the project advisory instead of two texts drifting apart.
+    pub failure_why: String,
 }
 
 /// Consumes [`QuorumRequest`]s until `ctx` is cancelled or the sender is dropped (§0.12).
 ///
 /// One request at a time, serially — there is no `spawn` in this module, so at most one fan-out is
 /// ever in flight and a slow Linear cannot multiply into a burst of concurrent writes. A failed
-/// fan-out delays the NEXT one by the exponential back-off, which is the "never a hot retry loop
-/// against a down API" bound rather than a retry of the failed request: the quorum has no retry,
-/// because a re-handoff is the only thing that should ever ask again.
+/// fan-out is re-attempted up to [`QUORUM_FANOUT_ATTEMPTS`] times (STUDIO-822) and every attempt,
+/// including the first of the NEXT request, waits out the exponential back-off the failures earned
+/// — which is what keeps a retry from becoming a hot loop against a down API. Giving up is not
+/// silent: the round is recorded on [`crate::warnings::WarningsState`] and posted to the room.
 pub async fn run_quorum_task<TF>(
     mut ctx: CancelWait,
     deps: QuorumDeps<TF>,
@@ -327,11 +449,15 @@ pub async fn run_quorum_task<TF>(
         "teams review quorum task started (off-loop; a handoff is never blocked on it)"
     );
     let mut failures: i64 = 0;
-    // Parents already settled in THIS process. The durable record is the marker label in Linear —
-    // this only closes the window the label cannot: two handoffs of the same run before a poll
-    // could refresh the candidate's labels. It grows by one entry per fan-out, which is bounded by
-    // how many tickets a daemon hands off in its lifetime; a few thousand short strings.
-    let mut settled: HashSet<String> = HashSet::new();
+    // The head each parent's quorum was last REQUESTED at, in this process (STUDIO-822) — the one
+    // condition that replaced the marker label's per-ticket refusal and the per-ticket `settled`
+    // set that used to sit here. `requested_sha` in [`crate::reviewwatch`]'s vocabulary: written
+    // when the fan-out is asked for rather than when a review finishes, which is what makes a
+    // repeat handoff while a review of the same head is in flight fan out nothing.
+    //
+    // It grows by one entry per PARENT (not per head — a new head replaces the old), bounded by how
+    // many tickets a daemon hands off in its lifetime; a few thousand short strings.
+    let mut requested: HashMap<String, String> = HashMap::new();
     loop {
         let req = tokio::select! {
             _ = ctx.cancelled() => return,
@@ -342,65 +468,164 @@ pub async fn run_quorum_task<TF>(
                 None => return,
             },
         };
-        if settled.contains(&req.parent_issue_id) {
-            tracing::debug!(
-                issue = %req.parent_identifier,
-                "teams quorum already fanned out for this ticket; ignoring the repeat handoff"
-            );
-            continue;
-        }
-        if failures > 0 {
-            let delay = Duration::from_millis(
-                failure_backoff_ms(failures, deps.max_backoff_ms).max(0) as u64,
-            );
-            tokio::select! {
-                _ = ctx.cancelled() => return,
-                _ = tokio::time::sleep(delay) => {}
+        let prior = requested.get(&req.parent_issue_id).cloned();
+        // One request, up to `QUORUM_FANOUT_ATTEMPTS` attempts. The back-off is waited out BEFORE
+        // every attempt, so a retry of this request and the first attempt of the next one are paced
+        // identically — there is no faster path back to a tracker that just refused.
+        let mut attempt: u32 = 0;
+        let res = loop {
+            attempt += 1;
+            if failures > 0 {
+                let delay = Duration::from_millis(
+                    failure_backoff_ms(failures, deps.max_backoff_ms).max(0) as u64,
+                );
+                tokio::select! {
+                    _ = ctx.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
-        }
-        if ctx.is_cancelled() {
-            return;
-        }
-        let outcome = fan_out(&deps, &req).await;
-        if outcome.settles_the_parent() {
-            settled.insert(req.parent_issue_id.clone());
-        }
-        if outcome.is_failure() {
+            if ctx.is_cancelled() {
+                return;
+            }
+            let res = fan_out(&deps, &req, prior.as_deref()).await;
+            if !res.outcome.is_failure() {
+                break res;
+            }
             failures += 1;
+            if attempt >= QUORUM_FANOUT_ATTEMPTS {
+                break res;
+            }
             tracing::warn!(
                 issue = %req.parent_identifier,
+                attempt,
+                attempts = QUORUM_FANOUT_ATTEMPTS,
                 consecutive_failures = failures,
-                "teams quorum fan-out failed; backing off (the handoff itself already succeeded)"
+                "teams quorum fan-out failed; retrying after a back-off (the handoff itself already succeeded)"
             );
-        } else if outcome.clears_the_backoff() {
+        };
+        if res.outcome.records_the_head() {
+            requested.insert(req.parent_issue_id.clone(), res.head.clone());
+        }
+        if res.outcome.is_failure() {
+            give_up(&deps, &req, &res, attempt);
+        } else if res.outcome.clears_the_backoff() {
             failures = 0;
         }
     }
 }
 
-/// One fan-out: create a review ticket per reviewer, mark the parent, tell the room.
+/// Reports a fan-out this task attempted `attempts` times and is abandoning (STUDIO-822).
+///
+/// Three surfaces, because the failure that motivated this was visible on none of them: the `WARN`
+/// line (which is what it already had), the room post the fan-out prepared, and — the one an
+/// operator actually looks at — the project advisory on `GET /api/v1/projects`, which is LOCAL and
+/// therefore still works when the reason for the failure is that the tracker does not answer.
+///
+/// The pull request named is `res.pr_url`, the one [`fan_out`] RESOLVED, and never the `req.pr_url`
+/// the request arrived with: on an installation whose Linear holds no GitHub attachments the latter
+/// is empty (STUDIO-674), and this post is the one message telling a human that a review round is
+/// permanently gone. Every abandoned round has a resolved URL — [`FanOutcome::TrackerFailure`] is
+/// only ever returned below the lookup.
+fn give_up<TF>(deps: &QuorumDeps<TF>, req: &QuorumRequest, res: &FanResult, attempts: u32)
+where
+    TF: Fn() -> Option<QuorumTarget>,
+{
+    tracing::warn!(
+        issue = %req.parent_identifier,
+        project = %req.parent_project_group,
+        attempts,
+        "teams quorum gave up on the fan-out; this round has no reviewer and nothing will ask again"
+    );
+    if let Some(w) = deps.warnings.as_ref() {
+        w.record_lost_review(
+            &req.parent_project_group,
+            &req.parent_identifier,
+            &res.failure_why,
+        );
+    }
+    post(
+        deps,
+        Message::room(
+            MANAGER_IDENTITY,
+            Utc::now(),
+            format!(
+                "REVIEW QUORUM ABANDONED for {}: {} after {attempts} attempts. No review of {} was \
+                 requested and nothing will ask again — {} is unreviewed however the merge gate \
+                 reads, so request the review by hand.",
+                req.parent_identifier, res.failure_why, res.pr_url, req.parent_identifier,
+            ),
+        )
+        .with_refs([req.parent_identifier.clone()]),
+    );
+}
+
+/// One fan-out: resolve the pull request, refuse a head already asked about, create a review ticket
+/// per reviewer, mark the parent, tell the room.
+///
+/// `requested_head` is the head this parent's quorum was last requested at, or `None` when it has
+/// never been (STUDIO-822). It is the WHOLE repeat-guard — see the module docs — and it is compared
+/// here rather than on the control task for the reason the pull request itself is: the head comes
+/// from GitHub, and the control task makes no network call.
 ///
 /// A create that fails does NOT abort the rest — that is what produces the partial fan-out the
 /// module docs describe, and it is bounded by `reviewers` (2 by default), so a down tracker costs
 /// two failed calls rather than a retry storm.
-pub(crate) async fn fan_out<TF>(deps: &QuorumDeps<TF>, req: &QuorumRequest) -> FanOutcome
+pub(crate) async fn fan_out<TF>(
+    deps: &QuorumDeps<TF>,
+    req: &QuorumRequest,
+    requested_head: Option<&str>,
+) -> FanResult
 where
     TF: Fn() -> Option<QuorumTarget>,
 {
-    // STUDIO-674: the PR, first, because every write below names it. An attachment on the candidate
-    // wins outright and costs nothing; only its absence asks GitHub, and only here — the control
-    // task that built this request made no network call.
-    let req: Cow<'_, QuorumRequest> = if req.pr_url.is_empty() {
-        match resolve_open_pr(deps, req).await {
-            Some(pr_url) => {
-                let mut resolved = req.clone();
-                resolved.pr_url = pr_url;
-                Cow::Owned(resolved)
-            }
-            None => return FanOutcome::NoPullRequest,
-        }
-    } else {
+    // The PR, first, because every write below names it AND because its head is what the repeat
+    // guard compares (STUDIO-674, STUDIO-822). Only here — the control task that built this request
+    // made no network call.
+    let Some(pr) = resolve_open_pr(deps, req).await else {
+        return FanResult {
+            outcome: FanOutcome::NoPullRequest,
+            pr_url: String::new(),
+            head: String::new(),
+            failure_why: String::new(),
+        };
+    };
+    let (pr_url, head) = (pr.url, pr.head_sha);
+    // The one condition that replaced the marker label's refusal and the per-ticket `settled` set:
+    // a quorum was already asked for at exactly this head, so either a review of it is in flight or
+    // one finished and nothing has been pushed since. Both mean the same thing — there is no new
+    // work to review — which is precisely what a per-TICKET guard could not tell apart from "the
+    // author pushed the fixes a reviewer asked for".
+    //
+    // An UNKNOWN head — [`resolve_open_pr`]'s attachment fallback, taken whenever the `gh` lookup
+    // fails or times out — reads the same way ONCE A HEAD IS ON RECORD. There, the blip is the only
+    // reason this handoff cannot name the head, and we already know a review was requested; fanning
+    // out would wake a second reviewer onto a diff someone is reading, and would overwrite the
+    // record with the unknown head so that the next SUCCESSFUL lookup woke a third. With NO head on
+    // record the trade runs the other way and the fallback stands: nothing has been asked, so
+    // refusing would turn a lookup blip into a missing review, which is the failure this whole
+    // ticket is about.
+    if let Some(prior) = requested_head
+        && (prior == head || head.is_empty())
+    {
+        tracing::debug!(
+            issue = %req.parent_identifier,
+            head = %head,
+            %prior,
+            "teams quorum already requested a review at this head; the repeat handoff fans out nothing"
+        );
+        return FanResult {
+            outcome: FanOutcome::AlreadyRequestedAtHead,
+            pr_url,
+            head,
+            failure_why: String::new(),
+        };
+    }
+    let req: Cow<'_, QuorumRequest> = if req.pr_url == pr_url {
         Cow::Borrowed(req)
+    } else {
+        let mut resolved = req.clone();
+        resolved.pr_url.clone_from(&pr_url);
+        Cow::Owned(resolved)
     };
     let req = req.as_ref();
 
@@ -409,7 +634,13 @@ where
             issue = %req.parent_identifier,
             "teams quorum has no tracker yet; the fan-out is skipped"
         );
-        return FanOutcome::TrackerFailure;
+        return FanResult {
+            outcome: FanOutcome::TrackerFailure,
+            pr_url: pr_url.clone(),
+            head,
+            failure_why: "no tracker has loaded yet, so no review ticket could be created"
+                .to_string(),
+        };
     };
     let tracker = tracker_for(&target, req);
 
@@ -437,7 +668,12 @@ where
             )
             .with_refs([req.parent_identifier.clone()]),
         );
-        return FanOutcome::NoReviewers;
+        return FanResult {
+            outcome: FanOutcome::NoReviewers,
+            pr_url: pr_url.clone(),
+            head,
+            failure_why: String::new(),
+        };
     }
 
     // §0.12's claim rule: the review ticket must be ASSIGNED, because the default candidate query
@@ -456,32 +692,30 @@ where
                 err = %why,
                 "teams quorum could not resolve the viewer to assign review tickets to; nothing created"
             );
-            post(
-                deps,
-                Message::room(
-                    MANAGER_IDENTITY,
-                    Utc::now(),
-                    format!(
-                        "REVIEW QUORUM FAILED for {}: could not resolve the tracker viewer to \
-                         assign review tickets to ({why}). No review of {} was requested; an \
-                         unassigned ticket is never picked up, so creating one would have been \
-                         worse than creating none.",
-                        req.parent_identifier, req.pr_url
-                    ),
-                )
-                .with_refs([req.parent_identifier.clone()]),
-            );
-            return FanOutcome::TrackerFailure;
+            return FanResult {
+                outcome: FanOutcome::TrackerFailure,
+                pr_url: pr_url.clone(),
+                head,
+                // Not posted here: the room hears about it once, at exhaustion (STUDIO-822).
+                failure_why: format!(
+                    "the tracker viewer to assign review tickets to could not be resolved \
+                     ({why}), and an unassigned ticket is never picked up, so creating one \
+                     would have been worse than creating none"
+                ),
+            };
         }
     };
 
     let mut created: Vec<(String, String)> = Vec::with_capacity(req.reviewers.len());
     let mut failed: Vec<String> = Vec::new();
+    // The last create error, kept so a total failure can SAY what went wrong rather than only that
+    // something did — the one line an operator reading the abandoned-fan-out advisory needs.
+    let mut create_err = String::from("no error was recorded");
     for reviewer in &req.reviewers {
         let spec = NewIssue {
             team_id: req.parent_team_id.clone(),
             title: review_title(&req.parent_identifier, &req.parent_title),
-            description: review_description(req, reviewer),
+            description: review_description(req, reviewer, &head),
             state_name: req.state_name.clone(),
             assignee_id: assignee.clone(),
             // The identity label IS the assignment (§0.11.1); the marker records what KIND of
@@ -510,35 +744,29 @@ where
                     err = %e,
                     "teams quorum could not create a review ticket"
                 );
+                create_err = e.to_string();
                 failed.push(reviewer.clone());
             }
         }
     }
 
     if created.is_empty() {
-        post(
-            deps,
-            Message::room(
-                MANAGER_IDENTITY,
-                Utc::now(),
-                format!(
-                    "REVIEW QUORUM FAILED for {}: no review ticket could be created for {} \
-                     (asked: {}). {} is unreviewed and the ticket is NOT marked, so a later \
-                     handoff may try again.",
-                    req.parent_identifier,
-                    req.pr_url,
-                    req.reviewers.join(", "),
-                    req.parent_identifier,
-                ),
-            )
-            .with_refs([req.parent_identifier.clone()]),
-        );
-        return FanOutcome::TrackerFailure;
+        return FanResult {
+            outcome: FanOutcome::TrackerFailure,
+            pr_url: pr_url.clone(),
+            head,
+            failure_why: format!(
+                "no review ticket could be created (asked: {}); the last create failed with {}",
+                req.reviewers.join(", "),
+                create_err,
+            ),
+        };
     }
 
-    // The marker is written even for a partial fan-out (see the module docs). Its failure is not
-    // fatal either — it costs idempotency across restarts, and the in-process `settled` set still
-    // holds for this daemon's lifetime — but it IS worth saying out loud, so it joins the post.
+    // The marker is written even for a partial fan-out (see the module docs), and re-written on
+    // every later round — `issueAddLabel` is additive, so a label already present is a no-op. It no
+    // longer guards anything here (STUDIO-822); what it costs when it fails is the operator-visible
+    // record and [`crate::teamsears`]'s manual lever, which is worth saying out loud in the post.
     let mut marker_err = String::new();
     if let Err(e) = tracker
         .add_issue_label(
@@ -568,9 +796,14 @@ where
                 .chain(created.iter().map(|(_, id)| id.clone())),
         ),
     );
-    FanOutcome::Fanned {
-        created: created.len(),
-        wanted: req.reviewers.len(),
+    FanResult {
+        outcome: FanOutcome::Fanned {
+            created: created.len(),
+            wanted: req.reviewers.len(),
+        },
+        pr_url,
+        head,
+        failure_why: String::new(),
     }
 }
 
@@ -589,8 +822,8 @@ where
 /// The fallback is not a silent one. An EMPTY slug is the legacy single-project path, where the
 /// account tracker is the slug-bound client and this is simply correct. A slug that matches nothing
 /// is a project paused or removed between the dispatch and the handoff: the account tracker is then
-/// the only client left to try, and if it too is slug-less the create fails into the fan-out's
-/// existing loud "REVIEW QUORUM FAILED" room post rather than dropping the request quietly.
+/// the only client left to try, and if it too is slug-less the create fails into the task's retry
+/// and its loud "REVIEW QUORUM ABANDONED" room post rather than dropping the request quietly.
 fn tracker_for(target: &QuorumTarget, req: &QuorumRequest) -> Arc<dyn Tracker> {
     if req.parent_project_slug.is_empty() {
         tracing::debug!(
@@ -621,25 +854,51 @@ fn tracker_for(target: &QuorumTarget, req: &QuorumRequest) -> Arc<dyn Tracker> {
 }
 
 /// Asks GitHub for the open PR on the request's head branch (STUDIO-674), returning `None` when
-/// there is nothing to review — no configured source, no repo/branch to ask about, no open PR, or a
-/// lookup that could not be made.
+/// there is nothing to review — no source and no attachment, no repo/branch to ask about, no open
+/// PR, and no attachment to fall back on.
+///
+/// **The lookup is no longer skipped when the Linear attachment already carried a URL**
+/// (STUDIO-822). It used to be, and it cost nothing then, because a URL was all the fan-out needed.
+/// It needs a HEAD now, the attachment carries none, and there is no way to learn one without
+/// asking. GitHub is in any case the source of truth the attachment was only ever a cache of. What
+/// this costs is one `gh pr list` per handoff on an installation whose Linear↔GitHub integration
+/// works — and nothing at all on one whose does not, which is where the attachment path was already
+/// dead.
+///
+/// The attachment remains the FALLBACK, with an empty head: when GitHub answers nothing (or cannot
+/// be asked) and Linear says there is a pull request, the FIRST fan-out still happens and only the
+/// per-head granularity is lost. Refusing there would turn a lookup blip into a missing review,
+/// which is the failure this whole ticket is about. Once a head IS on record [`fan_out`] reads that
+/// same empty head as "already requested" instead — see the guard there for why the trade reverses.
 ///
 /// Every `None` is a DEBUG line except a lookup that FAILED, which is a warning: "GitHub says there
 /// is no PR" is a normal state of a ticket, while "we could not ask GitHub" is an operator problem
-/// that would otherwise look identical from the outside. Neither retries here — a handoff is the
-/// only thing that asks, so a failed lookup costs one `gh` call and waits for the next handoff
-/// rather than spinning.
-async fn resolve_open_pr<TF>(deps: &QuorumDeps<TF>, req: &QuorumRequest) -> Option<String>
+/// that would otherwise look identical from the outside. Neither retries here — the task's own
+/// retry covers a fan-out that reached the tracker and failed, and a lookup that answers "no pull
+/// request" is not a failure to retry.
+async fn resolve_open_pr<TF>(
+    deps: &QuorumDeps<TF>,
+    req: &QuorumRequest,
+) -> Option<crate::ghsummons::OpenPr>
 where
     TF: Fn() -> Option<QuorumTarget>,
 {
+    /// The Linear attachment, as a head-less [`OpenPr`](crate::ghsummons::OpenPr).
+    fn attached(req: &QuorumRequest) -> Option<crate::ghsummons::OpenPr> {
+        (!req.pr_url.is_empty()).then(|| crate::ghsummons::OpenPr {
+            url: req.pr_url.clone(),
+            head_sha: String::new(),
+        })
+    }
     let Some(src) = deps.pr_source.as_ref() else {
-        tracing::debug!(
-            issue = %req.parent_identifier,
-            "teams quorum: the handed-off ticket has no linked PR and no PR source is configured; \
-             nothing to review"
-        );
-        return None;
+        if req.pr_url.is_empty() {
+            tracing::debug!(
+                issue = %req.parent_identifier,
+                "teams quorum: the handed-off ticket has no linked PR and no PR source is \
+                 configured; nothing to review"
+            );
+        }
+        return attached(req);
     };
     // Bounded exactly as the poll path's summons fetch is, and for the same reason — but see
     // `PR_LOOKUP_TIMEOUT`: the real `gh` runner blocks rather than yields, so this cannot interrupt
@@ -651,43 +910,46 @@ where
     )
     .await;
     match looked_up {
-        Ok(Ok(Some(url))) => {
+        Ok(Ok(Some(pr))) => {
             tracing::info!(
                 issue = %req.parent_identifier,
                 branch = %req.pr_head_branch,
-                pr = %url,
-                "teams quorum resolved the ticket's open PR by head branch (no Linear attachment)"
+                pr = %pr.url,
+                head = %pr.head_sha,
+                "teams quorum resolved the ticket's open PR and its head by head branch"
             );
-            Some(url)
+            Some(pr)
         }
         Ok(Ok(None)) => {
             tracing::debug!(
                 issue = %req.parent_identifier,
                 repo = %format!("{}/{}", req.pr_owner, req.pr_repo),
                 branch = %req.pr_head_branch,
-                "teams quorum: the handed-off ticket has no Linear attachment and no open PR on \
-                 its branch; nothing to review"
+                attached = !req.pr_url.is_empty(),
+                "teams quorum: GitHub reports no open PR on the ticket's branch"
             );
-            None
+            attached(req)
         }
         Ok(Err(e)) => {
             tracing::warn!(
                 issue = %req.parent_identifier,
                 branch = %req.pr_head_branch,
                 err = %e,
-                "teams quorum could not ask GitHub for the ticket's open PR; no review was \
-                 requested (the handoff itself already succeeded)"
+                attached = !req.pr_url.is_empty(),
+                "teams quorum could not ask GitHub for the ticket's open PR (the handoff itself \
+                 already succeeded)"
             );
-            None
+            attached(req)
         }
         Err(_) => {
             tracing::warn!(
                 issue = %req.parent_identifier,
                 branch = %req.pr_head_branch,
                 timeout_ms = PR_LOOKUP_TIMEOUT.as_millis(),
-                "teams quorum's open-PR lookup timed out; no review was requested"
+                attached = !req.pr_url.is_empty(),
+                "teams quorum's open-PR lookup timed out"
             );
-            None
+            attached(req)
         }
     }
 }
@@ -716,8 +978,8 @@ fn fan_out_post(
     if !failed.is_empty() {
         out.push_str(&format!(
             " SHORTFALL: no review ticket could be created for {} — {} of {} reviewers were asked. \
-             {} is marked as requested anyway, so this will NOT be retried automatically; create \
-             the missing ticket by hand if you want the full quorum.",
+             This head is recorded as requested anyway, so {} will NOT be retried automatically; \
+             create the missing ticket by hand if you want the full quorum.",
             failed.join(", "),
             created.len(),
             req.reviewers.len(),
@@ -727,7 +989,8 @@ fn fan_out_post(
     if !marker_err.is_empty() {
         out.push_str(&format!(
             " WARNING: the `{QUORUM_REQUESTED_LABEL}` marker could not be written to {} \
-             ({marker_err}); a later handoff from a restarted daemon could fan out a second time.",
+             ({marker_err}); it records nothing this daemon reads back, but the manager's \
+             `review <ticket>` room lever will not know a review was already asked for.",
             req.parent_identifier,
         ));
     }
@@ -747,7 +1010,7 @@ pub(crate) fn review_title(parent_identifier: &str, parent_title: &str) -> Strin
 /// "never merge" has to hold, and a description an agent could author is a description an agent
 /// could rewrite. §0.11.5 already treats agent-authored text as untrusted; this keeps the
 /// instruction on the trusted side of that line.
-pub(crate) fn review_description(req: &QuorumRequest, reviewer: &str) -> String {
+pub(crate) fn review_description(req: &QuorumRequest, reviewer: &str, head: &str) -> String {
     let QuorumRequest {
         pr_url,
         parent_identifier,
@@ -756,10 +1019,20 @@ pub(crate) fn review_description(req: &QuorumRequest, reviewer: &str) -> String 
         summon_token,
         ..
     } = req;
+    // Named when it is known (STUDIO-822) so the reviewer, and anyone reading the ticket later, can
+    // tell WHICH round this is: rounds 2+ exist because a reviewer found something, and two review
+    // tickets for one pull request are otherwise indistinguishable. Omitted rather than rendered
+    // empty when GitHub answered no `headRefOid`, because a blank commit reads as a bug.
+    let at_head = if head.is_empty() {
+        String::new()
+    } else {
+        format!("**Head:** {head}\n")
+    };
     format!(
         "You are **{reviewer}**, reviewing a teammate's work.\n\
          \n\
          **Pull request:** {pr_url}\n\
+         {at_head}\
          **Reviewing:** {parent_identifier} — {parent_title}\n\
          **Author:** {author}\n\
          \n\
@@ -889,6 +1162,18 @@ impl Orchestrator {
         rx
     }
 
+    /// The shared per-project advisory state, so the off-loop quorum task can record a fan-out it
+    /// gave up on where an operator will see it (STUDIO-822).
+    ///
+    /// Handed out as the [`Arc`] the warning resolver tasks already share rather than through a
+    /// control event: the recording is a lock-guarded write to a map the control task only ever
+    /// READS (in `project_statuses`), so it needs no round-trip, and a round-trip would be one more
+    /// thing that cannot happen while the control task is busy — which is the state the daemon is
+    /// in when the tracker is timing out.
+    pub fn warnings_state(&self) -> Arc<crate::warnings::WarningsState> {
+        Arc::clone(&self.warnings)
+    }
+
     /// Whether the review quorum is on: Teams enabled AND `quorum.enabled`. Both, always — the
     /// quorum is opt-in ON TOP of an already opt-in feature (§0.12's cost control).
     ///
@@ -963,11 +1248,6 @@ impl Orchestrator {
                 iss.id.clone(),
                 QuorumFacts {
                     pr_url: open_pr_url(iss),
-                    already_requested: iss
-                        .labels
-                        .iter()
-                        .flatten()
-                        .any(|l| l.eq_ignore_ascii_case(QUORUM_REQUESTED_LABEL)),
                 },
             );
         }
@@ -985,15 +1265,20 @@ impl Orchestrator {
     /// 2. The run was dispatched AS a roster identity. A run with no identity is an ordinary
     ///    Rhapsody run and the quorum has no author to exclude and no team to ask.
     /// 3. The ticket names a team to create the review tickets in.
-    /// 4. The ticket is not already marked (§0.12's "once per ticket"): a re-handoff after review
-    ///    fixes must NOT fan out a second time.
     ///
-    /// §0.12's remaining gate — "the ticket has an open linked PR" — is deliberately NOT one of
-    /// these (STUDIO-674). It has moved to [`fan_out`], off the loop: the URL is filled from the
-    /// candidate's Linear attachment when there is one and carried EMPTY when there is not, and the
-    /// quorum task resolves it by head branch and drops the request there if GitHub has no open PR
-    /// either. Keeping it here would mean either a network call on the control task or, as before,
-    /// a quorum that is structurally dead wherever Linear holds no attachments.
+    /// §0.12's remaining two gates are deliberately NOT here, and both for the same reason: they
+    /// are questions only GitHub can answer, and the control task makes no network call.
+    ///
+    /// * "the ticket has an open linked PR" moved to [`fan_out`] in STUDIO-674 — the URL is filled
+    ///   from the candidate's Linear attachment when there is one and carried EMPTY when there is
+    ///   not, and the quorum task resolves it by head branch. Keeping it here would mean a quorum
+    ///   that is structurally dead wherever Linear holds no attachments.
+    /// * "the ticket is not already marked" is GONE, not moved (STUDIO-822). The marker label said
+    ///   *this ticket has been reviewed once*, and once-per-ticket refused exactly the rounds that
+    ///   exist because a reviewer found something. What replaced it is per-HEAD and therefore also
+    ///   [`fan_out`]'s, since the head is GitHub's answer and not this task's. The label is still
+    ///   WRITTEN — see [`QUORUM_REQUESTED_LABEL`] — and a re-handoff now reaches the off-loop task,
+    ///   which costs one `gh pr list` and, at an unchanged head, still fans out nothing.
     pub(crate) fn plan_quorum(
         &self,
         re: &crate::orchestrator::RunningEntry,
@@ -1024,23 +1309,6 @@ impl Orchestrator {
         // source of truth the attachment was only ever a cache of — and drops the request there if
         // GitHub has no open PR either. Nothing on this path touches the network.
         let pr_url = facts.map(|f| f.pr_url.clone()).unwrap_or_default();
-        // The marker is checked from the candidate's already-fetched labels, and from the RUN's own
-        // copy too: a fresh dispatch stamps the issue it was dispatched with, so a re-handoff after
-        // review fixes carries the marker even if a tick has not landed yet.
-        let marked = facts.is_some_and(|f| f.already_requested)
-            || re
-                .issue
-                .labels
-                .iter()
-                .flatten()
-                .any(|l| l.eq_ignore_ascii_case(QUORUM_REQUESTED_LABEL));
-        if marked {
-            tracing::debug!(
-                issue = %re.issue.identifier,
-                "teams quorum already requested for this ticket; the re-handoff fans out nothing"
-            );
-            return None;
-        }
         // The remote the run pushed its branch to, with [`Orchestrator::bind_teams_run`]'s fallback
         // and for its reason: a legacy single-project config never populates `project_repo` (only
         // the resolved-project dispatch path sets it) and carries the repo top-level instead.
@@ -1063,6 +1331,7 @@ impl Orchestrator {
             // project's slug-bound tracker (STUDIO-677). Empty on the legacy single-project path,
             // which is the account tracker's own slug and handled as such.
             parent_project_slug: re.project_slug.clone(),
+            parent_project_group: self.quorum_warning_group(re),
             pr_url,
             // Derived from config alone, and carried even when the attachment already won so the
             // request's shape never depends on which path filled the URL. `symphony/<key>` is the
@@ -1076,6 +1345,32 @@ impl Orchestrator {
             state_name: self.quorum_create_state(&re.project_slug),
             summon_token: self.quorum_summon_token(),
         })
+    }
+
+    /// The project GROUP a fan-out this daemon gives up on is reported against (STUDIO-822), so the
+    /// advisory lands on the same `GET /api/v1/projects` row an operator already reads for that
+    /// project.
+    ///
+    /// The run's own group when it has one. It may not: `project_group` is unset on the legacy
+    /// single-project and test dispatch paths — `project_statuses` falls back to the slug for the
+    /// same reason — so the slug's resolved project answers next, and a single-project
+    /// installation (which resolves to exactly one project) answers from that one. An empty result
+    /// records the advisory under the empty group, where nothing renders it and the `WARN` line
+    /// remains the only trace; that is a degradation, not a silent one, and it takes a config with
+    /// no resolvable project at all to reach.
+    fn quorum_warning_group(&self, re: &crate::orchestrator::RunningEntry) -> String {
+        if !re.project_group.is_empty() {
+            return re.project_group.clone();
+        }
+        let Some(eff) = self.eff.as_ref() else {
+            return re.project_slug.clone();
+        };
+        eff.projects
+            .iter()
+            .find(|p| p.slug == re.project_slug)
+            .or_else(|| (eff.projects.len() == 1).then(|| &eff.projects[0]))
+            .map(|p| p.group.clone())
+            .unwrap_or_else(|| re.project_slug.clone())
     }
 
     /// The workflow state a review ticket is created in: the run's owning project's FIRST
@@ -1187,6 +1482,14 @@ mod tests {
         }
     }
 
+    /// The pull request a [`FakePrSource`] answers with: a URL and a head.
+    fn open_pr(url: &str, head: &str) -> crate::ghsummons::OpenPr {
+        crate::ghsummons::OpenPr {
+            url: url.to_string(),
+            head_sha: head.to_string(),
+        }
+    }
+
     /// An [`OpenPrSource`] that answers every lookup with `answer`, recording what it was asked.
     struct FakePrSource {
         answer: Box<dyn Fn() -> OpenPrResult + Send + Sync>,
@@ -1233,6 +1536,7 @@ mod tests {
             room: None,
             pr_source: None,
             max_backoff_ms: 20,
+            warnings: None,
         }
     }
 
@@ -1263,6 +1567,7 @@ mod tests {
             room: None,
             pr_source: None,
             max_backoff_ms: 20,
+            warnings: None,
         }
     }
 
@@ -1308,6 +1613,15 @@ mod tests {
             ..Default::default()
         };
         tr
+    }
+
+    /// One fan-out attempt against a parent nothing has been requested for yet — what every test
+    /// below wants unless it is specifically about the repeat handoff.
+    async fn fan(
+        d: &QuorumDeps<impl Fn() -> Option<QuorumTarget>>,
+        req: &QuorumRequest,
+    ) -> FanOutcome {
+        fan_out(d, req, None).await.outcome
     }
 
     /// Every message in the room, oldest first.
@@ -1414,7 +1728,7 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request(&["bob", "carol"])).await,
+            fan(&d, &request(&["bob", "carol"])).await,
             FanOutcome::Fanned {
                 created: 2,
                 wanted: 2
@@ -1499,7 +1813,7 @@ mod tests {
             Arc::clone(&room) as Arc<dyn RoomLog>,
         );
 
-        assert_eq!(fan_out(&d, &request(&[])).await, FanOutcome::NoReviewers);
+        assert_eq!(fan(&d, &request(&[])).await, FanOutcome::NoReviewers);
         assert!(tr.create_issue_calls().is_empty(), "nothing is created");
         assert!(tr.add_label_calls().is_empty(), "and nothing is marked");
 
@@ -1530,7 +1844,7 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request(&["bob", "carol"])).await,
+            fan(&d, &request(&["bob", "carol"])).await,
             FanOutcome::Fanned {
                 created: 1,
                 wanted: 2
@@ -1554,9 +1868,11 @@ mod tests {
     }
 
     // Every create failing is a TrackerFailure: the parent is NOT marked (so a later handoff may
-    // still try), the room is told loudly, and the caller backs off.
+    // still try), no head is recorded, and the reason comes back for the task to report. NOTHING is
+    // posted here — the room hears about it once, at exhaustion (STUDIO-822), because a per-attempt
+    // post would say "abandoned" three times for one outage.
     #[tokio::test]
-    async fn a_total_failure_leaves_the_parent_unmarked_and_posts_loudly() {
+    async fn a_total_failure_leaves_the_parent_unmarked_and_carries_the_reason_out() {
         let dir = TempDir::new();
         let room = Arc::new(LocalRoom::new(dir.child("room")));
         let mut fake = tracker_with_viewer();
@@ -1568,17 +1884,25 @@ mod tests {
             Arc::clone(&room) as Arc<dyn RoomLog>,
         );
 
-        assert_eq!(
-            fan_out(&d, &request(&["bob", "carol"])).await,
-            FanOutcome::TrackerFailure
-        );
+        let res = fan_out(&d, &request(&["bob", "carol"]), None).await;
+        assert_eq!(res.outcome, FanOutcome::TrackerFailure);
         assert!(
             tr.add_label_calls().is_empty(),
             "nothing was requested, so nothing is marked"
         );
-        let body = &room_posts(&room)[0].body;
-        assert!(body.contains("REVIEW QUORUM FAILED"), "{body}");
-        assert!(body.contains("NOT marked"), "{body}");
+        assert!(
+            !res.outcome.records_the_head(),
+            "a total failure wrote nothing, so a later handoff must still be able to ask"
+        );
+        assert!(
+            res.failure_why.contains("linear_api_status: 503"),
+            "the tracker's own error is carried out, not just the fact of failure: {}",
+            res.failure_why
+        );
+        assert!(
+            room_posts(&room).is_empty(),
+            "an attempt that will be retried says nothing to the room"
+        );
     }
 
     // Without a viewer to assign to, creating the tickets would be worse than creating none: an
@@ -1596,12 +1920,14 @@ mod tests {
             Arc::clone(&room) as Arc<dyn RoomLog>,
         );
 
-        assert_eq!(
-            fan_out(&d, &request(&["bob", "carol"])).await,
-            FanOutcome::TrackerFailure
-        );
+        let res = fan_out(&d, &request(&["bob", "carol"]), None).await;
+        assert_eq!(res.outcome, FanOutcome::TrackerFailure);
         assert!(tr.create_issue_calls().is_empty());
-        assert!(room_posts(&room)[0].body.contains("REVIEW QUORUM FAILED"));
+        assert!(
+            res.failure_why.contains("never picked up"),
+            "the viewer case keeps its own explanation: {}",
+            res.failure_why
+        );
     }
 
     // The room is advisory and Linear is the ledger (§0.11.4): a room that cannot be written costs
@@ -1638,7 +1964,7 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request(&["bob", "carol"])).await,
+            fan(&d, &request(&["bob", "carol"])).await,
             FanOutcome::Fanned {
                 created: 2,
                 wanted: 2
@@ -1664,7 +1990,7 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request(&["bob", "carol"])).await,
+            fan(&d, &request(&["bob", "carol"])).await,
             FanOutcome::Fanned {
                 created: 2,
                 wanted: 2
@@ -1685,9 +2011,10 @@ mod tests {
             room: None,
             pr_source: None,
             max_backoff_ms: 20,
+            warnings: None,
         };
         assert_eq!(
-            fan_out(&d, &request(&["bob"])).await,
+            fan(&d, &request(&["bob"])).await,
             FanOutcome::TrackerFailure
         );
     }
@@ -1722,7 +2049,7 @@ mod tests {
         };
 
         assert_eq!(
-            fan_out(&d, &req).await,
+            fan(&d, &req).await,
             FanOutcome::Fanned {
                 created: 2,
                 wanted: 2
@@ -1771,7 +2098,7 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request(&["bob"])).await,
+            fan(&d, &request(&["bob"])).await,
             FanOutcome::Fanned {
                 created: 1,
                 wanted: 1
@@ -1807,8 +2134,9 @@ mod tests {
             ..request(&["bob", "carol"])
         };
 
+        let res = fan_out(&d, &req, None).await;
         assert_eq!(
-            fan_out(&d, &req).await,
+            res.outcome,
             FanOutcome::TrackerFailure,
             "nothing was created, so the parent must stay unmarked for a later handoff"
         );
@@ -1825,18 +2153,19 @@ mod tests {
             account.add_label_calls().is_empty(),
             "a fan-out that created nothing does not mark the parent"
         );
-
-        let posts = room_posts(&room);
-        assert_eq!(posts.len(), 1, "the failure is said out loud: {posts:?}");
         assert!(
-            posts[0].body.starts_with("REVIEW QUORUM FAILED for MT-1"),
-            "{}",
-            posts[0].body
+            res.failure_why.contains("bob, carol"),
+            "the reason names who was asked: {}",
+            res.failure_why
         );
         assert!(
-            posts[0].body.contains("bob, carol"),
-            "naming who was asked: {}",
-            posts[0].body
+            res.failure_why.contains("tracker.project_slug"),
+            "…and what Linear actually said: {}",
+            res.failure_why
+        );
+        assert!(
+            room_posts(&room).is_empty(),
+            "the room hears about it once, at exhaustion, not once per attempt"
         );
     }
 
@@ -1848,7 +2177,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_without_an_attachment_resolves_the_pr_by_head_branch() {
         let tr = Arc::new(tracker_with_viewer());
-        let src = FakePrSource::new(|| Ok(Some("https://github.com/o/r/pull/64".to_string())));
+        let src =
+            FakePrSource::new(|| Ok(Some(open_pr("https://github.com/o/r/pull/64", "head-a"))));
         let d = deps_with_pr_source(
             teams_quorum(&["alice", "bob", "carol"], 2),
             Arc::clone(&tr),
@@ -1856,7 +2186,7 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request_without_attachment(&["bob", "carol"])).await,
+            fan(&d, &request_without_attachment(&["bob", "carol"])).await,
             FanOutcome::Fanned {
                 created: 2,
                 wanted: 2
@@ -1892,12 +2222,14 @@ mod tests {
         assert_eq!(labels[0].label_name, QUORUM_REQUESTED_LABEL);
     }
 
-    // The attachment still wins: a request that already carries a url makes NO network call. This
-    // is the "behaviour unchanged where Linear works" half of the ticket.
+    // The attachment no longer skips the lookup (STUDIO-822): the head is what the repeat guard
+    // compares, the attachment carries none, and GitHub is the only place one can be learned. When
+    // GitHub answers, its answer — url AND head — is what reviewers are handed.
     #[tokio::test]
-    async fn an_attachment_wins_and_costs_no_lookup() {
+    async fn an_attachment_still_costs_a_lookup_because_it_carries_no_head() {
         let tr = Arc::new(tracker_with_viewer());
-        let src = FakePrSource::new(|| panic!("the attachment path must not query GitHub"));
+        let src =
+            FakePrSource::new(|| Ok(Some(open_pr("https://github.com/o/r/pull/7", "head-a"))));
         let d = deps_with_pr_source(
             teams_quorum(&["alice", "bob"], 2),
             Arc::clone(&tr),
@@ -1905,23 +2237,57 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request(&["bob"])).await,
+            fan(&d, &request(&["bob"])).await,
             FanOutcome::Fanned {
                 created: 1,
                 wanted: 1
             }
         );
+        assert_eq!(src.calls().len(), 1, "the head is asked for even so");
+        let body = &tr.create_issue_calls()[0].spec.description;
+        assert!(body.contains("https://github.com/o/r/pull/7"), "{body}");
         assert!(
-            src.calls().is_empty(),
-            "no lookup when Linear already knows"
+            body.contains("head-a"),
+            "the head is named on the ticket: {body}"
         );
-        assert!(
-            tr.create_issue_calls()[0]
-                .spec
-                .description
-                .contains("https://github.com/o/r/pull/7"),
-            "the attachment's url is what reviewers get"
-        );
+    }
+
+    // …and when GitHub answers NOTHING, the attachment is still honoured: a lookup blip must not
+    // turn into a missing review, which is the failure this whole ticket is about. The price is the
+    // per-head granularity, which degrades to the per-pull-request guard it replaced.
+    #[tokio::test]
+    async fn an_attachment_is_the_fallback_when_the_lookup_answers_nothing() {
+        for answer in [
+            || -> OpenPrResult { Ok(None) },
+            || -> OpenPrResult { Err("gh: command not found".into()) },
+        ] {
+            let tr = Arc::new(tracker_with_viewer());
+            let src = FakePrSource::new(answer);
+            let d = deps_with_pr_source(
+                teams_quorum(&["alice", "bob"], 2),
+                Arc::clone(&tr),
+                Arc::clone(&src),
+            );
+
+            let res = fan_out(&d, &request(&["bob"]), None).await;
+            assert_eq!(
+                res.outcome,
+                FanOutcome::Fanned {
+                    created: 1,
+                    wanted: 1
+                }
+            );
+            assert!(res.head.is_empty(), "no head could be learned");
+            let body = &tr.create_issue_calls()[0].spec.description;
+            assert!(
+                body.contains("https://github.com/o/r/pull/7"),
+                "the attachment's url is what reviewers get: {body}"
+            );
+            assert!(
+                !body.contains("**Head:**"),
+                "an unknown head is omitted rather than rendered blank: {body}"
+            );
+        }
     }
 
     // No open PR on the branch either: the request is dropped where the ticket says it should be —
@@ -1938,13 +2304,13 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request_without_attachment(&["bob", "carol"])).await,
+            fan(&d, &request_without_attachment(&["bob", "carol"])).await,
             FanOutcome::NoPullRequest
         );
         assert!(tr.create_issue_calls().is_empty(), "no review ticket");
         assert!(tr.add_label_calls().is_empty(), "the parent is NOT marked");
         assert!(
-            !FanOutcome::NoPullRequest.settles_the_parent(),
+            !FanOutcome::NoPullRequest.records_the_head(),
             "a later handoff, once the PR exists, must still be able to fan out"
         );
         assert!(
@@ -1967,7 +2333,7 @@ mod tests {
         );
 
         assert_eq!(
-            fan_out(&d, &request_without_attachment(&["bob"])).await,
+            fan(&d, &request_without_attachment(&["bob"])).await,
             FanOutcome::NoPullRequest
         );
         assert!(tr.create_issue_calls().is_empty() && tr.add_label_calls().is_empty());
@@ -1981,7 +2347,7 @@ mod tests {
         let d = deps(teams_quorum(&["alice", "bob"], 2), Arc::clone(&tr));
 
         assert_eq!(
-            fan_out(&d, &request_without_attachment(&["bob"])).await,
+            fan(&d, &request_without_attachment(&["bob"])).await,
             FanOutcome::NoPullRequest
         );
         assert!(tr.create_issue_calls().is_empty() && tr.add_label_calls().is_empty());
@@ -2005,19 +2371,19 @@ mod tests {
             ..request_without_attachment(&["bob"])
         };
 
-        assert_eq!(fan_out(&d, &req).await, FanOutcome::NoPullRequest);
+        assert_eq!(fan(&d, &req).await, FanOutcome::NoPullRequest);
         assert!(tr.create_issue_calls().is_empty() && tr.add_label_calls().is_empty());
     }
 
-    // The task-level consequence of not settling: two handoffs of the same ticket, the first before
-    // the PR exists and the second after, fan out on the second. The `settled` set must not have
-    // swallowed it.
+    // The task-level consequence of recording no head: two handoffs of the same ticket, the first
+    // before the PR exists and the second after, fan out on the second. The repeat guard must not
+    // have swallowed it.
     #[tokio::test]
     async fn a_second_handoff_after_the_pr_appears_fans_out() {
         let tr = Arc::new(tracker_with_viewer());
         let answers = Arc::new(Mutex::new(vec![
             Ok(None),
-            Ok(Some("https://github.com/o/r/pull/64".to_string())),
+            Ok(Some(open_pr("https://github.com/o/r/pull/64", "head-a"))),
         ]));
         let queue = Arc::clone(&answers);
         let src = FakePrSource::new(move || {
@@ -2056,7 +2422,7 @@ mod tests {
     #[test]
     fn the_reviewer_description_renders_without_leaking_source_indentation() {
         let req = request(&["bob"]);
-        let body = review_description(&req, "bob");
+        let body = review_description(&req, "bob", "head-a");
 
         for (n, line) in body.lines().enumerate() {
             assert!(
@@ -2083,6 +2449,22 @@ mod tests {
         assert!(body.contains("Never merge"), "{body}");
         // The reviewer is named, so the run knows which identity it is wearing.
         assert!(body.contains("You are **bob**"), "{body}");
+        // The head sits between the pull request and what it is reviewing, on its own line and with
+        // no blank line either side (STUDIO-822). Pinned as an exact adjacency because a lost or
+        // doubled `\n` around an interpolated block is invisible in the source and obvious only in
+        // the shipped prose.
+        assert!(
+            body.contains(
+                "**Pull request:** https://github.com/o/r/pull/7\n**Head:** head-a\n**Reviewing:**"
+            ),
+            "{body}"
+        );
+        // …and it vanishes cleanly when GitHub stated no head, leaving the two lines adjacent.
+        let headless = review_description(&req, "bob", "");
+        assert!(
+            headless.contains("**Pull request:** https://github.com/o/r/pull/7\n**Reviewing:**"),
+            "{headless}"
+        );
     }
 
     // The title is the host template §0.12 names, and it leads with the parent's identifier so a
@@ -2136,9 +2518,11 @@ mod tests {
             o.quorum_facts["iss-1"].pr_url,
             "https://github.com/o/r/pull/7"
         );
-        assert!(!o.quorum_facts["iss-1"].already_requested);
-        assert!(o.quorum_facts["iss-2"].already_requested);
-        assert!(!o.quorum_facts["iss-3"].already_requested);
+        assert!(
+            o.quorum_facts.contains_key("iss-2"),
+            "a marked parent is still a candidate: the marker label stopped being a refusal in \
+             STUDIO-822, so the sweep records it like any other"
+        );
     }
 
     // Replaces rather than merges: a ticket that has left the candidate set stops asserting a PR
@@ -2246,8 +2630,9 @@ mod tests {
 
     // ── the task ────────────────────────────────────────────────────────────────────────────────
 
-    // §0.12's "once per ticket", in-process half: a second handoff of the SAME parent fans out
-    // nothing, even before a poll could refresh the marker label onto the candidate.
+    // A second handoff of the same parent at an unchanged head fans out nothing. This is the case
+    // §0.12 reached for "once per ticket" to cover, and the per-head record still covers it — what
+    // it no longer does is refuse the handoffs that arrive at a NEW head (STUDIO-822).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_second_handoff_of_the_same_parent_fans_out_nothing() {
         let tr = Arc::new(tracker_with_viewer());
@@ -2303,31 +2688,27 @@ mod tests {
         signal.cancel();
     }
 
-    // A tracker that refuses everything must not turn into a hot retry loop: a failed fan-out
-    // delays the NEXT one, and the failed one is never retried at all — a re-handoff is the only
-    // thing entitled to ask again.
+    // A tracker that refuses everything is retried a BOUNDED number of times and then abandoned —
+    // never a hot loop, and never (as before STUDIO-822) a single attempt whose failure silently
+    // lost the round.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_fan_out_backs_off_and_is_never_retried() {
+    async fn a_failed_fan_out_is_retried_a_bounded_number_of_times() {
         let mut fake = tracker_with_viewer();
         fake.create_issue_err = Some(TrackerError::Other("linear_api_status: 503".into()));
         let tr = Arc::new(fake);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let signal = crate::control_loop::CancelSignal::new();
-        let d = deps(teams_quorum(&["alice", "bob", "carol"], 2), Arc::clone(&tr));
+        let d = deps(teams_quorum(&["alice", "bob"], 1), Arc::clone(&tr));
         let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
 
-        for n in 1..=3 {
-            let mut req = request(&["bob"]);
-            req.parent_issue_id = format!("iss-{n}");
-            tx.send(req).expect("send");
-        }
+        tx.send(request(&["bob"])).expect("send");
         drop(tx);
         task.await.expect("task joins");
 
         assert_eq!(
             tr.create_issue_calls().len(),
-            3,
-            "one attempt per REQUEST, never a retry of a failed one"
+            QUORUM_FANOUT_ATTEMPTS as usize,
+            "one create per reviewer per attempt, and exactly QUORUM_FANOUT_ATTEMPTS attempts"
         );
         signal.cancel();
     }
@@ -2356,5 +2737,360 @@ mod tests {
             );
         }
         assert!(FanOutcome::TrackerFailure.is_failure());
+    }
+
+    // ── the per-head repeat guard (STUDIO-822) ──────────────────────────────────────────────────
+
+    const PR: &str = "https://github.com/o/r/pull/64";
+
+    /// The parent as it looks on round 2 and after: wearing the marker label round 1 wrote, which
+    /// used to be the whole reason no reviewer was ever assigned again.
+    fn marked_parent() -> Issue {
+        let mut i = issue("iss-1", "MT-1", "In Review");
+        i.team_id = "team-1".to_string();
+        i.title = "do the thing".to_string();
+        i.labels = Some(vec![
+            QUORUM_REQUESTED_LABEL.to_string(),
+            "rhapsody:@alice".to_string(),
+        ]);
+        i
+    }
+
+    /// The run `plan_quorum` decides on: `iss`, handed off by `identity`.
+    fn running_entry(iss: Issue, identity: &str) -> crate::orchestrator::RunningEntry {
+        crate::orchestrator::RunningEntry {
+            identity: identity.to_string(),
+            project_repo: "git@github.com:o/r.git".to_string(),
+            ..crate::orchestrator::RunningEntry::empty(iss)
+        }
+    }
+
+    /// Runs `reqs` through the task, front to back, against a source answering `heads` in order
+    /// (and its last answer forever after). Returns the tracker the fan-outs wrote through.
+    async fn run_handoffs(
+        reqs: Vec<QuorumRequest>,
+        heads: &[&str],
+    ) -> (Arc<Fake>, Arc<FakePrSource>) {
+        let tr = Arc::new(tracker_with_viewer());
+        let queue: Vec<String> = heads.iter().map(|h| (*h).to_string()).collect();
+        let queue = Arc::new(Mutex::new(queue));
+        let src = FakePrSource::new(move || {
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            let head = if q.len() > 1 {
+                q.remove(0)
+            } else {
+                q[0].clone()
+            };
+            Ok(Some(open_pr(PR, &head)))
+        });
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 1),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+        for r in reqs {
+            tx.send(r).expect("send");
+        }
+        drop(tx);
+        task.await.expect("task joins");
+        signal.cancel();
+        (tr, src)
+    }
+
+    // THE acceptance, and it crosses BOTH of the guards this ticket removed — which is the point:
+    // a test that drove only one would have passed while the other still refused every repeat
+    // handoff, which is exactly how the operator's "clear the label" workaround failed.
+    //
+    //   * GUARD A, the marker label: the parent already wears it, and the CONTROL task must still
+    //     build a request. A label cannot carry a commit, so it cannot tell round 2 of a pull
+    //     request from the same round asked twice.
+    //   * GUARD B, the in-memory record: the same request arrives twice with the author's fixes
+    //     pushed in between, so GitHub answers a new head — and the second one fans out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_handoff_at_a_new_head_fans_out_a_second_review() {
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
+        o.record_quorum_state(std::iter::once(&marked_parent()));
+        let req = o
+            .plan_quorum(&running_entry(marked_parent(), "alice"))
+            .expect("a parent already marked must still plan a fan-out");
+
+        let (tr, src) = run_handoffs(vec![req.clone(), req], &["head-a", "head-b"]).await;
+
+        let created = tr.create_issue_calls();
+        assert_eq!(
+            created.len(),
+            2,
+            "round 2 exists BECAUSE a reviewer found something; it needs its own reviewer"
+        );
+        assert!(
+            created[0].spec.description.contains("head-a"),
+            "{}",
+            created[0].spec.description
+        );
+        assert!(
+            created[1].spec.description.contains("head-b"),
+            "the second review ticket names the NEW head, so the two rounds are tellable apart: {}",
+            created[1].spec.description
+        );
+        assert_eq!(
+            src.calls().len(),
+            2,
+            "each handoff asked GitHub where the PR is"
+        );
+    }
+
+    // The inverse, and the reason the guards could not simply be deleted: a repeat handoff at the
+    // SAME head — the shape a live review of that head is in — must fan out nothing, or a second
+    // agent wakes onto a diff somebody is already reading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_handoff_at_the_same_head_fans_out_nothing() {
+        let mut o = orch_with(teams_quorum(&["alice", "bob"], 1));
+        o.record_quorum_state(std::iter::once(&marked_parent()));
+        let req = o
+            .plan_quorum(&running_entry(marked_parent(), "alice"))
+            .expect("planned");
+
+        let (tr, src) = run_handoffs(vec![req.clone(), req], &["head-a"]).await;
+
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            1,
+            "the head has not moved, so there is nothing new to review: {:?}",
+            tr.create_issue_calls()
+        );
+        assert_eq!(
+            tr.add_label_calls().len(),
+            1,
+            "and the parent is marked once, not once per handoff"
+        );
+        assert_eq!(
+            src.calls().len(),
+            2,
+            "the repeat handoff still ASKS — the head is the only thing that can answer it"
+        );
+    }
+
+    // A pull request GitHub answers without a `headRefOid` degrades to the per-pull-request guard
+    // rather than fanning out on every handoff forever: an unknown head compares equal to the next
+    // unknown head. Pinned because the alternative — treating an empty head as "new" — turns a
+    // GitHub quirk into a duplicate-reviewer loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_head_degrades_to_one_fan_out_rather_than_repeating() {
+        let req = request(&["bob"]);
+        let (tr, _) = run_handoffs(vec![req.clone(), req], &[""]).await;
+        assert_eq!(tr.create_issue_calls().len(), 1);
+    }
+
+    // ── the retry and its exhaustion (STUDIO-822, defect 2) ─────────────────────────────────────
+
+    // The observed failure: ONE connection error to Linear, and that round's review simply did not
+    // exist. It is a retry now, and the retry recovers on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transient_fan_out_failure_is_retried_and_recovers() {
+        let mut fake = tracker_with_viewer();
+        // The real thing, verbatim from `rhapsodyd.2026-09-09.log`: a request that never left.
+        fake.create_issue_fail_first = 1;
+        let tr = Arc::new(fake);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let d = deps(teams_quorum(&["alice", "bob"], 1), Arc::clone(&tr));
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        tx.send(request(&["bob"])).expect("send");
+        drop(tx);
+        task.await.expect("task joins");
+
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            2,
+            "the first attempt failed and the second one made the ticket"
+        );
+        assert_eq!(
+            tr.add_label_calls().len(),
+            1,
+            "the recovered fan-out finishes normally"
+        );
+        signal.cancel();
+    }
+
+    // …and when the retries run out, the round is gone for good — so it must be visible somewhere
+    // an operator looks. A `WARN` in a log running 23 MB/day was where it used to live.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exhausting_the_retries_surfaces_on_the_project_and_in_the_room() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let warnings = Arc::new(crate::warnings::WarningsState::default());
+        let mut fake = tracker_with_viewer();
+        fake.create_issue_err = Some(TrackerError::Other(
+            "linear_api_request: error sending request for url".into(),
+        ));
+        let tr = Arc::new(fake);
+        let d = QuorumDeps {
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            warnings: Some(Arc::clone(&warnings)),
+            ..deps(teams_quorum(&["alice", "bob"], 1), Arc::clone(&tr))
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        tx.send(QuorumRequest {
+            parent_project_group: "proj-a".into(),
+            ..request(&["bob"])
+        })
+        .expect("send");
+        drop(tx);
+        task.await.expect("task joins");
+
+        let advisories = warnings.merged_for("proj-a");
+        assert_eq!(
+            advisories.len(),
+            1,
+            "the abandoned round is on the project an operator reads: {advisories:?}"
+        );
+        assert!(advisories[0].contains("MT-1"), "{}", advisories[0]);
+        assert!(
+            advisories[0].contains("error sending request for url"),
+            "naming what actually went wrong: {}",
+            advisories[0]
+        );
+
+        let posts = room_posts(&room);
+        assert_eq!(
+            posts.len(),
+            1,
+            "ONE post for the whole outage, not one per attempt: {posts:?}"
+        );
+        assert!(
+            posts[0].body.contains("REVIEW QUORUM ABANDONED for MT-1"),
+            "{}",
+            posts[0].body
+        );
+        signal.cancel();
+    }
+
+    // …and it must name the pull request a HUMAN can open. On an installation whose Linear holds
+    // no GitHub attachments — STUDIO-674's whole premise, and the state of this daemon — the
+    // request arrives with an EMPTY `pr_url` and only the branch, so the one message telling an
+    // operator that a review round is permanently gone can only name the URL the fan-out itself
+    // resolved. Driven from [`request_without_attachment`] precisely so the assertion cannot pass
+    // on a string that was already in the request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_abandonment_post_names_the_resolved_pull_request() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let warnings = Arc::new(crate::warnings::WarningsState::default());
+        let mut fake = tracker_with_viewer();
+        fake.create_issue_err = Some(TrackerError::Other(
+            "linear_api_request: error sending request for url".into(),
+        ));
+        let tr = Arc::new(fake);
+        let src = FakePrSource::new(|| Ok(Some(open_pr(PR, "head-a"))));
+        let d = QuorumDeps {
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            warnings: Some(Arc::clone(&warnings)),
+            ..deps_with_pr_source(
+                teams_quorum(&["alice", "bob"], 1),
+                Arc::clone(&tr),
+                Arc::clone(&src),
+            )
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        tx.send(QuorumRequest {
+            parent_project_group: "proj-a".into(),
+            ..request_without_attachment(&["bob"])
+        })
+        .expect("send");
+        drop(tx);
+        task.await.expect("task joins");
+
+        let posts = room_posts(&room);
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert!(
+            posts[0].body.contains(PR),
+            "the abandonment post must name the pull request the fan-out resolved, or the human \
+             it is addressed to has nothing to open: {}",
+            posts[0].body
+        );
+        signal.cancel();
+    }
+
+    // ── the lookup blip that must not duplicate a review (STUDIO-822) ───────────────────────────
+
+    // A `gh` failure answers an UNKNOWN head. When nothing has been requested yet that degrades to
+    // one fan-out, which is right — refusing there would lose a review outright. When a head is
+    // already on record it is the opposite: a review WAS requested, so fanning out again wakes a
+    // second reviewer onto a diff someone is already reading — and, because the blip would
+    // overwrite the record with the unknown head, the next SUCCESSFUL lookup at the same head
+    // would wake a third.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lookup_blip_does_not_re_review_a_head_already_requested() {
+        let tr = Arc::new(tracker_with_viewer());
+        // Answer, blip, answer: the same head either side of one failed `gh` call.
+        let nth = Arc::new(Mutex::new(0usize));
+        let src = FakePrSource::new(move || {
+            let mut n = nth.lock().unwrap_or_else(|e| e.into_inner());
+            *n += 1;
+            if *n == 2 {
+                Err("gh: rate limited".into())
+            } else {
+                Ok(Some(open_pr(PR, "head-a")))
+            }
+        });
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 1),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        let req = request(&["bob"]);
+        for _ in 0..3 {
+            tx.send(req.clone()).expect("send");
+        }
+        drop(tx);
+        task.await.expect("task joins");
+
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            1,
+            "the blip must not wake a second reviewer, nor lose the recorded head and let the \
+             next successful lookup wake a third"
+        );
+        assert_eq!(src.calls().len(), 3, "every handoff still ASKS");
+        signal.cancel();
+    }
+
+    // The advisory outlives the next success, alone among the warning producers. Every other one
+    // describes a live condition that self-heals; this one describes a round that will never be
+    // reviewed, and clearing it on an unrelated later handoff is how it stayed invisible.
+    #[test]
+    fn an_abandoned_fan_out_is_not_cleared_by_a_later_one() {
+        let w = crate::warnings::WarningsState::default();
+        for n in 1..=crate::warnings::LOST_REVIEW_WARN_CAP + 2 {
+            w.record_lost_review("proj-a", &format!("MT-{n}"), "boom");
+        }
+        let got = w.merged_for("proj-a");
+        assert_eq!(
+            got.len(),
+            crate::warnings::LOST_REVIEW_WARN_CAP,
+            "capped, because nothing clears it: {got:?}"
+        );
+        assert!(
+            got[0].contains("MT-3") && got.last().is_some_and(|l| l.contains("MT-7")),
+            "the OLDEST are dropped, so the advisory always names the most recent: {got:?}"
+        );
+        assert!(
+            w.merged_for("proj-b").is_empty(),
+            "and it is scoped to its own project"
+        );
     }
 }

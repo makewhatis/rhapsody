@@ -238,7 +238,11 @@ pub async fn run_diff(plan: &DiffPlan, deps: &DiffDeps) -> DiffOutcome {
         .open_pr_for_branch(&plan.owner, &plan.repo, &plan.branch)
         .await
     {
-        Ok(Some(url)) => url,
+        // Only the URL. `OpenPr` also carries `head_sha` (STUDIO-822), but the head this
+        // endpoint serves a diff at is the one `pr_state` returns below, because that is the
+        // lookup carrying the `Gone`/`Untrusted` refusals — taking the sha from here instead
+        // would skip the boundary that vets it.
+        Ok(Some(open)) => open.url,
         // Not a refusal and not an error, and it covers TWO different situations: a branch never
         // pushed, and one whose pull request was merged or closed. `open_pr_for_branch` filters
         // `--state open`, so the second has no coordinate to read a diff at even though `gh pr
@@ -433,7 +437,12 @@ mod tests {
             if self.fail {
                 return Err("gh pr list: HTTP 502".into());
             }
-            Ok(self.url.map(str::to_string))
+            // `head_sha` stays empty: `run_diff` takes only the URL from this seam, and a
+            // value here would imply it reads one.
+            Ok(self.url.map(|url| crate::ghsummons::OpenPr {
+                url: url.to_string(),
+                head_sha: String::new(),
+            }))
         }
     }
 

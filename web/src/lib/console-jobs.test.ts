@@ -16,6 +16,7 @@ import {
   mateStates,
   needsOperator,
   relativeSince,
+  reviewRunIssues,
   reviewTicketIssues,
   statusNote,
   ticketAssignees,
@@ -137,6 +138,81 @@ describe("consoleJobStatus on a review ticket", () => {
   // A daemon that does not serve the field behaves exactly as it did before it existed.
   it("defaults to the pre-existing mapping when nothing is known", () => {
     expect(consoleJobStatus("running")).toBe("run");
+  });
+});
+
+// STUDIO-826 — a TICKETLESS review job (`review.mode: ticketless`) is a run against a pull request
+// with no tracker ticket behind it, so `/api/v1/history/issues` serves it with NO `lifecycle` and no
+// `review_ticket`: there is no ticket to resolve a state for and none to carry the marker label.
+// Every row below therefore leaves both fields off, because that absence IS the bug — a fixture that
+// supplies a lifecycle passes against the broken code.
+//
+// Both halves of the status were wrong. Live, the row said "running" because the only route to
+// `reviewing` was the ticket label. Finished, it said "in review" — `completed → review`, "the work
+// now awaits somebody's review" — which is the inverse of what a finished review means, and it
+// billed the operator's "Needs you" for a job that needed nobody.
+describe("a ticketless review job", () => {
+  it("says reviewing while the review run is live", () => {
+    expect(consoleJobStatus("running", undefined, false, true)).toBe("reviewing");
+  });
+
+  // The half a label-only reading of this ticket would miss: the review IS the work, so its
+  // completion is terminal. Nothing is handed to a reviewer, because the reviewer just left.
+  it("says done when the review run has finished", () => {
+    expect(consoleJobStatus("completed", undefined, false, true)).toBe("done");
+  });
+
+  // A failed review genuinely does need a person — it is the one review outcome that does.
+  it("still says blocked when the review run failed", () => {
+    expect(consoleJobStatus("failed", undefined, false, true)).toBe("blocked");
+    expect(consoleJobStatus("waiting", undefined, false, true)).toBe("blocked");
+  });
+
+  it("leaves a stopped review run queued for its next dispatch", () => {
+    expect(consoleJobStatus("stopped", undefined, false, true)).toBe("queued");
+  });
+
+  // The guard on the fix: an ORDINARY ticket the daemon could not resolve a lifecycle for still
+  // infers "in review" from its completed outcome, exactly as it did before. That inference is
+  // wrong only for a review run, and the flag is the whole difference.
+  it("changes nothing about a row that is not a review run", () => {
+    expect(consoleJobStatus("completed", undefined, false, false)).toBe("review");
+    expect(consoleJobStatus("running", undefined, false, false)).toBe("run");
+  });
+
+  // STUDIO-780's rows keep their behaviour untouched: a review TICKET parked in its tracker's
+  // review state is awaiting a person's read, and terminal is still terminal.
+  it("leaves a ticket-based review row alone", () => {
+    expect(consoleJobStatus("completed", "in_review", true, false)).toBe("review");
+    expect(consoleJobStatus("running", "in_review", true, false)).toBe("reviewing");
+    expect(consoleJobStatus("completed", "done", true, false)).toBe("done");
+  });
+});
+
+describe("reviewRunIssues", () => {
+  it("collects only the rows the daemon marked", () => {
+    const got = reviewRunIssues([
+      issueRow({ issue_identifier: "pr:acme/x#1@alice", review_run: true }),
+      issueRow({ issue_identifier: "MT-1" }),
+      issueRow({ issue_identifier: "MT-2", review_run: false }),
+    ]);
+    expect([...got]).toEqual(["pr:acme/x#1@alice"]);
+  });
+
+  // The daemon reads the run's own id; nothing on this side parses one. A key that merely LOOKS
+  // like a review run, or a title that opens with the word, is not the signal.
+  it("never reads the key or the title", () => {
+    const got = reviewRunIssues([
+      issueRow({
+        issue_identifier: "pr:acme/x#2@jimmy",
+        title: "Review acme/x#2 at abc1234",
+      }),
+    ]);
+    expect(got.size).toBe(0);
+  });
+
+  it("ignores a row with no key", () => {
+    expect(reviewRunIssues([issueRow({ issue_identifier: "", review_run: true })]).size).toBe(0);
   });
 });
 
@@ -769,6 +845,109 @@ describe("the Now strip's Needs you count", () => {
       blocked: 0,
       needsYou: 0,
     });
+  });
+});
+
+// STUDIO-826, end to end through the builder and the strip — David's own worklist, with both
+// teammates idle and 0 running:
+//
+//   pr:makewhatis/rhapsody#135@jimmy · Review makewhatis/rhapsody#135 at 34a573c   [ in review ]
+//   pr:makewhatis/rhapsody#136@alice · Review makewhatis/rhapsody#136 at 7b8b9e1   [ in review ]
+//
+// Both runs had FINISHED, and both pushed "Needs you" up while needing nobody. The payload below is
+// the shape `/api/v1/history/issues` actually served for them, measured on the live daemon: the
+// `pr:` rows carry `review_run` and NOTHING else — no `lifecycle`, no `review_ticket` — because
+// there is no ticket behind them. The ordinary ticket beside them is what a real page always has,
+// and it is also what keeps the count knowable (see the `needsYou` nullability above).
+describe("a page of ticketless review jobs", () => {
+  const rows = buildConsoleJobs(
+    [
+      job({ issue: "pr:makewhatis/rhapsody#135@jimmy", status: "completed" }),
+      job({ issue: "pr:makewhatis/rhapsody#136@alice", status: "completed" }),
+      job({ issue: "pr:makewhatis/rhapsody#137@alice", status: "running" }),
+      job({ issue: "pr:makewhatis/rhapsody#138@jimmy", status: "failed" }),
+      job({ issue: "STUDIO-712", status: "completed" }),
+    ],
+    [
+      issueRow({ issue_identifier: "pr:makewhatis/rhapsody#135@jimmy", review_run: true }),
+      issueRow({ issue_identifier: "pr:makewhatis/rhapsody#136@alice", review_run: true }),
+      issueRow({ issue_identifier: "pr:makewhatis/rhapsody#137@alice", review_run: true }),
+      issueRow({ issue_identifier: "pr:makewhatis/rhapsody#138@jimmy", review_run: true }),
+      issueRow({ issue_identifier: "STUDIO-712", lifecycle: "in_review" }),
+    ],
+    undefined,
+    NOW,
+  );
+  const row = (issue: string) => rows.find((r) => r.issue === issue);
+
+  it("paints the pill each review job's own run earned", () => {
+    expect(row("pr:makewhatis/rhapsody#137@alice")?.statusLabel).toBe("reviewing");
+    expect(row("pr:makewhatis/rhapsody#135@jimmy")?.statusLabel).toBe("done");
+    expect(row("pr:makewhatis/rhapsody#136@alice")?.statusLabel).toBe("done");
+    expect(row("pr:makewhatis/rhapsody#138@jimmy")?.statusLabel).toBe("blocked");
+    // The ordinary ticket on the same page is untouched: its work really does await a reviewer.
+    expect(row("STUDIO-712")?.statusLabel).toBe("in review");
+  });
+
+  // The half a pill-only test would miss, and the half David actually complained about: the strip
+  // said four tickets needed him while nothing did. Before the fix these numbers read
+  // `review: 3, needsYou: 4` — the three finished-or-live review runs inferred into "in review",
+  // plus the failed one.
+  it("bills Needs you for the failed review only", () => {
+    expect(consoleJobCounts(rows)).toEqual({
+      running: 1,
+      review: 1,
+      queued: 0,
+      blocked: 1,
+      needsYou: 2,
+    });
+  });
+
+  it("keeps a finished review out of both the In review stat and Needs you", () => {
+    expect(row("pr:makewhatis/rhapsody#135@jimmy")).toMatchObject({
+      status: "done",
+      needsYou: false,
+    });
+    expect(row("pr:makewhatis/rhapsody#136@alice")).toMatchObject({
+      status: "done",
+      needsYou: false,
+    });
+  });
+
+  // A failed review genuinely does need a person, and says so.
+  it("keeps a failed review billed to Needs you", () => {
+    expect(row("pr:makewhatis/rhapsody#138@jimmy")).toMatchObject({
+      status: "blocked",
+      needsYou: true,
+    });
+  });
+
+  // `reviewing` gets no Seg button of its own (STUDIO-780), and a ticketless one must not change
+  // that: the live review job files under "Running", never under "In review", and no row lands in
+  // two buckets. (The blocked row answers to no button but "All" — that is the Seg's pre-existing
+  // shape, unchanged here: `CONSOLE_JOB_FILTERS` has never offered a "blocked" one.)
+  it("keeps the Seg's buckets disjoint, with reviewing under Running", () => {
+    expect(filterConsoleJobs(rows, "run", "").map((r) => r.issue)).toEqual([
+      "pr:makewhatis/rhapsody#137@alice",
+    ]);
+    expect(filterConsoleJobs(rows, "review", "").map((r) => r.issue)).toEqual(["STUDIO-712"]);
+    const buckets = CONSOLE_JOB_FILTERS.filter((f) => f.id !== "all").flatMap((f) =>
+      filterConsoleJobs(rows, f.id, "").map((r) => r.issue),
+    );
+    expect(buckets.length).toBe(new Set(buckets).size);
+    expect([...buckets].sort()).toEqual([
+      "STUDIO-712",
+      "pr:makewhatis/rhapsody#135@jimmy",
+      "pr:makewhatis/rhapsody#136@alice",
+      "pr:makewhatis/rhapsody#137@alice",
+    ]);
+  });
+
+  // No tracker answered for these rows and none ever will, so the row's status is the RUN's — one
+  // fact, not two. "done · run done" would be the pill restating itself.
+  it("adds no run note to a row that has no ticket behind it", () => {
+    expect(row("pr:makewhatis/rhapsody#135@jimmy")?.statusNote).toBeUndefined();
+    expect(row("pr:makewhatis/rhapsody#138@jimmy")?.statusNote).toBeUndefined();
   });
 });
 

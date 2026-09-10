@@ -8,13 +8,13 @@
 //!
 //! # Why the sweep exists at all, rather than the watcher just calling the primitive
 //!
-//! [`crate::ghsummons::GH`] shells out through a synchronous `std::process::Command`. Its future
-//! has no await point, so it runs to completion in its first poll: a `tokio::time::timeout` around
-//! it cannot cancel it, and whatever task drives it is blocked for the whole round-trip. N pull
-//! requests in review would therefore be N serial blocking round-trips on whichever task asked —
-//! and on the control task that would be a daemon that stops dispatching every time GitHub is slow.
+//! [`crate::ghsummons::GH`] shells out through a synchronous `std::process::Command`. Since
+//! STUDIO-829 that exec is handed to tokio's blocking pool and bounded by
+//! `ghsummons::GH_EXEC_TIMEOUT`, so it yields and it terminates — but it is still a round-trip per
+//! call, and N pull requests in review are still N serial round-trips on whichever task asked. On
+//! the control task that would be a daemon that stops dispatching every time GitHub is slow.
 //!
-//! The containment is structural rather than temporal, exactly as [`crate::quorum`]'s is: this
+//! The containment is structural as well as temporal, exactly as [`crate::quorum`]'s is: this
 //! function takes no `Orchestrator`, sends no control event and holds no lock the control task
 //! takes, so a later slice drives it from its own spawned task and a stalled `gh` parks that task
 //! and nothing else. `pr_state_is_never_called_from_the_control_loop` is the standing check that it
@@ -419,6 +419,8 @@ mod tests {
     /// The architecture check (design record §14.2): the PR-state lookup shells out through a
     /// blocking `std::process::Command`, so a call site on the control task is a daemon that stops
     /// dispatching for as long as GitHub is slow — with N watched pull requests, N times over.
+    /// STUDIO-829's blocking-pool move bounds how long "slow" can be; it does not make the call
+    /// free, so the control task must still never be the one to make it.
     ///
     /// This asserts on CALL SITES across the whole workspace rather than on a type, because the
     /// mistake it guards against is a later slice reaching for a convenient `self.pr_source` from

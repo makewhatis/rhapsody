@@ -233,6 +233,10 @@ where
     // quorum is on: with `quorum.enabled: false` (the default) `o.quorum_tx` stays `None`, so a
     // handoff cannot even represent a fan-out. §0.12's cost control, enforced by construction.
     let quorum_rx = spawn_quorum(&teams_cfg).then(|| o.open_quorum_channel());
+    // Captured here because `o.control()` below consumes the orchestrator: the quorum task records
+    // a fan-out it gave up on against the owning project's advisories, which is the surface an
+    // operator reads (STUDIO-822).
+    let quorum_warnings = o.warnings_state();
 
     // --- ticketless review introduction (STUDIO-720, slice 6; design record
     // ~/.rhapsody/docs/STUDIO-703-ticketless-pr-review.md §14.1 F-SEC, §15-a) ---
@@ -681,6 +685,10 @@ where
                 None,
             ))),
             max_backoff_ms: rhapsody_orchestrator::MAX_QUORUM_BACKOFF_MS,
+            // STUDIO-822: where a fan-out retried to exhaustion is recorded. A LOCAL surface,
+            // deliberately — the fan-out fails because the tracker is unreachable, so a comment on
+            // the ticket is the one write guaranteed to fail for the same reason.
+            warnings: Some(quorum_warnings),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::run_quorum_task(quorum_ctx, deps, rx).await;
@@ -2308,6 +2316,37 @@ mod tests {
         assert!(
             parse_flags(&["--port".into(), "abc".into()]).is_err(),
             "non-numeric port must error"
+        );
+    }
+
+    /// The whole abandoned-fan-out advisory surface hangs off ONE field of the deps this function
+    /// hands the quorum task, and nothing in the workspace could see it go: every quorum test
+    /// builds its own `QuorumDeps`, so flipping this to `None` here left `cargo test --workspace`
+    /// green and the advisory silently dead in production (STUDIO-822).
+    ///
+    /// So it is pinned on this file's own source, the idiom `runmerge.rs` and
+    /// `handlers_runmerge.rs` already use for a wiring no run-time assertion can reach. Both
+    /// needles are assembled at run time on purpose: `include_str!` pulls in THIS module too, so a
+    /// needle spelled as a literal here would match its own source and the pin would pass no
+    /// matter what the daemon does.
+    #[test]
+    fn the_quorum_task_is_handed_the_project_advisories() {
+        let src = include_str!("run.rs");
+        let opener = format!("let deps = rhapsody_orchestrator::{}Deps {{", "Quorum");
+        let start = src
+            .find(&opener)
+            .expect("the quorum task still builds its own deps here");
+        let end = src[start..]
+            .find("\n        };")
+            .expect("that deps literal is still a braced struct");
+        let block = &src[start..start + end];
+
+        let wired = format!("{}: {}(", "warnings", "Some");
+        assert!(
+            block.contains(&wired),
+            "the quorum task is no longer handed a warnings state: a fan-out retried to \
+             exhaustion would go back to being a WARN in a 23 MB/day log, with nothing on \
+             `GET /api/v1/projects` for an operator to read (STUDIO-822)"
         );
     }
 }

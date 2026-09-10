@@ -883,6 +883,18 @@ later tick, inside the same sliding `now - 5m` lookback window. Moving enrichmen
 path — the shape `triage.rs` already uses — remains the structurally correct end state and is not
 attempted here.
 
+**STUDIO-829 finished the `spawn_blocking` row above.** It covered the summons fetch alone, and
+seven of `ghsummons.rs`'s eight `gh` exec sites still called the synchronous runner inline. That is
+a Rust hazard with no Go counterpart — a goroutine blocked in `exec` detaches its OS thread, while a
+Rust future with no await point holds a tokio *worker* thread, from the pool the control loop and
+the HTTP server share — so a hung `gh` on an operator's console-merge click could stall dispatch by
+a different route than the one this entry describes. All eight now go through `GH::run_off_task`,
+and every exec is capped at `GH_EXEC_TIMEOUT` (60s), a backstop deliberately above the 15s
+operation-level bounds so it never preempts them. Nothing Go-observable changes: `summons_since` is
+the only one of the eight with a Go counterpart and it keeps `GH_SUMMONS_TIMEOUT` as its governing
+bound; the other seven are Rhapsody-only seams (console merge, review-comment posting, the quorum's
+and the review watcher's lookups) that Go Symphony does not have at all.
+
 ### A merged pull request moves its ticket to Done (STUDIO-712)
 
 Go v0.4.0 knows what a terminal state IS — `tracker.terminal_states` — but it only ever READS the
@@ -960,3 +972,30 @@ point: the prohibition stays on the trusted side of the line the quorum design d
 **Implementers are untouched.** The selection is false for every ticket that is not a review, so an
 implementation run reads its configured `prompt_file` exactly as before — including this
 repository's Phase 6 merge instruction, which a test asserts is still rendered.
+
+### An abandoned review round becomes a project advisory (STUDIO-822)
+
+Go v0.4.0 has no review quorum at all, so its `projectWarningsFor` has exactly two producers — the
+unmatched project slug (INF-277) and the missing `prompt_file` (INF-279). Rhapsody has added three
+Rhapsody-only ones on the same `GET /api/v1/projects` field: the candidate-fetch-failure streak
+(STUDIO-406), the summons-enrichment-deferred streak (STUDIO-811), and now the abandoned review
+fan-out. The endpoint's SHAPE is unchanged — the same `warnings` array of strings, with the two
+ported producers keeping their golden ordering ahead of the additions — but its CONTENT can name a
+condition Go could not produce.
+
+| A fan-out that failed every attempt | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| where it is visible | n/a (no quorum) | a `warn!`, one room post, and a per-project advisory |
+| cleared by a later success | — | **no** — see below |
+
+**It is deliberately the one producer nothing clears.** Every other advisory here describes a live
+condition that self-heals: fix the slug, restore the file, let a tick keep up, and the next pass
+drops it. This one describes a round that will never be reviewed — the work is merged or waiting
+either way, and clearing it on an unrelated later handoff is precisely how the failure that
+motivated the ticket stayed invisible for weeks. It is capped instead
+(`warnings::LOST_REVIEW_WARN_CAP`), oldest dropped first, so the advisory always names the most
+recent losses rather than growing without bound.
+
+A local surface was the point. The fan-out fails because the tracker cannot be reached, so a comment
+on the ticket is the one write guaranteed to fail for the same reason. Teams-off and quorum-off
+installations never reach the producer, so their `GET /api/v1/projects` is byte-identical to Go's.

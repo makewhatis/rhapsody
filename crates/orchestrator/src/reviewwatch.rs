@@ -56,7 +56,8 @@
 //! # Off the loop, then back onto it (§5, F3)
 //!
 //! Asking GitHub where a pull request stands is a `gh` call, and [`crate::ghsummons::GH`] shells out
-//! through a synchronous `std::process::Command`. [`run_review_watch_task`] owns every one of them,
+//! through a synchronous `std::process::Command` — off-task and bounded since STUDIO-829, but still
+//! a round trip per watched pull request. [`run_review_watch_task`] owns every one of them,
 //! holds no `Orchestrator` and takes no lock the control task takes — the same structural
 //! containment [`crate::prstate`] was built for and documents. What comes back crosses to the
 //! control task as ONE [`Event::ReviewSweep`], where the watch set stays single-writer beside

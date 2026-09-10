@@ -1405,7 +1405,9 @@ async fn file_review(
     let spec = NewIssue {
         team_id: iss.team_id.clone(),
         title: review_title(&iss.identifier, &iss.title),
-        description: review_description(&req, &reviewer),
+        // No head: this lever files one review ticket by hand from a room post and keeps no
+        // per-head record, so it has nothing honest to name (STUDIO-822).
+        description: review_description(&req, &reviewer, ""),
         state_name: facts.create_state.clone(),
         assignee_id,
         labels: vec![format!("{IDENTITY_LABEL_PREFIX}{reviewer}")],
@@ -1458,7 +1460,9 @@ async fn review_pr_url(ears: &Ears, iss: &Issue, facts: &ProjectFacts) -> Option
         .open_pr_for_branch(&facts.pr_owner, &facts.pr_repo, &branch)
         .await
     {
-        Ok(url) => url,
+        // The manager's room lever files one review ticket by hand and keeps no head record, so
+        // only the URL is read out of the answer.
+        Ok(pr) => pr.map(|p| p.url),
         Err(e) => {
             // "GitHub says there is no PR" is a normal state; "we could not ask GitHub" is an
             // operator problem that would otherwise look identical from the outside.
@@ -2183,7 +2187,7 @@ fn snippet(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ghsummons::{OpenPrResult, PrBranchResult};
+    use crate::ghsummons::{OpenPr, OpenPrResult, PrBranchResult};
     use crate::testsupport::{TempDir, issue};
     use rhapsody_config::memory::{
         Fact as MemFact, MemoryBackend, MemoryError, NoneBackend, Query as MemQuery, Recalled,
@@ -2194,6 +2198,15 @@ mod tests {
     use rhapsody_store::{RunEnd, RunStart, Sqlite, Store, StorePath};
 
     use crate::teamsknow::{Knowledge, TeamScope};
+
+    /// The lookup answer this path cares about: a URL. The manager's lever keeps no head record, so
+    /// `head_sha` is deliberately left empty here (STUDIO-822).
+    fn open_pr(url: &str) -> OpenPr {
+        OpenPr {
+            url: url.to_string(),
+            head_sha: String::new(),
+        }
+    }
     use rhapsody_core::{LinkedPRRef, Viewer};
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex as StdMutex;
@@ -2700,7 +2713,7 @@ mod tests {
         let ears = fx.ears(FakeArbiter::never()).with_github(
             Arc::new(FakeBranches(Box::new(|| Ok(None)))),
             Arc::new(FakeOpenPr(Box::new(|| {
-                Ok(Some("https://github.com/o/r/pull/230".to_string()))
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
             }))),
         );
 
@@ -3003,7 +3016,7 @@ mod tests {
         let ears = fx.ears(FakeArbiter::never()).with_github(
             Arc::new(FakeBranches(Box::new(|| Ok(None)))),
             Arc::new(FakeOpenPr(Box::new(|| {
-                Ok(Some("https://github.com/o/r/pull/230".into()))
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
             }))),
         );
 
@@ -3202,7 +3215,7 @@ mod tests {
         let ears = fx.ears(FakeArbiter::never()).with_github(
             Arc::new(FakeBranches(Box::new(|| Ok(None)))),
             Arc::new(FakeOpenPr(Box::new(|| {
-                Ok(Some("https://github.com/o/r/pull/230".into()))
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
             }))),
         );
 
@@ -3522,7 +3535,7 @@ mod tests {
                 Ok(Some("symphony/STUDIO-654".into()))
             }))),
             Arc::new(FakeOpenPr(Box::new(|| {
-                Ok(Some("https://github.com/o/r/pull/230".into()))
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
             }))),
         );
 
@@ -3792,7 +3805,7 @@ mod tests {
             let ears = fx.ears(FakeArbiter::never()).with_github(
                 Arc::new(FakeBranches(Box::new(|| Ok(None)))),
                 Arc::new(FakeOpenPr(Box::new(|| {
-                    Ok(Some("https://github.com/o/r/pull/230".into()))
+                    Ok(Some(open_pr("https://github.com/o/r/pull/230")))
                 }))),
             );
 
@@ -3928,7 +3941,7 @@ mod tests {
         let ears = fx.ears(FakeArbiter::never()).with_github(
             Arc::new(FakeBranches(Box::new(|| Ok(None)))),
             Arc::new(FakeOpenPr(Box::new(|| {
-                Ok(Some("https://github.com/o/r/pull/230".into()))
+                Ok(Some(open_pr("https://github.com/o/r/pull/230")))
             }))),
         );
 

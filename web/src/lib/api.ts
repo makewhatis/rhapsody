@@ -180,6 +180,20 @@ export interface IssueRun extends RunSummary {
   // this one is not shaped like `lifecycle`/`assignee` above, where absence is a distinguishable
   // third answer — here there is nothing a client could do differently.
   review_ticket?: boolean;
+  // True when this row's own RUN is a review run (STUDIO-826) — a run the daemon dispatched against
+  // a synthetic `pr:owner/repo#n@reviewer` issue rather than a tracker ticket, which is what
+  // `review.mode: ticketless` produces.
+  //
+  // The sibling of `review_ticket` above, and NOT a restatement of it: that one says the TICKET's
+  // job is to review somebody's work, while a job marked here has no ticket at all — so no label
+  // could mark it, and `lifecycle` will never be resolved for it however warm the daemon's cache
+  // gets. Without this field a client has only the run outcome, and a completed review reads
+  // "awaiting a reviewer", which is the inverse of what it means.
+  //
+  // The daemon reads it off the run's own issue id. A client must not re-derive it by parsing that
+  // id or the row's title — both are conventions the daemon happens to follow, not facts. Positive-
+  // only, on the same terms as `review_ticket`.
+  review_run?: boolean;
 }
 
 // IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —
