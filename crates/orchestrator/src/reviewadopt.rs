@@ -164,6 +164,11 @@ impl Orchestrator {
                 }
             }
         }
+        // An entry older than the interval can no longer refuse anything, so keeping it would only
+        // grow the map by one string per ticket this daemon has EVER seen parked in review. Retain
+        // FIRST, so this tick's own probes are never swept by it.
+        self.review_adopt_probed
+            .retain(|_, at| now.duration_since(*at) < REVIEW_ADOPT_PROBE_INTERVAL);
         for identifier in probed {
             self.review_adopt_probed.insert(identifier, now);
         }
@@ -788,6 +793,37 @@ mod tests {
         );
 
         assert_eq!(sweep(&mut o, &[iss], Instant::now()), AdoptSweep::default());
+    }
+
+    /// The memo holds only what still paces something. An entry older than the probe interval can
+    /// no longer refuse anything, so it is dropped — otherwise the map would grow by one entry per
+    /// ticket this daemon has EVER seen parked in review, for the life of the process, rather than
+    /// tracking the review column as it stands.
+    #[test]
+    fn the_probe_memo_drops_entries_that_no_longer_pace_anything() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-836", "alice");
+        let t0 = Instant::now();
+
+        sweep(&mut o, &[parked("STUDIO-836")], t0);
+        assert!(o.review_adopt_probed.contains_key("STUDIO-836"));
+
+        // A much later tick, over a review column this ticket has since left.
+        sweep(
+            &mut o,
+            &[parked("STUDIO-901")],
+            t0 + REVIEW_ADOPT_PROBE_INTERVAL * 2,
+        );
+
+        assert!(
+            !o.review_adopt_probed.contains_key("STUDIO-836"),
+            "the stale entry paced nothing and is gone: {:?}",
+            o.review_adopt_probed.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            o.review_adopt_probed.contains_key("STUDIO-901"),
+            "the live one stays"
+        );
     }
 
     /// A ticket this daemon never ran as a teammate costs its store reads ONCE per probe interval,

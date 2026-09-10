@@ -457,9 +457,10 @@ pub struct Orchestrator {
     /// review-state move succeeds — a handoff Linear refused has not happened, so it introduces
     /// nothing, exactly as it fans nothing out.
     /// When each ticket was last considered by the ticketless ADOPTION sweep (STUDIO-838), so the
-    /// same ticket is not resolved to a pull request on every poll tick. Loop-confined, and grows
-    /// by one short string per ticket this daemon sees parked in a review state without a watch row
-    /// — a set bounded by the review column, not by history.
+    /// same ticket is not resolved to a pull request on every poll tick. Loop-confined, and swept
+    /// of anything older than `REVIEW_ADOPT_PROBE_INTERVAL` on every sweep — an entry that old
+    /// paces nothing — so it holds the review column as it stands rather than every ticket this
+    /// daemon has ever seen parked.
     pub(crate) review_adopt_probed: std::collections::HashMap<String, std::time::Instant>,
     pub(crate) review_intro_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::reviewintro::ReviewIntroRequest>>,
