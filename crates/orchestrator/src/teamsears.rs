@@ -2188,15 +2188,6 @@ fn snippet(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ghsummons::{OpenPr, OpenPrResult, PrBranchResult};
-
-    /// The lookup answer this path cares about: a URL. The manager's lever keeps no head record, so
-    /// `head_sha` is deliberately left empty here (STUDIO-822).
-    fn open_pr(url: &str) -> OpenPr {
-        OpenPr {
-            url: url.to_string(),
-            head_sha: String::new(),
-        }
-    }
     use crate::testsupport::{TempDir, issue};
     use rhapsody_config::memory::{
         Fact as MemFact, MemoryBackend, MemoryError, NoneBackend, Query as MemQuery, Recalled,
@@ -2207,6 +2198,15 @@ mod tests {
     use rhapsody_store::{RunEnd, RunStart, Sqlite, Store, StorePath};
 
     use crate::teamsknow::{Knowledge, TeamScope};
+
+    /// The lookup answer this path cares about: a URL. The manager's lever keeps no head record, so
+    /// `head_sha` is deliberately left empty here (STUDIO-822).
+    fn open_pr(url: &str) -> OpenPr {
+        OpenPr {
+            url: url.to_string(),
+            head_sha: String::new(),
+        }
+    }
     use rhapsody_core::{LinkedPRRef, Viewer};
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex as StdMutex;

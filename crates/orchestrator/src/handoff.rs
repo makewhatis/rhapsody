@@ -657,32 +657,32 @@ mod tests {
         let _ = task.await;
     }
 
-    // The gates that still refuse BEFORE the attachment question is reached, so an attachment-less
-    // ticket that fails one of them still costs no request at all: STUDIO-674 widened exactly one
-    // gate and left the rest where they were. The marker gate is no longer among them (STUDIO-822).
+    // The identity gate still refuses BEFORE the attachment question is reached, so an
+    // attachment-less ticket without an identity still costs no request at all: STUDIO-674 widened
+    // exactly one gate and left the rest where they were. The marker gate is no longer one of them
+    // (STUDIO-822) — see `a_parent_already_marked_still_requests_because_the_guard_is_per_head`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_other_gates_still_refuse_an_attachment_less_ticket() {
-        for (why, teams, identity) in [(
-            "no identity ⇒ no quorum",
+    async fn the_identity_gate_still_refuses_an_attachment_less_ticket() {
+        let tr = Arc::new(Fake::new());
+        let mut parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        parent.title = "do the thing".into();
+        let snapshot = vec![parent.clone()];
+        let (task, handle, mut rx, run_id, signal) = quorum_harness(
+            Arc::clone(&tr),
             quorum_teams(&["alice", "bob", "carol"]),
+            parent,
             "",
-        )] {
-            let tr = Arc::new(Fake::new());
-            let mut parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
-            parent.title = "do the thing".into();
-            let snapshot = vec![parent.clone()];
-            let (task, handle, mut rx, run_id, signal) =
-                quorum_harness(Arc::clone(&tr), teams, parent, identity, &snapshot);
+            &snapshot,
+        );
 
-            handle
-                .handoff_run(CancelWait::default(), run_id)
-                .await
-                .expect("handoff_run");
-            assert!(rx.try_recv().is_err(), "{why}");
+        handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(rx.try_recv().is_err(), "no identity ⇒ no quorum");
 
-            signal.cancel();
-            let _ = task.await;
-        }
+        signal.cancel();
+        let _ = task.await;
     }
 
     // A ticket with no team id can never be reviewed — `create_issue` and `add_issue_label` both
