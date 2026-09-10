@@ -44,7 +44,7 @@ import { useTicketFacts } from "@/hooks/useTicketFacts";
 import { ticketAssignees } from "@/lib/console-jobs";
 import { clockTime, runOutcomeLabel, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
 import { checksSummary, diffFiles, diffStat } from "@/lib/console-diff";
-import { mergeStateNote } from "@/lib/console-merge";
+import { mergeStateNote, ungatedMergeStateNote } from "@/lib/console-merge";
 import { formatDateTime } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
@@ -1807,14 +1807,22 @@ function TeamsPanel({
  * The console derives none of the reasons. `reason` is the daemon's own sentence, verbatim — the
  * discipline the header's Merge already follows (STUDIO-790).
  *
- * **On the merge-state note.** `mergeStateNote`'s own doc warns against putting this sentence
- * beside the header's Merge, because there it is a second reading of a question the daemon already
- * answered on that control and the two contradicted each other on `DIRTY`. It is safe HERE for the
- * reason that warning names: there is no Merge control in this zone for it to contradict. What it
- * annotates is the pull request the operator is reading a diff of — GitHub's own state of it — and
- * `merge_state` arrives as a raw `mergeStateStatus` rather than as a verdict the daemon reached,
- * so it cannot disagree with one. The wording goes through the shared helper rather than being
- * written again here, so the console has one sentence per GitHub state and not two.
+ * **On the merge-state note, and why it is the UNGATED one.** `console-merge.ts` states a
+ * precondition its wording depends on: every value reaching `mergeStateNote` came off a
+ * `MergeReceipt`, so it passed every refusal `runmerge::resolve_pull_request` makes. `rundiff`
+ * refuses nothing — that is the point of the module — so this panel is the first caller holding a
+ * value that passed none of them, and one arm of that helper is only true because of the gate.
+ * `BEHIND` promises GitHub updates the branch itself, which `resolve_pull_request` guarantees by
+ * REFUSING a behind branch on a repository that will not; ungated, that promise would send the
+ * operator to wait for something that never happens, while Merge on the same run tells them to
+ * push. So this reads through [`ungatedMergeStateNote`], which says only what is observable
+ * without the policy read. The other arms are facts of GitHub's own and are shared, not copied:
+ * one sentence per GitHub state, still, rather than a second vocabulary that can drift.
+ *
+ * Separately — and answering a different objection — `mergeStateNote`'s doc also warns against
+ * putting this sentence beside the header's Merge, where it was a second reading of a question
+ * the daemon had already answered on that control. That warning is satisfied here because there
+ * is no Merge control in this zone to contradict; it is not what the precondition above is about.
  */
 function DiffPanel({ run }: { run: RunSummary }) {
   const read = useRunDiff(run.id);
@@ -1845,7 +1853,7 @@ function DiffPanel({ run }: { run: RunSummary }) {
   const { diff } = answer;
   const stat = diffStat(files);
   const checks = checksSummary(diff.checks);
-  const state = mergeStateNote(diff.merge_state);
+  const state = ungatedMergeStateNote(diff.merge_state);
   return (
     <>
       {/* What this diff is OF, before the diff itself. A patch with no coordinate cannot be told

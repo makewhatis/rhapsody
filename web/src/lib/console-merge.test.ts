@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { mergeStateNote } from "@/lib/console-merge";
+import { mergeStateNote, ungatedMergeStateNote } from "@/lib/console-merge";
 
 describe("mergeStateNote — what an armed auto-merge is waiting on (STUDIO-784)", () => {
   // The two states the whole feature turns on: DIRTY is the one that needs a human, and BLOCKED is
@@ -59,5 +59,45 @@ describe("mergeStateNote — what an armed auto-merge is waiting on (STUDIO-784)
       expect(mergeStateNote(state, true)).toBe(mergeStateNote(state));
       expect(mergeStateNote(state, true)).not.toBe("");
     }
+  });
+});
+
+describe("ungatedMergeStateNote — a mergeStateStatus no daemon gate has filtered (STUDIO-749)", () => {
+  // THE ONE ARM THAT CANNOT SURVIVE LOSING THE GATE. `mergeStateNote`'s BEHIND reading promises
+  // GitHub will update the branch itself, and that is only true because
+  // `runmerge::resolve_pull_request` has already refused every BEHIND branch on a repository that
+  // will not (STUDIO-784 gap 1). A raw value has passed no such refusal, so on this repository —
+  // `main` requires up-to-date branches and does not update them — the promise is of something
+  // that never happens, while Merge on the same run says "push or update the branch".
+  it("does not promise GitHub will update a branch nothing has gated", () => {
+    expect(ungatedMergeStateNote("BEHIND")).toMatch(/behind its base/i);
+    expect(ungatedMergeStateNote("BEHIND")).not.toMatch(/bring it up to date|github will/i);
+    expect(ungatedMergeStateNote("BEHIND")).not.toBe(mergeStateNote("BEHIND"));
+  });
+
+  // It says nothing the gate is needed for, and nothing MORE either: it must not become a second
+  // vocabulary that drifts from the first. BEHIND is the whole of the difference.
+  it("reads every other state exactly as the gated note does", () => {
+    for (const state of [
+      "",
+      "UNKNOWN",
+      "CLEAN",
+      "BLOCKED",
+      "UNSTABLE",
+      "DIRTY",
+      "DRAFT",
+      "HAS_HOOKS",
+      "SOMETHING_NEW",
+      undefined,
+    ]) {
+      expect(ungatedMergeStateNote(state)).toBe(mergeStateNote(state));
+    }
+  });
+
+  // Same normalisation and the same refusal to guess — it is the same switch, not a copy of it.
+  it("keeps the shared reading of casing, whitespace and an absent value", () => {
+    expect(ungatedMergeStateNote(" behind ")).toBe(ungatedMergeStateNote("BEHIND"));
+    expect(ungatedMergeStateNote(undefined)).toBe("");
+    expect(ungatedMergeStateNote("SOMETHING_NEW")).toContain("SOMETHING_NEW");
   });
 });

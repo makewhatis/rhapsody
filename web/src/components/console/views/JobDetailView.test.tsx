@@ -2093,6 +2093,28 @@ describe("Diff — the change a run produced (§5, STUDIO-749)", () => {
     expect(head.querySelector(".state")?.textContent).toContain("required checks");
   });
 
+  // THIS TAB'S VALUE PASSED NO DAEMON GATE. `mergeStateNote`'s BEHIND reading promises GitHub
+  // updates the branch itself, and that is true only of a value off a `MergeReceipt`, which
+  // `runmerge::resolve_pull_request` refuses on a repository that will not update one. `rundiff`
+  // refuses nothing, so the raw BEHIND that reaches here is exactly the one the promise is false
+  // for — and Merge on the same run answers "push or update the branch, then merge". The tab must
+  // not tell an operator to wait for something that never happens.
+  it("does not promise GitHub will update a behind branch it has not gated", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockResolvedValue({
+      available: true,
+      diff: { ...RUN_DIFF, merge_state: "BEHIND" },
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+
+    await waitFor(() => expect(panel().querySelector(".trdiffhead")).toBeTruthy());
+    const state = panel().querySelector(".trdiffhead .state")?.textContent ?? "";
+    expect(state).toContain("behind its base");
+    expect(state).not.toMatch(/bring it up to date|github will/i);
+  });
+
   it("says a cut patch was cut, rather than letting it read as complete", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     h.fetchRunDiff.mockResolvedValue({
