@@ -346,17 +346,19 @@ impl crate::ControlHandle {
     ///
     /// It is not a claim that a `gh` call costs only the calling task. Every one of these blocks
     /// ([`crate::runmerge`]'s module doc), and a future with no await point holds the tokio WORKER
-    /// THREAD it is polled on, not just its own task. The two seams this route added —
-    /// [`crate::ghsummons::PrDiffSource::pr_diff`] and
-    /// [`crate::ghsummons::PrChecksSource::pr_checks`] — go through [`crate::ghsummons::GH::run_off_task`]
-    /// for that reason, but the three they share with the merge path
-    /// ([`crate::ghsummons::OpenPrSource::open_pr_for_branch`],
+    /// THREAD it is polled on, not just its own task — a thread from the pool the control loop and
+    /// the HTTP server share. That hazard is cheaper to reach on this route than on the merge one,
+    /// because opening a tab triggers all five of its `gh` reads where merging takes a click and a
+    /// confirmation. So all five go through [`crate::ghsummons::GH::run_off_task`], capped at
+    /// `GH_EXEC_TIMEOUT`: the two this route added
+    /// ([`crate::ghsummons::PrDiffSource::pr_diff`],
+    /// [`crate::ghsummons::PrChecksSource::pr_checks`]) from the start, and the three it shares
+    /// with the merge path ([`crate::ghsummons::OpenPrSource::open_pr_for_branch`],
     /// [`crate::ghsummons::PrStateSource::pr_state`],
-    /// [`crate::ghsummons::MergeStateSource::merge_state`]) still run inline and so occupy a
-    /// runtime thread for the duration. That is pre-existing and identical on both routes, but it
-    /// is cheaper to reach here, because opening a tab triggers it where merging takes a click and
-    /// a confirmation. Moving those three off-task is a change to seams other callers share and is
-    /// not this ticket's; it is recorded as a follow-up rather than claimed away here.
+    /// [`crate::ghsummons::MergeStateSource::merge_state`]) since STUDIO-829, which moved every
+    /// remaining inline exec in `ghsummons.rs` off the runtime thread. This route recorded that as
+    /// a follow-up rather than doing it here, because those three are seams other callers share;
+    /// it is done, not open, and a source pin in `ghsummons.rs` keeps it that way.
     ///
     /// A daemon built with no diff seams answers [`DiffOutcome::Unavailable`] rather than an
     /// error: the console asked a question and there is a true answer to it.
