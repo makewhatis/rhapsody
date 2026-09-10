@@ -302,14 +302,26 @@ as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@review
 sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
 different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
 
-What it costs the tracker is stated rather than left to be found: asking about every issue is
-`ceil(issues / 100)` round trips — five at 425 issues — and the daemon's shared 60s lifecycle memo
-bounds that to once per window for the whole process, however many consoles are open and however
-fast they poll. About 300 GraphQL requests an hour while a console is open. The listing's second
-decoration, the `review_ticket` label read, would double it and is deliberately NOT made here: that
-marker only turns a live `run` into `reviewing`, which the strip counts as running either way, so it
-cannot move any of the five figures. Cutting the lifecycle half further wants a TTL that knows a
-terminal ticket will not change again, which is a change to the memo rather than to this endpoint.
+What it costs the tracker is stated rather than left to be found, and this is the first caller that
+asks the daemon's lifecycle memo about more ids than one lookup will refresh. A lookup refreshes at
+most 200 stale ids in batches of 100, so one request is at most two round trips however large the
+store is, and a cold cache of 425 issues covers the whole store over three polls rather than in one.
+Each 60s window expires them all and spends the same five batches across those polls — about 300
+GraphQL requests an hour while a console is open, shared by the whole process however many consoles
+are open and however fast they poll.
+
+That cap has one visible consequence, and it falls the way this defect fell: an id the budget did
+not reach carries no lifecycle, so the console's fallback reads it as `completed → review` and the
+strip over-reports "needs you" for the seconds before the next poll resolves the rest. It cannot
+persist — an expired entry still serves its last answer, so past the first convergence the tally is
+complete and merely up to a TTL stale on the ids past the budget. Raising the cap would be a change
+to the shared memo rather than to this endpoint.
+
+The listing's second decoration, the `review_ticket` label read, would double all of that and is
+deliberately NOT made here: that marker only turns a live `run` into `reviewing`, which the strip
+counts as running either way, so it cannot move any of the five figures. Cutting the lifecycle half
+further wants a TTL that knows a terminal ticket will not change again, which is again a change to
+the memo rather than to this endpoint.
 
 ### Daemon-mediated review handoff — `POST /api/v1/runs/{id}/handoff` (TRA-242)
 

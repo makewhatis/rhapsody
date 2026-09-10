@@ -172,19 +172,34 @@ pub(crate) async fn handle_issue_runs(
 /// silent — an empty result, not an error a console could show — which is why the filter is pinned
 /// by a test rather than left to be noticed.
 ///
-/// WHAT IT COSTS THE TRACKER, AND THE LOOKUP THAT IS DELIBERATELY NOT MADE. This asks about every
-/// issue rather than a page, so the lifecycle refresh is `ceil(issues / LIFECYCLE_BATCH)` round
-/// trips — five, at the operator's 425 issues — and the shared TTL memo bounds that to once per
-/// [`rhapsody_orchestrator::LIFECYCLE_TTL`] window for the whole daemon, however many
-/// consoles are open and however fast they poll. It is not free (about 300 GraphQL requests an hour
-/// while a console is open) and it is the price of counting the store by the rule the rows use.
+/// WHAT IT COSTS THE TRACKER, AND THE COLD-START WINDOW THAT COMES WITH IT. This is the first
+/// caller that asks the memo about MORE ids than one lookup will refresh, and that is worth being
+/// exact about rather than stating the arithmetic the page-sized callers get. A lookup refreshes at
+/// most `MAX_LIFECYCLE_REFRESH` (200) stale ids, batched at `LIFECYCLE_BATCH` (100) — so ONE
+/// request costs at most two round trips however many issues the store holds, and a cold cache of
+/// the operator's 425 issues covers the whole store over `ceil(425 / 200)` = three polls rather
+/// than in one. In the steady state each [`rhapsody_orchestrator::LIFECYCLE_TTL`] window expires
+/// all of them and spends the same five batches spread over those polls: about 300 GraphQL requests
+/// an hour while a console is open, shared by the whole daemon however many consoles are open and
+/// however fast they poll.
 ///
-/// The `review_tickets` label read the listing also makes would DOUBLE that, and it is skipped
-/// because it provably cannot change any of the five figures: `review_ticket` only narrows the LIVE
-/// arm of `consoleJobStatus`, turning `run` into `reviewing`, and the strip counts both as running.
-/// Five round trips a minute for a fact the tally cannot use is not a trade worth making, so the
-/// bucket key carries no `review_ticket` at all — see [`IssueStatusKey`]. `review_run` needs no
-/// lookup: it is read off the id.
+/// The consequence of the cap is a TRANSIENT, and it falls the way this ticket's own symptom falls:
+/// an id the budget did not reach carries no lifecycle, `consoleJobStatus` falls back to
+/// `completed → review`, and the strip over-reports "needs you" for the few seconds before the next
+/// poll resolves the rest. It self-heals and it cannot persist — once an id has an answer, an
+/// EXPIRED entry still serves its last row (`Lifecycles::partition` caches whatever row it has and
+/// only queues the refresh), so past the first convergence the tally stays complete and merely
+/// carries up to a TTL of staleness on the ids past the budget. Raising the cap for this caller
+/// would be a change to the shared memo, not to this endpoint, and is deliberately not made here.
+/// A bucket with no lifecycle at all is pinned as a first-class case by
+/// `issue_counts_carry_the_ticket_lifecycle_and_its_absence`.
+///
+/// The `review_tickets` label read the listing also makes would DOUBLE all of that, and it is
+/// skipped because it provably cannot change any of the five figures: `review_ticket` only narrows
+/// the LIVE arm of `consoleJobStatus`, turning `run` into `reviewing`, and the strip counts both as
+/// running. Doubling the tally's tracker cost for a fact it cannot use is not a trade worth making,
+/// so the bucket key carries no `review_ticket` at all — see [`IssueStatusKey`]. `review_run` needs
+/// no lookup: it is read off the id.
 ///
 /// THE LIVE OVERLAY. A ticket the daemon is holding for retry still reads "running" in the table
 /// (`runs-model.jobStatus` folds a pending retry into the live set), while its stored row's outcome
