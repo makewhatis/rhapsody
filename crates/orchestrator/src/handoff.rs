@@ -87,6 +87,72 @@ pub struct HandoffPlan {
     pub review: Option<crate::reviewintro::ReviewIntroRequest>,
 }
 
+/// How many times the review-state move is attempted before the handoff reports it failed
+/// (STUDIO-838). Only a TRANSIENT failure earns another attempt; a refusal fails at the first.
+///
+/// Three, [`crate::quorum::QUORUM_FANOUT_ATTEMPTS`]'s value for its reason — the failure it exists
+/// for is a single connection blip — but paced very differently, because this one runs on the
+/// request path of an agent's `symphony_handoff` tool call rather than on a background task. The
+/// quorum can afford the exponential back-off and spread three attempts over minutes; here that
+/// would hang the agent's terminal action, so the delays are fixed and short.
+pub const HANDOFF_MOVE_ATTEMPTS: u32 = 3;
+
+/// The delay before each retry, in milliseconds — one entry per attempt after the first.
+///
+/// Sized against the whole budget rather than against Linear: three attempts cost at most one
+/// second of extra latency on the agent's terminal tool call, which is imperceptible next to a
+/// turn. A longer back-off would ride out more outages and is the wrong trade here — the failures
+/// that need minutes are the ones the ADOPT path repairs without an agent waiting at all.
+const HANDOFF_MOVE_RETRY_DELAYS_MS: [u64; 2] = [250, 750];
+
+/// Whether a failed review-state move is worth attempting again (STUDIO-838).
+///
+/// The distinction is whether the tracker CONSIDERED the request. A transport failure and a
+/// "not now" status both mean it did not: the move may still be possible, and the introduction
+/// that rides on it is worth one more attempt. Everything else — a rejected move, a malformed
+/// query, a state that does not exist, no tracker at all — is the tracker having considered the
+/// request and refused it, and no number of retries changes a refusal.
+///
+/// Deliberately narrow, because the sibling defect this ticket cites (STUDIO-836) was a retry with
+/// no bound on a failure that was never going to clear. A refusal must fail FAST so the agent gets
+/// its error and falls back; only the failures that plausibly self-heal within seconds are retried.
+///
+/// A stub-shaped [`TrackerError::Other`] is not retried either. It is what the file adapter and the
+/// test double return, and — the case that matters in production — it is how "no effective tracker"
+/// reaches here, which no retry can fix.
+pub(crate) fn move_is_transient(err: &rhapsody_tracker::TrackerError) -> bool {
+    let rhapsody_tracker::TrackerError::Linear(e) = err else {
+        return false;
+    };
+    match e.kind {
+        rhapsody_tracker::linear::LinearErrorKind::ApiRequest => true,
+        rhapsody_tracker::linear::LinearErrorKind::ApiStatus => {
+            http_status_is_transient(&e.context)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the HTTP status an [`ApiStatus`](rhapsody_tracker::linear::LinearErrorKind::ApiStatus)
+/// context names is one the server may answer differently a moment later.
+///
+/// The context is the linear client's `"status {code}: {body snippet}"`, so the code is read off
+/// the front rather than sniffed out of the body. A context that names NO parseable status says
+/// nothing about whether the request landed and is therefore not retried — and the body is never
+/// consulted, which keeps this from turning a wording change at Linear into a retry loop.
+fn http_status_is_transient(context: &str) -> bool {
+    let Some(code) = context
+        .strip_prefix("status ")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|code| code.trim().parse::<u16>().ok())
+    else {
+        return false;
+    };
+    // 408 Request Timeout and 429 Too Many Requests are the server declining to answer NOW; 5xx is
+    // it failing to. Every other 4xx is a refusal of this request as written.
+    matches!(code, 408 | 429) || (500..600).contains(&code)
+}
+
 impl Orchestrator {
     /// Runs ON the control task for `evHandoffRun`: resolve the live run's issue/team + the configured
     /// review state to move to. Read-only — no kill, no suppression change (the agent is calling the
@@ -193,11 +259,16 @@ impl ControlHandle {
             ..Default::default()
         };
         match self
-            .move_issue_state(&plan.issue_id, &plan.team_id, &plan.review_state)
+            .move_issue_state_retrying(
+                &plan.issue_id,
+                &plan.team_id,
+                &plan.review_state,
+                &res.identifier,
+            )
             .await
         {
             Ok(()) => res.moved_to = plan.review_state,
-            Err(e) => res.move_err = e,
+            Err(e) => res.move_err = e.to_string(),
         }
         if !res.move_err.is_empty() {
             tracing::error!(issue_identifier = %res.identifier, err = %res.move_err, "handoff: review-state move failed");
@@ -235,6 +306,57 @@ impl ControlHandle {
         }
     }
 
+    /// [`move_issue_state`](Self::move_issue_state), attempted up to [`HANDOFF_MOVE_ATTEMPTS`]
+    /// times while the failure is TRANSIENT (STUDIO-838).
+    ///
+    /// The retry is here rather than inside the tracker because what is worth rescuing is not the
+    /// move: it is the ticketless review INTRODUCTION, which `handoff_run` fires only on a move
+    /// that landed. Discarding it because one request never reached Linear leaves the pull request
+    /// orphaned — open, green, in the review state and invisible to everything that assigns a
+    /// reviewer — which is the whole of STUDIO-838.
+    ///
+    /// A refusal returns at the first attempt, so the agent's tool call is never delayed by a
+    /// failure that was never going to clear ([`move_is_transient`] states the line exactly). The
+    /// wait is a plain `sleep` and not the lifetime ctx's `select!`, unlike the quorum's: the
+    /// longest this can hold is a second, and a handoff already in flight when the daemon is asked
+    /// to stop should finish rather than report a false failure.
+    async fn move_issue_state_retrying(
+        &self,
+        issue_id: &str,
+        team_id: &str,
+        state_name: &str,
+        identifier: &str,
+    ) -> Result<(), rhapsody_tracker::TrackerError> {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let err = match self.move_issue_state(issue_id, team_id, state_name).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            if !move_is_transient(&err) || attempt >= HANDOFF_MOVE_ATTEMPTS {
+                return Err(err);
+            }
+            tracing::warn!(
+                issue_identifier = %identifier,
+                attempt,
+                attempts = HANDOFF_MOVE_ATTEMPTS,
+                err = %err,
+                "handoff: the review-state move did not reach the tracker; retrying so the review \
+                 introduction is not lost with it"
+            );
+            // In range by construction — the loop returned above unless `attempt` is below
+            // `HANDOFF_MOVE_ATTEMPTS`, and the table holds one entry per attempt after the first.
+            // Indexed rather than sliced anyway, so a future edit to either constant degrades to a
+            // short wait instead of a panic on the agent's terminal tool call.
+            let delay = HANDOFF_MOVE_RETRY_DELAYS_MS
+                .get(attempt as usize - 1)
+                .copied()
+                .unwrap_or(250);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
+
     /// The off-loop by-NAME `MoveIssueState` for handoff, resolving the tracker exactly like
     /// [`stop_run`](ControlHandle::stop_run)'s `move_to` (the `control()`-time snapshot, else the shared
     /// reads tracker so the daemon — which builds the handle before the first reload — still moves
@@ -246,7 +368,7 @@ impl ControlHandle {
         issue_id: &str,
         team_id: &str,
         state_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), rhapsody_tracker::TrackerError> {
         let tracker = self.tracker.clone().or_else(|| {
             self.reads
                 .read()
@@ -255,11 +377,13 @@ impl ControlHandle {
                 .clone()
         });
         match tracker {
-            Some(tr) => tr
-                .move_issue_state(issue_id, team_id, state_name)
-                .await
-                .map_err(|e| e.to_string()),
-            None => Err("no effective tracker".to_string()),
+            Some(tr) => tr.move_issue_state(issue_id, team_id, state_name).await,
+            // Typed rather than a bare string since STUDIO-838, because the caller now CLASSIFIES
+            // the failure: `Other` is not transient, which is the right answer — no retry conjures
+            // a tracker that has not been configured yet.
+            None => Err(rhapsody_tracker::TrackerError::Other(
+                "no effective tracker".to_string(),
+            )),
         }
     }
 }
@@ -274,6 +398,7 @@ mod tests {
     use rhapsody_store::{Sqlite, Store, StorePath};
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
+    use rhapsody_tracker::linear::LinearErrorKind;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -914,6 +1039,80 @@ mod tests {
         let _ = task.await;
     }
 
+    // ── which move failures may be retried (STUDIO-838) ─────────────────────────────────────────
+
+    fn linear(kind: LinearErrorKind, context: &str) -> TrackerError {
+        TrackerError::Linear(rhapsody_tracker::linear::LinearError::new(kind, context))
+    }
+
+    /// The classification, stated exactly, because "be exact about which errors are transient" is
+    /// the ticket's own warning and the sibling defect (STUDIO-836) was a retry that never stopped.
+    ///
+    /// Transient means the REQUEST did not land: the transport failed, or the server said "not
+    /// now". Everything else is the tracker having considered the request and refused it, and no
+    /// number of retries changes a refusal.
+    #[test]
+    fn only_a_transport_failure_or_a_now_now_status_is_retried() {
+        for (want, err) in [
+            // The transport never delivered it. This is the failure STUDIO-822 lost a review round
+            // to — a single `error sending request` that the next attempt would have ridden out.
+            (
+                true,
+                linear(LinearErrorKind::ApiRequest, "error sending request"),
+            ),
+            (true, linear(LinearErrorKind::ApiRequest, "read body: eof")),
+            // The server took it and said "not now".
+            (
+                true,
+                linear(LinearErrorKind::ApiStatus, "status 429: slow down"),
+            ),
+            (
+                true,
+                linear(LinearErrorKind::ApiStatus, "status 408: timeout"),
+            ),
+            (true, linear(LinearErrorKind::ApiStatus, "status 500: oops")),
+            (
+                true,
+                linear(LinearErrorKind::ApiStatus, "status 502: bad gateway"),
+            ),
+            (
+                true,
+                linear(LinearErrorKind::ApiStatus, "status 503: unavailable"),
+            ),
+            // **The observed STUDIO-836 failure, and deliberately NOT retried.** Linear reports
+            // hourly quota exhaustion as a 429 body inside a 400, so it lands here rather than as a
+            // real 429 — and an hour-long quota is not something a retry seconds later rides out.
+            // Retrying it would spend attempts to fail identically. This is the case the ADOPT path
+            // exists for; the retry covers the blip, not the quota.
+            (
+                false,
+                linear(
+                    LinearErrorKind::ApiStatus,
+                    "status 400: \"Rate limit exceeded. Only 2500 requests are allowed per 1 hour\"",
+                ),
+            ),
+            (false, linear(LinearErrorKind::ApiStatus, "status 401: no")),
+            (false, linear(LinearErrorKind::ApiStatus, "status 403: no")),
+            (false, linear(LinearErrorKind::ApiStatus, "status 404: no")),
+            // A context that does not name a status at all says nothing about whether the request
+            // landed, so it is not retried.
+            (false, linear(LinearErrorKind::ApiStatus, "unparseable")),
+            // The tracker CONSIDERED the request and refused it.
+            (
+                false,
+                linear(LinearErrorKind::MoveRejected, "success:false"),
+            ),
+            (false, linear(LinearErrorKind::GraphqlErrors, "bad field")),
+            (false, linear(LinearErrorKind::UnknownPayload, "junk")),
+            (false, linear(LinearErrorKind::ViewerUnresolved, "")),
+            (false, TrackerError::StateNotFound("no such state".into())),
+            // Including the daemon's own "there is no tracker yet", which no retry can fix.
+            (false, TrackerError::Other("no effective tracker".into())),
+        ] {
+            assert_eq!(move_is_transient(&err), want, "{err:?}");
+        }
+    }
+
     // A tracker move rejection surfaces as move_err with NO moved_to (a handoff failure, not a partial
     // success) — so the agent's tool sees an error and falls back to the Linear-MCP path.
     #[tokio::test(flavor = "multi_thread")]
@@ -1013,6 +1212,126 @@ mod tests {
         assert!(
             quorum_rx.is_empty(),
             "the ticket fan-out must not fire on the ticketless path"
+        );
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
+    /// **STUDIO-838, the retry.** A review-state move that fails TRANSIENTLY and then succeeds
+    /// still ends with an introduction — the watch row the whole ticketless path depends on is not
+    /// discarded because one request did not reach Linear.
+    ///
+    /// The assertion that matters is the introduction, not the move: a handoff that moved the
+    /// ticket but lost the introduction is exactly the orphan this ticket is about.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transient_move_failure_is_retried_and_still_introduces() {
+        let mut fake = Fake::new();
+        fake.move_err = Some(linear(LinearErrorKind::ApiRequest, "error sending request"));
+        fake.move_err_calls = 1; // the first attempt fails, the second lands
+        let tr = Arc::new(fake);
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        if let Some(eff) = o.eff.as_mut() {
+            let mut p = crate::testsupport::empty_resolved_project("proj-a", Arc::clone(&tr) as _);
+            p.repo = "git@github.com:o/r.git".to_string();
+            eff.projects = vec![p];
+        }
+        o.teams = Some(ticketless_teams(&["alice", "bob"]));
+        let mut rx = o.open_review_intro_channel();
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = "alice".to_string();
+            re.project_repo = "git@github.com:o/r.git".to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(res.move_err.is_empty(), "the blip was ridden out");
+        assert_eq!(res.moved_to, "In Review");
+        let req = rx.try_recv().expect("the introduction survived the blip");
+        assert_eq!(req.introduced_by, "handoff:MT-1");
+        assert_eq!(
+            tr.move_calls().len(),
+            2,
+            "one retry, and no more than the failure needed"
+        );
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
+    /// The other half, and the one STUDIO-836's lesson is about: a move the tracker CONSIDERED and
+    /// refused is attempted exactly once. Retrying a refusal only delays the error the agent needs
+    /// in order to fall back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rejected_move_is_never_retried() {
+        let mut fake = Fake::new();
+        fake.move_err = Some(linear(LinearErrorKind::MoveRejected, "success: false"));
+        let tr = Arc::new(fake);
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        o.dispatch_issue(
+            issue_team("ID-3", "MT-3", "In Progress", "TEAM-3"),
+            None,
+            None,
+            String::new(),
+        );
+        let run_id = o.running["ID-3"].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(!res.move_err.is_empty(), "the refusal still surfaces");
+        assert_eq!(
+            tr.move_calls().len(),
+            1,
+            "considered and refused: asked once"
+        );
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
+    /// A transient failure that NEVER clears stops at the attempt bound rather than looping — the
+    /// defect STUDIO-836 is, in the module this ticket touches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transient_failure_that_never_clears_stops_at_the_attempt_bound() {
+        let mut fake = Fake::new();
+        fake.move_err = Some(linear(
+            LinearErrorKind::ApiStatus,
+            "status 503: unavailable",
+        ));
+        let tr = Arc::new(fake);
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        o.dispatch_issue(
+            issue_team("ID-3", "MT-3", "In Progress", "TEAM-3"),
+            None,
+            None,
+            String::new(),
+        );
+        let run_id = o.running["ID-3"].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+
+        assert!(!res.move_err.is_empty(), "it still fails, and says so");
+        assert_eq!(
+            tr.move_calls().len(),
+            HANDOFF_MOVE_ATTEMPTS as usize,
+            "bounded"
         );
 
         env.signal.cancel();

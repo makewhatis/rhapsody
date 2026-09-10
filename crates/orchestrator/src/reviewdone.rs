@@ -64,7 +64,7 @@ use rhapsody_store::RunFilter;
 
 use crate::orchestrator::Orchestrator;
 use crate::prstate::PrCoord;
-use crate::reviewintro::REVIEW_ORIGIN_HANDOFF;
+use crate::reviewintro::{REVIEW_ORIGIN_ADOPT, REVIEW_ORIGIN_HANDOFF};
 use crate::stop::ControlHandle;
 
 /// One merged pull request's implementation ticket, and the terminal state it is going to.
@@ -89,14 +89,22 @@ pub struct ReviewDonePlan {
     pub state: String,
 }
 
-/// The ticket named by a `handoff:<identifier>` origin, or `None` for any other origin.
+/// The ticket named by a `handoff:<identifier>` or `adopt:<identifier>` origin, or `None` for any
+/// other origin.
 ///
-/// The one reader of that spelling besides the writer in [`crate::reviewintro`], and the whole of
-/// this module's scope guard: a `console:` row (or a future origin nobody has written yet) yields
-/// `None` and moves no ticket.
-pub(crate) fn handoff_ticket(introduced_by: &str) -> Option<&str> {
+/// The one reader of those spellings besides the writers in [`crate::reviewintro`] and
+/// [`crate::reviewadopt`], and the whole of this module's scope guard: a `console:` row (or a
+/// future origin nobody has written yet) yields `None` and moves no ticket.
+///
+/// **Both ticket-bearing origins, not just the handoff** (STUDIO-838). The guard is "a ticket THIS
+/// DAEMON parked in a review state", and an adoption is that — resolved from the daemon's own run
+/// ledger and its own configured repository, through the same gates. A `console:` origin still
+/// yields `None` for the reason it always did, which is not that it is untrusted: it names an
+/// OPERATOR, so there is no ticket in it to move.
+pub(crate) fn origin_ticket(introduced_by: &str) -> Option<&str> {
     let identifier = introduced_by
-        .strip_prefix(REVIEW_ORIGIN_HANDOFF)?
+        .strip_prefix(REVIEW_ORIGIN_HANDOFF)
+        .or_else(|| introduced_by.strip_prefix(REVIEW_ORIGIN_ADOPT))?
         .strip_prefix(':')?
         .trim();
     (!identifier.is_empty()).then_some(identifier)
@@ -134,7 +142,7 @@ impl Orchestrator {
         let identifier = rows
             .iter()
             .filter(|row| crate::reviewwatch::row_is(row, pr))
-            .find_map(|row| handoff_ticket(&row.introduced_by))?
+            .find_map(|row| origin_ticket(&row.introduced_by))?
             .to_string();
         // The opaque tracker ids the move needs live on the run that produced the pull request.
         // The LATEST run of that ticket, because a retried ticket has several and they all carry
@@ -211,7 +219,7 @@ mod tests {
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
-    use crate::reviewintro::REVIEW_ORIGIN_CONSOLE;
+    use crate::reviewintro::{REVIEW_ORIGIN_ADOPT, REVIEW_ORIGIN_CONSOLE};
     use crate::reviewwatch::{ControlWatchSink, ReviewWatchSink};
     use crate::testsupport::{empty_effective, set_of};
 
@@ -349,7 +357,31 @@ mod tests {
         );
     }
 
-    /// The scope guard: only a ticket the daemon's own handoff parked is in scope. An
+    /// An ADOPTED row names its ticket exactly as a handoff row does, so a merged pull request the
+    /// repair sweep introduced still moves its implementation ticket to the terminal state
+    /// (STUDIO-838).
+    ///
+    /// The alternative would punish the unlucky twice: a ticket whose handoff lost its introduction
+    /// would get its review back and then never leave the review column, for no reason an operator
+    /// could see. The scope guard this module is built on is "a ticket THIS DAEMON parked in a
+    /// review state" — an adoption is that, from the daemon's own ledger and its own config.
+    #[test]
+    fn an_adopted_row_names_its_ticket_exactly_as_a_handoff_row_does() {
+        let o = orch(ticketless_done("Done"));
+        run_of(&o, "STUDIO-836", "ID-836", "TEAM-1");
+
+        let plan = o
+            .plan_review_done(
+                &[row(144, &format!("{REVIEW_ORIGIN_ADOPT}:STUDIO-836"))],
+                &coord(144),
+            )
+            .expect("an adopted row names a ticket");
+        assert_eq!(plan.identifier, "STUDIO-836");
+        assert_eq!(plan.issue_id, "ID-836");
+        assert_eq!(plan.state, "Done");
+    }
+
+    /// The scope guard: only a ticket the daemon's own handoff or adoption parked is in scope. An
     /// operator-introduced pull request names no ticket, so its merge moves nothing.
     #[test]
     fn only_a_handoff_introduced_row_names_a_ticket() {
@@ -358,6 +390,9 @@ mod tests {
             "handoff:".to_string(),
             "handoff".to_string(),
             "handoffs:STUDIO-712".to_string(),
+            format!("{REVIEW_ORIGIN_ADOPT}:"),
+            REVIEW_ORIGIN_ADOPT.to_string(),
+            "adopts:STUDIO-712".to_string(),
             String::new(),
         ] {
             let o = orch(ticketless_done("Done"));
@@ -404,7 +439,7 @@ mod tests {
         assert_eq!(plan.identifier, "STUDIO-712");
         assert_eq!(
             rows.iter()
-                .filter_map(|r| handoff_ticket(&r.introduced_by))
+                .filter_map(|r| origin_ticket(&r.introduced_by))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
             1,
@@ -527,20 +562,28 @@ mod tests {
         );
     }
 
-    /// The origin parser, over the spellings the two writers produce and the near-misses.
+    /// The origin parser, over the spellings the three writers produce and the near-misses.
     #[test]
-    fn handoff_ticket_reads_the_handoff_origin_only() {
-        assert_eq!(handoff_ticket("handoff:STUDIO-712"), Some("STUDIO-712"));
-        assert_eq!(handoff_ticket("handoff: STUDIO-712 "), Some("STUDIO-712"));
+    fn origin_ticket_reads_the_ticket_bearing_origins_only() {
+        assert_eq!(origin_ticket("handoff:STUDIO-712"), Some("STUDIO-712"));
+        assert_eq!(origin_ticket("handoff: STUDIO-712 "), Some("STUDIO-712"));
+        assert_eq!(origin_ticket("adopt:STUDIO-836"), Some("STUDIO-836"));
+        assert_eq!(origin_ticket("adopt: STUDIO-836 "), Some("STUDIO-836"));
         for other in [
+            // Names an operator, not a ticket.
             "console:operator",
             "handoff",
             "handoff:",
             "handoff:   ",
             "HANDOFF:STUDIO-712",
+            "adopt",
+            "adopt:",
+            "adopt:   ",
+            "ADOPT:STUDIO-836",
+            "adopted:STUDIO-836",
             "",
         ] {
-            assert_eq!(handoff_ticket(other), None, "{other:?}");
+            assert_eq!(origin_ticket(other), None, "{other:?}");
         }
     }
 }
