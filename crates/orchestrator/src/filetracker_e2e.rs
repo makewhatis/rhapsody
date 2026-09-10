@@ -132,31 +132,52 @@ fn count_runs(o: &Orchestrator) -> usize {
         .len()
 }
 
-/// Whether any process still exists in the group led by `pgid` — `kill(-pgid, 0)`, which delivers no
-/// signal and only probes. STUDIO-840's acceptance is a property of the OS, not of the orchestrator's
-/// maps, so the e2e asks the OS.
-fn group_alive(pgid: i32) -> bool {
-    if pgid <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 is the documented existence check; a negative pid addresses the process group
-    // led by `pgid`. Nothing is written and no signal is delivered.
-    unsafe { libc::kill(-pgid, 0) == 0 }
+/// The `ps` rows for processes in the group led by `pgid` that are still ALIVE — zombies excluded.
+/// Each row is `pid stat comm`, kept whole so a failure names exactly what survived.
+///
+/// STUDIO-840's acceptance is a property of the OS, not of the orchestrator's maps, so the e2e asks
+/// the OS — but it asks with `ps` rather than the obvious `kill(-pgid, 0)`, which cannot tell a
+/// running process from a ZOMBIE. The group leader IS a zombie for the window between the SIGKILL
+/// and the runtime reaping it, and under a loaded `cargo test --workspace` (many `#[tokio::test]`
+/// runtimes competing for the SIGCHLD that drains tokio's orphan queue) that window is long enough
+/// to fail a `kill`-based probe on CI while passing locally. A zombie is an exit status waiting to
+/// be collected: it cannot commit to a branch, which is the thing this test is about.
+///
+/// A `ps` whose format this failed to parse would find NO rows and quietly pass — so the caller
+/// asserts the group is live BEFORE the stop, which reds first if the parse is wrong.
+fn group_live_rows(pgid: i32) -> Vec<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-Ao", "pid=,pgid=,stat=,comm="])
+        .output()
+        .expect("ps -Ao pid=,pgid=,stat=,comm=");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let pid = f.next()?;
+            let grp: i32 = f.next()?.parse().ok()?;
+            let stat = f.next()?;
+            let comm = f.next().unwrap_or("");
+            // `Z` / `Z+`: a corpse pending a reap, not something still running.
+            (grp == pgid && !stat.starts_with('Z')).then(|| format!("{pid} {stat} {comm}"))
+        })
+        .collect()
 }
 
-/// Polls [`group_alive`] until the group is gone or `timeout` elapses, returning whether it went. The
-/// kill is delivered by the worker task dropping its run future, so it lands a scheduling hop after
-/// the terminate rather than synchronously; the group leader also lingers as a zombie for the moment
-/// between the SIGKILL and the runtime reaping it.
-async fn wait_group_gone(pgid: i32, timeout: Duration) -> bool {
+/// Polls [`group_live_rows`] until nothing live is left in the group or `timeout` elapses. The kill
+/// is delivered by the worker task dropping its run future, so it lands a scheduling hop after the
+/// terminate rather than synchronously.
+async fn wait_group_quiet(pgid: i32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !group_alive(pgid) {
+    loop {
+        if group_live_rows(pgid).is_empty() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    !group_alive(pgid)
 }
 
 /// The assembled file-tracker orchestrator plus the handles a test drives it through. The temp dirs are
@@ -553,7 +574,7 @@ async fn file_tracker_e2e_stop_leaves_no_agent_process() {
         (re.pgid, re.run_id)
     };
     assert!(
-        group_alive(pgid),
+        !group_live_rows(pgid).is_empty(),
         "the agent's process group ({pgid}) should be alive before the stop"
     );
 
@@ -566,8 +587,9 @@ async fn file_tracker_e2e_stop_leaves_no_agent_process() {
     );
 
     assert!(
-        wait_group_gone(pgid, Duration::from_secs(10)).await,
-        "a process of the stopped run survived: the group ({pgid}) is still alive"
+        wait_group_quiet(pgid, Duration::from_secs(15)).await,
+        "a process of the stopped run survived: group {pgid} still runs {:?}",
+        group_live_rows(pgid)
     );
 
     // And the bookkeeping half still commits — a stop must not trade one divergence for the other.

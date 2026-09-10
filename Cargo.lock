@@ -1694,7 +1694,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "harness-fixtures",
- "libc",
  "regex",
  "rhapsody-agent",
  "rhapsody-config",
