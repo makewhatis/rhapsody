@@ -62,6 +62,15 @@ pub(crate) const ENRICH_DEFERRED_WARN_AFTER: u32 = 3;
 /// that it is happening repeatedly, which is the only thing more than one entry tells them.
 pub(crate) const LOST_REVIEW_WARN_CAP: usize = 5;
 
+/// How many orphaned reviews one project's advisory names (STUDIO-838).
+///
+/// [`LOST_REVIEW_WARN_CAP`]'s value and most of its reason — nothing clears this automatically
+/// either — with one difference that matters: this map is keyed by TICKET, so re-observing the same
+/// orphan on the next poll tick replaces its entry rather than adding one. The cap therefore bounds
+/// how many DISTINCT unrepairable pull requests are named, and five of those is already an
+/// installation-wide fault rather than an incident.
+pub(crate) const ORPHANED_REVIEW_WARN_CAP: usize = 5;
+
 /// The per-project snapshot the warning resolver works from, captured on the control task (from
 /// `eff.projects`) BEFORE the async resolver runs, so the resolver never reads loop-owned state
 /// off-loop. Mirrors Go `projectWarnInput`.
@@ -128,7 +137,29 @@ struct WarningMaps {
     /// how it stayed invisible. It is capped instead ([`LOST_REVIEW_WARN_CAP`]) and a restart
     /// forgets it, which is the operator saying they have seen it.
     lost_review: HashMap<String, Vec<LostReview>>,
+    /// Producer 6 (STUDIO-838) — the pull requests this daemon can see are parked in a review state
+    /// with NO watch row and is not allowed to adopt, per project group. Recorded directly by the
+    /// control task's adoption sweep, so it carries no generation guard for `fetch`'s reason.
+    ///
+    /// **Keyed by TICKET**, unlike `lost_review`'s append-only list, because the sweep re-observes
+    /// the same orphan on every poll tick: a list would grow one entry per tick per orphan. One
+    /// ticket is one line, and re-observing it refreshes the reason rather than adding a line.
+    ///
+    /// **Never cleared by a later success**, for `lost_review`'s reason and one of its own: the
+    /// condition it describes is a pull request sitting unreviewed, and the only thing that makes
+    /// it untrue is the adoption that repairs it — which is why the only way out is
+    /// [`clear_orphaned_review`](WarningsState::clear_orphaned_review), called with that ticket's
+    /// own identifier.
+    orphaned: HashMap<String, OrphanedReviews>,
 }
+
+/// One project group's orphaned reviews: the tickets, oldest-first, and why each is unrepairable.
+///
+/// A `Vec` of pairs rather than a map, because the ORDER is load-bearing twice over — the cap drops
+/// the oldest, and the advisory must render deterministically — and the list is at most
+/// [`ORPHANED_REVIEW_WARN_CAP`] long, so a scan costs nothing.
+#[derive(Debug, Clone, Default)]
+struct OrphanedReviews(Vec<(String, String)>);
 
 /// One review fan-out this daemon gave up on (STUDIO-822).
 #[derive(Debug, Clone)]
@@ -272,6 +303,37 @@ impl WarningsState {
         }
     }
 
+    /// Records a pull request this daemon can see is parked in a review state with NO watch row and
+    /// is NOT allowed to repair (STUDIO-838). Called from the control task's adoption sweep.
+    ///
+    /// A LOCAL surface, deliberately, for [`record_lost_review`](Self::record_lost_review)'s
+    /// reason: the ticket is orphaned precisely because a tracker write did not land, so a comment
+    /// on the ticket is the one place guaranteed to fail for the same cause.
+    pub(crate) fn record_orphaned_review(&self, group: &str, identifier: &str, why: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        let e = m.orphaned.entry(group.to_string()).or_default();
+        match e.0.iter_mut().find(|(id, _)| id == identifier) {
+            // Re-observed: refresh the reason and keep its place, so a sweep every poll tick neither
+            // grows the advisory nor churns its order.
+            Some(entry) => entry.1 = why.to_string(),
+            None => e.0.push((identifier.to_string(), why.to_string())),
+        }
+        // Oldest first out, so the advisory always names the most recent faults.
+        while e.0.len() > ORPHANED_REVIEW_WARN_CAP {
+            e.0.remove(0);
+        }
+    }
+
+    /// Retires a recorded orphan — the ONLY thing that does. Called with the ticket's own
+    /// identifier when its pull request is adopted, which is the only event that makes the advisory
+    /// untrue.
+    pub(crate) fn clear_orphaned_review(&self, group: &str, identifier: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = m.orphaned.get_mut(group) {
+            e.0.retain(|(id, _)| id != identifier);
+        }
+    }
+
     /// The merged warnings for a group (empty when none): missing-prompt-file flags first, then the
     /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406), then the
     /// enrichment-deferred warning (STUDIO-811), then the abandoned review fan-outs (STUDIO-822).
@@ -313,6 +375,14 @@ impl WarningsState {
             out.push(format!(
                 "the review fan-out for {} was abandoned after every retry failed — {}. That round has NO reviewer and nothing will ask again, so its pull request is unreviewed however the merge gate reads; request the review by hand",
                 l.identifier, l.why
+            ));
+        }
+        // Appended after the abandoned fan-outs, for the same golden-ordering reason (STUDIO-838).
+        // One line per orphan: the identifier is the actionable content, and an operator has to
+        // repair each one by hand.
+        for (identifier, why) in m.orphaned.get(group).into_iter().flat_map(|o| o.0.iter()) {
+            out.push(format!(
+                "the pull request for {identifier} is parked in a review state with no reviewer and cannot be adopted — {why}. Nothing will assign one, so it is unreviewed however the merge gate reads; introduce it by hand or fix the cause"
             ));
         }
         out
@@ -1122,5 +1192,82 @@ mod tests {
             HashMap::from([("g".to_string(), vec!["stale file".to_string()])]),
         );
         assert_eq!(o.project_warnings_for("g"), vec!["fresh".to_string()]);
+    }
+
+    // ── producer 6: an orphaned review (STUDIO-838) ──────────────────────────────────────────────
+
+    /// The fault the ticket asks to be visible: a pull request in the review state with no watch
+    /// row that this daemon may not repair. It names the ticket and the reason, so the advisory is
+    /// actionable without reading the log.
+    #[test]
+    fn an_orphaned_review_is_surfaced_with_its_ticket_and_reason() {
+        let w = WarningsState::default();
+        w.record_orphaned_review(
+            "proj-a",
+            "STUDIO-836",
+            "no configured project owns the ticket's repository",
+        );
+
+        let got = w.merged_for("proj-a");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("STUDIO-836"), "{got:?}");
+        assert!(
+            got[0].contains("no configured project owns the ticket's repository"),
+            "{got:?}"
+        );
+        assert!(
+            w.merged_for("proj-b").is_empty(),
+            "and it is scoped to its own project"
+        );
+    }
+
+    /// **It does not self-clear.** Every other producer here describes a live condition that heals
+    /// on its own; this one describes a pull request sitting unreviewed, and the only thing that
+    /// makes it untrue is the adoption that repairs it. A later sweep of a DIFFERENT ticket must
+    /// not retire it — that is exactly how the condition stayed invisible.
+    #[test]
+    fn an_orphaned_review_is_cleared_only_by_adopting_that_ticket() {
+        let w = WarningsState::default();
+        w.record_orphaned_review("proj-a", "STUDIO-836", "boom");
+        w.record_orphaned_review("proj-a", "STUDIO-840", "boom");
+
+        w.clear_orphaned_review("proj-a", "STUDIO-840");
+        let got = w.merged_for("proj-a");
+        assert_eq!(got.len(), 1, "only the adopted one is retired: {got:?}");
+        assert!(got[0].contains("STUDIO-836"), "{got:?}");
+
+        w.clear_orphaned_review("proj-a", "STUDIO-836");
+        assert!(w.merged_for("proj-a").is_empty(), "and then it is gone");
+    }
+
+    /// One ticket, one line, however many sweeps observe it — the sweep runs every poll tick, so a
+    /// producer that appended would grow an advisory per tick per orphan.
+    #[test]
+    fn re_observing_the_same_orphan_does_not_grow_the_advisory() {
+        let w = WarningsState::default();
+        for _ in 0..5 {
+            w.record_orphaned_review("proj-a", "STUDIO-836", "boom");
+        }
+        assert_eq!(w.merged_for("proj-a").len(), 1);
+    }
+
+    /// Bounded like its sibling, because nothing clears it automatically either, and the OLDEST go
+    /// first so the advisory always names the most recent.
+    #[test]
+    fn orphaned_reviews_are_capped_oldest_first() {
+        let w = WarningsState::default();
+        for n in 1..=ORPHANED_REVIEW_WARN_CAP + 2 {
+            w.record_orphaned_review("proj-a", &format!("MT-{n}"), "boom");
+        }
+        let got = w.merged_for("proj-a");
+        assert_eq!(got.len(), ORPHANED_REVIEW_WARN_CAP, "{got:?}");
+        assert!(
+            got.iter().any(|l| l.contains("MT-3")) && got.iter().any(|l| l.contains("MT-7")),
+            "the oldest are dropped: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|l| l.contains("MT-1")),
+            "MT-1 was the oldest: {got:?}"
+        );
     }
 }

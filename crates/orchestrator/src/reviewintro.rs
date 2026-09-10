@@ -1220,7 +1220,11 @@ mod tests {
     /// would be two review runs — "a duplicate wakes a real agent against a real PR for no reason".
     #[test]
     fn adopting_an_already_watched_pull_request_writes_no_second_row() {
-        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob", "carol"]));
+        let mut o = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            &["alice", "bob", "carol"],
+        ));
         o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["bob"]));
         o.store()
             .mark_review_requested(&watch_key("bob"), HEAD_A)
@@ -1237,8 +1241,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "one row, one reviewer: {rows:?}");
         assert_eq!(rows[0].key.reviewer, "bob");
         assert_eq!(
-            rows[0].status,
-            REVIEW_STATUS_APPROVED,
+            rows[0].status, REVIEW_STATUS_APPROVED,
             "the settled round was not re-armed"
         );
     }
@@ -1262,6 +1265,69 @@ mod tests {
         let rows = o.store().load_review_watch().expect("read");
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].status, REVIEW_STATUS_DROPPED, "left retired");
+    }
+
+    /// **The gate pin STUDIO-838 names.** An adoption of a pull request in a repository no
+    /// configured project owns must FAIL TO ADOPT — every guard a handoff-time introduction passes,
+    /// an adoption passes, and the allowlist is F-SEC's anchor.
+    ///
+    /// It is a distinct test from `an_off_allowlist_introduction_is_refused_and_writes_nothing`
+    /// because the adopt path added a gate BELOW this one (`only_if_unwatched`), and an ordering
+    /// that let the cheap new exit run first would be a path that skipped every check above it. The
+    /// watch set here is empty, so the new gate cannot answer, and the refusal can only come from
+    /// the allowlist.
+    #[test]
+    fn an_adoption_in_an_unconfigured_repository_is_refused() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        assert_eq!(
+            o.handle_review_introduce(&adoption("attacker", "evil", 1, &["bob"])),
+            ReviewIntroOutcome::Refused("no configured project owns the PR's repo")
+        );
+        assert!(
+            o.store().load_review_watch().expect("read").is_empty(),
+            "no watch-set entry may exist for an off-allowlist repository"
+        );
+    }
+
+    /// The same, for the rest of the gate battery: an adoption carrying coordinates that cannot
+    /// name a pull request, or no reviewer, is refused exactly as a handoff's would be. Pinned
+    /// separately from the handoff case for the ordering reason above.
+    #[test]
+    fn an_adoption_with_unusable_coordinates_is_refused() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        for (why, pr) in [
+            ("no owner", adoption("", "rhapsody", 12, &["bob"])),
+            ("no repo", adoption("makewhatis", "", 12, &["bob"])),
+            ("number 0", adoption("makewhatis", "rhapsody", 0, &["bob"])),
+            ("no reviewer", adoption("makewhatis", "rhapsody", 12, &[])),
+        ] {
+            assert!(
+                matches!(
+                    o.handle_review_introduce(&pr),
+                    ReviewIntroOutcome::Refused(_)
+                ),
+                "{why}"
+            );
+        }
+        assert!(o.store().load_review_watch().expect("read").is_empty());
+    }
+
+    /// §16 for the adopt path: a dormant daemon adopts nothing, whatever it is handed.
+    #[test]
+    fn a_dormant_daemon_adopts_nothing() {
+        for (enabled, mode) in [
+            (false, ReviewMode::Ticketless),
+            (true, ReviewMode::Off),
+            (true, ReviewMode::Tickets),
+        ] {
+            let mut o = orch(teams_with(enabled, mode, &["alice", "bob"]));
+            assert_eq!(
+                o.handle_review_introduce(&adoption("makewhatis", "rhapsody", 144, &["bob"])),
+                ReviewIntroOutcome::Dormant,
+                "enabled={enabled} mode={mode:?}"
+            );
+            assert!(o.store().load_review_watch().expect("read").is_empty());
+        }
     }
 
     /// The other half of the same property, and the one the ticket is actually about: a pull

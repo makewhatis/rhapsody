@@ -456,6 +456,11 @@ pub struct Orchestrator {
     /// Cloned into every [`ControlHandle`](crate::stop::ControlHandle), which sends it after the
     /// review-state move succeeds — a handoff Linear refused has not happened, so it introduces
     /// nothing, exactly as it fans nothing out.
+    /// When each ticket was last considered by the ticketless ADOPTION sweep (STUDIO-838), so the
+    /// same ticket is not resolved to a pull request on every poll tick. Loop-confined, and grows
+    /// by one short string per ticket this daemon sees parked in a review state without a watch row
+    /// — a set bounded by the review column, not by history.
+    pub(crate) review_adopt_probed: std::collections::HashMap<String, std::time::Instant>,
     pub(crate) review_intro_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::reviewintro::ReviewIntroRequest>>,
 
@@ -736,6 +741,7 @@ impl Orchestrator {
             quorum_load: HashMap::new(),
             quorum_facts: HashMap::new(),
             quorum_tx: None,
+            review_adopt_probed: std::collections::HashMap::new(),
             review_intro_tx: None,
             review_notify_tx: None,
             teams_memory: None,

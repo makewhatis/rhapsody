@@ -826,6 +826,15 @@ impl Orchestrator {
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
             // the quorum off (§0.12).
             self.record_quorum_state(tagged.iter().map(|t| &t.iss));
+            // Ticketless review ADOPTION (STUDIO-838): the same snapshot again, for the repair
+            // path. A pull request whose handoff never introduced it is invisible to every other
+            // mechanism, and this fetch — active ∪ review — is already holding the one fact that
+            // finds it, so the sweep costs no tracker call. A hard no-op unless
+            // `review.mode: ticketless`.
+            self.sweep_review_adoptions(
+                tagged.iter().map(|t| (&t.iss, t.proj)),
+                std::time::Instant::now(),
+            );
             let (picked, reopen, held_for_capacity) =
                 self.select_dispatch_multi_with_reopens(tagged);
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
@@ -893,6 +902,12 @@ impl Orchestrator {
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
         self.record_quorum_state(issues.iter());
+        // The legacy ladder's half of the adoption sweep (STUDIO-838). Untagged, so each candidate
+        // resolves its repository through the top-level binding.
+        self.sweep_review_adoptions(
+            issues.iter().map(|iss| (iss, None)),
+            std::time::Instant::now(),
+        );
         let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
         // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
         // over the reset at the top of the tick, so a teammate who has since freed up cannot linger

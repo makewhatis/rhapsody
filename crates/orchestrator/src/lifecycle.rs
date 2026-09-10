@@ -638,7 +638,7 @@ impl LifecycleCache {
 ///     have named someone has been consulted. A gap that is really a failed read cannot, on either
 ///     branch: caching it would blank a column over a transient error, which is the same rule
 ///     [`label_identities`] follows for a failed round trip.
-enum RunIdentity {
+pub(crate) enum RunIdentity {
     /// A `teams.route` row naming this teammate.
     Routed(String),
     /// A `teams.unrouted` row: this dispatch was solo or matched nobody, on the record.
@@ -670,7 +670,10 @@ enum RunIdentity {
 ///
 /// A `run_id` of zero is [`RunIdentity::Silent`], not [`RunIdentity::Unreadable`] — there is no run
 /// to have a ledger, which is a definite absence rather than a failed read.
-fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) -> RunIdentity {
+pub(crate) fn run_identity(
+    store: &(dyn rhapsody_store::Store + Send + Sync),
+    run_id: i64,
+) -> RunIdentity {
     if run_id <= 0 {
         return RunIdentity::Silent;
     }
@@ -710,6 +713,24 @@ fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) 
         Ok(Some(_)) => RunIdentity::Unrouted,
         Ok(None) => RunIdentity::Silent,
         Err(()) => RunIdentity::Unreadable,
+    }
+}
+
+/// The teammate a run was ROUTED to, or `None` for every other answer — a run that recorded
+/// `teams.unrouted`, one whose ledger is silent (Teams was off), and one whose ledger could not be
+/// read at all.
+///
+/// The narrow half of [`run_identity`], for callers that need "which teammate did this work" and
+/// have nothing to do with the other three answers (STUDIO-838's adoption sweep, which must refuse
+/// rather than guess). The assignee decoration above keeps using the full enum, because there the
+/// difference between "nobody" and "unreadable" decides whether the ticket LABEL may be consulted.
+pub(crate) fn routed_identity(
+    store: &(dyn rhapsody_store::Store + Send + Sync),
+    run_id: i64,
+) -> Option<String> {
+    match run_identity(store, run_id) {
+        RunIdentity::Routed(name) => Some(name),
+        RunIdentity::Unrouted | RunIdentity::Silent | RunIdentity::Unreadable => None,
     }
 }
 
