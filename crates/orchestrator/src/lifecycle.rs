@@ -3245,12 +3245,14 @@ mod tests {
         );
     }
 
-    /// The ceiling has to hold "however many consoles are open", so the gate is claimed on ENTRY
-    /// and not merely consulted: two dashboards polling the same instant would otherwise both find
-    /// it open and both spend a round trip, and the bound would be one request per window PER
-    /// READER instead of one per window.
+    /// Readers inside a SETTLED backoff window share the probe that armed it. That is one of the
+    /// two gates `claim` stands in front of, and the easier one: `settle` has already recorded the
+    /// failure, so what refuses these readers is the real wait rather than the provisional arm.
+    /// [`readers_arriving_while_the_first_probe_is_open_ride_on_it`] covers the other one, and the
+    /// names have to say which is which — a rename that blurs them costs the next reader the hour
+    /// it takes to notice that only one of the two is actually pinned.
     #[tokio::test]
-    async fn concurrent_readers_share_one_probe_per_window() {
+    async fn concurrent_readers_share_one_probe_per_settled_window() {
         let mut f = Fake::default();
         f.states_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
         let tr = Arc::new(f);
@@ -3283,9 +3285,88 @@ mod tests {
         assert_eq!(
             tr.by_id_calls(),
             1,
-            "eight concurrent readers inside one backoff window must cost the one probe that \
-             armed it, not one each",
+            "eight concurrent readers inside one SETTLED backoff window must cost the one probe \
+             that armed it, not one each",
         );
+    }
+
+    /// The other half of the ceiling, and the half a test that awaits each poll to completion can
+    /// never see: readers arriving while the very FIRST probe is still in flight, before anything
+    /// has settled. `failures` is still zero here and `settle` has not run, so the only thing that
+    /// can refuse them is the wait [`Gate::claim`] arms provisionally on entry. Delete those two
+    /// lines and the bound silently becomes one request per window per concurrent READER — which
+    /// is the reading of "however many consoles are open" this whole change exists to rule out.
+    ///
+    /// The tracker fake PARKS inside the round trip until released, which is what makes that window
+    /// enterable at all; the sibling test above cannot reach it because its first `resolve` is
+    /// awaited to completion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn readers_arriving_while_the_first_probe_is_open_ride_on_it() {
+        let (release, gate) = tokio::sync::watch::channel(false);
+        let mut f = Fake::default();
+        f.states_by_ids_gate = Some(gate);
+        f.states_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
+        let tr = Arc::new(f);
+        let cache = Arc::new(LifecycleCache::default());
+        let ids = vec!["a".to_string()];
+        let t0 = Instant::now();
+
+        let first = {
+            let (cache, tr, ids) = (Arc::clone(&cache), Arc::clone(&tr), ids.clone());
+            tokio::spawn(async move {
+                cache
+                    .resolve(&ids, Some((tr as Arc<dyn Tracker>, states())), t0)
+                    .await
+            })
+        };
+        // Wait until that probe is definitively OPEN. The fake clones a receiver for exactly the
+        // duration of the awaited call, so a second receiver existing is "the round trip is in
+        // flight right now" — and nothing has settled while it is.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while release.receiver_count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first probe never reached the tracker",
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Eight consoles poll one second in, meeting only the provisional arm.
+        let at = t0 + Duration::from_secs(1);
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let (cache, tr, ids) = (Arc::clone(&cache), Arc::clone(&tr), ids.clone());
+            readers.push(tokio::spawn(async move {
+                cache
+                    .resolve(&ids, Some((tr as Arc<dyn Tracker>, states())), at)
+                    .await
+            }));
+        }
+        // A refused reader returns at once; one that is NOT refused parks behind the same unreleased
+        // gate, so this join is bounded rather than awaited outright — otherwise the regression this
+        // test exists for would hang here instead of failing with the count that explains it.
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            for r in readers {
+                let _ = r.await;
+            }
+        })
+        .await;
+
+        assert_eq!(
+            tr.by_id_calls(),
+            1,
+            "eight readers arriving while the first probe was still in flight must ride on it; \
+             they opened {} round trips between them",
+            tr.by_id_calls(),
+        );
+        assert!(
+            joined.is_ok(),
+            "a refused reader must be served the memo immediately, not queued behind the open probe",
+        );
+
+        // Release, so the parked probe can settle rather than be dropped mid-flight.
+        let _ = release.send(true);
+        first.await.expect("the first probe");
     }
 
     /// The two label lookups share the tracker, the quota and the defect, so they share the fix.
