@@ -834,6 +834,18 @@ later tick, inside the same sliding `now - 5m` lookback window. Moving enrichmen
 path — the shape `triage.rs` already uses — remains the structurally correct end state and is not
 attempted here.
 
+**STUDIO-829 finished the `spawn_blocking` row above.** It covered the summons fetch alone, and
+seven of `ghsummons.rs`'s eight `gh` exec sites still called the synchronous runner inline. That is
+a Rust hazard with no Go counterpart — a goroutine blocked in `exec` detaches its OS thread, while a
+Rust future with no await point holds a tokio *worker* thread, from the pool the control loop and
+the HTTP server share — so a hung `gh` on an operator's console-merge click could stall dispatch by
+a different route than the one this entry describes. All eight now go through `GH::run_off_task`,
+and every exec is capped at `GH_EXEC_TIMEOUT` (60s), a backstop deliberately above the 15s
+operation-level bounds so it never preempts them. Nothing Go-observable changes: `summons_since` is
+the only one of the eight with a Go counterpart and it keeps `GH_SUMMONS_TIMEOUT` as its governing
+bound; the other seven are Rhapsody-only seams (console merge, review-comment posting, the quorum's
+and the review watcher's lookups) that Go Symphony does not have at all.
+
 ### A merged pull request moves its ticket to Done (STUDIO-712)
 
 Go v0.4.0 knows what a terminal state IS — `tracker.terminal_states` — but it only ever READS the

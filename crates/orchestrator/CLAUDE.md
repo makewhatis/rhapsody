@@ -103,6 +103,18 @@ the `Orchestrator` struct itself. Concretely:
   and reporting the shortfall (see the README divergence). Do not reintroduce a per-candidate lazy
   fetch: the three-pass shape there (candidates → bounded fetch → pure apply) is what keeps the
   cost bounded by wall clock rather than by repo count.
+  **`run_off_task` is now the ONLY way to reach `gh` from this crate** (STUDIO-829): 811 contained
+  one of the module's eight exec sites and the other seven still called the synchronous runner
+  inline, which holds a tokio WORKER thread rather than its own task and makes any timeout around
+  it unenforceable. All eight go through the helper, every exec is capped at `GH_EXEC_TIMEOUT`
+  (60s — a backstop, deliberately above the 15s operation-level bounds in `ghenrich` and `quorum`
+  so it never preempts them), and `every_gh_exec_goes_through_the_blocking_pool` asserts on
+  `ghsummons.rs`'s own source that no inline call site can come back. If you add a `gh` seam, that
+  test is the thing that will tell you — don't route around it. The several module docs that used
+  to explain "a bound here would be decoration" (`runmerge`, `prstate`, `quorum`, `reviewintro`,
+  `reviewnotify`, `reviewwatch`, `teamsknow`) were corrected in the same change; the STRUCTURAL
+  containment each of them describes is still load-bearing and still the reason the control task
+  never makes these calls.
 - **Orchestrator-internal ports of dependency-free Go packages** (`internal/liveness`,
   `internal/obslog`; `internal/ghsummons` above is a third): `liveness.rs` and `obslog.rs`. These
   exist because the Go packages have no dedicated Rust crate and the orchestrator is their sole
