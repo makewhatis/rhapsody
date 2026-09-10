@@ -63,6 +63,7 @@ pub mod reload;
 pub mod retry;
 pub mod review;
 pub mod reviewconsole;
+pub mod reviewdone;
 pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewprompt;

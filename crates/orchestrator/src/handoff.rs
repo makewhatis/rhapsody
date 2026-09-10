@@ -241,7 +241,7 @@ impl ControlHandle {
     /// tickets). Returns the tracker error text on failure; no tracker at all (before the first config
     /// load) is a move failure so the agent falls back to the Linear-MCP path. Clones the handle out
     /// before any await; the reads guard is never held across it.
-    async fn move_issue_state(
+    pub(crate) async fn move_issue_state(
         &self,
         issue_id: &str,
         team_id: &str,

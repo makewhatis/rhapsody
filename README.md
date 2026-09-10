@@ -834,6 +834,49 @@ later tick, inside the same sliding `now - 5m` lookback window. Moving enrichmen
 path — the shape `triage.rs` already uses — remains the structurally correct end state and is not
 attempted here.
 
+### A merged pull request moves its ticket to Done (STUDIO-712)
+
+Go v0.4.0 knows what a terminal state IS — `tracker.terminal_states` — but it only ever READS the
+set, for claim-skip and for startup worktree cleanup, and it has no pull-request merge watcher at
+all. **Nothing in the frozen reference ever moves a ticket INTO a terminal state**, so this is a
+deliberate divergence rather than additive surface. It exists because the other end of the
+review handoff was never built: `POST /api/v1/runs/{id}/handoff` parks a finished run's ticket in
+the configured review state, and until now nothing moved it out — one evening's ten merged pull
+requests cost roughly sixteen manual transitions, and the maintainer's merge checklist carries the
+step verbatim.
+
+| A merged pull request | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| ticket transition | none — terminal states are only ever read | moved to `teams.review.done_state` by NAME |
+| what watches the merge | nothing | the existing ticketless review watcher, off-loop |
+| default | — | **off**: `done_state` is empty unless an operator names a state |
+
+**The config is one key, and empty means off.** `teams.review.done_state` is the state NAME the
+ticket is moved to — the same by-NAME `MoveIssueState` the handoff uses, and the same
+empty-means-off discipline `review_states` has, so there is no second toggle to keep in agreement
+with it. A name rather than a boolean over `terminal_states[0]`: workspace state names vary, and
+`terminal_states`' conventional second member is `Canceled`, so reading a position out of an
+unordered set would let a reordered config silently cancel finished work. It nests under `teams`
+because it rides the ticketless watcher, which makes "a Teams-off install is byte-identical"
+structural rather than remembered — there is no way to spell it outside Teams.
+
+**Scope: only tickets this daemon parked, and only on a MERGE.** The population is
+`rhapsody_review_watch`, whose rows exist because a handoff introduced them from the run's own
+trusted repository binding in the same breath as the review-state move, and which record that
+origin as `handoff:<identifier>`. The ticket is therefore read off the row rather than inferred; a
+row an operator introduced through the console names none and moves none. A **closed-unmerged**
+pull request is out of scope and stays a human's call — it is abandoned work whose ticket still
+needs picking up, and auto-Cancelling it would destroy the only signal that says so. `Closed`,
+`Gone` and an untrusted head all retire the watch row and move nothing.
+
+**No second watcher and no second GitHub call.** The merge edge is the one
+`reviewwatch::handle_review_sweep` already computes from `prstate`'s sweep, so the transition adds
+no `gh` traffic whatsoever. The decision is made on the control task (where the watch set is
+single-writer) and the Linear write happens on the watcher's own task, exactly as the handoff
+resolves its plan on the loop and moves the ticket off it. A ticket whose runs have aged out of
+history cannot be addressed — `MoveIssueState` needs the opaque ids — so the daemon declines and
+warns rather than firing a call it knows will fail.
+
 ### A review run renders the daemon's own base prompt (STUDIO-798)
 
 Go v0.4.0 has one base prompt per run and renders whatever `prompt`/`prompt_file` names — on a real
