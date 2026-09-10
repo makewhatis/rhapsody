@@ -13,7 +13,9 @@
 // and what it costs:
 //   - Status  — the TICKET's lifecycle when the daemon resolved one (STUDIO-702), else the
 //               daemon's own job status, narrowed to `reviewing` when a live run is on a REVIEW
-//               ticket (STUDIO-780). See `consoleJobStatus`.
+//               ticket (STUDIO-780) or IS a review run (STUDIO-826). A review run is also the one
+//               row whose own outcome is terminal, having no ticket to be handed to a reviewer.
+//               See `consoleJobStatus`.
 //   - Assignee— the DURABLE assignee the daemon resolves per history row (STUDIO-735), falling
 //               back to the Teams roster's LIVE tickets (`GET /api/v1/teams`) only for a row that
 //               has none — a run that started before its routing record landed. See
@@ -120,14 +122,35 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * It defaults to `false` on the same terms as `lifecycle` defaults to absent — a daemon that does
  * not serve `review_ticket`, a ticket minted before the marker label existed, and a tracker that
  * could not be asked are all the same answer, and all three read exactly as they did before.
+ *
+ * The fourth rule is `reviewRun`, and it is the one place a row's own OUTCOME is terminal
+ * (STUDIO-826). A ticketless review job — `review.mode: ticketless`, a run dispatched against a
+ * `pr:owner/repo#n@reviewer` key — has no tracker ticket, so `lifecycle` is not merely unresolved
+ * for it, it is unresolvable: there is nothing to resolve. Both halves of the fallback are then
+ * wrong for it. Live, `reviewTicket` cannot reach it, because that marker is a TICKET label and
+ * there is no ticket to carry one. Finished, `completed → review` claims the work now awaits
+ * somebody's review, when the review IS the work and it is over — and that claim went on to bill
+ * the strip's "Needs you" for a job that needed nobody.
+ *
+ * So a review run reads its own run: `reviewing` while live, `done` when it completed, and `blocked`
+ * or `queued` exactly as before otherwise. A FAILED review is deliberately still `blocked` and still
+ * the operator's move; it is the one review outcome that genuinely does need a person.
+ *
+ * It changes nothing about a ticket-based review row, which keeps STUDIO-780's behaviour entirely:
+ * the two flags mark different subjects, the daemon sets them on different rows, and only the live
+ * arm is shared between them.
  */
 export function consoleJobStatus(
   status: string,
   lifecycle?: string,
   reviewTicket = false,
+  reviewRun = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
-  if (fromRun === "run") return reviewTicket ? "reviewing" : "run";
+  if (fromRun === "run") return reviewTicket || reviewRun ? "reviewing" : "run";
+  // No ticket exists behind this row, so there is no lifecycle for one to outrank and the run's own
+  // outcome is the whole truth. `completed` here means the review finished, not that one is owed.
+  if (reviewRun) return fromRun === "review" ? "done" : fromRun;
   switch (lifecycle) {
     case "done":
     case "canceled":
@@ -347,6 +370,31 @@ export function reviewTicketIssues(rows: readonly IssueRun[]): Set<string> {
 }
 
 /**
+ * The rows whose own RUN is a review, from the issue-level listing's `review_run` field
+ * (STUDIO-826) — a run dispatched against a `pr:owner/repo#n@reviewer` key instead of a ticket,
+ * which is what `review.mode: ticketless` produces.
+ *
+ * The sibling of [`reviewTicketIssues`] and not a substitute for it: that one reads a marker on a
+ * TICKET, and these rows have no ticket for a marker to live on. It is why they never reached
+ * `reviewing`, and why their completion has to stop meaning "awaiting a reviewer" — see
+ * [`consoleJobStatus`].
+ *
+ * Positive-only, mirroring the daemon exactly, for the reason [`reviewTicketIssues`] is.
+ *
+ * Nothing here parses the key, and nothing reads the title. The daemon resolves this from the run's
+ * own issue id and serializes the answer; re-deriving it from the `pr:` prefix would turn a wire
+ * format into a UI contract, and `"Review owner/repo#n at <sha>"` is a string the daemon happens to
+ * mint rather than a fact about a run.
+ */
+export function reviewRunIssues(rows: readonly IssueRun[]): Set<string> {
+  const out = new Set<string>();
+  for (const r of rows) {
+    if (r.issue_identifier !== "" && r.review_run === true) out.add(r.issue_identifier);
+  }
+  return out;
+}
+
+/**
  * Ticket key → teammate name, from the issue-level listing's own `assignee` field (STUDIO-735).
  *
  * This is the historical record — who the run was dispatched under — so unlike `ticketAssignees` it
@@ -429,11 +477,13 @@ export function buildConsoleJobs(
   const activity = lastActivityByIssue(issueRows);
   const lifecycles = lifecycleByIssue(issueRows);
   const reviewTickets = reviewTicketIssues(issueRows);
+  const reviewRuns = reviewRunIssues(issueRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
     const reviewTicket = reviewTickets.has(job.issue);
-    const status = consoleJobStatus(job.status, ticket?.lifecycle, reviewTicket);
+    const reviewRun = reviewRuns.has(job.issue);
+    const status = consoleJobStatus(job.status, ticket?.lifecycle, reviewTicket, reviewRun);
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     return {
       key: job.key,

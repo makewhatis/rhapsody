@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow};
+use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow, review};
 use rhapsody_store::{DayRollup, DayTotals, EventHit, EventRow, RunSummary};
 use serde_json::{Value, json};
 
@@ -201,6 +201,19 @@ pub(crate) fn history_response(runs: &[RunSummary], next_offset: Option<i64>) ->
 /// before the marker label existed, and all three mean the same thing to the client — paint this
 /// row exactly as it was painted before the field existed.
 ///
+/// It carries `review_run: true` when the row's own run is a REVIEW RUN — a run dispatched against
+/// a synthetic `pr:owner/repo#n@reviewer` issue rather than a tracker ticket (STUDIO-826). This is
+/// the sibling fact to `review_ticket`, not a restatement of it: `review_ticket` says the TICKET's
+/// job is to review somebody's work, while a ticketless review job has no ticket at all, so no
+/// label could ever mark it and no lifecycle will ever be resolved for it. Without the field the
+/// console has only the run outcome, and `completed` there reads "awaiting a reviewer" — the exact
+/// inverse of what a finished review means.
+///
+/// It is read off `issue_id`, which for such a run IS the `pr:` key — the same predicate the
+/// orchestrator's own dispatch and retry paths key on ([`review::is_review_key`]) — and never off
+/// the title: `Review owner/repo#n at <sha>` is a string the daemon happens to mint, not a fact
+/// about the run. Positive-only for the same reason `review_ticket` is.
+///
 /// It carries `assignee` on the same terms when `assignees` names one (STUDIO-735): the teammate
 /// the ticket's newest run was dispatched under, which is what keeps a finished job attributed
 /// after its teammate has left the live roster. A ticket nobody was routed for — solo, unrouted, or
@@ -234,6 +247,11 @@ pub(crate) fn issue_runs_response(
             }
             if reviews.contains(&r.issue_id) {
                 obj.insert("review_ticket".to_string(), json!(true));
+            }
+            // No lookup: a review run announces itself in the id it was dispatched under, which is
+            // why this one needs no provider surface beside the three above.
+            if review::is_review_key(&r.issue_id) {
+                obj.insert("review_run".to_string(), json!(true));
             }
             row
         })
