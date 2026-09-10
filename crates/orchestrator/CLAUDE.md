@@ -255,7 +255,16 @@ the `Orchestrator` struct itself. Concretely:
   path is the seam where this mismatch is bridged — read its module doc before changing either
   table's key.
 - `RunningEntry::cancel` defaults to an **unarmed** `CancelSignal` (Go leaves `cancel` nil for
-  test/legacy entries); don't assume every `RunningEntry` in a test fixture can be cancelled.
+  test/legacy entries); don't assume every `RunningEntry` in a test fixture can be cancelled. Since
+  STUDIO-840 `handle_stop_run` REFUSES an unarmed entry (`kill_undeliverable`) instead of firing a
+  no-op cancel and moving the ticket anyway, so a stop test built on a hand-made fixture asserts the
+  refusal, not the stop — dispatch the issue if you want the real path.
+- **Cancellation is a dropped future, and the drop is what kills the agent.** `terminate` fires
+  `re.cancel`; `spawn_worker`'s `tokio::select!` then drops the run future, and the turn's
+  `KillGroupOnDrop` guard (`crates/agent`) SIGKILLs the `claude` process group — the stand-in for
+  Go's `exec.CommandContext` + `cmd.Cancel`. Nothing else kills an agent, so any new path that
+  abandons a run future must let it drop rather than `mem::forget`/detach it, and any new path that
+  reports a run stopped owes the same armed-signal check `handle_stop_run` makes.
 - The control channel is `tokio::sync::mpsc::unbounded`, not Go's buffered-256 channel — a
   deliberate deviation (the worker's per-event forwarding closure is sync and can't await a
   bounded send). Don't "fix" this back to a bounded channel without re-reading `loop.rs`'s module

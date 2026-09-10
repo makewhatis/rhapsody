@@ -23,6 +23,10 @@ pub struct StopResult {
     pub moved_to: String,
     /// Non-empty when the agent was killed but the Backlog move failed.
     pub move_err: String,
+    /// The kill could NOT be delivered (the run's cancellation is unarmed), so the stop committed
+    /// nothing at all: the agent is still running, the run is still `running`, and the ticket was
+    /// left where it was. Rendered as a `kill_undeliverable` 409 rather than a success (STUDIO-840).
+    pub kill_undeliverable: bool,
 }
 
 /// The HTTP-layer result of a Resume (Go `ResumeResult`).
@@ -51,6 +55,10 @@ pub struct StopPlan {
     pub issue_id: String,
     pub team_id: String,
     pub identifier: String,
+    /// The live run was found but its cancellation is unarmed, so no kill can reach the agent. The
+    /// control task committed NOTHING for it and the off-loop half must not move the ticket
+    /// (STUDIO-840).
+    pub kill_undeliverable: bool,
 }
 
 /// The control-task reply for `evResume` (Go `resumePlan`): the admission decision. `live` / `superseded`
@@ -217,6 +225,30 @@ impl Orchestrator {
         if id.is_empty() {
             return StopPlan::default(); // found = false
         }
+        // The kill and the ticket move are two separate commits, and the response implies both. Only
+        // the kill can fail to be DELIVERED at all: on an unarmed `CancelSignal`, `re.cancel()` is a
+        // silent no-op, while the move — which does not depend on the signal — would commit normally
+        // and leave the board saying Backlog with an agent still committing (STUDIO-840). Every
+        // production dispatch arms the signal, so this is unreachable in a live daemon; the type
+        // still permits it, and a stop that reports success without stopping is worse than one that
+        // errors. Refuse the WHOLE stop: terminate nothing, record nothing, move nothing.
+        if let Some(re) = self.running.get(&id)
+            && !re.cancel.is_armed()
+        {
+            tracing::error!(
+                issue_id = %id,
+                issue_identifier = %re.issue.identifier,
+                run_id,
+                "stop refused: this run has no armed cancellation, so its agent cannot be killed"
+            );
+            return StopPlan {
+                found: true,
+                kill_undeliverable: true,
+                issue_id: id.clone(),
+                team_id: re.issue.team_id.clone(),
+                identifier: re.issue.identifier.clone(),
+            };
+        }
         // `terminate` removes the entry, fires the worker cancellation (Go `re.cancel()` → SIGKILL),
         // and returns the entry we persist the `stopped` outcome from.
         let Some(re) = self.terminate(&id) else {
@@ -224,6 +256,7 @@ impl Orchestrator {
         };
         let plan = StopPlan {
             found: true,
+            kill_undeliverable: false,
             issue_id: id.clone(),
             team_id: re.issue.team_id.clone(),
             identifier: re.issue.identifier.clone(),
@@ -324,6 +357,15 @@ impl ControlHandle {
         if !plan.found {
             return Ok(StopResult {
                 not_running: true,
+                ..Default::default()
+            });
+        }
+        // The control task refused: nothing was killed and nothing recorded, so the ticket must stay
+        // where it is. Reporting the move here is what made the production failure invisible.
+        if plan.kill_undeliverable {
+            return Ok(StopResult {
+                kill_undeliverable: true,
+                identifier: plan.identifier,
                 ..Default::default()
             });
         }
@@ -735,6 +777,97 @@ mod tests {
         assert!(
             !o.claimed.contains("ID-1"),
             "claimed[ID-1] should be cleared after a successful Backlog move"
+        );
+    }
+
+    /// STUDIO-840. `terminate` fires `re.cancel()` unconditionally, and on the UNARMED default that
+    /// call is a silent no-op — so the kill reaches nothing while the ticket move, which does not
+    /// depend on the signal, commits normally. That is the exact divergence the defect produced: the
+    /// board said Backlog while an agent was still committing. A stop that cannot deliver its kill
+    /// must therefore commit NOTHING and say so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_run_refuses_when_the_kill_cannot_be_delivered() {
+        let mut f = Fake::new();
+        f.move_to_type_name = "Backlog".to_string();
+        let tr = Arc::new(f);
+        let (mut o, env) = stop_orch(Arc::clone(&tr));
+        // Built the ordinary fixture way (`RunningEntry::empty`), which `CLAUDE.md` warns carries an
+        // unarmed `CancelSignal` — never via `dispatch_issue`, which arms it.
+        let run_id = seed_run(env.store.as_ref(), "ID-1", "MT-1", "TEAM-1", None);
+        let mut re = crate::orchestrator::RunningEntry::empty(issue_team(
+            "ID-1",
+            "MT-1",
+            "In Progress",
+            "TEAM-1",
+        ));
+        re.run_id = run_id;
+        assert!(
+            !re.cancel.is_armed(),
+            "this test is only meaningful on an unarmed entry"
+        );
+        o.running.insert("ID-1".to_string(), re);
+        o.claimed.insert("ID-1".to_string());
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .stop_run(CancelWait::default(), run_id)
+            .await
+            .expect("stop_run");
+
+        assert!(
+            res.kill_undeliverable,
+            "a stop that cannot kill must report it, not answer success"
+        );
+        assert!(
+            !res.not_running,
+            "the run WAS found; it just cannot be killed"
+        );
+        assert_eq!(res.identifier, "MT-1");
+        assert_eq!(
+            res.moved_to, "",
+            "the ticket must not move when the agent cannot be stopped"
+        );
+        assert!(
+            tr.move_to_type_calls().is_empty(),
+            "the tracker must not be touched: move_to_type_calls = {:?}",
+            tr.move_to_type_calls()
+        );
+        let run = env
+            .store
+            .get_run(run_id)
+            .expect("get_run")
+            .expect("run found");
+        assert_eq!(
+            run.outcome, OUTCOME_RUNNING,
+            "the run must not be recorded canceled while its agent is alive"
+        );
+
+        env.signal.cancel();
+        let o = task.await.expect("loop task");
+        assert!(
+            o.running.contains_key("ID-1"),
+            "the entry must stay in `running` — the daemon must not believe a live run has ended"
+        );
+    }
+
+    /// The other half of STUDIO-840's decision: an unarmed cancellation is representable (it is
+    /// [`RunningEntry::empty`]'s default, for the test/legacy entries Go leaves `cancel` nil on) but
+    /// can never come from a real dispatch. `dispatch_issue` is the only production path that inserts
+    /// into `running`, and it arms the signal before the spawn observes it — pinned here so the
+    /// refusal above stays unreachable in a live daemon rather than merely unobserved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_arms_every_running_entrys_cancellation() {
+        let tr = Arc::new(Fake::new());
+        let (mut o, _env) = stop_orch(Arc::clone(&tr));
+        o.dispatch_issue(
+            issue_team("ID-1", "MT-1", "In Progress", "TEAM-1"),
+            None,
+            None,
+            String::new(),
+        );
+        assert!(
+            o.running["ID-1"].cancel.is_armed(),
+            "a dispatched run's cancellation must be armed, or its Stop can never kill the agent"
         );
     }
 
