@@ -11,7 +11,7 @@
 //! serializes an empty [`Vec`] as `[]` (never `null`) intrinsically — the guarantee Go must hand-write
 //! a `MarshalJSON` for on every list envelope.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow, review};
@@ -259,6 +259,67 @@ pub(crate) fn issue_runs_response(
     json!({
         "issues": Value::Array(issues),
         "next_offset": next_offset,
+    })
+}
+
+/// The distinct combination of STATUS INPUTS one issue carries — the key the whole-store per-status
+/// tally in [`issue_counts_response`] groups by (STUDIO-828).
+///
+/// It is deliberately the run/ticket FACTS the issue listing already serves per row, and not the
+/// console's own vocabulary. The console maps this tuple onto the word its Pill paints
+/// (`consoleJobStatus`, `web/src/lib/console-jobs.ts`) and onto its "Needs you" flag
+/// (`needsOperator`), and that mapping stays in ONE place — the client — precisely so the strip's
+/// count and the table's pill can never be derived by two rules that drift. The daemon's job here is
+/// the part the client genuinely cannot do: fold every issue in the store, not the page it fetched.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct IssueStatusKey {
+    /// The run outcome the console's `jobStatus` would see for this issue — the stored row's
+    /// `outcome`, or `running` when the live snapshot has the ticket in flight or parked for retry.
+    pub outcome: String,
+    /// The normalized tracker lifecycle, or `None` when the daemon resolved none — the same absence
+    /// the per-row `lifecycle` field expresses by omission.
+    pub lifecycle: Option<String>,
+    /// Whether this is a ticketless review RUN — the fact `consoleJobStatus` needs to stop reading a
+    /// finished review as "awaiting a reviewer" (STUDIO-826). Read off the id, so it costs nothing.
+    ///
+    /// There is deliberately no `review_ticket` beside it, though the per-row listing carries one:
+    /// that marker only turns a LIVE `run` into `reviewing`, and the strip counts both as running,
+    /// so it cannot move any of the five figures — while resolving it would double this endpoint's
+    /// tracker cost. See [`crate::handlers_history`]'s counts handler.
+    pub review_run: bool,
+}
+
+/// `{issues, buckets:[…]}` — the `GET /api/v1/history/issues/counts` payload (STUDIO-828).
+///
+/// `issues` is how many issues the tally covers, and equals the sum of the buckets' counts; it is
+/// carried rather than left to be summed because "the whole store" is the claim this endpoint
+/// exists to make, and a client that wants to check the claim should not have to reconstruct it.
+///
+/// Each bucket serializes its key exactly as the per-row listing serializes the same facts —
+/// `lifecycle` present only when resolved, `review_run` positive-only — so the two endpoints speak
+/// one vocabulary and a client reads a bucket with the code it already has for a row. The array is
+/// ordered by the key, so the payload is stable for a given store.
+///
+/// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
+pub(crate) fn issue_counts_response(buckets: &BTreeMap<IssueStatusKey, i64>) -> Value {
+    let mut issues: i64 = 0;
+    let mut out: Vec<Value> = Vec::with_capacity(buckets.len());
+    for (key, count) in buckets {
+        issues += *count;
+        let mut obj = serde_json::Map::new();
+        obj.insert("outcome".to_string(), json!(key.outcome));
+        if let Some(life) = &key.lifecycle {
+            obj.insert("lifecycle".to_string(), json!(life));
+        }
+        if key.review_run {
+            obj.insert("review_run".to_string(), json!(true));
+        }
+        obj.insert("count".to_string(), json!(count));
+        out.push(Value::Object(obj));
+    }
+    json!({
+        "issues": issues,
+        "buckets": Value::Array(out),
     })
 }
 

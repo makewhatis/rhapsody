@@ -19,7 +19,7 @@ import {
   CONSOLE_JOB_FILTERS,
   JOBS_PAGE_SIZE,
   buildConsoleJobs,
-  consoleJobCounts,
+  consoleStoreCounts,
   consoleJobProjects,
   consoleJobsPageNote,
   filterConsoleJobs,
@@ -74,7 +74,7 @@ export function JobsView({
   // caller sent (handlers_history.rs), so an unsent limit still answers "is there more?".
   // `useJobsFeed` polls the default window and refreshes a widened one off the live snapshot
   // instead — its own doc comment carries the measurements behind that split.
-  const { state, issueRuns } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
+  const { state, issueRuns, issueCounts } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
@@ -95,7 +95,15 @@ export function JobsView({
     [state.data, issueRows, projects, overview.data, nowMs],
   );
 
-  const counts = consoleJobCounts(rows);
+  // The strip's numbers come from the DAEMON's tally over every issue in the store, not from `rows`
+  // (STUDIO-828). Folding them out of the fetched page made every figure on the strip a count of
+  // what this client had loaded: they grew when the operator clicked "Load more" and could never
+  // report more than the window held. `undefined` until the first response, which the strip renders
+  // as "—" — the same answer it already gives for a number it cannot know.
+  // `state.blocked` rides along because it is the one part of the worklist the daemon's tally
+  // cannot see — and, being the live snapshot rather than a page, adding it keeps the numbers
+  // paging-invariant. See `consoleStoreCounts`.
+  const counts = consoleStoreCounts(issueCounts.data, state.data?.blocked);
   const mates = mateStates(overview.data);
   const roster = mates.map((m) => m.name);
   const visible = filterConsoleJobs(rows, filter, project);
@@ -124,7 +132,11 @@ export function JobsView({
       <NowStrip>
         <NowMates>
           {mates.length === 0 ? (
-            <Mate name="rhapsodyd" task={counts.running > 0 ? "running" : "idle"} running={counts.running > 0} />
+            <Mate
+              name="rhapsodyd"
+              task={(counts?.running ?? 0) > 0 ? "running" : "idle"}
+              running={(counts?.running ?? 0) > 0}
+            />
           ) : (
             mates.map((mate) => (
               <Mate key={mate.name} name={mate.name} task={mate.task} running={mate.running} />
@@ -132,9 +144,9 @@ export function JobsView({
           )}
         </NowMates>
         <NowStats>
-          <Stat value={counts.running} label="running" />
-          <Stat value={counts.queued} label="queued" />
-          <Stat value={counts.blocked} label="blocked" tone="bad" />
+          <Stat value={counts?.running ?? "—"} label="running" />
+          <Stat value={counts?.queued ?? "—"} label="queued" />
+          <Stat value={counts?.blocked ?? "—"} label="blocked" tone="bad" />
           {/* The operator's own queue (STUDIO-743, design record §6), and the strip's ONLY
               human-attention flag. §3 originally painted an "in review" stat here too; David's
               2026-09-03 decision dropped it, because the two reported the same set two pills
@@ -144,9 +156,11 @@ export function JobsView({
               `needsOperator`). The in-review rows themselves are still one click away on the Seg
               below, which is where a count of them belongs if one is ever wanted again.
 
-              Unlike the three it can also be UNANSWERABLE: when the daemon resolved no ticket
-              lifecycle for this page, it says "—" rather than a number — see `ConsoleJobCounts`. */}
-          <Stat value={counts.needsYou ?? "—"} label="needs you" tone="op" />
+              Unlike the three it can also be UNANSWERABLE even once the tally has landed: when the
+              daemon resolved no ticket lifecycle at all, it says "—" rather than a number — see
+              `ConsoleJobCounts`. All four say "—" before the first tally arrives, because a zero
+              there would be a claim that the store is empty. */}
+          <Stat value={counts?.needsYou ?? "—"} label="needs you" tone="op" />
         </NowStats>
       </NowStrip>
 

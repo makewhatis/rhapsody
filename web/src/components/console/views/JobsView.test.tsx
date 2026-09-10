@@ -5,7 +5,7 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { IssueRun, StateResponse } from "@/lib/api";
+import type { HistoryFilter, IssueCountsResponse, IssueRun, IssueStatusBucket, StateResponse } from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
 import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
 import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
@@ -17,6 +17,7 @@ import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
 const h = vi.hoisted(() => ({
   fetchState: vi.fn(),
   fetchIssueRuns: vi.fn(),
+  fetchIssueCounts: vi.fn(),
   fetchTeamsOverview: vi.fn(),
   fetchRunTranscript: vi.fn(),
 }));
@@ -27,6 +28,7 @@ vi.mock("@/lib/api", async (orig) => {
     ...actual,
     fetchState: h.fetchState,
     fetchIssueRuns: h.fetchIssueRuns,
+    fetchIssueCounts: h.fetchIssueCounts,
     fetchTeamsOverview: h.fetchTeamsOverview,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchVersion: vi.fn(async () => ({
@@ -44,6 +46,7 @@ const { JobsView } = await import("./JobsView");
 // The cadence the view is asserted to keep, read from where it is defined rather than retyped —
 // the same anti-drift reason `useJobsFeed` imports it instead of writing 2000 (STUDIO-791).
 const { LIVE_POLL_MS } = await import("@/hooks/useStateQuery");
+const { TRACKER_POLL_MS } = await import("@/hooks/useHistory");
 
 // Each history row gets a DISTINCT id unless the caller pins one. `mergeJobs` keys a history row
 // `hist-${id}`, so a shared id is a duplicate React key: the list renders correctly on first paint
@@ -71,6 +74,63 @@ function run(over: Partial<IssueRun> & Pick<IssueRun, "issue_identifier" | "outc
     transcript_path: "",
     ...over,
   } as IssueRun;
+}
+
+/**
+ * The daemon's whole-store tally (`GET /api/v1/history/issues/counts`) stood up over an explicit set
+ * of rows — the fake half of STUDIO-828 these view tests need.
+ *
+ * It reproduces `handle_issue_counts`: group the STORE's issues by their status inputs, and fold the
+ * live snapshot's running/retrying sets in first so a retry-parked ticket lands in the same bucket
+ * as its own row. That the real daemon does exactly this is pinned on the Rust side; what these
+ * tests get from it is a daemon whose tally and whose listing cannot fall out of step by accident.
+ */
+function tallyOf(rows: readonly IssueRun[], state: StateResponse): IssueCountsResponse {
+  const live = new Set(
+    [...(state.running ?? []), ...(state.retrying ?? [])]
+      .map((r) => r.issue_identifier)
+      .filter((id) => id !== ""),
+  );
+  const by = new Map<string, IssueStatusBucket>();
+  const add = (key: Omit<IssueStatusBucket, "count">) => {
+    const k = JSON.stringify(key);
+    const seen = by.get(k);
+    if (seen) seen.count += 1;
+    else by.set(k, { ...key, count: 1 });
+  };
+  const counted = new Set<string>();
+  for (const r of rows) {
+    counted.add(r.issue_identifier);
+    // No `review_ticket`: the daemon does not resolve that marker for the tally, because it only
+    // turns a live `run` into `reviewing` and the strip counts both as running.
+    add({
+      outcome: live.has(r.issue_identifier) ? "running" : r.outcome,
+      lifecycle: r.lifecycle,
+      review_run: r.review_run,
+    });
+  }
+  for (const id of live) if (!counted.has(id)) add({ outcome: "running" });
+  const buckets = [...by.values()];
+  return { issues: buckets.reduce((n, b) => n + b.count, 0), buckets };
+}
+
+/**
+ * Point BOTH issue reads at one store, so a test that changes what the daemon reports changes the
+ * paged listing and the whole-store tally together — which is what a real daemon does, and what the
+ * strip and the table are supposed to agree about.
+ *
+ * The listing pages; the tally never does. That asymmetry IS the fix (STUDIO-828), so a harness that
+ * served the tally from the page would make the paging-invariance test pass for the wrong reason.
+ * The snapshot is read at call time from `h.fetchState`, so it stays the test's one source of truth
+ * for what is live.
+ */
+function serveStore(rows: readonly IssueRun[]) {
+  h.fetchIssueRuns.mockImplementation(async (f: HistoryFilter = {}) => {
+    const limit = f.limit ?? JOBS_PAGE_SIZE;
+    const page = rows.slice(0, limit);
+    return { issues: page, next_offset: page.length === limit ? limit : null };
+  });
+  h.fetchIssueCounts.mockImplementation(async () => tallyOf(rows, await h.fetchState()));
 }
 
 const EMPTY_STATE: StateResponse = {
@@ -172,18 +232,15 @@ describe("the Now strip (§3)", () => {
         },
       ],
     });
-    h.fetchIssueRuns.mockResolvedValue({
-      // Decorated with the lifecycles a healthy daemon serves (STUDIO-702). Each one agrees with
-      // what the outcome alone already inferred, so the four statuses are unchanged — but the page
-      // is now the answered one, which is what lets "Needs you" report a number at all.
-      issues: [
-        run({ issue_identifier: "B", outcome: "completed", lifecycle: "in_review" }),
-        run({ issue_identifier: "C", outcome: "completed", lifecycle: "in_review" }),
-        run({ issue_identifier: "E", outcome: "stopped", lifecycle: "open" }),
-        run({ issue_identifier: "F", outcome: "failed", lifecycle: "open" }),
-      ],
-      next_offset: null,
-    });
+    // Decorated with the lifecycles a healthy daemon serves (STUDIO-702). Each one agrees with
+    // what the outcome alone already inferred, so the four statuses are unchanged — but the store
+    // is now the answered one, which is what lets "Needs you" report a number at all.
+    serveStore([
+      run({ issue_identifier: "B", outcome: "completed", lifecycle: "in_review" }),
+      run({ issue_identifier: "C", outcome: "completed", lifecycle: "in_review" }),
+      run({ issue_identifier: "E", outcome: "stopped", lifecycle: "open" }),
+      run({ issue_identifier: "F", outcome: "failed", lifecycle: "open" }),
+    ]);
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
       manager_mode: "labels",
@@ -233,15 +290,12 @@ describe("the Now strip (§3)", () => {
 describe("the ticket lifecycle (STUDIO-702)", () => {
   async function mountLifecycleJobs() {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [
-        run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done", tracker_state: "Done" }),
-        run({ issue_identifier: "DROPPED", outcome: "completed", lifecycle: "canceled", tracker_state: "Won't Do" }),
-        run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review", tracker_state: "In Review" }),
-        run({ issue_identifier: "LEGACY", outcome: "completed" }),
-      ],
-      next_offset: null,
-    });
+    serveStore([
+      run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done", tracker_state: "Done" }),
+      run({ issue_identifier: "DROPPED", outcome: "completed", lifecycle: "canceled", tracker_state: "Won't Do" }),
+      run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review", tracker_state: "In Review" }),
+      run({ issue_identifier: "LEGACY", outcome: "completed" }),
+    ]);
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
       manager_mode: "labels",
@@ -553,15 +607,12 @@ describe("the Needs you count (§6)", () => {
         },
       ],
     });
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [
-        run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review" }),
-        run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done" }),
-        run({ issue_identifier: "FAILED", outcome: "failed", lifecycle: "open" }),
-        run({ issue_identifier: "IDLE", outcome: "stopped", lifecycle: "open" }),
-      ],
-      next_offset: null,
-    });
+    serveStore([
+      run({ issue_identifier: "REVIEW", outcome: "completed", lifecycle: "in_review" }),
+      run({ issue_identifier: "MERGED", outcome: "completed", lifecycle: "done" }),
+      run({ issue_identifier: "FAILED", outcome: "failed", lifecycle: "open" }),
+      run({ issue_identifier: "IDLE", outcome: "stopped", lifecycle: "open" }),
+    ]);
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
       manager_mode: "labels",
@@ -587,13 +638,10 @@ describe("the Needs you count (§6)", () => {
   // waiting on the operator — and saying "0" there is a fact the strip should report, not a shrug.
   it("says 0, not —, when the tracker answered and nothing is waiting", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [
-        run({ issue_identifier: "ONE", outcome: "completed", lifecycle: "done" }),
-        run({ issue_identifier: "TWO", outcome: "completed", lifecycle: "done" }),
-      ],
-      next_offset: null,
-    });
+    serveStore([
+      run({ issue_identifier: "ONE", outcome: "completed", lifecycle: "done" }),
+      run({ issue_identifier: "TWO", outcome: "completed", lifecycle: "done" }),
+    ]);
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
       manager_mode: "labels",
@@ -617,13 +665,10 @@ describe("the Needs you count (§6)", () => {
   // console cannot know at that moment. The assertion reds on either.)
   it("says — rather than a number when the tracker answered nothing for the page", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [
-        run({ issue_identifier: "ONE", outcome: "completed" }),
-        run({ issue_identifier: "TWO", outcome: "completed" }),
-      ],
-      next_offset: null,
-    });
+    serveStore([
+      run({ issue_identifier: "ONE", outcome: "completed" }),
+      run({ issue_identifier: "TWO", outcome: "completed" }),
+    ]);
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
       manager_mode: "labels",
@@ -988,6 +1033,148 @@ describe("the §6 additions are painted, not just classed", () => {
 });
 
 // STUDIO-792 — the worklist used to stop at the store's 50 newest issues and say nothing about it.
+// STUDIO-828 — the Now strip's counts, which used to be a fold over whatever rows this client had
+// fetched. Two defects, pinned independently, because they have different fixes and either one can
+// be reverted without the other going red.
+describe("the Now strip counts the STORE (STUDIO-828)", () => {
+  /**
+   * The TRACKER's own state name behind one row's pill, which the Status cell hovers (STUDIO-702).
+   * Asserted instead of the pill's text because the pill also carries the run's outcome — a ticket
+   * parked in review whose run completed reads "in review · run done", and a test looking for
+   * "done" in that string would pass without the tracker having moved at all.
+   */
+  function trackerStateOf(identifier: string): string {
+    const tr = [...document.querySelectorAll(".jtbl tbody tr")].find(
+      (el) => el.querySelector(".ti")?.textContent?.split(" · ")[0] === identifier,
+    );
+    return tr === undefined ? "<no row>" : (tr.querySelectorAll("td")[2]?.getAttribute("title") ?? "");
+  }
+
+  /** `n` finished tickets the tracker has parked for review — each one is a "needs you". */
+  function store(n: number): IssueRun[] {
+    return Array.from({ length: n }, (_, i) =>
+      run({
+        issue_identifier: `T-${i}`,
+        outcome: "completed",
+        lifecycle: "in_review",
+        tracker_state: "In Review",
+      }),
+    );
+  }
+
+  // DEFECT A, and the ticket's own acceptance wording: render a NARROW window and a WIDE one over
+  // the same store, and the numbers are equal. A test that renders one window and asserts a number
+  // passes on the defective code too, so the two widths are the test.
+  //
+  // 57 issues, so the default page genuinely truncates. The old fold answered "50 needs you" here
+  // and "57" after one click — a figure that moved because the operator scrolled.
+  it("does not move when the operator loads more rows", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    serveStore(store(57));
+    mount();
+
+    await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
+    const strip = () => ({
+      needsYou: stat("needs you"),
+      running: stat("running"),
+      queued: stat("queued"),
+      blocked: stat("blocked"),
+    });
+    // 57, not 50: the number the operator reads is a count of the STORE, and the table beside it is
+    // showing 50 of those rows. That gap is the fix, not a discrepancy.
+    expect(strip()).toEqual({ needsYou: "57", running: "0", queued: "0", blocked: "0" });
+    const narrow = strip();
+
+    fireEvent.click(screen.getByRole("button", { name: /load 50 more/i }));
+    await waitFor(() => expect(rowKeys()).toHaveLength(57));
+
+    // The TABLE widened — that is what the click is for — and the strip did not move with it.
+    expect(strip()).toEqual(narrow);
+  });
+
+  // DEFECT B, in the shape the acceptance names: a ticket moved to a TERMINAL state in the tracker,
+  // with no daemon activity at all. The live snapshot is static for the whole test — no run starts,
+  // none finishes, nothing retries — so `liveJobsSignature` never moves and the pull-forward can
+  // never fire. Only the interval can carry this, which is what makes it independent of defect A.
+  //
+  // It is not a hypothetical: `review.done_state` (STUDIO-712) moves a ticket to Done when its pull
+  // request merges, from a code path that is not a run, so this now happens on every merge.
+  it("stops counting a ticket the tracker moved to Done, with nothing running", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    serveStore(store(3));
+    mount();
+
+    await waitFor(() => expect(stat("needs you")).toBe("3"));
+
+    // The maintainer merges one. The daemon reports the new tracker state and nothing else changes.
+    serveStore([
+      ...store(2),
+      run({
+        issue_identifier: "T-2",
+        outcome: "completed",
+        lifecycle: "done",
+        tracker_state: "Done",
+      }),
+    ]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 500);
+    });
+
+    expect(stat("needs you")).toBe("2");
+    vi.useRealTimers();
+  });
+
+  // The ↻ control is the operator asking for the current truth about the surface in front of them,
+  // and since STUDIO-828 that surface is three reads rather than two. A Refresh that moved the rows
+  // and left the numbers above them on the previous answer would be the disagreement it is pressed
+  // to resolve, so `useRefresh` invalidates the tally as well.
+  it("moves the strip as well as the rows when the operator clicks Refresh", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    serveStore(store(3));
+    mount();
+
+    await waitFor(() => expect(stat("needs you")).toBe("3"));
+
+    serveStore([
+      ...store(2),
+      run({ issue_identifier: "T-2", outcome: "completed", lifecycle: "done", tracker_state: "Done" }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
+
+    await waitFor(() => expect(stat("needs you")).toBe("2"));
+  });
+
+  // The other half of defect B, and the one STUDIO-792 deliberately left open: a WIDENED window came
+  // off the refresh cadence entirely, so its rows kept the answer they had when the page was opened
+  // for as long as it stayed open. It is back on a cadence — the tracker's own, since that is the
+  // fastest any answer here can change — rather than back on 2s, which is the request size STUDIO-792
+  // measured and rejected.
+  it("refreshes a widened window's rows on the tracker cadence", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    serveStore(store(57));
+    mount();
+
+    await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
+    fireEvent.click(screen.getByRole("button", { name: /load 50 more/i }));
+    await waitFor(() => expect(rowKeys()).toHaveLength(57));
+    expect(trackerStateOf("T-0")).toBe("In Review");
+
+    serveStore([
+      run({ issue_identifier: "T-0", outcome: "completed", lifecycle: "done", tracker_state: "Done" }),
+      ...store(57).slice(1),
+    ]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TRACKER_POLL_MS + 500);
+    });
+
+    expect(trackerStateOf("T-0")).toBe("Done");
+    expect(rowKeys()).toHaveLength(57);
+    vi.useRealTimers();
+  });
+});
+
 // On the operator's own daemon that hid 336 of 386 tickets. The daemon has served
 // `/api/v1/history/issues?limit=&offset=` with a `next_offset` all along; these are the boxes that
 // make the console use it and make the cut visible while it lasts.
@@ -1239,18 +1426,18 @@ describe("a Jobs list left open (STUDIO-791)", () => {
   // page stays open.
   //
   // Note which way that failure actually falls, because it is not the one the ticket predicted. The
-  // strip does not tick on ahead of the rows here: `consoleJobCounts` counts the SAME merged array
-  // the table renders, so a stale history row pins the header count as surely as it pins the row.
-  // Live and stored disagreeing is what produces the visible mess, and which half is wrong depends
-  // on the transition — a run STARTING shows up in the strip at once (the live snapshot carries it)
-  // while the row's stored columns lag, and a run FINISHING freezes both, as here.
+  // strip does not tick on ahead of the rows here. When this was written the reason was that the
+  // counts were folded from the SAME merged array the table renders, so a stale history row pinned
+  // the header count as surely as it pinned the row; since STUDIO-828 the strip reads a separate
+  // daemon-computed tally, and the two are held together instead by sharing one cadence and one
+  // pull-forward. Either way, live and stored disagreeing is what produces the visible mess, and
+  // which half is wrong depends on the transition — a run STARTING shows up in the strip at once
+  // (the live snapshot carries it) while the row's stored columns lag, and a run FINISHING freezes
+  // both, as here.
   it("moves its rows and its header together when a run finishes, with no Refresh click", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     h.fetchState.mockResolvedValue({ ...EMPTY_STATE, running: [LIVE] });
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [run({ id: 9, issue_identifier: "A-1", outcome: "running" })],
-      next_offset: null,
-    });
+    serveStore([run({ id: 9, issue_identifier: "A-1", outcome: "running" })]);
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
       manager_mode: "labels",
@@ -1266,10 +1453,7 @@ describe("a Jobs list left open (STUDIO-791)", () => {
     // The daemon now reports the run finished — it leaves the live snapshot and lands in the store
     // with a terminal outcome. No click, no remount, no query invalidation from the test.
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [run({ id: 9, issue_identifier: "A-1", outcome: "completed" })],
-      next_offset: null,
-    });
+    serveStore([run({ id: 9, issue_identifier: "A-1", outcome: "completed" })]);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2500);
@@ -1299,18 +1483,15 @@ describe("a Jobs list left open (STUDIO-791)", () => {
     // Static, and stays static: no running, retrying or blocked work for the whole test, so
     // `liveJobsSignature` is the empty string at the first snapshot and at every one after it.
     h.fetchState.mockResolvedValue(EMPTY_STATE);
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [
-        run({
-          id: 41,
-          issue_identifier: "B-2",
-          outcome: "completed",
-          lifecycle: "open",
-          tracker_state: "In Progress",
-        }),
-      ],
-      next_offset: null,
-    });
+    serveStore([
+      run({
+        id: 41,
+        issue_identifier: "B-2",
+        outcome: "completed",
+        lifecycle: "open",
+        tracker_state: "In Progress",
+      }),
+    ]);
     mount();
 
     await waitFor(() => expect(rowKeys()).toContain("B-2"));
@@ -1318,26 +1499,24 @@ describe("a Jobs list left open (STUDIO-791)", () => {
     expect(stat("needs you")).toBe("0");
 
     // Only the STORE moves — the agent handed the ticket off and the tracker now parks it in review.
-    h.fetchIssueRuns.mockResolvedValue({
-      issues: [
-        run({
-          id: 41,
-          issue_identifier: "B-2",
-          outcome: "completed",
-          lifecycle: "in_review",
-          tracker_state: "In Review",
-        }),
-      ],
-      next_offset: null,
-    });
+    serveStore([
+      run({
+        id: 41,
+        issue_identifier: "B-2",
+        outcome: "completed",
+        lifecycle: "in_review",
+        tracker_state: "In Review",
+      }),
+    ]);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 500);
     });
 
-    // Both halves, together — which is the ticket's second acceptance clause. They cannot disagree
-    // by construction (`consoleJobCounts` folds the same merged array the table renders), so the
-    // point of asserting both is that ONE stale fetch freezes both, and only the poll thaws them.
+    // Both halves, together — which is the ticket's second acceptance clause. Since STUDIO-828 they
+    // are no longer one fetch: the row comes from the listing and the count from the whole-store
+    // tally, two queries on the same cadence. That makes asserting both worth more than it was, not
+    // less — it is now possible for one to move without the other, and this says they do not.
     expect(rowStatus("B-2")).toContain("in review");
     expect(stat("needs you")).toBe("1");
   });
