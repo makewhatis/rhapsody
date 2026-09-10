@@ -952,12 +952,13 @@ impl<'a> Knowledge<'a> {
     ///
     /// **Not for the control task.** The `gh` leg goes through
     /// [`SummonSource`](crate::ghsummons::SummonSource), whose production implementation shells out
-    /// through a synchronous `std::process::Command` and therefore runs to completion in its first
-    /// poll. The containment is structural, exactly as [`crate::prstate`]'s is: this method takes
-    /// no `Orchestrator`, sends no control event and holds no lock the control task takes, so its
-    /// caller drives it from its own task and a stalled `gh` parks that task and nothing else.
-    /// A `tokio::time::timeout` around it would be decoration — the future has no await point to
-    /// cancel at.
+    /// through a synchronous `std::process::Command`. The containment is structural, exactly as
+    /// [`crate::prstate`]'s is: this method takes no `Orchestrator`, sends no control event and
+    /// holds no lock the control task takes, so its caller drives it from its own task and a
+    /// stalled `gh` parks that task and nothing else. Since STUDIO-829 that exec also goes to
+    /// tokio's blocking pool under `ghsummons::GH_EXEC_TIMEOUT`, so it yields and it terminates;
+    /// before then a `tokio::time::timeout` around it would have been decoration, the future
+    /// having had no await point to cancel at.
     pub async fn outcome(&self, identifier: &str) -> Result<Outcome, KnowledgeError> {
         let key = self.key(identifier);
         if key.is_empty() {

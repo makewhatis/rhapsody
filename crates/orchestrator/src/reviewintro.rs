@@ -47,10 +47,10 @@
 //! and [`crate::ghsummons::GH`] shells out through a synchronous `std::process::Command` — so it
 //! must not happen on the control task. [`run_review_intro_task`] owns it, holds no `Orchestrator`
 //! and takes no lock the control task takes, exactly as [`crate::quorum`]'s task does. The
-//! containment is structural rather than temporal: a `tokio::time::timeout` around that call could
-//! never fire (the future has no await point and completes in its first poll), so a bound here
-//! would read stronger than it is. A hung `gh` parks THIS task, which owns all of introduction's
-//! network I/O, and the daemon keeps ticking.
+//! containment is structural first: a slow `gh` parks THIS task, which owns all of introduction's
+//! network I/O, and the daemon keeps ticking. It is temporal too since STUDIO-829 — the exec goes
+//! to tokio's blocking pool and is capped by `ghsummons::GH_EXEC_TIMEOUT`, where before it had no
+//! await point and a bound written here would have read stronger than it was.
 //!
 //! What comes back is a resolved [`IntroducedPr`] handed to the control task as an [`Event`], where
 //! the watch-set write happens beside every other one. That keeps the watch set single-writer, the
