@@ -1218,14 +1218,17 @@ mod tests {
         let _ = task.await;
     }
 
-    /// **STUDIO-838, the retry.** A review-state move that fails TRANSIENTLY and then succeeds
-    /// still ends with an introduction — the watch row the whole ticketless path depends on is not
-    /// discarded because one request did not reach Linear.
+    /// **STUDIO-838, the retry, asserted to the row.** A review-state move that fails TRANSIENTLY
+    /// and then succeeds ends with the watch row that assigns a reviewer — not merely with a
+    /// request that was not discarded.
     ///
-    /// The assertion that matters is the introduction, not the move: a handoff that moved the
-    /// ticket but lost the introduction is exactly the orphan this ticket is about.
+    /// The row is the property, because a handoff that moved the ticket and lost the introduction
+    /// is exactly the orphan this ticket is about, and every hop between the request and the row
+    /// is somewhere it could still be lost. So the real off-loop
+    /// [`run_review_intro_task`](crate::reviewintro::run_review_intro_task) runs here over the real
+    /// control loop; only GitHub is faked.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_transient_move_failure_is_retried_and_still_introduces() {
+    async fn a_transient_move_failure_is_retried_and_still_ends_with_a_watch_row() {
         let mut fake = Fake::new();
         fake.move_err = Some(linear(LinearErrorKind::ApiRequest, "error sending request"));
         fake.move_err_calls = 1; // the first attempt fails, the second lands
@@ -1239,7 +1242,8 @@ mod tests {
             eff.projects = vec![p];
         }
         o.teams = Some(ticketless_teams(&["alice", "bob"]));
-        let mut rx = o.open_review_intro_channel();
+        let rx = o.open_review_intro_channel();
+        let store = Arc::clone(&o.store);
         let id = parent.id.clone();
         o.dispatch_issue(parent, None, None, String::new());
         if let Some(re) = o.running.get_mut(&id) {
@@ -1248,6 +1252,14 @@ mod tests {
         }
         let run_id = o.running[&id].run_id;
         let (task, handle) = start(o, &env.signal);
+        let intro = tokio::spawn(crate::reviewintro::run_review_intro_task(
+            env.signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(OnePr("https://github.com/o/r/pull/7"))),
+                sink: Arc::new(crate::reviewintro::ControlIntroSink::new(handle.clone())),
+            },
+            rx,
+        ));
 
         let res = handle
             .handoff_run(CancelWait::default(), run_id)
@@ -1256,16 +1268,51 @@ mod tests {
 
         assert!(res.move_err.is_empty(), "the blip was ridden out");
         assert_eq!(res.moved_to, "In Review");
-        let req = rx.try_recv().expect("the introduction survived the blip");
-        assert_eq!(req.introduced_by, "handoff:MT-1");
         assert_eq!(
             tr.move_calls().len(),
             2,
             "one retry, and no more than the failure needed"
         );
 
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows = store.load_review_watch().expect("read");
+            if !rows.is_empty() {
+                break rows;
+            }
+            if tokio::time::Instant::now() > deadline {
+                env.signal.cancel();
+                panic!("the introduction was lost with the failed attempt");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].key.number, 7);
+        assert_eq!(rows[0].key.reviewer, "bob");
+        assert_eq!(rows[0].introduced_by, "handoff:MT-1");
+
         env.signal.cancel();
         let _ = task.await;
+        let _ = intro.await;
+    }
+
+    /// An [`OpenPrSource`](crate::ghsummons::OpenPrSource) that always answers the same open pull
+    /// request — the one hop a test cannot really make.
+    struct OnePr(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::OpenPrSource for OnePr {
+        async fn open_pr_for_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+        ) -> crate::ghsummons::OpenPrResult {
+            Ok(Some(crate::ghsummons::OpenPr {
+                url: self.0.to_string(),
+                head_sha: String::new(),
+            }))
+        }
     }
 
     /// The other half, and the one STUDIO-836's lesson is about: a move the tracker CONSIDERED and

@@ -521,6 +521,108 @@ mod tests {
         o.plan_review_adoptions(issues.iter().map(|i| (i, Some(0))), now)
     }
 
+    /// **The acceptance criterion, end to end.** An orphaned pull request is recoverable without
+    /// re-dispatching its ticket: the daemon's own poll tick finds the parked ticket, the off-loop
+    /// task resolves its branch to a pull-request number, and the row that assigns a reviewer
+    /// exists at the end — with no live run anywhere in the path.
+    ///
+    /// Every hop is the real one: the real control loop, the real
+    /// [`run_review_intro_task`](crate::reviewintro::run_review_intro_task), the real
+    /// `handle_review_introduce`. Only GitHub is faked, because it is the one thing that cannot be
+    /// asked from a test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphaned_pull_request_ends_with_a_watch_row_and_no_re_dispatch() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![parked("STUDIO-836")];
+        let mut o = orch_with_tracker(
+            teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]),
+            Arc::new(tr),
+        );
+        let store = Arc::clone(&o.store);
+        record_run(&o, "STUDIO-836", "alice");
+        assert!(
+            store.load_review_watch().expect("read").is_empty(),
+            "the fixture must start orphaned"
+        );
+        if let Some(eff) = o.eff.as_mut() {
+            eff.poll_interval = Duration::from_millis(20);
+        }
+        let rx = o.open_review_intro_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        o.ctx = Some(signal.wait());
+        let handle = o.control();
+        let loop_ctx = signal.wait();
+        let looped = tokio::spawn(async move {
+            let mut o = o;
+            o.run_loaded(loop_ctx).await;
+        });
+        let intro = tokio::spawn(crate::reviewintro::run_review_intro_task(
+            signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(OnePr(
+                    "https://github.com/makewhatis/rhapsody/pull/144",
+                ))),
+                sink: Arc::new(crate::reviewintro::ControlIntroSink::new(handle)),
+            },
+            rx,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows = store.load_review_watch().expect("read");
+            if !rows.is_empty() {
+                break rows;
+            }
+            if tokio::time::Instant::now() > deadline {
+                signal.cancel();
+                panic!("the orphaned pull request was never adopted");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(rows.len(), 1, "one row, one reviewer: {rows:?}");
+        assert_eq!(rows[0].key.number, 144);
+        assert_eq!(rows[0].key.reviewer, "bob");
+        assert_eq!(rows[0].author, "alice");
+        assert_eq!(
+            rows[0].introduced_by,
+            format!("{REVIEW_ORIGIN_ADOPT}:STUDIO-836")
+        );
+        assert_eq!(rows[0].status, rhapsody_store::REVIEW_STATUS_REQUESTED);
+        assert!(rows[0].open);
+
+        // And it stays one row however many ticks run over it — the sweep runs every poll.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            store.load_review_watch().expect("read").len(),
+            1,
+            "adoption is idempotent across ticks"
+        );
+
+        signal.cancel();
+        let _ = looped.await;
+        let _ = intro.await;
+    }
+
+    /// An [`OpenPrSource`](crate::ghsummons::OpenPrSource) that always answers the same open pull
+    /// request — the one hop a test cannot really make.
+    struct OnePr(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::OpenPrSource for OnePr {
+        async fn open_pr_for_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+        ) -> crate::ghsummons::OpenPrResult {
+            Ok(Some(crate::ghsummons::OpenPr {
+                url: self.0.to_string(),
+                head_sha: String::new(),
+            }))
+        }
+    }
+
     /// The wiring, through the daemon's real tick: a poll that returns an orphaned review-state
     /// ticket ends with an ADOPTION on the introduction task's channel — no live run, no
     /// re-dispatch, and nothing an operator had to press.
