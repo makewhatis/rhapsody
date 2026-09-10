@@ -141,13 +141,16 @@ impl Orchestrator {
         // the candidate list is a whole poll's worth of tickets.
         let origins = self.review_adopt_origins();
         let load = crate::teams::LoadSnapshot::from_running(&self.running);
+        // The issue-id set `review_reopen_eligible` takes, built once for the whole sweep.
+        let running: std::collections::HashSet<String> = self.running.keys().cloned().collect();
         let mut probed: Vec<String> = Vec::new();
         for (iss, proj) in candidates {
             if out.planned.len() >= MAX_REVIEW_ADOPTIONS_PER_TICK {
                 break;
             }
-            match self.adopt_verdict(iss, proj, &origins, load.counts(), now) {
+            match self.adopt_verdict(iss, proj, &origins, &running, load.counts(), now) {
                 Verdict::Skip => {}
+                Verdict::Considered => probed.push(iss.identifier.clone()),
                 Verdict::Adopt(req) => {
                     probed.push(iss.identifier.clone());
                     out.repaired
@@ -179,6 +182,14 @@ impl Orchestrator {
         candidates: impl Iterator<Item = (&'a Issue, Option<usize>)>,
         now: Instant,
     ) {
+        // A daemon with no introduction task cannot adopt anything, so it does no work and files no
+        // advisory: the fault it would report is one it could never act on. `run::spawn_review_intro`
+        // opens this channel on exactly the ticketless path, plus a non-empty roster — and a
+        // rosterless install would otherwise have every parked ticket refused for want of a
+        // reviewer, which is a configuration, not an incident.
+        if self.review_intro_tx.is_none() {
+            return;
+        }
         let sweep = self.plan_review_adoptions(candidates, now);
         // Retired FIRST, so a ticket that is refused for a new reason in the same sweep — which it
         // cannot be, but the ordering should not be what makes that true — ends the tick recorded
@@ -196,7 +207,7 @@ impl Orchestrator {
                 .record_orphaned_review(&group, &identifier, why);
         }
         let Some(tx) = self.review_intro_tx.as_ref() else {
-            return;
+            return; // unreachable — checked above; kept so the send site owns its own precondition.
         };
         for req in sweep.planned {
             let origin = req.introduced_by.clone();
@@ -223,6 +234,7 @@ impl Orchestrator {
         iss: &Issue,
         proj: Option<usize>,
         origins: &HashSet<String>,
+        running: &HashSet<String>,
         load: &std::collections::HashMap<String, i64>,
         now: Instant,
     ) -> Verdict {
@@ -250,6 +262,14 @@ impl Orchestrator {
         if self.running.contains_key(&iss.id) || self.claimed.contains(&iss.id) {
             return Verdict::Skip;
         }
+        // Gate: not about to have one either. The selection ladder reopens a review-state ticket
+        // carrying a summons newer than its last run, IN THIS SAME TICK and after this sweep, so
+        // "no live run" alone would let an adoption race a re-dispatch the daemon has already
+        // decided on. Cheap in the common case — a ticket with no summons at all answers `false`
+        // before the store is touched.
+        if self.review_reopen_eligible(iss, running) {
+            return Verdict::Skip;
+        }
         // Gate: the watch set holds no row introduced FOR this ticket. The cheap pre-filter, and
         // the reason a sweep every tick is affordable: every healthy handoff leaves one of these,
         // so almost every candidate stops here rather than at a `gh` lookup. It is not the
@@ -261,21 +281,24 @@ impl Orchestrator {
         {
             return Verdict::Skip;
         }
-        // Gate: a teammate of this daemon's own ran it. Without an author there is nobody to
-        // EXCLUDE, and "the author is not the reviewer" is a guard rather than a nicety — so a
-        // ticket parked in review that this daemon never ran as a teammate is not adopted at all.
-        // `plan_review_intro` refuses the same case as `re.identity.is_empty()`.
-        let Some(author) = self.adopt_author(&iss.identifier) else {
-            return Verdict::Skip;
-        };
-        // Gate: paced. The candidate this exists for is the one no sweep can ever settle — a ticket
-        // parked in review whose branch has no pull request at all — which is indistinguishable
-        // from an orphan without the `gh` lookup this paces.
+        // Gate: paced — and everything below this line is the EXPENSIVE half, which is why the pace
+        // sits exactly here. The candidate it exists for is the one no sweep can ever settle: a
+        // ticket parked in review whose branch has no pull request at all, indistinguishable from
+        // an orphan without the `gh` lookup this paces. Every verdict below is recorded against the
+        // pace, including the one that adopts nothing, so a review column full of tickets this
+        // daemon never ran does not re-read the run ledger on every tick.
         if let Some(at) = self.review_adopt_probed.get(&iss.identifier)
             && now.duration_since(*at) < REVIEW_ADOPT_PROBE_INTERVAL
         {
             return Verdict::Skip;
         }
+        // Gate: a teammate of this daemon's own ran it. Without an author there is nobody to
+        // EXCLUDE, and "the author is not the reviewer" is a guard rather than a nicety — so a
+        // ticket parked in review that this daemon never ran as a teammate is not adopted at all.
+        // `plan_review_intro` refuses the same case as `re.identity.is_empty()`.
+        let Some(author) = self.adopt_author(&iss.identifier) else {
+            return Verdict::Considered;
+        };
         // Gate: the repository parses. Everything past here is a REFUSAL rather than a skip: the
         // ticket is an orphan candidate on this daemon's own terms, and the reasons it cannot be
         // repaired are all conditions an operator has to act on.
@@ -390,8 +413,14 @@ fn handoff_origin(identifier: &str) -> String {
 enum Verdict {
     /// Not an adoption candidate — the ordinary answer for nearly every ticket the poll returns.
     /// Silent by design: a ticket being mid-run, or in an active state, or already watched, is not
-    /// a fault and must not read like one.
+    /// a fault and must not read like one. Decided from memory alone, so it costs nothing and is
+    /// not paced.
     Skip,
+    /// Considered at COST — the store was read — and found not adoptable, but not faulty either:
+    /// this daemon simply never ran the ticket as a teammate. Paced exactly like an adoption, so a
+    /// review column full of tickets somebody else parked does not re-read the run ledger on every
+    /// poll tick forever.
+    Considered,
     /// A candidate this daemon may repair.
     Adopt(Box<ReviewIntroRequest>),
     /// A candidate this daemon may NOT repair. Surfaced to the operator.
@@ -698,6 +727,7 @@ mod tests {
     fn adopting_a_previously_refused_ticket_retires_its_advisory() {
         let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
         record_run(&o, "STUDIO-836", "alice");
+        let _rx = o.open_review_intro_channel();
         let t0 = Instant::now();
 
         o.sweep_review_adoptions([(&parked("STUDIO-836"), Some(0))].into_iter(), t0);
@@ -714,6 +744,65 @@ mod tests {
         assert!(
             o.warnings.merged_for("rhapsody").is_empty(),
             "the fault is repaired, so the advisory is retired"
+        );
+    }
+
+    /// A daemon with no introduction task does no sweeping and files no advisory. `run.rs` opens
+    /// that channel on exactly the ticketless path WITH a non-empty roster, so this is the shape of
+    /// a ticketless install nobody has put a teammate in — where every parked ticket would
+    /// otherwise be reported as an unrepairable orphan, which is a configuration rather than an
+    /// incident.
+    #[test]
+    fn a_daemon_that_cannot_introduce_sweeps_nothing() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+        record_run(&o, "STUDIO-836", "alice");
+        // No `open_review_intro_channel`.
+
+        o.sweep_review_adoptions(
+            [(&parked("STUDIO-836"), Some(0))].into_iter(),
+            Instant::now(),
+        );
+
+        assert!(o.warnings.merged_for("rhapsody").is_empty());
+        assert!(
+            o.review_adopt_probed.is_empty(),
+            "and it did not even read the store"
+        );
+    }
+
+    /// A ticket the SELECTION LADDER is about to reopen is not adopted. The reopen decision is made
+    /// later in the very same tick — a fresh `@symphony` summons on a review-state ticket — so
+    /// "there is no live run" is true at this instant and about to stop being true. Adopting here
+    /// would ask a teammate to review a branch whose author the daemon has already decided to
+    /// re-dispatch.
+    #[test]
+    fn a_ticket_the_ladder_is_about_to_reopen_is_not_adopted() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-836", "alice");
+        let mut iss = parked("STUDIO-836");
+        // A summons newer than the run recorded above — exactly `review_reopen_eligible`'s test.
+        iss.latest_summon_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                .expect("parse")
+                .with_timezone(&chrono::Utc),
+        );
+
+        assert_eq!(sweep(&mut o, &[iss], Instant::now()), AdoptSweep::default());
+    }
+
+    /// A ticket this daemon never ran as a teammate costs its store reads ONCE per probe interval,
+    /// not once per poll tick. It is the commonest thing in a review column — anything a human
+    /// parked — so re-reading the run ledger for each of them every tick would be the sweep's real
+    /// steady-state cost.
+    #[test]
+    fn a_ticket_with_no_teammate_run_is_paced_like_any_other_candidate() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        // No run at all, so it can never be adopted.
+        sweep(&mut o, &[parked("STUDIO-836")], Instant::now());
+
+        assert!(
+            o.review_adopt_probed.contains_key("STUDIO-836"),
+            "considering it at the cost of a store read is what the pace exists to bound"
         );
     }
 
