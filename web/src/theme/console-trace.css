@@ -283,15 +283,44 @@
 .rh-console .trreceipt .rv b { color: var(--ink-4); font-weight: 500; }
 
 /* ---- (C) The Split ---- */
-.rh-console .trsplit { display: grid; grid-template-columns: 264px minmax(0, 1fr); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; background: var(--panel); margin-bottom: 18px; }
+/* `overflow: clip`, NOT `hidden` (STUDIO-821). Both clip the children to the rounded corner, but
+   `hidden` also makes this box a SCROLL CONTAINER — and a sticky descendant resolves its offsets
+   against the nearest scroll container, not the viewport. `.trspine` below has been `position:
+   sticky` since it was written and has never once stuck, because this declaration silently
+   re-pointed it at a scrollport that never scrolls. `clip` clips without establishing one.
+   An engine too old to know `clip` drops the declaration and falls back to `visible`: the spine's
+   border-right then squares off the Split's bottom-left corner, which is a cosmetic loss and not
+   a functional one — the sticky and the height cap are unaffected either way. */
+.rh-console .trsplit { display: grid; grid-template-columns: 264px minmax(0, 1fr); border: 1px solid var(--line); border-radius: var(--r); overflow: clip; background: var(--panel); margin-bottom: 18px; }
 @media (max-width: 900px) {
   .rh-console .trsplit { grid-template-columns: minmax(0, 1fr); }
+  /* One column: the spine sits ABOVE the inspector rather than beside it, so pinning it would
+     park the step list on top of the detail it selects — `static`, not `sticky`. It keeps an
+     internal scroller, because the bug this ticket fixes is not milder in one column (30+ steps
+     is still 30+ steps to scroll past before the detail begins), but the desktop cap would be:
+     a spine as tall as the viewport IS the whole screen here, and pushes the inspector clean off
+     it. Half the viewport leaves both on screen at once. */
+  .rh-console .trspine { position: static; max-height: 50vh; }
 }
 /* The spine sticks BELOW the sticky header, whose height is not a constant — the action cluster
    and the attempt selector wrap onto a second row on a narrow window. `--trhd-h` is published by
    the view from a `ResizeObserver` on the header itself; the literal is the fallback for the
-   first render and for any engine without one. */
-.rh-console .trspine { border-right: 1px solid var(--line); padding: 10px; align-self: start; position: sticky; top: var(--trhd-h, 64px); }
+   first render and for any engine without one.
+   The SAME measurement caps the height (STUDIO-821), because the two are the same geometry: a
+   box pinned `--trhd-h` from the top of the viewport has exactly `100vh - --trhd-h` of screen
+   below it, and a sticky box taller than that never sticks at all — it scrolls with the page
+   until its bottom edge arrives, which is what made a 30-step spine drag `.trinsp` (whose row
+   height is `max(spine, inspector)`) thousands of pixels above the step being selected. The 18px
+   is `.trsplit`'s own `margin-bottom`, so the pinned spine leaves the same gutter beneath it that
+   the Split leaves beneath itself.
+   The cap is on `.trspine` and the SCROLLING is on `.trsteps` inside it, so `.trfilter` and
+   `.grep` stay pinned: scrolling the filters out of reach is the same class of bug as the one
+   being fixed here. */
+.rh-console .trspine { border-right: 1px solid var(--line); padding: 10px; align-self: start; position: sticky; top: var(--trhd-h, 64px); display: flex; flex-direction: column; max-height: calc(100vh - var(--trhd-h, 64px) - 18px); }
+/* `min-height: 0` is load-bearing, not tidiness: a flex item's default `min-height: auto` is its
+   CONTENT height, so without it the list refuses to shrink below 30 steps and takes the capped
+   spine with it — the overflow would never engage and nothing would scroll. */
+.rh-console .trsteps { flex: 1; min-height: 0; overflow-y: auto; }
 .rh-console .trfilter { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 8px; }
 .rh-console .trfilter .chip { padding: 3px 9px; font-size: 11.5px; }
 /* The pressed filter chip, teal per this view's prototype (STUDIO-817). Scoped to `.trfilter`
@@ -329,6 +358,14 @@
 .rh-console .fxchip.room { color: var(--info); }
 .rh-console .fxchip.memory { color: var(--ticket); }
 
+/* The inspector deliberately has NO scroller of its own (STUDIO-821). With the spine capped it is
+   the tallest thing in the row whenever the detail is long — a big diff, several expanded cards —
+   and the PAGE scrolls it, which is the behaviour that was chosen over a fully fixed two-pane
+   layout where neither column moves the document. The reason is find-in-page: browser Cmd-F only
+   reveals a match it can scroll to, so putting the detail in its own overflow box means Cmd-F over
+   the trace stops finding anything below the fold of either pane. That cost is not free, and the
+   thing it would buy — a spine that never leaves the screen — the sticky above already buys. A
+   detail read linearly, top to bottom, is also what a long one is FOR. */
 .rh-console .trinsp { padding: 16px 18px; min-width: 0; }
 .rh-console .trinsp h4 { font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-4); margin: 0 0 10px; font-weight: 600; }
 .rh-console .trcard { border: 1px solid var(--line); border-radius: var(--r-sm); margin-bottom: 8px; background: var(--panel-2); overflow: hidden; }
