@@ -26,15 +26,25 @@
 //! [`RunDiff::merge_state`]: GitHub's OWN `mergeStateStatus`, a raw fact rather than a judgement,
 //! which cannot contradict a verdict because it is not one.
 //!
-//! # Why it refuses nothing
+//! # Why it refuses nothing — and what it nonetheless cannot show
 //!
 //! Every gate on the merge path exists because a merge is irreversible. Reading a diff is not, so
-//! none of them applies here and none is copied: an already-merged pull request, a closed one, one
-//! a live Rhapsody review is watching, one whose reviewer asked for changes — every one of those
-//! has a diff, and every one of them is a diff an operator has a reason to read. The outcome
-//! vocabulary says so, with [`DiffOutcome::Unavailable`] where the merge path has `Refused`: this
-//! module never denies a request it could have served, it only reports that there is nothing to
-//! serve.
+//! none of them applies here and none is copied: a pull request a live Rhapsody review is
+//! watching, one whose reviewer asked for changes, one a merge already refused — every one of
+//! those has a diff, and this module reads it. The outcome vocabulary says so, with
+//! [`DiffOutcome::Unavailable`] where the merge path has `Refused`: this module never denies a
+//! request it could have served, it only reports that there is nothing to serve.
+//!
+//! **But the diff is available only while the pull request is OPEN, and that is a real limit
+//! rather than a gate.** The coordinate is resolved by
+//! [`crate::ghsummons::OpenPrSource::open_pr_for_branch`], which filters `--state open`, so a
+//! merged or closed pull request yields no number and the read stops at
+//! [`DiffOutcome::Unavailable`] — even though `gh pr diff` would serve its diff perfectly well.
+//! Nothing refuses it; there is simply never a coordinate. This bites hardest on exactly the runs
+//! an operator browses in history, because STUDIO-712 moves a ticket to Done when its pull request
+//! merges, so a finished run's pull request is usually closed. Lifting it means resolving the
+//! number without that filter, which is a change to a seam three other callers share and is not
+//! this ticket's.
 //!
 //! What it DOES keep from the merge path is guardrail G1's shape, because the same argument holds
 //! for any `gh` call the console can trigger: the coordinate is derived from the run row, never
@@ -228,11 +238,18 @@ pub async fn run_diff(plan: &DiffPlan, deps: &DiffDeps) -> DiffOutcome {
         .await
     {
         Ok(Some(url)) => url,
-        // Not a refusal and not an error: an unpushed branch, or one whose pull request was merged
-        // and closed, genuinely has nothing to show here. The console deep-links to the branch
-        // instead, which is what it did before this endpoint existed.
+        // Not a refusal and not an error, and it covers TWO different situations: a branch never
+        // pushed, and one whose pull request was merged or closed. `open_pr_for_branch` filters
+        // `--state open`, so the second has no coordinate to read a diff at even though `gh pr
+        // diff` would serve one — and since STUDIO-712 moves a ticket to Done when its pull
+        // request merges, the finished runs an operator browses in history are mostly that
+        // second case. So the reason names it, rather than leaving a merged pull request to read
+        // as a branch nobody ever pushed. The console deep-links to the branch either way, which
+        // is what it did before this endpoint existed.
         Ok(None) => {
-            return DiffOutcome::Unavailable("no open pull request on this run's branch");
+            return DiffOutcome::Unavailable(
+                "this run's branch has no open pull request — a merged or closed one is not read here",
+            );
         }
         Err(e) => return DiffOutcome::Failed(e.to_string()),
     };
@@ -320,8 +337,21 @@ impl crate::ControlHandle {
     /// **No control round trip at all.** The run row is read straight off the handle's own store,
     /// as [`crate::ControlHandle::resume_run`] already does, because a diff read takes no claim,
     /// consults no live loop state and records nothing — so there is nothing for the control task
-    /// to own. Every `gh` call it makes then blocks ([`crate::runmerge`]'s module doc), on the HTTP
-    /// request's own task, which is where the containment is.
+    /// to own. THAT is the containment: nothing this route does can stall dispatch.
+    ///
+    /// It is not a claim that a `gh` call costs only the calling task. Every one of these blocks
+    /// ([`crate::runmerge`]'s module doc), and a future with no await point holds the tokio WORKER
+    /// THREAD it is polled on, not just its own task. The two seams this route added —
+    /// [`crate::ghsummons::PrDiffSource::pr_diff`] and
+    /// [`crate::ghsummons::PrChecksSource::pr_checks`] — go through [`crate::ghsummons::GH::run_off_task`]
+    /// for that reason, but the three they share with the merge path
+    /// ([`crate::ghsummons::OpenPrSource::open_pr_for_branch`],
+    /// [`crate::ghsummons::PrStateSource::pr_state`],
+    /// [`crate::ghsummons::MergeStateSource::merge_state`]) still run inline and so occupy a
+    /// runtime thread for the duration. That is pre-existing and identical on both routes, but it
+    /// is cheaper to reach here, because opening a tab triggers it where merging takes a click and
+    /// a confirmation. Moving those three off-task is a change to seams other callers share and is
+    /// not this ticket's; it is recorded as a follow-up rather than claimed away here.
     ///
     /// A daemon built with no diff seams answers [`DiffOutcome::Unavailable`] rather than an
     /// error: the console asked a question and there is a true answer to it.
@@ -654,13 +684,25 @@ mod tests {
     /// A branch with no open pull request is not an error and not a refusal: there is genuinely
     /// nothing to show, and the console falls back to the deep link it used before this endpoint.
     /// **No diff is read**, so an unpushed branch costs one `gh` call rather than four.
+    ///
+    /// The reason must say OPEN. `open_pr_for_branch` filters `--state open`, so this same answer
+    /// covers a merged-and-closed pull request — and since STUDIO-712 those are most of the
+    /// finished runs in history. "No pull request on this branch" would tell their operator the
+    /// branch was never pushed, which is the opposite of what happened to it.
     #[tokio::test]
     async fn a_branch_with_no_open_pull_request_has_nothing_to_show() {
         let diff = FakeDiff::at(PATCH);
         let got = run_diff(&plan(), &deps(open_prs(None), Arc::clone(&diff))).await;
-        assert_eq!(
-            got,
-            DiffOutcome::Unavailable("no open pull request on this run's branch")
+        let DiffOutcome::Unavailable(reason) = got else {
+            panic!("expected Unavailable, got {got:?}");
+        };
+        assert!(
+            reason.contains("no open pull request"),
+            "reason should say the pull request must be OPEN: {reason}"
+        );
+        assert!(
+            reason.contains("merged or closed"),
+            "a merged pull request must not read as an unpushed branch: {reason}"
         );
         assert!(diff.asked().is_empty(), "no diff should have been read");
     }

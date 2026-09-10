@@ -827,13 +827,21 @@ reason: no `gh` call the console can trigger should take its coordinate from som
 wrote.
 
 **It refuses nothing, and it cannot merge.** Every gate on `POST …/merge` exists because a merge is
-irreversible; reading a diff is not, so an already-merged pull request, one under review, or one
-whose reviewer asked for changes all still have a diff worth reading and none of those gates is
-copied. Its dependencies are five `gh` READ seams with no merge seam among them, so nothing in its
-call graph can act on the pull request it resolves — asserted on the module's own source. It serves
-no mergeability **verdict** either: `GET …/mergeability` already does, from the daemon's one shared
-resolution, so what rides here is GitHub's own `merge_state` — a fact, not a second judgement that
-could disagree with the first.
+irreversible; reading a diff is not, so a pull request under review, one whose reviewer asked for
+changes, or one a merge already refused all still have a diff worth reading and none of those gates
+is copied. Its dependencies are five `gh` READ seams with no merge seam among them, so nothing in
+its call graph can act on the pull request it resolves — asserted on the module's own source. It
+serves no mergeability **verdict** either: `GET …/mergeability` already does, from the daemon's one
+shared resolution, so what rides here is GitHub's own `merge_state` — a fact, not a second judgement
+that could disagree with the first.
+
+**It reads a pull request only while it is open — a limit, not a gate.** The number is resolved by
+`gh pr list --state open`, so a merged or closed pull request yields no coordinate and the route
+answers "nothing to show", even though `gh pr diff` would serve its diff. Nothing refuses it; there
+is simply never a number. That lands on the runs an operator browses most, because a merged pull
+request moves its ticket to Done, so the reason says which of the two it is rather than letting a
+merged pull request read as a branch nobody pushed. Resolving the number without that filter would
+lift the limit and is a follow-up, not part of this route.
 
 **Unlike the merge routes it is not gated on Teams.** Teams gates Rhapsody-additive *write*
 surfaces — a merge needs a manager to act as and a room to report in. This writes nothing, decides

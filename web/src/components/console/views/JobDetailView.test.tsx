@@ -2129,13 +2129,15 @@ describe("Diff — the change a run produced (§5, STUDIO-749)", () => {
     expect(panel().querySelector(".trdep")?.textContent).toContain("cut short");
   });
 
-  // The daemon's answer, not the console's: an unpushed branch is the ordinary life of a ticket,
-  // and it keeps the calm card and the deep link it always had.
+  // The daemon's answer, not the console's: a branch with no open pull request — never pushed, or
+  // merged and closed — is the ordinary life of a ticket, and it keeps the calm card and the deep
+  // link it always had. The reason is rendered VERBATIM, which is what lets the daemon say which
+  // of those two it is without the console guessing.
   it("shows the daemon's own reason, and the deep link, when there is no diff to show", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     h.fetchRunDiff.mockResolvedValue({
       available: false,
-      reason: "no open pull request on this run's branch",
+      reason: "this run's branch has no open pull request — a merged or closed one is not read here",
     });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
@@ -2143,7 +2145,7 @@ describe("Diff — the change a run produced (§5, STUDIO-749)", () => {
 
     await waitFor(() => expect(panel().querySelector(".trdep")).toBeTruthy());
     expect(panel().querySelector(".trdep")?.textContent).toContain(
-      "no open pull request on this run's branch",
+      "this run's branch has no open pull request — a merged or closed one is not read here",
     );
     // Nothing that could be read as a diff.
     expect(panel().querySelector("pre")).toBeNull();
@@ -4296,7 +4298,10 @@ describe("external links leave the app through the openExternal seam (STUDIO-765
   // an operator follows when the daemon resolved no pull request.
   it("opens the no-diff card's head-branch search in the browser", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
-    h.fetchRunDiff.mockResolvedValue({ available: false, reason: "no open pull request on this run's branch" });
+    h.fetchRunDiff.mockResolvedValue({
+      available: false,
+      reason: "this run's branch has no open pull request — a merged or closed one is not read here",
+    });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
     await openTab("Diff");
