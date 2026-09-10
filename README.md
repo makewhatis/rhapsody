@@ -980,3 +980,30 @@ point: the prohibition stays on the trusted side of the line the quorum design d
 **Implementers are untouched.** The selection is false for every ticket that is not a review, so an
 implementation run reads its configured `prompt_file` exactly as before — including this
 repository's Phase 6 merge instruction, which a test asserts is still rendered.
+
+### An abandoned review round becomes a project advisory (STUDIO-822)
+
+Go v0.4.0 has no review quorum at all, so its `projectWarningsFor` has exactly two producers — the
+unmatched project slug (INF-277) and the missing `prompt_file` (INF-279). Rhapsody has added three
+Rhapsody-only ones on the same `GET /api/v1/projects` field: the candidate-fetch-failure streak
+(STUDIO-406), the summons-enrichment-deferred streak (STUDIO-811), and now the abandoned review
+fan-out. The endpoint's SHAPE is unchanged — the same `warnings` array of strings, with the two
+ported producers keeping their golden ordering ahead of the additions — but its CONTENT can name a
+condition Go could not produce.
+
+| A fan-out that failed every attempt | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| where it is visible | n/a (no quorum) | a `warn!`, one room post, and a per-project advisory |
+| cleared by a later success | — | **no** — see below |
+
+**It is deliberately the one producer nothing clears.** Every other advisory here describes a live
+condition that self-heals: fix the slug, restore the file, let a tick keep up, and the next pass
+drops it. This one describes a round that will never be reviewed — the work is merged or waiting
+either way, and clearing it on an unrelated later handoff is precisely how the failure that
+motivated the ticket stayed invisible for weeks. It is capped instead
+(`warnings::LOST_REVIEW_WARN_CAP`), oldest dropped first, so the advisory always names the most
+recent losses rather than growing without bound.
+
+A local surface was the point. The fan-out fails because the tracker cannot be reached, so a comment
+on the ticket is the one write guaranteed to fail for the same reason. Teams-off and quorum-off
+installations never reach the producer, so their `GET /api/v1/projects` is byte-identical to Go's.
