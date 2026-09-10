@@ -827,9 +827,9 @@ reason: no `gh` call the console can trigger should take its coordinate from som
 wrote.
 
 **It refuses nothing, and it cannot merge.** Every gate on `POST …/merge` exists because a merge is
-irreversible; reading a diff is not, so a pull request under review, one whose reviewer asked for
-changes, or one a merge already refused all still have a diff worth reading and none of those gates
-is copied. Its dependencies are five `gh` READ seams with no merge seam among them, so nothing in
+irreversible; reading a diff is not, so an open pull request the merge path would turn away — one
+under review, one whose reviewer asked for changes, one whose ticket is not waiting in review —
+still has a diff worth reading, and none of those gates is copied. Its dependencies are five `gh` READ seams with no merge seam among them, so nothing in
 its call graph can act on the pull request it resolves — asserted on the module's own source. It
 serves no mergeability **verdict** either: `GET …/mergeability` already does, from the daemon's one
 shared resolution, so what rides here is GitHub's own `merge_state` — a fact, not a second judgement

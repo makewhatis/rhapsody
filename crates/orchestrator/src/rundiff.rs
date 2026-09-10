@@ -29,9 +29,10 @@
 //! # Why it refuses nothing — and what it nonetheless cannot show
 //!
 //! Every gate on the merge path exists because a merge is irreversible. Reading a diff is not, so
-//! none of them applies here and none is copied: a pull request a live Rhapsody review is
-//! watching, one whose reviewer asked for changes, one a merge already refused — every one of
-//! those has a diff, and this module reads it. The outcome vocabulary says so, with
+//! none of them applies here and none is copied. Take an OPEN pull request the merge path would
+//! turn away — one a live Rhapsody review is watching, one whose reviewer asked for changes, one
+//! whose ticket is not waiting in review: each has a diff, and this module reads it. The outcome
+//! vocabulary says so, with
 //! [`DiffOutcome::Unavailable`] where the merge path has `Refused`: this module never denies a
 //! request it could have served, it only reports that there is nothing to serve.
 //!

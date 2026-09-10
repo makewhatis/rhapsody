@@ -225,7 +225,9 @@ mod tests {
     #[tokio::test]
     async fn nothing_to_show_is_the_answer_and_carries_the_daemons_own_words() {
         let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_diff(
-            DiffOutcome::Unavailable("no open pull request on this run's branch"),
+            DiffOutcome::Unavailable(
+                "this run's branch has no open pull request — a merged or closed one is not read here",
+            ),
         ));
         let url = spawn(provider).await;
 
@@ -236,7 +238,10 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body = body_json(resp).await;
         assert_eq!(body["available"], false);
-        assert_eq!(body["reason"], "no open pull request on this run's branch");
+        assert_eq!(
+            body["reason"],
+            "this run's branch has no open pull request — a merged or closed one is not read here"
+        );
         assert!(body.get("patch").is_none(), "{body}");
     }
 
