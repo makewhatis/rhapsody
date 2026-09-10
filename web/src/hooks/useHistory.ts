@@ -2,11 +2,13 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   fetchDaySummary,
   fetchHistory,
+  fetchIssueCounts,
   fetchIssueRuns,
   localDayStartISO,
   type DaySummary,
   type HistoryFilter,
   type HistoryResponse,
+  type IssueCountsResponse,
   type IssueRunsResponse,
 } from "@/lib/api";
 
@@ -63,6 +65,56 @@ export function useIssueRuns(
     refetchInterval: opts?.refetchInterval ?? false,
     refetchOnWindowFocus: false,
     placeholderData: keepPreviousData,
+  });
+}
+
+// TRACKER_POLL_MS is the cadence for a read whose freshness is the TRACKER's rather than the
+// daemon's, and which is too expensive to put on the live one.
+//
+// The number is not a taste. The daemon resolves a ticket's lifecycle through a 60s TTL memo shared
+// by the whole process (`LIFECYCLE_TTL`, crates/orchestrator/src/lifecycle.rs), so a ticket moved in
+// Linear with no run involved cannot become visible to ANY console faster than that window. Asking
+// more often than the answer can change buys nothing, and matching the two makes the bound statable:
+// such a change reaches the console within one TTL plus one interval — under two minutes worst case,
+// about one typically.
+//
+// What it costs a daemon with several consoles open is worth being exact about, because the obvious
+// guess is wrong. The TRACKER cost is bounded by that memo and NOT by this interval or by the number
+// of consoles: N consoles polling at any rate share one refresh per TTL window. What scales with
+// polls is the daemon's own SQL, measured at ~1ms for the whole-store issue query over the
+// operator's own database (600 runs, 425 issues) — which is why the Now strip's tally is on
+// LIVE_POLL_MS instead, and why only the WIDENED issue listing, a 284KB response, is on this one.
+export const TRACKER_POLL_MS = 60_000;
+
+// The issue-listing TALLY's query key (STUDIO-828), kept beside the listing's own prefix because
+// the two answer the same question at different widths and are invalidated together.
+export const HISTORY_ISSUE_COUNTS_QUERY_KEY = ["history-issue-counts"] as const;
+
+// useIssueCounts fetches the daemon-computed per-status tally over EVERY issue in the store
+// (GET /api/v1/history/issues/counts) — the Now strip's numbers.
+//
+// The strip used to fold them out of the rows the table happened to hold, so they grew as the
+// operator paged and were capped by the window (STUDIO-828 defect A). This is the same correction
+// TRA-320 made to the header's day totals and for the same reason: a total is never a page.
+//
+// It takes no filter, so it is one cache entry per console however wide the worklist's window is —
+// widening the page changes what the TABLE shows and must not change what the strip counts, which
+// is the property the whole endpoint exists to hold.
+//
+// `useJobsFeed` runs it on LIVE_POLL_MS, with the rest of the surface. It can afford that where the
+// widened listing cannot: the response is O(1) in the store's size, the query behind it measures
+// ~1ms on the operator's own database, and its tracker cost is pinned to the daemon's 60s lifecycle
+// memo however often it is asked. Anything slower would let the strip and the rows beside it
+// disagree for the length of the gap, which is the failure this ticket is about.
+export function useIssueCounts(opts?: { enabled?: boolean; refetchInterval?: number | false }) {
+  return useQuery<IssueCountsResponse>({
+    queryKey: HISTORY_ISSUE_COUNTS_QUERY_KEY,
+    queryFn: fetchIssueCounts,
+    enabled: opts?.enabled ?? true,
+    refetchInterval: opts?.refetchInterval ?? false,
+    refetchOnWindowFocus: false,
+    // No `placeholderData`: the key is constant, so there is no previous page to keep across a
+    // re-key — react-query already serves the last successful answer while the next is in flight.
   });
 }
 

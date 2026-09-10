@@ -27,8 +27,9 @@ use rhapsody_store::StoreError;
 use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_version};
 use crate::handlers_config::{handle_capabilities, handle_config};
 use crate::handlers_history::{
-    handle_event_search, handle_history, handle_history_summary, handle_issue_history,
-    handle_issue_runs, handle_metrics, handle_run_detail, handle_run_events, handle_run_transcript,
+    handle_event_search, handle_history, handle_history_summary, handle_issue_counts,
+    handle_issue_history, handle_issue_runs, handle_metrics, handle_run_detail, handle_run_events,
+    handle_run_transcript,
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
@@ -533,6 +534,11 @@ where
         // from whatever run page the client happened to fetch. Both are static paths, so they never
         // contend with `/api/v1/history` itself.
         .route("/api/v1/history/issues", any(handle_issue_runs))
+        // The whole-store per-status tally behind the console's Now strip (STUDIO-828). A
+        // static path, more specific than the listing above it, and unfiltered on purpose —
+        // see `handle_issue_counts` for why it is a route rather than a field on either
+        // neighbour.
+        .route("/api/v1/history/issues/counts", any(handle_issue_counts))
         .route("/api/v1/history/summary", any(handle_history_summary))
         .route("/api/v1/events", any(handle_event_search))
         .route("/api/v1/metrics", any(handle_metrics))

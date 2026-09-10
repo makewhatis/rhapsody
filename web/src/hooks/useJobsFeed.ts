@@ -1,7 +1,13 @@
 import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { HistoryFilter, StateResponse } from "@/lib/api";
-import { HISTORY_ISSUES_QUERY_KEY, useIssueRuns } from "@/hooks/useHistory";
+import {
+  HISTORY_ISSUES_QUERY_KEY,
+  HISTORY_ISSUE_COUNTS_QUERY_KEY,
+  TRACKER_POLL_MS,
+  useIssueCounts,
+  useIssueRuns,
+} from "@/hooks/useHistory";
 import { LIVE_POLL_MS, useStateQuery } from "@/hooks/useStateQuery";
 
 /**
@@ -55,16 +61,39 @@ import { LIVE_POLL_MS, useStateQuery } from "@/hooks/useStateQuery";
  * What the interval uniquely buys is a change the live snapshot cannot see at all: a ticket's
  * tracker state moving with no run in flight, which `JobsView`'s "moves a stored row and its count
  * when only the issue listing changed" pins. That is worth 2s at the default width. It is not worth
- * a 0.6s request every 2s across a window the operator widened, so a widened window waits for the
- * live set to move, for the operator's own Refresh (`useRefresh` invalidates this family by prefix
- * for exactly this reason), or for a remount. Capping how far the chip may reach was the
- * other way out and was rejected: it puts STUDIO-792's silent truncation back at a different number.
+ * a 0.6s request every 2s across a window the operator widened, so a widened window came off that
+ * cadence entirely — and STUDIO-828 has since put it back on a much slower one (see below), which
+ * is the same trade settled at a price the measurements actually support rather than at "never".
+ * Capping how far the chip may reach was the other way out and was rejected: it puts STUDIO-792's
+ * silent truncation back at a different number.
  *
  * One consequence, stated rather than left to be discovered: while the window is widened the rail's
  * badge query (`useIssueRuns()`, the `{}` key) has no poller of its own, so it too falls back to the
  * pull-forward. That covers the half of that number which actually moves — the live set. The other
  * half, the page rows it also folds in, is the counting defect already noted on `useIssueRuns`, and
  * no cadence was ever going to fix that one.
+ *
+ * THE THIRD READ, AND THE CASE NONE OF THE ABOVE CATCHES (STUDIO-828). The strip's numbers are now a
+ * daemon-computed tally over the whole store rather than a fold over these rows, so this hook holds
+ * three queries and not two. All three are pulled forward by the same live signature, which is what
+ * keeps the strip, the rows and the badge from reporting a run's start or end a tick apart.
+ *
+ * The signature cannot see a ticket whose TRACKER state moved with no run involved, and that case
+ * stopped being exotic: `review.done_state` (STUDIO-712) now moves a ticket to Done when its pull
+ * request merges, from a code path that is not a run — verified in production on 2026-09-10, a merge
+ * at 17:14:22 and `auto-done: … state=Done` 108 seconds later with no run in flight. A human editing
+ * Linear directly does the same thing. Only an interval catches it, so all three reads keep one —
+ * and the BOUND on how late it can be is the daemon's, not the client's: `LIFECYCLE_TTL` is 60s, so
+ * no console sees such a move sooner than that however fast it polls. Within two minutes, about one
+ * typically, is what this surface promises for a ticket that moved with nothing running.
+ *
+ * A WIDENED listing is the one read that cannot ride the live cadence, and it now falls back to
+ * TRACKER_POLL_MS in place of `false`. STUDIO-792
+ * took the widened window off the 2s cadence with real numbers — 0.63s warm for a full-width page,
+ * so a request every 2s is a third of the daemon's history path spent on the rows least likely to
+ * have moved — and none of those numbers argues for never. At 60s the same page is well under one
+ * percent of that path, and it buys the widened window the one refresh the pull-forward cannot give
+ * it: a stale row under a strip that has already moved on is the disagreement this ticket is about.
  */
 export function useJobsFeed(filter: HistoryFilter = {}) {
   const qc = useQueryClient();
@@ -75,8 +104,13 @@ export function useJobsFeed(filter: HistoryFilter = {}) {
   // larger, and has no reason to lose the cadence.
   const widened = filter.limit !== undefined;
   const issueRuns = useIssueRuns(filter, {
-    refetchInterval: widened ? false : LIVE_POLL_MS,
+    refetchInterval: widened ? TRACKER_POLL_MS : LIVE_POLL_MS,
   });
+  // The tally rides the LIVE cadence with the rest of the surface — it is unfiltered and unwidened
+  // by construction, O(1) on the wire, and ~1ms of SQL, so nothing argues for holding it back. A
+  // slower strip than table is the disagreement this hook exists to prevent, only spelled the other
+  // way round.
+  const issueCounts = useIssueCounts({ refetchInterval: LIVE_POLL_MS });
 
   // `null` until the first snapshot lands, so seeding the comparison is not mistaken for a change:
   // the listing has already fetched on mount and does not need a second identical request.
@@ -86,11 +120,12 @@ export function useJobsFeed(filter: HistoryFilter = {}) {
     if (signature === null) return;
     if (seen.current !== null && seen.current !== signature) {
       void qc.invalidateQueries({ queryKey: HISTORY_ISSUES_QUERY_KEY });
+      void qc.invalidateQueries({ queryKey: HISTORY_ISSUE_COUNTS_QUERY_KEY });
     }
     seen.current = signature;
   }, [signature, qc]);
 
-  return { state, issueRuns };
+  return { state, issueRuns, issueCounts };
 }
 
 /**

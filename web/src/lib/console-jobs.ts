@@ -21,7 +21,15 @@
 //               has none — a run that started before its routing record landed. See
 //               `durableAssignees`.
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
-import type { IssueLifecycle, IssueRun, RunSummary, TeamsOverview } from "@/lib/api";
+import type {
+  BlockedEntry,
+  IssueCountsResponse,
+  IssueLifecycle,
+  IssueRun,
+  IssueStatusBucket,
+  RunSummary,
+  TeamsOverview,
+} from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 // The run detail's own vocabulary, imported rather than restated: `statusNote` exists to make the
 // worklist and the run detail AGREE about a run, and two copies of "completed reads done" is the
@@ -607,19 +615,115 @@ export interface ConsoleJobCounts {
   needsYou: number | null;
 }
 
-export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCounts {
+/** What the tally needs to know about one ticket — the three derived facts, and nothing else. */
+interface CountedJob {
+  status: ConsoleJobStatus;
+  needsYou: boolean;
+  lifecycleResolved: boolean;
+}
+
+/**
+ * The tally itself, over WEIGHTED entries: `[job, howMany]`.
+ *
+ * The weight is what lets the two callers below share one accumulator instead of one each. The
+ * table has a row per ticket and weighs everything 1; the daemon's whole-store tally arrives
+ * pre-grouped, with one entry standing for however many issues carry that exact combination of
+ * status inputs. Reconstructing a row per issue just to count them again would be the same
+ * arithmetic with a list in the middle.
+ */
+function tally(entries: Iterable<readonly [CountedJob, number]>): ConsoleJobCounts {
   const counts = { running: 0, review: 0, queued: 0, blocked: 0 };
   let needsYou = 0;
   let heard = false;
-  for (const row of rows) {
-    if (isLive(row.status)) counts.running += 1;
-    else if (row.status === "review") counts.review += 1;
-    else if (row.status === "queued") counts.queued += 1;
-    else if (row.status === "blocked") counts.blocked += 1;
-    if (row.needsYou) needsYou += 1;
-    if (row.lifecycleResolved) heard = true;
+  let total = 0;
+  for (const [job, weight] of entries) {
+    total += weight;
+    if (isLive(job.status)) counts.running += weight;
+    else if (job.status === "review") counts.review += weight;
+    else if (job.status === "queued") counts.queued += weight;
+    else if (job.status === "blocked") counts.blocked += weight;
+    if (job.needsYou) needsYou += weight;
+    if (job.lifecycleResolved) heard = true;
   }
-  return { ...counts, needsYou: heard || rows.length === 0 ? needsYou : null };
+  return { ...counts, needsYou: heard || total === 0 ? needsYou : null };
+}
+
+/**
+ * The tally over the rows a client is HOLDING — the table's own count of what it renders.
+ *
+ * This is no longer what the Now strip paints. It used to be, and that was defect A of STUDIO-828:
+ * a fold over the fetched window grows when the operator clicks "Load more" and cannot report more
+ * than the window holds, so it was a count of the client's paging rather than of anything. The
+ * strip now reads [`consoleStoreCounts`] off a figure the daemon computes over the store.
+ *
+ * It survives as the DEFINITION of those five numbers over a set of rows, and it earns its keep as
+ * the reference the daemon's grouping is pinned against: a test folds a whole store both ways —
+ * through the row pipeline here, and through the daemon's buckets there — and asserts the two
+ * agree. That agreement is the acceptance criterion the strip and the table share, and pinning it
+ * needs a row-side answer to compare with.
+ */
+export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCounts {
+  return tally(rows.map((row) => [row, 1] as const));
+}
+
+/**
+ * The Now strip's five numbers, over EVERY issue in the store — STUDIO-828 defect A.
+ *
+ * `undefined` in, `undefined` out: before the first response there is no answer, and the strip
+ * renders "—" rather than four zeroes it would have to take back. A zero is a claim that the store
+ * is empty, which is exactly the sort of number this ticket exists to stop the console inventing.
+ *
+ * The daemon sends the same per-row facts the issue listing sends, grouped by their distinct
+ * combinations, and the rule that turns those facts into a pill is applied HERE — by the same
+ * [`consoleJobStatus`] and [`needsOperator`] the table's rows go through. That is deliberate and it
+ * is the whole reason the endpoint counts inputs rather than statuses: a count derived by a second
+ * implementation of the rule can disagree with the row beside it, and a strip that contradicts its
+ * own table is worse than one that is merely stale.
+ *
+ * A bucket the daemon could not resolve a lifecycle for carries no `lifecycle`, exactly as such a
+ * row does, so the "—" gate on `needsYou` reads the payload the same way it read the page: some
+ * bucket answered ⇒ the tracker is answering. See [`ConsoleJobCounts.needsYou`].
+ *
+ * `held` is the ONE thing the daemon's tally cannot supply and the client must add: the live
+ * snapshot's held dependents (`state.blocked`, INF-318/INF-320), which the worklist renders as rows
+ * with no run behind them at all. Adding it does not reopen defect A, and the reason is worth being
+ * exact about: the live snapshot is not a page — it is the complete set of what the daemon is doing
+ * right now, at every window width — so folding it in is paging-invariant in a way folding the
+ * listing never was. Nor can it double-count: a ticket only reads "waiting" when its whole group is
+ * synthetic (`runs-model.jobStatus`), i.e. when it has never run, and a ticket that has never run
+ * has no stored row for the daemon's tally to have counted.
+ *
+ * It is inert on a Rhapsody daemon today — the Rust `Snapshot` carries no held-dependent set, so
+ * `/api/v1/state` never sends one — and it is here so that the strip and the table cannot disagree
+ * about a row the table already knows how to draw, rather than as a feature.
+ */
+export function consoleStoreCounts(
+  payload: IssueCountsResponse | undefined,
+  held: readonly BlockedEntry[] = [],
+): ConsoleJobCounts | undefined {
+  if (payload === undefined) return undefined;
+  // A held dependent's status inputs are exactly a `waiting` outcome and nothing else, so it goes
+  // through the SAME derivation below rather than being scored separately.
+  const buckets: readonly IssueStatusBucket[] =
+    held.length === 0
+      ? payload.buckets
+      : [...payload.buckets, { outcome: "waiting", count: held.length }];
+  return tally(
+    buckets.map((b) => {
+      // `reviewTicket` is always false here: the daemon does not resolve that marker for the tally
+      // because it cannot move any of these five numbers — a live review TICKET reads `reviewing`
+      // and an ordinary live run reads `run`, and `running` counts both. See `IssueStatusBucket`.
+      const status = consoleJobStatus(b.outcome, b.lifecycle, false, b.review_run ?? false);
+      return [
+        {
+          status,
+          needsYou: needsOperator(status, b.outcome),
+          lifecycleResolved: b.lifecycle !== undefined,
+        },
+        b.count,
+      ] as const;
+    }),
+  );
 }
 
 /** One teammate's live state in the Now strip (§3). */

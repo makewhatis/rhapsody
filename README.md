@@ -266,6 +266,63 @@ midnight. This preserves the local-day semantics the client-side fold had; a UTC
 silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
 meaning, so the header's `cached = total − in − out` reconciliation still adds up.
 
+### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828)
+
+A third **additive**, Rhapsody-only history endpoint, for the same reason the two above exist and
+against the same rule: *a total is never a page.* The console's Now strip — running / queued /
+blocked / needs you — folded its numbers out of whatever rows the client had fetched, so every one
+of them grew when the operator clicked "Load more" and none could report more than the window held.
+Measured on the operator's own daemon, the strip could not name more than 50 of 425 issues.
+
+| Endpoint | Serves |
+| --- | --- |
+| `GET /api/v1/history/issues/counts` | how many ISSUES in the whole store carry each distinct combination of status inputs |
+
+It takes no filters. The Seg and project Select the strip renders beside it are explicitly scoped to
+the loaded rows (the worklist says so in words), while the strip asks about the store.
+
+**It counts inputs, not statuses**, and that is the load-bearing decision. The count has to be
+derived by the same rule the row's pill is, or the strip and the table disagree — which is worse
+than either being wrong alone — and the only way to guarantee one rule is to keep one implementation
+of it. That implementation is the console's, which owns the vocabulary ("in review", "reviewing",
+"needs you"); the daemon does the half a client cannot, folding every issue rather than a page, and
+serves the same per-row facts `GET /api/v1/history/issues` already serves, grouped:
+
+```json
+{"issues": 425,
+ "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
+             {"outcome": "completed", "review_run": true, "count": 7},
+             {"outcome": "running", "count": 1}]}
+```
+
+Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
+endpoints speak one vocabulary. The lifecycle lookup is filtered by `review::is_review_key` exactly
+as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@reviewer` id in a Linear
+`id: { in: … }` batch fails the whole request, silently — and the snapshot's `running`/`retrying`
+sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
+different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
+
+What it costs the tracker is stated rather than left to be found, and this is the first caller that
+asks the daemon's lifecycle memo about more ids than one lookup will refresh. A lookup refreshes at
+most 200 stale ids in batches of 100, so one request is at most two round trips however large the
+store is, and a cold cache of 425 issues covers the whole store over three polls rather than in one.
+Each 60s window expires them all and spends the same five batches across those polls — about 300
+GraphQL requests an hour while a console is open, shared by the whole process however many consoles
+are open and however fast they poll.
+
+That cap has one visible consequence, and it falls the way this defect fell: an id the budget did
+not reach carries no lifecycle, so the console's fallback reads it as `completed → review` and the
+strip over-reports "needs you" for the seconds before the next poll resolves the rest. It cannot
+persist — an expired entry still serves its last answer, so past the first convergence the tally is
+complete and merely up to a TTL stale on the ids past the budget. Raising the cap would be a change
+to the shared memo rather than to this endpoint.
+
+The listing's second decoration, the `review_ticket` label read, would double all of that and is
+deliberately NOT made here: that marker only turns a live `run` into `reviewing`, which the strip
+counts as running either way, so it cannot move any of the five figures. Cutting the lifecycle half
+further wants a TTL that knows a terminal ticket will not change again, which is again a change to
+the memo rather than to this endpoint.
+
 ### Daemon-mediated review handoff — `POST /api/v1/runs/{id}/handoff` (TRA-242)
 
 Go has no analogue: an agent that finished its work moved its own ticket to the review state through
