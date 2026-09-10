@@ -1004,6 +1004,46 @@ mod tests {
         );
     }
 
+    // STUDIO-826 — a TICKETLESS review job has no tracker ticket at all, so the `review_ticket`
+    // marker above can never reach it: there is no ticket to carry the label. The listing therefore
+    // states the other half of the same fact from the run row itself — this run's subject is a pull
+    // request — so the console can say "reviewing" while it runs and "done" when it ends, instead of
+    // inferring "awaiting a reviewer" from a completed outcome that means the review is OVER.
+    //
+    // Read off the run's own issue id, never its title: `Review owner/repo#n at <sha>` is a string
+    // this daemon happens to mint, and a hand-written ticket opening with the word would be
+    // mislabelled silently and forever.
+    #[tokio::test]
+    async fn issue_runs_mark_a_ticketless_review_run() {
+        let store = mem_store();
+        let review_key = "pr:makewhatis/rhapsody#136@alice";
+        seed_run_for(review_key, review_key, "2026-08-01T00:00:00Z", &store);
+        seed_run_for("iss_impl", "MT-2", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let by_ident: std::collections::HashMap<&str, &Value> = body["issues"]
+            .as_array()
+            .expect("issues array")
+            .iter()
+            .map(|r| (r["issue_identifier"].as_str().unwrap_or_default(), r))
+            .collect();
+        assert_eq!(by_ident[review_key]["review_run"], true);
+        // No tracker was asked, and none could have answered — the fact is the run row's own.
+        assert!(
+            by_ident[review_key].get("review_ticket").is_none(),
+            "a ticketless review job carries no ticket marker: {}",
+            by_ident[review_key],
+        );
+        assert!(
+            by_ident["MT-2"].get("review_run").is_none(),
+            "an ordinary run carries no field, never a false: {}",
+            by_ident["MT-2"],
+        );
+    }
+
     // STUDIO-735 — the issue listing carries the ticket's DURABLE assignee, so a job that has left
     // "running" keeps naming the teammate who did it. A ticket nobody was routed for carries no
     // field at all, which is what keeps the column's "—" honest.
