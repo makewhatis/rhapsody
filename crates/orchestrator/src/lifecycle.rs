@@ -638,7 +638,7 @@ impl LifecycleCache {
 ///     have named someone has been consulted. A gap that is really a failed read cannot, on either
 ///     branch: caching it would blank a column over a transient error, which is the same rule
 ///     [`label_identities`] follows for a failed round trip.
-pub(crate) enum RunIdentity {
+enum RunIdentity {
     /// A `teams.route` row naming this teammate.
     Routed(String),
     /// A `teams.unrouted` row: this dispatch was solo or matched nobody, on the record.
@@ -670,10 +670,7 @@ pub(crate) enum RunIdentity {
 ///
 /// A `run_id` of zero is [`RunIdentity::Silent`], not [`RunIdentity::Unreadable`] — there is no run
 /// to have a ledger, which is a definite absence rather than a failed read.
-pub(crate) fn run_identity(
-    store: &(dyn rhapsody_store::Store + Send + Sync),
-    run_id: i64,
-) -> RunIdentity {
+fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) -> RunIdentity {
     if run_id <= 0 {
         return RunIdentity::Silent;
     }
