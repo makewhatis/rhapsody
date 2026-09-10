@@ -92,6 +92,13 @@ use crate::stop::ControlHandle;
 /// true.
 pub const REVIEW_ORIGIN_HANDOFF: &str = "handoff";
 
+/// The origin recorded on a row the ADOPTION sweep introduced, as `adopt:<identifier>`
+/// (STUDIO-838). Distinct from [`REVIEW_ORIGIN_HANDOFF`] on purpose: a row that reached the watch
+/// set by repair rather than at its own handoff is a fact about this installation an operator
+/// should be able to read off the row, and [`crate::reviewdone`] keys the merge→Done transition on
+/// the identifier this tag carries exactly as it does for a handoff.
+pub const REVIEW_ORIGIN_ADOPT: &str = "adopt";
+
 /// The origin recorded on a row an operator introduced through the authenticated console
 /// (slice 8). Defined here, beside its sibling, so the two spellings cannot drift apart; nothing
 /// writes it until the console surface exists.
@@ -125,6 +132,14 @@ pub struct ReviewIntroRequest {
     pub author: String,
     /// The origin tag written onto the watch-set row.
     pub introduced_by: String,
+    /// Introduce this pull request ONLY if the watch set holds no row for it at all (STUDIO-838).
+    ///
+    /// `false` — every handoff and every console introduction — is the RE-ARMING introduction the
+    /// subsystem was built on: a second handoff of the same ticket puts its row back to `requested`
+    /// while preserving both recorded heads, which is how a re-run gets re-reviewed. `true` is the
+    /// ADOPTION sweep's, and it is what makes a repair a repair: it may create the row that is
+    /// missing and may never disturb one that is not.
+    pub only_if_unwatched: bool,
 }
 
 /// A pull request RESOLVED to the coordinate the watch set is keyed by, on its way back to the
@@ -152,6 +167,9 @@ pub struct IntroducedPr {
     pub author: String,
     /// The origin tag, e.g. `handoff:STUDIO-720`.
     pub introduced_by: String,
+    /// Carried through from [`ReviewIntroRequest::only_if_unwatched`], which is where it is
+    /// documented. Re-checked by the handler rather than trusted, as every other field here is.
+    pub only_if_unwatched: bool,
 }
 
 /// What one introduction attempt did. Returned rather than logged-and-swallowed so the off-loop
@@ -165,6 +183,11 @@ pub enum ReviewIntroOutcome {
     /// Teams is off or the mode is not `ticketless`, so the subsystem is dormant (§16). Nothing was
     /// read and nothing was written.
     Dormant,
+    /// An `only_if_unwatched` introduction — an ADOPTION — found the watch set already holding a
+    /// row for this pull request, so it wrote nothing (STUDIO-838). Not a refusal and not an
+    /// introduction: the repair had nothing to repair, which is the ordinary outcome of a sweep
+    /// that runs every tick over a healthy installation.
+    AlreadyWatched,
     /// The coordinates were refused; the payload names why.
     Refused(&'static str),
 }
@@ -287,6 +310,7 @@ pub async fn run_review_intro_task(
                 reviewers: req.reviewers.clone(),
                 author: req.author.clone(),
                 introduced_by: req.introduced_by.clone(),
+                only_if_unwatched: req.only_if_unwatched,
             })
             .await;
         match outcome {
@@ -300,6 +324,11 @@ pub async fn run_review_intro_task(
             ReviewIntroOutcome::Introduced(n) => tracing::info!(
                 pr = %pr, rows = n, origin = %req.introduced_by,
                 "ticketless review: pull request introduced into the watch set"
+            ),
+            ReviewIntroOutcome::AlreadyWatched => tracing::debug!(
+                pr = %pr, origin = %req.introduced_by,
+                "ticketless review: this pull request is already in the watch set, so the \
+                 adoption had nothing to repair"
             ),
             ReviewIntroOutcome::Dormant => tracing::debug!(
                 pr = %pr,
@@ -435,6 +464,10 @@ impl Orchestrator {
             reviewers,
             author: re.identity.clone(),
             introduced_by: format!("{REVIEW_ORIGIN_HANDOFF}:{}", re.issue.identifier),
+            // A handoff RE-ARMS (STUDIO-838): a second handoff of the same ticket must put its row
+            // back to `requested`, which is how a re-run gets re-reviewed. Only the adoption sweep
+            // refuses to touch a row that already exists.
+            only_if_unwatched: false,
         })
     }
 
@@ -466,6 +499,15 @@ impl Orchestrator {
         }
         if !self.review_repo_is_configured(&pr.pr.owner, &pr.pr.repo) {
             return ReviewIntroOutcome::Refused("no configured project owns the PR's repo");
+        }
+        // The ADOPTION guard, and deliberately the LAST gate rather than the first (STUDIO-838):
+        // every check above is one an adoption must pass exactly as a handoff does, so putting the
+        // cheap exit first would be a path that skipped them. What it adds is the repair's own
+        // precondition — there is something to repair — and it is keyed on the PULL REQUEST rather
+        // than on the (PR, reviewer) rows below, because "one row and one reviewer, never two"
+        // means a second reviewer is a duplicate too.
+        if pr.only_if_unwatched && self.review_pr_is_watched(&pr.pr) {
+            return ReviewIntroOutcome::AlreadyWatched;
         }
         let mut written = 0usize;
         for reviewer in pr.reviewers.iter().filter(|r| !r.trim().is_empty()) {
@@ -602,6 +644,36 @@ impl Orchestrator {
             }
         }
         armed
+    }
+
+    /// Whether the watch set holds ANY row for this pull request — live or retired, whoever the
+    /// reviewer is (STUDIO-838).
+    ///
+    /// The whole set and not [`load_live_review_watch`](rhapsody_store::Store::load_live_review_watch):
+    /// a merged, closed or dismissed pull request stays in the set as a `dropped` row rather than
+    /// being deleted, so reading only the live rows would call every pull request this daemon has
+    /// ever finished reviewing an orphan, and re-adopt each of them.
+    ///
+    /// **A store that cannot be read answers `true`.** There is no safe way to introduce without
+    /// knowing what is already there — the failure mode is a duplicate reviewer on a real pull
+    /// request — and the repair is the caller that can afford to wait: the sweep runs again next
+    /// tick.
+    fn review_pr_is_watched(&self, pr: &PrCoord) -> bool {
+        match self.store().load_review_watch() {
+            Ok(rows) => rows.iter().any(|row| {
+                row.key.number == pr.number
+                    && row.key.owner.eq_ignore_ascii_case(&pr.owner)
+                    && row.key.repo.eq_ignore_ascii_case(&pr.repo)
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    pr = %pr, err = %e,
+                    "ticketless review: the watch set could not be read, so this pull request is \
+                     treated as already watched and nothing is adopted"
+                );
+                true
+            }
+        }
     }
 
     /// Whether `owner/repo` is a repository this daemon is configured for — the watched-repo
@@ -819,6 +891,18 @@ mod tests {
             reviewers: reviewers.iter().map(|r| r.to_string()).collect(),
             author: "alice".to_string(),
             introduced_by: "handoff:STUDIO-720".to_string(),
+            only_if_unwatched: false,
+        }
+    }
+
+    /// The same coordinate as [`introduced`], as the ADOPTION sweep hands it over: the repair
+    /// origin, and the "only if nothing is watching it" flag that makes it a repair rather than a
+    /// second way to request a review (STUDIO-838).
+    fn adoption(owner: &str, repo: &str, number: i64, reviewers: &[&str]) -> IntroducedPr {
+        IntroducedPr {
+            introduced_by: format!("{REVIEW_ORIGIN_ADOPT}:STUDIO-836"),
+            only_if_unwatched: true,
+            ..introduced(owner, repo, number, reviewers)
         }
     }
 
@@ -1128,6 +1212,82 @@ mod tests {
         assert_eq!(row.requested_sha, HEAD_A);
     }
 
+    // ── adoption: introducing a pull request nothing is watching (STUDIO-838) ────────────────────
+
+    /// The idempotency acceptance. An adoption is a REPAIR, so it may only ever create the row that
+    /// is missing: a pull request the watch set already holds is left exactly as it was found, and
+    /// the reviewers the adoption named are not written beside the ones already there. Two rows
+    /// would be two review runs — "a duplicate wakes a real agent against a real PR for no reason".
+    #[test]
+    fn adopting_an_already_watched_pull_request_writes_no_second_row() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob", "carol"]));
+        o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["bob"]));
+        o.store()
+            .mark_review_requested(&watch_key("bob"), HEAD_A)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&watch_key("bob"), HEAD_A, REVIEW_STATUS_APPROVED)
+            .expect("completed");
+
+        assert_eq!(
+            o.handle_review_introduce(&adoption("makewhatis", "rhapsody", 12, &["carol"])),
+            ReviewIntroOutcome::AlreadyWatched,
+        );
+        let rows = o.store().load_review_watch().expect("read");
+        assert_eq!(rows.len(), 1, "one row, one reviewer: {rows:?}");
+        assert_eq!(rows[0].key.reviewer, "bob");
+        assert_eq!(
+            rows[0].status,
+            REVIEW_STATUS_APPROVED,
+            "the settled round was not re-armed"
+        );
+    }
+
+    /// A RETIRED row still counts as watched. The watch set keeps a merged, closed or dismissed
+    /// pull request as a `dropped` row rather than deleting it (that is what the console renders),
+    /// so reading "no LIVE row" as "orphaned" would re-adopt every pull request this daemon has
+    /// ever finished reviewing — and dispatch a reviewer at each of them.
+    #[test]
+    fn adopting_a_pull_request_whose_row_is_retired_writes_nothing() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["bob"]));
+        o.store()
+            .drop_review_watch(&watch_key("bob"))
+            .expect("drop");
+
+        assert_eq!(
+            o.handle_review_introduce(&adoption("makewhatis", "rhapsody", 12, &["bob"])),
+            ReviewIntroOutcome::AlreadyWatched,
+        );
+        let rows = o.store().load_review_watch().expect("read");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].status, REVIEW_STATUS_DROPPED, "left retired");
+    }
+
+    /// The other half of the same property, and the one the ticket is actually about: a pull
+    /// request NOTHING is watching is exactly what an adoption may write. The fixture starts from
+    /// the orphaned state — an empty watch set — because a test that introduces normally first
+    /// would pass without the adopt path existing at all.
+    #[test]
+    fn adopting_an_unwatched_pull_request_writes_its_row() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        assert!(
+            o.store().load_review_watch().expect("read").is_empty(),
+            "the fixture must start orphaned"
+        );
+
+        assert_eq!(
+            o.handle_review_introduce(&adoption("makewhatis", "rhapsody", 144, &["bob"])),
+            ReviewIntroOutcome::Introduced(1),
+        );
+        let rows = o.store().load_review_watch().expect("read");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].key.number, 144);
+        assert_eq!(rows[0].key.reviewer, "bob");
+        assert_eq!(rows[0].introduced_by, "adopt:STUDIO-836");
+        assert_eq!(rows[0].status, REVIEW_STATUS_REQUESTED);
+    }
+
     // ── the in-process re-review event ───────────────────────────────────────────────────────────
 
     /// The head-advance acceptance: the daemon's own "the author pushed fixes" signal arms one more
@@ -1292,6 +1452,7 @@ mod tests {
             reviewers: vec!["bob".to_string()],
             author: "alice".to_string(),
             introduced_by: "handoff:STUDIO-720".to_string(),
+            only_if_unwatched: false,
         }
     }
 
