@@ -19,18 +19,20 @@
 //!     `env VAR=val <stub>` command prefix rather than a process-global `t.Setenv`, so the suite's
 //!     `#[tokio::test]`s (which cargo runs in PARALLEL, unlike Go's serial package tests) can never
 //!     race each other's environment.
-//!   * The terminal-teardown scenario (2) pins a long-but-BOUNDED stub sleep where Go uses
-//!     `FAKE_CLAUDE_HANG=1` (sleep forever). Reconcile still tears the LIVE run down within a few
-//!     seconds — the assertions are identical — but because the Rust worker-cancel drops the run future
-//!     rather than SIGKILLing the process group (reconcile's `terminate` fires `re.cancel`; the actual
-//!     kill-propagation into the runner is a noted O3/O5 follow-up), a forever-hang would ORPHAN the
-//!     stub on the CI runner. A bounded sleep self-terminates on SIGPIPE once the run future is dropped.
+//!   * (Historical, resolved by STUDIO-840.) The terminal-teardown scenario (2) used to pin a
+//!     long-but-BOUNDED stub sleep where Go uses `FAKE_CLAUDE_HANG=1` (sleep forever), because the
+//!     Rust worker-cancel dropped the run future without SIGKILLing the process group, so a
+//!     forever-hang ORPHANED the stub on the CI runner. That was the defect, not a porting choice:
+//!     the drop now performs the group kill (`rhapsody_agent`'s `KillGroupOnDrop`), so the scenario
+//!     runs Go's own knob again, and scenario (4) asserts the group is gone after a Stop.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rhapsody_agent::claude;
-use rhapsody_store::{OUTCOME_COMPLETED, OUTCOME_CONTINUED, RunFilter, Sqlite, Store, StorePath};
+use rhapsody_store::{
+    OUTCOME_COMPLETED, OUTCOME_CONTINUED, OUTCOME_STOPPED, RunFilter, Sqlite, Store, StorePath,
+};
 use rhapsody_tracker::{Tracker, file};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Instant;
@@ -128,6 +130,54 @@ fn count_runs(o: &Orchestrator) -> usize {
         .list_runs(RunFilter::default())
         .expect("list runs")
         .len()
+}
+
+/// The `ps` rows for processes in the group led by `pgid` that are still ALIVE — zombies excluded.
+/// Each row is `pid stat comm`, kept whole so a failure names exactly what survived.
+///
+/// STUDIO-840's acceptance is a property of the OS, not of the orchestrator's maps, so the e2e asks
+/// the OS — but it asks with `ps` rather than the obvious `kill(-pgid, 0)`, which cannot tell a
+/// running process from a ZOMBIE. The group leader IS a zombie for the window between the SIGKILL
+/// and the runtime reaping it, and under a loaded `cargo test --workspace` (many `#[tokio::test]`
+/// runtimes competing for the SIGCHLD that drains tokio's orphan queue) that window is long enough
+/// to fail a `kill`-based probe on CI while passing locally. A zombie is an exit status waiting to
+/// be collected: it cannot commit to a branch, which is the thing this test is about.
+///
+/// A `ps` whose format this failed to parse would find NO rows and quietly pass — so the caller
+/// asserts the group is live BEFORE the stop, which reds first if the parse is wrong.
+fn group_live_rows(pgid: i32) -> Vec<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-Ao", "pid=,pgid=,stat=,comm="])
+        .output()
+        .expect("ps -Ao pid=,pgid=,stat=,comm=");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let pid = f.next()?;
+            let grp: i32 = f.next()?.parse().ok()?;
+            let stat = f.next()?;
+            let comm = f.next().unwrap_or("");
+            // `Z` / `Z+`: a corpse pending a reap, not something still running.
+            (grp == pgid && !stat.starts_with('Z')).then(|| format!("{pid} {stat} {comm}"))
+        })
+        .collect()
+}
+
+/// Polls [`group_live_rows`] until nothing live is left in the group or `timeout` elapses. The kill
+/// is delivered by the worker task dropping its run future, so it lands a scheduling hop after the
+/// terminate rather than synchronously.
+async fn wait_group_quiet(pgid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if group_live_rows(pgid).is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The assembled file-tracker orchestrator plus the handles a test drives it through. The temp dirs are
@@ -335,10 +385,9 @@ async fn file_tracker_e2e_terminal_teardown() {
             latest_summon_at: "",
         }],
     );
-    // A long-but-BOUNDED stub sleep stands in for Go's FAKE_CLAUDE_HANG=1 (see the module docs): the
-    // run stays alive so reconcile (not the stub's own exit) tears it down, without orphaning a
-    // forever-hung stub on the CI runner.
-    let mut ft = build_file_tracker_orch(&src, "FAKE_CLAUDE_SLEEP_S=30");
+    // Go's own knob: the stub sleeps forever, so ONLY reconcile's teardown can end this run — and a
+    // teardown that fails to kill would hang the stub past the test rather than pass quietly.
+    let mut ft = build_file_tracker_orch(&src, "FAKE_CLAUDE_HANG=1");
 
     // Dispatch the long-running worker and let it get going (drain its init/assistant events).
     ft.o.on_tick().await;
@@ -473,6 +522,86 @@ async fn file_tracker_e2e_review_reopen_promotes_and_reengages() {
         read_issue_state(&src, "i1"),
         "In Progress",
         "MoveIssueState promote not persisted to the file"
+    );
+
+    teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+}
+
+/// (4) STUDIO-840, Rhapsody-only: a Stop against a live run must leave NO agent process behind.
+///
+/// The chain has four links — `handle_stop_run` fires the run's cancellation, `spawn_worker`'s select
+/// drops the run future, the turn's `KillGroupOnDrop` guard SIGKILLs the `claude` process group, and
+/// only then may the ticket move. Every link but the third was already covered, and the third is the
+/// one that was broken: in production the entry left `running`, the ticket moved to Backlog, the
+/// daemon fell silent — and the real agent kept committing for 35 minutes and opened a pull request.
+/// So this asks the OS, through the real runner and a stub that ends no other way.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tracker_e2e_stop_leaves_no_agent_process() {
+    let dir = TempDir::new();
+    let src = dir.child("issues.json");
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "i1",
+            identifier: "SMK-1",
+            title: "Smoke",
+            state: "Todo",
+            team_id: "team-1",
+            latest_summon_at: "",
+        }],
+    );
+    // Sleeps forever: nothing but a kill can end this run, so a passing assertion cannot be the stub
+    // having finished on its own.
+    let mut ft = build_file_tracker_orch(&src, "FAKE_CLAUDE_HANG=1");
+
+    // Dispatch, and pump until the worker has reported the agent's pid — `pgid` is stamped from the
+    // agent's own events, so a non-zero one means a real process group exists to assert on.
+    ft.o.on_tick().await;
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(10), |o| o
+            .running
+            .get("i1")
+            .is_some_and(|re| re.pgid != 0))
+        .await,
+        "the agent never reported a pid; running={}",
+        ft.o.running.len()
+    );
+    let (pgid, run_id) = {
+        let re =
+            ft.o.running
+                .get("i1")
+                .expect("the worker should be running");
+        (re.pgid, re.run_id)
+    };
+    assert!(
+        !group_live_rows(pgid).is_empty(),
+        "the agent's process group ({pgid}) should be alive before the stop"
+    );
+
+    // The operator Stop, on the control task exactly as `evStopRun` runs it.
+    let plan = ft.o.handle_stop_run(run_id);
+    assert!(plan.found, "the live run should be found by its run id");
+    assert!(
+        !plan.kill_undeliverable,
+        "a dispatched run's kill must be deliverable"
+    );
+
+    assert!(
+        wait_group_quiet(pgid, Duration::from_secs(15)).await,
+        "a process of the stopped run survived: group {pgid} still runs {:?}",
+        group_live_rows(pgid)
+    );
+
+    // And the bookkeeping half still commits — a stop must not trade one divergence for the other.
+    assert!(
+        !ft.o.running.contains_key("i1"),
+        "the stopped run should be out of `running`"
+    );
+    let runs = ft.store.list_runs(RunFilter::default()).expect("list runs");
+    assert_eq!(runs.len(), 1, "want 1 recorded run, got {runs:?}");
+    assert_eq!(
+        runs[0].outcome, OUTCOME_STOPPED,
+        "the stopped run should be recorded stopped, got {runs:?}"
     );
 
     teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;

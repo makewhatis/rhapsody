@@ -51,7 +51,9 @@ pub(crate) fn parse_run_id(id: &str) -> Result<i64, Box<Response>> {
 /// `POST /api/v1/runs/{id}/stop` — kill the agent + move its ticket to Backlog. `not_running` ⇒ 409;
 /// a kill with a failed Backlog move is a PARTIAL SUCCESS (200 with `move_error` in the body, which
 /// the UI surfaces so the operator moves the ticket by hand before a restart could re-dispatch it).
-/// Mirrors Go `handleRunStop`.
+/// Mirrors Go `handleRunStop`, plus one additive failure code Go has no analogue for:
+/// `kill_undeliverable` ⇒ 409, when the run's kill could not be delivered and the stop therefore
+/// committed nothing at all (STUDIO-840; README "Divergences").
 pub(crate) async fn handle_run_stop(
     method: Method,
     Path(id): Path<String>,
@@ -75,6 +77,15 @@ pub(crate) async fn handle_run_stop(
             StatusCode::CONFLICT,
             "not_running",
             "run is not currently running",
+            None,
+        ),
+        // The run was found but its kill could not be delivered, so the stop committed NOTHING —
+        // no kill, no `stopped` outcome, no ticket move. It must never read as a success: an
+        // operator who sees `moved_to` has every reason to believe the work is halted (STUDIO-840).
+        Ok(res) if res.kill_undeliverable => write_error(
+            StatusCode::CONFLICT,
+            "kill_undeliverable",
+            format!("run {run_id} could not be stopped: its agent cannot be signalled"),
             None,
         ),
         // The run was found and the agent killed. A failed Backlog move is a partial success, not an
@@ -322,6 +333,33 @@ mod tests {
         let resp = do_action(&format!("{base}/api/v1/runs/7/stop"), reqwest::Method::POST).await;
         assert_eq!(resp.status(), 409);
         assert_eq!(err_code(resp).await, "not_running");
+    }
+
+    /// STUDIO-840: a stop whose kill could not be delivered committed NOTHING, so it must not read
+    /// as the partial success above — no 200, and no `moved_to` for an operator to believe. This is
+    /// the surface that makes the failure visible without reading logs at all.
+    #[tokio::test]
+    async fn stop_kill_undeliverable_is_409() {
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_stop_result(StopResult {
+                identifier: "INF-9".into(),
+                kill_undeliverable: true,
+                ..Default::default()
+            }),
+        );
+        let base = spawn(provider).await;
+        let resp = do_action(&format!("{base}/api/v1/runs/7/stop"), reqwest::Method::POST).await;
+        assert_eq!(
+            resp.status(),
+            409,
+            "a stop that could not kill must not answer 200"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "kill_undeliverable");
+        assert!(
+            body.get("moved_to").is_none(),
+            "no ticket moved, so the body must not imply one: {body}"
+        );
     }
 
     // Mirrors Go `TestHandleRunStop_MoveErrStill200WithBody`: a kill whose Backlog move failed is a

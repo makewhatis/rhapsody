@@ -1423,9 +1423,18 @@ mod tests {
         re.started_at = chrono::Utc::now();
         re.project_slug = "rhapsody".to_string();
         re.run_id = 77;
+        // Armed as a real dispatch arms it: since STUDIO-840 an unarmed entry makes `handle_stop_run`
+        // REFUSE, and this test would then assert the absence of a teardown that never got the chance
+        // to run — a `found` that means "cannot be stopped", not "was stopped".
+        re.cancel = crate::control_loop::CancelSignal::new();
         o.running.insert("1".to_string(), re);
 
-        assert!(o.handle_stop_run(77).found);
+        let plan = o.handle_stop_run(77);
+        assert!(plan.found, "the stop did not find the live ticket run");
+        assert!(
+            !plan.kill_undeliverable,
+            "this test must exercise the real stop, not the refusal path"
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(30), o.wg.wait())
             .await

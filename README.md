@@ -1056,3 +1056,30 @@ recent losses rather than growing without bound.
 A local surface was the point. The fan-out fails because the tracker cannot be reached, so a comment
 on the ticket is the one write guaranteed to fail for the same reason. Teams-off and quorum-off
 installations never reach the producer, so their `GET /api/v1/projects` is byte-identical to Go's.
+
+### A stop that cannot kill refuses instead of reporting success (STUDIO-840)
+
+Go kills the agent through its context: `re.cancel()` cancels the run's `ctx`, the turn's
+`exec.CommandContext` fires `cmd.Cancel`, and `kill(-pid, SIGKILL)` takes the whole `claude` process
+group down. Rust has no context to inherit — a cancelled worker is a DROPPED future, and a dropped
+`tokio::process::Child` signals nothing. The port therefore adds a `KillGroupOnDrop` guard inside the
+turn (`crates/agent/src/claude/runner.rs`), disarmed once the child is reaped, so a drop performs the
+same group kill Go's `cmd.Cancel` does. This is an implementation divergence, not a behavioral one:
+it restores Go's observable outcome, which is that a stopped run leaves no process behind.
+
+One behavioral divergence rides with it, on `POST /api/v1/runs/{id}/stop`:
+
+| The run is live but its kill cannot be delivered | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| what the daemon does | fires a nil-safe cancel, terminates, moves the ticket | terminates nothing, records nothing, moves nothing |
+| what the caller is told | `200 {"identifier":…,"moved_to":"Backlog"}` | `409 {"error":{"code":"kill_undeliverable"}}` |
+
+Go leaves `runningEntry.cancel` nil for test/legacy entries, where calling it is a no-op; the Rust
+mirror is an unarmed `CancelSignal`. Neither can arise from a real dispatch — `dispatch_issue` arms
+the signal before the spawn observes it, pinned by
+`stop::tests::dispatch_arms_every_running_entrys_cancellation` — but the type permits it, and the
+kill and the ticket move are two separate commits behind one response. Reporting the move alone is
+what let a parked ticket sit in Backlog for 35 minutes while its agent kept committing, so Rhapsody
+refuses the whole stop rather than committing the half that cannot fail. `kill_undeliverable` is
+additive: every response Go can produce (`200`, the partial-success `move_error` body, the
+`not_running` 409) is unchanged, and no golden covers this path.
