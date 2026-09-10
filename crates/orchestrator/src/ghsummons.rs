@@ -2467,13 +2467,14 @@ mod tests {
         let src = GH::new("@symphony", Some(run)).with_exec_timeout(bound);
 
         let started = std::time::Instant::now();
-        let err = src
-            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
-            .await
-            .expect_err("a gh that never answers must not be waited on forever");
+        let got = src.merge_pr("o", "r", 64, MergeMethod::Squash, true).await;
         let waited = started.elapsed();
+        // Released BEFORE the assertions, not after: a panic here with the runner still spinning
+        // would leave a blocking-pool thread that never returns, and dropping the test runtime
+        // waits for it — so a regression would hang the suite instead of reporting a failure.
         released.store(true, Ordering::SeqCst);
 
+        let err = got.expect_err("a gh that never answers must not be waited on forever");
         assert!(
             waited < std::time::Duration::from_secs(5),
             "the caller must be released at its own deadline ({bound:?}), waited {waited:?}"
