@@ -348,7 +348,7 @@ impl crate::ControlHandle {
     /// ([`crate::runmerge`]'s module doc), and a future with no await point holds the tokio WORKER
     /// THREAD it is polled on, not just its own task — a thread from the pool the control loop and
     /// the HTTP server share. That hazard is cheaper to reach on this route than on the merge one,
-    /// because opening a tab triggers all five of its `gh` reads where merging takes a click and a
+    /// because opening a tab triggers up to five `gh` reads where merging takes a click and a
     /// confirmation. So all five go through [`crate::ghsummons::GH::run_off_task`], capped at
     /// `GH_EXEC_TIMEOUT`: the two this route added
     /// ([`crate::ghsummons::PrDiffSource::pr_diff`],
