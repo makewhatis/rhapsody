@@ -248,11 +248,14 @@ pub async fn run_review_intro_task(
         };
         // `--state open` and the fork guard both live inside this call, so what comes back is
         // already an OPEN pull request whose head repository belongs to the owner asked about.
+        // Only the URL is wanted here: the watch row records no head until the watcher's own
+        // `gh pr view` sweep reports one (§14.1 F-SHA), so `OpenPr::head_sha` is deliberately
+        // dropped rather than half-trusted.
         let url = match src
             .open_pr_for_branch(&req.owner, &req.repo, &req.head_branch)
             .await
         {
-            Ok(Some(url)) => url,
+            Ok(Some(pr)) => pr.url,
             Ok(None) => {
                 tracing::debug!(
                     owner = %req.owner, repo = %req.repo, branch = %req.head_branch,
@@ -1315,9 +1318,10 @@ mod tests {
     /// coordinate back, with the trusted binding, the reviewers and the origin intact.
     #[tokio::test]
     async fn the_task_resolves_the_open_pull_request_and_hands_it_back() {
-        let seen = run_once(Ok(Some(
-            "https://github.com/makewhatis/rhapsody/pull/91".to_string(),
-        )))
+        let seen = run_once(Ok(Some(crate::ghsummons::OpenPr {
+            url: "https://github.com/makewhatis/rhapsody/pull/91".to_string(),
+            head_sha: "head-a".to_string(),
+        })))
         .await;
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].pr, PrCoord::new("makewhatis", "rhapsody", 91));
@@ -1347,7 +1351,12 @@ mod tests {
             "not a url at all",
         ] {
             assert!(
-                run_once(Ok(Some(url.to_string()))).await.is_empty(),
+                run_once(Ok(Some(crate::ghsummons::OpenPr {
+                    url: url.to_string(),
+                    head_sha: String::new(),
+                })))
+                .await
+                .is_empty(),
                 "{url} must not become a review coordinate"
             );
         }

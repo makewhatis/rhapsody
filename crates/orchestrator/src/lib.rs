@@ -110,8 +110,8 @@ pub use preflight::{
     ClaudeCredentialProbe, CredentialProbe, PROBE_TIMEOUT, ProbeOutcome, ProbeRequest,
 };
 pub use quorum::{
-    MAX_QUORUM_BACKOFF_MS, QUORUM_REQUESTED_LABEL, QuorumDeps, QuorumRequest, QuorumTarget,
-    REVIEW_TICKET_LABEL, run_quorum_task,
+    MAX_QUORUM_BACKOFF_MS, QUORUM_FANOUT_ATTEMPTS, QUORUM_REQUESTED_LABEL, QuorumDeps,
+    QuorumRequest, QuorumTarget, REVIEW_TICKET_LABEL, run_quorum_task,
 };
 pub use reads::{Identity, ProjectTracker, ReadsError, ReadsTarget};
 pub use reconcile::{ActionKind, ReconcileAction, reconcile_actions};

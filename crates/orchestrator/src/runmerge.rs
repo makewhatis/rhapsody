@@ -338,7 +338,9 @@ pub async fn resolve_pull_request(plan: &MergePlan, deps: &ResolveDeps) -> Merge
         .open_pr_for_branch(&plan.owner, &plan.repo, &plan.branch)
         .await
     {
-        Ok(Some(url)) => url,
+        // The URL alone: the console merge resolves a NUMBER, and `OpenPr::head_sha` belongs to
+        // the review quorum's repeat-guard rather than to anything here.
+        Ok(Some(pr)) => pr.url,
         Ok(None) => {
             return MergeResolution::Refused("no open pull request on this run's branch");
         }
@@ -607,7 +609,10 @@ mod tests {
             if self.fail {
                 return Err("gh pr list: HTTP 502".into());
             }
-            Ok(self.url.map(str::to_string))
+            Ok(self.url.map(|u| crate::ghsummons::OpenPr {
+                url: u.to_string(),
+                head_sha: String::new(),
+            }))
         }
     }
 
