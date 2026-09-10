@@ -21,6 +21,7 @@ use rhapsody_httpapi::{
 };
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
+use rhapsody_orchestrator::rundiff::DiffOutcome;
 use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeabilityOutcome};
 use rhapsody_orchestrator::teamsmemory::{
     InvalidateView, PostView, RecallView, ReinstateView, RetainView, RoomView, RosterView,
@@ -289,6 +290,16 @@ impl StateProvider for DaemonState {
     /// single-flight claim is taken and nothing is recorded, so the console may refetch it.
     async fn run_mergeability(&self, run_id: i64) -> MergeabilityOutcome {
         self.handle.run_mergeability(run_id).await
+    }
+
+    /// `GET /api/v1/runs/{id}/diff` (STUDIO-749) — the diff a run produced on its branch.
+    ///
+    /// The shortest of the four: no control round trip at ALL. The handle reads the run row off
+    /// its own store and does the blocking `gh` half here, on this HTTP task, because a diff read
+    /// takes no claim, gates on no loop state and records nothing — so there is nothing for the
+    /// control task to own (`rundiff`'s module doc).
+    async fn run_diff(&self, run_id: i64) -> DiffOutcome {
+        self.handle.run_diff(run_id).await
     }
 
     fn teams_config_path(&self) -> &str {

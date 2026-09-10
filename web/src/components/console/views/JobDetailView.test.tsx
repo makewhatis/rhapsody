@@ -33,6 +33,7 @@ const h = vi.hoisted(() => ({
   resumeRun: vi.fn(),
   mergeRun: vi.fn(),
   fetchRunMergeability: vi.fn(),
+  fetchRunDiff: vi.fn(),
   fetchVersion: vi.fn(),
   openExternal: vi.fn(),
 }));
@@ -58,6 +59,7 @@ vi.mock("@/lib/api", async (orig) => {
     resumeRun: h.resumeRun,
     mergeRun: h.mergeRun,
     fetchRunMergeability: h.fetchRunMergeability,
+    fetchRunDiff: h.fetchRunDiff,
     fetchVersion: h.fetchVersion,
   };
 });
@@ -302,6 +304,44 @@ const MERGE_RECEIPT = {
   said: "",
 };
 
+// STUDIO-749 — what `GET /api/v1/runs/{id}/diff` serves. A two-file patch, because one file can
+// hide a boundary bug and two cannot.
+const PATCH = [
+  "diff --git a/crates/x.rs b/crates/x.rs",
+  "index 1111111..2222222 100644",
+  "--- a/crates/x.rs",
+  "+++ b/crates/x.rs",
+  "@@ -1,3 +1,3 @@",
+  " fn main() {",
+  "-    old();",
+  "+    new();",
+  " }",
+  "diff --git a/web/y.ts b/web/y.ts",
+  "--- a/web/y.ts",
+  "+++ b/web/y.ts",
+  "@@ -1 +1 @@",
+  "-const a = 1;",
+  "+const a = 2;",
+  "",
+].join("\n");
+
+const RUN_DIFF = {
+  run_id: 547,
+  issue: "STUDIO-654",
+  branch: "symphony/STUDIO-654",
+  pr: "makewhatis/rhapsody#64",
+  url: "https://github.com/makewhatis/rhapsody/pull/64",
+  number: 64,
+  head_sha: "e90ccc6457f1111111111111111111111111111a",
+  merge_state: "BLOCKED",
+  checks: [
+    { name: "lint", state: "SUCCESS" },
+    { name: "test", state: "IN_PROGRESS" },
+  ],
+  patch: PATCH,
+  truncated: false,
+};
+
 function action(name: string | RegExp): HTMLElement {
   return within(document.querySelector(".trhd .acts") as HTMLElement).getByRole(
     /view pr|open ticket/i.test(String(name)) ? "link" : "button",
@@ -321,6 +361,7 @@ afterEach(() => {
   h.fetchVersion.mockReset();
   h.mergeRun.mockReset();
   h.fetchRunMergeability.mockReset();
+  h.fetchRunDiff.mockReset();
   h.fetchRunMessages.mockReset();
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
@@ -1521,7 +1562,10 @@ describe("the watch-tabs rail (§3C)", () => {
     // make — the very defect, one zone up, that moving this rail was meant to remove.
     expect(watch.querySelector(".eyebrow")?.textContent).toBe("Not this step");
 
-    expect(tabLabels()).toEqual(["Diffdep", "Review", "Room", "Memory", "Messages"]);
+    // No tab carries a `dep` mark any more: Diff was the last one that did, and STUDIO-749 built
+    // the endpoint it was waiting on. Leaving the mark would tell an operator a served surface is
+    // missing.
+    expect(tabLabels()).toEqual(["Diff", "Review", "Room", "Memory", "Messages"]);
     expect(screen.getByRole("tab", { name: /^room/i }).getAttribute("aria-selected")).toBe("true");
     // Every tab drives the one panel, and the panel names the tab that filled it.
     for (const tab of screen.getAllByRole("tab")) {
@@ -1577,9 +1621,9 @@ describe("the watch-tabs rail (§3C)", () => {
     await waitFor(() => expect(selected()).toBe("Messages"));
     // And it wraps, rather than dead-ending on the last tab.
     fireEvent.keyDown(list, { key: "ArrowRight" });
-    await waitFor(() => expect(selected()).toBe("Diffdep"));
+    await waitFor(() => expect(selected()).toBe("Diff"));
     fireEvent.keyDown(list, { key: "Home" });
-    await waitFor(() => expect(selected()).toBe("Diffdep"));
+    await waitFor(() => expect(selected()).toBe("Diff"));
   });
 
   // The whole reason only ONE panel is mounted: four surfaces polling for nobody to read.
@@ -1981,17 +2025,130 @@ describe("a failed read is never reported as an empty one", () => {
 });
 
 // Acceptance — "Diff + Review render as dependency-named (deep-link / status), never fake."
-describe("Diff and Review — dependency-named, never invented (§5)", () => {
-  it("shows no diff at all, names the endpoint it waits on, and deep-links the pull request", async () => {
+describe("Diff — the change a run produced (§5, STUDIO-749)", () => {
+  it("renders the served patch, colorized, in its own scroll box", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    h.fetchRunDiff.mockResolvedValue({ available: true, diff: RUN_DIFF });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
     await openTab("Diff");
 
-    expect(panel().querySelector(".trdep")?.textContent).toContain("needs a daemon endpoint");
-    // Nothing that could be read as a diff: no patch text, no +/- lines, no file list.
+    await waitFor(() => expect(panel().querySelector(".trdiff")).toBeTruthy());
+    // One block per file, each named by its POST-image path.
+    const files = panel().querySelectorAll(".trdiff .file");
+    expect(files).toHaveLength(2);
+    expect([...files].map((f) => f.querySelector(".path")?.textContent)).toEqual([
+      "crates/x.rs",
+      "web/y.ts",
+    ]);
+    // Colorized — and the `+`/`-` characters are still there, so the colour is redundant rather
+    // than the only channel carrying the difference.
+    const added = [...panel().querySelectorAll(".trdiff .l.add")].map((l) => l.textContent?.trim());
+    const removed = [...panel().querySelectorAll(".trdiff .l.del")].map((l) => l.textContent?.trim());
+    expect(added).toEqual(["+    new();", "+const a = 2;"]);
+    expect(removed).toEqual(["-    old();", "-const a = 1;"]);
+    // `---`/`+++` are the file headers and NOT a deletion and an addition: reading them as one
+    // would put two phantom changed lines in every file of every patch, and miscount the stat.
+    expect(added.some((t) => t?.startsWith("+++"))).toBe(false);
+    expect(removed.some((t) => t?.startsWith("---"))).toBe(false);
+  });
+
+  // §5's "colorized, scrolls in its own box". Asserted on the STYLESHEET, the way this file's
+  // other layout claims are: jsdom loads no CSS, so `getComputedStyle` here would answer the
+  // initial value and pass whatever the rule said.
+  it("gives the diff its own bounded scroll container", () => {
+    const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+    const rule = css
+      .split("\n")
+      .find((l) => l.startsWith(".rh-console .trdiff {"));
+    expect(rule).toBeTruthy();
+    // Bounded AND scrolling: `overflow: auto` with no cap would still let a thousand-line diff
+    // push the spine and the Result card off the screen — the defect STUDIO-821 fixed one zone up.
+    expect(rule).toContain("overflow: auto");
+    expect(rule).toMatch(/max-height:\s*\d+/);
+  });
+
+  it("says what the diff is OF — the pull request, the head commit, the stat and the checks", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockResolvedValue({ available: true, diff: RUN_DIFF });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+
+    await waitFor(() => expect(panel().querySelector(".trdiffhead")).toBeTruthy());
+    const head = panel().querySelector(".trdiffhead") as HTMLElement;
+    expect(head.querySelector(".pr")?.textContent).toContain("makewhatis/rhapsody#64");
+    expect(head.querySelector(".pr")?.getAttribute("href")).toBe(
+      "https://github.com/makewhatis/rhapsody/pull/64",
+    );
+    // The head SHA is what makes the patch citable: without it a diff cannot be told apart from
+    // the same files read a push later.
+    expect(head.textContent).toContain("e90ccc6");
+    expect(head.querySelector(".stat")?.textContent).toContain("2 files");
+    expect(head.querySelector(".stat .add")?.textContent).toBe("+2");
+    expect(head.querySelector(".stat .del")?.textContent).toBe("−2");
+    expect(head.querySelector(".checks")?.textContent).toBe("1 of 2 checks still running");
+    // GitHub's own merge state, read through the same helper the merge dialog uses — one wording
+    // for one fact, rather than a second reading of it here.
+    expect(head.querySelector(".state")?.textContent).toContain("required checks");
+  });
+
+  // THIS TAB'S VALUE PASSED NO DAEMON GATE. `mergeStateNote`'s BEHIND reading promises GitHub
+  // updates the branch itself, and that is true only of a value off a `MergeReceipt`, which
+  // `runmerge::resolve_pull_request` refuses on a repository that will not update one. `rundiff`
+  // refuses nothing, so the raw BEHIND that reaches here is exactly the one the promise is false
+  // for — and Merge on the same run answers "push or update the branch, then merge". The tab must
+  // not tell an operator to wait for something that never happens.
+  it("does not promise GitHub will update a behind branch it has not gated", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockResolvedValue({
+      available: true,
+      diff: { ...RUN_DIFF, merge_state: "BEHIND" },
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+
+    await waitFor(() => expect(panel().querySelector(".trdiffhead")).toBeTruthy());
+    const state = panel().querySelector(".trdiffhead .state")?.textContent ?? "";
+    expect(state).toContain("behind its base");
+    expect(state).not.toMatch(/bring it up to date|github will/i);
+  });
+
+  it("says a cut patch was cut, rather than letting it read as complete", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockResolvedValue({
+      available: true,
+      diff: { ...RUN_DIFF, truncated: true },
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+
+    await waitFor(() => expect(panel().querySelector(".trdiff")).toBeTruthy());
+    expect(panel().querySelector(".trdep")?.textContent).toContain("cut short");
+  });
+
+  // The daemon's answer, not the console's: a branch with no open pull request — never pushed, or
+  // merged and closed — is the ordinary life of a ticket, and it keeps the calm card and the deep
+  // link it always had. The reason is rendered VERBATIM, which is what lets the daemon say which
+  // of those two it is without the console guessing.
+  it("shows the daemon's own reason, and the deep link, when there is no diff to show", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockResolvedValue({
+      available: false,
+      reason: "this run's branch has no open pull request — a merged or closed one is not read here",
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+
+    await waitFor(() => expect(panel().querySelector(".trdep")).toBeTruthy());
+    expect(panel().querySelector(".trdep")?.textContent).toContain(
+      "this run's branch has no open pull request — a merged or closed one is not read here",
+    );
+    // Nothing that could be read as a diff.
     expect(panel().querySelector("pre")).toBeNull();
-    expect(panel().textContent).not.toMatch(/^[+-]{3}/m);
     // The deep link is the head-branch SEARCH, so it can never assert a PR that does not exist.
     const link = within(panel()).getByRole("link", { name: /pull request/i });
     expect(link.getAttribute("href")).toBe(
@@ -2002,13 +2159,50 @@ describe("Diff and Review — dependency-named, never invented (§5)", () => {
 
   it("names the missing link too when the run's remote is not a GitHub one", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockResolvedValue({
+      available: false,
+      reason: "this run has no GitHub repository, so there is no diff to read",
+    });
     mountDetail([run({ id: 547, repo: "git@gitlab.com:o/r.git" })]);
     await settleTrace();
     await openTab("Diff");
+    await waitFor(() => expect(panel().querySelector(".trdep")).toBeTruthy());
     expect(within(panel()).queryByRole("link")).toBeNull();
     expect(panel().textContent).toContain("not on github.com");
   });
 
+  // The load-bearing distinction. "There is no diff" is a statement about the RUN; "GitHub would
+  // not answer" is not, and rendering the second as the first would tell an operator their branch
+  // has no pull request because the network was down.
+  it("does not report an unanswerable question as this run having changed nothing", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockRejectedValue(new Error("gh pr diff: HTTP 502"));
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+
+    await waitFor(() => expect(panel().querySelector(".trdep")?.textContent).toContain("could not be read"));
+    const text = panel().querySelector(".trdep")?.textContent ?? "";
+    expect(text).toContain("HTTP 502");
+    expect(text).not.toContain("no open pull request");
+    expect(panel().querySelector(".trdiff")).toBeNull();
+  });
+
+  // The rail mounts only the panel being read, and this read costs the daemon four blocking `gh`
+  // round trips — so a Diff tab nobody opened must cost nothing at all.
+  it("asks the daemon nothing until the tab is opened", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunDiff.mockResolvedValue({ available: true, diff: RUN_DIFF });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+
+    expect(h.fetchRunDiff).not.toHaveBeenCalled();
+    await openTab("Diff");
+    await waitFor(() => expect(h.fetchRunDiff).toHaveBeenCalledWith(547));
+  });
+});
+
+describe("Review — dependency-named, never invented (§5)", () => {
   it("reports the reviewer and the watch-set status, and names the verdict as the dependency", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     h.fetchReviews.mockResolvedValue({
@@ -4086,11 +4280,32 @@ describe("external links leave the app through the openExternal seam (STUDIO-765
     );
   });
 
-  it("opens the Diff panel's pull-request deep link in the browser", async () => {
+  it("opens the Diff panel's pull-request link in the browser", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    h.fetchRunDiff.mockResolvedValue({ available: true, diff: RUN_DIFF });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
     await openTab("Diff");
+    await waitFor(() => expect(panel().querySelector(".trdiffhead .pr")).toBeTruthy());
+    const link = panel().querySelector(".trdiffhead .pr") as HTMLElement;
+    expect(clickLink(link)).toBe(false);
+    expect(h.openExternal).toHaveBeenCalledWith(
+      "https://github.com/makewhatis/rhapsody/pull/64",
+    );
+  });
+
+  // And the no-diff card's link too, which is the deep link this panel always had — it is the one
+  // an operator follows when the daemon resolved no pull request.
+  it("opens the no-diff card's head-branch search in the browser", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    h.fetchRunDiff.mockResolvedValue({
+      available: false,
+      reason: "this run's branch has no open pull request — a merged or closed one is not read here",
+    });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Diff");
+    await waitFor(() => expect(panel().querySelector(".trdep")).toBeTruthy());
     const link = within(panel()).getByRole("link", { name: /pull request/i });
     expect(clickLink(link)).toBe(false);
     expect(h.openExternal).toHaveBeenCalledWith(

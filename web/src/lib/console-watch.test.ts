@@ -83,11 +83,12 @@ function message(over: Partial<RunMessage> = {}): RunMessage {
 }
 
 describe("the rail", () => {
-  // §3C names five, and the ONE that is not real is the one an endpoint is missing for. A rail
-  // that marked Review as a dependency too would be disowning data the daemon does serve.
-  it("names Diff as the only tab whose whole surface is waiting on an endpoint", () => {
+  // §3C names five, and since STUDIO-749 built the run-branch diff endpoint, none of them is
+  // waiting on one. Diff was the last that was; a rail that still marked it would be disowning a
+  // surface the daemon now serves, which is the same class of lie the mark exists to prevent.
+  it("marks no tab as a dependency, now that the diff endpoint is served", () => {
     expect(WATCH_TABS.map((t) => t.id)).toEqual(["diff", "review", "room", "memory", "messages"]);
-    expect(WATCH_TABS.filter((t) => t.dependency).map((t) => t.id)).toEqual(["diff"]);
+    expect(WATCH_TABS.filter((t) => t.dependency).map((t) => t.id)).toEqual([]);
     expect(DEFAULT_WATCH_TAB).toBe("room");
   });
 });

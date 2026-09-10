@@ -18,7 +18,8 @@
  *
  * Every value reaching here comes off a `MergeReceipt`, so it has passed every refusal
  * `runmerge::resolve_pull_request` makes. That is load-bearing for BEHIND below, whose reading
- * depends on the gate the daemon already applied to it.
+ * depends on the gate the daemon already applied to it. A value from anywhere else — the Diff
+ * tab's `rundiff`, which gates nothing — belongs in [`ungatedMergeStateNote`] instead.
  *
  * `undefined` is accepted even though the receipt types the field as a `string`, because the
  * receipt crosses a process boundary and `api.ts` casts the daemon's JSON rather than validating
@@ -39,6 +40,34 @@
  * that can contradict it — which it did, on DIRTY.
  */
 export function mergeStateNote(state: string | undefined, armed = false): string {
+  return stateNote(state, armed, true);
+}
+
+/**
+ * The same reading, for a `mergeStateStatus` NO daemon gate has filtered (STUDIO-749).
+ *
+ * `rundiff` deliberately refuses nothing, so the console's Diff tab is the first caller holding a
+ * raw `mergeStateStatus` — one that has passed none of `runmerge::resolve_pull_request`'s
+ * refusals. Exactly one arm above depends on having passed them, and it is BEHIND: its promise
+ * that GitHub updates the branch itself is true only because a BEHIND branch on a repository that
+ * will NOT update one was already refused. Ungated, that promise sends the operator to wait for
+ * something that never happens — while Merge on the same run tells them to push the branch.
+ *
+ * So this says only what is observable without the policy read: the branch is behind its base.
+ * Every other state is a fact of GitHub's own, reads the same either way, and shares this switch
+ * rather than being written twice — one sentence per GitHub state, as before.
+ *
+ * There is no `armed` here: arming is a property of a merge this console applied, and a value that
+ * reached no merge has none.
+ */
+export function ungatedMergeStateNote(state: string | undefined): string {
+  return stateNote(state, false, false);
+}
+
+/**
+ * The one switch both readings share. `gated` says whether the value passed the daemon's refusals.
+ */
+function stateNote(state: string | undefined, armed: boolean, gated: boolean): string {
   const value = (state ?? "").trim().toUpperCase();
   switch (value) {
     case "":
@@ -57,8 +86,11 @@ export function mergeStateNote(state: string | undefined, armed = false): string
       // NOT "push the branch". A receipt carrying BEHIND has already passed
       // `runmerge::resolve_pull_request`'s branch-update gate, which refuses a behind branch on a
       // repository that will not update one (STUDIO-784 gap 1) — so the only BEHIND that reaches
-      // this console is one GitHub brings up to date itself.
-      return "The branch is behind its base; GitHub will bring it up to date itself before merging.";
+      // this console THROUGH A RECEIPT is one GitHub brings up to date itself. Ungated, that gate
+      // has not run, so the note stops at what GitHub itself reported (STUDIO-749).
+      return gated
+        ? "The branch is behind its base; GitHub will bring it up to date itself before merging."
+        : "The branch is behind its base.";
     case "DIRTY":
       return "The branch conflicts with its base — it cannot land until someone resolves that.";
     case "DRAFT":

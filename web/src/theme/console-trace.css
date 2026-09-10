@@ -510,6 +510,35 @@
 .rh-console .trdep a { color: var(--operator); }
 .rh-console .trrev + .trdep { margin-top: 12px; }
 
+/* The Diff tab (STUDIO-749): what a run changed, in its own scroll container.
+   ------------------------------------------------------------------------------------------
+   COLOUR IS REDUNDANT HERE, NOT THE SIGNAL. Every line keeps its leading `+`/`-`/space exactly as
+   `gh` printed it, so an operator who cannot separate these two hues still reads the diff from the
+   character in column one — which is also why the tint sits behind the text with a solid rule at
+   the gutter rather than being applied TO the text, where it would have to clear a contrast floor
+   on its own. */
+.rh-console .trdiffhead { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-4); margin-bottom: 9px; }
+.rh-console .trdiffhead .pr { font-family: var(--mono); font-size: 11.5px; color: var(--operator); }
+.rh-console .trdiffhead .stat .add { color: var(--ok); }
+.rh-console .trdiffhead .stat .del { color: var(--bad); }
+.rh-console .trdiffhead .checks, .rh-console .trdiffhead .state { color: var(--ink-3); }
+
+/* §5's "colorized, scrolls in its own box". The cap is what keeps a thousand-line diff from
+   pushing the spine and the result card off the screen — the defect STUDIO-821 fixed one zone up,
+   and this panel must not reintroduce it one zone down. */
+.rh-console .trdiff { max-height: 62vh; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel-2); }
+.rh-console .trdiff .file + .file { border-top: 1px solid var(--line); }
+/* Sticky, so the file a long hunk belongs to stays readable while scrolling through it. */
+.rh-console .trdiff .path { position: sticky; top: 0; z-index: 1; padding: 7px 12px; background: var(--panel); border-bottom: 1px solid var(--line-soft); }
+.rh-console .trdiff .path .mono { font-size: 11.5px; color: var(--ink-2); }
+.rh-console .trdiff .hunks { margin: 0; padding: 6px 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.55; white-space: pre; overflow-wrap: normal; }
+.rh-console .trdiff .l { display: block; padding: 0 12px; border-left: 3px solid transparent; color: var(--ink-2); }
+.rh-console .trdiff .l.add { background: rgba(99, 192, 122, .10); border-left-color: var(--ok); }
+.rh-console .trdiff .l.del { background: rgba(224, 104, 95, .10); border-left-color: var(--bad); }
+.rh-console .trdiff .l.hunk { color: var(--ink-4); background: var(--panel); }
+.rh-console .trdiff .l.meta { color: var(--ink-4); }
+.rh-console .trdiff + .trdep { margin-top: 12px; }
+
 /* The Review tab's served half: one row per (pull request, reviewer). */
 .rh-console .trrev { display: flex; flex-direction: column; gap: 8px; }
 .rh-console .trrev .rev { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; font-size: 12.5px; }

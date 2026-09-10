@@ -15,6 +15,7 @@ use rhapsody_config::{decode, resolve, validate};
 use rhapsody_core::Project;
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
+use rhapsody_orchestrator::rundiff::DiffOutcome;
 use rhapsody_orchestrator::runmerge::{MergeControlOutcome, MergeabilityOutcome};
 use rhapsody_orchestrator::{
     HandoffResult, Identity, IssueKey, IssueLifecycleRow, ReadsError, RefreshResult, ResumeResult,
@@ -112,6 +113,10 @@ pub(crate) struct FakeProvider {
     /// (STUDIO-790).
     mergeability_outcome: Option<MergeabilityOutcome>,
     mergeability_asked: Mutex<Option<i64>>,
+    /// The canned outcome `run_diff` returns, and the run id the last read asked about
+    /// (STUDIO-749).
+    diff_outcome: Option<DiffOutcome>,
+    diff_asked: Mutex<Option<i64>>,
 }
 
 impl FakeProvider {
@@ -163,6 +168,8 @@ impl FakeProvider {
             merge_asked: Mutex::new(None),
             mergeability_outcome: None,
             mergeability_asked: Mutex::new(None),
+            diff_outcome: None,
+            diff_asked: Mutex::new(None),
         }
     }
 
@@ -402,6 +409,20 @@ impl FakeProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Set the canned outcome `run_diff` returns. Unset ⇒ the trait's `Unavailable`.
+    pub(crate) fn with_diff(mut self, outcome: DiffOutcome) -> Self {
+        self.diff_outcome = Some(outcome);
+        self
+    }
+
+    /// The run id the last `run_diff` read asked about — `None` proves the daemon was never asked.
+    pub(crate) fn diff_asked(&self) -> Option<i64> {
+        *self
+            .diff_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[async_trait]
@@ -610,6 +631,16 @@ impl StateProvider for FakeProvider {
         self.mergeability_outcome
             .clone()
             .unwrap_or(MergeabilityOutcome::Dormant)
+    }
+
+    async fn run_diff(&self, run_id: i64) -> DiffOutcome {
+        *self
+            .diff_asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(run_id);
+        self.diff_outcome
+            .clone()
+            .unwrap_or(DiffOutcome::Unavailable("this daemon cannot read a diff"))
     }
 
     async fn teams_recall(

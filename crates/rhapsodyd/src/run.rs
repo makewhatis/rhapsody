@@ -320,6 +320,41 @@ where
         })
     });
 
+    // --- the console's Diff tab (STUDIO-749; design record
+    // ~/.rhapsody/docs/console-run-detail-design.md §5, §9 slice 7) ---
+    //
+    // The five `gh` READ seams `GET /api/v1/runs/{id}/diff` drives. One `GH` fills all five, and
+    // there is deliberately no sixth: `DiffDeps` has no `MergeSource` member, so nothing this
+    // route reaches can act on the pull request it resolves.
+    //
+    // Built UNCONDITIONALLY, unlike `merge_deps` above, and the contrast is deliberate. Teams
+    // gates Rhapsody-additive WRITE surfaces — a merge needs a manager to act as and a room to
+    // report in. A diff read writes nothing, decides nothing and reports nowhere; gating it would
+    // leave the Diff tab dependency-named on a daemon perfectly able to answer it. The summon
+    // token is `GH::new`'s only construction input and none of these five reads uses it, so a
+    // daemon with no readable workflow still serves a diff.
+    o.diff_deps = Some({
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            &resolved
+                .as_ref()
+                .map(|c| c.tracker.summon_token.clone())
+                .unwrap_or_default(),
+            None,
+        ));
+        Arc::new(rhapsody_orchestrator::rundiff::DiffDeps {
+            prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::OpenPrSource>,
+            state: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
+            mergestate: Arc::clone(&gh)
+                as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
+            checks: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
+            diff: gh as Arc<dyn rhapsody_orchestrator::ghsummons::PrDiffSource>,
+            // The base repository's own owner and nothing else — the same default trust boundary
+            // the merge path takes, and it fails closed for a read too: the next thing that
+            // happens to this patch is that a browser renders it under this run's ticket.
+            allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+        })
+    });
+
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
 
