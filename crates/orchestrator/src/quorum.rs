@@ -2404,6 +2404,22 @@ mod tests {
         assert!(body.contains("Never merge"), "{body}");
         // The reviewer is named, so the run knows which identity it is wearing.
         assert!(body.contains("You are **bob**"), "{body}");
+        // The head sits between the pull request and what it is reviewing, on its own line and with
+        // no blank line either side (STUDIO-822). Pinned as an exact adjacency because a lost or
+        // doubled `\n` around an interpolated block is invisible in the source and obvious only in
+        // the shipped prose.
+        assert!(
+            body.contains(
+                "**Pull request:** https://github.com/o/r/pull/7\n**Head:** head-a\n**Reviewing:**"
+            ),
+            "{body}"
+        );
+        // …and it vanishes cleanly when GitHub stated no head, leaving the two lines adjacent.
+        let headless = review_description(&req, "bob", "");
+        assert!(
+            headless.contains("**Pull request:** https://github.com/o/r/pull/7\n**Reviewing:**"),
+            "{headless}"
+        );
     }
 
     // The title is the host template §0.12 names, and it leads with the parent's identifier so a
