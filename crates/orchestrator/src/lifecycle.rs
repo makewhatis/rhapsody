@@ -12,7 +12,7 @@
 //! means asking the tracker about it BY ID, which is what [`Tracker::fetch_issue_states_by_ids`]
 //! does — the reconciliation read, reused here.
 //!
-//! Two properties keep that affordable and safe on an HTTP read path:
+//! Three properties keep that affordable and safe on an HTTP read path:
 //!
 //!   * **Cached with a TTL** ([`LIFECYCLE_TTL`]). The Jobs view fetches its listing once per mount,
 //!     and a page is at most the store's page size of ids; within the window every further read is
@@ -22,6 +22,14 @@
 //!     or an id the tracker does not return all yield "no answer" for that ticket, and the console
 //!     falls back to exactly the run-outcome mapping it used before. A lifecycle lookup can make
 //!     the Jobs list better; it can never make it fail.
+//!   * **Bounded when it FAILS, not only when it succeeds** ([`Gate`], STUDIO-836). The TTL bounds
+//!     a lookup that answers, because an answer is what gets memoized. A lookup that fails
+//!     memoizes nothing, so before this every id stayed stale and every console poll re-issued the
+//!     whole batch — ~60 requests a minute against a 2500/hour workspace quota, self-sustaining
+//!     once the quota was the thing failing. So each of the three lookups now backs off
+//!     exponentially on repeated failure and a refused id memoizes as a bounded negative. Read
+//!     [`Gate`] before changing what counts as a failure here; the distinction between a round trip
+//!     that said nothing and one that returned a verdict about an id is the whole design.
 //!
 //! The second decoration is the ticket's DURABLE ASSIGNEE (STUDIO-735) — who did this work — and it
 //! is here because it has the same shape: an off-loop, TTL-cached, best-effort per-ticket lookup
@@ -98,6 +106,7 @@ use std::time::{Duration, Instant};
 use rhapsody_core::normalize_state;
 use rhapsody_tracker::Tracker;
 
+use crate::backoff::failure_backoff_ms;
 use crate::dispatch::DispatchStates;
 use crate::stop::ControlHandle;
 
@@ -133,6 +142,177 @@ const MAX_ISOLATION_QUERIES: usize = 32;
 /// entries are dropped, and if that is not enough the whole memo is. Discarding a memo is only ever
 /// a cost — the next read re-queries — so the crude bound is the right one here.
 const MAX_CACHE_ENTRIES: usize = 2_000;
+
+/// The ceiling on the backoff a repeatedly-failing lookup arms — the longest ONE lookup waits
+/// before it probes the tracker again (STUDIO-836). Deliberately tighter than the 15 minutes
+/// [`crate::triage::MAX_TRIAGE_BACKOFF_MS`] and its two siblings use, because those govern
+/// background work nobody is waiting on and this governs a column somebody is looking AT: five
+/// minutes is the most staleness worth trading for the request storm, and it already reduces this
+/// path's traffic by two orders of magnitude (see [`Gate`]).
+const MAX_LIFECYCLE_BACKOFF_MS: i64 = 5 * 60 * 1000;
+
+/// The three lookups' diagnostic names — the `lookup` field on every warning this module writes.
+///
+/// Named constants because each is now used TWICE: once by [`fetch_by_ids`] when a round trip
+/// fails, and once by that lookup's [`Gate`] when it backs off or recovers. The two must agree
+/// verbatim or an operator cannot grep one lookup's whole story, and the strings are the ones the
+/// daemon has always logged, so an existing grep keeps working.
+const LOOKUP_STATES: &str = "lifecycle lookup failed; serving cached ticket states";
+const LOOKUP_ASSIGNEES: &str = "assignee label lookup failed; serving cached ticket assignees";
+const LOOKUP_REVIEWS: &str = "review-ticket label lookup failed; serving cached ticket kinds";
+
+/// One lookup's failure gate: how many consecutive round trips have left it degraded, and the
+/// instant its next round trip is allowed (STUDIO-836).
+///
+/// **The memos bound a lookup that SUCCEEDS; nothing bounded one that FAILS, and they are not the
+/// same question.** A failed refresh memoizes nothing, so every id it asked about stays stale and
+/// the next console poll re-issues the whole batch. Measured on the `v0.3.4-rc.19` daemon this was
+/// written for, that ran at ~30 requests a minute per lookup and ~60 across the two that were
+/// failing — roughly 3500 an hour against a workspace quota of 2500. The retry rate ALONE exceeded
+/// the quota by 40%, and the log line said "serving cached ticket states", which reads like
+/// graceful degradation and was in fact an unthrottled loop.
+///
+/// It was also self-sustaining, which is the part that made it more than wasted traffic. Once the
+/// quota was gone every request came back `RATELIMITED`, which is a failure, which provoked the
+/// retry that kept the quota gone. Nothing inside the hour window could break that cycle, and
+/// while it ran the daemon's OTHER Linear consumers failed with it: `review.done_state` could not
+/// move a merged ticket to Done, and teams triage could not fetch candidates, so nothing new was
+/// dispatched.
+///
+/// So a lookup that leaves work undone arms an exponential wait before it will spend another round
+/// trip, on [`failure_backoff_ms`] — the cadence the retry queue, triage, the quorum and the
+/// prefetch already share, rather than a second one that can drift from it. Capped at
+/// [`MAX_LIFECYCLE_BACKOFF_MS`], a persistent failure settles at 12 attempts an hour per lookup,
+/// 36 across all three, and the doubling that leads there adds four more each: **at most 48 gated
+/// ATTEMPTS an hour from this path**, against the ~3500 requests it was making.
+///
+/// Attempts rather than requests, because the two coincide only for the shape this gate is for: a
+/// wholesale failure is one round trip per attempt. A refusal is neither — it fans one attempt out
+/// into an isolation (bounded by [`MAX_ISOLATION_QUERIES`], not by one) and it does not arm the
+/// gate at all, so it runs at [`LIFECYCLE_TTL`]'s cadence rather than the ladder's. The hourly
+/// total each shape really costs is measured and pinned in this module's tests, and the largest of
+/// the three is NOT the pathological all-refused page: it is an ordinary page carrying one refused
+/// id, ungated on purpose, and an operator budgeting quota from the all-refused number alone would
+/// under-count by 76%. That shape's cost RISES WITH PAGE SIZE, so it is quoted at the cap: a full
+/// [`MAX_LIFECYCLE_REFRESH`] page spends 960 an hour, which across three lookups is 2880 — over
+/// the 2500/hour quota. **So this gate bounds the storm; it does not by itself keep every shape
+/// inside the quota**, and an operator reading "48 attempts an hour" should not conclude
+/// otherwise. Nothing here is a reason to gate a refusal — see the next paragraph — only a reason
+/// to quote the right number and to quote the page size it belongs to.
+///
+/// **What arms it is "left work undone", which is narrower than "something went wrong".** A
+/// refusal of a particular id is a VERDICT about that id — it memoizes as a bounded negative and
+/// does not repeat, so it must not gate the healthy ids batched with it. What arms the gate is a
+/// round trip that came back with nothing said about the ids at all: a transport failure, a non-200
+/// (which is how the rate limit itself arrives), an undecodable body, or an isolation that ran out
+/// of budget. See [`Fetched::degraded`].
+///
+/// **What an operator sees while it is armed.** Every row keeps its last known decoration, however
+/// stale, because [`LifecycleCache::partition`] returns cached answers whether fresh or not; rows
+/// that never resolved stay undecorated and the console falls back to the run-outcome mapping, as
+/// it always has for an unresolved id. That is the SAME degradation a failed round trip already
+/// produced — held for longer, and without the storm. The logs are what change shape: the ~60
+/// warnings a minute become one per backoff window naming the consecutive-failure count and the
+/// wait it chose, plus one `INFO` when the lookup recovers. A failure that stops printing must not
+/// become a failure nobody can see.
+#[derive(Default)]
+struct Gate {
+    /// Consecutive degraded lookups. Zero means the last one came back clean.
+    failures: i64,
+    /// When the next round trip is allowed. `None` is "now" — no backoff standing.
+    retry_at: Option<Instant>,
+}
+
+/// What settling one attempt into a [`Gate`] did, so the caller can log the transition and only the
+/// transition.
+enum Settled {
+    /// A clean lookup that was not backed off: the ordinary case, and nothing to say about it.
+    Steady,
+    /// A degraded lookup armed the next wait, after this many consecutive failures.
+    BackedOff { failures: i64, wait: Duration },
+    /// A clean lookup cleared a standing backoff, which had reached this many failures.
+    Recovered { failures: i64 },
+}
+
+impl Gate {
+    /// Claims the right to spend a round trip at `now`, or refuses because a backoff is standing.
+    ///
+    /// **Claiming arms the gate immediately rather than waiting for the result, and that ordering
+    /// IS the ceiling.** Two dashboards polling the same instant would otherwise both find the gate
+    /// open and both spend a round trip, so the bound would be one request per window per concurrent
+    /// READER — and "however many consoles are open" is exactly the clause this has to hold under.
+    /// The arm is provisional: [`Self::settle`] either confirms it with the real next wait or drops
+    /// it because the lookup came back clean, so a healthy lookup is never slowed by having claimed.
+    ///
+    /// A caller that claims and never settles leaves the provisional wait standing. That errs
+    /// toward asking LESS, which is the safe direction for a best-effort decoration.
+    fn claim(&mut self, now: Instant) -> bool {
+        if self.retry_at.is_some_and(|t| now < t) {
+            return false;
+        }
+        self.retry_at = Some(now + Self::wait_after(self.failures.saturating_add(1)));
+        true
+    }
+
+    /// Folds one attempt's outcome in: a degraded lookup advances the failure count and arms the
+    /// longer wait, a clean one clears whatever was standing.
+    fn settle(&mut self, now: Instant, degraded: bool) -> Settled {
+        if degraded {
+            self.failures = self.failures.saturating_add(1);
+            let wait = Self::wait_after(self.failures);
+            self.retry_at = Some(now + wait);
+            return Settled::BackedOff {
+                failures: self.failures,
+                wait,
+            };
+        }
+        let cleared = std::mem::take(&mut self.failures);
+        self.retry_at = None;
+        if cleared > 0 {
+            Settled::Recovered { failures: cleared }
+        } else {
+            Settled::Steady
+        }
+    }
+
+    /// The wait a lookup that has now failed `failures` times in a row owes before its next round
+    /// trip. [`failure_backoff_ms`] is positive for every attempt and capped, so the `.max(0)` is
+    /// belt-and-braces on the cast rather than a real branch — the same shape triage, the quorum
+    /// and the prefetch use at their own call sites.
+    fn wait_after(failures: i64) -> Duration {
+        Duration::from_millis(failure_backoff_ms(failures, MAX_LIFECYCLE_BACKOFF_MS).max(0) as u64)
+    }
+}
+
+/// Whether `gate` permits a refresh to spend a round trip at `now`, claiming it if so.
+fn gate_claim(gate: &Mutex<Gate>, now: Instant) -> bool {
+    gate.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .claim(now)
+}
+
+/// Folds one lookup's outcome back into `gate` and logs the transition — never the steady state, so
+/// a healthy daemon writes nothing here and a failing one writes one line per backoff window.
+fn gate_settle(gate: &Mutex<Gate>, now: Instant, degraded: bool, lookup: &str) {
+    let settled = gate
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .settle(now, degraded);
+    match settled {
+        Settled::Steady => {}
+        Settled::BackedOff { failures, wait } => tracing::warn!(
+            failures,
+            retry_in_s = wait.as_secs(),
+            lookup,
+            "backing off this tracker lookup; the rows keep whatever they last resolved",
+        ),
+        Settled::Recovered { failures } => tracing::info!(
+            failures,
+            lookup,
+            "the tracker lookup recovered; refreshing on the normal cadence again",
+        ),
+    }
+}
 
 /// Where a ticket sits in its tracker's lifecycle, normalized across workspaces whose state NAMES
 /// differ. Derived from the configured state sets, never from Linear's own state `type`: the sets
@@ -222,9 +402,11 @@ fn prune(entries: &mut HashMap<String, Entry>, now: Instant) {
     }
 }
 
-/// One cached answer. `row: None` records that the tracker did NOT return the id — a deleted or
-/// inaccessible issue — and is cached exactly like a hit so a permanently-missing ticket is not
-/// re-queried on every dashboard load.
+/// One cached answer. `row: None` records that the tracker did not ANSWER for the id, and is cached
+/// exactly like a hit so a permanently-unanswerable ticket is not re-queried on every dashboard
+/// load. Two things reach it: a deleted or inaccessible issue the tracker simply omitted, and (since
+/// STUDIO-836) an id the tracker REFUSED — see [`Fetched::degraded`] for why a refusal memoizes
+/// while a failure does not. Both expire with [`LIFECYCLE_TTL`], so neither outlives its window.
 struct Entry {
     row: Option<IssueLifecycleRow>,
     at: Instant,
@@ -260,16 +442,26 @@ struct ReviewEntry {
 #[derive(Default)]
 pub struct LifecycleCache {
     entries: Mutex<HashMap<String, Entry>>,
+    /// The lifecycle lookup's failure gate (STUDIO-836). One gate PER LOOKUP rather than one for
+    /// the cache, for the reason there are three memos rather than one: the three reach different
+    /// records and must fail independently, so a state query Linear is refusing must not also stop
+    /// the daemon asking who worked a ticket.
+    entries_gate: Mutex<Gate>,
     /// The assignee memo (STUDIO-735), keyed by tracker issue id and bounded exactly as `entries`
     /// is. A second map rather than a second field on [`Entry`] because the two decorations resolve
     /// from different sources and must fail independently: a tracker that cannot say what state a
     /// ticket is in must not also erase who worked it, which the store alone can answer.
     assignees: Mutex<HashMap<String, AssigneeEntry>>,
+    /// The assignee LABEL lookup's failure gate — the tracker half of that decoration only. The
+    /// store half is local, costs no quota, and is never gated.
+    assignees_gate: Mutex<Gate>,
     /// The review-ticket memo (STUDIO-780), keyed by tracker issue id and bounded exactly as
     /// `entries` is. A third map for the same reason there is a second one: it resolves from a
     /// different record — the ticket's LABELS rather than its workflow state — and a tracker that
     /// cannot say what state a ticket is in must not also erase what kind of ticket it is.
     reviews: Mutex<HashMap<String, ReviewEntry>>,
+    /// The review-ticket lookup's failure gate.
+    reviews_gate: Mutex<Gate>,
 }
 
 impl LifecycleCache {
@@ -283,9 +475,16 @@ impl LifecycleCache {
     /// resolve rather than the whole page, which is [`fetch_by_ids`]'s contract and was the
     /// STUDIO-831 defect when it was not.
     ///
-    /// Two concurrent reads over the same cold ids can both fetch. That is deliberate: the
-    /// alternative is holding a lock across a network round-trip, and a duplicate read-only query
-    /// costs less than serializing every dashboard load behind one.
+    /// A refresh that keeps failing is skipped too, on this lookup's [`Gate`] (STUDIO-836): the
+    /// caller is served the cached rows without a round trip being spent, which is the same answer
+    /// a failed round trip gave it and none of the traffic.
+    ///
+    /// No lock is held across the network round-trip, so two concurrent reads over the same cold
+    /// ids are not serialized behind one another — that would put every dashboard load in a queue
+    /// to save a read-only query. What they no longer do is both FETCH: since STUDIO-836 the
+    /// second is refused by the [`Gate`] the first claimed on entry and is served from the memo,
+    /// which is the same fallback it would have got had the first one failed. That is what makes
+    /// the request ceiling hold per DAEMON rather than per concurrent reader.
     pub async fn resolve(
         &self,
         ids: &[String],
@@ -299,14 +498,17 @@ impl LifecycleCache {
         if stale.is_empty() {
             return out;
         }
-        let (issues, covered) = fetch_by_ids(
-            tracker.as_ref(),
-            ByIds::States,
-            &stale,
-            "lifecycle lookup failed; serving cached ticket states",
-        )
-        .await;
-        let by_id: HashMap<&str, &str> = issues
+        // The failure gate (STUDIO-836). While a backoff is standing this refresh spends no round
+        // trip at all and the caller is served whatever `partition` held — which is exactly the
+        // "serving cached ticket states" degradation a failed round trip already produced, for
+        // longer and without the request storm that kept it failing.
+        if !gate_claim(&self.entries_gate, now) {
+            return out;
+        }
+        let fetched = fetch_by_ids(tracker.as_ref(), ByIds::States, &stale, LOOKUP_STATES).await;
+        gate_settle(&self.entries_gate, now, fetched.degraded, LOOKUP_STATES);
+        let by_id: HashMap<&str, &str> = fetched
+            .issues
             .iter()
             .map(|iss| (iss.id.as_str(), iss.state.as_str()))
             .collect();
@@ -315,7 +517,7 @@ impl LifecycleCache {
         // label decorations already followed and the one this refresh was missing: an id the
         // tracker refused, or one in a chunk that never ran, must keep whatever it had rather than
         // be recorded as an answer nothing gave.
-        for id in stale.iter().filter(|id| covered.contains(*id)) {
+        for id in stale.iter().filter(|id| fetched.covered.contains(*id)) {
             let row = by_id.get(id.as_str()).and_then(|state| {
                 classify(state, &states).map(|lifecycle| IssueLifecycleRow {
                     state: (*state).to_string(),
@@ -453,11 +655,20 @@ impl LifecycleCache {
         // actually answered about, so a failed round-trip leaves its ids untouched instead of
         // caching "nobody" over an assignee the console already had.
         match tracker.filter(|_| !unanswered.is_empty()) {
-            Some(tracker) => {
-                let (labelled, asked) = label_identities(tracker.as_ref(), &unanswered).await;
+            // Behind the label lookup's own failure gate (STUDIO-836).
+            Some(tracker) if gate_claim(&self.assignees_gate, now) => {
+                let (labelled, asked, degraded) =
+                    label_identities(tracker.as_ref(), &unanswered).await;
+                gate_settle(&self.assignees_gate, now, degraded, LOOKUP_ASSIGNEES);
                 answers.extend(labelled);
                 covered.extend(asked);
             }
+            // A backoff is standing, so the label is not asked and NOTHING is concluded — not even
+            // for a `silent` ledger. This is the one place the gate must not borrow the branch
+            // below: "nobody could have spoken" completes an answer, but "the daemon chose not to
+            // ask" does not, and caching "nobody" over an assignee the console already had would
+            // blank a correct column for the whole window.
+            Some(_) => {}
             // No tracker to ask AT ALL — before the first config load — is not a failed round-trip.
             // For a ledger that was READ and held nothing, it completes the answer: nothing else
             // could have spoken, so "nobody" caches. Without that the whole store loop re-ran on
@@ -533,20 +744,21 @@ impl LifecycleCache {
         if stale.is_empty() {
             return out;
         }
-        let (issues, covered) = fetch_by_ids(
-            tracker.as_ref(),
-            ByIds::Labels,
-            &stale,
-            "review-ticket label lookup failed; serving cached ticket kinds",
-        )
-        .await;
-        let marked: HashSet<&str> = issues
+        // Gated exactly as [`Self::resolve`] is, and for the same reason (STUDIO-836): while a
+        // backoff stands, the already-cached kinds are served and no round trip is spent.
+        if !gate_claim(&self.reviews_gate, now) {
+            return out;
+        }
+        let fetched = fetch_by_ids(tracker.as_ref(), ByIds::Labels, &stale, LOOKUP_REVIEWS).await;
+        gate_settle(&self.reviews_gate, now, fetched.degraded, LOOKUP_REVIEWS);
+        let marked: HashSet<&str> = fetched
+            .issues
             .iter()
             .filter(|iss| is_review_ticket(iss))
             .map(|iss| iss.id.as_str())
             .collect();
         let mut guard = self.reviews.lock().unwrap_or_else(PoisonError::into_inner);
-        for id in stale.iter().filter(|id| covered.contains(*id)) {
+        for id in stale.iter().filter(|id| fetched.covered.contains(*id)) {
             let is_review = marked.contains(id.as_str());
             if is_review {
                 out.insert(id.clone());
@@ -715,9 +927,12 @@ fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) 
 
 /// The `rhapsody:@<name>` label of each of `keys`, through [`fetch_by_ids`] — so the batching, the
 /// covered-set rule and the isolation of a refused id are the same ones the lifecycle refresh
-/// follows. `covered` is the set of ids a round-trip actually answered ABOUT, which is not the set
-/// it named a teammate for: a ticket the tracker answered about but that carries no identity label
-/// is covered with no label, and that distinction is what lets the caller cache "nobody" without
+/// follows. Returns the ids it could NAME a teammate for, the ids a round trip COVERED, and whether
+/// the lookup was [degraded](Fetched::degraded) — the signal the caller's [`Gate`] arms on.
+///
+/// `covered` is the set of ids a round-trip actually answered ABOUT, which is not the set it named
+/// a teammate for: a ticket the tracker answered about but that carries no identity label is
+/// covered with no label, and that distinction is what lets the caller cache "nobody" without
 /// also caching it over a chunk that simply failed.
 ///
 /// Every key here is passed through unfiltered, including a ticketless review run's synthetic `pr:`
@@ -728,20 +943,15 @@ fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) 
 async fn label_identities(
     tracker: &dyn Tracker,
     keys: &[IssueKey],
-) -> (Vec<(String, String)>, HashSet<String>) {
+) -> (Vec<(String, String)>, HashSet<String>, bool) {
     let ids: Vec<String> = keys.iter().map(|k| k.id.clone()).collect();
-    let (issues, covered) = fetch_by_ids(
-        tracker,
-        ByIds::Labels,
-        &ids,
-        "assignee label lookup failed; serving cached ticket assignees",
-    )
-    .await;
-    let out = issues
+    let fetched = fetch_by_ids(tracker, ByIds::Labels, &ids, LOOKUP_ASSIGNEES).await;
+    let out = fetched
+        .issues
         .iter()
         .filter_map(|iss| Some((iss.id.clone(), label_identity(iss)?)))
         .collect();
-    (out, covered)
+    (out, fetched.covered, fetched.degraded)
 }
 
 /// Which of the tracker's two by-ids reads a batched lookup performs.
@@ -790,10 +1000,38 @@ fn refuses_input(err: &rhapsody_tracker::TrackerError) -> bool {
     )
 }
 
+/// What ONE batched lookup produced.
+#[derive(Default)]
+struct Fetched {
+    /// The issues the tracker returned, across every chunk that answered.
+    issues: Vec<rhapsody_core::Issue>,
+    /// The ids a round trip actually COVERED — which is not the set it returned an issue for: a
+    /// ticket the tracker answered about but that carries none of what the caller is looking for is
+    /// covered with no answer, and that distinction is what lets a caller memoize the negative
+    /// without also memoizing it over a chunk that simply failed.
+    covered: HashSet<String>,
+    /// Whether this lookup left work undone for a reason that is NOT a verdict about any id — the
+    /// signal its [`Gate`] arms on (STUDIO-836).
+    ///
+    /// Set by a round trip that failed wholesale (transport, a non-200 — which is how Linear's rate
+    /// limit arrives — or an undecodable body), by an isolation the tracker stopped answering
+    /// part-way, and by one that ran out of [`MAX_ISOLATION_QUERIES`]. All three leave ids stale
+    /// with nothing said about them, so the next poll would re-ask every one of them.
+    ///
+    /// **A refusal does NOT set it**, and that asymmetry is the whole reason this is a separate flag
+    /// rather than "did anything go wrong". A refused id is a verdict about that id: it is covered,
+    /// it memoizes as a bounded negative, and it does not come back for a TTL window. Gating on it
+    /// would make one malformed id on a page delay the refresh of every healthy ticket batched with
+    /// it — trading this defect for a stale console, which is the outcome the acceptance criteria
+    /// name.
+    degraded: bool,
+}
+
 /// What isolating ONE refused batch produced.
 struct Isolated {
     /// The ids the tracker refused ON THEIR OWN — the batch's poison, pinned to individual ids so
-    /// the diagnostic can name them.
+    /// the diagnostic can name them, and (since STUDIO-836) memoized as a bounded negative so the
+    /// next poll neither re-asks them nor pays this isolation again.
     refused: Vec<String>,
     /// How many ids the isolation gave up on: the budget ran out, or the tracker stopped answering
     /// part-way. They are simply left unresolved, which is what every id in the batch was before.
@@ -821,38 +1059,46 @@ struct Isolated {
 /// resolves. The cost is bounded by [`MAX_ISOLATION_QUERIES`] and paid only on the failure path.
 /// Two limits on that, both deliberate:
 ///
-///   * Only a [`refuses_input`] error is isolated. Anything else keeps the wholesale degradation.
-///   * A refused id is NOT recorded as covered, so no caller memoizes it as an answer. It is
-///     re-asked on the next refresh, which costs one round trip per TTL window and is the right
-///     trade: the alternative caches "no such ticket" over what may have been a transient refusal.
+///   * Only a [`refuses_input`] error is isolated. Anything else keeps the wholesale degradation,
+///     and arms this lookup's [`Gate`] (STUDIO-836).
+///   * A refused id IS recorded as covered, so every caller memoizes it as a bounded negative and
+///     the next poll neither re-asks it nor pays another isolation. STUDIO-836 revised this:
+///     STUDIO-831 left it uncovered to keep a TRANSIENT refusal from sticking, and priced that at
+///     "one round trip per TTL window" — but an uncovered id never becomes fresh, so the real
+///     price was one round trip per POLL, with an isolation attached. The memo makes the original
+///     arithmetic true, and it keeps the protection it was for: the negative expires with
+///     [`LIFECYCLE_TTL`] and the id is asked again.
 ///
 /// Shared by all three decorations so the batching, the covered-set rule, the isolation and the
 /// failure-is-not-an-answer rule have one home rather than three that can drift. A failure never
 /// propagates — the listing being decorated has already succeeded — and `what` names the caller in
 /// the diagnostic.
-async fn fetch_by_ids(
-    tracker: &dyn Tracker,
-    kind: ByIds,
-    ids: &[String],
-    what: &str,
-) -> (Vec<rhapsody_core::Issue>, HashSet<String>) {
-    let mut out = Vec::new();
-    let mut covered = HashSet::new();
+async fn fetch_by_ids(tracker: &dyn Tracker, kind: ByIds, ids: &[String], what: &str) -> Fetched {
+    let mut fetched = Fetched::default();
     let mut budget = MAX_ISOLATION_QUERIES;
     for chunk in ids.chunks(LIFECYCLE_BATCH) {
         let err = match kind.fetch(tracker, chunk).await {
             Ok(issues) => {
-                out.extend(issues);
-                covered.extend(chunk.iter().cloned());
+                fetched.issues.extend(issues);
+                fetched.covered.extend(chunk.iter().cloned());
                 continue;
             }
             Err(err) => err,
         };
         if !refuses_input(&err) {
             tracing::warn!(error = %err, ids = chunk.len(), "{what}");
+            fetched.degraded = true;
             break;
         }
-        let iso = isolate(tracker, kind, chunk, &mut out, &mut covered, &mut budget).await;
+        let iso = isolate(
+            tracker,
+            kind,
+            chunk,
+            &mut fetched.issues,
+            &mut fetched.covered,
+            &mut budget,
+        )
+        .await;
         // The ids, not a count of them. The pre-STUDIO-831 warning logged how many were in the
         // batch beside Linear's own error text, leaving an operator to spot the odd element among a
         // hundred — work the daemon has already done by the time it writes this line.
@@ -867,11 +1113,26 @@ async fn fetch_by_ids(
             lookup = what,
             "tracker refused these ids; the rest of the batch resolved without them",
         );
+        // A refused id is COVERED, which memoizes it as a bounded negative for one TTL window
+        // (STUDIO-836). It is not an answer about the ticket, it is a verdict about the id — the
+        // tracker will not accept this shape — and the distinction that matters here is that it is
+        // REPEATABLE. Left uncovered it stayed stale, so it rejoined `stale` on the very next
+        // console poll and dragged the whole batch, plus an isolation, back through the network at
+        // poll rate: the ~30/min half of the incident. STUDIO-831 left it uncovered to protect a
+        // legitimate id from a transient refusal and reasoned that cost "one round trip per TTL
+        // window"; the memo is what makes that arithmetic true rather than aspirational, and it
+        // keeps the protection, because the negative expires with the window and is re-asked.
+        fetched.covered.extend(iso.refused);
+        // Ids the isolation gave up on, by contrast, had nothing said about them at all.
+        if iso.abandoned > 0 {
+            fetched.degraded = true;
+        }
         if iso.stop {
+            fetched.degraded = true;
             break;
         }
     }
-    (out, covered)
+    fetched
 }
 
 /// Halves a batch the tracker REFUSED until every refusal is pinned to individual ids, extending
@@ -1499,11 +1760,22 @@ mod tests {
         );
     }
 
-    // A refused id must not be memoized as a MISS. A miss is "the tracker answered and does not
-    // know this id"; a refusal is the tracker declining to answer, and caching it would keep a
-    // legitimate id blank for the rest of the TTL window if the refusal were ever transient.
+    // A refused id is memoized for a BOUNDED interval, and both bounds are load-bearing
+    // (STUDIO-831 established this test; STUDIO-836 revised which way it points).
+    //
+    // Leaving a refusal un-memoized was the other half of the request storm. An uncovered id never
+    // becomes fresh, so it rejoined `stale` on the very next console poll and took the whole batch
+    // — plus an isolation to re-pin it — back through the network at poll rate. STUDIO-831 read
+    // that cost as "one round trip per TTL window"; it was one per POLL, which is the ~30/min this
+    // half of the fix removes.
+    //
+    // The protection it was reaching for survives, because the memo EXPIRES: the refusal is not
+    // "no such ticket" forever, it is "the tracker would not accept this id a moment ago", and one
+    // TTL later the id is asked again. So the assertions are a pair, and dropping either one
+    // re-opens a defect: no memo is the storm, a permanent memo is a legitimate id blanked by a
+    // refusal that was transient.
     #[tokio::test]
-    async fn a_refused_id_is_not_cached_as_an_answer() {
+    async fn a_refused_id_is_memoized_for_one_ttl_window_and_then_re_asked() {
         let tr = linear_shaped(&[("2cc5fcd2", "Done")]);
         let cache = LifecycleCache::default();
         let ids: Vec<String> = ["2cc5fcd2", "pr:makewhatis/rhapsody#141@jimmy"]
@@ -1515,12 +1787,27 @@ mod tests {
 
         cache.resolve(&ids, target(), t0).await;
         let calls = tr.by_id_calls();
-        let again = cache.resolve(&ids, target(), t0).await;
 
+        // Inside the window: nothing is re-asked, and the id the tracker refuses still has no
+        // lifecycle to report — the memo records the refusal, never an invented state.
+        let again = cache.resolve(&ids, target(), t0 + LIFECYCLE_TTL / 2).await;
         assert_eq!(again["2cc5fcd2"].lifecycle, IssueLifecycle::Done);
+        assert_eq!(
+            again.len(),
+            1,
+            "a refused id must be memoized as a refusal, not as an answer: {again:?}",
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            calls,
+            "a refused id must not drag the batch back through the network on the next poll",
+        );
+
+        // Past it: asked again, so a refusal that was transient cannot stick.
+        cache.resolve(&ids, target(), t0 + LIFECYCLE_TTL).await;
         assert!(
             tr.by_id_calls() > calls,
-            "the resolved id is memoized, the refused one is re-asked",
+            "the memoized refusal must expire with the TTL window, not outlive it",
         );
     }
 
@@ -2754,5 +3041,671 @@ mod tests {
 
         assert_eq!(got.get("a").map(String::as_str), Some("alice"));
         assert!(!got.contains_key("b"));
+    }
+
+    // ─── a failing lookup must not retry at console-poll rate (STUDIO-836) ───────────────────────
+
+    /// Linear's rate-limit refusal, verbatim in shape from the `v0.3.4-rc.19` daemon log: the quota
+    /// error arrives as **HTTP 400** with the `RATELIMITED` body, so `do_graphql`'s status check
+    /// classifies it [`ApiStatus`](rhapsody_tracker::linear::LinearErrorKind::ApiStatus) — NOT a
+    /// GraphQL-errors refusal. That matters twice over: it is not [`refuses_input`], so it is never
+    /// bisected, and it is the one failure mode where retrying is itself what prevents recovery.
+    ///
+    /// ```text
+    /// linear_api_status: status 400: {"errors":[{"message":"Rate limit exceeded. Only 2500
+    ///   requests are allowed per 1 hour…","extensions":{"code":"RATELIMITED","statusCode":429…
+    /// ```
+    fn rate_limited() -> rhapsody_tracker::TrackerError {
+        rhapsody_tracker::TrackerError::Linear(rhapsody_tracker::linear::LinearError::new(
+            rhapsody_tracker::linear::LinearErrorKind::ApiStatus,
+            "status 400: {\"errors\":[{\"message\":\"Rate limit exceeded. Only 2500 requests are \
+             allowed per 1 hour\",\"extensions\":{\"code\":\"RATELIMITED\",\"statusCode\":429}}]}",
+        ))
+    }
+
+    /// One simulated hour of console polling, once a second — the cadence the incident ran at.
+    const POLLS: u64 = 3600;
+
+    /// What a page the tracker refuses EVERY part of costs in an hour: 16 gated attempts, each
+    /// spending 2 batches and [`MAX_ISOLATION_QUERIES`].
+    const WHOLLY_REFUSED_HOURLY: usize = 544;
+
+    /// What a page carrying ONE refused id costs in an hour, measured at a FULL
+    /// [`MAX_LIFECYCLE_REFRESH`] page — the largest page [`LifecycleCache::partition`] serves
+    /// whole. See [`a_page_with_one_refused_id_is_the_expensive_shape`] for why it is larger than
+    /// [`WHOLLY_REFUSED_HOURLY`] rather than smaller.
+    ///
+    /// **Qualified by page size on purpose: this is a step function, not a constant.** The cost is
+    /// `(chunks + isolation queries) × 60`, and the isolation that pins one bad id out of `n` grows
+    /// with `n` — a 50-id page spends 780 and a 100-id page 900. Quoting any of those as "the
+    /// maximum" is the same mistake that once quoted [`WHOLLY_REFUSED_HOURLY`] as one, so the test
+    /// measures at the cap rather than at a literal. Measured, retuning [`MAX_LIFECYCLE_REFRESH`]
+    /// (200→150 gives 840), [`LIFECYCLE_BATCH`] (100→64 gives 600) or [`LIFECYCLE_TTL`] moves this
+    /// number and reds that test. [`MAX_ISOLATION_QUERIES`] is guarded by
+    /// [`WHOLLY_REFUSED_HOURLY`] instead — a single-id bisection of one chunk needs about seven
+    /// queries, so trimming the budget to 24 reds THAT ceiling while leaving this one green, and
+    /// only a cut past the bisection depth (32→8) reaches here.
+    ///
+    /// **Three lookups at this rate is 2880 an hour, OVER the 2500/hour quota this module exists to
+    /// stay inside.** An operator needs to know that; it is not an argument for gating the refusal,
+    /// which is the one trade this design forbids — see
+    /// [`a_refused_id_must_not_slow_the_healthy_ids_batched_with_it`].
+    const PARTIALLY_REFUSED_HOURLY: usize = 960;
+
+    /// The ORDERING of those two is itself a claim the module's prose makes, so it is a COMPILE
+    /// error rather than a test failure: which shape costs more per hour decides which number an
+    /// operator should budget from, and the wrong answer was written down once already. Each total
+    /// is measured by its own test; this only pins how they compare.
+    const _: () = assert!(
+        PARTIALLY_REFUSED_HOURLY > WHOLLY_REFUSED_HOURLY,
+        "the partially-refused page is this path's expensive shape; a doc or a constant saying \
+         otherwise is wrong",
+    );
+
+    /// Polls `resolve` once a second for [`POLLS`] seconds of SIMULATED time and answers how many
+    /// tracker round trips that cost. Simulated: every `resolve` takes its own `now`, so the whole
+    /// hour runs instantly and the assertion is on cadence rather than on wall clock.
+    async fn calls_over_an_hour(tr: &Arc<Fake>, cache: &LifecycleCache) -> usize {
+        let ids = vec!["a".to_string()];
+        let t0 = Instant::now();
+        for s in 0..POLLS {
+            cache
+                .resolve(
+                    &ids,
+                    Some((Arc::clone(tr) as Arc<dyn Tracker>, states())),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+        }
+        tr.by_id_calls()
+    }
+
+    /// THE ACCEPTANCE PROPERTY, and it is a RATE rather than a call. A test that asserts "it
+    /// retries" passes against the defect; what has to be true is that failing N times in a row
+    /// costs strictly FEWER requests over a fixed interval than failing once does — because a
+    /// lookup that recovers goes back to re-asking once per TTL, while one that keeps failing must
+    /// back off past that.
+    ///
+    /// Mutation check: delete the gate from `resolve` and the persistent lookup issues one request
+    /// per poll — 3600 against the recovered lookup's 61 — and the inequality reverses.
+    #[tokio::test]
+    async fn a_persistently_failing_lookup_costs_fewer_requests_than_one_that_fails_once() {
+        // Fails every time, the way a quota-exhausted workspace does.
+        let mut always = Fake::default();
+        always.states_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
+        let always = Arc::new(always);
+        let persistent = calls_over_an_hour(&always, &LifecycleCache::default()).await;
+
+        // Fails its first round trip and answers every one after it.
+        let seen = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&seen);
+        let mut once = Fake::default();
+        once.states_by_ids_func = Some(Box::new(move |ids| {
+            let mut n = counter.lock().unwrap_or_else(PoisonError::into_inner);
+            *n += 1;
+            if *n == 1 {
+                return Err(rate_limited());
+            }
+            Ok(ids.iter().map(|id| issue(id, "Done")).collect())
+        }));
+        let once = Arc::new(once);
+        let transient = calls_over_an_hour(&once, &LifecycleCache::default()).await;
+
+        assert!(
+            persistent < transient,
+            "a lookup that keeps failing must cost FEWER requests than one that recovers, \
+             not more: persistent={persistent} transient={transient}",
+        );
+    }
+
+    /// The stated ceiling, which is the claim an operator has to be able to rely on: this path
+    /// cannot exceed [`HOURLY_CEILING`] requests per hour per lookup however long the failure
+    /// persists. With [`MAX_LIFECYCLE_BACKOFF_MS`] at five minutes a wholesale failure settles at
+    /// twelve attempts an hour, and the doubling before it adds five — sixteen, against the 2500/h
+    /// workspace quota the incident exhausted from this path alone.
+    #[tokio::test]
+    async fn a_failing_lookup_stays_under_a_stated_hourly_ceiling() {
+        /// The arithmetic, spelled out rather than asserted loosely: attempts land at t=0 and then
+        /// after 10s, 20s, 40s, 80s, 160s and 300s each — 0, 10, 30, 70, 150, 310, then every 300s
+        /// to 3310. Sixteen inside the hour.
+        const HOURLY_CEILING: usize = 16;
+
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
+        let tr = Arc::new(f);
+
+        let calls = calls_over_an_hour(&tr, &LifecycleCache::default()).await;
+
+        assert_eq!(
+            calls, HOURLY_CEILING,
+            "{POLLS} polls of a failing lookup must cost {HOURLY_CEILING} requests, not {calls}",
+        );
+    }
+
+    /// The other failure shape's ceiling, measured rather than reasoned about — the most ONE
+    /// GATED attempt can cost, which is why it is worth pinning beside the frequency. A batch the
+    /// tracker refuses EVERY part of pays [`MAX_ISOLATION_QUERIES`] on each attempt (STUDIO-831's
+    /// bisection, bounded but not free), and it makes slow progress: all-refused ids halve down to
+    /// single-id leaves about seven queries at a time, so a full [`MAX_LIFECYCLE_REFRESH`] page
+    /// pins only a handful of them per window and the rest are abandoned and re-asked.
+    ///
+    /// The gate still bounds the FREQUENCY, which is what turns that from unbounded into a number:
+    /// 16 attempts an hour costing at most `MAX_ISOLATION_QUERIES + 2` requests each. Recorded here
+    /// so that anyone retuning either constant sees the quota cost move — and note this shape
+    /// cannot arise from the listing, which keeps `pr:` keys out of the batch; it is the class,
+    /// reached only by an id shape nobody has met yet.
+    ///
+    /// **It is not the path's worst hour, and an operator budgeting from this number alone would
+    /// under-count.** Costliest-per-attempt is not costliest-per-hour, because the gate does not
+    /// bound every shape's frequency: a page carrying one refused id is cheaper per attempt and
+    /// runs at the ungated TTL cadence, which nets out larger. That is
+    /// [`a_page_with_one_refused_id_is_the_expensive_shape`], and the two are asserted against each
+    /// other there so this comment cannot go back to claiming the crown.
+    #[tokio::test]
+    async fn even_a_wholly_refused_page_stays_under_a_stated_hourly_ceiling() {
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(|_| Err(invalid_input())));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = (0..MAX_LIFECYCLE_REFRESH)
+            .map(|i| format!("i{i}"))
+            .collect();
+        let t0 = Instant::now();
+
+        for s in 0..POLLS {
+            cache
+                .resolve(
+                    &ids,
+                    Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+        }
+
+        assert_eq!(
+            tr.by_id_calls(),
+            WHOLLY_REFUSED_HOURLY,
+            "a wholly-refused page must stay inside its stated ceiling; it spent {} requests",
+            tr.by_id_calls(),
+        );
+    }
+
+    /// THE ASYMMETRY the fix is built on, and until this test three documents asserted it and
+    /// nothing in the repository held them to it. A refusal is a VERDICT about one id — it
+    /// memoizes as a bounded negative and does not repeat — so it must not arm the [`Gate`]; only
+    /// a round trip that came back with nothing said about the batch does. Conflating the two is a
+    /// one-line edit in [`fetch_by_ids`], immediately before `fetched.covered.extend(iso.refused)`:
+    ///
+    /// ```text
+    /// if !iso.refused.is_empty() { fetched.degraded = true; }
+    /// ```
+    ///
+    /// and it trades this ticket's defect for precisely the outcome the acceptance criteria
+    /// forbid: one malformed id on a page drags every HEALTHY ticket batched with it onto the
+    /// backoff ladder, so the console's status column carries up to [`MAX_LIFECYCLE_BACKOFF_MS`]
+    /// of staleness because a neighbouring row has a bad id.
+    ///
+    /// **The assertion is the healthy id's REFRESH RATE, not a total**, because the rate is what
+    /// the ladder moves: across the same simulated hour the healthy id must keep its 60
+    /// [`LIFECYCLE_TTL`] windows. Under the conflation it gets 16, the gated cadence.
+    ///
+    /// Neither neighbouring test can see that, which is why this one exists:
+    ///
+    ///   * `a_refused_id_is_memoized_for_one_ttl_window_and_then_re_asked` re-probes at exactly
+    ///     one TTL, and the first mutated wait is [`Gate::wait_after`]`(1)` = 10s, so the gate has
+    ///     long since reopened by the time it looks. A single refusal never climbs the ladder, and
+    ///     the ladder is where the damage is.
+    ///   * `even_a_wholly_refused_page_stays_under_a_stated_hourly_ceiling` does poll for an hour,
+    ///     but its `degraded` is already set by `iso.abandoned`, so it spends the same 544 with the
+    ///     conflation in or out.
+    ///
+    /// [`refuses_input`] and [`Fetched::degraded`] are the two seams a later edit is most likely to
+    /// blur — a `?`-shaped refactor folding "we logged a warning" into `degraded` is one line — so
+    /// the guard is a rate over an hour rather than a shape a reader has to trust.
+    #[tokio::test]
+    async fn a_refused_id_must_not_slow_the_healthy_ids_batched_with_it() {
+        /// One refresh per [`LIFECYCLE_TTL`] window across [`POLLS`] seconds: t=0, 60, … 3540.
+        const TTL_REFRESHES: usize = 60;
+        /// Each window: the batch, refused; then its two halves — one answers for the healthy id,
+        /// one pins the refusal to its own id.
+        const ROUND_TRIPS: usize = TTL_REFRESHES * 3;
+
+        const HEALTHY: &str = "2cc5fcd2";
+        const REFUSED: &str = "pr:makewhatis/rhapsody#141@jimmy";
+
+        // Counts the round trips that ANSWERED about the healthy id, which is the refresh the
+        // console's status column actually gets — `by_id_calls` alone cannot distinguish it from
+        // the refusals and the isolation queries batched around it.
+        let refreshed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&refreshed);
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(move |ids| {
+            if ids.iter().any(|id| crate::review::is_review_key(id)) {
+                return Err(invalid_input());
+            }
+            if ids.iter().any(|id| id == HEALTHY) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(ids.iter().map(|id| issue(id, "Done")).collect())
+        }));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = [HEALTHY, REFUSED].iter().map(|s| s.to_string()).collect();
+        let t0 = Instant::now();
+
+        for s in 0..POLLS {
+            let got = cache
+                .resolve(
+                    &ids,
+                    Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+            // Every poll in the hour, not just the ones that queried: the healthy row is decorated
+            // from the memo between windows, so a rate that survives while the answer goes missing
+            // would not be the property claimed.
+            assert_eq!(
+                got.get(HEALTHY).map(|d| d.lifecycle),
+                Some(IssueLifecycle::Done),
+                "the healthy id must stay decorated on every poll, including from the memo",
+            );
+        }
+
+        let refreshed = refreshed.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            refreshed, TTL_REFRESHES,
+            "a refused id must leave the healthy ids batched with it on the TTL cadence: \
+             {refreshed} refreshes in the hour, not {TTL_REFRESHES}",
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            ROUND_TRIPS,
+            "and it must cost the isolation once per window, not once per poll; it spent {}",
+            tr.by_id_calls(),
+        );
+    }
+
+    /// Which failure shape is actually the expensive one, measured — because the answer is not the
+    /// one the other two ceilings suggest, and an operator budgeting quota from
+    /// [`WHOLLY_REFUSED_HOURLY`] alone would under-count by 76%.
+    ///
+    /// Costliest per ATTEMPT is not costliest per HOUR. A wholly-refused page is the worst single
+    /// attempt this path can make, but it is degraded, so the [`Gate`] holds it to 16 attempts an
+    /// hour. A page carrying ONE refused id is not degraded at all — deliberately, that is
+    /// [`a_refused_id_must_not_slow_the_healthy_ids_batched_with_it`] — so it runs at the ungated
+    /// [`LIFECYCLE_TTL`] cadence, 60 times an hour, and being cheaper per attempt does not make up
+    /// for being nearly four times as frequent.
+    ///
+    /// **This is not a request to gate it.** Gating it is exactly the trade the asymmetry forbids:
+    /// it would buy the requests back with a stale console. The number is pinned because a stated
+    /// ceiling an ordinary failure exceeds is worse than no stated ceiling — and pinning it at
+    /// [`MAX_LIFECYCLE_REFRESH`] means retuning that cap, [`LIFECYCLE_BATCH`] or
+    /// [`LIFECYCLE_TTL`] moves a visible number rather than a silent one. The isolation budget is
+    /// the one knob this test does NOT guard until it goes very low; see
+    /// [`PARTIALLY_REFUSED_HOURLY`] for the measured split between the two ceilings.
+    ///
+    /// **And the number crosses the quota.** Three lookups in this shape is 2880 requests an hour
+    /// against a 2500/hour workspace quota, so the fix bounds the storm without making this shape
+    /// safe at a full page. That is the honest thing to tell an operator, and it is still not a
+    /// reason to gate the refusal — the console would go stale instead, which is the trade
+    /// [`a_refused_id_must_not_slow_the_healthy_ids_batched_with_it`] exists to forbid. What
+    /// bounds it is the page: the cost only reaches 960 when a single lookup's refresh set fills
+    /// [`MAX_LIFECYCLE_REFRESH`] AND one of those ids is refused.
+    ///
+    /// Not measured here, deliberately: a caller handing `resolve` MORE than
+    /// [`MAX_LIFECYCLE_REFRESH`] ids costs more still, because the overflow stays stale and spills
+    /// into the next poll's refresh set. Whether the listing can do that is a question about the
+    /// caller, not about this path, and STUDIO-836 leaves it alone.
+    ///
+    /// Reachability, plainly: `handle_issue_runs` and `handle_issue_counts` both filter
+    /// [`crate::review::is_review_key`] out of `ids`, so for the states and review lookups this is
+    /// the CLASS and not the instance — the same standing [`WHOLLY_REFUSED_HOURLY`] already has.
+    #[tokio::test]
+    async fn a_page_with_one_refused_id_is_the_expensive_shape() {
+        /// A FULL page. [`LifecycleCache::partition`] fills the refresh set right up to
+        /// [`MAX_LIFECYCLE_REFRESH`], so this is the largest page served whole — and the cap
+        /// rather than a convenient literal BECAUSE the cost is a step function of page size (50
+        /// ids spend 780, 100 spend 900). A smaller sample understates the ceiling it gets quoted
+        /// as, which is how this test's own number was wrong once already.
+        const PAGE: usize = MAX_LIFECYCLE_REFRESH;
+
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(|ids| {
+            if ids.iter().any(|id| crate::review::is_review_key(id)) {
+                return Err(invalid_input());
+            }
+            Ok(ids.iter().map(|id| issue(id, "Done")).collect())
+        }));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let mut ids: Vec<String> = (0..PAGE - 1).map(|i| format!("i{i}")).collect();
+        ids.push("pr:makewhatis/rhapsody#141@jimmy".to_string());
+        let t0 = Instant::now();
+
+        for s in 0..POLLS {
+            cache
+                .resolve(
+                    &ids,
+                    Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+        }
+
+        assert_eq!(
+            tr.by_id_calls(),
+            PARTIALLY_REFUSED_HOURLY,
+            "a page with one refused id must cost its stated hourly ceiling at a full \
+             MAX_LIFECYCLE_REFRESH page; it spent {}",
+            tr.by_id_calls(),
+        );
+    }
+
+    /// A backoff with no recovery path is a new defect wearing this one's fix: the console would
+    /// trade a request storm for a status column stuck at whatever it last knew. So a lookup that
+    /// starts answering again must resolve on its first permitted probe and go straight back to the
+    /// TTL cadence — no residual penalty from the failures behind it.
+    #[tokio::test]
+    async fn a_lookup_that_starts_succeeding_recovers_on_its_first_permitted_probe() {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = Arc::clone(&down);
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(move |ids| {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(rate_limited());
+            }
+            Ok(ids.iter().map(|id| issue(id, "Done")).collect())
+        }));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids = vec!["a".to_string()];
+        let target = || Some((Arc::clone(&tr) as Arc<dyn Tracker>, states()));
+        let t0 = Instant::now();
+
+        // Two failures: the first arms 10s, the second — taken once that expires — arms 20s.
+        assert!(cache.resolve(&ids, target(), t0).await.is_empty());
+        let armed = cache
+            .resolve(&ids, target(), t0 + Duration::from_secs(10))
+            .await;
+        assert!(
+            armed.is_empty(),
+            "still failing, still nothing to serve: {armed:?}"
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            2,
+            "one probe per window, not one per poll"
+        );
+
+        // The tracker heals. Polls inside the standing window are still not spent on it — that is
+        // the backoff doing its job — and the probe at the far end of it resolves.
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            cache
+                .resolve(&ids, target(), t0 + Duration::from_secs(20))
+                .await
+                .is_empty(),
+            "a healed tracker does not un-arm a standing backoff early",
+        );
+        let healed = cache
+            .resolve(&ids, target(), t0 + Duration::from_secs(30))
+            .await;
+        assert_eq!(
+            healed["a"].lifecycle,
+            IssueLifecycle::Done,
+            "the first permitted probe after recovery must answer: {healed:?}",
+        );
+
+        // And the penalty is gone with it: the very next expiry re-queries on the TTL alone, which
+        // a lookup still carrying two failures' worth of backoff (20s→40s) would not do.
+        let calls = tr.by_id_calls();
+        let after_ttl = cache
+            .resolve(&ids, target(), t0 + Duration::from_secs(30) + LIFECYCLE_TTL)
+            .await;
+        assert_eq!(after_ttl["a"].lifecycle, IssueLifecycle::Done);
+        assert_eq!(
+            tr.by_id_calls(),
+            calls + 1,
+            "recovery must restore the TTL cadence, not leave a backoff standing",
+        );
+    }
+
+    /// Readers inside a SETTLED backoff window share the probe that armed it. That is one of the
+    /// two gates `claim` stands in front of, and the easier one: `settle` has already recorded the
+    /// failure, so what refuses these readers is the real wait rather than the provisional arm.
+    /// [`readers_arriving_while_the_first_probe_is_open_ride_on_it`] covers the other one, and the
+    /// names have to say which is which — a rename that blurs them costs the next reader the hour
+    /// it takes to notice that only one of the two is actually pinned.
+    #[tokio::test]
+    async fn concurrent_readers_share_one_probe_per_settled_window() {
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
+        let tr = Arc::new(f);
+        let cache = Arc::new(LifecycleCache::default());
+        let ids = vec!["a".to_string()];
+        let t0 = Instant::now();
+
+        // The first attempt arms the gate; then eight readers poll at one instant inside it.
+        cache
+            .resolve(
+                &ids,
+                Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                t0,
+            )
+            .await;
+        let at = t0 + Duration::from_secs(1);
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (cache, tr, ids) = (Arc::clone(&cache), Arc::clone(&tr), ids.clone());
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .resolve(&ids, Some((tr as Arc<dyn Tracker>, states())), at)
+                    .await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("reader task");
+        }
+
+        assert_eq!(
+            tr.by_id_calls(),
+            1,
+            "eight concurrent readers inside one SETTLED backoff window must cost the one probe \
+             that armed it, not one each",
+        );
+    }
+
+    /// The other half of the ceiling, and the half a test that awaits each poll to completion can
+    /// never see: readers arriving while the very FIRST probe is still in flight, before anything
+    /// has settled. `failures` is still zero here and `settle` has not run, so the only thing that
+    /// can refuse them is the wait [`Gate::claim`] arms provisionally on entry. Delete those two
+    /// lines and the bound silently becomes one request per window per concurrent READER — which
+    /// is the reading of "however many consoles are open" this whole change exists to rule out.
+    ///
+    /// The tracker fake PARKS inside the round trip until released, which is what makes that window
+    /// enterable at all; the sibling test above cannot reach it because its first `resolve` is
+    /// awaited to completion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn readers_arriving_while_the_first_probe_is_open_ride_on_it() {
+        let (release, gate) = tokio::sync::watch::channel(false);
+        let mut f = Fake::default();
+        f.states_by_ids_gate = Some(gate);
+        f.states_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
+        let tr = Arc::new(f);
+        let cache = Arc::new(LifecycleCache::default());
+        let ids = vec!["a".to_string()];
+        let t0 = Instant::now();
+
+        let first = {
+            let (cache, tr, ids) = (Arc::clone(&cache), Arc::clone(&tr), ids.clone());
+            tokio::spawn(async move {
+                cache
+                    .resolve(&ids, Some((tr as Arc<dyn Tracker>, states())), t0)
+                    .await
+            })
+        };
+        // Wait until that probe is definitively OPEN. The fake clones a receiver for exactly the
+        // duration of the awaited call, so a second receiver existing is "the round trip is in
+        // flight right now" — and nothing has settled while it is.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while release.receiver_count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first probe never reached the tracker",
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Eight consoles poll one second in, meeting only the provisional arm.
+        let at = t0 + Duration::from_secs(1);
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let (cache, tr, ids) = (Arc::clone(&cache), Arc::clone(&tr), ids.clone());
+            readers.push(tokio::spawn(async move {
+                cache
+                    .resolve(&ids, Some((tr as Arc<dyn Tracker>, states())), at)
+                    .await
+            }));
+        }
+        // A refused reader returns at once; one that is NOT refused parks behind the same unreleased
+        // gate, so this join is bounded rather than awaited outright — otherwise the regression this
+        // test exists for would hang here instead of failing with the count that explains it.
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            for r in readers {
+                let _ = r.await;
+            }
+        })
+        .await;
+
+        assert_eq!(
+            tr.by_id_calls(),
+            1,
+            "eight readers arriving while the first probe was still in flight must ride on it; \
+             they opened {} round trips between them",
+            tr.by_id_calls(),
+        );
+        assert!(
+            joined.is_ok(),
+            "a refused reader must be served the memo immediately, not queued behind the open probe",
+        );
+
+        // Release, so the parked probe can settle rather than be dropped mid-flight.
+        let _ = release.send(true);
+        first.await.expect("the first probe");
+    }
+
+    /// The two label lookups share the tracker, the quota and the defect, so they share the fix.
+    /// Asserted separately because each keeps its OWN gate: a states lookup that is failing must
+    /// not gate the label reads, which is the same independence the three memos already have.
+    #[tokio::test]
+    async fn the_review_ticket_lookup_backs_off_too() {
+        let mut f = Fake::default();
+        f.labels_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids = vec!["a".to_string()];
+        let t0 = Instant::now();
+
+        for s in 0..POLLS {
+            cache
+                .resolve_reviews(
+                    &ids,
+                    Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+        }
+
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            16,
+            "the review-ticket lookup must back off on the same cadence; it spent {} requests",
+            tr.labels_by_id_calls(),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_assignee_label_lookup_backs_off_too() {
+        let mut f = Fake::default();
+        f.labels_by_ids_func = Some(Box::new(|_| Err(rate_limited())));
+        let tr = Arc::new(f);
+        let (_o, store) = crate::testsupport::orch_with_store();
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = store;
+        let cache = LifecycleCache::default();
+        // `run_id` 0 is a definite absence rather than a failed read, so the ledger is SILENT and
+        // every key falls through to the label — which is the lookup under test.
+        let keys = vec![key("a", 0)];
+        let t0 = Instant::now();
+
+        for s in 0..POLLS {
+            cache
+                .resolve_assignees(
+                    &keys,
+                    &store,
+                    Some(Arc::clone(&tr) as Arc<dyn Tracker>),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+        }
+
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            16,
+            "the assignee label lookup must back off on the same cadence; it spent {} requests",
+            tr.labels_by_id_calls(),
+        );
+    }
+
+    /// A backed-off assignee lookup must not conclude anything. The un-asked rows stay unanswered
+    /// and the console falls back exactly as a failed round trip left it — memoizing "nobody" for
+    /// a ticket the daemon simply chose not to ask about would blank a column that is correct.
+    #[tokio::test]
+    async fn a_backed_off_assignee_lookup_concludes_nothing() {
+        let answer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&answer);
+        let mut f = Fake::default();
+        f.labels_by_ids_func = Some(Box::new(move |ids| {
+            if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(rate_limited());
+            }
+            Ok(ids
+                .iter()
+                .map(|id| labelled(id, &["rhapsody:@alice"]))
+                .collect())
+        }));
+        let tr = Arc::new(f);
+        let (_o, store) = crate::testsupport::orch_with_store();
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = store;
+        let cache = LifecycleCache::default();
+        let keys = vec![key("a", 0)];
+        let t0 = Instant::now();
+        let tracker = || Some(Arc::clone(&tr) as Arc<dyn Tracker>);
+
+        assert!(
+            cache
+                .resolve_assignees(&keys, &store, tracker(), t0)
+                .await
+                .is_empty(),
+            "a failed label read answers nothing",
+        );
+        // Inside the backoff window the tracker CAN answer, and is not asked.
+        answer.store(true, std::sync::atomic::Ordering::SeqCst);
+        let gated = cache
+            .resolve_assignees(&keys, &store, tracker(), t0 + Duration::from_secs(1))
+            .await;
+        assert!(
+            gated.is_empty(),
+            "a gated lookup serves what it had; it must not cache 'nobody' over an \
+             assignee it declined to ask about: {gated:?}",
+        );
+        // And once the window is over the standing answer is picked up, not a memoized negative.
+        let recovered = cache
+            .resolve_assignees(&keys, &store, tracker(), t0 + Duration::from_secs(10))
+            .await;
+        assert_eq!(
+            recovered.get("a").map(String::as_str),
+            Some("alice"),
+            "the first permitted probe after the window must answer: {recovered:?}",
+        );
     }
 }
