@@ -348,6 +348,12 @@ impl Session for ClaudeSession {
                 }
             };
 
+        // Every await below can be reached by a DROP rather than a return: an operator Stop (and a
+        // daemon shutdown) cancels a run by dropping this future, and the child leads its own process
+        // group, so it would otherwise run on unattended. Arm the group kill for the whole turn and
+        // disarm it only once the child is reaped (STUDIO-840).
+        let mut group_kill = KillGroupOnDrop(pid);
+
         // The FIRST stdin line is the prompt as one stream-json user message (INF-250). A write
         // failure (child never drained stdin / exited early) is not fatal — the scan loop still runs.
         match encode_user_message(prompt) {
@@ -541,6 +547,7 @@ impl Session for ClaudeSession {
         };
         tokio::join!(drain_out, drain_err);
         let wait_res = child.wait().await;
+        group_kill.disarm(); // reaped — nothing left to signal, and the pid may now be recycled
 
         // Billing abort (a system/init reported a non-"none" apiKeySource): refuse to bill.
         if billing_failed {
@@ -627,6 +634,27 @@ fn timed_out_result(usage: Usage) -> TurnResult {
         status: TURN_TIMED_OUT.to_string(),
         usage,
         result_text: String::new(),
+    }
+}
+
+/// SIGKILLs the child's whole process group when a turn is abandoned by having its future DROPPED,
+/// unless [`disarm`](KillGroupOnDrop::disarm)ed first. Go gets this from `exec.CommandContext(tctx,
+/// …)` + `cmd.Cancel`: cancelling the run's context kills the agent's group. Rust's cancellation IS
+/// the drop, and a dropped `tokio::process::Child` signals nothing, so before STUDIO-840 an operator
+/// Stop removed the running entry, moved the ticket and answered 200 while the real `claude` kept
+/// committing. Disarmed once the child has been reaped, so a kill can never reach a recycled pid.
+struct KillGroupOnDrop(u32);
+
+impl KillGroupOnDrop {
+    /// Stands the kill down (the child is reaped).
+    fn disarm(&mut self) {
+        self.0 = 0; // `kill_group` skips pid 0
+    }
+}
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        kill_group(self.0);
     }
 }
 
@@ -1872,6 +1900,70 @@ mod tests {
         assert!(
             !env.contains_key("SYMPHONY_RUN_ID") && !env.contains_key("RHAPSODY_RUN_ID"),
             "a zero run id must emit no run-id env"
+        );
+    }
+
+    /// STUDIO-840. An operator Stop cancels a run by DROPPING the worker's future (`spawn_worker`'s
+    /// `tokio::select!` on the run's `CancelSignal`), and a dropped `tokio::process::Child` kills
+    /// nothing — the `claude` group, spawned into its OWN process group, simply carried on. In
+    /// production that meant a stopped run kept committing for 35 minutes and opened a pull request
+    /// for a ticket the same Stop had already parked in Backlog.
+    ///
+    /// The property is "no process of the run survives the drop", which the entry map cannot observe.
+    /// So this asserts on a GRANDCHILD the fake forks: it outlives its parent, and it writes the
+    /// marker only if something the group kill missed was still running a second after the drop.
+    /// Killing just the direct child (`kill_on_drop`) leaves it, so the assertion reds on that too.
+    #[tokio::test]
+    async fn dropping_a_turn_kills_the_whole_agent_process_group() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-840");
+        let survivor = root.join("survivor");
+        // Fork the grandchild BEFORE announcing the session, so the init event proves it exists.
+        let (_s, script) = write_fake_claude(&format!(
+            "#!/usr/bin/env bash\n\
+             head -n 1 >/dev/null\n\
+             ( sleep 1; : > {survivor} ) &\n\
+             echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}}'\n\
+             sleep 30\n"
+        ));
+        // A long turn timeout: the deadline kill must not be what stops this run, or the test would
+        // pass while the cancellation path is still inert.
+        let r = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            turn_timeout: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let sess = r
+            .start_session(&ws, issue("840", "MT-840"), None)
+            .await
+            .expect("start session");
+        let (types, on_event) = type_collector();
+        let mut turn = Box::pin(sess.run_turn("p", None, None, &on_event));
+        // Drive the turn until the child has announced itself (and so has forked the grandchild).
+        let started = async {
+            loop {
+                tokio::select! {
+                    _ = &mut turn => panic!("the fake turn ended on its own"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                        if !types.lock().expect("types lock").is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .expect("the agent child never started");
+
+        drop(turn); // the Stop: `terminate` fires the cancel and the worker drops this future
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !std::path::Path::new(&survivor).exists(),
+            "a process of the stopped run survived the cancellation and kept working ({survivor})"
         );
     }
 }
