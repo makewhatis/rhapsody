@@ -81,6 +81,12 @@ tracing-subscriber = "0.3"
 # which real time cannot wait out and which a test-only injected interval would only pretend to
 # check. Test-only, already in Cargo.lock.
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+# libc (test-only, Unix): `kill(-pgid, 0)` — the existence probe the STUDIO-840 e2e uses to assert
+# that a stopped run leaves NO process in the agent's group. The orchestrator's own `liveness`
+# sampler cannot answer this on the CI platform (it reads `/proc`, which macOS has none of), and the
+# property is exactly the one no other test could see. Already in Cargo.lock (a tokio + rhapsody-agent
+# dependency), so no new crate enters the tree.
+libc = "0.2"
 
 [lints]
 workspace = true
