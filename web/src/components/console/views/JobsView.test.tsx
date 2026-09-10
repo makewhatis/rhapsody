@@ -101,10 +101,11 @@ function tallyOf(rows: readonly IssueRun[], state: StateResponse): IssueCountsRe
   const counted = new Set<string>();
   for (const r of rows) {
     counted.add(r.issue_identifier);
+    // No `review_ticket`: the daemon does not resolve that marker for the tally, because it only
+    // turns a live `run` into `reviewing` and the strip counts both as running.
     add({
       outcome: live.has(r.issue_identifier) ? "running" : r.outcome,
       lifecycle: r.lifecycle,
-      review_ticket: r.review_ticket,
       review_run: r.review_run,
     });
   }

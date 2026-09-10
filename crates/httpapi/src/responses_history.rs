@@ -279,7 +279,13 @@ pub(crate) struct IssueStatusKey {
     /// The normalized tracker lifecycle, or `None` when the daemon resolved none — the same absence
     /// the per-row `lifecycle` field expresses by omission.
     pub lifecycle: Option<String>,
-    pub review_ticket: bool,
+    /// Whether this is a ticketless review RUN — the fact `consoleJobStatus` needs to stop reading a
+    /// finished review as "awaiting a reviewer" (STUDIO-826). Read off the id, so it costs nothing.
+    ///
+    /// There is deliberately no `review_ticket` beside it, though the per-row listing carries one:
+    /// that marker only turns a LIVE `run` into `reviewing`, and the strip counts both as running,
+    /// so it cannot move any of the five figures — while resolving it would double this endpoint's
+    /// tracker cost. See [`crate::handlers_history`]'s counts handler.
     pub review_run: bool,
 }
 
@@ -290,9 +296,9 @@ pub(crate) struct IssueStatusKey {
 /// exists to make, and a client that wants to check the claim should not have to reconstruct it.
 ///
 /// Each bucket serializes its key exactly as the per-row listing serializes the same facts —
-/// `lifecycle` present only when resolved, `review_ticket`/`review_run` positive-only — so the two
-/// endpoints speak one vocabulary and a client reads a bucket with the code it already has for a
-/// row. The array is ordered by the key, so the payload is stable for a given store.
+/// `lifecycle` present only when resolved, `review_run` positive-only — so the two endpoints speak
+/// one vocabulary and a client reads a bucket with the code it already has for a row. The array is
+/// ordered by the key, so the payload is stable for a given store.
 ///
 /// Rhapsody-only; Go has neither the issue listing nor an aggregate over it.
 pub(crate) fn issue_counts_response(buckets: &BTreeMap<IssueStatusKey, i64>) -> Value {
@@ -304,9 +310,6 @@ pub(crate) fn issue_counts_response(buckets: &BTreeMap<IssueStatusKey, i64>) -> 
         obj.insert("outcome".to_string(), json!(key.outcome));
         if let Some(life) = &key.lifecycle {
             obj.insert("lifecycle".to_string(), json!(life));
-        }
-        if key.review_ticket {
-            obj.insert("review_ticket".to_string(), json!(true));
         }
         if key.review_run {
             obj.insert("review_run".to_string(), json!(true));

@@ -22,6 +22,7 @@
 //               `durableAssignees`.
 //   - PR      — no endpoint carries one; the column renders "—" until one does.
 import type {
+  BlockedEntry,
   IssueCountsResponse,
   IssueLifecycle,
   IssueRun,
@@ -698,7 +699,7 @@ export function consoleJobCounts(rows: readonly ConsoleJobRow[]): ConsoleJobCoun
  */
 export function consoleStoreCounts(
   payload: IssueCountsResponse | undefined,
-  held: readonly unknown[] = [],
+  held: readonly BlockedEntry[] = [],
 ): ConsoleJobCounts | undefined {
   if (payload === undefined) return undefined;
   // A held dependent's status inputs are exactly a `waiting` outcome and nothing else, so it goes
@@ -709,12 +710,10 @@ export function consoleStoreCounts(
       : [...payload.buckets, { outcome: "waiting", count: held.length }];
   return tally(
     buckets.map((b) => {
-      const status = consoleJobStatus(
-        b.outcome,
-        b.lifecycle,
-        b.review_ticket ?? false,
-        b.review_run ?? false,
-      );
+      // `reviewTicket` is always false here: the daemon does not resolve that marker for the tally
+      // because it cannot move any of these five numbers — a live review TICKET reads `reviewing`
+      // and an ordinary live run reads `run`, and `running` counts both. See `IssueStatusBucket`.
+      const status = consoleJobStatus(b.outcome, b.lifecycle, false, b.review_run ?? false);
       return [
         {
           status,

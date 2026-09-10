@@ -220,7 +220,13 @@ export interface IssueStatusBucket {
   // exactly as `mergeJobs` does, so a retry-parked ticket is not in a different bucket from its row).
   outcome: string;
   lifecycle?: IssueLifecycle;
-  review_ticket?: boolean;
+  // True when these are ticketless review RUNS (STUDIO-826) — the fact that stops a finished review
+  // reading as "awaiting a reviewer". The daemon reads it off the run's own id, so it costs nothing.
+  //
+  // There is deliberately no `review_ticket` beside it, though a listing ROW carries one: that
+  // marker only turns a LIVE `run` into `reviewing`, and the strip counts both as running, so it
+  // cannot move any of the five figures — while resolving it would double this endpoint's tracker
+  // cost. If the strip ever splits "reviewing" out, the daemon adds the lookup and the field.
   review_run?: boolean;
   count: number;
 }

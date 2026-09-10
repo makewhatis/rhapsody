@@ -165,12 +165,26 @@ pub(crate) async fn handle_issue_runs(
 /// client cannot — folding every issue rather than a page — and serves the same per-row facts the
 /// listing already serves, grouped. The client multiplies its own rule over the buckets.
 ///
-/// The lifecycle/label lookups are asked only about the ids a TRACKER can answer for, filtered by
+/// The lifecycle lookup is asked only about the ids a TRACKER can answer for, filtered by
 /// [`review::is_review_key`] exactly as the listing filters them (STUDIO-831): a ticketless review
 /// run is dispatched under a synthetic `pr:<owner>/<repo>#<n>@<reviewer>` key, Linear validates
 /// `id: { in: … }` before serving it, and ONE such id used to fail the whole batch. That failure is
 /// silent — an empty result, not an error a console could show — which is why the filter is pinned
 /// by a test rather than left to be noticed.
+///
+/// WHAT IT COSTS THE TRACKER, AND THE LOOKUP THAT IS DELIBERATELY NOT MADE. This asks about every
+/// issue rather than a page, so the lifecycle refresh is `ceil(issues / LIFECYCLE_BATCH)` round
+/// trips — five, at the operator's 425 issues — and the shared TTL memo bounds that to once per
+/// [`rhapsody_orchestrator::lifecycle::LIFECYCLE_TTL`] window for the whole daemon, however many
+/// consoles are open and however fast they poll. It is not free (about 300 GraphQL requests an hour
+/// while a console is open) and it is the price of counting the store by the rule the rows use.
+///
+/// The `review_tickets` label read the listing also makes would DOUBLE that, and it is skipped
+/// because it provably cannot change any of the five figures: `review_ticket` only narrows the LIVE
+/// arm of `consoleJobStatus`, turning `run` into `reviewing`, and the strip counts both as running.
+/// Five round trips a minute for a fact the tally cannot use is not a trade worth making, so the
+/// bucket key carries no `review_ticket` at all — see [`IssueStatusKey`]. `review_run` needs no
+/// lookup: it is read off the id.
 ///
 /// THE LIVE OVERLAY. A ticket the daemon is holding for retry still reads "running" in the table
 /// (`runs-model.jobStatus` folds a pending retry into the live set), while its stored row's outcome
@@ -206,9 +220,8 @@ pub(crate) async fn handle_issue_counts(
         .map(|r| r.issue_id.clone())
         .filter(|id| !review::is_review_key(id))
         .collect();
-    let (lifecycles, reviews, snap) = tokio::join!(
+    let (lifecycles, snap) = tokio::join!(
         provider.issue_lifecycles(&ids),
-        provider.review_tickets(&ids),
         tokio::time::timeout(SNAPSHOT_TIMEOUT, provider.snapshot()),
     );
     // (identifier, issue id) of the work the daemon has in flight or parked for retry. A snapshot
@@ -244,7 +257,7 @@ pub(crate) async fn handle_issue_counts(
             r.outcome.as_str()
         };
         *buckets
-            .entry(status_key(&r.issue_id, outcome, &lifecycles, &reviews))
+            .entry(status_key(&r.issue_id, outcome, &lifecycles))
             .or_insert(0) += 1;
     }
     // Live work with no stored row at all — a `--no-store` daemon, or a run dispatched between the
@@ -255,7 +268,7 @@ pub(crate) async fn handle_issue_counts(
             continue;
         }
         *buckets
-            .entry(status_key(issue_id, OUTCOME_RUNNING, &lifecycles, &reviews))
+            .entry(status_key(issue_id, OUTCOME_RUNNING, &lifecycles))
             .or_insert(0) += 1;
     }
     write_json(StatusCode::OK, &issue_counts_response(&buckets))
@@ -268,14 +281,12 @@ fn status_key(
     issue_id: &str,
     outcome: &str,
     lifecycles: &HashMap<String, IssueLifecycleRow>,
-    reviews: &HashSet<String>,
 ) -> IssueStatusKey {
     IssueStatusKey {
         outcome: outcome.to_string(),
         lifecycle: lifecycles
             .get(issue_id)
             .map(|life| life.lifecycle.as_str().to_string()),
-        review_ticket: reviews.contains(issue_id),
         review_run: review::is_review_key(issue_id),
     }
 }
@@ -1285,7 +1296,7 @@ mod tests {
 
     /// Collapse the counts payload into `bucket-key -> count`, so a test asserts on the tally
     /// rather than on the array's order. The key is spelled the way the wire spells it: an absent
-    /// lifecycle is `-`, and the two markers only appear when true.
+    /// lifecycle is `-`, and `review_run` only appears when true.
     fn tally(body: &Value) -> std::collections::HashMap<String, i64> {
         body["buckets"]
             .as_array()
@@ -1297,9 +1308,6 @@ mod tests {
                     b["outcome"].as_str().unwrap_or_default(),
                     b["lifecycle"].as_str().unwrap_or("-"),
                 );
-                if b.get("review_ticket").is_some() {
-                    key.push_str("/review_ticket");
-                }
                 if b.get("review_run").is_some() {
                     key.push_str("/review_run");
                 }
@@ -1381,6 +1389,9 @@ mod tests {
                         },
                     ),
                 ]))
+                // Set, and deliberately NOT reflected in the tally: the marker only turns a LIVE
+                // `run` into `reviewing`, which the strip counts as running either way, so this
+                // endpoint does not spend a tracker round trip resolving it.
                 .with_review_tickets(HashSet::from(["iss_review".to_string()])),
         );
         let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
@@ -1392,10 +1403,14 @@ mod tests {
             tally(&body),
             std::collections::HashMap::from([
                 ("completed/done".to_string(), 1),
-                ("completed/in_review/review_ticket".to_string(), 1),
+                ("completed/in_review".to_string(), 1),
                 ("completed/-".to_string(), 1),
             ]),
             "a resolved lifecycle rides the key; an unresolved one is absent from it: {body}",
+        );
+        assert!(
+            provider.review_tickets_asked().is_empty(),
+            "the label read is skipped: it cannot change any of the five figures",
         );
     }
 
@@ -1432,11 +1447,6 @@ mod tests {
             provider.issue_lifecycles_asked(),
             vec!["iss_impl".to_string()],
             "a `pr:` key has no lifecycle to look up and must never enter the batch",
-        );
-        assert_eq!(
-            provider.review_tickets_asked(),
-            vec!["iss_impl".to_string()],
-            "nor a label to look up: a ticketless review job has no ticket to carry one",
         );
         assert_eq!(
             tally(&body),

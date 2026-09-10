@@ -291,17 +291,25 @@ serves the same per-row facts `GET /api/v1/history/issues` already serves, group
 ```json
 {"issues": 425,
  "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
-             {"outcome": "completed", "review_run": true, "count": 6},
-             {"outcome": "running", "count": 2}]}
+             {"outcome": "completed", "review_run": true, "count": 7},
+             {"outcome": "running", "count": 1}]}
 ```
 
 Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
-endpoints speak one vocabulary. The lifecycle and label lookups are filtered by
-`review::is_review_key` exactly as the listing filters them (STUDIO-831) — one synthetic
-`pr:owner/repo#n@reviewer` id in a Linear `id: { in: … }` batch fails the whole request, silently —
-and the snapshot's `running`/`retrying` sets are folded in the way the worklist folds them, so a
-retry-parked ticket is not counted in a different bucket from its own row. Go has neither the issue
-listing nor an aggregate over it.
+endpoints speak one vocabulary. The lifecycle lookup is filtered by `review::is_review_key` exactly
+as the listing filters it (STUDIO-831) — one synthetic `pr:owner/repo#n@reviewer` id in a Linear
+`id: { in: … }` batch fails the whole request, silently — and the snapshot's `running`/`retrying`
+sets are folded in the way the worklist folds them, so a retry-parked ticket is not counted in a
+different bucket from its own row. Go has neither the issue listing nor an aggregate over it.
+
+What it costs the tracker is stated rather than left to be found: asking about every issue is
+`ceil(issues / 100)` round trips — five at 425 issues — and the daemon's shared 60s lifecycle memo
+bounds that to once per window for the whole process, however many consoles are open and however
+fast they poll. About 300 GraphQL requests an hour while a console is open. The listing's second
+decoration, the `review_ticket` label read, would double it and is deliberately NOT made here: that
+marker only turns a live `run` into `reviewing`, which the strip counts as running either way, so it
+cannot move any of the five figures. Cutting the lifecycle half further wants a TTL that knows a
+terminal ticket will not change again, which is a change to the memo rather than to this endpoint.
 
 ### Daemon-mediated review handoff — `POST /api/v1/runs/{id}/handoff` (TRA-242)
 

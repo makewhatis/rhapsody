@@ -1048,14 +1048,15 @@ describe("consoleStoreCounts", () => {
     ).toEqual({ running: 2, review: 7, queued: 1, blocked: 3, needsYou: 10 });
   });
 
-  // The two review markers reach the tally as they reach a row, and mean the same things there:
-  // a live REVIEW TICKET is an agent doing a review (counted as running), and a FINISHED review RUN
-  // is done rather than awaiting one — the "Needs you" inflation STUDIO-826 fixed on the rows.
-  it("reads the two review markers exactly as a row does", () => {
+  // A FINISHED review RUN is done rather than awaiting one — the "Needs you" inflation STUDIO-826
+  // fixed on the rows, reaching the tally by the same field and the same rule. A live one reads
+  // `reviewing`, which the strip counts as running, which is also why the daemon does not resolve
+  // the sibling `review_ticket` marker for this payload.
+  it("reads a review run's own outcome exactly as a row does", () => {
     expect(
       consoleStoreCounts(
         counts([
-          { outcome: "running", review_ticket: true, count: 1 },
+          { outcome: "running", count: 1 },
           { outcome: "completed", review_run: true, count: 4 },
           // One ordinary answered ticket, so the needs-you gate below is open and its zero is a
           // real zero rather than the "—" a wholly unanswered payload gets.
@@ -1119,11 +1120,12 @@ describe("consoleStoreCounts", () => {
       ),
     );
     // What `handle_issue_counts` serves for exactly those tickets: one bucket per distinct
-    // combination of the same per-row facts.
+    // combination of the same per-row facts. H's `review_ticket` is absent here, and the two
+    // answers still agree — which is the evidence for skipping that lookup: the table paints H
+    // "reviewing" and the strip counts it running, and the marker changes only the word.
     const strip = consoleStoreCounts(
       counts([
-        { outcome: "running", count: 1 },
-        { outcome: "running", review_ticket: true, count: 1 },
+        { outcome: "running", count: 2 },
         { outcome: "completed", lifecycle: "in_review", count: 1 },
         { outcome: "completed", lifecycle: "done", count: 1 },
         { outcome: "completed", lifecycle: "open", count: 1 },
@@ -1142,7 +1144,8 @@ describe("consoleStoreCounts", () => {
   it("adds the live snapshot's held dependents, which the daemon's tally cannot carry", () => {
     const payload = counts([{ outcome: "completed", lifecycle: "done", count: 1 }]);
     expect(consoleStoreCounts(payload)?.blocked).toBe(0);
-    const withHeld = consoleStoreCounts(payload, [{}, {}]);
+    const held = { issue_identifier: "HELD", title: "", project: "", blocker_identifier: "X", blocker_state: "In Review" };
+    const withHeld = consoleStoreCounts(payload, [held, { ...held, issue_identifier: "HELD2" }]);
     expect(withHeld?.blocked).toBe(2);
     // A held ticket waits on its PREDECESSOR, not on the operator — the same rule `needsOperator`
     // applies to the row, reached through the same call.
