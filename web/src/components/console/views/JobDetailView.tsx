@@ -1128,8 +1128,31 @@ function TraceSplit({
   // still following: there is nothing to track, and nothing to have fallen behind either.
   const headHidden = playhead !== undefined && playing === undefined;
   const following = live && !headHidden && (picked === null || picked === playhead?.id);
-  const { atBottom, jumpToBottom } = useFollowScroll(following);
+  // The step LIST is the scroller, not the page and not `.trspine` — the filter chips and the grep
+  // field are the spine's other children and stay pinned above it (STUDIO-821).
+  const stepsRef = useRef<HTMLDivElement | null>(null);
+  const { atBottom, jumpToBottom } = useFollowScroll(following, stepsRef);
   const behind = live && (!following || !atBottom);
+
+  // The selection can move without the operator having reached for it — the Result card's "jump to
+  // failing step", the playhead carrying a live run's pick forward — and the step it lands on can
+  // be anywhere in a list that now scrolls inside its own box. Before the cap the page scrolled and
+  // the whole spine was on it; now a step outside the box is simply not on screen.
+  //
+  // `block: "nearest"` is the whole point: a step already visible is left exactly where it is, so
+  // this neither fights the follow pin (which has just put the head at the bottom) nor yanks the
+  // list when the operator clicks a step they can already see.
+  const selectedId = selected?.id;
+  useEffect(() => {
+    const list = stepsRef.current;
+    if (list === null) return;
+    const step = list.querySelector('.trstep[aria-pressed="true"]');
+    // jsdom implements no layout and leaves `scrollIntoView` undefined; a missing scroll is not a
+    // failure anyone can act on, so it is skipped rather than thrown.
+    if (step instanceof HTMLElement && typeof step.scrollIntoView === "function") {
+      step.scrollIntoView({ block: "nearest" });
+    }
+  }, [selectedId]);
 
   return (
     <div className="trsplit">
@@ -1149,29 +1172,31 @@ function TraceSplit({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        {/* The baton this attempt was handed (§3C). It leads the spine because that is when it
-            happened: the previous run ended and this one picked the work up. */}
-        {batons.incoming === null ? null : <BatonRow baton={batons.incoming} direction="in" />}
-        {visible.map((phase) => (
-          <SpineStep
-            key={phase.id}
-            phase={phase}
-            who={who}
-            roster={roster}
-            selected={phase.id === selected?.id}
-            playing={phase.id === playing?.id}
-            onSelect={() => setPicked(phase.id)}
-          />
-        ))}
-        {batons.outgoing === null ? null : <BatonRow baton={batons.outgoing} direction="out" />}
-        {phases.length === 0 ? (
-          <div className="empty">
-            {pending ? "Loading transcript…" : "No transcript recorded for this run."}
-          </div>
-        ) : null}
-        {phases.length > 0 && visible.length === 0 ? (
-          <div className="empty">No step matches.</div>
-        ) : null}
+        <div className="trsteps" ref={stepsRef}>
+          {/* The baton this attempt was handed (§3C). It leads the spine because that is when it
+              happened: the previous run ended and this one picked the work up. */}
+          {batons.incoming === null ? null : <BatonRow baton={batons.incoming} direction="in" />}
+          {visible.map((phase) => (
+            <SpineStep
+              key={phase.id}
+              phase={phase}
+              who={who}
+              roster={roster}
+              selected={phase.id === selected?.id}
+              playing={phase.id === playing?.id}
+              onSelect={() => setPicked(phase.id)}
+            />
+          ))}
+          {batons.outgoing === null ? null : <BatonRow baton={batons.outgoing} direction="out" />}
+          {phases.length === 0 ? (
+            <div className="empty">
+              {pending ? "Loading transcript…" : "No transcript recorded for this run."}
+            </div>
+          ) : null}
+          {phases.length > 0 && visible.length === 0 ? (
+            <div className="empty">No step matches.</div>
+          ) : null}
+        </div>
       </div>
       {/* The right column holds the inspector alone — everything in the Split is scoped to the
           step the spine has selected. The watch-tabs, which follow no step, are zone D below
@@ -1214,41 +1239,37 @@ function TraceSplit({
   );
 }
 
-/** The page's own scroller — the run detail scrolls the document, not a box inside it. */
-function pageScroller(): HTMLElement | null {
-  if (typeof document === "undefined") return null;
-  return (document.scrollingElement as HTMLElement | null) ?? document.documentElement;
-}
-
-function scrollToBottom() {
-  const el = pageScroller();
+function scrollToBottom(el: HTMLElement | null) {
   // Assigning `scrollTop` rather than calling `scrollTo`: it is the one form every engine the
   // console runs in — a browser, the Tauri webview, and jsdom under test — implements alike.
   if (el !== null) el.scrollTop = el.scrollHeight;
 }
 
-/** What the follow rule gives the view: where the page is, and the way back to the bottom. */
+/** What the follow rule gives the view: where the list is, and the way back to the bottom. */
 interface FollowScroll {
-  /** Whether the page is still pinned to the bottom, auto-following what the stream appends. */
+  /** Whether the step list is still pinned to the bottom, auto-following what the stream appends. */
   atBottom: boolean;
-  /** Take the page back to the bottom and resume following it (the "jump to latest" chip). */
+  /** Take the list back to the bottom and resume following it (the "jump to latest" chip). */
   jumpToBottom: () => void;
 }
 
 /**
- * Follow-mode for a live run: reports whether the page is still pinned to the bottom, and keeps it
- * there as the stream appends.
+ * Follow-mode for a live run: reports whether the step list is still pinned to the bottom, and
+ * keeps it there as the stream appends.
  *
  * The geometry is `lib/follow-scroll`'s, shared verbatim with the logs follow — one definition of
- * "at the bottom", threshold and all, rather than a second one that drifts.
+ * "at the bottom", threshold and all, rather than a second one that drifts. What changed in
+ * STUDIO-821 is only WHICH element is measured: the scroller is passed in as `ref` — the spine's
+ * capped step list — where it used to be the document itself. `lib/follow-scroll` was already
+ * element-agnostic (it takes three numbers), so the logs follow is untouched by this.
  *
  * Where the operator has scrolled to is tracked whether following is on or OFF, because `active`
  * can turn back on: a grep that hides a live run's head stops the follow, and the next poll to
- * bring in a phase the grep MATCHES turns it on again while growing the page in the same commit.
+ * bring in a phase the grep MATCHES turns it on again while growing the list in the same commit.
  * Observing the position only while active meant that commit had no reading of its own to go on —
- * the last one was from before the operator scrolled — and the page dragged them to the bottom.
+ * the last one was from before the operator scrolled — and the list dragged them to the bottom.
  */
-function useFollowScroll(active: boolean): FollowScroll {
+function useFollowScroll(active: boolean, ref: RefObject<HTMLElement | null>): FollowScroll {
   const [atBottom, setAtBottom] = useState(true);
   // The same reading as `atBottom`, mirrored into a ref: it is what the growth effect below reads,
   // so a commit that carries BOTH a scroll reading and the growth acts on the reading rather than
@@ -1264,7 +1285,7 @@ function useFollowScroll(active: boolean): FollowScroll {
   // against one it does — which is exactly why the next reader will think it is redundant.
   const pinned = useRef(true);
   useEffect(() => {
-    const el = pageScroller();
+    const el = ref.current;
     if (el === null) return;
     const read = () => {
       const at = isAtBottom({
@@ -1275,13 +1296,18 @@ function useFollowScroll(active: boolean): FollowScroll {
       pinned.current = at;
       setAtBottom(at);
     };
-    // Nothing is read here: the scroll position at mount is the one the PREVIOUS view left in the
-    // document, not a choice the operator made about this run, and `lib/follow-scroll`'s other
-    // consumer opens a live view at its tail for exactly that reason. The first scroll event is
-    // the first thing that speaks for the operator.
-    window.addEventListener("scroll", read, { passive: true });
-    return () => window.removeEventListener("scroll", read);
-  }, []);
+    // Nothing is read here: the position at mount is whatever the list happens to open at, not a
+    // choice the operator made about this run, and `lib/follow-scroll`'s other consumer opens a
+    // live view at its tail for exactly that reason. The first scroll event is the first thing
+    // that speaks for the operator.
+    //
+    // The listener is on the ELEMENT, not on `window`: a box that scrolls inside the page fires
+    // its scroll events at itself and they do not bubble to the window, so the document-level
+    // listener this replaced would have gone permanently silent and follow-mode would have been
+    // stuck on whatever it read last.
+    el.addEventListener("scroll", read, { passive: true });
+    return () => el.removeEventListener("scroll", read);
+  }, [ref]);
 
   // Checked every render, acted on only when the page actually GREW: a poll that appends a step
   // must not push the newest line off the screen, and every other re-render — a keystroke in the
@@ -1289,11 +1315,11 @@ function useFollowScroll(active: boolean): FollowScroll {
   // never dragged back; that is what the jump chip is for.
   const height = useRef(0);
   useEffect(() => {
-    const el = pageScroller();
+    const el = ref.current;
     if (el === null) return;
-    // No reading is written back here: this branch only runs when the page was ALREADY pinned,
+    // No reading is written back here: this branch only runs when the list was ALREADY pinned,
     // and it leaves it pinned.
-    if (active && pinned.current && el.scrollHeight > height.current) scrollToBottom();
+    if (active && pinned.current && el.scrollHeight > height.current) scrollToBottom(el);
     height.current = el.scrollHeight;
   });
 
@@ -1302,7 +1328,7 @@ function useFollowScroll(active: boolean): FollowScroll {
   // enough on its own — a browser announces a programmatic scroll with a scroll event and jsdom
   // never does, so the reading is set here rather than waited for.
   const jumpToBottom = () => {
-    scrollToBottom();
+    scrollToBottom(ref.current);
     pinned.current = true;
     setAtBottom(true);
   };
