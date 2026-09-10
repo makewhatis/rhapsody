@@ -193,8 +193,12 @@ const LOOKUP_REVIEWS: &str = "review-ticket label lookup failed; serving cached 
 /// total each shape really costs is measured and pinned in this module's tests, and the largest of
 /// the three is NOT the pathological all-refused page: it is an ordinary page carrying one refused
 /// id, ungated on purpose, and an operator budgeting quota from the all-refused number alone would
-/// under-count. Nothing here is a reason to gate a refusal — see the next paragraph — only a
-/// reason to quote the right maximum.
+/// under-count by 76%. That shape's cost RISES WITH PAGE SIZE, so it is quoted at the cap: a full
+/// [`MAX_LIFECYCLE_REFRESH`] page spends 960 an hour, which across three lookups is 2880 — over
+/// the 2500/hour quota. **So this gate bounds the storm; it does not by itself keep every shape
+/// inside the quota**, and an operator reading "48 attempts an hour" should not conclude
+/// otherwise. Nothing here is a reason to gate a refusal — see the next paragraph — only a reason
+/// to quote the right number and to quote the page size it belongs to.
 ///
 /// **What arms it is "left work undone", which is narrower than "something went wrong".** A
 /// refusal of a particular id is a VERDICT about that id — it memoizes as a bounded negative and
@@ -3066,10 +3070,27 @@ mod tests {
     /// spending 2 batches and [`MAX_ISOLATION_QUERIES`].
     const WHOLLY_REFUSED_HOURLY: usize = 544;
 
-    /// What a page carrying ONE refused id costs in an hour, which is the real maximum this path
-    /// can reach — see [`a_page_with_one_refused_id_is_the_expensive_shape`] for why it is larger
-    /// than [`WHOLLY_REFUSED_HOURLY`] rather than smaller.
-    const PARTIALLY_REFUSED_HOURLY: usize = 780;
+    /// What a page carrying ONE refused id costs in an hour, measured at a FULL
+    /// [`MAX_LIFECYCLE_REFRESH`] page — the largest page [`LifecycleCache::partition`] serves
+    /// whole. See [`a_page_with_one_refused_id_is_the_expensive_shape`] for why it is larger than
+    /// [`WHOLLY_REFUSED_HOURLY`] rather than smaller.
+    ///
+    /// **Qualified by page size on purpose: this is a step function, not a constant.** The cost is
+    /// `(chunks + isolation queries) × 60`, and the isolation that pins one bad id out of `n` grows
+    /// with `n` — a 50-id page spends 780 and a 100-id page 900. Quoting any of those as "the
+    /// maximum" is the same mistake that once quoted [`WHOLLY_REFUSED_HOURLY`] as one, so the test
+    /// measures at the cap rather than at a literal. Measured, retuning [`MAX_LIFECYCLE_REFRESH`]
+    /// (200→150 gives 840), [`LIFECYCLE_BATCH`] (100→64 gives 600) or [`LIFECYCLE_TTL`] moves this
+    /// number and reds that test. [`MAX_ISOLATION_QUERIES`] is guarded by
+    /// [`WHOLLY_REFUSED_HOURLY`] instead — a single-id bisection of one chunk needs about seven
+    /// queries, so trimming the budget to 24 reds THAT ceiling while leaving this one green, and
+    /// only a cut past the bisection depth (32→8) reaches here.
+    ///
+    /// **Three lookups at this rate is 2880 an hour, OVER the 2500/hour quota this module exists to
+    /// stay inside.** An operator needs to know that; it is not an argument for gating the refusal,
+    /// which is the one trade this design forbids — see
+    /// [`a_refused_id_must_not_slow_the_healthy_ids_batched_with_it`].
+    const PARTIALLY_REFUSED_HOURLY: usize = 960;
 
     /// The ORDERING of those two is itself a claim the module's prose makes, so it is a COMPILE
     /// error rather than a test failure: which shape costs more per hour decides which number an
@@ -3306,7 +3327,7 @@ mod tests {
 
     /// Which failure shape is actually the expensive one, measured — because the answer is not the
     /// one the other two ceilings suggest, and an operator budgeting quota from
-    /// [`WHOLLY_REFUSED_HOURLY`] alone would under-count by 43%.
+    /// [`WHOLLY_REFUSED_HOURLY`] alone would under-count by 76%.
     ///
     /// Costliest per ATTEMPT is not costliest per HOUR. A wholly-refused page is the worst single
     /// attempt this path can make, but it is degraded, so the [`Gate`] holds it to 16 attempts an
@@ -3317,18 +3338,36 @@ mod tests {
     ///
     /// **This is not a request to gate it.** Gating it is exactly the trade the asymmetry forbids:
     /// it would buy the requests back with a stale console. The number is pinned because a stated
-    /// ceiling an ordinary failure exceeds is worse than no stated ceiling — and pinning it here
-    /// means retuning [`MAX_ISOLATION_QUERIES`], [`LIFECYCLE_BATCH`] or [`LIFECYCLE_TTL`] moves a
-    /// visible number rather than a silent one.
+    /// ceiling an ordinary failure exceeds is worse than no stated ceiling — and pinning it at
+    /// [`MAX_LIFECYCLE_REFRESH`] means retuning that cap, [`LIFECYCLE_BATCH`] or
+    /// [`LIFECYCLE_TTL`] moves a visible number rather than a silent one. The isolation budget is
+    /// the one knob this test does NOT guard until it goes very low; see
+    /// [`PARTIALLY_REFUSED_HOURLY`] for the measured split between the two ceilings.
+    ///
+    /// **And the number crosses the quota.** Three lookups in this shape is 2880 requests an hour
+    /// against a 2500/hour workspace quota, so the fix bounds the storm without making this shape
+    /// safe at a full page. That is the honest thing to tell an operator, and it is still not a
+    /// reason to gate the refusal — the console would go stale instead, which is the trade
+    /// [`a_refused_id_must_not_slow_the_healthy_ids_batched_with_it`] exists to forbid. What
+    /// bounds it is the page: the cost only reaches 960 when a single lookup's refresh set fills
+    /// [`MAX_LIFECYCLE_REFRESH`] AND one of those ids is refused.
+    ///
+    /// Not measured here, deliberately: a caller handing `resolve` MORE than
+    /// [`MAX_LIFECYCLE_REFRESH`] ids costs more still, because the overflow stays stale and spills
+    /// into the next poll's refresh set. Whether the listing can do that is a question about the
+    /// caller, not about this path, and STUDIO-836 leaves it alone.
     ///
     /// Reachability, plainly: `handle_issue_runs` and `handle_issue_counts` both filter
     /// [`crate::review::is_review_key`] out of `ids`, so for the states and review lookups this is
     /// the CLASS and not the instance — the same standing [`WHOLLY_REFUSED_HOURLY`] already has.
     #[tokio::test]
     async fn a_page_with_one_refused_id_is_the_expensive_shape() {
-        /// A page the way the listing serves one — well inside [`LIFECYCLE_BATCH`], so the whole
-        /// page is one batch and the cost is the bisection that pins the single bad id.
-        const PAGE: usize = 50;
+        /// A FULL page. [`LifecycleCache::partition`] fills the refresh set right up to
+        /// [`MAX_LIFECYCLE_REFRESH`], so this is the largest page served whole — and the cap
+        /// rather than a convenient literal BECAUSE the cost is a step function of page size (50
+        /// ids spend 780, 100 spend 900). A smaller sample understates the ceiling it gets quoted
+        /// as, which is how this test's own number was wrong once already.
+        const PAGE: usize = MAX_LIFECYCLE_REFRESH;
 
         let mut f = Fake::default();
         f.states_by_ids_func = Some(Box::new(|ids| {
@@ -3356,7 +3395,8 @@ mod tests {
         assert_eq!(
             tr.by_id_calls(),
             PARTIALLY_REFUSED_HOURLY,
-            "a page with one refused id must cost its stated hourly maximum; it spent {}",
+            "a page with one refused id must cost its stated hourly ceiling at a full \
+             MAX_LIFECYCLE_REFRESH page; it spent {}",
             tr.by_id_calls(),
         );
     }
