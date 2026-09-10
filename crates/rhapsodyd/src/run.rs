@@ -2283,4 +2283,35 @@ mod tests {
             "non-numeric port must error"
         );
     }
+
+    /// The whole abandoned-fan-out advisory surface hangs off ONE field of the deps this function
+    /// hands the quorum task, and nothing in the workspace could see it go: every quorum test
+    /// builds its own `QuorumDeps`, so flipping this to `None` here left `cargo test --workspace`
+    /// green and the advisory silently dead in production (STUDIO-822).
+    ///
+    /// So it is pinned on this file's own source, the idiom `runmerge.rs` and
+    /// `handlers_runmerge.rs` already use for a wiring no run-time assertion can reach. Both
+    /// needles are assembled at run time on purpose: `include_str!` pulls in THIS module too, so a
+    /// needle spelled as a literal here would match its own source and the pin would pass no
+    /// matter what the daemon does.
+    #[test]
+    fn the_quorum_task_is_handed_the_project_advisories() {
+        let src = include_str!("run.rs");
+        let opener = format!("let deps = rhapsody_orchestrator::{}Deps {{", "Quorum");
+        let start = src
+            .find(&opener)
+            .expect("the quorum task still builds its own deps here");
+        let end = src[start..]
+            .find("\n        };")
+            .expect("that deps literal is still a braced struct");
+        let block = &src[start..start + end];
+
+        let wired = format!("{}: {}(", "warnings", "Some");
+        assert!(
+            block.contains(&wired),
+            "the quorum task is no longer handed a warnings state: a fan-out retried to \
+             exhaustion would go back to being a WARN in a 23 MB/day log, with nothing on \
+             `GET /api/v1/projects` for an operator to read (STUDIO-822)"
+        );
+    }
 }
