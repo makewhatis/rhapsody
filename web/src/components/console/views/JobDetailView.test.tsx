@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -325,11 +325,11 @@ afterEach(() => {
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
   h.fetchRunIdentityEvents.mockReset();
-  // The page geometry is defined on the live document, which outlives a render.
-  const el = scroller() as unknown as Record<string, unknown>;
-  delete el.scrollHeight;
-  delete el.clientHeight;
-  scroller().scrollTop = 0;
+  // The scroll position is on the live document, which outlives a render. (The step list's own
+  // geometry is reset by the `beforeEach` beside `sizeList`; the list itself is torn down with
+  // the render, so there is nothing of it left here to clear.)
+  const el = (document.scrollingElement ?? document.documentElement) as HTMLElement;
+  el.scrollTop = 0;
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -2750,10 +2750,19 @@ describe("the single header row is built out of what it says it is (STUDIO-763)"
 describe("wide content is contained (STUDIO-681's layout rule)", () => {
   const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
 
-  /** The declarations of one selector's block. */
+  /**
+   * The declarations of one TOP-LEVEL selector's block.
+   *
+   * Anchored on the newline, because a selector can be declared twice: STUDIO-821 declares
+   * `.rh-console .trspine` a second time inside the narrow `@media` block — the OVERRIDING one,
+   * which is why it sits after the top-level rule rather than before it. This file indents
+   * everything nested in a media query by two spaces while every top-level rule starts at column
+   * 0, so the newline pins the desktop declaration wherever the override happens to sit; a bare
+   * `indexOf` would depend on their order and silently return the wrong one if it ever changed.
+   */
   function rule(selector: string): string {
-    const at = css.indexOf(`${selector} {`);
-    expect(at, `${selector} is not declared`).toBeGreaterThan(-1);
+    const at = css.indexOf(`\n${selector} {`);
+    expect(at, `${selector} is not declared at the top level`).toBeGreaterThan(-1);
     return css.slice(at, css.indexOf("}", at));
   }
 
@@ -2864,27 +2873,74 @@ async function poll(key: unknown[]) {
   });
 }
 
-/** The page's own scroller, which is what the run detail scrolls. */
+/**
+ * The spine's step list — the box the run detail scrolls since STUDIO-821. It is NOT the document:
+ * the whole point of that ticket is that a 30-step spine used to make the page thousands of pixels
+ * tall and put `.trinsp` off the top of it. Every follow-mode assertion below reads this element,
+ * and `theDocumentIsNotTheScroller` is the test that keeps it that way.
+ */
 function scroller(): HTMLElement {
+  const el = document.querySelector(".trsteps");
+  expect(el, "the spine has no step list").not.toBeNull();
+  return el as HTMLElement;
+}
+
+/** The document scroller, which follow-mode must NOT drive any more. */
+function pageScroller(): HTMLElement {
   return (document.scrollingElement ?? document.documentElement) as HTMLElement;
 }
 
+// The geometry `sizeList` installs, read by the prototype getters below. Module state rather than
+// per-element properties because the list is created by the RENDER: the follow effects read it on
+// their very first run, so a test that waited for the element to exist before sizing it would have
+// already missed the reading it is trying to control.
+let listHeight: () => number = () => 0;
+let listViewport = 0;
+
 /**
- * Gives the page a real geometry. jsdom lays nothing out, so every dimension is 0 and "at the
- * bottom" is trivially true — the follow rules cannot be exercised without saying how tall the
- * page is. `height` is a getter so a test can GROW the page the way a poll does.
+ * Gives the step list a real geometry. jsdom lays nothing out, so every dimension is 0 and "at the
+ * bottom" is trivially true — the follow rules cannot be exercised without saying how tall the list
+ * is. `height` is a getter so a test can GROW the list the way a poll does.
+ *
+ * The getters are gated on the class, so every other element in the document keeps jsdom's own 0
+ * and nothing outside the spine's list is affected.
  */
-function sizePage(height: () => number, viewport = 800) {
-  const el = scroller();
-  Object.defineProperty(el, "scrollHeight", { get: height, configurable: true });
-  Object.defineProperty(el, "clientHeight", { value: viewport, configurable: true });
+function sizeList(height: () => number, viewport = 800) {
+  listHeight = height;
+  listViewport = viewport;
 }
 
-/** Puts the window where a scrolled-up operator has left it, and tells the view about it. */
+beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+    configurable: true,
+    get(this: HTMLElement) {
+      return this.classList.contains("trsteps") ? listHeight() : 0;
+    },
+  });
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get(this: HTMLElement) {
+      return this.classList.contains("trsteps") ? listViewport : 0;
+    },
+  });
+});
+
+afterAll(() => {
+  // `delete` removes the shadow this file put on `HTMLElement.prototype` and restores jsdom's own
+  // `Element.prototype` accessors underneath it.
+  delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight;
+  delete (HTMLElement.prototype as unknown as Record<string, unknown>).clientHeight;
+});
+
+beforeEach(() => {
+  sizeList(() => 0, 0);
+});
+
+/** Puts the list where a scrolled-up operator has left it, and tells the view about it. */
 function scrollUp(distance: number) {
-  sizePage(() => 2000);
+  sizeList(() => 2000);
   scroller().scrollTop = 2000 - 800 - distance;
-  fireEvent.scroll(window);
+  fireEvent.scroll(scroller());
 }
 
 const LIVE = { id: 547, outcome: "running", ended_at: "" } as const;
@@ -2984,21 +3040,21 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     await waitFor(() => expect(document.querySelector(".trlatest")).toBeNull());
   });
 
-  it("keeps a grep that is not hiding the playhead when the chip takes the page back", async () => {
+  it("keeps a grep that is not hiding the playhead when the chip takes the list back", async () => {
     // The chip is offered for two independent reasons, and only one of them is the filter's
     // fault. Here the grep is showing the head perfectly well and the operator has simply
-    // scrolled up: taking the page back to the bottom is all that was asked for, and wiping what
+    // scrolled up: taking the list back to the bottom is all that was asked for, and wiping what
     // they typed on the way would be a loss they did not ask for at all.
-    sizePage(() => 2000);
+    sizeList(() => 2000);
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
     mountDetail([run(LIVE)]);
     await settleTrace();
     fireEvent.change(grepField(), { target: { value: "cargo" } });
     await waitFor(() => expect(spineTitles()).toEqual(["Verified"]));
-    expect(nowStep()).toBe("Verified"); // the head is on the spine, so the page is still following
+    expect(nowStep()).toBe("Verified"); // the head is on the spine, so the list is still following
 
     scroller().scrollTop = 0;
-    fireEvent.scroll(window);
+    fireEvent.scroll(scroller());
     await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
     fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
 
@@ -3009,13 +3065,13 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
 
   it("keeps a live run pinned to the bottom as the stream appends to it", async () => {
     let height = 1000;
-    sizePage(() => height);
-    scroller().scrollTop = 200; // pinned to the bottom of a 1000px page in an 800px viewport
+    sizeList(() => height);
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
+    scroller().scrollTop = 200; // pinned to the bottom of a 1000px list in an 800px viewport
 
-    height = 1600; // the poll appended a step, and the page grew under the operator
+    height = 1600; // the poll appended a step, and the list grew under the operator
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
     await poll(["run-transcript", 547]);
     // The view asks for the very bottom; a real engine clamps that to scrollHeight − clientHeight,
@@ -3024,16 +3080,16 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     expect(document.querySelector(".trlatest")).toBeNull();
   });
 
-  it("follows a live run opened at the top of a tall page", async () => {
+  it("follows a live run opened at the top of a tall list", async () => {
     // The other side of the same rule, and the one an operator meets FIRST: nobody has scrolled
-    // yet, so the position at mount belongs to the view they came from, not to this run. Reading
-    // it as a choice is what used to open a live trace pinned to nothing and never follow again.
+    // yet, so the position at mount is not a choice they made about this run. Reading it as one
+    // is what used to open a live trace pinned to nothing and never follow again.
     let height = 2000;
-    sizePage(() => height);
-    scroller().scrollTop = 0; // not the bottom of a 2000px page — and not the operator's doing
+    sizeList(() => height);
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
+    scroller().scrollTop = 0; // not the bottom of a 2000px list — and not the operator's doing
 
     height = 3000;
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
@@ -3044,39 +3100,39 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
 
   it("never drags a scrolled-up operator back down, however much the stream grows", async () => {
     let height = 2000;
-    sizePage(() => height);
+    sizeList(() => height);
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
     scroller().scrollTop = 0;
-    fireEvent.scroll(window);
+    fireEvent.scroll(scroller());
     await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
 
     height = 3000;
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
     await poll(["run-transcript", 547]);
     // Observed at the moment the GROWTH RENDER has actually happened — the appended step is on
-    // the spine, so the follow effect has already run against the taller page. Asserting straight
+    // the spine, so the follow effect has already run against the taller list. Asserting straight
     // after the poll instead proves only that the refetch had not landed yet, and passes whether
     // or not the guard is there.
     await waitFor(() => expect(spineTitles()).toContain("Verified"));
     expect(scroller().scrollTop).toBe(0);
-    // And the chip is the way back: it re-takes the playhead AND the bottom of the page.
+    // And the chip is the way back: it re-takes the playhead AND the bottom of the list.
     fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
     await waitFor(() => expect(scroller().scrollTop).toBe(3000));
   });
 
-  it("follows the stream again once the chip has taken the page back", async () => {
-    // The chip does not only move the page, it re-takes the pin: the NEXT growth has to follow.
+  it("follows the stream again once the chip has taken the list back", async () => {
+    // The chip does not only move the list, it re-takes the pin: the NEXT growth has to follow.
     // A browser would confirm the chip's own scroll with a scroll event, but a rule that only
     // works because the engine volunteers one is a rule that does not work.
     let height = 2000;
-    sizePage(() => height);
+    sizeList(() => height);
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
     scroller().scrollTop = 0;
-    fireEvent.scroll(window);
+    fireEvent.scroll(scroller());
     await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
 
     fireEvent.click(document.querySelector(".trlatest") as HTMLElement);
@@ -3093,16 +3149,16 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
 
   it("never drags a scrolled-up operator down when a filtered-in phase flips follow back on", async () => {
     // The other half of the same promise, and the half a detached scroll listener used to break:
-    // while the page is not following, the operator's position is still theirs. The page is tall
+    // while the list is not following, the operator's position is still theirs. The list is tall
     // only while the head is VISIBLE (the `now` badge is on the spine) — exactly when follow can
     // be on — so the growth and the follow-flip land in ONE commit, the way a real poll does.
-    sizePage(() => (document.querySelector(".trstep.ph") === null ? 2000 : 3000));
+    sizeList(() => (document.querySelector(".trstep.ph") === null ? 2000 : 3000));
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMING });
     mountDetail([run(LIVE)]);
     await settleTrace();
 
     // A grep for a step the run has not written yet hides every phase, the head included: the
-    // page stops following, and the chip is offered.
+    // list stops following, and the chip is offered.
     fireEvent.change(grepField(), { target: { value: "cargo" } });
     await waitFor(() => expect(spineTitles()).toEqual([]));
     expect(nowStep()).toBe("");
@@ -3111,10 +3167,10 @@ describe("the live run — the spine is a playhead (§3A/§3C)", () => {
     // The operator scrolls up to read. Nothing about follow being off makes this position less
     // real, and the follow rule has to observe it.
     scroller().scrollTop = 0;
-    fireEvent.scroll(window);
+    fireEvent.scroll(scroller());
 
     // The poll brings the phase the grep was looking for. It is the newest one, so it is BOTH
-    // visible and the head: follow flips back on and the page grows in the same commit.
+    // visible and the head: follow flips back on and the list grows in the same commit.
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: STREAMED_ON });
     await poll(["run-transcript", 547]);
     await waitFor(() => expect(spineTitles()).toEqual(["Verified"]));
@@ -3291,6 +3347,366 @@ describe("the live run — the Message composer (§3A)", () => {
     expect(action(/^message/i).getAttribute("aria-disabled")).toBe("true");
     fireEvent.click(action(/^message/i));
     expect(screen.queryByLabelText(/message the running agent/i)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// STUDIO-821 — the step spine scrolls IN PLACE, and the detail stays next to the steps.
+//
+// The bug: `.trspine` has no height cap, so a 30-step spine is several times taller than the
+// viewport. `.trsplit` is a two-column grid, so the ROW is `max(spine, inspector)` tall and
+// `.trinsp` renders at the top of it — scroll down to click step 30 and the detail you just
+// selected is thousands of pixels above you. (The same absence also defeated the spine's own
+// `position: sticky`, which cannot engage on a box taller than the viewport.)
+//
+// WHAT THESE TESTS DO NOT COVER, said plainly: jsdom lays nothing out. `offsetHeight`,
+// `scrollHeight` and `getBoundingClientRect` are 0 unless stubbed, `100vh` is never resolved, and
+// `position: sticky` is never honoured — so NOTHING here can assert "the detail is visible", and a
+// test claiming to would pass against a completely broken layout. What is real in jsdom, and what
+// is asserted below, is: which element is the scroll container, that follow-mode drives `scrollTop`
+// on THAT element and not on the document, that the pinned region is outside it, that a
+// programmatic selection is scrolled into view within it, and — through the whole theme cascade,
+// not a single file's text — which declarations actually win on these elements.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A transcript at a REALISTIC length: 32 phases. Three steps does not reproduce this bug — the
+ * spine only outgrows the viewport, and only drags the inspector off the top of the page with it,
+ * at the length David actually hit. The kinds alternate so consecutive cards never merge into one
+ * phase (`Read` classifies `oriented`, `Edit` classifies `implemented`).
+ */
+const LONG: LogEntry[] = Array.from({ length: 32 }, (_, i) => {
+  const reading = i % 2 === 0;
+  const seq = i * 2 + 1;
+  return [
+    entry({
+      seq,
+      kind: "tool_use",
+      tool: reading ? "Read" : "Edit",
+      text: `file_path=/repo/src/step-${i}.ts`,
+    }),
+    entry({
+      seq: seq + 1,
+      kind: "tool_result",
+      text: reading ? "export const x = 1;" : "The file has been updated.",
+    }),
+  ];
+}).flat();
+
+/** The same long trace, ending in the failure the Result card's jump aims at. */
+const LONG_FAILED: LogEntry[] = [
+  ...LONG,
+  entry({ seq: 200, kind: "tool_use", tool: "Bash", text: "command=cargo test --workspace" }),
+  entry({ seq: 201, kind: "tool_result", text: "Error: test result: FAILED. 1 failed" }),
+];
+
+describe("the step spine scrolls in place, not the page (STUDIO-821)", () => {
+  it("puts every step in one scroll container and leaves the filters pinned outside it", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: LONG });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+
+    const list = document.querySelector(".trsteps") as HTMLElement;
+    expect(list, "the spine has no step list").toBeTruthy();
+    // Long enough to be the case that breaks.
+    expect(list.querySelectorAll(".trstep").length).toBeGreaterThanOrEqual(30);
+    expect(spineTitles().length).toBe(list.querySelectorAll(".trstep").length);
+    // Not one step left outside the box that scrolls.
+    expect(document.querySelectorAll(".trspine > .trstep")).toHaveLength(0);
+
+    // And the pinned region really is OUTSIDE it: scrolling the filter chips or the grep field out
+    // of reach is the same class of bug as the one being fixed, so this is not a nicety.
+    expect(list.querySelector(".trfilter")).toBeNull();
+    expect(list.querySelector(".grep")).toBeNull();
+    expect(document.querySelector(".trspine > .trfilter")).toBeTruthy();
+    expect(document.querySelector(".trspine > .grep")).toBeTruthy();
+  });
+
+  it("drives the LIST's scrollTop as a live run appends, and never the document's", async () => {
+    // The mutation this pins: point follow-mode back at `document.scrollingElement` and the list
+    // never moves, so both halves of this go red at once.
+    let height = 2400;
+    sizeList(() => height);
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: LONG });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(pageScroller().scrollTop).toBe(0);
+
+    height = 3200; // the poll appended a step, and the LIST grew — not the page
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 547,
+      generated_at: "",
+      entries: [...LONG, ...LONG_FAILED.slice(LONG.length)],
+    });
+    await poll(["run-transcript", 547]);
+    await waitFor(() => expect(spineTitles()).toContain("Verified"));
+    await waitFor(() => expect(scroller().scrollTop).toBe(3200));
+    // The document was never touched. Before this ticket it was the only thing that ever was.
+    expect(pageScroller().scrollTop).toBe(0);
+  });
+
+  it("hears the operator scroll the LIST, which does not reach a window listener", async () => {
+    // A box that scrolls inside the page fires its scroll events at itself, and `scroll` does not
+    // bubble. A listener left on `window` would go permanently silent: follow-mode would be stuck
+    // on its last reading and the chip would never be offered.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: LONG });
+    mountDetail([run(LIVE)]);
+    await settleTrace();
+    expect(document.querySelector(".trlatest")).toBeNull();
+
+    sizeList(() => 2400);
+    scroller().scrollTop = 0;
+    fireEvent.scroll(scroller());
+    await waitFor(() => expect(document.querySelector(".trlatest")).toBeTruthy());
+  });
+
+  describe("a selection the operator did not reach for", () => {
+    const seen: Array<{ title: string; opts: unknown; inList: boolean }> = [];
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const had = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+
+    beforeAll(() => {
+      // jsdom implements no layout and leaves `scrollIntoView` undefined, so the view skips it and
+      // there is nothing to observe until it is stood up. What this records is the CALL — which
+      // element, with which options — not any resulting position, which jsdom would not produce.
+      proto.scrollIntoView = function (this: HTMLElement, opts: unknown) {
+        seen.push({
+          title: this.querySelector(".stt")?.textContent ?? "",
+          opts,
+          inList: this.closest(".trsteps") !== null,
+        });
+      };
+    });
+
+    afterAll(() => {
+      if (had === undefined) delete proto.scrollIntoView;
+      else Object.defineProperty(HTMLElement.prototype, "scrollIntoView", had);
+    });
+
+    it("scrolls the jumped-to failing step into view inside the container", async () => {
+      h.fetchRunTranscript.mockResolvedValue({
+        run_id: 547,
+        generated_at: "",
+        entries: LONG_FAILED,
+      });
+      mountDetail([run({ id: 547, outcome: "failed", error: "cargo test exited 101" })]);
+      await settleTrace();
+      expect(selectedStep()).toBe("Oriented"); // a finished trace opens on its FIRST step
+
+      seen.length = 0;
+      fireEvent.click(screen.getByRole("button", { name: /jump to failing step/i }));
+      await waitFor(() => expect(selectedStep()).toBe("Verified"));
+
+      // The failing step is the 33rd of 33: before the cap the page scrolled and the whole spine
+      // was on it, so a jump landed somewhere on screen for free. Inside a box that scrolls it
+      // does not, and this is what puts it there.
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+      const last = seen[seen.length - 1];
+      expect(last.title).toBe("Verified");
+      expect(last.inList).toBe(true);
+      // `nearest` and nothing else: a step already on screen must be left exactly where it is, or
+      // this fights the follow pin on a live run and yanks the list on an ordinary click.
+      expect(last.opts).toEqual({ block: "nearest" });
+    });
+
+    it("leaves a step the operator clicked where it already is, by asking for `nearest`", async () => {
+      h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: LONG });
+      mountDetail([run({ id: 547 })]);
+      await settleTrace();
+
+      seen.length = 0;
+      const steps = [...document.querySelectorAll(".trstep")] as HTMLElement[];
+      fireEvent.click(steps[steps.length - 1]);
+      await waitFor(() => expect(seen.length).toBeGreaterThan(0));
+      expect(seen[seen.length - 1].opts).toEqual({ block: "nearest" });
+    });
+  });
+
+  it("keeps ONE shared definition of `at the bottom` with the logs follow", async () => {
+    // The acceptance this protects is in the LOGS view, not this one: `lib/follow-scroll` is
+    // imported verbatim by both, and a threshold forked into this file would drift silently.
+    const view = readFileSync(path.resolve(__dirname, "JobDetailView.tsx"), "utf8");
+    expect(view).toMatch(/import \{ isAtBottom \} from "@\/lib\/follow-scroll";/);
+    // No second opinion about the slack, in any spelling.
+    expect(view).not.toMatch(/FOLLOW_THRESHOLD|scrollHeight - .*clientHeight/);
+  });
+
+  describe("through the whole theme cascade", () => {
+    beforeAll(mountThemeCascade);
+    afterAll(unmountThemeCascade);
+
+    /** The Split, really rendered and really styled. */
+    async function split(): Promise<HTMLElement> {
+      h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: LONG });
+      mountDetail([run({ id: 547 })]);
+      await settleTrace();
+      return document.querySelector(".trsplit") as HTMLElement;
+    }
+
+    it("caps the spine off the SAME measured header height it sticks below", async () => {
+      const spine = (await split()).querySelector(".trspine") as HTMLElement;
+      const cs = getComputedStyle(spine);
+      // The two are one geometry: a box pinned `--trhd-h` from the top of the viewport has exactly
+      // that much less than a viewport of screen beneath it. A literal here would be wrong the
+      // moment the header wraps to two rows, which is why `--trhd-h` is measured at all.
+      expect(cs.top).toBe("var(--trhd-h, 64px)");
+      expect(cs.maxHeight).toBe("calc(100vh - var(--trhd-h, 64px) - 18px)");
+      // Removing the cap is the mutation this reds — and with it, the whole ticket.
+      expect(cs.maxHeight).not.toBe("");
+      // A column, so the pinned filters take their own height and the list takes the rest.
+      expect(cs.display).toBe("flex");
+      expect(cs.flexDirection).toBe("column");
+    });
+
+    it("makes the step list the scroller, and lets it shrink below its content", async () => {
+      const list = (await split()).querySelector(".trsteps") as HTMLElement;
+      const cs = getComputedStyle(list);
+      expect(cs.overflowY).toBe("auto");
+      expect(cs.flexGrow).toBe("1");
+      // `min-height: auto` is a flex item's default and it means CONTENT height: without this the
+      // list refuses to shrink, takes the capped spine with it, and nothing ever scrolls.
+      expect(cs.minHeight).toBe("0");
+    });
+
+    it("stops the Split being a scroll container, which is what defeated the sticky", async () => {
+      // `overflow: hidden` here makes `.trsplit` a scroll container, and a sticky descendant
+      // resolves its offsets against the nearest scroll container rather than the viewport — so
+      // the spine's `position: sticky` has never once stuck. `clip` clips the rounded corner the
+      // same way without establishing one.
+      const cs = getComputedStyle(await split());
+      expect(cs.overflow).toBe("clip");
+      expect(["hidden", "auto", "scroll"]).not.toContain(cs.overflow);
+    });
+
+    it("lets no ancestor of the spine become a scroll container either", async () => {
+      // The generalisation of the test above, and the reason it is worth having twice: the sticky
+      // is defeated by the NEAREST scroll container, whichever ancestor that turns out to be. A
+      // future wrapper quietly given `overflow: hidden` to clip a corner would silently un-stick
+      // the spine again — the exact failure this ticket found, one level up.
+      //
+      // Bounded by what the harness renders: it mounts the run detail bare, so this walks
+      // `.trspine` → `.trsplit` → `.trrun` and no further. The console shell above it
+      // (`.rh-console .main`, `.app.rh-console`) carries no overflow of its own, checked by
+      // reading `console.css`; the walk covers everything this VIEW owns.
+      const spine = (await split()).querySelector(".trspine") as HTMLElement;
+      const seen: string[] = [];
+      for (let el = spine.parentElement; el !== null && el !== document.body; el = el.parentElement) {
+        const cs = getComputedStyle(el);
+        for (const axis of [cs.overflow, cs.overflowX, cs.overflowY]) {
+          expect(["hidden", "auto", "scroll"], `${el.className} scrolls`).not.toContain(axis);
+        }
+        seen.push(el.className);
+      }
+      // Not vacuous: the Split really is on the walk.
+      expect(seen).toContain("trsplit");
+      expect(seen).toContain("trrun");
+    });
+
+    it("gives the inspector NO scroller of its own — the page still scrolls a long detail", async () => {
+      // The examined decision (ticket §5). With the spine capped, a long detail is the tallest
+      // thing in the row and the PAGE scrolls it. The alternative — a fixed two-pane layout where
+      // neither column moves the document — costs browser find-in-page over the trace, because
+      // Cmd-F only reveals a match it can scroll to. That is a real loss, and the thing it would
+      // buy (a spine that never leaves the screen) the sticky above already buys.
+      const insp = (await split()).querySelector(".trinsp") as HTMLElement;
+      const cs = getComputedStyle(insp);
+      expect(cs.overflowY === "" || cs.overflowY === "visible").toBe(true);
+      expect(cs.maxHeight === "" || cs.maxHeight === "none").toBe(true);
+    });
+
+    it("puts the narrow override where it WINS the cascade, not merely where it reads well", () => {
+      // The round-2 finding, and the hole the test below cannot cover on its own: that one
+      // asserts what the narrow block CONTAINS and never asks which declaration WINS. For the
+      // first version of this change the answer was "not that one" — the block sat ABOVE the
+      // top-level rule, so `position: static` and `max-height: 50vh` parsed, minified into the
+      // shipped bundle, and never once applied.
+      //
+      // This is asserted on the FILE, and unavoidably so. jsdom does not implement `@media` in
+      // the cascade AT ALL — a declaration inside one never reaches `getComputedStyle` even when
+      // the condition trivially matches the window (verified directly: a `@media (min-width: 1px)`
+      // block at `innerWidth: 1024` leaves the property at its initial value). So no amount of
+      // rendering can measure this here, and a test that appeared to would be reading the
+      // desktop value and reporting it as the narrow one.
+      //
+      // What is asserted instead is the complete set of inputs the cascade decides on for two
+      // rules of the same origin: specificity, importance, then source order. Pin all three and
+      // the outcome follows from the spec rather than from a renderer.
+      const raw = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+      // Comments in this file discuss `.rh-console .trspine` in prose, and prose is not a rule.
+      const css = raw.replace(/\/\*[\s\S]*?\*\//g, "");
+      const decls = [...css.matchAll(/(?:^|\n)([ \t]*)(\.rh-console \.trspine) \{([^}]*)\}/g)];
+
+      // The whole population is two — so "the later one" is unambiguous. (Nothing in any OTHER
+      // sheet in the layer names `.trspine` either; that half is the last test in this block.)
+      expect(decls, "the spine is no longer declared exactly twice").toHaveLength(2);
+      const [desktop, narrow] = decls;
+
+      // 1. SPECIFICITY: identical selector text, so identical (0,2,0). `@media` contributes none
+      //    of its own, which is the whole reason this ordering has to be deliberate.
+      expect(narrow[2]).toBe(desktop[2]);
+      // 2. IMPORTANCE: neither shouts, so `!important` does not decide it either.
+      expect(desktop[3]).not.toMatch(/!important/);
+      expect(narrow[3]).not.toMatch(/!important/);
+      // 3. SOURCE ORDER, which is therefore the only tie-break left: the override must come
+      //    second, and it must be the one nested in the narrow query. Swap the two blocks back
+      //    and this reds — which is what the original defect was.
+      const mediaOpen = css.indexOf("@media (max-width: 900px) {");
+      expect(mediaOpen, "the narrow media query is gone").toBeGreaterThan(-1);
+      expect(desktop.index, "the desktop rule no longer comes first").toBeLessThan(mediaOpen);
+      expect(mediaOpen, "the second declaration is not the narrow one").toBeLessThan(narrow.index);
+      // Belt and braces on which is which: this file indents a nested rule and starts every
+      // top-level one at column 0.
+      expect(desktop[1]).toBe("");
+      expect(narrow[1]).toBe("  ");
+    });
+
+    it("states the narrow behaviour rather than letting it fall out of the desktop rule", () => {
+      // ASSERTED ON THE FILE, deliberately: jsdom does not implement `@media` in the cascade at
+      // all, so a declaration inside the narrow block never reaches `getComputedStyle` here no
+      // matter what width the window reports, and a rule-shaped assertion would silently read the
+      // DESKTOP value and pass while claiming otherwise. (The stronger-sounding "jsdom just will
+      // not let a test change the width" was this comment's first answer and it was wrong — the
+      // block is ignored even when its condition matches.) The collision risk that shape carries is covered
+      // directly by two other tests: nothing else in the theme layer names `.trspine` at all
+      // (below), and these declarations really do win the cascade (above). This one is about the
+      // WORDING only — on its own it would happily pass on a block that never applies, which is
+      // exactly what it did before the ordering test above was added.
+      const css = readFileSync(path.resolve(__dirname, "../../../theme/console-trace.css"), "utf8");
+      const block = css.indexOf("@media (max-width: 900px) {");
+      expect(block, "the narrow media query is gone").toBeGreaterThan(-1);
+      const at = css.indexOf("  .rh-console .trspine {", block);
+      expect(at, "the spine has no narrow rule").toBeGreaterThan(-1);
+      const narrow = css.slice(at, css.indexOf("}", at));
+
+      // One column puts the spine ABOVE the inspector, so pinning it would park the step list on
+      // top of the detail it selects.
+      expect(narrow).toMatch(/position:\s*static/);
+      // It keeps an internal scroller — 30+ steps is still 30+ steps to scroll past before the
+      // detail begins — but not the desktop cap: a viewport-tall box IS the whole screen at this
+      // width and pushes the inspector clean off it. Half the viewport leaves both on screen.
+      expect(narrow).toMatch(/max-height:\s*50vh/);
+      expect(narrow).not.toMatch(/100vh/);
+      // The single column itself, which the cap is sized for.
+      const split = css.indexOf("  .rh-console .trsplit {", block);
+      expect(css.slice(split, css.indexOf("}", split))).toMatch(
+        /grid-template-columns:\s*minmax\(0, 1fr\)/,
+      );
+    });
+
+    it("lets no other stylesheet in the layer claim the spine or its list", async () => {
+      // The STUDIO-817 lesson, applied forwards rather than after the fact: that bug was a
+      // GENERIC class name (`.bar`, `.sect`, `.head`) that another view's stylesheet also owned.
+      // These two names are new or newly load-bearing, so the check is direct.
+      const dir = path.resolve(__dirname, "../../../theme");
+      for (const file of SHEETS) {
+        if (file === "console-trace.css") continue;
+        const text = readFileSync(path.join(dir, file), "utf8");
+        expect(text, `${file} also styles the spine`).not.toMatch(/\.trspine\b/);
+        expect(text, `${file} also styles the step list`).not.toMatch(/\.trsteps\b/);
+      }
+      // And the Split really does render them, so the loop above is not vacuous.
+      expect((await split()).querySelector(".trspine > .trsteps")).toBeTruthy();
+    });
   });
 });
 
@@ -3741,62 +4157,70 @@ describe("external links leave the app through the openExternal seam (STUDIO-765
 // observable here and unobservable in a single-file string match. It does NOT resolve `var()`,
 // so a token-valued property reads back as its literal `var(--x)` text — which still names the
 // winning declaration, and that is all these assertions need.
+// EVERY theme file, not just the one under test — the collision is by definition in what ELSE
+// matches — and IN THE ORDER THE BUNDLE CONCATENATES THEM. Both halves matter:
+//
+//   * All of them, because `ConsoleApp` imports these views statically. One bundled stylesheet
+//     carries every file below on every console page load; there is no build serving a subset.
+//   * In this order, because jsdom's `getComputedStyle` cascades by DOCUMENT ORDER ALONE and
+//     ignores specificity. Load them alphabetically and a rule that legitimately wins in every
+//     real engine can lose here, so the order has to mirror production or the test lies.
+//
+// Taken by measuring each file's first uniquely-owned selector in the emitted
+// `crates/httpapi/web-dist/assets/index-*.css`: `main.tsx`'s own imports lead, then each view's
+// in module-graph order. `tokens.css` is first, and scopes its palette under `.rh-console`
+// rather than `:root` so it cannot repaint the Podium screens (see that file's own header).
+const SHEETS = [
+  "tokens.css",
+  "console.css",
+  "console-views.css",
+  "markdown.css",
+  "teams-console.css",
+  "console-firstrun.css",
+  "console-trace.css",
+  "console-manage.css",
+  "memory.css",
+  "console-reviews.css",
+  "console-settings-tabs.css",
+  "console-workflow.css",
+];
+
+const cascadeStyles: HTMLStyleElement[] = [];
+
+/**
+ * Puts the whole theme layer into the document so `getComputedStyle` reads the real cascade.
+ * Shared by every block below that asserts style, so a second one cannot quietly go back to
+ * matching a single file's text and lose sight of what else claims the same element.
+ */
+function mountThemeCascade() {
+  const dir = path.resolve(__dirname, "../../../theme");
+  // A theme file added later must not be silently dropped from the cascade under test — that
+  // would quietly restore exactly the blind spot this harness exists to remove.
+  const onDisk = readdirSync(dir)
+    .filter((f) => f.endsWith(".css"))
+    .sort();
+  expect([...SHEETS].sort()).toEqual(onDisk);
+
+  for (const file of SHEETS) {
+    const el = document.createElement("style");
+    el.textContent = readFileSync(path.join(dir, file), "utf8");
+    document.head.append(el);
+    cascadeStyles.push(el);
+  }
+  // The console scopes its whole theme under `.rh-console`; the test harness renders the view
+  // bare. Without this every rule fails to match and every assertion passes vacuously.
+  document.body.classList.add("rh-console");
+}
+
+function unmountThemeCascade() {
+  for (const el of cascadeStyles) el.remove();
+  cascadeStyles.length = 0;
+  document.body.classList.remove("rh-console");
+}
+
 describe("the Result card matches the approved prototype through the cascade (STUDIO-817)", () => {
-  const styles: HTMLStyleElement[] = [];
-
-  // EVERY theme file, not just the card's own — the collision is by definition in what ELSE
-  // matches — and IN THE ORDER THE BUNDLE CONCATENATES THEM. Both halves matter:
-  //
-  //   * All of them, because `ConsoleApp` imports these views statically. One bundled stylesheet
-  //     carries every file below on every console page load; there is no build serving a subset.
-  //   * In this order, because jsdom's `getComputedStyle` cascades by DOCUMENT ORDER ALONE and
-  //     ignores specificity. Load them alphabetically and a rule that legitimately wins in every
-  //     real engine can lose here, so the order has to mirror production or the test lies.
-  //
-  // Taken by measuring each file's first uniquely-owned selector in the emitted
-  // `crates/httpapi/web-dist/assets/index-*.css`: `main.tsx`'s own imports lead, then each view's
-  // in module-graph order. `tokens.css` is first, and scopes its palette under `.rh-console`
-  // rather than `:root` so it cannot repaint the Podium screens (see that file's own header).
-  const SHEETS = [
-    "tokens.css",
-    "console.css",
-    "console-views.css",
-    "markdown.css",
-    "teams-console.css",
-    "console-firstrun.css",
-    "console-trace.css",
-    "console-manage.css",
-    "memory.css",
-    "console-reviews.css",
-    "console-settings-tabs.css",
-    "console-workflow.css",
-  ];
-
-  beforeAll(() => {
-    const dir = path.resolve(__dirname, "../../../theme");
-    // A theme file added later must not be silently dropped from the cascade under test — that
-    // would quietly restore exactly the blind spot this block exists to remove.
-    const onDisk = readdirSync(dir)
-      .filter((f) => f.endsWith(".css"))
-      .sort();
-    expect([...SHEETS].sort()).toEqual(onDisk);
-
-    for (const file of SHEETS) {
-      const el = document.createElement("style");
-      el.textContent = readFileSync(path.join(dir, file), "utf8");
-      document.head.append(el);
-      styles.push(el);
-    }
-    // The console scopes its whole theme under `.rh-console`; the test harness renders the view
-    // bare. Without this every rule below fails to match and every assertion passes vacuously.
-    document.body.classList.add("rh-console");
-  });
-
-  afterAll(() => {
-    for (const el of styles) el.remove();
-    styles.length = 0;
-    document.body.classList.remove("rh-console");
-  });
+  beforeAll(mountThemeCascade);
+  afterAll(unmountThemeCascade);
 
   async function card(): Promise<HTMLElement> {
     h.fetchRunTranscript.mockResolvedValue({

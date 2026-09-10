@@ -271,6 +271,36 @@ stated_binary "the repo tour names the bin crate the tree actually builds" \
 stated_binary "the non-negotiable names the binary the tree actually builds" \
               's/.*the binary stays `\([^`]*\)`.*/\1/p'
 
+# --- the run never merges its own pull request ------------------------------------------------------
+# The prompt tells a run FOUR times that merging is not its job (the opening paragraph, Phase 4's
+# "do NOT enable auto-merge and do NOT merge", Phase 6's "You do NOT merge", and the hand-off's
+# "A reviewer merges") — and pinned it zero times. So when the git-hygiene bullet came to say the
+# opposite ("You DO merge your own PR — but only in Phase 6..."), nothing caught the contradiction
+# and it sat there through every run.
+#
+# It stayed harmless only by accident: under `review.mode: tickets` the review ticket's own prompt
+# said "Never merge", which outranked it in the reviewer's context. Moving the install to
+# `review.mode: ticketless` removed that second prompt, and the reviewer's hand-off began telling
+# the AUTHOR they own the merge — so the contradiction became live, on the one instruction whose
+# failure mode is an unreviewed merge to `main`.
+#
+# Pinned as a pair on purpose: the `absent` check alone would pass on a prompt that simply stopped
+# mentioning merging, which is the same silence that let this drift in.
+# Matching the AFFIRMATIVE construction directly, rather than matching "merge your own PR" and then
+# filtering out lines that negate somewhere. That filtering approach was tried first and is a trap:
+# the offending line was `You DO merge your own PR — ... never merge early`, so it carried its own
+# negation and a filter dropped the very line it existed to catch. The check passed against the bug.
+#
+# `merge` must follow `you`/`you do` IMMEDIATELY, which is what separates the two readings: in
+# "You do NOT merge your own PR" the word `NOT` sits in that gap, so it cannot match however the
+# case falls.
+absent "no line tells the run to merge its own pull request" \
+       '[Yy]ou (DO |do )?merge your own (PR|pull request)'
+present_i "the run is told merging is not its job" \
+          'do NOT merge|does not merge|never merge'
+present_i "the prompt names who does merge instead" \
+          'a reviewer( or the maintainer)? merges|driver agent \(or a human\) reviews and merges|the maintainer merges'
+
 if [ "$fail" -ne 0 ]; then
   echo "prompt_test: FAILED"
   exit 1

@@ -976,8 +976,11 @@ mod tests {
             prompt.contains("Never merge, and never push to the author's branch."),
             "the quorum's own host-written instructions must still be there:\n{prompt}"
         );
+        // `Parity is the product` replaces the old `You DO merge your own PR` canary, which stopped
+        // being a canary when that line was removed from the implementer prompt: a string absent
+        // from BOTH documents proves nothing about a leak between them.
         for leaked in [
-            "You DO merge your own PR",
+            "Parity is the product",
             "You are an autonomous staff engineer",
             "Phase 6",
         ] {
@@ -1007,11 +1010,21 @@ mod tests {
         );
     }
 
-    /// STUDIO-798's third acceptance criterion: an implementation run's prompt is UNCHANGED — the
-    /// Phase 6 merge instruction is exactly where it was, because losing it would cost every
-    /// implementer the instruction the ticket explicitly protects.
+    /// STUDIO-798's third acceptance criterion, as amended: an implementation run gets the
+    /// CONFIGURED prompt verbatim and the host review prompt never reaches it.
+    ///
+    /// What that prompt SAYS about merging changed after 798. 798 protected the git-hygiene
+    /// bullet's "You DO merge your own PR" because losing it would have been collateral damage from
+    /// a ticket about the reviewer. But the same file told a run four other times that merging is
+    /// not its job — the opening paragraph, Phase 4's "do NOT enable auto-merge and do NOT merge",
+    /// Phase 6, and the hand-off's "A reviewer merges" — so the bullet was the outlier, not the
+    /// rule, and the file contradicted itself 4:1. It now agrees with the other four.
+    ///
+    /// This test is deliberately still shaped around the merge instruction rather than moved off
+    /// it: the instruction whose failure mode is an unreviewed merge to `main` is the one worth
+    /// spending a test on, whichever way it points.
     #[tokio::test]
-    async fn an_implementation_run_keeps_its_merge_instruction() {
+    async fn an_implementation_run_is_told_not_to_merge_its_own_pr() {
         let implementer = repo_implementer_prompt();
         let ag = fake_agent(vec![succeeded_turn()]);
         let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
@@ -1024,8 +1037,15 @@ mod tests {
 
         let prompt = ag.last_prompt();
         assert!(
-            prompt.contains("You DO merge your own PR"),
-            "an implementation run must keep its Phase 6 instruction:\n{prompt}"
+            prompt.contains("You do NOT merge your own PR"),
+            "an implementation run must be told merging is not its job:\n{prompt}"
+        );
+        // The affirmative form must not survive anywhere in what the agent is handed. Checked
+        // separately from the line above because a prompt carrying BOTH is exactly the state this
+        // amendment removes, and a single positive assertion would pass in it.
+        assert!(
+            !prompt.contains("You DO merge your own PR"),
+            "the contradicting instruction is back in the implementer's prompt:\n{prompt}"
         );
         assert!(
             !prompt.contains("Standing rules for a review run"),
@@ -1045,8 +1065,8 @@ mod tests {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         assert!(
-            text.contains("You DO merge your own PR"),
-            "{} no longer carries the merge instruction this test is about",
+            text.contains("You do NOT merge your own PR"),
+            "{} no longer carries the merge instruction these tests are about",
             path.display()
         );
         text
