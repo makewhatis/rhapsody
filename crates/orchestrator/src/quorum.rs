@@ -396,11 +396,18 @@ impl FanOutcome {
     }
 }
 
-/// One fan-out attempt's full answer: what happened, at which head, and the loud room post a
-/// failure wants made once its retries are exhausted.
+/// One fan-out attempt's full answer: what happened, at which head, against which pull request,
+/// and the loud room post a failure wants made once its retries are exhausted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FanResult {
     pub outcome: FanOutcome,
+    /// The pull request this attempt ran against, as [`resolve_open_pr`] resolved it — NOT
+    /// whatever the request arrived carrying. On an installation whose Linear holds no GitHub
+    /// attachments (STUDIO-674) the request's own `pr_url` is empty, so this is the only thing
+    /// [`give_up`] can name; it is carried out here because the resolved URL otherwise lives only
+    /// on [`fan_out`]'s local rebinding of the request. Empty only for
+    /// [`FanOutcome::NoPullRequest`], which is never a failure and is never abandoned.
+    pub pr_url: String,
     /// The pull-request head this attempt ran against — what gets recorded when
     /// [`FanOutcome::records_the_head`] says so. Empty when no pull request was resolved, and
     /// empty-but-recorded when GitHub answered a pull request without a `headRefOid`: an unknown
@@ -506,6 +513,12 @@ pub async fn run_quorum_task<TF>(
 /// line (which is what it already had), the room post the fan-out prepared, and — the one an
 /// operator actually looks at — the project advisory on `GET /api/v1/projects`, which is LOCAL and
 /// therefore still works when the reason for the failure is that the tracker does not answer.
+///
+/// The pull request named is `res.pr_url`, the one [`fan_out`] RESOLVED, and never the `req.pr_url`
+/// the request arrived with: on an installation whose Linear holds no GitHub attachments the latter
+/// is empty (STUDIO-674), and this post is the one message telling a human that a review round is
+/// permanently gone. Every abandoned round has a resolved URL — [`FanOutcome::TrackerFailure`] is
+/// only ever returned below the lookup.
 fn give_up<TF>(deps: &QuorumDeps<TF>, req: &QuorumRequest, res: &FanResult, attempts: u32)
 where
     TF: Fn() -> Option<QuorumTarget>,
@@ -532,7 +545,7 @@ where
                 "REVIEW QUORUM ABANDONED for {}: {} after {attempts} attempts. No review of {} was \
                  requested and nothing will ask again — {} is unreviewed however the merge gate \
                  reads, so request the review by hand.",
-                req.parent_identifier, res.failure_why, req.pr_url, req.parent_identifier,
+                req.parent_identifier, res.failure_why, res.pr_url, req.parent_identifier,
             ),
         )
         .with_refs([req.parent_identifier.clone()]),
@@ -564,11 +577,12 @@ where
     let Some(pr) = resolve_open_pr(deps, req).await else {
         return FanResult {
             outcome: FanOutcome::NoPullRequest,
+            pr_url: String::new(),
             head: String::new(),
             failure_why: String::new(),
         };
     };
-    let head = pr.head_sha;
+    let (pr_url, head) = (pr.url, pr.head_sha);
     // The one condition that replaced the marker label's refusal and the per-ticket `settled` set:
     // a quorum was already asked for at exactly this head, so either a review of it is in flight or
     // one finished and nothing has been pushed since. Both mean the same thing — there is no new
@@ -582,15 +596,16 @@ where
         );
         return FanResult {
             outcome: FanOutcome::AlreadyRequestedAtHead,
+            pr_url,
             head,
             failure_why: String::new(),
         };
     }
-    let req: Cow<'_, QuorumRequest> = if req.pr_url == pr.url {
+    let req: Cow<'_, QuorumRequest> = if req.pr_url == pr_url {
         Cow::Borrowed(req)
     } else {
         let mut resolved = req.clone();
-        resolved.pr_url = pr.url;
+        resolved.pr_url.clone_from(&pr_url);
         Cow::Owned(resolved)
     };
     let req = req.as_ref();
@@ -602,6 +617,7 @@ where
         );
         return FanResult {
             outcome: FanOutcome::TrackerFailure,
+            pr_url: pr_url.clone(),
             head,
             failure_why: "no tracker has loaded yet, so no review ticket could be created"
                 .to_string(),
@@ -635,6 +651,7 @@ where
         );
         return FanResult {
             outcome: FanOutcome::NoReviewers,
+            pr_url: pr_url.clone(),
             head,
             failure_why: String::new(),
         };
@@ -658,6 +675,7 @@ where
             );
             return FanResult {
                 outcome: FanOutcome::TrackerFailure,
+                pr_url: pr_url.clone(),
                 head,
                 // Not posted here: the room hears about it once, at exhaustion (STUDIO-822).
                 failure_why: format!(
@@ -716,6 +734,7 @@ where
     if created.is_empty() {
         return FanResult {
             outcome: FanOutcome::TrackerFailure,
+            pr_url: pr_url.clone(),
             head,
             failure_why: format!(
                 "no review ticket could be created (asked: {}); the last create failed with {}",
@@ -763,6 +782,7 @@ where
             created: created.len(),
             wanted: req.reviewers.len(),
         },
+        pr_url,
         head,
         failure_why: String::new(),
     }
@@ -2927,6 +2947,55 @@ mod tests {
         assert!(
             posts[0].body.contains("REVIEW QUORUM ABANDONED for MT-1"),
             "{}",
+            posts[0].body
+        );
+        signal.cancel();
+    }
+
+    // …and it must name the pull request a HUMAN can open. On an installation whose Linear holds
+    // no GitHub attachments — STUDIO-674's whole premise, and the state of this daemon — the
+    // request arrives with an EMPTY `pr_url` and only the branch, so the one message telling an
+    // operator that a review round is permanently gone can only name the URL the fan-out itself
+    // resolved. Driven from [`request_without_attachment`] precisely so the assertion cannot pass
+    // on a string that was already in the request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_abandonment_post_names_the_resolved_pull_request() {
+        let dir = TempDir::new();
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let warnings = Arc::new(crate::warnings::WarningsState::default());
+        let mut fake = tracker_with_viewer();
+        fake.create_issue_err = Some(TrackerError::Other(
+            "linear_api_request: error sending request for url".into(),
+        ));
+        let tr = Arc::new(fake);
+        let src = FakePrSource::new(|| Ok(Some(open_pr(PR, "head-a"))));
+        let d = QuorumDeps {
+            room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            warnings: Some(Arc::clone(&warnings)),
+            ..deps_with_pr_source(
+                teams_quorum(&["alice", "bob"], 1),
+                Arc::clone(&tr),
+                Arc::clone(&src),
+            )
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        tx.send(QuorumRequest {
+            parent_project_group: "proj-a".into(),
+            ..request_without_attachment(&["bob"])
+        })
+        .expect("send");
+        drop(tx);
+        task.await.expect("task joins");
+
+        let posts = room_posts(&room);
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert!(
+            posts[0].body.contains(PR),
+            "the abandonment post must name the pull request the fan-out resolved, or the human \
+             it is addressed to has nothing to open: {}",
             posts[0].body
         );
         signal.cancel();
