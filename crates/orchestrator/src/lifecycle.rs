@@ -183,8 +183,18 @@ const LOOKUP_REVIEWS: &str = "review-ticket label lookup failed; serving cached 
 /// trip, on [`failure_backoff_ms`] — the cadence the retry queue, triage, the quorum and the
 /// prefetch already share, rather than a second one that can drift from it. Capped at
 /// [`MAX_LIFECYCLE_BACKOFF_MS`], a persistent failure settles at 12 attempts an hour per lookup,
-/// 36 across all three, and the doubling that leads there adds four more each: **at most 48
-/// requests an hour from this path**, against the ~3500 it was making.
+/// 36 across all three, and the doubling that leads there adds four more each: **at most 48 gated
+/// ATTEMPTS an hour from this path**, against the ~3500 requests it was making.
+///
+/// Attempts rather than requests, because the two coincide only for the shape this gate is for: a
+/// wholesale failure is one round trip per attempt. A refusal is neither — it fans one attempt out
+/// into an isolation (bounded by [`MAX_ISOLATION_QUERIES`], not by one) and it does not arm the
+/// gate at all, so it runs at [`LIFECYCLE_TTL`]'s cadence rather than the ladder's. The hourly
+/// total each shape really costs is measured and pinned in this module's tests, and the largest of
+/// the three is NOT the pathological all-refused page: it is an ordinary page carrying one refused
+/// id, ungated on purpose, and an operator budgeting quota from the all-refused number alone would
+/// under-count. Nothing here is a reason to gate a refusal — see the next paragraph — only a
+/// reason to quote the right maximum.
 ///
 /// **What arms it is "left work undone", which is narrower than "something went wrong".** A
 /// refusal of a particular id is a VERDICT about that id — it memoizes as a bounded negative and
@@ -3052,6 +3062,25 @@ mod tests {
     /// One simulated hour of console polling, once a second — the cadence the incident ran at.
     const POLLS: u64 = 3600;
 
+    /// What a page the tracker refuses EVERY part of costs in an hour: 16 gated attempts, each
+    /// spending 2 batches and [`MAX_ISOLATION_QUERIES`].
+    const WHOLLY_REFUSED_HOURLY: usize = 544;
+
+    /// What a page carrying ONE refused id costs in an hour, which is the real maximum this path
+    /// can reach — see [`a_page_with_one_refused_id_is_the_expensive_shape`] for why it is larger
+    /// than [`WHOLLY_REFUSED_HOURLY`] rather than smaller.
+    const PARTIALLY_REFUSED_HOURLY: usize = 780;
+
+    /// The ORDERING of those two is itself a claim the module's prose makes, so it is a COMPILE
+    /// error rather than a test failure: which shape costs more per hour decides which number an
+    /// operator should budget from, and the wrong answer was written down once already. Each total
+    /// is measured by its own test; this only pins how they compare.
+    const _: () = assert!(
+        PARTIALLY_REFUSED_HOURLY > WHOLLY_REFUSED_HOURLY,
+        "the partially-refused page is this path's expensive shape; a doc or a constant saying \
+         otherwise is wrong",
+    );
+
     /// Polls `resolve` once a second for [`POLLS`] seconds of SIMULATED time and answers how many
     /// tracker round trips that cost. Simulated: every `resolve` takes its own `now`, so the whole
     /// hour runs instantly and the assertion is on cadence rather than on wall clock.
@@ -3132,23 +3161,27 @@ mod tests {
         );
     }
 
-    /// The other failure shape's ceiling, measured rather than reasoned about — and it is the
-    /// expensive one, so it is the one worth pinning. A batch the tracker refuses EVERY part of
-    /// pays [`MAX_ISOLATION_QUERIES`] on each attempt (STUDIO-831's bisection, bounded but not
-    /// free), and it makes slow progress: all-refused ids halve down to single-id leaves about
-    /// seven queries at a time, so a full [`MAX_LIFECYCLE_REFRESH`] page pins only a handful of
-    /// them per window and the rest are abandoned and re-asked.
+    /// The other failure shape's ceiling, measured rather than reasoned about — the most ONE
+    /// GATED attempt can cost, which is why it is worth pinning beside the frequency. A batch the
+    /// tracker refuses EVERY part of pays [`MAX_ISOLATION_QUERIES`] on each attempt (STUDIO-831's
+    /// bisection, bounded but not free), and it makes slow progress: all-refused ids halve down to
+    /// single-id leaves about seven queries at a time, so a full [`MAX_LIFECYCLE_REFRESH`] page
+    /// pins only a handful of them per window and the rest are abandoned and re-asked.
     ///
     /// The gate still bounds the FREQUENCY, which is what turns that from unbounded into a number:
     /// 16 attempts an hour costing at most `MAX_ISOLATION_QUERIES + 2` requests each. Recorded here
     /// so that anyone retuning either constant sees the quota cost move — and note this shape
     /// cannot arise from the listing, which keeps `pr:` keys out of the batch; it is the class,
     /// reached only by an id shape nobody has met yet.
+    ///
+    /// **It is not the path's worst hour, and an operator budgeting from this number alone would
+    /// under-count.** Costliest-per-attempt is not costliest-per-hour, because the gate does not
+    /// bound every shape's frequency: a page carrying one refused id is cheaper per attempt and
+    /// runs at the ungated TTL cadence, which nets out larger. That is
+    /// [`a_page_with_one_refused_id_is_the_expensive_shape`], and the two are asserted against each
+    /// other there so this comment cannot go back to claiming the crown.
     #[tokio::test]
     async fn even_a_wholly_refused_page_stays_under_a_stated_hourly_ceiling() {
-        /// 16 windows × (2 batches + 32 isolation queries).
-        const HOURLY_CEILING: usize = 544;
-
         let mut f = Fake::default();
         f.states_by_ids_func = Some(Box::new(|_| Err(invalid_input())));
         let tr = Arc::new(f);
@@ -3170,8 +3203,160 @@ mod tests {
 
         assert_eq!(
             tr.by_id_calls(),
-            HOURLY_CEILING,
+            WHOLLY_REFUSED_HOURLY,
             "a wholly-refused page must stay inside its stated ceiling; it spent {} requests",
+            tr.by_id_calls(),
+        );
+    }
+
+    /// THE ASYMMETRY the fix is built on, and until this test three documents asserted it and
+    /// nothing in the repository held them to it. A refusal is a VERDICT about one id — it
+    /// memoizes as a bounded negative and does not repeat — so it must not arm the [`Gate`]; only
+    /// a round trip that came back with nothing said about the batch does. Conflating the two is a
+    /// one-line edit in [`fetch_by_ids`], immediately before `fetched.covered.extend(iso.refused)`:
+    ///
+    /// ```text
+    /// if !iso.refused.is_empty() { fetched.degraded = true; }
+    /// ```
+    ///
+    /// and it trades this ticket's defect for precisely the outcome the acceptance criteria
+    /// forbid: one malformed id on a page drags every HEALTHY ticket batched with it onto the
+    /// backoff ladder, so the console's status column carries up to [`MAX_LIFECYCLE_BACKOFF_MS`]
+    /// of staleness because a neighbouring row has a bad id.
+    ///
+    /// **The assertion is the healthy id's REFRESH RATE, not a total**, because the rate is what
+    /// the ladder moves: across the same simulated hour the healthy id must keep its 60
+    /// [`LIFECYCLE_TTL`] windows. Under the conflation it gets 16, the gated cadence.
+    ///
+    /// Neither neighbouring test can see that, which is why this one exists:
+    ///
+    ///   * `a_refused_id_is_memoized_for_one_ttl_window_and_then_re_asked` re-probes at exactly
+    ///     one TTL, and the first mutated wait is [`Gate::wait_after`]`(1)` = 10s, so the gate has
+    ///     long since reopened by the time it looks. A single refusal never climbs the ladder, and
+    ///     the ladder is where the damage is.
+    ///   * `even_a_wholly_refused_page_stays_under_a_stated_hourly_ceiling` does poll for an hour,
+    ///     but its `degraded` is already set by `iso.abandoned`, so it spends the same 544 with the
+    ///     conflation in or out.
+    ///
+    /// [`refuses_input`] and [`Fetched::degraded`] are the two seams a later edit is most likely to
+    /// blur — a `?`-shaped refactor folding "we logged a warning" into `degraded` is one line — so
+    /// the guard is a rate over an hour rather than a shape a reader has to trust.
+    #[tokio::test]
+    async fn a_refused_id_must_not_slow_the_healthy_ids_batched_with_it() {
+        /// One refresh per [`LIFECYCLE_TTL`] window across [`POLLS`] seconds: t=0, 60, … 3540.
+        const TTL_REFRESHES: usize = 60;
+        /// Each window: the batch, refused; then its two halves — one answers for the healthy id,
+        /// one pins the refusal to its own id.
+        const ROUND_TRIPS: usize = TTL_REFRESHES * 3;
+
+        const HEALTHY: &str = "2cc5fcd2";
+        const REFUSED: &str = "pr:makewhatis/rhapsody#141@jimmy";
+
+        // Counts the round trips that ANSWERED about the healthy id, which is the refresh the
+        // console's status column actually gets — `by_id_calls` alone cannot distinguish it from
+        // the refusals and the isolation queries batched around it.
+        let refreshed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&refreshed);
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(move |ids| {
+            if ids.iter().any(|id| crate::review::is_review_key(id)) {
+                return Err(invalid_input());
+            }
+            if ids.iter().any(|id| id == HEALTHY) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(ids.iter().map(|id| issue(id, "Done")).collect())
+        }));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let ids: Vec<String> = [HEALTHY, REFUSED].iter().map(|s| s.to_string()).collect();
+        let t0 = Instant::now();
+
+        for s in 0..POLLS {
+            let got = cache
+                .resolve(
+                    &ids,
+                    Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+            // Every poll in the hour, not just the ones that queried: the healthy row is decorated
+            // from the memo between windows, so a rate that survives while the answer goes missing
+            // would not be the property claimed.
+            assert_eq!(
+                got.get(HEALTHY).map(|d| d.lifecycle),
+                Some(IssueLifecycle::Done),
+                "the healthy id must stay decorated on every poll, including from the memo",
+            );
+        }
+
+        let refreshed = refreshed.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            refreshed, TTL_REFRESHES,
+            "a refused id must leave the healthy ids batched with it on the TTL cadence: \
+             {refreshed} refreshes in the hour, not {TTL_REFRESHES}",
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            ROUND_TRIPS,
+            "and it must cost the isolation once per window, not once per poll; it spent {}",
+            tr.by_id_calls(),
+        );
+    }
+
+    /// Which failure shape is actually the expensive one, measured — because the answer is not the
+    /// one the other two ceilings suggest, and an operator budgeting quota from
+    /// [`WHOLLY_REFUSED_HOURLY`] alone would under-count by 43%.
+    ///
+    /// Costliest per ATTEMPT is not costliest per HOUR. A wholly-refused page is the worst single
+    /// attempt this path can make, but it is degraded, so the [`Gate`] holds it to 16 attempts an
+    /// hour. A page carrying ONE refused id is not degraded at all — deliberately, that is
+    /// [`a_refused_id_must_not_slow_the_healthy_ids_batched_with_it`] — so it runs at the ungated
+    /// [`LIFECYCLE_TTL`] cadence, 60 times an hour, and being cheaper per attempt does not make up
+    /// for being nearly four times as frequent.
+    ///
+    /// **This is not a request to gate it.** Gating it is exactly the trade the asymmetry forbids:
+    /// it would buy the requests back with a stale console. The number is pinned because a stated
+    /// ceiling an ordinary failure exceeds is worse than no stated ceiling — and pinning it here
+    /// means retuning [`MAX_ISOLATION_QUERIES`], [`LIFECYCLE_BATCH`] or [`LIFECYCLE_TTL`] moves a
+    /// visible number rather than a silent one.
+    ///
+    /// Reachability, plainly: `handle_issue_runs` and `handle_issue_counts` both filter
+    /// [`crate::review::is_review_key`] out of `ids`, so for the states and review lookups this is
+    /// the CLASS and not the instance — the same standing [`WHOLLY_REFUSED_HOURLY`] already has.
+    #[tokio::test]
+    async fn a_page_with_one_refused_id_is_the_expensive_shape() {
+        /// A page the way the listing serves one — well inside [`LIFECYCLE_BATCH`], so the whole
+        /// page is one batch and the cost is the bisection that pins the single bad id.
+        const PAGE: usize = 50;
+
+        let mut f = Fake::default();
+        f.states_by_ids_func = Some(Box::new(|ids| {
+            if ids.iter().any(|id| crate::review::is_review_key(id)) {
+                return Err(invalid_input());
+            }
+            Ok(ids.iter().map(|id| issue(id, "Done")).collect())
+        }));
+        let tr = Arc::new(f);
+        let cache = LifecycleCache::default();
+        let mut ids: Vec<String> = (0..PAGE - 1).map(|i| format!("i{i}")).collect();
+        ids.push("pr:makewhatis/rhapsody#141@jimmy".to_string());
+        let t0 = Instant::now();
+
+        for s in 0..POLLS {
+            cache
+                .resolve(
+                    &ids,
+                    Some((Arc::clone(&tr) as Arc<dyn Tracker>, states())),
+                    t0 + Duration::from_secs(s),
+                )
+                .await;
+        }
+
+        assert_eq!(
+            tr.by_id_calls(),
+            PARTIALLY_REFUSED_HOURLY,
+            "a page with one refused id must cost its stated hourly maximum; it spent {}",
             tr.by_id_calls(),
         );
     }
