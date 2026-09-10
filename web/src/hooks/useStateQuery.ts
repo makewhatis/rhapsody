@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { HISTORY_ISSUES_QUERY_KEY } from "@/hooks/useHistory";
+import { HISTORY_ISSUES_QUERY_KEY, HISTORY_ISSUE_COUNTS_QUERY_KEY } from "@/hooks/useHistory";
 import { fetchState, postRefresh, type StateResponse } from "@/lib/api";
 
 export const STATE_QUERY_KEY = ["state"] as const;
@@ -42,7 +42,11 @@ export function useStateQuery(opts?: { enabled?: boolean }) {
 // inert for the rows unless the refresh happened to change the live set — a control that reports
 // less than it appears to, which is the failure this ticket exists to remove.
 //
-// By prefix, so the widened page and the rail badge's `{}` entry are both covered.
+// The strip's whole-store tally goes with them (STUDIO-828). It is a third read of the same
+// surface, and a Refresh that moved the rows while leaving the numbers above them on the previous
+// answer would be the disagreement this button is pressed to resolve.
+//
+// By prefix for the listing, so the widened page and the rail badge's `{}` entry are both covered.
 export function useRefresh() {
   const qc = useQueryClient();
   return useMutation({
@@ -50,6 +54,7 @@ export function useRefresh() {
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: STATE_QUERY_KEY });
       void qc.invalidateQueries({ queryKey: HISTORY_ISSUES_QUERY_KEY });
+      void qc.invalidateQueries({ queryKey: HISTORY_ISSUE_COUNTS_QUERY_KEY });
     },
   });
 }
