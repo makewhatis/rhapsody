@@ -113,7 +113,8 @@ export function useIssueCounts(opts?: { enabled?: boolean; refetchInterval?: num
     enabled: opts?.enabled ?? true,
     refetchInterval: opts?.refetchInterval ?? false,
     refetchOnWindowFocus: false,
-    placeholderData: keepPreviousData,
+    // No `placeholderData`: the key is constant, so there is no previous page to keep across a
+    // re-key — react-query already serves the last successful answer while the next is in flight.
   });
 }
 

@@ -1125,6 +1125,26 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
     vi.useRealTimers();
   });
 
+  // The ↻ control is the operator asking for the current truth about the surface in front of them,
+  // and since STUDIO-828 that surface is three reads rather than two. A Refresh that moved the rows
+  // and left the numbers above them on the previous answer would be the disagreement it is pressed
+  // to resolve, so `useRefresh` invalidates the tally as well.
+  it("moves the strip as well as the rows when the operator clicks Refresh", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    serveStore(store(3));
+    mount();
+
+    await waitFor(() => expect(stat("needs you")).toBe("3"));
+
+    serveStore([
+      ...store(2),
+      run({ issue_identifier: "T-2", outcome: "completed", lifecycle: "done", tracker_state: "Done" }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
+
+    await waitFor(() => expect(stat("needs you")).toBe("2"));
+  });
+
   // The other half of defect B, and the one STUDIO-792 deliberately left open: a WIDENED window came
   // off the refresh cadence entirely, so its rows kept the answer they had when the page was opened
   // for as long as it stayed open. It is back on a cadence — the tracker's own, since that is the
@@ -1406,11 +1426,14 @@ describe("a Jobs list left open (STUDIO-791)", () => {
   // page stays open.
   //
   // Note which way that failure actually falls, because it is not the one the ticket predicted. The
-  // strip does not tick on ahead of the rows here: `consoleJobCounts` counts the SAME merged array
-  // the table renders, so a stale history row pins the header count as surely as it pins the row.
-  // Live and stored disagreeing is what produces the visible mess, and which half is wrong depends
-  // on the transition — a run STARTING shows up in the strip at once (the live snapshot carries it)
-  // while the row's stored columns lag, and a run FINISHING freezes both, as here.
+  // strip does not tick on ahead of the rows here. When this was written the reason was that the
+  // counts were folded from the SAME merged array the table renders, so a stale history row pinned
+  // the header count as surely as it pinned the row; since STUDIO-828 the strip reads a separate
+  // daemon-computed tally, and the two are held together instead by sharing one cadence and one
+  // pull-forward. Either way, live and stored disagreeing is what produces the visible mess, and
+  // which half is wrong depends on the transition — a run STARTING shows up in the strip at once
+  // (the live snapshot carries it) while the row's stored columns lag, and a run FINISHING freezes
+  // both, as here.
   it("moves its rows and its header together when a run finishes, with no Refresh click", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     h.fetchState.mockResolvedValue({ ...EMPTY_STATE, running: [LIVE] });
@@ -1490,9 +1513,10 @@ describe("a Jobs list left open (STUDIO-791)", () => {
       await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 500);
     });
 
-    // Both halves, together — which is the ticket's second acceptance clause. They cannot disagree
-    // by construction (`consoleJobCounts` folds the same merged array the table renders), so the
-    // point of asserting both is that ONE stale fetch freezes both, and only the poll thaws them.
+    // Both halves, together — which is the ticket's second acceptance clause. Since STUDIO-828 they
+    // are no longer one fetch: the row comes from the listing and the count from the whole-store
+    // tally, two queries on the same cadence. That makes asserting both worth more than it was, not
+    // less — it is now possible for one to move without the other, and this says they do not.
     expect(rowStatus("B-2")).toContain("in review");
     expect(stat("needs you")).toBe("1");
   });

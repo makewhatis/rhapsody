@@ -175,7 +175,7 @@ pub(crate) async fn handle_issue_runs(
 /// WHAT IT COSTS THE TRACKER, AND THE LOOKUP THAT IS DELIBERATELY NOT MADE. This asks about every
 /// issue rather than a page, so the lifecycle refresh is `ceil(issues / LIFECYCLE_BATCH)` round
 /// trips — five, at the operator's 425 issues — and the shared TTL memo bounds that to once per
-/// [`rhapsody_orchestrator::lifecycle::LIFECYCLE_TTL`] window for the whole daemon, however many
+/// [`rhapsody_orchestrator::LIFECYCLE_TTL`] window for the whole daemon, however many
 /// consoles are open and however fast they poll. It is not free (about 300 GraphQL requests an hour
 /// while a console is open) and it is the price of counting the store by the rule the rows use.
 ///
@@ -205,7 +205,7 @@ pub(crate) async fn handle_issue_counts(
     }
     // Every issue in the store, deliberately unpaged: a tally that stopped at a page size would be
     // the defect this endpoint exists to remove, one indirection further from the operator. The row
-    // set is bounded by the number of ISSUES the daemon has ever run (424 on the operator's own
+    // set is bounded by the number of ISSUES the daemon has ever run (425 on the operator's own
     // store when this landed), the same set `GET /api/v1/history/issues?limit=…` already lets any
     // client ask for in one request, and the response it produces is O(1) in that number.
     let runs = match provider.history().list_issue_runs(RunFilter {
