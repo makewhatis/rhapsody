@@ -205,6 +205,40 @@ export interface IssueRunsResponse {
   next_offset: number | null;
 }
 
+// IssueStatusBucket is one cell of the whole-store per-status tally (STUDIO-828): a distinct
+// combination of the STATUS INPUTS an issue carries, plus how many issues in the store carry it.
+//
+// The fields are spelled exactly as IssueRun spells the same facts, and mean exactly the same
+// things — including the absences. The daemon deliberately does NOT send the console's five
+// numbers: the strip's count has to be derived by the same rule the row's pill is, and the only
+// way to guarantee one rule is one implementation of it. That implementation is `consoleJobStatus`
+// / `needsOperator` (lib/console-jobs.ts), which owns the vocabulary; the daemon does the half the
+// client cannot, which is folding every issue in the store rather than the page it fetched.
+export interface IssueStatusBucket {
+  // The run outcome the worklist's `jobStatus` would see: the stored row's outcome, or "running"
+  // when the daemon has the ticket live or parked for retry (the daemon folds its own snapshot in,
+  // exactly as `mergeJobs` does, so a retry-parked ticket is not in a different bucket from its row).
+  outcome: string;
+  lifecycle?: IssueLifecycle;
+  review_ticket?: boolean;
+  review_run?: boolean;
+  count: number;
+}
+
+// IssueCountsResponse is the GET /api/v1/history/issues/counts payload (STUDIO-828): the per-status
+// tally behind the Now strip, computed over EVERY issue in the store. `issues` is how many issues
+// the tally covers and equals the sum of the buckets' counts.
+//
+// This exists because the strip's counts used to be a fold over whatever page the console had
+// fetched, so they grew when the operator loaded more rows and were capped by the window — the same
+// defect TRA-320 fixed for the header's day totals, and the same fix: a figure the daemon computes
+// over the store. It takes no filters at all; the Seg and project Select the strip renders beside
+// are explicitly scoped to the loaded rows (see `consoleJobsPageNote`).
+export interface IssueCountsResponse {
+  issues: number;
+  buckets: IssueStatusBucket[];
+}
+
 // DaySummary is the GET /api/v1/history/summary payload (TRA-320): whole-store totals over the runs
 // that STARTED at or after `since`, computed in the daemon's SQL rather than folded over whatever
 // page the client happens to hold. `total_tokens` is the cache-INCLUSIVE billed total, so the
@@ -553,6 +587,17 @@ export async function fetchIssueRuns(f: HistoryFilter): Promise<IssueRunsRespons
   // Defensive: tolerate a server that omits/nulls issues so the table can .map() safely.
   r.issues ??= [];
   r.next_offset ??= null;
+  return r;
+}
+
+// fetchIssueCounts reads the daemon-computed per-status tally over every issue in the store — the
+// Now strip's numbers (STUDIO-828). Unfiltered by design; see IssueCountsResponse.
+export async function fetchIssueCounts(): Promise<IssueCountsResponse> {
+  const r = await getJSON<IssueCountsResponse>("/api/v1/history/issues/counts");
+  // Defensive, on the same terms as fetchIssueRuns: a payload with no buckets is a store with no
+  // issues, which the strip renders as four zeroes rather than as nothing.
+  r.buckets ??= [];
+  r.issues ??= 0;
   return r;
 }
 

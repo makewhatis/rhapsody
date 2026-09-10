@@ -266,6 +266,43 @@ midnight. This preserves the local-day semantics the client-side fold had; a UTC
 silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
 meaning, so the header's `cached = total − in − out` reconciliation still adds up.
 
+### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828)
+
+A third **additive**, Rhapsody-only history endpoint, for the same reason the two above exist and
+against the same rule: *a total is never a page.* The console's Now strip — running / queued /
+blocked / needs you — folded its numbers out of whatever rows the client had fetched, so every one
+of them grew when the operator clicked "Load more" and none could report more than the window held.
+Measured on the operator's own daemon, the strip could not name more than 50 of 425 issues.
+
+| Endpoint | Serves |
+| --- | --- |
+| `GET /api/v1/history/issues/counts` | how many ISSUES in the whole store carry each distinct combination of status inputs |
+
+It takes no filters. The Seg and project Select the strip renders beside it are explicitly scoped to
+the loaded rows (the worklist says so in words), while the strip asks about the store.
+
+**It counts inputs, not statuses**, and that is the load-bearing decision. The count has to be
+derived by the same rule the row's pill is, or the strip and the table disagree — which is worse
+than either being wrong alone — and the only way to guarantee one rule is to keep one implementation
+of it. That implementation is the console's, which owns the vocabulary ("in review", "reviewing",
+"needs you"); the daemon does the half a client cannot, folding every issue rather than a page, and
+serves the same per-row facts `GET /api/v1/history/issues` already serves, grouped:
+
+```json
+{"issues": 425,
+ "buckets": [{"outcome": "completed", "lifecycle": "done", "count": 300},
+             {"outcome": "completed", "review_run": true, "count": 6},
+             {"outcome": "running", "count": 2}]}
+```
+
+Each bucket spells its fields exactly as a listing row spells them, absences included, so the two
+endpoints speak one vocabulary. The lifecycle and label lookups are filtered by
+`review::is_review_key` exactly as the listing filters them (STUDIO-831) — one synthetic
+`pr:owner/repo#n@reviewer` id in a Linear `id: { in: … }` batch fails the whole request, silently —
+and the snapshot's `running`/`retrying` sets are folded in the way the worklist folds them, so a
+retry-parked ticket is not counted in a different bucket from its own row. Go has neither the issue
+listing nor an aggregate over it.
+
 ### Daemon-mediated review handoff — `POST /api/v1/runs/{id}/handoff` (TRA-242)
 
 Go has no analogue: an agent that finished its work moved its own ticket to the review state through

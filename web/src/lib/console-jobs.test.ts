@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { IssueRun, TeamsOverview } from "@/lib/api";
+import type { IssueCountsResponse, IssueRun, TeamsOverview } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 import {
   CONSOLE_JOB_FILTERS,
@@ -9,6 +9,7 @@ import {
   consoleJobCounts,
   consoleJobProjects,
   consoleJobStatus,
+  consoleStoreCounts,
   durableAssignees,
   filterConsoleJobs,
   lastActivityByIssue,
@@ -1016,5 +1017,135 @@ describe("consoleJobsPageNote", () => {
   // would re-ask for rows already held (smaller) or skip the daemon's page boundary (larger).
   it("steps by the store's own default page size", () => {
     expect(JOBS_PAGE_SIZE).toBe(50);
+  });
+});
+
+// STUDIO-828 — the Now strip's five numbers now come from a figure the daemon computes over every
+// issue in the store, instead of from a fold over the rows this client happened to fetch.
+describe("consoleStoreCounts", () => {
+  function counts(buckets: IssueCountsResponse["buckets"]): IssueCountsResponse {
+    return { issues: buckets.reduce((n, b) => n + b.count, 0), buckets };
+  }
+
+  // Before the first response there is no answer, and the strip renders "—". A zero would be a
+  // claim that the store is empty, which is the sort of number this ticket exists to stop the
+  // console inventing.
+  it("has no answer until the daemon has given one", () => {
+    expect(consoleStoreCounts(undefined)).toBeUndefined();
+  });
+
+  it("applies the row's own rule to each bucket, weighted by its count", () => {
+    expect(
+      consoleStoreCounts(
+        counts([
+          { outcome: "running", count: 2 },
+          { outcome: "completed", lifecycle: "in_review", count: 7 },
+          { outcome: "completed", lifecycle: "done", count: 300 },
+          { outcome: "completed", lifecycle: "open", count: 1 },
+          { outcome: "failed", lifecycle: "open", count: 3 },
+        ]),
+      ),
+    ).toEqual({ running: 2, review: 7, queued: 1, blocked: 3, needsYou: 10 });
+  });
+
+  // The two review markers reach the tally as they reach a row, and mean the same things there:
+  // a live REVIEW TICKET is an agent doing a review (counted as running), and a FINISHED review RUN
+  // is done rather than awaiting one — the "Needs you" inflation STUDIO-826 fixed on the rows.
+  it("reads the two review markers exactly as a row does", () => {
+    expect(
+      consoleStoreCounts(
+        counts([
+          { outcome: "running", review_ticket: true, count: 1 },
+          { outcome: "completed", review_run: true, count: 4 },
+          // One ordinary answered ticket, so the needs-you gate below is open and its zero is a
+          // real zero rather than the "—" a wholly unanswered payload gets.
+          { outcome: "completed", lifecycle: "done", count: 1 },
+        ]),
+      ),
+    ).toEqual({ running: 1, review: 0, queued: 0, blocked: 0, needsYou: 0 });
+  });
+
+  // The outage gate, moved from the page to the payload and unchanged in meaning: when the daemon
+  // resolved NO lifecycle at all, every `completed` is inferred into "in review" and a count over
+  // that would be a number the console invented. Some bucket answering is enough — a store where
+  // most tickets are unknown is a healthy tracker that does not know every ticket.
+  it("refuses a needs-you number when the tracker answered nothing, and gives one when it did", () => {
+    expect(
+      consoleStoreCounts(counts([{ outcome: "completed", count: 2 }]))?.needsYou,
+    ).toBeNull();
+    expect(
+      consoleStoreCounts(
+        counts([
+          { outcome: "completed", count: 2 },
+          { outcome: "completed", lifecycle: "done", count: 1 },
+        ]),
+      )?.needsYou,
+    ).toBe(2);
+    // An empty store is knowable: nothing is waiting because there is nothing.
+    expect(consoleStoreCounts(counts([]))).toEqual({
+      running: 0,
+      review: 0,
+      queued: 0,
+      blocked: 0,
+      needsYou: 0,
+    });
+  });
+
+  // The acceptance criterion the strip and the table share: a count is derived by the SAME rule the
+  // row's pill is. Pinned by folding one store both ways — through the row pipeline the table uses,
+  // and through the buckets the daemon serves for the same tickets — and asserting they agree.
+  //
+  // This is what makes the daemon's choice to group INPUTS rather than statuses checkable. Were the
+  // daemon to send its own five numbers instead, nothing on this side could tell whether they had
+  // been derived by the same rule; here the two answers are computed from the same facts by the
+  // same function and the fixture would have to be wrong for them to agree by accident.
+  it("agrees with the table's own tally over the same store", () => {
+    const rows: IssueRun[] = [
+      issueRow({ issue_identifier: "A", outcome: "running" }),
+      issueRow({ issue_identifier: "B", outcome: "completed", lifecycle: "in_review" }),
+      issueRow({ issue_identifier: "C", outcome: "completed", lifecycle: "done" }),
+      issueRow({ issue_identifier: "D", outcome: "completed", lifecycle: "open" }),
+      issueRow({ issue_identifier: "E", outcome: "failed", lifecycle: "open" }),
+      issueRow({ issue_identifier: "F", outcome: "completed" }),
+      issueRow({ issue_identifier: "G", outcome: "completed", review_run: true }),
+      issueRow({ issue_identifier: "H", outcome: "running", review_ticket: true }),
+    ];
+    const table = consoleJobCounts(
+      buildConsoleJobs(
+        rows.map((r) => job({ issue: r.issue_identifier, status: r.outcome as JobRow["status"] })),
+        rows,
+        undefined,
+        NOW,
+      ),
+    );
+    // What `handle_issue_counts` serves for exactly those tickets: one bucket per distinct
+    // combination of the same per-row facts.
+    const strip = consoleStoreCounts(
+      counts([
+        { outcome: "running", count: 1 },
+        { outcome: "running", review_ticket: true, count: 1 },
+        { outcome: "completed", lifecycle: "in_review", count: 1 },
+        { outcome: "completed", lifecycle: "done", count: 1 },
+        { outcome: "completed", lifecycle: "open", count: 1 },
+        { outcome: "failed", lifecycle: "open", count: 1 },
+        { outcome: "completed", count: 1 },
+        { outcome: "completed", review_run: true, count: 1 },
+      ]),
+    );
+    expect(strip).toEqual(table);
+    expect(strip).toEqual({ running: 2, review: 2, queued: 1, blocked: 1, needsYou: 3 });
+  });
+
+  // The held dependents the daemon's tally cannot see (`state.blocked`) are added by the client, so
+  // the strip does not silently drop a row the table draws. Inert on a Rhapsody daemon — the Rust
+  // snapshot carries no such set — which is exactly why it is pinned rather than assumed.
+  it("adds the live snapshot's held dependents, which the daemon's tally cannot carry", () => {
+    const payload = counts([{ outcome: "completed", lifecycle: "done", count: 1 }]);
+    expect(consoleStoreCounts(payload)?.blocked).toBe(0);
+    const withHeld = consoleStoreCounts(payload, [{}, {}]);
+    expect(withHeld?.blocked).toBe(2);
+    // A held ticket waits on its PREDECESSOR, not on the operator — the same rule `needsOperator`
+    // applies to the row, reached through the same call.
+    expect(withHeld?.needsYou).toBe(0);
   });
 });
