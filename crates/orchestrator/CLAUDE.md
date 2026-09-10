@@ -52,6 +52,16 @@ the `Orchestrator` struct itself. Concretely:
     because a ticket's runs can disagree about who ran them) — a read-only use of the same
     `Arc<dyn Store>` the handle already carries, never a write.
 
+    Each of the three memos has a `Mutex<Gate>` beside it (STUDIO-836) — the per-lookup failure
+    backoff. A memo bounds how often a lookup that ANSWERS re-asks; nothing bounded one that FAILS,
+    because a failure memoizes nothing, so every console poll re-issued the whole batch (~60
+    requests/min against a 2500/hour quota, self-sustaining once the quota was what was failing).
+    The gate is claimed on ENTRY, not on result, so the ceiling holds however many consoles poll at
+    once. If you add a fourth decoration here, give it a gate too; and if you change what counts as
+    a failure, read `Fetched::degraded` first — a round trip that said nothing arms the gate, while
+    a REFUSAL of a particular id is a verdict that memoizes as a bounded negative instead, and
+    conflating them either re-opens the storm or makes one bad id stall every healthy row with it.
+
   If you need to touch orchestrator state from outside the loop task, route through one of these
   five seams; if none fits, that's a real design decision — don't reach for a sixth ad hoc
   `Arc<Mutex<..>>` without updating this list.
