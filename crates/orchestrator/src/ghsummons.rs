@@ -165,15 +165,24 @@ impl GH {
         }
     }
 
-    /// Runs `gh` with `args` on tokio's BLOCKING pool and awaits the result (STUDIO-811).
+    /// Runs `gh` with `args` on tokio's BLOCKING pool and awaits the result (STUDIO-811,
+    /// STUDIO-829). **Every `gh` exec in this module goes through here** — there is no other way to
+    /// reach the runner, and `every_gh_exec_goes_through_the_blocking_pool` is what keeps it so.
     ///
     /// [`RunFn`] is synchronous — the real one shells out with [`std::process::Command`] — so calling
-    /// it inline made [`SummonSource::summons_since`] a future that never yields, and a future that
-    /// never yields cannot be cancelled: `ghenrich`'s surrounding [`tokio::time::timeout`] had no
-    /// poll at which to fire, and the control task that drove it stalled for however long `gh` took.
-    /// Handing the call to `spawn_blocking` and awaiting the join turns each `gh` invocation into a
-    /// real yield point, which is what makes that timeout — and the poll path's per-tick enrichment
-    /// budget — enforceable rather than advisory.
+    /// it inline made the calling method a future that never yields, and a future that never yields
+    /// cannot be cancelled: a surrounding [`tokio::time::timeout`] has no poll at which to fire, and
+    /// the task driving it stalls for however long `gh` takes. Worse, a future that never yields
+    /// holds the tokio WORKER THREAD rather than merely its own task, and the control loop and the
+    /// HTTP server share that pool — so enough concurrent stalls stop dispatch while the daemon
+    /// still looks healthy. Handing the call to `spawn_blocking` and awaiting the join turns each
+    /// `gh` invocation into a real yield point, which is what makes a timeout — `ghenrich`'s
+    /// [`crate::ghenrich::GH_SUMMONS_TIMEOUT`], `quorum`'s open-PR bound, and [`GH_EXEC_TIMEOUT`]
+    /// below — enforceable rather than advisory.
+    ///
+    /// STUDIO-811 did this for [`SummonSource::summons_since`] alone; the other seven seams
+    /// (the console merge path, review comment posting, the quorum's and the review watcher's
+    /// lookups) were still inline until STUDIO-829 routed them here too.
     ///
     /// A cancelled await abandons the join handle, not the thread: the `gh` process still runs to
     /// completion on the blocking pool and its output is dropped. That is the only cancellation a
@@ -285,9 +294,12 @@ impl OpenPrSource for GH {
             "--limit",
             PR_LIST_LIMIT,
         ];
-        let body = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("gh pr list --repo {slug} --head {branch}: {e}").into()
-        })?;
+        let body = self
+            .run_off_task(args.map(String::from).into())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr list --repo {slug} --head {branch}: {e}").into()
+            })?;
         let prs: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("decode gh pr list --repo {slug} --head {branch}: {e}").into()
@@ -358,9 +370,12 @@ impl PrBranchSource for GH {
             "--json",
             "headRefName,headRepositoryOwner",
         ];
-        let body = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("gh pr view {num} --repo {slug}: {e}").into()
-        })?;
+        let body = self
+            .run_off_task(args.map(String::from).into())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr view {num} --repo {slug}: {e}").into()
+            })?;
         let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("decode gh pr view {num} --repo {slug}: {e}").into()
@@ -447,9 +462,11 @@ impl PrCommentSink for GH {
             "--body",
             body,
         ];
-        (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("gh pr comment {num} --repo {slug}: {e}").into()
-        })?;
+        self.run_off_task(args.map(String::from).into())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr comment {num} --repo {slug}: {e}").into()
+            })?;
         Ok(())
     }
 }
@@ -581,9 +598,12 @@ impl MergeSource for GH {
         if auto {
             args.push("--auto");
         }
-        let out = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("gh pr merge {num} --repo {slug}: {e}").into()
-        })?;
+        let out = self
+            .run_off_task(args.into_iter().map(String::from).collect())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr merge {num} --repo {slug}: {e}").into()
+            })?;
         // Lossy, and bounded by characters rather than bytes so the cap cannot split one: this is
         // `gh`'s console chatter on its way into an audit record, not a value anything parses.
         let said = String::from_utf8_lossy(&out);
@@ -660,9 +680,12 @@ impl MergeStateSource for GH {
             "--json",
             "mergeStateStatus",
         ];
-        let body = (self.run)(&args).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("gh pr view {num} --repo {slug}: {e}").into()
-        })?;
+        let body = self
+            .run_off_task(args.map(String::from).into())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr view {num} --repo {slug}: {e}").into()
+            })?;
         let pr: serde_json::Value = serde_json::from_slice(&body).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("decode gh pr view {num} --repo {slug}: {e}").into()
@@ -719,9 +742,16 @@ impl BranchUpdateSource for GH {
             return Err(format!("gh api repos: incomplete coordinate {owner}/{repo}").into());
         }
         let ep = format!("repos/{owner}/{repo}");
-        let body = (self.run)(&["api", ep.as_str(), "--jq", ".allow_update_branch"]).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> { format!("gh api {ep}: {e}").into() },
-        )?;
+        let body = self
+            .run_off_task(
+                ["api", ep.as_str(), "--jq", ".allow_update_branch"]
+                    .map(String::from)
+                    .into(),
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh api {ep}: {e}").into()
+            })?;
         match String::from_utf8_lossy(&body).trim() {
             "true" => Ok(true),
             "false" => Ok(false),
@@ -918,7 +948,7 @@ impl PrStateSource for GH {
             "--json",
             "headRefOid,state,mergedAt,headRepository,headRepositoryOwner",
         ];
-        let body = match (self.run)(&args) {
+        let body = match self.run_off_task(args.map(String::from).into()).await {
             Ok(b) => b,
             Err(e) => {
                 let msg = e.to_string();
@@ -2313,6 +2343,57 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(300),
             "the caller must be released at its own deadline, waited {elapsed:?}"
+        );
+    }
+
+    /// STUDIO-829: every `gh` exec in this module reaches the subprocess through
+    /// [`GH::run_off_task`], and this test is what keeps it that way.
+    ///
+    /// The property is architectural rather than behavioural, which is why it is asserted on
+    /// source. An inline `(self.<runner>)(…)` call compiles, passes every other test in this file,
+    /// and silently reintroduces the defect STUDIO-811 fixed for one call site: [`RunFn`] is
+    /// synchronous, so a future that calls it inline has no await point, holds a tokio WORKER
+    /// thread — not merely its own task — for the whole round-trip, and cannot be cancelled by any
+    /// `tokio::time::timeout` placed around it. Seven of this module's eight `gh` seams were that
+    /// shape until STUDIO-829. Nothing observable at run time distinguishes the two, so the check
+    /// is on this module's own text, exactly as
+    /// `runmerge::the_resolve_half_is_never_handed_the_merge_seam` is on its.
+    #[test]
+    fn every_gh_exec_goes_through_the_blocking_pool() {
+        let src = include_str!("ghsummons.rs");
+        // Assembled at run time so this test's own source is not itself an occurrence of the thing
+        // it forbids.
+        let field: String = ["self", ".", "run"].concat();
+        // A `run_off_task` CALL names the same prefix but reaches the helper rather than past it
+        // to the runner, so it is not an occurrence. Every other way of naming the field is — an
+        // inline call, an `Arc::clone` of it, a borrow bound to a local.
+        let uses: Vec<usize> = src
+            .match_indices(field.as_str())
+            .map(|(at, _)| at)
+            .filter(|&at| !src[at + field.len()..].starts_with("_off_task"))
+            .collect();
+
+        let start = src
+            .find("async fn run_off_task(")
+            .expect("the blocking-pool helper is still called run_off_task");
+        let end = start
+            + src[start..]
+                .find("\n    }")
+                .expect("run_off_task is still a braced method inside an impl block");
+
+        assert_eq!(
+            uses.len(),
+            1,
+            "the `gh` runner is named {} times in ghsummons; it must be reached ONLY from \
+             run_off_task, or the exec blocks a tokio worker thread and no timeout around it can \
+             ever fire (STUDIO-829)",
+            uses.len()
+        );
+        assert!(
+            (start..end).contains(&uses[0]),
+            "the `gh` runner is named at byte {}, outside run_off_task ({start}..{end}); route \
+             that exec through the blocking-pool helper instead (STUDIO-829)",
+            uses[0]
         );
     }
 }
