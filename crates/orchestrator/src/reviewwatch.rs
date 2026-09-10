@@ -390,8 +390,9 @@ impl Orchestrator {
                     // the ticket is finished (STUDIO-712). A closed-unmerged pull request is
                     // ABANDONED work whose ticket still needs a human; it is deliberately left
                     // where it is rather than auto-Cancelled, because that would destroy the one
-                    // signal a maintainer has that something needs picking up. The plan is built
-                    // BEFORE the retirement below, which drops the rows it reads the ticket off.
+                    // signal a maintainer has that something needs picking up. The ticket is
+                    // read off `rows` — this tick's in-memory snapshot — so the retirement below
+                    // cannot race it, whichever order the two run in.
                     let why = if snap.status == PrStatus::Merged {
                         report.done.extend(self.plan_review_done(&rows, &obs.pr));
                         "merged"

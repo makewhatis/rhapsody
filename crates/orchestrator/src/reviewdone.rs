@@ -107,7 +107,8 @@ impl Orchestrator {
     /// terminal state it should move to — or `None` when this daemon must not, or cannot, move one.
     ///
     /// `rows` is the tick's watch-set snapshot, passed in rather than re-read because the caller
-    /// retires these very rows in the same breath: read the origin first, then drop it.
+    /// retires these very rows in the same breath — reading the STORE here would race that
+    /// retirement, and reading the snapshot cannot, whichever order the two run in.
     ///
     /// `None` covers five distinct situations, all of them quiet by design except the two that
     /// point at a real problem:
@@ -206,10 +207,12 @@ mod tests {
     use rhapsody_store::{
         REVIEW_STATUS_REQUESTED, ReviewWatchKey, ReviewWatchRow, RunStart, Sqlite, StorePath,
     };
+    use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
     use crate::reviewintro::REVIEW_ORIGIN_CONSOLE;
+    use crate::reviewwatch::{ControlWatchSink, ReviewWatchSink};
     use crate::testsupport::{empty_effective, set_of};
 
     const OWNER: &str = "makewhatis";
@@ -229,7 +232,12 @@ mod tests {
     }
 
     fn orch(teams: Teams) -> Orchestrator {
-        let tracker = Arc::new(Fake::new());
+        orch_tracked(teams, Arc::new(Fake::new()))
+    }
+
+    /// The same, over a tracker the CALLER keeps a handle on — what the two move tests read the
+    /// recorded `move_issue_state` call off.
+    fn orch_tracked(teams: Teams, tracker: Arc<Fake>) -> Orchestrator {
         let mut eff = empty_effective(tracker);
         eff.terminal_states = set_of(&["done"]);
         let mut o = Orchestrator::new("WORKFLOW.md");
@@ -452,6 +460,70 @@ mod tests {
         assert_eq!(
             o.plan_review_done(&[row(64, "handoff:STUDIO-712")], &coord(64)),
             None
+        );
+    }
+
+    /// The move itself, over the production chain the watcher task runs: `ControlWatchSink::finish`
+    /// → [`ControlHandle::finish_review_ticket`] → `Tracker::move_issue_state`. Through the SINK
+    /// rather than the handle directly, because the sink is the whole of what the task holds.
+    ///
+    /// The argument order is the point. A plan carries both a human identifier and an opaque issue
+    /// id, only one of them addresses the tracker, and a test that stops at a fake sink — proving
+    /// the task called `finish` — cannot tell them apart. Passing `identifier` where `issue_id`
+    /// belongs would send Linear `MoveIssueState("STUDIO-712", …)`, which it rejects, so every
+    /// merge would log a failed move and every ticket would stay in review: the feature dead in
+    /// exactly the way it exists to fix. This is the assertion that says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merged_pull_requests_ticket_is_moved_by_its_opaque_ids() {
+        let tr = Arc::new(Fake::new());
+        let o = orch_tracked(ticketless_done("Done"), Arc::clone(&tr));
+        run_of(&o, "STUDIO-712", "ID-712", "TEAM-1");
+        let plan = o
+            .plan_review_done(&[row(64, "handoff:STUDIO-712")], &coord(64))
+            .expect("a plan");
+
+        ControlWatchSink::new(o.control()).finish(plan).await;
+
+        let calls = tr.move_calls();
+        assert_eq!(calls.len(), 1, "move_calls = {calls:?}");
+        assert_eq!(
+            (
+                calls[0].issue_id.as_str(),
+                calls[0].team_id.as_str(),
+                calls[0].state_name.as_str()
+            ),
+            ("ID-712", "TEAM-1", "Done"),
+            "the opaque ids off the run row and the configured state, in that order"
+        );
+        assert!(
+            tr.move_to_type_calls().is_empty(),
+            "auto-done moves by NAME to the configured state, not by type"
+        );
+    }
+
+    /// The failure contract the doc comment promises: a tracker that REFUSES the move is logged and
+    /// dropped — [`ControlHandle::finish_review_ticket`] returns `()`, so there is no error to
+    /// swallow and nothing to retry against, and the ticket stays in review, which is where it sat
+    /// before this feature existed. The call is still recorded, so a ticket left in review is the
+    /// tracker's answer rather than a move this daemon quietly skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_move_is_logged_and_dropped() {
+        let mut fake = Fake::new();
+        fake.move_err = Some(TrackerError::Other("linear_move_rejected: nope".into()));
+        let tr = Arc::new(fake);
+        let o = orch_tracked(ticketless_done("Done"), Arc::clone(&tr));
+        run_of(&o, "STUDIO-712", "ID-712", "TEAM-1");
+        let plan = o
+            .plan_review_done(&[row(64, "handoff:STUDIO-712")], &coord(64))
+            .expect("a plan");
+
+        // Returns rather than panicking or propagating — the whole of the contract.
+        ControlWatchSink::new(o.control()).finish(plan).await;
+
+        assert_eq!(
+            tr.move_calls().len(),
+            1,
+            "the move was attempted; the tracker is what refused it"
         );
     }
 
