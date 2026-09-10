@@ -81,6 +81,13 @@
 //! `requested_sha`, not its `last_reviewed_sha`), which is what makes a repeat handoff while a
 //! review of the same head is still in flight fan out nothing — the record is already there.
 //!
+//! A head GitHub could not be asked about is an UNKNOWN head, and it resolves toward whichever
+//! mistake is cheaper. With nothing on record it fans out: nobody has been asked, so refusing would
+//! lose the review outright, which is the very failure above. With a head already on record it
+//! refuses: a review WAS requested, and a duplicate wakes a real agent against a real pull request
+//! for no reason — and, worse, would replace the record with the unknown head so the next
+//! successful lookup fanned out a third time.
+//!
 //! The two paths cannot share the *function*, because they do not share a subject:
 //! [`review_round_due`](crate::reviewwatch::review_round_due) matches over a store-backed
 //! [`ReviewWatchRow`](rhapsody_store::ReviewWatchRow)'s `status`, and the ticket path has no watch
@@ -588,10 +595,22 @@ where
     // one finished and nothing has been pushed since. Both mean the same thing — there is no new
     // work to review — which is precisely what a per-TICKET guard could not tell apart from "the
     // author pushed the fixes a reviewer asked for".
-    if requested_head == Some(head.as_str()) {
+    //
+    // An UNKNOWN head — [`resolve_open_pr`]'s attachment fallback, taken whenever the `gh` lookup
+    // fails or times out — reads the same way ONCE A HEAD IS ON RECORD. There, the blip is the only
+    // reason this handoff cannot name the head, and we already know a review was requested; fanning
+    // out would wake a second reviewer onto a diff someone is reading, and would overwrite the
+    // record with the unknown head so that the next SUCCESSFUL lookup woke a third. With NO head on
+    // record the trade runs the other way and the fallback stands: nothing has been asked, so
+    // refusing would turn a lookup blip into a missing review, which is the failure this whole
+    // ticket is about.
+    if let Some(prior) = requested_head
+        && (prior == head || head.is_empty())
+    {
         tracing::debug!(
             issue = %req.parent_identifier,
             head = %head,
+            %prior,
             "teams quorum already requested a review at this head; the repeat handoff fans out nothing"
         );
         return FanResult {
@@ -847,9 +866,10 @@ fn tracker_for(target: &QuorumTarget, req: &QuorumRequest) -> Arc<dyn Tracker> {
 /// dead.
 ///
 /// The attachment remains the FALLBACK, with an empty head: when GitHub answers nothing (or cannot
-/// be asked) and Linear says there is a pull request, the review still happens and only the
+/// be asked) and Linear says there is a pull request, the FIRST fan-out still happens and only the
 /// per-head granularity is lost. Refusing there would turn a lookup blip into a missing review,
-/// which is the failure this whole ticket is about.
+/// which is the failure this whole ticket is about. Once a head IS on record [`fan_out`] reads that
+/// same empty head as "already requested" instead — see the guard there for why the trade reverses.
 ///
 /// Every `None` is a DEBUG line except a lookup that FAILED, which is a warning: "GitHub says there
 /// is no PR" is a normal state of a ticket, while "we could not ask GitHub" is an operator problem
@@ -2998,6 +3018,54 @@ mod tests {
              it is addressed to has nothing to open: {}",
             posts[0].body
         );
+        signal.cancel();
+    }
+
+    // ── the lookup blip that must not duplicate a review (STUDIO-822) ───────────────────────────
+
+    // A `gh` failure answers an UNKNOWN head. When nothing has been requested yet that degrades to
+    // one fan-out, which is right — refusing there would lose a review outright. When a head is
+    // already on record it is the opposite: a review WAS requested, so fanning out again wakes a
+    // second reviewer onto a diff someone is already reading — and, because the blip would
+    // overwrite the record with the unknown head, the next SUCCESSFUL lookup at the same head
+    // would wake a third.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lookup_blip_does_not_re_review_a_head_already_requested() {
+        let tr = Arc::new(tracker_with_viewer());
+        // Answer, blip, answer: the same head either side of one failed `gh` call.
+        let nth = Arc::new(Mutex::new(0usize));
+        let src = FakePrSource::new(move || {
+            let mut n = nth.lock().unwrap_or_else(|e| e.into_inner());
+            *n += 1;
+            if *n == 2 {
+                Err("gh: rate limited".into())
+            } else {
+                Ok(Some(open_pr(PR, "head-a")))
+            }
+        });
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 1),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        let task = tokio::spawn(run_quorum_task(signal.wait(), d, rx));
+
+        let req = request(&["bob"]);
+        for _ in 0..3 {
+            tx.send(req.clone()).expect("send");
+        }
+        drop(tx);
+        task.await.expect("task joins");
+
+        assert_eq!(
+            tr.create_issue_calls().len(),
+            1,
+            "the blip must not wake a second reviewer, nor lose the recorded head and let the \
+             next successful lookup wake a third"
+        );
+        assert_eq!(src.calls().len(), 3, "every handoff still ASKS");
         signal.cancel();
     }
 
