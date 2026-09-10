@@ -456,14 +456,16 @@ pub struct Orchestrator {
     /// Cloned into every [`ControlHandle`](crate::stop::ControlHandle), which sends it after the
     /// review-state move succeeds — a handoff Linear refused has not happened, so it introduces
     /// nothing, exactly as it fans nothing out.
-    /// When each ticket was last considered by the ticketless ADOPTION sweep (STUDIO-838), so the
-    /// same ticket is not resolved to a pull request on every poll tick. Loop-confined, and swept
-    /// of anything older than `REVIEW_ADOPT_PROBE_INTERVAL` on every sweep — an entry that old
-    /// paces nothing — so it holds the review column as it stands rather than every ticket this
-    /// daemon has ever seen parked.
-    pub(crate) review_adopt_probed: std::collections::HashMap<String, std::time::Instant>,
     pub(crate) review_intro_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::reviewintro::ReviewIntroRequest>>,
+
+    /// When each ticket was last considered by the ticketless ADOPTION sweep (STUDIO-838), so the
+    /// same ticket is not resolved to a pull request on every poll tick. Loop-confined, and swept
+    /// of anything older than
+    /// [`REVIEW_ADOPT_PROBE_INTERVAL`](crate::reviewadopt::REVIEW_ADOPT_PROBE_INTERVAL) on every
+    /// sweep — an entry that old paces nothing — so it holds the review column as it stands rather
+    /// than every ticket this daemon has ever seen parked.
+    pub(crate) review_adopt_probed: std::collections::HashMap<String, std::time::Instant>,
 
     /// The off-loop ticketless review NOTIFICATION task's inbox (STUDIO-723, slice 9). `None`
     /// whenever the ticketless path is off or no task was spawned, in which case a review's exit
