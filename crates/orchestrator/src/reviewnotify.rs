@@ -48,11 +48,13 @@
 //!
 //! Posting is a `gh` call and [`crate::ghsummons::GH`] shells out through a synchronous
 //! `std::process::Command`, so it happens on this module's own task for
-//! [`crate::reviewintro::run_review_intro_task`]'s reason: the containment is structural rather
-//! than temporal (that future has no await point, so a `tokio::time::timeout` around it could never
-//! fire), and a hung `gh` must park the task that owns this subsystem's network I/O and nothing
-//! else. The control task decides ([`Orchestrator::plan_review_notify`], at the review's exit) and
-//! hands the decision over; it never waits for the post.
+//! [`crate::reviewintro::run_review_intro_task`]'s reason: a slow `gh` must park the task that owns
+//! this subsystem's network I/O and nothing else. The containment is structural first — that is
+//! what confines it — and temporal since STUDIO-829, which moved the exec onto tokio's blocking
+//! pool and capped it at `ghsummons::GH_EXEC_TIMEOUT`. Before that the exec had no await point, so
+//! a bound placed here would never have fired; this doc used to say so. The control task decides
+//! ([`Orchestrator::plan_review_notify`], at the review's exit) and hands the decision over; it
+//! never waits for the post.
 
 use std::sync::Arc;
 

@@ -13,25 +13,29 @@
 //! # Why this file holds no `Orchestrator`
 //!
 //! Everything here shells out through [`crate::ghsummons::GH`]'s synchronous
-//! `std::process::Command`. Its future has no await point, so a `tokio::time::timeout` around it
-//! cannot cancel it and whatever task drives it is blocked for the whole round-trip —
-//! [`crate::prstate`]'s finding, and the reason its sweep is a free function too. The containment
-//! is therefore **structural**: this module takes no `Orchestrator`, sends no control event and
-//! holds no lock the control task takes, so a stalled `gh` parks the task that called it and
-//! nothing else. Its callers are [`crate::mergeconsole`]'s [`crate::ControlHandle`] methods, which
-//! run on the HTTP request's own task — so a hung `gh` delays that one request. `prstate`'s
-//! standing `pr_state_is_never_called_from_the_control_loop` check knows this file by name.
+//! `std::process::Command`. That exec is handed to tokio's blocking pool by `GH::run_off_task`
+//! (STUDIO-811 for one seam, STUDIO-829 for the rest), so awaiting it is a real yield point: it
+//! parks its own task rather than a worker thread from the pool the HTTP server and the control
+//! loop share, and it is bounded — `ghsummons::GH_EXEC_TIMEOUT` caps every exec at 60s. Until
+//! STUDIO-829 neither was true here, and this doc claimed both.
 //!
-//! Two things about the READ half ([`mergeability`], STUDIO-790) sharpen that, and neither is a
+//! The containment is **also structural**, which is what keeps a stall from reaching anything else:
+//! this module takes no `Orchestrator`, sends no control event and holds no lock the control task
+//! takes, so a slow `gh` delays the task that called it and nothing else. Its callers are
+//! [`crate::mergeconsole`]'s [`crate::ControlHandle`] methods, which run on the HTTP request's own
+//! task — so a slow `gh` delays that one request. `prstate`'s standing
+//! `pr_state_is_never_called_from_the_control_loop` check knows this file by name.
+//!
+//! One thing about the READ half ([`mergeability`], STUDIO-790) sharpens that, and it is not a
 //! click: the console asks on every run-detail mount, and a question takes no single-flight claim
 //! (a probe must leave no trace, see [`crate::mergeconsole::MergeIntent`]) — so nothing bounds how
-//! many blocking `gh` resolutions can be in flight for one pull request at once. `rhapsodyd` is a
-//! multi-thread `#[tokio::main]` with no `spawn_blocking` on this path, so "parks the task" is
-//! really "parks a worker thread", from the pool the HTTP server and the control loop share.
-//! What keeps that small is the ORDER: `mergeconsole::ticket_not_waiting_in_review` runs before
-//! any `gh` and short-circuits every ticket not waiting in review, so an ordinary run detail costs
-//! one tracker read and zero GitHub round trips, and only a review-state ticket pays for
-//! `gh pr list` + `gh pr view`.
+//! many `gh` resolutions can be in flight for one pull request at once. Each now costs a
+//! blocking-pool thread for at most `GH_EXEC_TIMEOUT` rather than a worker thread indefinitely,
+//! which is a much smaller thing to be unbounded about, but it is still unbounded. What keeps it
+//! small is the ORDER: `mergeconsole::ticket_not_waiting_in_review` runs before any `gh` and
+//! short-circuits every ticket not waiting in review, so an ordinary run detail costs one tracker
+//! read and zero GitHub round trips, and only a review-state ticket pays for `gh pr list` +
+//! `gh pr view`.
 //!
 //! The DECISIONS that need loop state — the run row, the single-flight claim, the live review
 //! snapshot, the audit record — are made in [`crate::mergeconsole`] on the control task and

@@ -213,15 +213,20 @@ pub const QUORUM_FANOUT_ATTEMPTS: u32 = 3;
 /// Bounds the open-PR lookup (STUDIO-674), [`crate::ghenrich`]'s `GH_SUMMONS_TIMEOUT` and its
 /// reason: a network-stalled lookup must not park the fan-out indefinitely.
 ///
-/// Honest reach, because a bound that reads stronger than it is, is worse than none: against the
-/// PRODUCTION source it is currently INERT. [`crate::ghsummons::GH`] shells out through a
-/// synchronous `std::process::Command`, so its future has no await point and runs to completion in
-/// its first poll — `tokio::time::timeout` never gets to cancel it. The bound is real for any
-/// source that actually yields, which today means the tests. What makes it real everywhere is the
-/// non-blocking runner (`spawn_blocking` / `tokio::process`) already noted as a follow-up on
-/// `ghsummons::default_run`, and until then the containment is structural rather than temporal: a
-/// hung `gh` parks THIS task, which owns all of the quorum's network I/O and no lock the control
-/// task takes, and the daemon keeps ticking.
+/// Honest reach, because a bound that reads stronger than it is, is worse than none: this one is
+/// REAL against the production source as of STUDIO-829, and was inert before it.
+/// [`crate::ghsummons::GH`] shells out through a synchronous `std::process::Command`, so while that
+/// exec was inline its future had no await point and ran to completion in its first poll —
+/// `tokio::time::timeout` never got a poll at which to cancel it. Every exec now goes through
+/// `GH::run_off_task`, which hands it to tokio's blocking pool, so the await this bound wraps is a
+/// real yield point and 15s means 15s.
+///
+/// The containment is still structural as well as temporal, and the structural half is the one that
+/// keeps the daemon ticking: a hung `gh` parks THIS task, which owns all of the quorum's network
+/// I/O and no lock the control task takes. What the bound adds is that the task is released rather
+/// than parked forever. It stays tighter than `ghsummons::GH_EXEC_TIMEOUT`, the per-exec backstop
+/// underneath it, on purpose — a fan-out waiting on one lookup should give up well before the
+/// floor does.
 const PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the per-tick candidate sweep learned about ONE ticket, so the handoff moment can decide
