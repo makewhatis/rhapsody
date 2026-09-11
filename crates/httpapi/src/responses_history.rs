@@ -214,6 +214,12 @@ pub(crate) fn history_response(runs: &[RunSummary], next_offset: Option<i64>) ->
 /// the title: `Review owner/repo#n at <sha>` is a string the daemon happens to mint, not a fact
 /// about the run. Positive-only for the same reason `review_ticket` is.
 ///
+/// It carries `review_of` beside that flag when `review_origins` names the ticket the review is OF
+/// (STUDIO-834) — the fact that makes a review row readable at a glance, because a `pr:` key names
+/// the repository, the number and the reviewer and no ticket at all. The daemon resolves it from
+/// the watch row's recorded origin, so the client neither parses the key nor reads the title;
+/// absent, never empty, when the origin names no ticket (`console:`) or no watch row survives.
+///
 /// It carries `assignee` on the same terms when `assignees` names one (STUDIO-735): the teammate
 /// the ticket's newest run was dispatched under, which is what keeps a finished job attributed
 /// after its teammate has left the live roster. A ticket nobody was routed for — solo, unrouted, or
@@ -230,6 +236,7 @@ pub(crate) fn issue_runs_response(
     lifecycles: &HashMap<String, IssueLifecycleRow>,
     assignees: &HashMap<String, String>,
     reviews: &HashSet<String>,
+    review_origins: &HashMap<String, String>,
 ) -> Value {
     let issues: Vec<Value> = runs
         .iter()
@@ -252,6 +259,14 @@ pub(crate) fn issue_runs_response(
             // why this one needs no provider surface beside the three above.
             if review::is_review_key(&r.issue_id) {
                 obj.insert("review_run".to_string(), json!(true));
+            }
+            // WHICH ticket that review is of (STUDIO-834). Only ever present beside `review_run`,
+            // because the map is keyed by review-run key and no other row can match one. Absent —
+            // never an empty string — when the origin names no ticket (`console:`, an operator) or
+            // no watch row survives for the key: both mean "say what you said before this field
+            // existed", which is the same shape `review_ticket` above uses for the same reason.
+            if let Some(ticket) = review_origins.get(&r.issue_id) {
+                obj.insert("review_of".to_string(), json!(ticket));
             }
             row
         })
