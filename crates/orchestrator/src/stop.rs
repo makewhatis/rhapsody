@@ -805,11 +805,13 @@ mod tests {
         // file whose assertion needs the entry to SURVIVE the loop. `run_loaded` schedules its first
         // tick at `Duration::ZERO`, so a tick can land before the cancel; `reconcile_stalled` then
         // reads `last_event_at`, falls back to `started_at`, and finds a run that "began" in 1970 —
-        // wedged past any stall timeout — and terminates it out of `running`. That eviction is
-        // indistinguishable from the false-success this test exists to catch, so stamp the entry the
-        // way `dispatch_issue` stamps a real one (`(o.now)()`, the convention every hand-built live
-        // entry in this crate follows). A live run's stall clock then reads ~0 against the fixture's
-        // 1h timeout, so no tick has any reason to retire it however the race lands.
+        // wedged past any stall timeout it is given, since only a zero one disables the sweep — and
+        // terminates it out of `running`. That eviction is indistinguishable from the false-success
+        // this test exists to catch, so stamp the entry the way `dispatch_issue` stamps a real one.
+        // `(o.now)()` specifically, because that is the clock `reconcile_stalled` itself reads: the
+        // sweep then measures this entry against its OWN now, so the elapsed time is structurally
+        // ~0 rather than ~0 by wall-clock luck, and no tick has a reason to retire it however the
+        // race lands.
         re.started_at = (o.now)();
         assert!(
             !re.cancel.is_armed(),
