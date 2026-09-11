@@ -801,6 +801,18 @@ mod tests {
             "TEAM-1",
         ));
         re.run_id = run_id;
+        // STUDIO-860. `empty` zeroes `started_at` to the epoch, and this is the first test in the
+        // file whose assertion needs the entry to SURVIVE the loop. `run_loaded` schedules its first
+        // tick at `Duration::ZERO`, so a tick can land before the cancel; `reconcile_stalled` then
+        // reads `last_event_at`, falls back to `started_at`, and finds a run that "began" in 1970 —
+        // wedged past any stall timeout it is given, since only a zero one disables the sweep — and
+        // terminates it out of `running`. That eviction is indistinguishable from the false-success
+        // this test exists to catch, so stamp the entry the way `dispatch_issue` stamps a real one.
+        // `(o.now)()` specifically, because that is the clock `reconcile_stalled` itself reads: the
+        // sweep then measures this entry against its OWN now, so the elapsed time is structurally
+        // ~0 rather than ~0 by wall-clock luck, and no tick has a reason to retire it however the
+        // race lands.
+        re.started_at = (o.now)();
         assert!(
             !re.cancel.is_armed(),
             "this test is only meaningful on an unarmed entry"
