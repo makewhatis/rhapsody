@@ -154,15 +154,19 @@ pub(crate) async fn handle_issue_runs(
 /// THE LINK LIVES ONLY ON THE WATCH ROW. A `pr:` key carries the repository, the number and the
 /// reviewer and no ticket whatever, so nothing here parses one out of it; `introduced_by` is the
 /// record of how the pull request entered the watch set, and
-/// [`review::origin_ticket`](rhapsody_orchestrator::reviewdone::origin_ticket) is the one reader of
-/// its spellings — called, never re-derived, so `handoff:` and `adopt:` resolve here exactly as
-/// they resolve for the two orchestrator paths that move a ticket by them.
+/// [`rhapsody_orchestrator::reviewdone::origin_ticket`] is the one reader of its spellings —
+/// called, never re-derived, so `handoff:` and `adopt:` resolve here exactly as they resolve for
+/// the two orchestrator paths that move a ticket by them.
 ///
 /// ONE STORE READ FOR THE PAGE, AND NONE FOR A PAGE WITH NO REVIEW ROW. The watch set is read whole
-/// and keyed in memory rather than probed per row: a per-row lookup is what STUDIO-836 cost on the
-/// lifecycle path, and this listing is polled every two seconds. The table holds one row per
-/// (pull request, reviewer) the daemon has ever watched — three on the operator's own install when
-/// this landed — so reading it whole is cheaper than the `list_issue_runs` that preceded it.
+/// and matched in memory rather than probed per row: a per-row lookup is what STUDIO-836 cost on
+/// the lifecycle path, and this listing is polled every two seconds.
+///
+/// What comes BACK is bounded by the page rather than by the table, which is a different bound and
+/// the one that keeps: nothing prunes `rhapsody_review_watch` (a retirement is a soft delete), so
+/// it accumulates one row per (pull request, reviewer) the daemon has ever watched for the life of
+/// the install, while a page holds at most a few dozen. Keying every row instead would grow this
+/// map forever at poll rate for rows no page can ever show.
 ///
 /// Best-effort, exactly like the three decorations beside it: a store error yields an empty map and
 /// every row renders as it did before the field existed. The key is compared BYTE-wise because both
@@ -173,7 +177,12 @@ fn review_origins(
     history: &dyn crate::HistoryStore,
     runs: &[rhapsody_store::RunSummary],
 ) -> HashMap<String, String> {
-    if !runs.iter().any(|r| review::is_review_key(&r.issue_id)) {
+    let wanted: HashSet<&str> = runs
+        .iter()
+        .map(|r| r.issue_id.as_str())
+        .filter(|id| review::is_review_key(id))
+        .collect();
+    if wanted.is_empty() {
         return HashMap::new();
     }
     let Ok(rows) = history.load_review_watch() else {
@@ -182,16 +191,17 @@ fn review_origins(
     };
     rows.iter()
         .filter_map(|row| {
+            let key = review::review_key(
+                &row.key.owner,
+                &row.key.repo,
+                row.key.number,
+                &row.key.reviewer,
+            );
+            if !wanted.contains(key.as_str()) {
+                return None;
+            }
             let ticket = rhapsody_orchestrator::reviewdone::origin_ticket(&row.introduced_by)?;
-            Some((
-                review::review_key(
-                    &row.key.owner,
-                    &row.key.repo,
-                    row.key.number,
-                    &row.key.reviewer,
-                ),
-                ticket.to_string(),
-            ))
+            Some((key, ticket.to_string()))
         })
         .collect()
 }
@@ -734,7 +744,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use super::{SUMMARY_RHYTHM_RUNS, local_day_start};
+    use super::{SUMMARY_RHYTHM_RUNS, local_day_start, review_origins};
     use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
     use rhapsody_agent::LogEntry;
     use rhapsody_orchestrator::{
@@ -1551,6 +1561,31 @@ mod tests {
         let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
         assert_eq!(status, 200);
         assert_eq!(by_identifier(&body)[key]["review_of"], "STUDIO-838");
+    }
+
+    // STUDIO-834 — what the join MATERIALIZES is bounded by the page, not by the table. Nothing
+    // prunes `rhapsody_review_watch`: a retirement is a soft delete, so the table accumulates one
+    // row per (pull request, reviewer) for the life of the install, while a page holds a few dozen.
+    // Keying every row would grow the map forever at poll rate for rows no page can ever show.
+    #[test]
+    fn the_review_origin_map_holds_only_the_keys_the_page_asked_about() {
+        let store = mem_store();
+        let on_page = "pr:makewhatis/rhapsody#147@alice";
+        seed_watch(&store, 147, "alice", "handoff:STUDIO-839");
+        seed_watch(&store, 145, "jimmy", "adopt:STUDIO-838");
+        seed_watch(&store, 12, "bob", "handoff:STUDIO-1");
+        let page = vec![RunSummary {
+            issue_id: on_page.into(),
+            issue_identifier: on_page.into(),
+            ..RunSummary::default()
+        }];
+
+        let got = review_origins(&store as &dyn crate::HistoryStore, &page);
+        assert_eq!(
+            got,
+            HashMap::from([(on_page.to_string(), "STUDIO-839".to_string())]),
+            "two watch rows no row on the page names must not be carried",
+        );
     }
 
     // STUDIO-834 acceptance — no new PER-ROW round trip. The whole watch set is read ONCE for a
