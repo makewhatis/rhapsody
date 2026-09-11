@@ -925,6 +925,24 @@ fn run_identity(store: &(dyn rhapsody_store::Store + Send + Sync), run_id: i64) 
     }
 }
 
+/// The teammate a run was ROUTED to, or `None` for every other answer — a run that recorded
+/// `teams.unrouted`, one whose ledger is silent (Teams was off), and one whose ledger could not be
+/// read at all.
+///
+/// The narrow half of [`run_identity`], for callers that need "which teammate did this work" and
+/// have nothing to do with the other three answers (STUDIO-838's adoption sweep, which must refuse
+/// rather than guess). The assignee decoration above keeps using the full enum, because there the
+/// difference between "nobody" and "unreadable" decides whether the ticket LABEL may be consulted.
+pub(crate) fn routed_identity(
+    store: &(dyn rhapsody_store::Store + Send + Sync),
+    run_id: i64,
+) -> Option<String> {
+    match run_identity(store, run_id) {
+        RunIdentity::Routed(name) => Some(name),
+        RunIdentity::Unrouted | RunIdentity::Silent | RunIdentity::Unreadable => None,
+    }
+}
+
 /// The `rhapsody:@<name>` label of each of `keys`, through [`fetch_by_ids`] — so the batching, the
 /// covered-set rule and the isolation of a refused id are the same ones the lifecycle refresh
 /// follows. Returns the ids it could NAME a teammate for, the ids a round trip COVERED, and whether
