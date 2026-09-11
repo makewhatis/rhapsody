@@ -724,8 +724,11 @@ where
     });
 
     // The notification task, the ticketless path's other off-loop writer. It holds the ONE `gh`
-    // seam in this subsystem that writes — `PrCommentSink` — and nothing else: it takes no
-    // `Orchestrator`, reads no store, and a hung `gh pr comment` parks it alone.
+    // seam in this subsystem that writes — `PrCommentSink` — and one `ControlHandle`, for the
+    // findings route-back's tracker move; it takes no `Orchestrator` and reads no store. Both of
+    // those writes run ON THIS TASK: a hung `gh pr comment`, or a slow tracker round-trip (bounded
+    // at 30s by the Linear client's HTTP timeout), parks this task and with it the next round's
+    // completion comment — and nothing else.
     let review_notify_task = review_notify_rx.map(|rx| {
         let notify_ctx = shutdown.wait();
         let deps = rhapsody_orchestrator::reviewnotify::ReviewNotifyDeps {
@@ -740,6 +743,14 @@ where
                     .unwrap_or_default(),
                 None,
             ))),
+            // The findings route-back's tracker write (STUDIO-839), through the same
+            // `ControlHandle` seam the watcher's auto-Done move uses. It is wired unconditionally
+            // because the transition's own gate is the config — `teams.review.changes_state`,
+            // empty by default — and that gate lives on the control task, where the plan is made:
+            // an unconfigured installation sends no plan, so this sink is never called.
+            tickets: Some(Arc::new(
+                rhapsody_orchestrator::reviewchanges::ControlChangesSink::new(handle.clone()),
+            )),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::reviewnotify::run_review_notify_task(notify_ctx, deps, rx).await;
@@ -2347,6 +2358,47 @@ mod tests {
             "the quorum task is no longer handed a warnings state: a fan-out retried to \
              exhaustion would go back to being a WARN in a 23 MB/day log, with nothing on \
              `GET /api/v1/projects` for an operator to read (STUDIO-822)"
+        );
+    }
+
+    /// The same pin over the deps this function hands the NOTIFICATION task, for the same reason
+    /// and against the same blind spot: every `reviewnotify` test builds its own
+    /// `ReviewNotifyDeps`, so dropping either field HERE leaves `cargo test --workspace` fully
+    /// green while the shipped daemon goes quiet. Without the comment seam a verdict reaches no
+    /// pull request at all; without the ticket seam every findings route-back degrades to a debug
+    /// line and the board reads "In Review" while the author is implementing — which is
+    /// STUDIO-839's original defect arriving through a third door.
+    ///
+    /// Both needles are assembled at run time for the reason the quorum pin above gives.
+    #[test]
+    fn the_notify_task_is_handed_both_write_seams() {
+        let src = include_str!("run.rs");
+        let opener = format!(
+            "let deps = rhapsody_orchestrator::{}::{}Deps {{",
+            "reviewnotify", "ReviewNotify"
+        );
+        let start = src
+            .find(&opener)
+            .expect("the notification task still builds its own deps here");
+        let end = src[start..]
+            .find("\n        };")
+            .expect("that deps literal is still a braced struct");
+        let block = &src[start..start + end];
+
+        let posts = format!("{}: {}(", "comments", "Some");
+        assert!(
+            block.contains(&posts),
+            "the notification task is no longer handed a comment seam: a review verdict would \
+             post nothing, so an approval would never reach the pull request and a findings \
+             verdict would never re-engage the author's run (STUDIO-839)"
+        );
+
+        let moves = format!("{}: {}(", "tickets", "Some");
+        assert!(
+            block.contains(&moves),
+            "the notification task is no longer handed a tracker seam: every findings route-back \
+             would degrade to a debug line, and the board would go back to reading the review \
+             state while the author is implementing (STUDIO-839)"
         );
     }
 }

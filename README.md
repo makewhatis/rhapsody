@@ -998,6 +998,57 @@ resolves its plan on the loop and moves the ticket off it. A ticket whose runs h
 history cannot be addressed — `MoveIssueState` needs the opaque ids — so the daemon declines and
 warns rather than firing a call it knows will fail.
 
+### A review that files findings moves its ticket out of review (STUDIO-839)
+
+The sibling of the entry above, on the opposite edge, and a divergence for the same reason: Go
+v0.4.0 has no review feature at all, so nothing in the frozen reference has a verdict to act on.
+
+The ticketless review loop closed itself on the RUN side and not on the TRACKER side. A review that
+left findings posted a token-bearing completion comment, and that comment reopened the author's run
+through the existing GitHub-summons path — but nothing moved the ticket. So the review state stopped
+distinguishing three situations: waiting for a reviewer, being reviewed, and reviewed-with-findings
+while the author is actively pushing commits. A state that means three things means none of them,
+and the route-back In Review → In Progress was a manual step the maintainer took every round.
+
+| A review round's verdict | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| findings | no review feature exists | ticket moved to `teams.review.changes_state` by NAME |
+| approved | — | nothing — approval is the pause in the re-review loop |
+| default | — | **off**: `changes_state` is empty unless an operator names a state |
+
+**The pairing is the whole of the decision, and it is enforced twice.** Findings move the ticket;
+approval does not, because approval is already the pause in the re-review loop and the deliberately
+tokenless completion comment is the same decision on the author's side of it. The planner refuses
+the approved arm, and the notification task refuses it again at the point of action — a guard rather
+than an assertion, so a refactor that carried an approved plan that far cannot perform it.
+
+**Empty means off, and it nests under `teams`** — `done_state`'s discipline exactly, for
+`done_state`'s reasons: workspace state spellings vary, an installation whose workflow has no such
+state must not have one invented for it, and riding the ticketless path makes "a Teams-off install
+is unchanged" structural rather than remembered.
+
+**Scope, and the guard against auto-Done.** Only a ticket this daemon parked, named by the
+`handoff:<identifier>` origin recorded on the review run — or by the `adopt:<identifier>` origin,
+on the same terms the transition above reads it: an adoption resolves from the daemon's own ledger
+and its own configured repository, through the same gates, so an adopted pull request's ticket was
+parked by this daemon too and its findings verdict routes back exactly as a handoff's does. An
+operator-introduced pull request names an OPERATOR rather than a ticket, so it moves none. The
+guard is `reviewdone::origin_ticket`'s, shared rather than re-derived, which is what keeps the two
+entries from drifting apart. And only while the pull request is still OPEN: a findings round that
+exits after its pull request merged would otherwise pull a finished ticket back out of its terminal
+state, which is the one way the two transitions can fight. Both decisions are made on the control
+task; both writes happen off it, so a merge observed inside that window can still land the two moves
+in either order.
+
+**The two consequences can disagree, and the daemon says so.** The state move is this daemon's own
+write and always happens; the run re-engagement additionally needs the completion comment to have
+been posted carrying its token AND the pull request to be among the ticket's `linked_prs` in the
+poller's snapshot — the tracker's business, which is empty on an installation whose Linear carries
+no GitHub attachments (STUDIO-674). The daemon reports the half it knows: a move with no summons is
+a WARNING naming the ticket and the pull request, and a move WITH one still names the remaining
+condition rather than promising a run. A ticket sitting in the changes state with no run is
+therefore traceable to one line.
+
 ### A review run renders the daemon's own base prompt (STUDIO-798)
 
 Go v0.4.0 has one base prompt per run and renders whatever `prompt`/`prompt_file` names — on a real
