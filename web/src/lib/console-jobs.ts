@@ -289,6 +289,16 @@ export interface ConsoleJobRow {
   assignee: string;
   /** PR reference, or "" when none is known. */
   pr: string;
+  /**
+   * For a review row, the TICKET it is reviewing (STUDIO-834) — what the table leads with in place
+   * of the `pr:owner/repo#n@reviewer` key, which names no work. "" for every other row, and for a
+   * review row whose origin the daemon could not resolve to a ticket; the table then leads with
+   * [`issue`] exactly as it did before this existed.
+   *
+   * Never the route target. [`issue`] stays the key the row OPENS, because the row shows a review
+   * run and the ticket named here is somebody else's job.
+   */
+  reviewOf: string;
   /** Relative "6m ago", or "—" when the ticket has never run. */
   updated: string;
   /** Sort key: ms since epoch of the newest activity, 0 when unknown. */
@@ -403,6 +413,31 @@ export function reviewRunIssues(rows: readonly IssueRun[]): Set<string> {
 }
 
 /**
+ * Review-run key → the TICKET that review is of, from the issue-level listing's `review_of` field
+ * (STUDIO-834).
+ *
+ * The one thing that connects a review row to the work it is about. A `pr:owner/repo#n@reviewer`
+ * key names the repository, the number and the reviewer and no ticket at all, so this cannot be
+ * derived on this side — the link lives on the daemon's watch row, as the origin it recorded when
+ * the pull request entered the watch set, and the daemon parses it with the same reader it moves
+ * tickets by. `handoff:` and `adopt:` origins are indistinguishable here by design; both arrive as
+ * a bare ticket key.
+ *
+ * A row carrying no `review_of` — an operator-introduced pull request names no ticket, and a key
+ * with no surviving watch row resolves to none — is SKIPPED rather than mapped to "", exactly as
+ * [`durableAssignees`] skips a row with no assignee. An absent key is what makes the row fall back
+ * to the `pr:` key it already showed.
+ */
+export function reviewOfTickets(rows: readonly IssueRun[]): Map<string, string> {
+  const byIssue = new Map<string, string>();
+  for (const r of rows) {
+    if (r.issue_identifier === "" || !r.review_of || byIssue.has(r.issue_identifier)) continue;
+    byIssue.set(r.issue_identifier, r.review_of);
+  }
+  return byIssue;
+}
+
+/**
  * Ticket key → teammate name, from the issue-level listing's own `assignee` field (STUDIO-735).
  *
  * This is the historical record — who the run was dispatched under — so unlike `ticketAssignees` it
@@ -486,6 +521,7 @@ export function buildConsoleJobs(
   const lifecycles = lifecycleByIssue(issueRows);
   const reviewTickets = reviewTicketIssues(issueRows);
   const reviewRuns = reviewRunIssues(issueRows);
+  const reviewOf = reviewOfTickets(issueRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
@@ -509,6 +545,7 @@ export function buildConsoleJobs(
       // daemon has not yet decorated.
       assignee: durable.get(job.issue) ?? live.get(job.issue) ?? "",
       pr: "",
+      reviewOf: reviewOf.get(job.issue) ?? "",
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
       subLabel: job.subLabel,
