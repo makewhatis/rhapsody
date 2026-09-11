@@ -302,6 +302,23 @@ pub struct Review {
     /// keep in agreement with this one.
     #[serde(default)]
     pub done_state: String,
+    /// The state NAME a watched pull request's implementation ticket is moved
+    /// BACK to when a review round files findings on it (STUDIO-839). Empty —
+    /// the default — means the transition is off.
+    ///
+    /// The sibling of [`Review::done_state`], and shaped like it for the same
+    /// reasons: a NAME because workspace state spellings vary, and
+    /// empty-means-off because an installation whose workflow has no such
+    /// state must not have one invented for it. The two are the only writers of
+    /// ticket state off the back of a review outcome, and they act on opposite
+    /// edges — findings (the round's exit) route the ticket back to work, a
+    /// MERGE finishes it — so neither can stand in for the other.
+    ///
+    /// Without it the review state means three things at once: waiting for a
+    /// reviewer, being reviewed, and reviewed-with-findings while the author
+    /// implements. Naming a state here separates the third from the first two.
+    #[serde(default)]
+    pub changes_state: String,
 }
 
 impl Default for Review {
@@ -310,6 +327,7 @@ impl Default for Review {
             mode: ReviewMode::default(),
             reviewers: DEFAULT_REVIEW_REVIEWERS,
             done_state: String::new(),
+            changes_state: String::new(),
         }
     }
 }
@@ -504,6 +522,23 @@ impl Teams {
             return None;
         }
         let name = self.review.done_state.trim();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The state name a ticket is moved BACK to when its review round files
+    /// findings, or `None` when that transition is off (STUDIO-839).
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason: the findings
+    /// edge this rides is the ticketless review's own exit, so on any other
+    /// installation a configured name would promise a transition that can never
+    /// fire. Trimmed, so a whitespace-only value reads as "off" rather than as
+    /// a state name Linear will refuse.
+    pub fn review_changes_state(&self) -> Option<&str> {
+        if !self.review_ticketless() {
+            return None;
+        }
+        let name = self.review.changes_state.trim();
         (!name.is_empty()).then_some(name)
     }
 
@@ -1549,6 +1584,60 @@ mod tests {
         assert_eq!(present.done_state, "Shipped");
     }
 
+    /// STUDIO-839: the route-back transition is OFF unless somebody named the
+    /// state, and naming it is not enough on an installation whose review path
+    /// cannot produce a findings verdict to act on.
+    ///
+    /// The pair with `review_done_state` is deliberate — both write ticket
+    /// state off the back of a review outcome, so they share one gate and one
+    /// empty-means-off discipline rather than each inventing their own.
+    #[test]
+    fn review_changes_state_is_off_until_named_on_a_ticketless_team() {
+        assert_eq!(Review::default().changes_state, "");
+        assert_eq!(Teams::disabled().review_changes_state(), None);
+
+        let with = |enabled: bool, mode: ReviewMode, changes: &str| Teams {
+            enabled,
+            review: Review {
+                mode,
+                changes_state: changes.to_string(),
+                ..Review::default()
+            },
+            ..Teams::disabled()
+        };
+        assert_eq!(
+            with(true, ReviewMode::Ticketless, "In Progress").review_changes_state(),
+            Some("In Progress"),
+        );
+        for off in [
+            with(true, ReviewMode::Ticketless, ""),
+            with(true, ReviewMode::Ticketless, "   "),
+            with(true, ReviewMode::Tickets, "In Progress"),
+            with(true, ReviewMode::Off, "In Progress"),
+            with(false, ReviewMode::Ticketless, "In Progress"),
+        ] {
+            assert_eq!(off.review_changes_state(), None, "{off:?}");
+        }
+        assert_eq!(
+            with(true, ReviewMode::Ticketless, "  Doing  ").review_changes_state(),
+            Some("Doing"),
+            "a padded state name is a state name",
+        );
+    }
+
+    /// An absent `changes_state:` key is the off default while an explicit one
+    /// is carried verbatim — the `review:` block predates the key, so every
+    /// installation that has one must keep parsing, and an upgrade must not
+    /// invent a transition nobody asked for.
+    #[test]
+    fn review_changes_state_absent_is_off_and_present_is_honoured() {
+        let absent: Review = serde_yaml_ng::from_str("mode: ticketless").expect("parse");
+        assert_eq!(absent.changes_state, "");
+        let present: Review =
+            serde_yaml_ng::from_str("mode: ticketless\nchanges_state: Doing").expect("parse");
+        assert_eq!(present.changes_state, "Doing");
+    }
+
     /// An absent `reviewers:` key keeps the default while an explicit one is
     /// honoured — the serde default has to be the CONST, not `i64::default()`.
     #[test]
@@ -1574,6 +1663,7 @@ mod tests {
                 mode: ReviewMode::Ticketless,
                 reviewers: 3,
                 done_state: "Done".to_string(),
+                changes_state: "In Progress".to_string(),
             },
             roster: vec![Identity {
                 name: "alice".to_string(),
@@ -1591,6 +1681,10 @@ mod tests {
         assert_eq!(Teams::load(&path), teams);
         assert!(Teams::load(&path).review_ticketless());
         assert_eq!(Teams::load(&path).review_done_state(), Some("Done"));
+        assert_eq!(
+            Teams::load(&path).review_changes_state(),
+            Some("In Progress")
+        );
     }
 
     /// Unknown keys are ignored rather than fatal, matching `CapabilityDef`'s
