@@ -740,6 +740,14 @@ where
                     .unwrap_or_default(),
                 None,
             ))),
+            // The findings route-back's tracker write (STUDIO-839), through the same
+            // `ControlHandle` seam the watcher's auto-Done move uses. It is wired unconditionally
+            // because the transition's own gate is the config — `teams.review.changes_state`,
+            // empty by default — and that gate lives on the control task, where the plan is made:
+            // an unconfigured installation sends no plan, so this sink is never called.
+            tickets: Some(Arc::new(
+                rhapsody_orchestrator::reviewchanges::ControlChangesSink::new(handle.clone()),
+            )),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::reviewnotify::run_review_notify_task(notify_ctx, deps, rx).await;

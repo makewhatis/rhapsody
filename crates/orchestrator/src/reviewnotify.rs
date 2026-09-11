@@ -64,6 +64,7 @@ use crate::control_loop::CancelWait;
 use crate::ghsummons::PrCommentSink;
 use crate::orchestrator::Orchestrator;
 use crate::review::ReviewRun;
+use crate::reviewchanges::{ReviewChangesPlan, ReviewChangesSink};
 
 /// One finished review round, as the CONTROL TASK observed it, on its way to a comment.
 ///
@@ -96,6 +97,15 @@ pub struct ReviewCompletion {
     /// so the comment that is POSTED and the predicate that judged it cannot disagree across a
     /// config reload.
     pub summon_token: String,
+    /// The ticket this verdict routes back out of the review state, when there is one
+    /// (STUDIO-839). `None` on every approved round, on every installation that has not named
+    /// `teams.review.changes_state`, and whenever the ticket cannot be resolved — see
+    /// [`Orchestrator::plan_review_changes`].
+    ///
+    /// It rides the completion rather than a channel of its own because it is the same event and
+    /// the ORDER matters: the comment is what re-engages the author, so it is posted first and the
+    /// move is told whether it carried a summons.
+    pub changes: Option<ReviewChangesPlan>,
 }
 
 impl std::fmt::Display for ReviewCompletion {
@@ -193,6 +203,14 @@ pub struct ReviewNotifyDeps {
     /// reach GitHub cannot re-engage anybody, and there is no second route worth inventing — the
     /// author's ticket is reopened by a PR comment or not at all.
     pub comments: Option<Arc<dyn PrCommentSink>>,
+    /// Where a findings verdict's ticket move is performed (STUDIO-839). `None` — the daemon
+    /// default before the control handle exists — means no ticket is ever moved, which is the
+    /// unconfigured behaviour either way.
+    ///
+    /// A second seam rather than a widening of [`Self::comments`]: this one is a TRACKER write, and
+    /// the off-loop guarantee in the type is what says the notification task holds no
+    /// `Orchestrator`, no store and no control channel of its own.
+    pub tickets: Option<Arc<dyn ReviewChangesSink>>,
 }
 
 /// Consumes [`ReviewCompletion`]s until `ctx` is cancelled or every sender is dropped.
@@ -244,10 +262,10 @@ pub async fn run_review_notify_task(
                  calls for; posting it as composed"
             );
         }
-        match sink
+        let posted = sink
             .post_pr_comment(&c.owner, &c.repo, c.number, &body)
-            .await
-        {
+            .await;
+        match &posted {
             Ok(()) => tracing::info!(
                 pr = %c, reviewer = %c.reviewer, author = %c.author, approved = c.approved, summons,
                 "ticketless review: review-completion comment posted"
@@ -258,7 +276,41 @@ pub async fn run_review_notify_task(
                  is not re-engaged for this round"
             ),
         }
+        // The second consequence of the same verdict (STUDIO-839), after the comment and never
+        // before it: the comment is what re-engages the author, and a ticket moved out of review
+        // ahead of the summons is the disagreement this path has to REPORT rather than create.
+        route_back(&deps, c, posted.is_ok() && summons).await;
     }
+}
+
+/// Performs the planned ticket move, and refuses an approved one.
+///
+/// The refusal is the guard [`crate::reviewchanges`]'s pairing needs, in the shape the token
+/// consistency check above already has: the planner will not produce a plan for an approved round,
+/// and if one ever reaches here anyway — a refactor that lost the branch, a caller that built a
+/// completion by hand — the move is REFUSED rather than merely reported. An approved review must
+/// not pull its own ticket out of review; §15-c makes approval the pause in the loop, and the
+/// tokenless comment two lines up is already the same decision on the author's side.
+async fn route_back(deps: &ReviewNotifyDeps, c: ReviewCompletion, re_engaged: bool) {
+    let Some(plan) = c.changes else {
+        return;
+    };
+    if c.approved {
+        tracing::error!(
+            pr = %plan.pr, issue_identifier = %plan.identifier, state = %plan.state,
+            "ticketless review: an APPROVED round carried a ticket route-back; refusing it — \
+             approval is the pause in the re-review loop, not a reason to reopen the work"
+        );
+        return;
+    }
+    let Some(tickets) = deps.tickets.as_ref() else {
+        tracing::debug!(
+            pr = %plan.pr, issue_identifier = %plan.identifier,
+            "ticketless review: no ticket sink, so the findings verdict moves no ticket"
+        );
+        return;
+    };
+    tickets.route_back(plan, re_engaged).await;
 }
 
 impl Orchestrator {
@@ -291,7 +343,10 @@ impl Orchestrator {
     /// 2. The coordinates can name a comment: an owner, a repo and a positive number.
     ///
     /// The verdict is NOT a gate. An approved round is notified too — with a deliberately tokenless
-    /// comment (see the module docs), which is the documented no-op rather than a missing one.
+    /// comment (see the module docs), which is the documented no-op rather than a missing one. It
+    /// IS the gate on the ticket route-back the completion also carries
+    /// ([`Orchestrator::plan_review_changes`], STUDIO-839): findings move the ticket out of the
+    /// review state, approval leaves it exactly where it is.
     ///
     /// **Where the trusted origin comes from (§14.1 F-SEC).** Posting as the daemon on an arbitrary
     /// repository would be a new way out of the trust boundary, so this path deliberately re-derives
@@ -320,6 +375,7 @@ impl Orchestrator {
             head_sha: run.head_sha.clone(),
             approved,
             summon_token: self.review_summon_token(),
+            changes: self.plan_review_changes(run, approved),
         })
     }
 
@@ -386,6 +442,21 @@ mod tests {
             head_sha: HEAD.to_string(),
             approved,
             summon_token: token.to_string(),
+            changes: None,
+        }
+    }
+
+    /// The same completion carrying a route-back plan, for the task-side tests.
+    fn completion_moving(approved: bool, token: &str) -> ReviewCompletion {
+        ReviewCompletion {
+            changes: Some(ReviewChangesPlan {
+                pr: "makewhatis/rhapsody#12".to_string(),
+                issue_id: "ID-999".to_string(),
+                team_id: "TEAM-1".to_string(),
+                identifier: "STUDIO-999".to_string(),
+                state: "In Progress".to_string(),
+            }),
+            ..completion(approved, token)
         }
     }
 
@@ -611,6 +682,7 @@ mod tests {
         drain(
             ReviewNotifyDeps {
                 comments: Some(Arc::clone(&sink) as Arc<dyn PrCommentSink>),
+                tickets: None,
             },
             vec![completion(false, "@symphony")],
         )
@@ -634,6 +706,7 @@ mod tests {
         drain(
             ReviewNotifyDeps {
                 comments: Some(Arc::clone(&sink) as Arc<dyn PrCommentSink>),
+                tickets: None,
             },
             vec![
                 completion(false, "@symphony"),
@@ -652,7 +725,10 @@ mod tests {
     #[tokio::test]
     async fn a_missing_comment_sink_posts_nothing() {
         drain(
-            ReviewNotifyDeps { comments: None },
+            ReviewNotifyDeps {
+                comments: None,
+                tickets: None,
+            },
             vec![completion(false, "@symphony")],
         )
         .await;
@@ -817,6 +893,218 @@ mod tests {
             *calls.lock().expect("call lock"),
             0,
             "no `gh` process may be spawned for a comment that cannot be posted"
+        );
+    }
+
+    // ── the ticket route-back the same verdict drives (STUDIO-839) ───────────────────────────────
+
+    /// A recording [`ReviewChangesSink`]: every move it was asked to perform, with the
+    /// re-engagement verdict it was told.
+    #[derive(Default)]
+    struct RecordingTickets {
+        moved: Mutex<Vec<(ReviewChangesPlan, bool)>>,
+    }
+
+    impl RecordingTickets {
+        fn new() -> Arc<RecordingTickets> {
+            Arc::new(RecordingTickets::default())
+        }
+        fn taken(&self) -> Vec<(ReviewChangesPlan, bool)> {
+            self.moved.lock().expect("moved lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReviewChangesSink for RecordingTickets {
+        async fn route_back(&self, plan: ReviewChangesPlan, re_engaged: bool) {
+            self.moved
+                .lock()
+                .expect("moved lock")
+                .push((plan, re_engaged));
+        }
+    }
+
+    fn deps(sink: &Arc<RecordingSink>, tickets: &Arc<RecordingTickets>) -> ReviewNotifyDeps {
+        ReviewNotifyDeps {
+            comments: Some(Arc::clone(sink) as Arc<dyn PrCommentSink>),
+            tickets: Some(Arc::clone(tickets) as Arc<dyn ReviewChangesSink>),
+        }
+    }
+
+    /// Arm one of the pairing, at the point of ACTION rather than of planning: a findings
+    /// completion posts its comment AND moves the ticket, and the move is told that the comment
+    /// summoned.
+    #[tokio::test]
+    async fn a_findings_completion_moves_the_ticket_it_planned() {
+        let sink = RecordingSink::new(false);
+        let tickets = RecordingTickets::new();
+        drain(
+            deps(&sink, &tickets),
+            vec![completion_moving(false, "@symphony")],
+        )
+        .await;
+        assert_eq!(sink.taken().len(), 1, "the comment is posted");
+        let moved = tickets.taken();
+        assert_eq!(moved.len(), 1, "and the ticket is moved once");
+        assert_eq!(moved[0].0.identifier, "STUDIO-999");
+        assert_eq!(moved[0].0.state, "In Progress");
+        assert!(
+            moved[0].1,
+            "a posted, token-bearing findings comment re-engages the author"
+        );
+    }
+
+    /// Arm two, and the guard that makes it more than a planner convention: an APPROVED completion
+    /// that somehow carries a route-back is REFUSED here, not merely reported. Approval is the pause
+    /// in the re-review loop (§15-c), and a refactor that loses the planner's branch must not be
+    /// able to pull an approved ticket back out of review. This is the sibling of the
+    /// `summons != !c.approved` check above — the same disagreement, caught where it would act.
+    #[tokio::test]
+    async fn an_approved_completion_is_refused_the_route_back_even_when_it_carries_one() {
+        let sink = RecordingSink::new(false);
+        let tickets = RecordingTickets::new();
+        drain(
+            deps(&sink, &tickets),
+            vec![completion_moving(true, "@symphony")],
+        )
+        .await;
+        assert_eq!(
+            sink.taken().len(),
+            1,
+            "the approved round is still notified — a review's record belongs on the pull request"
+        );
+        assert!(
+            tickets.taken().is_empty(),
+            "an approved review must never move its own ticket out of review"
+        );
+    }
+
+    /// A completion with no route-back planned — every approved round, and every installation that
+    /// has not named `teams.review.changes_state` — moves nothing and says nothing about it. The
+    /// unconfigured behaviour, pinned at the task as well as at the planner.
+    #[tokio::test]
+    async fn a_completion_with_no_plan_moves_nothing() {
+        let sink = RecordingSink::new(false);
+        let tickets = RecordingTickets::new();
+        drain(
+            deps(&sink, &tickets),
+            vec![
+                completion(false, "@symphony"),
+                completion(true, "@symphony"),
+            ],
+        )
+        .await;
+        assert_eq!(sink.taken().len(), 2);
+        assert!(tickets.taken().is_empty());
+    }
+
+    /// The state move is NOT gated on the comment having been posted: a ticket whose review filed
+    /// findings is not waiting for a reviewer whether or not the author's run reopened. What the
+    /// failed post changes is what the move is TOLD — and that is what turns a silent divergence
+    /// into a reported one.
+    #[tokio::test]
+    async fn a_failed_post_still_moves_the_ticket_and_reports_no_re_engagement() {
+        let sink = RecordingSink::new(true);
+        let tickets = RecordingTickets::new();
+        drain(
+            deps(&sink, &tickets),
+            vec![completion_moving(false, "@symphony")],
+        )
+        .await;
+        let moved = tickets.taken();
+        assert_eq!(moved.len(), 1, "the ticket still moves");
+        assert!(
+            !moved[0].1,
+            "and the move is told that nothing re-engaged the author"
+        );
+    }
+
+    /// The comment is posted BEFORE the ticket moves, and that order is the contract: the comment is
+    /// what re-engages the author, so a ticket moved out of review ahead of the summons is the
+    /// disagreement this path exists to report rather than to create. Pinned by having the comment
+    /// sink observe whether the move had already happened when it was called.
+    #[tokio::test]
+    async fn the_comment_is_posted_before_the_ticket_moves() {
+        struct OrderSink {
+            tickets: Arc<RecordingTickets>,
+            moves_seen_at_post: Mutex<Vec<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl PrCommentSink for OrderSink {
+            async fn post_pr_comment(&self, _: &str, _: &str, _: i64, _: &str) -> PrCommentResult {
+                self.moves_seen_at_post
+                    .lock()
+                    .expect("order lock")
+                    .push(self.tickets.taken().len());
+                Ok(())
+            }
+        }
+        let tickets = RecordingTickets::new();
+        let order = Arc::new(OrderSink {
+            tickets: Arc::clone(&tickets),
+            moves_seen_at_post: Mutex::new(Vec::new()),
+        });
+        drain(
+            ReviewNotifyDeps {
+                comments: Some(Arc::clone(&order) as Arc<dyn PrCommentSink>),
+                tickets: Some(Arc::clone(&tickets) as Arc<dyn ReviewChangesSink>),
+            },
+            vec![completion_moving(false, "@symphony")],
+        )
+        .await;
+        assert_eq!(
+            order
+                .moves_seen_at_post
+                .lock()
+                .expect("order lock")
+                .as_slice(),
+            [0],
+            "no ticket had moved when the comment was posted"
+        );
+        assert_eq!(tickets.taken().len(), 1, "and the move followed it");
+    }
+
+    /// The acceptance criterion the two halves' disagreement is named by, driven end to end: the
+    /// completion comment is posted and IS a summons, the ticket IS moved out of review — and with
+    /// empty `linked_prs` the author's ticket is reopened by nobody. The board then says the ticket
+    /// is being worked while no run exists, which is precisely the case the route-back's log line
+    /// has to name rather than leave to be discovered.
+    #[tokio::test]
+    async fn the_ticket_moves_even_when_an_unlinked_pull_request_reopens_nobody() {
+        let at = utc(2026, 9, 2, 16, 55);
+        let sink = RecordingSink::new(false);
+        let tickets = RecordingTickets::new();
+        drain(
+            deps(&sink, &tickets),
+            vec![completion_moving(false, "@symphony")],
+        )
+        .await;
+
+        let posted = sink.taken();
+        assert_eq!(posted.len(), 1);
+        let moved = tickets.taken();
+        assert_eq!(moved.len(), 1, "the ticket moved out of the review state");
+        assert!(moved[0].1, "the daemon believes it re-engaged the author");
+
+        // …and the half the daemon cannot see refuses it: the comment IS a summons, and it reaches
+        // no ticket because the poller's snapshot links the pull request to none.
+        let gh = gh_serving_comment(&posted[0].2, at);
+        let by_pr = gh
+            .summons_since("makewhatis", "rhapsody", at - chrono::Duration::hours(1))
+            .await
+            .expect("the summons query succeeds");
+        assert_eq!(by_pr.len(), 1, "the posted comment IS a summons");
+        let unlinked = Issue {
+            identifier: "STUDIO-999".into(),
+            linked_prs: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_github_summons(vec![unlinked], &by_pr, "makewhatis", "rhapsody")
+                .first()
+                .and_then(|i| i.latest_summon_at),
+            None,
+            "the state move and the run re-engagement disagree, which is the reported case"
         );
     }
 

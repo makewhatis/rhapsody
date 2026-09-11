@@ -960,6 +960,73 @@ mod tests {
         }
     }
 
+    /// STUDIO-839, the acceptance wiring for the OTHER consequence of the same verdict: the
+    /// completion a findings exit queues carries the ticket's route-back, and the one an approved
+    /// exit queues does not.
+    ///
+    /// Pinned at the exit rather than only at `plan_review_changes`, because the planner being
+    /// right is worth nothing if nothing calls it — a refactor that drops the wiring here leaves
+    /// every route-back test in `reviewchanges` green while no ticket ever moves, which is the
+    /// silent-green shape this whole subsystem keeps producing.
+    #[test]
+    fn a_findings_exit_queues_its_tickets_route_back_and_an_approved_one_does_not() {
+        for (verdict, want) in [
+            (REVIEW_STATE_FINDINGS, Some("In Progress")),
+            (REVIEW_STATE_APPROVED, None),
+        ] {
+            let (mut o, _d) = orch_with_review(true);
+            if let Some(t) = o.teams.as_mut() {
+                t.review.changes_state = "In Progress".to_string();
+            }
+            // The ticket the route-back is for, and the run row its opaque ids are read off.
+            let mut run = review_run("bob", HEAD_A);
+            run.introduced_by = "handoff:STUDIO-839".to_string();
+            o.store()
+                .start_run(rhapsody_store::RunStart {
+                    issue_id: "ID-839".to_string(),
+                    issue_identifier: "STUDIO-839".to_string(),
+                    team_id: "TEAM-1".to_string(),
+                    ..rhapsody_store::RunStart::default()
+                })
+                .expect("start run");
+            let mut rx = o.open_review_notify_channel();
+            o.dispatch_review(run.clone());
+            exit_review_as(&mut o, &run, false, "", true, verdict);
+
+            let queued: Vec<Option<String>> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|c| c.changes.map(|p| p.state))
+                .collect();
+            assert_eq!(queued, vec![want.map(str::to_string)], "verdict {verdict}");
+        }
+    }
+
+    /// And the unconfigured default, at the same seam: an installation that has not named
+    /// `teams.review.changes_state` queues a completion carrying no route-back at all, so its
+    /// behaviour is byte-identical to the daemon before this transition existed.
+    #[test]
+    fn an_unconfigured_daemon_queues_no_route_back() {
+        let (mut o, _d) = orch_with_review(true);
+        let mut run = review_run("bob", HEAD_A);
+        run.introduced_by = "handoff:STUDIO-839".to_string();
+        o.store()
+            .start_run(rhapsody_store::RunStart {
+                issue_id: "ID-839".to_string(),
+                issue_identifier: "STUDIO-839".to_string(),
+                team_id: "TEAM-1".to_string(),
+                ..rhapsody_store::RunStart::default()
+            })
+            .expect("start run");
+        let mut rx = o.open_review_notify_channel();
+        o.dispatch_review(run.clone());
+        exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_FINDINGS);
+
+        let queued: Vec<Option<crate::reviewchanges::ReviewChangesPlan>> =
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|c| c.changes)
+                .collect();
+        assert_eq!(queued, vec![None]);
+    }
+
     /// The two exits that are NOT completions notify nobody. A crashed round read nothing, so there
     /// are no findings to point the author at; a `max_turns` round is re-armed at the SAME head
     /// (`record_review_truncated`), so telling the author to push fixes would ask them to advance
