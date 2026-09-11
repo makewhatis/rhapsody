@@ -123,6 +123,10 @@ pub struct Fake {
 
     /// When set, returned by `move_issue_state` (the move is still recorded).
     pub move_err: Option<TrackerError>,
+    /// How many of the FIRST `move_issue_state` calls [`move_err`](Self::move_err) applies to;
+    /// `0` (the default) is every one of them. Lets a test drive a move that fails once and then
+    /// succeeds — the transient tracker error a handoff retry rides out (STUDIO-838).
+    pub move_err_calls: usize,
 
     /// The state display name returned by `move_issue_to_type`.
     pub move_to_type_name: String,
@@ -437,12 +441,17 @@ impl Tracker for Fake {
         team_id: &str,
         state_name: &str,
     ) -> Result<(), TrackerError> {
-        self.lock().move_calls.push(MoveCall {
-            issue_id: issue_id.to_string(),
-            team_id: team_id.to_string(),
-            state_name: state_name.to_string(),
-        });
+        let call = {
+            let mut st = self.lock();
+            st.move_calls.push(MoveCall {
+                issue_id: issue_id.to_string(),
+                team_id: team_id.to_string(),
+                state_name: state_name.to_string(),
+            });
+            st.move_calls.len()
+        };
         match &self.move_err {
+            Some(_) if self.move_err_calls > 0 && call > self.move_err_calls => Ok(()),
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }

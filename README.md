@@ -981,8 +981,11 @@ structural rather than remembered — there is no way to spell it outside Teams.
 **Scope: only tickets this daemon parked, and only on a MERGE.** The population is
 `rhapsody_review_watch`, whose rows exist because a handoff introduced them from the run's own
 trusted repository binding in the same breath as the review-state move, and which record that
-origin as `handoff:<identifier>`. The ticket is therefore read off the row rather than inferred; a
-row an operator introduced through the console names none and moves none. A **closed-unmerged**
+origin as `handoff:<identifier>` — or, since STUDIO-838, as `adopt:<identifier>` when the repair
+sweep introduced it, which names its ticket exactly as a handoff does and for the same reason (both
+resolve from the daemon's own ledger and its own configured repository, through the same gates). The
+ticket is therefore read off the row rather than inferred; a row an operator introduced through the
+console names an OPERATOR rather than a ticket, so it moves none. A **closed-unmerged**
 pull request is out of scope and stays a human's call — it is abandoned work whose ticket still
 needs picking up, and auto-Cancelling it would destroy the only signal that says so. `Closed`,
 `Gone` and an untrusted head all retire the watch row and move nothing.
@@ -1128,3 +1131,61 @@ what let a parked ticket sit in Backlog for 35 minutes while its agent kept comm
 refuses the whole stop rather than committing the half that cannot fail. `kill_undeliverable` is
 additive: every response Go can produce (`200`, the partial-success `move_error` body, the
 `not_running` 409) is unchanged, and no golden covers this path.
+
+### An orphaned pull request is adopted, and says so when it cannot be (STUDIO-838)
+
+Go v0.4.0 has no review feature, so all of this is Rhapsody-only surface — but it repairs a hole
+Rhapsody dug for itself. Under `review.mode: ticketless` a pull request gets a reviewer only if it
+holds a row in `rhapsody_review_watch`, and until now the ONLY thing that wrote one was
+`plan_review_intro` at `handle_handoff_run`, which needs a LIVE run. One transient tracker error at
+handoff therefore cost a review permanently: the pull request sat open, green, in the review state
+and invisible to every mechanism that assigns a reviewer, with no repair path short of
+re-dispatching the whole ticket. Five reviews were lost this way on the reference installation.
+
+| A pull request whose handoff never introduced it | before | after |
+| --- | --- | --- |
+| repair without a live run | none — `POST /runs/{id}/handoff` answers `not_running` | the poll tick's adoption sweep |
+| a transient review-state move | discards the introduction | retried, bounded, transient-only |
+| an orphan the daemon may not repair | silence | a per-project advisory |
+
+**Adoption is a repair, never a second way to request a review.** It contributes exactly one thing —
+a different TRIGGER — and nothing to the decision: a planned adoption is an ordinary
+`ReviewIntroRequest` travelling the same channel to the same off-loop introduction task and written
+by the same loop-side `handle_review_introduce`. Every gate a handoff-time introduction passes, an
+adoption passes, in the same code — the watched-repo allowlist above all. Its one addition is a
+refusal the handoff path does not want (`only_if_unwatched`): a handoff re-arms an existing row on
+purpose, because that is how a re-run gets re-reviewed, while an adoption may only ever create the
+row that is missing. That guard is keyed on the pull request rather than on (PR, reviewer), so a
+second reviewer is a duplicate too, and it reads the whole watch set rather than the live half,
+because a retired `dropped` row is still a row.
+
+**The trusted inputs are re-derived, not relaxed.** With no run to read them off, the repository
+comes from the ticket's own resolved project — config, which is where the allowlist itself lives —
+and the author from the daemon's own `teams.route` ledger rather than from the ticket's
+`rhapsody:@<name>` label. The label is who the ticket is assigned to TODAY; a re-assignment would
+leave the real author eligible to be picked as their own reviewer, which is the one error this
+lookup must not make. A ticket no teammate of this daemon ran is not adopted at all.
+
+**Bounded, and free in the steady state.** The candidate set is the poll tick's own fetch, which is
+already active ∪ review, so learning that a ticket is parked costs no tracker call. A ticket whose
+handoff DID introduce it is skipped before any `gh` lookup, the same ticket is re-probed at most
+every `REVIEW_ADOPT_PROBE_INTERVAL` (15 minutes), and one tick plans at most
+`MAX_REVIEW_ADOPTIONS_PER_TICK` (4). A Teams-off or non-`ticketless` daemon reaches none of it.
+
+**The retry is narrow on purpose.** `handoff::move_is_transient` retries a transport failure or a
+408/429/5xx — the tracker never CONSIDERED the request — and nothing else; a rejected move, a
+malformed query or a missing state fails at the first attempt so the agent gets its error and falls
+back. Three attempts, 250ms and 750ms apart, because this runs on the request path of an agent's
+terminal tool call rather than on a background task. Stated plainly: it could not have rescued the
+instance that motivated the ticket. Linear reports hourly quota exhaustion as a 429 body inside a
+**400**, which is deliberately not retried, because no retry seconds later rides out an hour-long
+quota. The adopt path is what covers that case.
+
+**Producer 6 on `GET /api/v1/projects`.** An orphan the daemon can see and may not repair becomes a
+per-project advisory naming the ticket and the reason. Like the abandoned fan-out above it is never
+cleared by an unrelated success — the condition is a pull request sitting unreviewed, and the only
+thing that makes it untrue is the adoption that repairs it. Unlike it, the map is keyed by TICKET
+rather than appended to, because the sweep re-observes the same orphan on every poll tick: one
+ticket is one line, refreshed rather than duplicated, capped at
+`warnings::ORPHANED_REVIEW_WARN_CAP`. The endpoint's shape is unchanged and the two ported producers
+keep their golden ordering ahead of the additions.
