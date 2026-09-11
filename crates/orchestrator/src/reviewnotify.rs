@@ -240,46 +240,65 @@ pub async fn run_review_notify_task(
                 None => return,
             },
         };
-        let Some(sink) = deps.comments.as_ref() else {
-            tracing::debug!(
-                pr = %c, "ticketless review: no GitHub comment sink, so the author is not re-engaged"
-            );
-            continue;
-        };
-        let body = re_engage_comment(&c);
-        // The contract, in the log, on every comment: whether THIS body will reopen the author's
-        // ticket. Recomputed from the body that is actually about to be posted rather than from
-        // `c.approved`, so an edit to the template that lost the token reads as "will not
-        // re-engage" here instead of failing silently three systems away (design §14.2).
-        let summons = summons_author(&body, &c.summon_token);
-        if summons != !c.approved {
-            // The two disagree only if the template and the verdict have come apart — a findings
-            // comment whose token no longer matches, or an approval that grew one. Neither is
-            // recoverable here and both are worth saying out loud before posting.
-            tracing::error!(
-                pr = %c, approved = c.approved, summons,
-                "ticketless review: the completion comment does not carry the token its verdict \
-                 calls for; posting it as composed"
-            );
-        }
-        let posted = sink
-            .post_pr_comment(&c.owner, &c.repo, c.number, &body)
-            .await;
-        match &posted {
-            Ok(()) => tracing::info!(
-                pr = %c, reviewer = %c.reviewer, author = %c.author, approved = c.approved, summons,
-                "ticketless review: review-completion comment posted"
-            ),
-            Err(e) => tracing::warn!(
-                pr = %c, reviewer = %c.reviewer, err = %e,
-                "ticketless review: the review-completion comment could not be posted; the author \
-                 is not re-engaged for this round"
-            ),
-        }
+        // Whether THIS round re-engaged the author: the comment was posted AND carries the token.
+        // Both halves are decided here, and neither gates the ticket move below — a daemon that
+        // cannot reach GitHub still knows the review filed findings.
+        let re_engaged = post_completion(&deps, &c).await;
         // The second consequence of the same verdict (STUDIO-839), after the comment and never
         // before it: the comment is what re-engages the author, and a ticket moved out of review
         // ahead of the summons is the disagreement this path has to REPORT rather than create.
-        route_back(&deps, c, posted.is_ok() && summons).await;
+        route_back(&deps, c, re_engaged).await;
+    }
+}
+
+/// Posts one completion comment, answering whether it will re-engage the author.
+///
+/// `false` covers all three ways that fails, and they are deliberately indistinguishable to the
+/// caller: no sink at all, a refused post, and a body that carries no token. None of them is a
+/// reason to leave the ticket in the review state — see [`route_back`] — and all three mean the
+/// same thing to the author, which is that nothing reopened their run.
+async fn post_completion(deps: &ReviewNotifyDeps, c: &ReviewCompletion) -> bool {
+    let Some(sink) = deps.comments.as_ref() else {
+        tracing::debug!(
+            pr = %c, "ticketless review: no GitHub comment sink, so the author is not re-engaged"
+        );
+        return false;
+    };
+    let body = re_engage_comment(c);
+    // The contract, in the log, on every comment: whether THIS body will reopen the author's
+    // ticket. Recomputed from the body that is actually about to be posted rather than from
+    // `c.approved`, so an edit to the template that lost the token reads as "will not
+    // re-engage" here instead of failing silently three systems away (design §14.2).
+    let summons = summons_author(&body, &c.summon_token);
+    if summons != !c.approved {
+        // The two disagree only if the template and the verdict have come apart — a findings
+        // comment whose token no longer matches, or an approval that grew one. Neither is
+        // recoverable here and both are worth saying out loud before posting.
+        tracing::error!(
+            pr = %c, approved = c.approved, summons,
+            "ticketless review: the completion comment does not carry the token its verdict \
+             calls for; posting it as composed"
+        );
+    }
+    match sink
+        .post_pr_comment(&c.owner, &c.repo, c.number, &body)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                pr = %c, reviewer = %c.reviewer, author = %c.author, approved = c.approved,
+                summons, "ticketless review: review-completion comment posted"
+            );
+            summons
+        }
+        Err(e) => {
+            tracing::warn!(
+                pr = %c, reviewer = %c.reviewer, err = %e,
+                "ticketless review: the review-completion comment could not be posted; the \
+                 author is not re-engaged for this round"
+            );
+            false
+        }
     }
 }
 
@@ -290,7 +309,8 @@ pub async fn run_review_notify_task(
 /// and if one ever reaches here anyway — a refactor that lost the branch, a caller that built a
 /// completion by hand — the move is REFUSED rather than merely reported. An approved review must
 /// not pull its own ticket out of review; §15-c makes approval the pause in the loop, and the
-/// tokenless comment two lines up is already the same decision on the author's side.
+/// tokenless comment [`post_completion`] just sent is already the same decision on the author's
+/// side.
 async fn route_back(deps: &ReviewNotifyDeps, c: ReviewCompletion, re_engaged: bool) {
     let Some(plan) = c.changes else {
         return;
@@ -1016,6 +1036,30 @@ mod tests {
         assert!(
             !moved[0].1,
             "and the move is told that nothing re-engaged the author"
+        );
+    }
+
+    /// A daemon with NO comment sink at all still moves the ticket, and still says nothing
+    /// re-engaged the author. The three ways re-engagement fails — no sink, a refused post, a body
+    /// with no token — must be indistinguishable here: a review that filed findings did so whether
+    /// or not this daemon can reach GitHub, and a ticket left in review because the comment path
+    /// was missing would be the original gap reintroduced through a second door.
+    #[tokio::test]
+    async fn a_missing_comment_sink_still_moves_the_ticket() {
+        let tickets = RecordingTickets::new();
+        drain(
+            ReviewNotifyDeps {
+                comments: None,
+                tickets: Some(Arc::clone(&tickets) as Arc<dyn ReviewChangesSink>),
+            },
+            vec![completion_moving(false, "@symphony")],
+        )
+        .await;
+        let moved = tickets.taken();
+        assert_eq!(moved.len(), 1, "the ticket still moves");
+        assert!(
+            !moved[0].1,
+            "and nothing claims the author was re-engaged by a comment that was never posted"
         );
     }
 
