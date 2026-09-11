@@ -89,6 +89,12 @@ pub fn default_capabilities() -> Vec<CapabilityDef> {
             description: "Review your approach from a fresh angle before committing".to_string(),
             instruction: "Before committing to your implementation approach, step back and evaluate it as if seeing it for the first time — is there a simpler or more robust way to solve this?".to_string(),
         },
+        CapabilityDef {
+            name: "claude-md-maintenance".to_string(),
+            label: "CLAUDE.md Maintenance Sweep".to_string(),
+            description: "Detect and fix drift in this repo's nested CLAUDE.md files".to_string(),
+            instruction: "Read and follow .claude/skills/claude-md-maintenance/SKILL.md in this repo verbatim — it documents the full drift-detection and targeted-fix process for this ticket.".to_string(),
+        },
     ]
 }
 
@@ -263,6 +269,20 @@ mod tests {
         assert_eq!(parsed[0].label, "");
         assert_eq!(parsed[0].description, "");
         assert_eq!(parsed[0].instruction, "");
+    }
+
+    /// The `claude-md-maintenance` capability points a dispatched agent at the repo-checked-in
+    /// skill file rather than carrying the whole sweep process inline: the process describes this
+    /// tree's own `CLAUDE.md` layout, so it belongs in the repo, versioned with the code it
+    /// documents, not in a machine-local registry entry.
+    #[test]
+    fn default_capabilities_includes_claude_md_maintenance() {
+        let found = default_capabilities()
+            .into_iter()
+            .find(|c| c.name == "claude-md-maintenance")
+            .expect("claude-md-maintenance capability present");
+        assert_eq!(found.label, "CLAUDE.md Maintenance Sweep");
+        assert!(found.instruction.contains("claude-md-maintenance/SKILL.md"));
     }
 
     #[test]
