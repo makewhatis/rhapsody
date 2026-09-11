@@ -52,6 +52,16 @@ the `Orchestrator` struct itself. Concretely:
     because a ticket's runs can disagree about who ran them) — a read-only use of the same
     `Arc<dyn Store>` the handle already carries, never a write.
 
+    Each of the three memos has a `Mutex<Gate>` beside it (STUDIO-836) — the per-lookup failure
+    backoff. A memo bounds how often a lookup that ANSWERS re-asks; nothing bounded one that FAILS,
+    because a failure memoizes nothing, so every console poll re-issued the whole batch (~60
+    requests/min against a 2500/hour quota, self-sustaining once the quota was what was failing).
+    The gate is claimed on ENTRY, not on result, so the ceiling holds however many consoles poll at
+    once. If you add a fourth decoration here, give it a gate too; and if you change what counts as
+    a failure, read `Fetched::degraded` first — a round trip that said nothing arms the gate, while
+    a REFUSAL of a particular id is a verdict that memoizes as a bounded negative instead, and
+    conflating them either re-opens the storm or makes one bad id stall every healthy row with it.
+
   If you need to touch orchestrator state from outside the loop task, route through one of these
   five seams; if none fits, that's a real design decision — don't reach for a sixth ad hoc
   `Arc<Mutex<..>>` without updating this list.
@@ -245,7 +255,16 @@ the `Orchestrator` struct itself. Concretely:
   path is the seam where this mismatch is bridged — read its module doc before changing either
   table's key.
 - `RunningEntry::cancel` defaults to an **unarmed** `CancelSignal` (Go leaves `cancel` nil for
-  test/legacy entries); don't assume every `RunningEntry` in a test fixture can be cancelled.
+  test/legacy entries); don't assume every `RunningEntry` in a test fixture can be cancelled. Since
+  STUDIO-840 `handle_stop_run` REFUSES an unarmed entry (`kill_undeliverable`) instead of firing a
+  no-op cancel and moving the ticket anyway, so a stop test built on a hand-made fixture asserts the
+  refusal, not the stop — dispatch the issue if you want the real path.
+- **Cancellation is a dropped future, and the drop is what kills the agent.** `terminate` fires
+  `re.cancel`; `spawn_worker`'s `tokio::select!` then drops the run future, and the turn's
+  `KillGroupOnDrop` guard (`crates/agent`) SIGKILLs the `claude` process group — the stand-in for
+  Go's `exec.CommandContext` + `cmd.Cancel`. Nothing else kills an agent, so any new path that
+  abandons a run future must let it drop rather than `mem::forget`/detach it, and any new path that
+  reports a run stopped owes the same armed-signal check `handle_stop_run` makes.
 - The control channel is `tokio::sync::mpsc::unbounded`, not Go's buffered-256 channel — a
   deliberate deviation (the worker's per-event forwarding closure is sync and can't await a
   bounded send). Don't "fix" this back to a bounded channel without re-reading `loop.rs`'s module

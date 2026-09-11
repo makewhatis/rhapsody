@@ -85,6 +85,13 @@ impl CancelSignal {
         }
     }
 
+    /// Whether this signal can actually fire — false for the [`Default`] (unarmed) one, whose
+    /// [`cancel`](CancelSignal::cancel) is a silent no-op. A caller that reports having killed
+    /// something must check this first (STUDIO-840).
+    pub(crate) fn is_armed(&self) -> bool {
+        self.tx.is_some()
+    }
+
     /// A fresh awaitable receiver of this signal (Go deriving a ctx off the same cancel).
     pub fn wait(&self) -> CancelWait {
         CancelWait {
@@ -1315,8 +1322,10 @@ impl Orchestrator {
     /// The production worker spawn: builds the owning project's deps, takes the run's operator mailbox
     /// receiver (INF-250), launches a tokio task driving `run_agent_attempt`, and forwards its per-turn
     /// agent events + transcript-open + terminal exit back onto the control channel. Cancellation (from
-    /// `terminate` / `shutdown`) races the run and drops it. Mirrors Go `spawnWorker` (telemetry span
-    /// links are P6; full agent-subprocess kill on cancel is validated e2e in O8).
+    /// `terminate` / `shutdown`) races the run and drops it — and THAT drop is what kills the agent:
+    /// the turn's `KillGroupOnDrop` guard (`rhapsody_agent`) SIGKILLs the `claude` process group, the
+    /// stand-in for Go's `exec.CommandContext` + `cmd.Cancel` (STUDIO-840). Mirrors Go `spawnWorker`
+    /// (telemetry span links are P6).
     // The signature mirrors Go's flat `spawnWorker(wctx, iss, attempt, projectSlug, stackContext,
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and

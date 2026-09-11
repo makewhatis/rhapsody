@@ -56,7 +56,10 @@ pub struct RunningEntry {
     /// [`dispatch_issue`](Orchestrator::dispatch_issue) before the spawn and fired by `terminate` /
     /// `shutdown` to kill the run (the SIGKILL path in production). The [`empty`](RunningEntry::empty)
     /// default is UNARMED (Go leaves `cancel` nil for test / legacy entries that never spawned a
-    /// cancelable worker); its trivial `PartialEq`/`Debug` keep [`RunningEntry`]'s derives.
+    /// cancelable worker); its trivial `PartialEq`/`Debug` keep [`RunningEntry`]'s derives. An
+    /// unarmed signal makes `cancel()` a silent no-op, so `handle_stop_run` checks
+    /// `CancelSignal::is_armed` and refuses the stop outright rather than reporting a kill it did
+    /// not deliver (STUDIO-840).
     pub(crate) cancel: CancelSignal,
 
     /// Owning project (Phase 2). Empty in the legacy single-project / test-injected path; stamped at
