@@ -28,9 +28,13 @@
 //!
 //! # What it may move, and what it may not
 //!
-//! The scope guard is [`crate::reviewdone::handoff_ticket`]'s, shared rather than re-derived: only
-//! a ticket THIS DAEMON parked, named by the `handoff:<identifier>` origin recorded on the review
-//! run. An operator-introduced pull request (`console:…`) names no ticket and moves none.
+//! The scope guard is [`crate::reviewdone::origin_ticket`]'s, shared rather than re-derived: only
+//! a ticket THIS DAEMON parked, named by the `handoff:<identifier>` or `adopt:<identifier>` origin
+//! recorded on the review run. Sharing is the point, so the widening STUDIO-838 gave that guard is
+//! inherited here rather than re-litigated: an adopted pull request's ticket was parked by this
+//! daemon too, and a findings verdict on it routes back exactly as a handoff's does. An
+//! operator-introduced pull request (`console:…`) names an operator rather than a ticket, so it
+//! moves none.
 //!
 //! **And only while the pull request is still open.** That is the guard against
 //! [`crate::reviewdone`], the other writer of ticket state off a review outcome: a findings round
@@ -60,7 +64,7 @@ use rhapsody_store::RunFilter;
 
 use crate::orchestrator::Orchestrator;
 use crate::review::ReviewRun;
-use crate::reviewdone::handoff_ticket;
+use crate::reviewdone::origin_ticket;
 use crate::stop::ControlHandle;
 
 /// One findings verdict's implementation ticket, and the state it is going back to.
@@ -154,7 +158,7 @@ impl Orchestrator {
             return None;
         }
         let state = self.teams.as_ref()?.review_changes_state()?.to_string();
-        let identifier = handoff_ticket(&run.introduced_by)?.to_string();
+        let identifier = origin_ticket(&run.introduced_by)?.to_string();
         let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
         // The anti-race guard against `reviewdone`: a merged pull request's rows are retired, so an
         // absent-or-closed row means the ticket has either already been finished or is about to be,
