@@ -801,6 +801,16 @@ mod tests {
             "TEAM-1",
         ));
         re.run_id = run_id;
+        // STUDIO-860. `empty` zeroes `started_at` to the epoch, and this is the first test in the
+        // file whose assertion needs the entry to SURVIVE the loop. `run_loaded` schedules its first
+        // tick at `Duration::ZERO`, so a tick can land before the cancel; `reconcile_stalled` then
+        // reads `last_event_at`, falls back to `started_at`, and finds a run that "began" in 1970 —
+        // wedged past any stall timeout — and terminates it out of `running`. That eviction is
+        // indistinguishable from the false-success this test exists to catch, so stamp the entry the
+        // way `dispatch_issue` stamps a real one (`(o.now)()`, the convention every hand-built live
+        // entry in this crate follows). A live run's stall clock then reads ~0 against the fixture's
+        // 1h timeout, so no tick has any reason to retire it however the race lands.
+        re.started_at = (o.now)();
         assert!(
             !re.cancel.is_armed(),
             "this test is only meaningful on an unarmed entry"
