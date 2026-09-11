@@ -1027,12 +1027,18 @@ than an assertion, so a refactor that carried an approved plan that far cannot p
 state must not have one invented for it, and riding the ticketless path makes "a Teams-off install
 is unchanged" structural rather than remembered.
 
-**Scope, and the guard against auto-Done.** Only a ticket this daemon's own handoff parked, named by
-the `handoff:<identifier>` origin recorded on the review run — an operator-introduced pull request
-names none. And only while the pull request is still OPEN: a findings round that exits after its
-pull request merged would otherwise pull a finished ticket back out of its terminal state, which is
-the one way the two transitions can fight. Both decisions are made on the control task; both writes
-happen off it, so a merge observed inside that window can still land the two moves in either order.
+**Scope, and the guard against auto-Done.** Only a ticket this daemon parked, named by the
+`handoff:<identifier>` origin recorded on the review run — or by the `adopt:<identifier>` origin,
+on the same terms the transition above reads it: an adoption resolves from the daemon's own ledger
+and its own configured repository, through the same gates, so an adopted pull request's ticket was
+parked by this daemon too and its findings verdict routes back exactly as a handoff's does. An
+operator-introduced pull request names an OPERATOR rather than a ticket, so it moves none. The
+guard is `reviewdone::origin_ticket`'s, shared rather than re-derived, which is what keeps the two
+entries from drifting apart. And only while the pull request is still OPEN: a findings round that
+exits after its pull request merged would otherwise pull a finished ticket back out of its terminal
+state, which is the one way the two transitions can fight. Both decisions are made on the control
+task; both writes happen off it, so a merge observed inside that window can still land the two moves
+in either order.
 
 **The two consequences can disagree, and the daemon says so.** The state move is this daemon's own
 write and always happens; the run re-engagement additionally needs the completion comment to have

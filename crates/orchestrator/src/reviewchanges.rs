@@ -143,7 +143,7 @@ impl Orchestrator {
     ///
     /// * the round was APPROVED — the pairing's other arm, and the common case;
     /// * the transition is not configured (or Teams / ticketless review is off) — the default;
-    /// * the review was not introduced by a handoff, so no ticket is in scope;
+    /// * the review was introduced by neither a handoff nor an adoption, so no ticket is in scope;
     /// * the pull request is no longer open (or its row is gone) — warned, because a findings
     ///   verdict arriving after a merge is the one way this can fight [`crate::reviewdone`];
     /// * no run row survives for that identifier — warned: the ticket is real but the daemon has
@@ -266,7 +266,7 @@ mod tests {
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
-    use crate::reviewintro::REVIEW_ORIGIN_CONSOLE;
+    use crate::reviewintro::{REVIEW_ORIGIN_ADOPT, REVIEW_ORIGIN_CONSOLE};
     use crate::testsupport::{empty_effective, set_of};
 
     const OWNER: &str = "makewhatis";
@@ -446,15 +446,53 @@ mod tests {
 
     // ── scope ────────────────────────────────────────────────────────────────────────────────────
 
-    /// Only a ticket this daemon's own handoff parked is in scope, read off the recorded origin
-    /// rather than inferred. An operator-introduced pull request names no ticket and moves none.
+    /// An ADOPTED review names its ticket exactly as a handoff-introduced one does, so a findings
+    /// verdict on a pull request the repair sweep introduced routes its ticket back out of the
+    /// review state (STUDIO-838's widening of [`origin_ticket`], inherited here rather than
+    /// re-derived).
+    ///
+    /// Pinned in THIS module and not only in [`crate::reviewdone`]: the guard is shared, and a
+    /// sibling's tests protect "the helper is wide", never "this module shares it". Narrowing the
+    /// guard back to handoff-only at [`Orchestrator::plan_review_changes`]'s call site leaves the
+    /// rest of the workspace green, so without this test an adopted pull request's findings verdict
+    /// could silently move no ticket at all.
+    ///
+    /// The scope guard this module is built on is "a ticket THIS DAEMON parked in a review state",
+    /// and an adoption is that — resolved from the daemon's own run ledger and its own configured
+    /// repository, through the same gates and recorded on the same ledger.
     #[test]
-    fn only_a_handoff_introduced_review_names_a_ticket() {
+    fn an_adopted_review_names_its_ticket_exactly_as_a_handoff_does() {
+        let o = orch(ticketless_changes("In Progress"));
+        let run = review(&format!("{REVIEW_ORIGIN_ADOPT}:STUDIO-839"));
+        watched(&o, &run, true);
+        run_of(&o, "STUDIO-839", "ID-839", "TEAM-1");
+
+        assert_eq!(
+            o.plan_review_changes(&run, false).expect("a plan"),
+            ReviewChangesPlan {
+                pr: "makewhatis/rhapsody#64".to_string(),
+                issue_id: "ID-839".to_string(),
+                team_id: "TEAM-1".to_string(),
+                identifier: "STUDIO-839".to_string(),
+                state: "In Progress".to_string(),
+            }
+        );
+    }
+
+    /// The scope guard: only a ticket this daemon's own handoff or adoption parked is in scope,
+    /// read off the recorded origin rather than inferred. An operator-introduced pull request names
+    /// an OPERATOR rather than a ticket, so it moves none — and neither does an origin that merely
+    /// looks like one of the two prefixes.
+    #[test]
+    fn only_a_handoff_or_adoption_introduced_review_names_a_ticket() {
         for origin in [
             format!("{REVIEW_ORIGIN_CONSOLE}:operator"),
             "handoff:".to_string(),
             "handoff".to_string(),
             "handoffs:STUDIO-839".to_string(),
+            format!("{REVIEW_ORIGIN_ADOPT}:"),
+            REVIEW_ORIGIN_ADOPT.to_string(),
+            "adopts:STUDIO-839".to_string(),
             String::new(),
         ] {
             let o = orch(ticketless_changes("In Progress"));
