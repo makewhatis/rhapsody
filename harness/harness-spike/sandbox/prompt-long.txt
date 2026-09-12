@@ -1,0 +1,8 @@
+Work through every step, in order. Do not stop early.
+
+1. Read mod1.conf, mod2.conf, mod3.conf, mod4.conf and mod5.conf (five separate reads).
+2. In mod2.conf, mod4.conf and mod5.conf, double the `value` number (three separate edits).
+3. Run: grep -h '^value' mod1.conf mod2.conf mod3.conf mod4.conf mod5.conf
+4. Run: ./check.sh
+5. Call the symphony_state tool from the "symphony" MCP server (no arguments).
+6. Print a final line: DONE <sum of all five values> <status field from step 5>.
