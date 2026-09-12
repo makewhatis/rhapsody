@@ -375,6 +375,10 @@ impl Orchestrator {
         if let Some(td) = &teams_dispatch {
             re.identity = td.identity.clone();
             re.teammate_section = td.section.clone();
+            // The routed teammate's profile model/effort (STUDIO-868). Empty for every teammate
+            // whose profile names neither — which is every built-in — so the worker's session keeps
+            // the installation-wide pair and the argv is byte-identical to today.
+            re.model_override = td.model_override.clone();
         }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
@@ -385,6 +389,12 @@ impl Orchestrator {
                 .as_ref()
                 .map_or_else(String::new, |e| e.cfg.claude.model.clone()),
         };
+        // …but the teammate's profile OUTRANKS it, for the same reason it outranks `claude.model`
+        // on the wire: the label must name the model the run will actually use, not the one it
+        // would have used had nobody been routed (STUDIO-868).
+        if !re.model_override.model.is_empty() {
+            re.model = re.model_override.model.clone();
+        }
         if let Some(r) = &route {
             re.project_slug = r.slug.clone();
             // The per-project cap is counted across the whole project group; fall back to the slug when
@@ -428,6 +438,7 @@ impl Orchestrator {
         let stack_context = re.stack_context.clone();
         let capabilities_section = re.capabilities_section.clone();
         let teammate_section = re.teammate_section.clone();
+        let model_override = re.model_override.clone();
         let review_checkout = review.as_ref().map(crate::review::ReviewRun::checkout);
         // Stamped by `persist_start_run` above; 0 when the store is off or the insert failed, which
         // the runner treats as "unknown" and emits no env for (STUDIO-675).
@@ -451,6 +462,7 @@ impl Orchestrator {
                 stack_context,
                 capabilities_section,
                 teammate_section,
+                model_override,
                 run_id,
                 started_at,
                 review_checkout,

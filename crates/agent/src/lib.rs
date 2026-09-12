@@ -125,6 +125,35 @@ pub struct Transcript {
     pub stderr: Option<Box<dyn std::io::Write + Send>>,
 }
 
+/// The model/effort a dispatched teammate's resolved profile asks for, overriding the
+/// installation-wide `claude.model` / `claude.effort` for that ONE session (STUDIO-868).
+///
+/// Rhapsody-only (no Go counterpart — the frozen reference has no Teams). A field is "unset" when
+/// empty, and an unset field INHERITS the global: a teammate whose profile names neither produces a
+/// byte-identical argv to a daemon built before this existed, which is what keeps an installation
+/// with no `~/.rhapsody/teams/profiles/` unchanged.
+///
+/// `identity` is carried for diagnostics alone — it never reaches the argv. It exists so a profile
+/// naming a model the CLI rejects fails as "jimmy's profile asked for `<model>`" rather than as a
+/// bare non-zero exit that names nobody.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelOverride {
+    /// The routed teammate. Diagnostics only; empty when Teams is off or nobody was routed.
+    pub identity: String,
+    /// `claude --model`; empty ⇒ inherit [`crate::claude::Config::model`].
+    pub model: String,
+    /// `claude --effort`; empty ⇒ inherit [`crate::claude::Config::effort`].
+    pub effort: String,
+}
+
+impl ModelOverride {
+    /// Whether this override changes any flag. A `false` override is indistinguishable from never
+    /// having called [`Session::set_model_override`] at all.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_empty() && self.effort.is_empty()
+    }
+}
+
 /// `Session` is one live coding-agent conversation for one issue. The thread stays logically alive
 /// across continuation turns (upstream §7.1, §10.3).
 ///
@@ -164,6 +193,22 @@ pub trait Session: Send + Sync {
     /// reports on the commit it is actually looking at rather than re-asking GitHub for the head —
     /// a re-query mid-review returns a SHA whose changes were never read.
     fn set_review_head(&self, _sha: &str) {}
+
+    /// Records the dispatched teammate's profile model/effort, so THIS session's turns run on that
+    /// teammate's model instead of the installation-wide one (STUDIO-868).
+    ///
+    /// Rhapsody-only, and shaped exactly like [`Session::set_run_id`] and
+    /// [`Session::set_review_head`]: `&self`, called once by the worker after `start_session` and
+    /// before the first turn, defaulted to a no-op so a backend that cannot vary its model ignores
+    /// it rather than implementing it. An override whose fields are all empty
+    /// ([`ModelOverride::is_empty`]) changes nothing — the session keeps the global values.
+    ///
+    /// It lands on the SESSION rather than the runner because a runner is built once per
+    /// `Effective`/`ResolvedProject` and shared by every teammate, while Teams picks the identity at
+    /// dispatch. Moving runner construction to dispatch is the pluggable-harnesses design's slice 4
+    /// (`~/.rhapsody/docs/pluggable-harnesses-design.md` §4.1) and is deliberately NOT done here:
+    /// swapping a whole harness needs a different runner, but changing `--model` inside one does not.
+    fn set_model_override(&self, _over: ModelOverride) {}
 
     /// Runs one turn with the given prompt, forwarding events to `on_event`. The returned
     /// `(TurnResult, Option<AgentError>)` mirrors Go's `(TurnResult, error)`: a `Some` error means
