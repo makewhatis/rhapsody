@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.5](https://github.com/makewhatis/rhapsody/compare/v0.3.4...v0.3.5) (2026-09-12)
+
+
+### Features
+
+* **httpapi,web:** a review row says which ticket it is reviewing (STUDIO-834) ([#150](https://github.com/makewhatis/rhapsody/issues/150)) ([6c93d59](https://github.com/makewhatis/rhapsody/commit/6c93d595a09f5e9af8306e7af2039bb9c7941905))
+* **orchestrator,agent:** make a teammate's profile model and effort live (STUDIO-868) ([#152](https://github.com/makewhatis/rhapsody/issues/152)) ([8e1db25](https://github.com/makewhatis/rhapsody/commit/8e1db2564745bf36c06558d18a8237c9b13fef95))
+* **orchestrator:** adopt a review-state pull request nothing is watching (STUDIO-838) ([#145](https://github.com/makewhatis/rhapsody/issues/145)) ([10d0147](https://github.com/makewhatis/rhapsody/commit/10d01472526c7177fb998b0623c48470ddca4483))
+
+
+### Bug Fixes
+
+* **orchestrator:** move a ticket out of review when its review files findings (STUDIO-839) ([#147](https://github.com/makewhatis/rhapsody/issues/147)) ([6270375](https://github.com/makewhatis/rhapsody/commit/6270375be2621ca15c16ecd2e4a412ba3e72f6d7))
+
 ## [0.3.4](https://github.com/makewhatis/rhapsody/compare/v0.3.3...v0.3.4) (2026-09-10)
 
 
