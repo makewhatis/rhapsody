@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Mimic the daemon's turn loop: spawn in its own process group, stream stdout,
-close stdin on the terminal line, reap. Records timings and exit code."""
+close stdin on the terminal line, reap. Writes <prefix>.stdout, .stderr, .timing
+and .exit — the exit status goes to a file of its own because a harness that
+fails while exiting 0 is one of this spike's findings, and a status only echoed
+to a terminal is not evidence anyone can check later."""
 import json, os, subprocess, sys, threading, time
 
 def main():
@@ -52,6 +55,7 @@ def main():
     rc = p.wait()
     so.close()
     open(out_prefix + ".stderr", "wb").write(err)
+    open(out_prefix + ".exit", "w").write(f"{rc}\n")
     with open(out_prefix + ".timing", "w") as f:
         for t, raw in events:
             f.write(f"{t:8.3f}  {len(raw):6d}  {raw[:110].decode('utf-8','replace').rstrip()}\n")
