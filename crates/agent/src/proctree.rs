@@ -470,8 +470,8 @@ mod tests {
     /// the daemon and the operator's session with it — which is exactly why the round's ENTIRE
     /// target set is a pure function: the requirement ("a sweep rooted at pid 1 delivers no signal
     /// at all") is assertable without delivering one. Asserting `!signalable(-1)` instead would only
-    /// restate the implementation, and would stay green if the guard were deleted from the one place
-    /// that consults it.
+    /// restate the implementation, and would stay green if every call site that consults it were
+    /// deleted.
     ///
     /// `alive` is deliberately NON-empty, and that is the whole of what this test adds over
     /// [`round_targets_kill_the_leaders_group_even_with_an_unreadable_process_table`]: an empty
