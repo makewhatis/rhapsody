@@ -214,12 +214,12 @@ impl ReviewWatchSink for ControlWatchSink {
             tracing::warn!(pr = %plan.pr, "auto-merge: no GitHub source is configured; not merging");
             return;
         };
-        // Infallible by contract: every outcome is reported here and none of them has a caller
-        // with anything to do about it. A decline is re-considered on the next tick.
+        // Infallible by contract: no outcome has a caller with anything to do about it, and every
+        // one of them is logged — the two that CHANGED something where the change happens, in
+        // `runautomerge`, which holds the fields describing it, and the two that changed nothing
+        // here. A decline is re-considered on the next tick.
         match crate::runautomerge::perform_auto_merge(&plan, deps).await {
-            crate::runautomerge::AutoMergeOutcome::Merged(said) => {
-                tracing::info!(pr = %plan.pr, said = %said, "auto-merge: merged")
-            }
+            crate::runautomerge::AutoMergeOutcome::Merged(_) => {}
             crate::runautomerge::AutoMergeOutcome::Updated => {}
             crate::runautomerge::AutoMergeOutcome::Declined(why) => {
                 tracing::info!(pr = %plan.pr, reason = why, "auto-merge: declined")
@@ -707,7 +707,8 @@ impl Orchestrator {
             Ok(approved_by) => {
                 tracing::info!(
                     pr = %pr, head, ?approved_by,
-                    "auto-merge: every reviewer approved this head; the remaining gates are asked                      of GitHub off-loop"
+                    "auto-merge: every reviewer approved this head; the remaining gates are \
+                     asked of GitHub off-loop"
                 );
                 report.merge.push(crate::automerge::AutoMergePlan {
                     pr: pr.clone(),

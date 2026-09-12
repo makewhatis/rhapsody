@@ -207,8 +207,10 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
         .await
     {
         Ok(said) => {
+            // The one audit line for a merge. The caller logs nothing further: two INFO lines
+            // saying `auto-merge: merged` read as two merges.
             tracing::info!(
-                pr = %plan.pr, head = %plan.head, approved_by = ?plan.approved_by,
+                pr = %plan.pr, head = %plan.head, approved_by = ?plan.approved_by, said = %said,
                 "auto-merge: merged"
             );
             AutoMergeOutcome::Merged(said)
