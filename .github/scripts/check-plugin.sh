@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Structural + leak checks for the Claude Code plugin this repo ships (STUDIO-867).
+#
+# Two things about a plugin are mechanically checkable, and both have failed in the wild:
+#
+#   1. A `source` path that does not match a real plugin directory produces a marketplace that
+#      adds cleanly and installs NOTHING. Reading the JSON does not catch it; resolving the path
+#      does.
+#   2. The shipped files are public. They were extracted from one operator's machine-local
+#      skills, where a private tailnet host, a person's name and a tracker workspace name were
+#      all fine. Here they are not.
+#
+# Prose has no compiler, so — exactly like `harness/prompt/prompt_test.sh` — this rides the
+# existing `lint` job rather than adding a branch-protection context that would not be required.
+#
+# NOTE: the leak scan searches ONLY the shipped directories, never this script, so the patterns
+# below can be spelled out plainly without the check passing on its own text. Those patterns are
+# pinned by check-plugin_test.sh — a pattern nobody has watched fire is not a guard, which is how
+# the first, case-sensitive version of this scan shipped missing the very leak it was written for.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
+MARKETPLACE=".claude-plugin/marketplace.json"
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+[ -f "$MARKETPLACE" ] || fail "$MARKETPLACE is missing"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to parse the plugin manifests"
+
+# --- 1. every `source` resolves, and the two manifests agree on the version -------------------
+SOURCES=$(python3 - "$MARKETPLACE" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+plugins = m.get("plugins") or []
+if not plugins:
+    sys.exit("marketplace lists no plugins")
+for p in plugins:
+    src = p.get("source")
+    if not isinstance(src, str) or not src.startswith("./"):
+        sys.exit(f"plugin {p.get('name')!r}: source must be a relative './dir' path, got {src!r}")
+    print(f"{p.get('name')}\t{src}\t{p.get('version')}")
+PY
+)
+
+while IFS=$'\t' read -r name src version; do
+    [ -n "$name" ] || continue
+    dir="${src#./}"
+    [ -d "$dir" ] || fail "plugin '$name' has source '$src' but '$dir/' does not exist"
+    manifest="$dir/.claude-plugin/plugin.json"
+    [ -f "$manifest" ] || fail "plugin '$name': '$manifest' is missing — the marketplace would install nothing"
+    python3 - "$manifest" "$name" "$version" <<'PY'
+import json, sys
+manifest, entry_name, entry_version = sys.argv[1], sys.argv[2], sys.argv[3]
+p = json.load(open(manifest))
+if p.get("name") != entry_name:
+    sys.exit(f"{manifest}: name {p.get('name')!r} != marketplace entry {entry_name!r}")
+if p.get("version") != entry_version:
+    sys.exit(f"{manifest}: version {p.get('version')!r} != marketplace entry {entry_version!r}")
+PY
+
+    # --- 2. every skill is loadable: a SKILL.md carrying a front-matter description -----------
+    [ -d "$dir/skills" ] || fail "plugin '$name': no '$dir/skills/' directory"
+    found=0
+    for skill in "$dir"/skills/*/; do
+        [ -d "$skill" ] || continue
+        skill="${skill%/}"
+        found=$((found + 1))
+        [ -f "$skill/SKILL.md" ] || fail "skill '$skill' has no SKILL.md"
+        # The `description:` must be in the FRONT MATTER, not merely somewhere in the file: it is
+        # what decides whether the skill ever triggers, and a whole-file grep would be satisfied by
+        # a body line — which the team-setup skill, whose subject is YAML front matter, can easily
+        # grow. Bounded to the block between the opening `---` and its closing delimiter.
+        set +e
+        awk '
+            NR == 1        { if ($0 != "---") { code = 2; done = 1; exit } ; next }
+            $0 == "---"    { code = found ? 0 : 1; done = 1; exit }
+            /^description:/ { found = 1 }
+            END            { if (!done) code = 3; exit code }
+        ' "$skill/SKILL.md"
+        case $? in
+            0) ;;
+            2) set -e; fail "$skill/SKILL.md does not open with YAML front matter" ;;
+            3) set -e; fail "$skill/SKILL.md has an unterminated YAML front-matter block" ;;
+            *) set -e; fail "$skill/SKILL.md has no front-matter 'description:' — it would never trigger" ;;
+        esac
+        set -e
+    done
+    [ "$found" -gt 0 ] || fail "plugin '$name' ships no skills"
+    echo "ok: plugin '$name' -> $dir ($found skill(s)), manifests agree at v$version"
+done <<< "$SOURCES"
+
+# --- 3. nothing machine-local or private leaks into a public, installable artefact ------------
+# Each entry is "<what it is>|<extended regex>", matched case-INSENSITIVELY, because the forms these
+# strings actually travel in are not the ones a human writing a checklist would think of first: the
+# front-matter key this plugin was extracted from spelled the name `david`, all lower case, and the
+# workspace reaches a file as the `linear.app/<slug>/` of every pasted ticket link — no space and no
+# capital. A case-sensitive scan reports clean on both, which is worse than not scanning at all.
+# The workspace slug is matched with an OPTIONAL space and no other separator on purpose: widening
+# it to `studio[^a-z0-9]?49` would red on ticket ids STUDIO-490..STUDIO-499, which are not leaks.
+# check-plugin_test.sh reintroduces each form in turn and asserts this scan reds on it.
+LEAKS=(
+    "a private tailnet hostname|[a-z0-9_-]+\.ts\.net"
+    "a personal name|david"
+    "a tracker workspace name|studio ?49"
+)
+scan_dirs=(".claude-plugin")
+while IFS=$'\t' read -r _ src _; do
+    [ -n "$src" ] && scan_dirs+=("${src#./}")
+done <<< "$SOURCES"
+
+for entry in "${LEAKS[@]}"; do
+    what="${entry%%|*}"
+    pattern="${entry#*|}"
+    if hits=$(grep -rIniE -- "$pattern" "${scan_dirs[@]}" 2>/dev/null); then
+        echo "$hits" >&2
+        fail "shipped plugin files must not contain $what"
+    fi
+done
+echo "ok: no tailnet hostname, personal name or workspace name in ${scan_dirs[*]}"
+
+# --- 4. the real validator, when it is on PATH ------------------------------------------------
+# Authoritative but optional: CI runners do not necessarily have the Claude Code CLI, and this
+# check must stay bash-only there. When it IS present it outranks everything above.
+if command -v claude >/dev/null 2>&1; then
+    claude plugin validate . --strict
+    while IFS=$'\t' read -r _ src _; do
+        [ -n "$src" ] && claude plugin validate "$src" --strict
+    done <<< "$SOURCES"
+else
+    echo "note: the 'claude' CLI is not on PATH — skipped 'claude plugin validate --strict'"
+fi
+
+echo "plugin checks passed"

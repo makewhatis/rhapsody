@@ -128,6 +128,7 @@ impl crate::Runner for Runner {
             transcript_warned: AtomicBool::new(false),
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
+            model_override: Mutex::new(crate::ModelOverride::default()),
         }))
     }
 }
@@ -165,6 +166,11 @@ struct ClaudeSession {
     /// emits no review env at all (STUDIO-715). Behind a `Mutex` for the same reason `thread_id`
     /// is: the setter takes `&self` and the value is read on every turn.
     review_head: Mutex<String>,
+    /// The dispatched teammate's profile model/effort, set once by the worker via
+    /// [`Session::set_model_override`] before the first turn; empty for every run that routed to
+    /// nobody or whose profile names neither, which leaves the argv byte-identical (STUDIO-868).
+    /// Behind a `Mutex` for the same reason `review_head` is.
+    model_override: Mutex<crate::ModelOverride>,
 }
 
 impl ClaudeSession {
@@ -177,6 +183,66 @@ impl ClaudeSession {
     /// Locks `review_head`, recovering the guard on poison, exactly as [`Self::locked_thread_id`] does.
     fn locked_review_head(&self) -> std::sync::MutexGuard<'_, String> {
         self.review_head.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Locks `model_override`, recovering the guard on poison, exactly as [`Self::locked_thread_id`]
+    /// does.
+    fn locked_model_override(&self) -> std::sync::MutexGuard<'_, crate::ModelOverride> {
+        self.model_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The `[teammate …]` clause a failure message carries when this session's model/effort came
+    /// from a dispatched teammate's profile; EMPTY when it did not, so an unrouted run's error text
+    /// is unchanged (STUDIO-868). Only the fields the profile actually named are listed — reporting
+    /// an inherited global as though the profile had chosen it would misdirect the reader.
+    fn model_attribution(&self) -> String {
+        let over = self.locked_model_override();
+        if over.is_empty() {
+            return String::new();
+        }
+        let mut parts = Vec::new();
+        if !over.model.is_empty() {
+            parts.push(format!("--model {}", over.model));
+        }
+        if !over.effort.is_empty() {
+            parts.push(format!("--effort {}", over.effort));
+        }
+        let who = if over.identity.is_empty() {
+            "a profile".to_string()
+        } else {
+            format!("teammate {}", over.identity)
+        };
+        format!("[{who} asked for {}] ", parts.join(" "))
+    }
+
+    /// The config THIS turn's argv is built from: the session's own copy of the runner's config
+    /// (`start_session` already clones it, which is how per-session `mcp_config` injection works),
+    /// with the dispatched teammate's profile model/effort substituted where the profile names one
+    /// (STUDIO-868).
+    ///
+    /// Per-turn rather than applied once at `start_session`, because the override arrives AFTER the
+    /// session is built — the worker calls `set_model_override` on a `Box<dyn Session>`, exactly as
+    /// it calls `set_run_id`. One `Config` clone per turn, against a process spawn.
+    ///
+    /// Precedence is per FIELD and non-empty-wins: a profile naming only a model keeps the global
+    /// effort. Empty means INHERIT, never "clear", so an installation with no profiles directory —
+    /// and every built-in profile, all of which ship `model: ""` — builds the same argv it always
+    /// did.
+    fn turn_cfg(&self) -> Config {
+        let over = self.locked_model_override();
+        if over.is_empty() {
+            return self.cfg.clone();
+        }
+        let mut cfg = self.cfg.clone();
+        if !over.model.is_empty() {
+            cfg.model = over.model.clone();
+        }
+        if !over.effort.is_empty() {
+            cfg.effort = over.effort.clone();
+        }
+        cfg
     }
 
     /// Tees one raw stdout line (+ newline) to the transcript BEFORE classification so even
@@ -242,6 +308,13 @@ impl Session for ClaudeSession {
         *self.locked_review_head() = sha.to_string();
     }
 
+    /// Stores the dispatched teammate's profile model/effort (STUDIO-868). An all-empty override is
+    /// stored as-is and read back as "inherit everything" by [`ClaudeSession::turn_cfg`], so it is
+    /// indistinguishable from never having been called.
+    fn set_model_override(&self, over: crate::ModelOverride) {
+        *self.locked_model_override() = over;
+    }
+
     async fn stop(&self) -> Result<(), AgentError> {
         Ok(()) // per-turn processes; nothing persistent
     }
@@ -280,7 +353,7 @@ impl Session for ClaudeSession {
         // argv: base command args ++ per-turn flags, resuming from the captured thread id.
         let resume = self.thread_id();
         let mut args = self.cmd_args.clone();
-        args.extend(build_args(&self.cfg, &resume));
+        args.extend(build_args(&self.turn_cfg(), &resume));
 
         let mut cmd = Command::new(&self.cmd_name);
         cmd.args(&args);
@@ -605,9 +678,18 @@ impl Session for ClaudeSession {
                 Ok(s) => format!("{s}"),
                 Err(e) => format!("{e}"),
             };
+            // A profile-supplied model is the first thing to suspect on a bare non-zero exit with no
+            // result event: the CLI refuses an unknown `--model` exactly here, and its stderr names
+            // neither the teammate nor the fact that the value came from a profile rather than from
+            // `claude.model` (STUDIO-868, decision 1). The run still FAILS — this only makes the
+            // failure attributable. Empty for every run with no override, which keeps the message
+            // byte-identical to a daemon built before this existed.
+            let whose = self.model_attribution();
             return (
                 failed(usage),
-                Some(AgentError::Other(format!("turn_failed: {detail}: {msg}"))),
+                Some(AgentError::Other(format!(
+                    "turn_failed: {detail}: {whose}{msg}"
+                ))),
             );
         }
         (
@@ -1964,6 +2046,297 @@ mod tests {
         assert!(
             !std::path::Path::new(&survivor).exists(),
             "a process of the stopped run survived the cancellation and kept working ({survivor})"
+        );
+    }
+
+    // ── Per-teammate model/effort (STUDIO-868) ──────────────────────────────────────────────────
+    //
+    // The property under test is WHICH ARGV a given identity produces, so these assert on the
+    // argv the child process actually received (`args.log`, written by the fake from `"$@"`) —
+    // never on the config that argv was built from.
+
+    /// Writes a fake claude that appends its own argv to `args.log` in its cwd and then emits a
+    /// successful one-turn stream.
+    fn write_argv_recording_claude() -> (TempDir, String) {
+        write_fake_claude(
+            "#!/usr/bin/env bash\n\
+             echo \"$@\" >> args.log\n\
+             head -n 1 >/dev/null\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}'\n\
+             echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+        )
+    }
+
+    /// Runs ONE turn in its own workspace under `root` and returns the argv line the child saw.
+    async fn argv_of_one_turn(
+        r: &Runner,
+        root: &TempDir,
+        ws_id: &str,
+        over: Option<crate::ModelOverride>,
+    ) -> String {
+        let ws = make_ws(root, ws_id);
+        let sess = r
+            .start_session(&ws, issue(ws_id, ws_id), None)
+            .await
+            .expect("start session");
+        if let Some(o) = over {
+            sess.set_model_override(o);
+        }
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "{ws_id}: {err:?}");
+        std::fs::read_to_string(format!("{ws}/args.log"))
+            .expect("read args.log")
+            .trim()
+            .to_string()
+    }
+
+    /// A runner over the argv-recording fake carrying the INSTALLATION-WIDE model/effort — the
+    /// single global pair every run shared before STUDIO-868.
+    fn global_model_runner(script: &str, root: &str) -> Runner {
+        Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.to_string(),
+            turn_timeout: Duration::from_secs(5),
+            model: "global-model".to_string(),
+            effort: "medium".to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// **The STUDIO-868 acceptance criterion.** Two teammates whose profiles name different
+    /// model/effort produce different `--model`/`--effort` on the wire — from ONE runner, which is
+    /// the whole point: a runner is built per project and shared, and Teams picks the identity
+    /// later.
+    #[tokio::test]
+    async fn two_teammates_argv_carry_their_own_profile_model_and_effort() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let (_s, script) = write_argv_recording_claude();
+        let r = global_model_runner(&script, &root.path());
+
+        let staff = argv_of_one_turn(
+            &r,
+            &root,
+            "MT-STAFF",
+            Some(crate::ModelOverride {
+                identity: "alice".to_string(),
+                model: "strong-model".to_string(),
+                effort: "xhigh".to_string(),
+            }),
+        )
+        .await;
+        let swe1 = argv_of_one_turn(
+            &r,
+            &root,
+            "MT-SWE1",
+            Some(crate::ModelOverride {
+                identity: "jerry".to_string(),
+                model: "cheap-model".to_string(),
+                effort: "low".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(
+            staff.contains("--model strong-model") && staff.contains("--effort xhigh"),
+            "the staff engineer's profile must reach the argv: {staff:?}"
+        );
+        assert!(
+            swe1.contains("--model cheap-model") && swe1.contains("--effort low"),
+            "the SWE I's profile must reach the argv: {swe1:?}"
+        );
+        assert!(
+            !staff.contains("global-model") && !swe1.contains("global-model"),
+            "a profile value REPLACES the global, it does not join it: {staff:?} / {swe1:?}"
+        );
+        assert_ne!(
+            staff, swe1,
+            "alice and jerry must stop being the same engineer"
+        );
+    }
+
+    /// **The regression that would silently re-model every existing run.** A teammate whose profile
+    /// leaves model/effort empty — which is every built-in (`swe`, `reviewer`, `sre` all ship
+    /// `model: ""`) — gets argv BYTE-IDENTICAL to the global-only path. Asserted as equality
+    /// against a session that was never given an override at all, not as a substring.
+    #[tokio::test]
+    async fn an_inheriting_teammate_gets_argv_byte_identical_to_the_global_only_path() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let (_s, script) = write_argv_recording_claude();
+        let r = global_model_runner(&script, &root.path());
+
+        // No override at all: an installation with no `teams/profiles/` directory, or Teams off.
+        let untouched = argv_of_one_turn(&r, &root, "MT-GLOBAL", None).await;
+        // Routed to a teammate whose resolved profile names neither value.
+        let inheriting = argv_of_one_turn(
+            &r,
+            &root,
+            "MT-INHERIT",
+            Some(crate::ModelOverride {
+                identity: "jimmy".to_string(),
+                model: String::new(),
+                effort: String::new(),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            inheriting, untouched,
+            "an empty profile must leave the argv byte-identical to today"
+        );
+        assert!(
+            untouched.contains("--model global-model") && untouched.contains("--effort medium"),
+            "and that argv is still the global pair: {untouched:?}"
+        );
+    }
+
+    /// Precedence is per-FIELD, not all-or-nothing: a profile that names only a model inherits the
+    /// global effort, and vice versa.
+    #[tokio::test]
+    async fn a_half_filled_profile_overrides_only_the_field_it_names() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let (_s, script) = write_argv_recording_claude();
+        let r = global_model_runner(&script, &root.path());
+
+        let model_only = argv_of_one_turn(
+            &r,
+            &root,
+            "MT-MODEL",
+            Some(crate::ModelOverride {
+                identity: "alice".to_string(),
+                model: "strong-model".to_string(),
+                effort: String::new(),
+            }),
+        )
+        .await;
+        assert!(
+            model_only.contains("--model strong-model") && model_only.contains("--effort medium"),
+            "an unnamed effort inherits the global: {model_only:?}"
+        );
+
+        let effort_only = argv_of_one_turn(
+            &r,
+            &root,
+            "MT-EFFORT",
+            Some(crate::ModelOverride {
+                identity: "alice".to_string(),
+                model: String::new(),
+                effort: "xhigh".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            effort_only.contains("--model global-model") && effort_only.contains("--effort xhigh"),
+            "an unnamed model inherits the global: {effort_only:?}"
+        );
+    }
+
+    /// The override is re-read every turn, so a `--resume` continuation stays on the teammate's
+    /// model. `build_args` runs per turn, not per runner — this pins that that stays true.
+    #[tokio::test]
+    async fn a_continuation_turn_keeps_the_teammates_model() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-RESUME");
+        let (_s, script) = write_argv_recording_claude();
+        let r = global_model_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("RESUME", "MT-RESUME"), None)
+            .await
+            .expect("start session");
+        sess.set_model_override(crate::ModelOverride {
+            identity: "alice".to_string(),
+            model: "strong-model".to_string(),
+            effort: "xhigh".to_string(),
+        });
+        let (_t, on_event) = type_collector();
+        let (_r1, e1) = sess.run_turn("first", None, None, &on_event).await;
+        assert!(e1.is_none(), "turn 1: {e1:?}");
+        let (_r2, e2) = sess.run_turn("continue", Some(2), None, &on_event).await;
+        assert!(e2.is_none(), "turn 2: {e2:?}");
+
+        let log = std::fs::read_to_string(format!("{ws}/args.log")).expect("read args.log");
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2, "expected 2 invocations: {log:?}");
+        for (n, line) in lines.iter().enumerate() {
+            assert!(
+                line.contains("--model strong-model") && line.contains("--effort xhigh"),
+                "turn {} lost the teammate's model: {line:?}",
+                n + 1
+            );
+        }
+        assert!(
+            lines[1].contains("--resume s"),
+            "turn 2 resumes: {:?}",
+            lines[1]
+        );
+    }
+
+    /// **Decision 1 of STUDIO-868.** A profile naming a model the CLI rejects FAILS the run — that
+    /// is not softened — but the failure must say whose profile asked for it. The CLI's own refusal
+    /// is a non-zero exit with a one-line stderr that names neither the teammate nor the fact that
+    /// the value came from a profile at all.
+    #[tokio::test]
+    async fn a_rejected_profile_model_fails_naming_the_teammate_and_the_model() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-BADMODEL");
+        let (_s, script) = write_fake_claude(
+            "#!/usr/bin/env bash\n\
+             echo 'error: unknown model' >&2\n\
+             exit 1\n",
+        );
+        let r = global_model_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("BAD", "MT-BADMODEL"), None)
+            .await
+            .expect("start session");
+        sess.set_model_override(crate::ModelOverride {
+            identity: "jerry".to_string(),
+            model: "no-such-model".to_string(),
+            effort: String::new(),
+        });
+        let (res, err) = sess.run_turn("p", None, None, &type_collector().1).await;
+        assert_eq!(res.status, TURN_FAILED, "the run still fails");
+        let msg = err
+            .expect("a rejected model must fail the turn")
+            .to_string();
+        assert!(
+            msg.contains("jerry") && msg.contains("no-such-model"),
+            "the failure must name the teammate and the model it asked for: {msg:?}"
+        );
+        assert!(
+            msg.contains("unknown model"),
+            "and must not swallow the CLI's own stderr: {msg:?}"
+        );
+    }
+
+    /// The other half of the same decision: with no profile override in play the failure text is
+    /// BYTE-IDENTICAL to what a daemon built before STUDIO-868 produced — no empty brackets, no
+    /// dangling "teammate ".
+    #[tokio::test]
+    async fn a_failure_with_no_override_carries_no_attribution_at_all() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-BADPLAIN");
+        let (_s, script) = write_fake_claude(
+            "#!/usr/bin/env bash\n\
+             echo 'error: unknown model' >&2\n\
+             exit 1\n",
+        );
+        let r = global_model_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("PLAIN", "MT-BADPLAIN"), None)
+            .await
+            .expect("start session");
+        let (_res, err) = sess.run_turn("p", None, None, &type_collector().1).await;
+        let msg = err.expect("the turn fails").to_string();
+        assert_eq!(
+            msg, "turn_failed: exit status: 1: error: unknown model\n",
+            "an unrouted run's failure text must be unchanged"
         );
     }
 }

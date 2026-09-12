@@ -111,6 +111,11 @@ pub struct WorkerDeps {
     /// nobody was routed, or the profile failed to resolve — and empty means the guard in
     /// [`build_turn_prompt`] skips it, leaving the prompt byte-identical.
     pub teammate_section: String,
+    /// The model/effort the routed teammate's profile asks for (STUDIO-868), landed on the session
+    /// by [`Session::set_model_override`] before its first turn. Empty — Teams off, nobody routed,
+    /// or (the common case) a profile naming neither — leaves the runner's own configured model in
+    /// place and the argv byte-identical.
+    pub model_override: agent::ModelOverride,
     /// The GitHub label name the post-run labeler adds to every PR in this run's stack (AIE-301).
     pub pr_label: String,
     /// The store run-row id for this attempt (Go `WorkerDeps.RunID`), threaded onto the session so
@@ -435,6 +440,11 @@ pub async fn run_agent_attempt(
     if let Some(rev) = &deps.review {
         sess.set_review_head(&rev.head_sha);
     }
+    // Run this turn loop on the routed teammate's OWN model, not the installation-wide one
+    // (STUDIO-868). Unconditional because an empty override is defined to change nothing — the same
+    // shape `set_run_id` uses for a zero id — and because a REVIEW run reaches here by the same
+    // path, which is how a reviewer gets their own model rather than the reviewed run's.
+    sess.set_model_override(deps.model_override.clone());
 
     let (final_state, result_text, loop_err) = deps
         .run_turns(
@@ -657,6 +667,7 @@ mod tests {
             stack_context: String::new(),
             capabilities_section: String::new(),
             teammate_section: String::new(),
+            model_override: agent::ModelOverride::default(),
             pr_label: String::new(),
             review_handoff_state: None,
             review: None,
@@ -1110,6 +1121,51 @@ mod tests {
             ag.last_review_head(),
             None,
             "a non-review run must not pin a review head"
+        );
+    }
+
+    /// The dispatch→session link for STUDIO-868: whatever profile model/effort the dispatch
+    /// resolved reaches the session before its first turn, which is where `build_args` reads it.
+    #[tokio::test]
+    async fn worker_lands_the_teammates_model_on_the_session() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.model_override = agent::ModelOverride {
+            identity: "alice".to_string(),
+            model: "strong-model".to_string(),
+            effort: "xhigh".to_string(),
+        };
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert_eq!(
+            ag.last_model_override(),
+            Some(agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "strong-model".to_string(),
+                effort: "xhigh".to_string(),
+            })
+        );
+    }
+
+    /// The inertness half: a run that routed to nobody still calls the setter — an empty override is
+    /// defined to change nothing, the same shape a zero `run_id` has — so the session keeps the
+    /// installation-wide model.
+    #[tokio::test]
+    async fn worker_lands_an_empty_model_override_for_an_unrouted_run() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag.clone(), tr, "p", 20);
+        let (_last, _declared, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert_eq!(
+            ag.last_model_override(),
+            Some(agent::ModelOverride::default()),
+            "an unrouted run threads an empty override, which changes no flag"
         );
     }
 

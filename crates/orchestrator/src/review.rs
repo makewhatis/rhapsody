@@ -1567,4 +1567,66 @@ mod tests {
             "a ticket run's workspace was torn down as if it were a review"
         );
     }
+
+    /// **STUDIO-868's review criterion.** A review run wears its REVIEWER's model, not the model of
+    /// the run it is reviewing and not the installation-wide one. That is half the point of the
+    /// feature — a reviewer on a strong model reading a cheap model's work — and reviews reach the
+    /// worker by a different dispatch path than a ticket, which is where a per-identity property is
+    /// most likely to be dropped.
+    #[test]
+    fn a_review_run_wears_its_reviewers_profile_model() {
+        let dir = crate::testsupport::TempDir::new();
+        let profiles = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&profiles).expect("create profiles dir");
+        std::fs::write(
+            profiles.join("picky.md"),
+            "---\nextends: reviewer\nmodel: strong-model\neffort: xhigh\n---\nBe picky.\n",
+        )
+        .expect("write profile");
+
+        let (mut o, _dispatched) = orch_with_review(true);
+        o.teams_profiles_dir = Some(profiles);
+        // The roster entry the synthetic issue's `rhapsody:@alice` label routes to.
+        if let Some(t) = o.teams.as_mut() {
+            t.roster[0].profile = "picky".to_string();
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_key("makewhatis", "rhapsody", 12, "alice");
+        let re = &o.running[&id];
+        assert_eq!(re.identity, "alice", "the reviewer's identity is routed");
+        assert_eq!(
+            re.model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "strong-model".to_string(),
+                effort: "xhigh".to_string(),
+            },
+            "the review must be dispatched on the REVIEWER's model"
+        );
+        assert_eq!(
+            re.model, "strong-model",
+            "and the run's model label must name it, not the project's"
+        );
+    }
+
+    /// The inherit half of the same criterion: a reviewer whose profile names nothing dispatches
+    /// with no override, so a review on an installation with no profiles is unchanged.
+    #[test]
+    fn a_reviewer_with_no_profile_model_dispatches_inheriting() {
+        let (mut o, _dispatched) = orch_with_review(true);
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_key("makewhatis", "rhapsody", 12, "alice");
+        assert!(
+            o.running[&id].model_override.is_empty(),
+            "{:?}",
+            o.running[&id].model_override
+        );
+    }
 }

@@ -1,0 +1,20 @@
+{
+  "name": "rhapsody",
+  "version": "0.1.0",
+  "description": "Skills for Rhapsody Teams — how named agent teammates get work done (routing, the room, memory, the two review models), how to compose a roster and write a teammate profile, and how to operate a running installation.",
+  "author": {
+    "name": "makewhatis",
+    "url": "https://github.com/makewhatis"
+  },
+  "homepage": "https://github.com/makewhatis/rhapsody",
+  "repository": "https://github.com/makewhatis/rhapsody",
+  "license": "MIT",
+  "keywords": [
+    "rhapsody",
+    "teams",
+    "agents",
+    "linear",
+    "orchestration",
+    "code-review"
+  ]
+}

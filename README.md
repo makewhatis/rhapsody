@@ -13,6 +13,39 @@ per-issue workspaces, and runs Claude Code agents inside them. The daemon binary
 
 Build: `cargo build --workspace` · Test: `make test` · Lint: `make lint`
 
+## Claude Code plugin
+
+This repo is also a Claude Code **marketplace**. `plugin/` ships the skills that describe how to
+plan, route and operate work through Rhapsody, and `.claude-plugin/marketplace.json` points at it:
+
+```
+/plugin marketplace add makewhatis/rhapsody
+/plugin install rhapsody@rhapsody
+```
+
+Two skills install:
+
+| Skill | What it covers |
+|---|---|
+| `rhapsody-teams` | The Teams domain model — the one assignment mechanism, what a teammate's run gets, the room, memory, the two mutually-exclusive review models — plus `operating.md` on running an installation (where a verdict lives, config traps, the 60s lifecycle TTL, release mechanics, why the board looks idle). |
+| `rhapsody-team-setup` | Composing a roster and writing the profile that gives a teammate its initial context, then landing a valid `teams.yaml` without the boot-only and degrade-to-off traps. |
+
+They live here rather than in a repo of their own **because they go stale otherwise**. An earlier
+copy asserted that an unmatched ticket dispatches identity-less for eleven days after the team-work
+invariant made that false. Here the pull request that changes the behaviour changes the skill in the
+same diff, and a reviewer sees both — the discipline [Divergences](#divergences) already applies to
+this README. A shipped, installable plugin is a product artefact, not a process document, so it is
+not covered by the "specs and plans never land in this repo" rule above.
+
+The plugin **versions independently of the daemon**: `rhapsodyd` releases on every merged fix, while
+the skills change only when described behaviour does, so tying them would either churn the plugin or
+lie about what moved. What keeps it honest is `.github/scripts/check-plugin.sh`, which rides the
+`lint` job (and `make lint`): it resolves every marketplace `source` to a real plugin directory,
+requires `marketplace.json` and `plugin.json` to agree on name and version, requires every skill to
+carry a front-matter `description`, and fails the build if a shipped file ever regains a private
+hostname, a person's name or a tracker workspace name. Bump the plugin version in the same pull
+request that edits a shipped skill.
+
 ## Parity testing
 
 Porting crates take `harness-fixtures` as a dev-dependency and assert their output equals the

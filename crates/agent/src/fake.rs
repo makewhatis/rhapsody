@@ -55,6 +55,12 @@ struct Recorded {
     /// `None` when the caller never set one (every non-review run). Recorded so a test can assert
     /// the worker pins the dispatched head onto the session exactly once (STUDIO-715).
     last_review_head: Option<String>,
+    /// The model/effort override the most recent session was given via
+    /// [`Session::set_model_override`], or `None` when the caller never called it. Recorded so a
+    /// test can assert the worker carries the DISPATCHED TEAMMATE's profile model onto the session
+    /// — including on a review run, which reaches the worker by a different dispatch path
+    /// (STUDIO-868).
+    last_model_override: Option<crate::ModelOverride>,
 }
 
 impl Fake {
@@ -93,6 +99,12 @@ impl Fake {
     /// `None` when the caller never called it (STUDIO-715).
     pub fn last_review_head(&self) -> Option<String> {
         self.lock().last_review_head.clone()
+    }
+
+    /// The model/effort override the most recent session was given via
+    /// [`Session::set_model_override`]; `None` when the caller never called it (STUDIO-868).
+    pub fn last_model_override(&self) -> Option<crate::ModelOverride> {
+        self.lock().last_model_override.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Recorded> {
@@ -164,6 +176,13 @@ impl Session for FakeSession {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .last_review_head = Some(sha.to_string());
+    }
+
+    fn set_model_override(&self, over: crate::ModelOverride) {
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_model_override = Some(over);
     }
 
     async fn run_turn(

@@ -3,12 +3,18 @@
 test:
 	cargo test --workspace
 
-# lint mirrors ci.yml's `lint` job step for step: rustfmt, clippy, and the .rhapsody/PROMPT.md
-# invariant guard (STUDIO-599) — prompt text has no compiler, so its rules are pinned by a case table.
+# lint mirrors ci.yml's `lint` job step for step: rustfmt, clippy, the .rhapsody/PROMPT.md
+# invariant guard (STUDIO-599) — prompt text has no compiler, so its rules are pinned by a case table
+# — and the same treatment for the shipped Claude Code plugin (STUDIO-867): the marketplace `source`
+# paths must resolve to real plugin directories, and no shipped file may carry a private hostname,
+# a person's name or a tracker workspace name — with that scan's own patterns pinned by
+# check-plugin_test.sh, which reintroduces each leak and asserts the scan reds on it.
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	harness/prompt/prompt_test.sh
+	.github/scripts/check-plugin.sh
+	.github/scripts/check-plugin_test.sh
 
 # Recapture golden fixtures from the reference Go daemon (operator machine only; see harness/capture/)
 fixtures:

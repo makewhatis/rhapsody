@@ -40,12 +40,18 @@
 //! templating affordance the design adds; keeping it a literal token splice is
 //! what keeps it small.
 //!
-//! # T2 is prompt-only (§0.11.7)
+//! # What a resolved profile decides (§0.11.7, as amended by STUDIO-868)
 //!
-//! `model` and `effort` resolve here and are consumed by **nothing** — wiring
-//! them into the dispatched invocation is T2b. `tools` is parsed and explicitly
-//! unused: per-profile tool allowlists are deferred (they need permission-flag
-//! plumbing), not implied.
+//! T2 shipped this module prompt-only: `model` and `effort` resolved here and
+//! were consumed by nothing. **They are live now** — STUDIO-868 made a routed
+//! teammate's resolved `model`/`effort` the `--model`/`--effort` its runs get,
+//! so a Staff Engineer and a SWE I stop sharing one installation-wide pair.
+//! Empty still means inherit, which is what every built-in ships. Selecting a
+//! different HARNESS (rather than a different model within Claude) remains the
+//! pluggable-harnesses design's, not this module's.
+//!
+//! `tools` is parsed and explicitly unused: per-profile tool allowlists are
+//! deferred (they need permission-flag plumbing), not implied.
 
 use std::path::{Path, PathBuf};
 
@@ -122,9 +128,10 @@ impl Extends {
 pub struct BuiltinProfile {
     pub name: &'static str,
     pub version: u32,
-    /// Empty ⇒ inherit the daemon's configured model (§2.2). Consumed by T2b.
+    /// Empty ⇒ inherit the daemon's configured model (§2.2). Every built-in ships empty, which is
+    /// why STUDIO-868 changed nothing for anyone until a profile sets a value.
     pub model: &'static str,
-    /// Empty ⇒ inherit. Consumed by T2b.
+    /// Empty ⇒ inherit, exactly as [`BuiltinProfile::model`].
     pub effort: &'static str,
     /// Names from the BO-11 registry ([`crate::capabilities`]) — referenced
     /// here, resolved by whoever renders them.
@@ -326,9 +333,13 @@ pub struct Provenance {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProfile {
     pub name: String,
-    /// Empty ⇒ inherit the daemon's configured model. Consumed by T2b, not T2.
+    /// `claude --model` for every run dispatched to a teammate wearing this profile; empty ⇒
+    /// inherit the daemon's configured `claude.model` (STUDIO-868). Read by
+    /// `Orchestrator::teammate_profile_for`, which carries it to the session as an
+    /// `agent::ModelOverride`.
     pub model: String,
-    /// Empty ⇒ inherit. Consumed by T2b, not T2.
+    /// `claude --effort`, resolved and consumed exactly as [`ResolvedProfile::model`] is; empty ⇒
+    /// inherit.
     pub effort: String,
     pub capabilities: Vec<String>,
     /// Parsed, explicitly unused (§0.11.7).
