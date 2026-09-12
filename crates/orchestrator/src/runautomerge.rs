@@ -331,9 +331,13 @@ mod tests {
         ])
     }
 
+    /// One recorded `merge_pr`: number, method, whether GitHub's auto-merge was armed, and the
+    /// head the merge was pinned to.
+    type MergeCall = (i64, MergeMethod, bool, Option<String>);
+
     #[derive(Default)]
     struct FakeMerger {
-        calls: Mutex<Vec<(i64, MergeMethod, bool, Option<String>)>>,
+        calls: Mutex<Vec<MergeCall>>,
         fail: Option<&'static str>,
     }
     #[async_trait]
@@ -742,11 +746,14 @@ mod tests {
         }
     }
 
+    /// Builds the deps for one case of the test below, given the merger it must record into.
+    type DepsBuilder = Box<dyn Fn(Arc<FakeMerger>) -> AutoMergeDeps>;
+
     /// A lookup that could not be MADE is a failure and never a refusal: nothing is known, so
     /// nothing is concluded and nothing is merged. Each of the three reads fails this way.
     #[tokio::test]
     async fn an_unreadable_lookup_fails_rather_than_merging() {
-        let cases: Vec<(&str, Box<dyn Fn(Arc<FakeMerger>) -> AutoMergeDeps>)> = vec![
+        let cases: Vec<(&str, DepsBuilder)> = vec![
             (
                 "pr state",
                 Box::new(|m| AutoMergeDeps {

@@ -762,22 +762,46 @@ where
     // ticking.
     let review_watch_task = spawn_watcher.then(|| {
         let watch_ctx = shutdown.wait();
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            &resolved
+                .as_ref()
+                .map(|c| c.tracker.summon_token.clone())
+                .unwrap_or_default(),
+            None,
+        ));
+        // The auto-merge's `gh` seams (STUDIO-874), wired only when the operator asked for it.
+        // `review_auto_merge()` already requires Teams AND `review.mode: ticketless`, so a
+        // Teams-off daemon builds nothing here and the sink's merge path is inert — the D5
+        // invariant, kept at the composition root as well as in the gate.
+        let automerge = teams_cfg.review_auto_merge().then(|| {
+            Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeDeps {
+                prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
+                mergestate: Arc::clone(&gh)
+                    as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
+                policy: Arc::clone(&gh)
+                    as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdateSource>,
+                updater: Arc::clone(&gh)
+                    as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdater>,
+                checks: Arc::clone(&gh)
+                    as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
+                merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
+                allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+            })
+        });
+        let mut sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone());
+        if let Some(deps) = automerge {
+            sink = sink.with_auto_merge(deps);
+        }
         let deps = rhapsody_orchestrator::reviewwatch::ReviewWatchDeps {
-            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
-                &resolved
-                    .as_ref()
-                    .map(|c| c.tracker.summon_token.clone())
-                    .unwrap_or_default(),
-                None,
-            ))),
+            pr_source: Some(
+                Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
+            ),
             // The base repository's own owner and nothing else — the default trust boundary. A
             // fork's head is refused rather than reviewed (design §14.1 F-SEC); there is no config
             // key to widen it, so widening is a code change a reviewer sees.
             allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
             teams: teams_cfg.clone(),
-            sink: Arc::new(rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(
-                handle.clone(),
-            )),
+            sink: Arc::new(sink),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::reviewwatch::run_review_watch_task(watch_ctx, deps).await;
