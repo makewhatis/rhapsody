@@ -12,8 +12,9 @@
 //! Deviations from the Go source, all behavior-preserving:
 //!   * Go's goroutine-per-worker + `ctx` cancellation maps to an `async fn`: cancellation is a
 //!     dropped future (O7 owns the task's abort handle), so there is no `ctx` parameter. The agent
-//!     subprocess dies with that drop — the turn holds a `KillGroupOnDrop` guard that SIGKILLs its
-//!     process group, since a dropped `tokio::process::Child` signals nothing (STUDIO-840).
+//!     subprocess dies with that drop — the turn holds a `KillTreeOnDrop` guard that SIGKILLs its
+//!     whole process tree, since a dropped `tokio::process::Child` signals nothing (STUDIO-840) and
+//!     every harness puts its tool children in a process group of their own (STUDIO-871).
 //!   * Telemetry is P6: Go's `symphony.run`/`worktree.ensure`/`turn` spans and the `turn.duration` /
 //!     token metrics are NOT emitted here (the `WorkerDeps` telemetry fields — `Tracer`, `Metrics`,
 //!     `Model`, `DispatchSpanContext` — are dropped; the per-event `tracing::debug!` forwarding line
