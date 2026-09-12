@@ -82,9 +82,10 @@ pub fn kill_tree(pid: u32) {
     // A leader that is not itself a legal target roots no sweep at all. `0` is the disarmed guard
     // (and `kill(0, …)` would signal the daemon's OWN group); `1` is init, whose descendants are
     // every process on the machine, so even the per-pid half of a sweep rooted there is the blast
-    // radius [`signalable`] exists to refuse. Unlike the same check inside [`round_targets`] this
-    // one cannot be exercised red — a test that removed it would take the runner with it — so it is
-    // the second line of defence, and [`round_targets`] is the one the suite pins.
+    // radius [`signalable`] exists to refuse. [`round_targets`] refuses the same two leaders, which
+    // is where the safety property is pinned; this one is not redundant with it but an early exit —
+    // it is what keeps a disarmed `Drop` (`leader == 0`, once per successful turn) from spending six
+    // `ps` execs and the sweep's whole `SWEEP_PAUSE` budget to arrive at an empty target set.
     if !signalable(-leader) {
         return;
     }
@@ -178,8 +179,17 @@ fn live_tree(table: &[Proc], known: &mut BTreeSet<i32>) -> Vec<Proc> {
 ///
 /// The whole set, `-leader` included, then passes [`signalable`] and the two self-checks: nothing
 /// that would signal init, every process on the machine, this process, or the daemon's own group
-/// ever reaches [`signal`].
+/// ever reaches [`signal`]. A leader that is itself illegal is refused BEFORE any of that, because
+/// per-member filtering cannot express it: a leader of `0` or `1` poisons `known` with the whole
+/// process table, and every row it drags in is a legal target on its own terms.
 fn round_targets(alive: &[Proc], leader: i32, known: &BTreeSet<i32>) -> BTreeSet<i32> {
+    // A sweep rooted at init or at the caller's own group has no legal target at all, and filtering
+    // `-leader` alone does not achieve that: `known` seeded with `0` or `1` closes over every
+    // process on the machine, and each one then contributes a target through the per-pid half
+    // below. The refusal belongs to the whole round, so it is taken before the round is built.
+    if !signalable(-leader) {
+        return BTreeSet::new();
+    }
     let me = std::process::id() as i32;
     // SAFETY: `getpgrp(2)` takes no arguments, touches no memory and cannot fail.
     let my_pgid = unsafe { libc::getpgrp() };
@@ -462,11 +472,34 @@ mod tests {
     /// at all") is assertable without delivering one. Asserting `!signalable(-1)` instead would only
     /// restate the implementation, and would stay green if the guard were deleted from the one place
     /// that consults it.
+    ///
+    /// `alive` is deliberately NON-empty, and that is the whole of what this test adds over
+    /// [`round_targets_kill_the_leaders_group_even_with_an_unreadable_process_table`]: an empty
+    /// table leaves `-leader` as the only candidate, so it would pin the filtering of that ONE
+    /// member and nothing else. The rows below are the per-pid half the group filter does not
+    /// reach — before the guard inside [`round_targets`] existed this returned `{-500, 501}`.
     #[test]
     fn a_sweep_rooted_at_pid_one_signals_nothing_at_all() {
+        let alive = vec![
+            // A child of init that leads a group of its own: contributes `-500`.
+            Proc {
+                pid: 500,
+                ppid: 1,
+                pgid: 500,
+                live: true,
+            },
+            // Its child, parked in a group nobody in the tree leads: contributes the bare `501`.
+            Proc {
+                pid: 501,
+                ppid: 500,
+                pgid: 777,
+                live: true,
+            },
+        ];
         assert!(
-            round_targets(&[], 1, &BTreeSet::from([1])).is_empty(),
-            "a leader of 1 makes the round's unconditional group kill kill(-1, …)"
+            round_targets(&alive, 1, &BTreeSet::from([1, 500, 501])).is_empty(),
+            "a leader of 1 makes the round's unconditional group kill kill(-1, …), and closes \
+             every process on the machine into the per-pid half besides"
         );
     }
 
@@ -483,11 +516,40 @@ mod tests {
 
     /// A zero pid is the disarmed guard, and `kill(0, …)` / `kill(-0, …)` would signal the DAEMON's
     /// own process group — every process the daemon leads, including itself.
+    ///
+    /// The sharper half is that `0` is not the dead end it looks like, and it is the HOT path:
+    /// `tree_kill.disarm()` sets the guard to `0`, so the `Drop` at the end of every SUCCESSFUL
+    /// turn arrives here. `launchd` has `ppid 0` on macOS, so a sweep seeded with `{0}` pulls pid 1
+    /// into the closure on its first pass and every process on the machine after it — measured on
+    /// the machine this was written on as 1108 of 1108 rows. `once(-0)` is filtered by
+    /// [`signalable`]; the per-pid half is what the guard inside [`round_targets`] is for, and it
+    /// is asserted rather than delivered for the same reason the pid-1 case is.
     #[test]
     fn kill_tree_of_pid_zero_is_a_no_op() {
         kill_tree(0);
         // Reaching this line is the assertion: the test process is in the daemon's position here,
         // and a `kill(0, SIGKILL)` would have taken the whole test binary down with it.
+
+        let alive = vec![
+            // `launchd`, whose parent is the pid-0 guard itself.
+            Proc {
+                pid: 1,
+                ppid: 0,
+                pgid: 1,
+                live: true,
+            },
+            // Anything at all under it — i.e. everything on the machine.
+            Proc {
+                pid: 500,
+                ppid: 1,
+                pgid: 500,
+                live: true,
+            },
+        ];
+        assert!(
+            round_targets(&alive, 0, &BTreeSet::from([0, 1, 500])).is_empty(),
+            "the disarmed guard swept the whole machine through launchd's ppid of 0"
+        );
     }
 
     /// The sweep must never aim at the process doing the sweeping or at its group, however the
