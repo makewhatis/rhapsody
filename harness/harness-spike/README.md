@@ -1,6 +1,6 @@
 # harness-spike — real captured event streams, one per candidate harness
 
-Captured by the STUDIO-869 spike on 2026-09-11 by running **one real multi-tool turn per harness
+Captured by the STUDIO-869 spike on 2026-09-11 and 2026-09-12 by running **one real multi-tool turn per harness
 against a real paid provider**, in a git sandbox, with the daemon's own MCP server attached. These
 are the samples the pluggable-harnesses adapter slices are built against.
 
@@ -31,7 +31,8 @@ Nothing in the Rust workspace reads these files yet. They are inputs for the ada
 | `claude/concurrency.txt` | Item 4, executed: two claude turns at once over the shared `~/.claude`. |
 | `claude/concurrency-trials.txt` | The same, repeated: 4 paired trials, 8/8 turns completed. |
 | `codex/happy.jsonl` | Same multi-tool turn, **with** `--dangerously-bypass-approvals-and-sandbox`. |
-| `codex/mcp-refused-approval-policy.jsonl` | The same turn **without** that flag: both MCP calls refused, `turn.completed`, exit 0. |
+| `codex/mcp-refused-approval-policy.jsonl` | The same turn **without** that flag: the MCP call refused, `turn.completed`. |
+| `codex/mcp-refused-approval-policy.exit` | Its observed exit status: **0** — a refused turn is not a failed process. |
 | `codex/failure-401.jsonl` | Deliberate failure (bogus key): **6** non-terminal `error` events, then `turn.failed`. |
 | `codex/failure-401.exit` | Its observed exit status: **1**. |
 | `codex/resume.jsonl` | `codex exec resume <thread_id>`. |
@@ -39,6 +40,7 @@ Nothing in the Rust workspace reads these files yet. They are inputs for the ada
 | `codex/killtest.txt` | Item 5, executed. |
 | `codex/concurrency.txt` | Item 4, executed: two codex turns at once over one shared `$CODEX_HOME`. |
 | `codex/concurrency-trials.txt` | The same, repeated: 4 paired trials, 8/8 turns completed. |
+| `codex/concurrency-rollouts.txt` | The two rollout files those two turns wrote into that one shared `$CODEX_HOME`. |
 | `opencode/happy.jsonl` | Same multi-tool turn. |
 | `opencode/long-turn.jsonl` | A longer turn: 11 tool calls over 4 steps, all correct. |
 | `opencode/long-turn.timing` | Per-event arrival offsets and sizes for that turn, from `drive.py`. |
@@ -48,7 +50,8 @@ Nothing in the Rust workspace reads these files yet. They are inputs for the ada
 | `opencode/opencode.json` | The project config that produced every opencode capture. |
 | `opencode/killtest.txt` | Item 5, executed. |
 | `opencode/concurrency.txt` | Item 4, executed: two opencode turns at once over the shared state dir — **one turn dies**. |
-| `opencode/concurrency-trials-shared.txt` | 5 paired trials on the shared state dir: **6/10 turns completed, 4 lost to `database is locked`**. |
+| `opencode/concurrency-trials-shared.txt` | 5 paired trials on the shared state dir, database already created: **8/10 turns completed, 2 lost to `database is locked`**. |
+| `opencode/concurrency-trials-fresh-shared-xdg.txt` | The same 5 trials against a state dir with **no database yet**: **0/10 — every turn lost**. |
 | `opencode/concurrency-trials-isolated-xdg.txt` | The same 5 trials with a private `XDG_DATA_HOME` per turn: **10/10**. |
 | `goose/failure-401-exit0.stdout` | Goose failing a 401 while **exiting 0**, with the error on stdout. Failure path only — see below. |
 | `goose/failure-401-exit0.exit` | Its observed exit status: **0**. The filename's claim, recorded rather than asserted. |
@@ -56,16 +59,21 @@ Nothing in the Rust workspace reads these files yet. They are inputs for the ada
 
 `sandbox/mksandbox.sh` builds the sandbox repo (honours `$RHAPSODYD` and `$WORKFLOW`);
 `sandbox/drive.py` mimics the daemon's turn loop (own process group, stream stdout, close stdin on
-the terminal line, reap) and writes a `.timing` sidecar; `sandbox/killtest.py` reproduces the
-daemon's exact kill (`process_group(0)` + `kill(-pid, SIGKILL)`) and reports surviving descendants;
-`sandbox/conctest.sh` runs two turns of one harness at once against its shared global state dir and
-checks each turn edited only its own sandbox; `sandbox/conctrials.sh` repeats that N times and
-reports how many turns survived, which is the only honest way to measure an intermittent failure.
+the terminal line, reap) and writes `.timing` and `.exit` sidecars; `sandbox/killtest.py` reproduces
+the daemon's exact kill (`process_group(0)` + `kill(-pid, SIGKILL)`) and reports surviving
+descendants; `sandbox/conctest.sh` runs two turns of one harness at once against one state
+directory and passes only if each turn edited its own sandbox **and** the two reported disjoint,
+non-empty session-id sets; `sandbox/conctrials.sh` repeats that N times and reports how many turns
+survived, which is the only honest way to measure an intermittent failure. `SEED_XDG=1` gives each
+turn a private `XDG_DATA_HOME`; `SHARED_XDG=1` points a pair at one state dir that has no database
+yet.
 
-Every `killtest.txt` and `concurrency.txt` in this directory is the **verbatim stdout of those two
-scripts**, timestamps and argv included — re-running the committed script reproduces the committed
-transcript. Both carry their own elapsed times, which is why the kill and concurrency cases have no
-separate `.timing` sidecar.
+Every `killtest.txt`, `concurrency.txt` and `concurrency-trials*.txt` here is the **stdout of the
+committed script that produced it** and nothing else — timestamps, argv and the leading `#` framing
+all come from the script (`$NOTE`), so re-running it reproduces the transcript. The one recorded
+thing that is not a script's stdout is `codex/concurrency-rollouts.txt`, which is the output of the
+`ls` in Provenance below and lives in its own file for exactly that reason. All of these carry
+their own elapsed times, which is why the kill and concurrency cases have no `.timing` sidecar.
 
 ## What items 4 and 5 found
 
@@ -85,36 +93,67 @@ put the *harness* in a killable group, and these transcripts show the harness th
 tool children somewhere else. A stop still leaves real work running, whichever harness is in use.
 Killing the leader's group is therefore not a containment boundary for any candidate.
 
-**Item 4, concurrency — clean on claude and codex, BROKEN on opencode.**
+**Item 4, concurrency — clean on claude and codex; on opencode the state directory is the whole
+story.**
 
-| Harness | Shared state dir | Private state dir |
+| Harness | One state dir for both turns | A private state dir per turn |
 |---|---|---|
 | claude | **8/8** turns completed (`claude/concurrency-trials.txt`) | not needed |
 | codex | **8/8** turns completed (`codex/concurrency-trials.txt`) | not needed |
-| opencode | **6/10** turns completed (`opencode/concurrency-trials-shared.txt`) | **10/10** (`opencode/concurrency-trials-isolated-xdg.txt`) |
+| opencode, database already created | **8/10** (`opencode/concurrency-trials-shared.txt`) | **10/10** (`opencode/concurrency-trials-isolated-xdg.txt`) |
+| opencode, **no database yet** | **0/10 — both turns of every pair died** (`opencode/concurrency-trials-fresh-shared-xdg.txt`) | — |
 
-⚠️ **opencode loses roughly one turn in three to `database is locked`** when two turns share the
-default state dir. The losing turn dies in **under a second**, exits **1**, emits a completely
-**empty event stream**, and writes `Error: Unexpected error` / `database is locked` to stderr —
-`~/.local/share/opencode/opencode.db` is SQLite and the second turn to open it is refused outright.
-It is a race, so a single pair often passes: that is why the evidence here is repeated trials
-(`sandbox/conctrials.sh`) and not one run.
+⚠️ **opencode loses turns to `database is locked` whenever two turns share one state directory.**
+The losing turn dies in **0–1s**, exits **1**, emits a **completely empty event stream** and no
+session id at all, and writes `Error: Unexpected error` / `database is locked` to stderr —
+`$XDG_DATA_HOME/opencode/opencode.db` is SQLite and the turn that loses the race is refused
+outright. For an adapter this is the important shape: **a turn can fail with zero events**, so
+"stream ended with no terminal event" has to be a first-class failure, not an impossible state.
 
-**Giving each turn a private `XDG_DATA_HOME` fixes it completely** — 10/10 across the same five
-paired trials. The credentials have to be copied in with it (`auth.json` lives in that same
-directory, so a bare redirect leaves the turn unauthenticated), and cold-start cost rises: isolated
-turns took 18–50s against 12–19s shared. **An opencode adapter must isolate the state dir per run;
-sharing it is not viable.**
+**How often it happens depends on whether the database already exists, and that is the finding.**
+Against a state dir whose db was created days earlier, the loss is intermittent — 2 of 10 turns
+here, plus one of the two in `opencode/concurrency.txt`, and 4 of 10 for the same command in the
+previous commit on this branch (`git show 3802ffe:harness/harness-spike/opencode/concurrency-trials-shared.txt`).
+Against a state dir with **no** database, it is not intermittent at all: five paired trials, ten
+turns, **ten losses, both turns of every pair**. So the hazard is at its worst exactly where an
+adapter would meet it — the first two runs to use a newly provisioned state directory.
+
+**A private `XDG_DATA_HOME` per turn fixes it completely** — 10/10 across five paired trials, with
+each turn creating its own database. The credentials have to be copied in (`auth.json` lives in
+that same directory, so a bare redirect leaves the turn unauthenticated; `conctrials.sh` now fails
+loudly rather than running a turn without it), and cold start costs more: isolated turns took
+**15–73s** against **9–28s** for the surviving shared-dir turns. **An opencode adapter must give
+each run its own state directory; sharing one is not viable.**
 
 Codex, by contrast, wrote one uniquely-named rollout per thread into a single shared `$CODEX_HOME`
-with no collision, so redirecting `CODEX_HOME` is not required for *correctness* — only to stop two
-runs sharing history. One codex turn took 128s against its partner's 19s in an earlier pair; that
-is a single observation with no isolated cause, not a measured contention finding.
+with no collision (`codex/concurrency-rollouts.txt` lists the two files, and their names carry the
+two `thread_id`s in `codex/concurrency.txt`), so redirecting `CODEX_HOME` is not required for
+*correctness* — only to stop two runs sharing history.
 
-Across the 42 concurrent turns in these transcripts, **5 were lost — all of them opencode on a
-shared state dir.** Each of the other 37 edited only its own `counter.txt` and reported a distinct
-session id. **No cross-talk was observed on any harness**: opencode's failure is a refusal to
-start (the lost turns edited nothing at all), not corruption of the other turn.
+⚠️ **Retracted: the "one codex turn took 128s against its partner's 19s" note from the previous
+revision of this file.** All ten codex turns here finished in **12–26s**. In between, `conctest.sh`
+was found not to close the child's stdin, and `codex exec` was directly observed sitting in
+`Reading additional input from stdin...` *after* emitting `turn.completed` — so a turn's recorded
+elapsed time could be mostly that wait. That is a sufficient explanation for the old outlier, not a
+proven one: the run itself is gone and cannot be re-examined. Either way the claim is withdrawn
+rather than restated, the script now passes `< /dev/null` (matching the documented invocation), and
+there is no measured codex contention finding.
+
+**No cross-talk was observed on any harness.** These transcripts hold **52** concurrent turns.
+**13 were lost, every one of them opencode sharing a state directory.** The other **39** each
+edited only their own `counter.txt` and reported a session id, and those 39 ids are **all
+distinct** — verifiable from the committed files, which record an event count and the id set for
+every one of the 52 turns:
+
+```
+$ grep -h 'session ids seen' */concurrency*.txt | wc -l
+      52
+$ grep -ho "ses_[A-Za-z0-9]*\|[0-9a-f]\{8\}-[0-9a-f-]*" */concurrency*.txt | sort -u | wc -l
+      39
+```
+
+opencode's failure is a refusal to start — a lost turn edits nothing and opens no session — not
+corruption of its neighbour. None of the 52 turns saw a 429.
 
 ## Provenance — the exact command per capture
 
@@ -138,7 +177,8 @@ claude -p --output-format stream-json --input-format stream-json --verbose \
 # codex/*  — provider: Fireworks (accounts/fireworks/models/deepseek-v4p1-flash) via CODEX_HOME/config.toml
 CODEX_HOME=<scratch> FIREWORKS_API_KEY=<key> \
   codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$PROMPT" </dev/null
-#   mcp-refused-approval-policy.jsonl: identical but `-s workspace-write` instead of the bypass flag
+#   mcp-refused-approval-policy.jsonl: identical but `-s workspace-write` instead of the bypass
+#     flag; `.exit` is `echo $?` from that same invocation
 #   failure-401.jsonl:                 identical but FIREWORKS_API_KEY=fw_BOGUSKEY
 #   resume.jsonl:                      `codex exec resume <thread_id> --json ... "$PROMPT"`
 
@@ -163,6 +203,18 @@ sandbox/killtest.py <label> <sandbox> 45 <the harness argv above, prompt-slow-ch
 # concurrency.txt, per harness — two turns at once over that harness's shared global state dir
 PROMPT="$(cat sandbox/prompt-multitool.txt)" \
   sandbox/conctest.sh <label> <sandbox-a> <sandbox-b> -- <the harness argv above>
+
+# codex/concurrency-rollouts.txt — the rollout files those two codex turns left behind
+ls -1 $CODEX_HOME/sessions/*/*/*/*.jsonl | tail -2
+
+# concurrency-trials*.txt — the same pair, repeated. $NOTE supplies each file's `#` header.
+NOTE=<the file's header text> sandbox/conctrials.sh cl-shared 4 <root> -- <claude argv>
+NOTE=<...>                   sandbox/conctrials.sh cx-shared 4 <root> -- <codex argv>
+NOTE=<...>                   sandbox/conctrials.sh oc-shared 5 <root> -- <opencode argv>
+NOTE=<...> SHARED_XDG=1      sandbox/conctrials.sh oc-fresh 5 <root> -- \
+  /usr/bin/env XDG_DATA_HOME='{XDG}' <opencode argv>
+NOTE=<...> SEED_XDG=1        sandbox/conctrials.sh oc-isolated 5 <root> -- \
+  /usr/bin/env XDG_DATA_HOME='{}/xdg' <opencode argv>
 ```
 
 `opencode` must be the Homebrew build at `/opt/homebrew/Cellar/opencode/<v>/bin/opencode`. On the
@@ -182,11 +234,11 @@ never ran; it exits 1 with an install error on stderr and runs nothing. A daemon
   leftover: an earlier ad-hoc burst of concurrent requests returned 200 across the board, but no
   transcript of it was kept, so it is not evidence and is not repeated here as a finding. What *is*
   committed is the two-turns-at-once case the ticket actually asked for, in each
-  `concurrency.txt` and `concurrency-trials*.txt` — and none of those 42 turns saw a 429 either.
+  `concurrency.txt` and `concurrency-trials*.txt` — and none of those 52 turns saw a 429 either.
   opencode's concurrent failures are a local SQLite lock, not a provider rate limit.
 - **A failing harness does not reliably say so in its exit code, and `claude` does not reliably say
-  so in its stream.** The four `.exit` sidecars are the recorded spread: goose 401 → **0**,
-  claude bad-model → 1, codex 401 → 1, opencode 401 → 1. Independently, `claude`'s terminal
+  so in its stream.** The five `.exit` sidecars are the recorded spread: goose 401 → **0**,
+  codex MCP-call-refused → **0**, claude bad-model → 1, codex 401 → 1, opencode 401 → 1. Independently, `claude`'s terminal
   `result` line for the bad-model failure carries `"subtype":"success"` *and* `"is_error":true` in
   the same object, so `subtype` is not a verdict either.
 - **The same prompt does not produce the same step grouping.** `opencode/long-turn.jsonl` and the

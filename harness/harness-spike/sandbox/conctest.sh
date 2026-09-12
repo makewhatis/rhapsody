@@ -25,7 +25,11 @@ for sb in "$sba" "$sbb"; do
     # The event stream goes to its own file, NOT into a field of .result: it is
     # multi-line, so embedding it would leave only its first line readable and
     # the session-id scan below would silently see one event instead of all.
-    "${args[@]}" "$PROMPT" > "$sb/.stream" 2>"$sb/.stderr"; rc=$?
+    # stdin from /dev/null, as the daemon gives a turn whose prompt is an
+    # argument. Without it `codex exec` prints "Reading additional input from
+    # stdin..." and waits there AFTER emitting turn.completed, so whether a
+    # trial ever ends depends on what the operator's shell handed the script.
+    "${args[@]}" "$PROMPT" > "$sb/.stream" 2>"$sb/.stderr" < /dev/null; rc=$?
     printf '%s\t%s\t%s\n' "$rc" "$(( $(date +%s) - s ))" "$sb" > "$sb/.result" ) &
 done
 wait

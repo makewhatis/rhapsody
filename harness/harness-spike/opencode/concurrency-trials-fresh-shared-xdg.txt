@@ -1,0 +1,71 @@
+# opencode, item 4: two turns at once against one state dir that has NO
+# database yet - a fresh XDG_DATA_HOME per trial, shared by both turns
+### oc-fresh — 5 paired trials, at=2026-09-12T16:43:27Z
+### argv=/usr/bin/env XDG_DATA_HOME={XDG} /opt/homebrew/Cellar/opencode/1.18.30/bin/opencode run --format json --auto --dir {} -m fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash <prompt>   SEED_XDG=0 SHARED_XDG=1
+### state dir seeded from /Users/david/.local/share/opencode/auth.json (85 bytes)
+[oc-fresh-1] oc-fresh-1-a exit=1 elapsed=1s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-1] oc-fresh-1-b exit=1 elapsed=1s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-1] VERDICT: UNEXPECTED counters a=7 b=7 (each should be 8); oc-fresh-1-a reported no session id; oc-fresh-1-b reported no session id
+    FAILED TURN oc-fresh-1-a, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+    FAILED TURN oc-fresh-1-b, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+[oc-fresh-2] oc-fresh-2-a exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-2] oc-fresh-2-b exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-2] VERDICT: UNEXPECTED counters a=7 b=7 (each should be 8); oc-fresh-2-a reported no session id; oc-fresh-2-b reported no session id
+    FAILED TURN oc-fresh-2-a, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+    FAILED TURN oc-fresh-2-b, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+[oc-fresh-3] oc-fresh-3-a exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-3] oc-fresh-3-b exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-3] VERDICT: UNEXPECTED counters a=7 b=7 (each should be 8); oc-fresh-3-a reported no session id; oc-fresh-3-b reported no session id
+    FAILED TURN oc-fresh-3-a, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+    FAILED TURN oc-fresh-3-b, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+[oc-fresh-4] oc-fresh-4-a exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-4] oc-fresh-4-b exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-4] VERDICT: UNEXPECTED counters a=7 b=7 (each should be 8); oc-fresh-4-a reported no session id; oc-fresh-4-b reported no session id
+    FAILED TURN oc-fresh-4-a, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+    FAILED TURN oc-fresh-4-b, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+[oc-fresh-5] oc-fresh-5-a exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-5] oc-fresh-5-b exit=1 elapsed=0s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[oc-fresh-5] VERDICT: UNEXPECTED counters a=7 b=7 (each should be 8); oc-fresh-5-a reported no session id; oc-fresh-5-b reported no session id
+    FAILED TURN oc-fresh-5-a, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+    FAILED TURN oc-fresh-5-b, stderr follows:
+      | Error: Unexpected error
+      | 
+      | database is locked
+### oc-fresh RESULT: 0/10 turns completed, 10 lost

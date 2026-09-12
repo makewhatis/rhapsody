@@ -1,16 +1,24 @@
 # codex, item 4: two turns at once against one shared $CODEX_HOME
-### cx-shared — 4 paired trials, at=2026-09-12T05:20:53Z
-### argv=/opt/homebrew/bin/codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check <prompt>   SEED_XDG=0
-[cx-shared-1] cx-shared-1-a exit=0 elapsed=22s counter=8 stderr_bytes=39
-[cx-shared-1] cx-shared-1-b exit=0 elapsed=20s counter=8 stderr_bytes=39
-[cx-shared-1] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
-[cx-shared-2] cx-shared-2-a exit=0 elapsed=20s counter=8 stderr_bytes=39
-[cx-shared-2] cx-shared-2-b exit=0 elapsed=26s counter=8 stderr_bytes=39
-[cx-shared-2] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
-[cx-shared-3] cx-shared-3-a exit=0 elapsed=9s counter=8 stderr_bytes=39
-[cx-shared-3] cx-shared-3-b exit=0 elapsed=11s counter=8 stderr_bytes=39
-[cx-shared-3] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
-[cx-shared-4] cx-shared-4-a exit=0 elapsed=23s counter=8 stderr_bytes=39
-[cx-shared-4] cx-shared-4-b exit=0 elapsed=14s counter=8 stderr_bytes=39
-[cx-shared-4] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+### cx-shared — 4 paired trials, at=2026-09-12T16:40:16Z
+### argv=/opt/homebrew/bin/codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check <prompt>   SEED_XDG=0 SHARED_XDG=0
+[cx-shared-1] cx-shared-1-a exit=0 elapsed=13s counter=8 stderr_bytes=39
+    21 events; session ids seen: ['01a0967d-b8d9-78b2-b2ad-f27b5f142fa3']
+[cx-shared-1] cx-shared-1-b exit=0 elapsed=26s counter=8 stderr_bytes=39
+    16 events; session ids seen: ['01a0967d-b8d7-7ce3-b3a0-ecac7a077837']
+[cx-shared-1] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
+[cx-shared-2] cx-shared-2-a exit=0 elapsed=12s counter=8 stderr_bytes=39
+    19 events; session ids seen: ['01a0967e-1e43-7cb2-86aa-69371c445dc0']
+[cx-shared-2] cx-shared-2-b exit=0 elapsed=22s counter=8 stderr_bytes=39
+    17 events; session ids seen: ['01a0967e-1e37-7252-b47d-5e05d72f23b9']
+[cx-shared-2] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
+[cx-shared-3] cx-shared-3-a exit=0 elapsed=12s counter=8 stderr_bytes=39
+    16 events; session ids seen: ['01a0967e-745d-7ee2-b28c-982b4a3f5cc9']
+[cx-shared-3] cx-shared-3-b exit=0 elapsed=15s counter=8 stderr_bytes=39
+    18 events; session ids seen: ['01a0967e-745c-7391-bff3-8189c9ffed48']
+[cx-shared-3] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
+[cx-shared-4] cx-shared-4-a exit=0 elapsed=24s counter=8 stderr_bytes=39
+    20 events; session ids seen: ['01a0967e-b05b-7361-a543-1ba6bc6dfe05']
+[cx-shared-4] cx-shared-4-b exit=0 elapsed=16s counter=8 stderr_bytes=39
+    18 events; session ids seen: ['01a0967e-b05b-7900-8642-4340a06b5cc0']
+[cx-shared-4] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
 ### cx-shared RESULT: 8/8 turns completed, 0 lost

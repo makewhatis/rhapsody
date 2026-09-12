@@ -1,16 +1,24 @@
 # claude, item 4: two turns at once against the shared ~/.claude
-### cl-shared — 4 paired trials, at=2026-09-12T05:19:41Z
-### argv=/Users/david/.local/bin/claude -p --output-format stream-json --verbose --permission-mode bypassPermissions --model claude-haiku-4-5-20251001 --mcp-config {}/.symphony-mcp.json --strict-mcp-config <prompt>   SEED_XDG=0
-[cl-shared-1] cl-shared-1-a exit=0 elapsed=15s counter=8 stderr_bytes=0
-[cl-shared-1] cl-shared-1-b exit=0 elapsed=14s counter=8 stderr_bytes=0
-[cl-shared-1] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
-[cl-shared-2] cl-shared-2-a exit=0 elapsed=17s counter=8 stderr_bytes=0
-[cl-shared-2] cl-shared-2-b exit=0 elapsed=18s counter=8 stderr_bytes=0
-[cl-shared-2] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+### cl-shared — 4 paired trials, at=2026-09-12T16:38:55Z
+### argv=/Users/david/.local/bin/claude -p --output-format stream-json --verbose --permission-mode bypassPermissions --model claude-haiku-4-5-20251001 --mcp-config {}/.symphony-mcp.json --strict-mcp-config <prompt>   SEED_XDG=0 SHARED_XDG=0
+[cl-shared-1] cl-shared-1-a exit=0 elapsed=19s counter=8 stderr_bytes=0
+    34 events; session ids seen: ['a90416c6-61f1-491b-b59e-e07a76415598']
+[cl-shared-1] cl-shared-1-b exit=0 elapsed=22s counter=8 stderr_bytes=0
+    36 events; session ids seen: ['51ae6795-ace5-4a9b-bda1-9220c8a695a5']
+[cl-shared-1] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
+[cl-shared-2] cl-shared-2-a exit=0 elapsed=19s counter=8 stderr_bytes=0
+    33 events; session ids seen: ['7bccb980-bd26-43c0-9e67-c4e362a4e258']
+[cl-shared-2] cl-shared-2-b exit=0 elapsed=22s counter=8 stderr_bytes=0
+    36 events; session ids seen: ['da9e3962-00c2-4c20-b76f-b3e0ad1f1235']
+[cl-shared-2] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
 [cl-shared-3] cl-shared-3-a exit=0 elapsed=15s counter=8 stderr_bytes=0
-[cl-shared-3] cl-shared-3-b exit=0 elapsed=14s counter=8 stderr_bytes=0
-[cl-shared-3] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
-[cl-shared-4] cl-shared-4-a exit=0 elapsed=16s counter=8 stderr_bytes=0
-[cl-shared-4] cl-shared-4-b exit=0 elapsed=15s counter=8 stderr_bytes=0
-[cl-shared-4] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+    30 events; session ids seen: ['2b755601-ae5e-42a1-a5a6-7503bac24c59']
+[cl-shared-3] cl-shared-3-b exit=0 elapsed=18s counter=8 stderr_bytes=0
+    36 events; session ids seen: ['a7828a61-9566-470a-ac95-63160394b1d2']
+[cl-shared-3] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
+[cl-shared-4] cl-shared-4-a exit=0 elapsed=18s counter=8 stderr_bytes=0
+    36 events; session ids seen: ['3f477728-7ea4-408d-a475-7c491df36a92']
+[cl-shared-4] cl-shared-4-b exit=0 elapsed=16s counter=8 stderr_bytes=0
+    36 events; session ids seen: ['627c4e16-f1c1-4b38-9e4f-508b74c923b2']
+[cl-shared-4] VERDICT: both turns edited their own sandbox to 8 and reported distinct session ids - no cross-talk
 ### cl-shared RESULT: 8/8 turns completed, 0 lost
