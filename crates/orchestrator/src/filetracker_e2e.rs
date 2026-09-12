@@ -23,8 +23,9 @@
 //!     long-but-BOUNDED stub sleep where Go uses `FAKE_CLAUDE_HANG=1` (sleep forever), because the
 //!     Rust worker-cancel dropped the run future without SIGKILLing the process group, so a
 //!     forever-hang ORPHANED the stub on the CI runner. That was the defect, not a porting choice:
-//!     the drop now performs the group kill (`rhapsody_agent`'s `KillGroupOnDrop`), so the scenario
-//!     runs Go's own knob again, and scenario (4) asserts the group is gone after a Stop.
+//!     the drop now performs the tree kill (`rhapsody_agent`'s `KillTreeOnDrop`), so the scenario
+//!     runs Go's own knob again, scenario (4) asserts the agent's own group is gone after a Stop, and
+//!     scenario (5) asserts the same of a tool child that escaped that group (STUDIO-871).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -530,7 +531,7 @@ async fn file_tracker_e2e_review_reopen_promotes_and_reengages() {
 /// (4) STUDIO-840, Rhapsody-only: a Stop against a live run must leave NO agent process behind.
 ///
 /// The chain has four links — `handle_stop_run` fires the run's cancellation, `spawn_worker`'s select
-/// drops the run future, the turn's `KillGroupOnDrop` guard SIGKILLs the `claude` process group, and
+/// drops the run future, the turn's `KillTreeOnDrop` guard SIGKILLs the `claude` process tree, and
 /// only then may the ticket move. Every link but the third was already covered, and the third is the
 /// one that was broken: in production the entry left `running`, the ticket moved to Backlog, the
 /// daemon fell silent — and the real agent kept committing for 35 minutes and opened a pull request.
@@ -605,4 +606,133 @@ async fn file_tracker_e2e_stop_leaves_no_agent_process() {
     );
 
     teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+}
+
+/// (5) STUDIO-871, Rhapsody-only: a Stop must leave no TOOL CHILD behind either.
+///
+/// Scenario (4) asserts the agent's own process group is gone, and it passed on the day this defect
+/// was found — because its stub keeps everything inside that group. Real harnesses do not: STUDIO-869
+/// measured claude 2.1.267, opencode 1.18.30 and codex-cli 0.153.4 all calling `setpgid` on the shell
+/// they run a tool command in, so the daemon's `kill(-pgid)` killed the leader, reported success, and
+/// left the model's own `/bin/zsh` → `/bin/bash` → `sleep` chain running. The dangerous survivor is
+/// not a stray `sleep`: it is a `git push` or a `gh pr create` completing after an operator was told
+/// the run had stopped — STUDIO-840's symptom exactly, from a cause 840's fix does not reach.
+///
+/// So the stub is told to escape its group (`FAKE_CLAUDE_ESCAPE`), reports the group it escaped INTO,
+/// and this asks the OS about that group — the assertion is process state, not the stop's return
+/// value. Reverting `kill_tree` to the bare group kill reds it with the survivors named.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tracker_e2e_stop_leaves_no_tool_child_that_escaped_the_group() {
+    let dir = TempDir::new();
+    let src = dir.child("issues.json");
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "i1",
+            identifier: "SMK-1",
+            title: "Smoke",
+            state: "Todo",
+            team_id: "team-1",
+            latest_summon_at: "",
+        }],
+    );
+    // Both knobs: hang so nothing but a kill can end the run, and escape so the run owns a process
+    // the daemon's own group kill cannot reach.
+    let escaped_report = dir.child("escaped.pgid");
+    let mut ft = build_file_tracker_orch(
+        &src,
+        &format!("FAKE_CLAUDE_HANG=1 FAKE_CLAUDE_ESCAPE={escaped_report}"),
+    );
+
+    // Dispatch, and pump until the worker has reported the agent's pid (as scenario (4) does) AND
+    // the stub has reported the group it escaped into.
+    ft.o.on_tick().await;
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(10), |o| o
+            .running
+            .get("i1")
+            .is_some_and(|re| re.pgid != 0))
+        .await,
+        "the agent never reported a pid; running={}",
+        ft.o.running.len()
+    );
+    let (pgid, run_id) = {
+        let re =
+            ft.o.running
+                .get("i1")
+                .expect("the worker should be running");
+        (re.pgid, re.run_id)
+    };
+    let escaped = read_escaped_pgid(&escaped_report, Duration::from_secs(10)).await;
+    // Reaped whatever the assertions below do, INCLUDING on a panic: this process is in a group of
+    // its own precisely so the group kill misses it, so a red run would otherwise leave a `sleep`
+    // on the machine for good.
+    let _reaper = GroupReaper(escaped);
+    assert_ne!(
+        escaped, pgid,
+        "the stub did not escape the agent's group, so this cannot prove containment"
+    );
+    assert!(
+        !group_live_rows(escaped).is_empty(),
+        "the escaped tool child's group ({escaped}) should be alive before the stop"
+    );
+
+    // The operator Stop, on the control task exactly as `evStopRun` runs it.
+    let plan = ft.o.handle_stop_run(run_id);
+    assert!(plan.found, "the live run should be found by its run id");
+    assert!(
+        !plan.kill_undeliverable,
+        "a dispatched run's kill must be deliverable"
+    );
+
+    assert!(
+        wait_group_quiet(escaped, Duration::from_secs(15)).await,
+        "a tool child of the stopped run survived: group {escaped} still runs {:?}",
+        group_live_rows(escaped)
+    );
+    // And STUDIO-840's half still holds — the leader's own group goes too.
+    assert!(
+        wait_group_quiet(pgid, Duration::from_secs(15)).await,
+        "the agent's own group survived the stop: group {pgid} still runs {:?}",
+        group_live_rows(pgid)
+    );
+
+    teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+}
+
+/// Polls until the stub has written the process group it escaped into, panicking if it never does
+/// (a silently missing report would make every assertion below it vacuous).
+async fn read_escaped_pgid(path: &str, timeout: Duration) -> i32 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            return v;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stub never reported an escaped process group at {path}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// SIGKILLs a process group when the test that owns it ends, however it ends — including by panic.
+/// The escaped tool child sits outside every group the daemon knows about, which is the whole point
+/// of it, so nothing else in this test would ever collect it.
+///
+/// Shells out rather than calling the code under test: a reaper that depends on `kill_tree` working
+/// would leak exactly when the test reds, which is when it matters.
+struct GroupReaper(i32);
+
+impl Drop for GroupReaper {
+    fn drop(&mut self) {
+        if self.0 > 1 {
+            let _ = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("kill -9 -{} 2>/dev/null", self.0)])
+                .status();
+        }
+    }
 }

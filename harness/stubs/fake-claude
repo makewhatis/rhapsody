@@ -39,6 +39,12 @@
 #   FAKE_CLAUDE_HANG      when 1: emit init + one assistant line, then sleep forever →
 #                         exercises stall_timeout_ms / the Stop+kill flow deterministically
 #                         (run outcome `failed`, reason `stalled`). Never emits a result.
+#   FAKE_CLAUDE_ESCAPE    path: before doing anything else, start a child in a process group of
+#                         its OWN and write that group's id to this path. Reproduces what a real
+#                         harness does to every tool command it runs (measured on claude 2.1.267,
+#                         opencode 1.18.30 and codex-cli 0.153.4 — STUDIO-869), so a test can
+#                         assert that a stop kills the agent's tool children and not just the
+#                         group the daemon created (STUDIO-871). Unset: nothing is started.
 #
 set -u
 
@@ -65,6 +71,20 @@ readonly SESSION_ID="fake-claude-session"
 cat >/dev/null 2>&1 &
 readonly DRAIN_PID=$!
 
+# FAKE_CLAUDE_ESCAPE: the daemon spawns us into a process group of our own and kills that group.
+# A real harness does NOT keep its tool children there — it calls setpgid on the shell it runs a
+# command in, so they survive the group kill (STUDIO-869 §1). Reproduce that exactly: `set -m` is
+# bash's own way to give a background job a new process group. The child reports the group it leads
+# (its `$$`, since a `bash -c` is its own process; macOS ships bash 3.2, which has no BASHPID) via a
+# write-then-rename so a reader never sees a half-written file, then outlives us.
+ESCAPED_PID=""
+if [ -n "${FAKE_CLAUDE_ESCAPE:-}" ]; then
+	set -m
+	bash -c 'ps -o pgid= -p $$ | tr -d " " >"$1.tmp"; mv "$1.tmp" "$1"; while true; do sleep 3600; done' _ "$FAKE_CLAUDE_ESCAPE" &
+	ESCAPED_PID=$!
+	set +m
+fi
+
 # emit prints one JSONL protocol line.
 emit() { printf '%s\n' "$1"; }
 
@@ -90,6 +110,9 @@ else
 	emit '{"type":"result","subtype":"success","is_error":false,"session_id":"'"$SESSION_ID"'","usage":{"input_tokens":1,"output_tokens":1}}'
 fi
 
-# Stop the stdin drain (best effort) and exit cleanly.
+# Stop the stdin drain and the escaped child's group (best effort) and exit cleanly. The escaped
+# child is in a group of its own precisely so OUR group kill misses it, so a clean exit has to take
+# it down by name or a non-kill scenario would leak it.
 kill "$DRAIN_PID" 2>/dev/null || true
+[ -n "$ESCAPED_PID" ] && kill -- "-$ESCAPED_PID" 2>/dev/null
 exit 0
