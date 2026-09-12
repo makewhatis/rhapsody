@@ -37,6 +37,9 @@
 //! check that ran. A required context nobody marked required yet is invisible to the first and
 //! visible to the second.
 //!
+//! That rollup is resolved per check NAME, not per entry — one head carries several entries for a
+//! name and the non-green ones are routinely superseded rather than owed. See [`blocking_check`].
+//!
 //! # BEHIND updates and re-gates; it never merges on a stale approval
 //!
 //! STUDIO-784 is this bug already shipped once: the console armed an auto-merge on a BEHIND branch
@@ -56,8 +59,8 @@ use std::sync::Arc;
 
 use crate::automerge::AutoMergePlan;
 use crate::ghsummons::{
-    BranchUpdateSource, BranchUpdater, HeadAllowlist, MERGE_STATE_BEHIND, MergeMethod, MergeSource,
-    MergeStateSource, PrChecksSource, PrLookup, PrStateSource, PrStatus,
+    BranchUpdateSource, BranchUpdater, CheckRun, HeadAllowlist, MERGE_STATE_BEHIND, MergeMethod,
+    MergeSource, MergeStateSource, PrChecksSource, PrLookup, PrStateSource, PrStatus,
 };
 
 /// How an auto-merge merges. `--squash` is the repository's convention — the squash subject is the
@@ -68,6 +71,11 @@ pub const AUTO_MERGE_METHOD: MergeMethod = MergeMethod::Squash;
 /// GitHub's vocabulary is open.
 pub const MERGE_STATE_CLEAN: &str = "CLEAN";
 
+/// The one conclusion that says a check NAME judged this head and passed. Named because
+/// [`blocking_check`] asks about it specifically, not merely as a member of
+/// [`NON_BLOCKING_CHECKS`].
+const CHECK_SUCCESS: &str = "SUCCESS";
+
 /// Check conclusions that do not BLOCK a merge.
 ///
 /// `SKIPPED` and `NEUTRAL` are non-failures — a path-filtered job reports one and would otherwise
@@ -75,8 +83,8 @@ pub const MERGE_STATE_CLEAN: &str = "CLEAN";
 /// [`MERGE_STATE_CLEAN`] has already been required, which is GitHub's own verdict that every
 /// REQUIRED context is satisfied; this list judges the rest. Everything else — `FAILURE`,
 /// `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED`, `IN_PROGRESS`, `QUEUED`, `PENDING`, and any state
-/// GitHub adds later — blocks.
-const NON_BLOCKING_CHECKS: [&str; 3] = ["SUCCESS", "SKIPPED", "NEUTRAL"];
+/// GitHub adds later — blocks, unless a green sibling supersedes it: see [`blocking_check`].
+const NON_BLOCKING_CHECKS: [&str; 3] = [CHECK_SUCCESS, "SKIPPED", "NEUTRAL"];
 
 /// Everything the off-loop half runs against. No `Orchestrator`, no store, no control channel —
 /// the off-loop guarantee, in the type.
@@ -175,10 +183,7 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
         // repository always runs several. Fails closed.
         return AutoMergeOutcome::Declined("no checks have reported on this head");
     }
-    if let Some(bad) = checks
-        .iter()
-        .find(|c| !NON_BLOCKING_CHECKS.contains(&c.state.as_str()))
-    {
+    if let Some(bad) = blocking_check(&checks) {
         tracing::info!(
             pr = %plan.pr, check = %bad.name, state = %bad.state,
             "auto-merge: declining on a check that is not green"
@@ -210,6 +215,34 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
         }
         Err(e) => AutoMergeOutcome::Failed(e.to_string()),
     }
+}
+
+/// The check that blocks this merge, or `None` when every check NAME resolved green at this head.
+///
+/// Judged per NAME rather than per ENTRY, because one head carries SEVERAL entries for the same
+/// name and the non-green ones among them are routinely superseded rather than owed. This
+/// repository produces exactly that: `.github/workflows/pr-title.yml` runs on `pull_request`
+/// **edited** under `concurrency: cancel-in-progress`, so editing a pull request's title or body
+/// while its first run is in flight cancels that run — and the CANCELLED run stays attached to the
+/// head forever, beside the SUCCESS that replaced it. Per-entry judgement reads that head as "a
+/// check was cancelled" and refuses a pull request GitHub reports `CLEAN`, forever, on every tick.
+/// Two of this repository's four open pull requests carried such an entry when this was written.
+///
+/// The rule is deliberately the NARROW one: a non-green entry is superseded only by a
+/// [`CHECK_SUCCESS`] entry of the SAME name at the same head. So a check that was cancelled and
+/// never re-ran — no green sibling — still blocks, which is why `CANCELLED` is not simply added to
+/// [`NON_BLOCKING_CHECKS`]. That would be the fail-open direction; this is not.
+///
+/// Quadratic in the rollup's length, which is a handful of entries per head: a map keyed by name
+/// would cost an allocation to save nothing measurable, and this way the entry REPORTED is the
+/// offending one rather than a name reconstructed from a key.
+fn blocking_check(checks: &[CheckRun]) -> Option<&CheckRun> {
+    checks.iter().find(|c| {
+        !NON_BLOCKING_CHECKS.contains(&c.state.as_str())
+            && !checks
+                .iter()
+                .any(|sibling| sibling.name == c.name && sibling.state == CHECK_SUCCESS)
+    })
 }
 
 /// The `BEHIND` branch: update it if the repository permits, and never merge it.
@@ -253,7 +286,7 @@ async fn update_behind_branch(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> Aut
 mod tests {
     use super::*;
     use crate::ghsummons::{
-        BranchUpdateResult, CheckRun, MergeResult, MergeStateResult, PrChecksResult, PrSnapshot,
+        BranchUpdateResult, MergeResult, MergeStateResult, PrChecksResult, PrSnapshot,
         PrStateResult,
     };
     use crate::prstate::PrCoord;
@@ -326,14 +359,16 @@ mod tests {
     }
 
     /// The repository's six checks, all green — what a mergeable pull request looks like here.
+    /// The five `ci.yml` jobs plus `pr-title`; see `a_superseded_check_run_does_not_block_its_
+    /// green_sibling` for the shape a real head takes when one of them was superseded.
     fn all_green() -> Arc<FakeChecks> {
         checks(&[
             ("lint", "SUCCESS"),
             ("test", "SUCCESS"),
             ("web", "SUCCESS"),
+            ("boot-e2e", "SUCCESS"),
             ("desktop", "SUCCESS"),
             ("pr-title", "SUCCESS"),
-            ("claude-review", "SUCCESS"),
         ])
     }
 
@@ -635,6 +670,114 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .is_empty(),
                 "({state})"
+            );
+        }
+    }
+
+    /// The rollup this repository actually produces. `pr-title` runs on `pull_request` **edited**
+    /// under `concurrency: cancel-in-progress`, so editing a title or body while the first run is
+    /// in flight cancels it — and the cancelled run stays attached to the head forever, beside the
+    /// SUCCESS that superseded it. Judged per ENTRY that head can never merge; judged per NAME it
+    /// merges, which is the same answer GitHub gives by reporting it `CLEAN`.
+    ///
+    /// The fixture is a real head: pull request #156 at `e72a3db`, read from
+    /// `repos/makewhatis/rhapsody/commits/<head>/check-runs`. Both orders, because the rollup's
+    /// order is GitHub's and a rule that depended on it would pass here and fail in production.
+    #[tokio::test]
+    async fn a_superseded_check_run_does_not_block_its_green_sibling() {
+        let rollups: [&[(&str, &str)]; 2] = [
+            &[
+                ("pr-title", "SUCCESS"),
+                ("boot-e2e", "SUCCESS"),
+                ("web", "SUCCESS"),
+                ("lint", "SUCCESS"),
+                ("desktop", "SUCCESS"),
+                ("test", "SUCCESS"),
+                ("pr-title", "CANCELLED"),
+            ],
+            &[
+                ("pr-title", "CANCELLED"),
+                ("pr-title", "CANCELLED"),
+                ("pr-title", "SUCCESS"),
+                ("lint", "SUCCESS"),
+                ("test", "SUCCESS"),
+                ("web", "SUCCESS"),
+                ("boot-e2e", "SUCCESS"),
+                ("desktop", "SUCCESS"),
+            ],
+        ];
+        for rollup in rollups {
+            let merger = Arc::new(FakeMerger::default());
+            let d = deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                checks(rollup),
+                Arc::clone(&merger),
+            );
+
+            assert!(
+                matches!(
+                    perform_auto_merge(&plan(), &d).await,
+                    AutoMergeOutcome::Merged(_)
+                ),
+                "{rollup:?}"
+            );
+            assert_eq!(
+                merger.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                1,
+                "{rollup:?}"
+            );
+        }
+    }
+
+    /// The other half of the per-name rule, and the reason it is not just `CANCELLED` added to
+    /// [`NON_BLOCKING_CHECKS`]: a name whose entries never reached SUCCESS was cancelled and never
+    /// re-ran, so it still blocks. Only a SUCCESS sibling clears one — a SKIPPED one does not,
+    /// because a check that was skipped never judged this head either.
+    #[tokio::test]
+    async fn a_cancelled_check_with_no_green_sibling_still_declines() {
+        let rollups: [&[(&str, &str)]; 3] = [
+            // Two cancelled runs of the same name and no green one: the whole name is cancelled.
+            &[
+                ("lint", "SUCCESS"),
+                ("test", "SUCCESS"),
+                ("desktop", "CANCELLED"),
+                ("desktop", "CANCELLED"),
+            ],
+            // A SKIPPED sibling is not a green one.
+            &[
+                ("lint", "SUCCESS"),
+                ("desktop", "SKIPPED"),
+                ("desktop", "CANCELLED"),
+            ],
+            // A SUCCESS under a DIFFERENT name clears nothing.
+            &[
+                ("lint", "SUCCESS"),
+                ("test", "SUCCESS"),
+                ("desktop", "CANCELLED"),
+            ],
+        ];
+        for rollup in rollups {
+            let merger = Arc::new(FakeMerger::default());
+            let d = deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                checks(rollup),
+                Arc::clone(&merger),
+            );
+
+            assert_eq!(
+                perform_auto_merge(&plan(), &d).await,
+                AutoMergeOutcome::Declined("a check is failing or has not finished"),
+                "{rollup:?}"
+            );
+            assert!(
+                merger
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty(),
+                "{rollup:?}"
             );
         }
     }
