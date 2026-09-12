@@ -26,9 +26,8 @@ PERMISSION_PREFERENCE = ["allow_always", "allow_once", "allow", "always_allow"]
 
 
 class Driver:
-    def __init__(self, prefix, cwd, argv, caps, kill_after=None):
-        self.prefix, self.cwd, self.caps = prefix, cwd, caps
-        self.kill_after = kill_after
+    def __init__(self, prefix, cwd, argv, caps):
+        self.prefix, self.caps = prefix, caps
         self.t0 = time.time()
         self.next_id = 0
         self.agent_log = open(prefix + ".jsonl", "wb")
@@ -76,9 +75,6 @@ class Driver:
             rid = self.next_id
         self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         return rid
-
-    def notify(self, method, params):
-        self.send({"jsonrpc": "2.0", "method": method, "params": params})
 
     def reply(self, rid, result):
         self.send({"jsonrpc": "2.0", "id": rid, "result": result})
@@ -289,7 +285,7 @@ def main():
             print(f"acp_drive.py: unknown option {t!r}", file=sys.stderr)
             return 2
 
-    d = Driver(prefix, cwd, argv, caps, kill_after)
+    d = Driver(prefix, cwd, argv, caps)
     client_caps = {"fs": {"readTextFile": caps["fs"], "writeTextFile": caps["fs"]},
                    "terminal": caps["terminal"]}
     init = d.await_id(d.request("initialize", {"protocolVersion": 1,
