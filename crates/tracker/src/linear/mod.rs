@@ -7,6 +7,7 @@
 //! (state moves in [`move_state`], the pool-mode claim assign/comment surface in [`claim`]) — every
 //! [`Tracker`](crate::Tracker) method now has a real body.
 
+mod attach;
 mod backlog;
 mod by_ids;
 mod by_states;
@@ -129,6 +130,9 @@ impl crate::Tracker for Client {
     }
     async fn create_issue(&self, spec: &NewIssue) -> Result<String, TrackerError> {
         create::create_issue(self, spec).await
+    }
+    async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError> {
+        attach::link_pull_request(self, issue_id, url).await
     }
 }
 

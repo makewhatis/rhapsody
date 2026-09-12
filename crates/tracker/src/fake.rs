@@ -79,6 +79,15 @@ pub struct CreateIssueCall {
     pub spec: crate::NewIssue,
 }
 
+/// One [`Tracker::link_pull_request`] invocation, recorded verbatim (STUDIO-875). The pair IS the
+/// assertion: linking the right pull request to the wrong ticket is the same silent drop the write
+/// exists to end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkPrCall {
+    pub issue_id: String,
+    pub url: String,
+}
+
 /// A programmable [`Tracker::fetch_issue_states_by_ids`] override (lets tests vary results per
 /// call, e.g. active-then-inactive). Takes precedence over `by_id`/`by_id_err` when set.
 type StatesByIdsFn = Box<dyn Fn(&[String]) -> Result<Vec<Issue>, TrackerError> + Send + Sync>;
@@ -179,6 +188,8 @@ pub struct Fake {
     pub add_label_fail_first: usize,
     /// When set, returned by `remove_issue_label` (the call is still recorded). STUDIO-672.
     pub remove_label_err: Option<TrackerError>,
+    /// When set, returned by `link_pull_request` (the call is still recorded). STUDIO-875.
+    pub link_pr_err: Option<TrackerError>,
     /// When set, returned by `create_issue` (the call is still recorded). STUDIO-659.
     pub create_issue_err: Option<TrackerError>,
     /// When set, `create_issue` fails for exactly the first N calls and succeeds thereafter — the
@@ -214,6 +225,7 @@ struct Inner {
     add_label_calls: Vec<AddLabelCall>,
     remove_label_calls: Vec<RemoveLabelCall>,
     create_issue_calls: Vec<CreateIssueCall>,
+    link_pr_calls: Vec<LinkPrCall>,
     open_by_labels_calls: usize,
     /// Issues `add_issue_label` has written a label onto, keyed by issue id, so the load read sees
     /// the fake's own writes (STUDIO-644).
@@ -324,6 +336,10 @@ impl Fake {
     /// Every `create_issue` invocation, in order (STUDIO-659).
     pub fn create_issue_calls(&self) -> Vec<CreateIssueCall> {
         self.lock().create_issue_calls.clone()
+    }
+    /// Every `link_pull_request` invocation, in order (STUDIO-875).
+    pub fn link_pr_calls(&self) -> Vec<LinkPrCall> {
+        self.lock().link_pr_calls.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -719,6 +735,20 @@ impl Tracker for Fake {
             )));
         }
         Ok(format!("FAKE-{seq}"))
+    }
+
+    /// Records the (issue, url) pair (STUDIO-875). `link_pr_err` fails every call; the call is
+    /// recorded either way, so a test can prove the daemon ATTEMPTED the link even when Linear
+    /// refused it.
+    async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError> {
+        self.lock().link_pr_calls.push(LinkPrCall {
+            issue_id: issue_id.to_string(),
+            url: url.to_string(),
+        });
+        match &self.link_pr_err {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
     }
 }
 

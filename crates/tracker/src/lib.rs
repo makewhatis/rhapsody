@@ -298,4 +298,23 @@ pub trait Tracker: Any + Send + Sync {
     /// An adapter with no notion of creating issues returns an error rather than a silent success:
     /// a caller must be able to tell that the fan-out did not land.
     async fn create_issue(&self, spec: &NewIssue) -> Result<String, TrackerError>;
+
+    /// LinkPullRequest attaches an already-open GitHub pull request to an issue, as the
+    /// **GitHub-sourced** attachment that `Issue::linked_prs` is built from. STUDIO-875.
+    ///
+    /// This is the one write in the contract whose purpose is to make a LATER READ possible.
+    /// `apply_github_summons` attributes a summoning pull-request comment to a ticket by walking
+    /// that ticket's `linked_prs`; a ticket with none can never be re-engaged, no matter how many
+    /// times a reviewer summons its author. On a workspace whose repository is not connected in
+    /// Linear's GitHub integration, nothing else ever writes that link — so the daemon writes it
+    /// itself, at the moment it resolves a pull request for a ticket.
+    ///
+    /// **Idempotent.** The link is keyed on (issue, url), so re-linking a pull request already
+    /// attached to the same issue is a successful no-op. Callers rely on it: the link is attempted
+    /// at every review introduction, and a ticket handed off repeatedly must not grow an attachment
+    /// per handoff.
+    ///
+    /// An adapter with no attachment surface returns an error rather than a silent success — the
+    /// caller treats the link as best-effort, but "best-effort" must never mean "told it worked".
+    async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError>;
 }

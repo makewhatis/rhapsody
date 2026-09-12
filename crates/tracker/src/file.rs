@@ -901,6 +901,17 @@ impl crate::Tracker for Tracker {
         self.write_locked(&doc)?;
         Ok(identifier)
     }
+
+    /// The file tracker has no attachment surface, so it refuses rather than pretending
+    /// (STUDIO-875). Its document models an issue's own fields; there is nowhere to record a linked
+    /// pull request and nothing that would read one back, so a silent `Ok(())` would tell the
+    /// daemon a link landed that nothing can ever see. The caller treats the link as best-effort
+    /// and logs the refusal.
+    async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError> {
+        Err(load_err(format!(
+            "the file tracker has no attachment surface; cannot link {url} to issue {issue_id}"
+        )))
+    }
 }
 
 /// Mints an identifier for a created issue: `<prefix>-<n>`, where the prefix is the issue's team
