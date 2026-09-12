@@ -658,6 +658,11 @@ pub struct Orchestrator {
     /// `poll_all_projects` can stay `&self`; it is control-task-owned like every field here and is
     /// NOT a sixth off-loop seam.
     pub(crate) gh_enrich_cursor: AtomicUsize,
+    /// Which "a summons was dropped because this ticket has no linked pull request" warnings have
+    /// already been said (STUDIO-875). Interior-mutable for `poll_all_projects`' `&self`, exactly
+    /// as [`Self::gh_enrich_cursor`] is, and control-task-owned for the same reason: it is NOT a
+    /// sixth off-loop seam.
+    pub(crate) summon_drops: crate::ghenrich::SummonDropLog,
     /// The effective `storage.retention_days` mirrored as an atomic so the daemon's prune scheduler
     /// (P6) reads it without racing the control task's reload (default 30 until the first reload).
     /// Mirrors Go `retentionDays`.
@@ -793,6 +798,7 @@ impl Orchestrator {
             wg: WaitGroup::new(),
             gh_source: None,
             gh_enrich_cursor: AtomicUsize::new(0),
+            summon_drops: crate::ghenrich::SummonDropLog::default(),
             retention_days: Arc::new(AtomicI64::new(DEFAULT_RETENTION_DAYS)),
             retention_loaded: Arc::new(AtomicBool::new(false)),
             warnings: Arc::new(WarningsState::default()),
