@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rhapsody",
+  "version": "0.1.0",
+  "description": "Claude Code skills for running work through Rhapsody",
+  "owner": {
+    "name": "makewhatis",
+    "url": "https://github.com/makewhatis/rhapsody"
+  },
+  "plugins": [
+    {
+      "name": "rhapsody",
+      "source": "./plugin",
+      "description": "Skills for planning, routing and operating work through Rhapsody Teams",
+      "version": "0.1.0",
+      "author": { "name": "makewhatis" }
+    }
+  ]
+}
