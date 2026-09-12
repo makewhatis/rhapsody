@@ -1243,7 +1243,7 @@ perfectly good token-bearing comment which is then dropped on every poll, foreve
 | Who links a pull request to its ticket | the tracker's GitHub integration, or nobody | the integration when it is configured, else the daemon |
 | When | — | at review introduction, off-loop, right after the head-branch lookup resolves the pull request |
 | Mutation | — | `attachmentLinkGitHubPR`, never the generic `attachmentLinkURL` |
-| A hit that reaches no ticket | one `continue` inside a per-tick debug line | one WARNING per ticket, naming the ticket and the pull requests |
+| A hit that reaches no ticket | one `continue` inside a per-tick debug line | one WARNING per (repository, ticket), naming the ticket and the repository's hit pull requests |
 
 **The mutation choice is load-bearing, not cosmetic.** `normalize`'s `isGithubPR` admits an
 attachment only when its `sourceType` is `"github"`, and that field is not caller-supplied — it comes
