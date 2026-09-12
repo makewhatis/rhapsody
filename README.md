@@ -1285,7 +1285,15 @@ routing.
 **The warning exists because the information already did.** The STUDIO-574 counters had been
 reporting `linked_prs_total=0 … matched=0 advanced=0` every ~35 seconds for eleven hours while three
 pull requests sat with blocking reviews and no running runs. A line that fires on every tick reads
-as background, so the report is now a WARNING, said once per (ticket, pull request) rather than once
+as background, so the report is now a WARNING, said once per (repository, ticket) rather than once
 per poll, and only for a ticket sitting in a configured review state — a ticket nobody has started
 has no pull request and no fault, and warning about it would put the loud line straight back into
 the background it is being rescued from.
+
+The memo's key deliberately excludes the pull-request numbers the line names. They are the polled
+repository's pull requests with a summons hit this tick, not the ticket's — the ticket has none,
+which is the fault — and that set is a rolling five-minute window, so keying on it re-fired the
+warning for every unlinked in-review ticket whenever any summons anywhere in the repository landed
+or aged out: the same repetition, at WARN. The numbers stay in the line, under the name `repo_prs`,
+because on an unlinked ticket they are the only handle an operator has on the comment that was
+dropped.

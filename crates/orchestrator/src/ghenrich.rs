@@ -121,40 +121,53 @@ pub struct UnlinkedSummons {
     /// Its tracker state, VERBATIM — the caller normalizes before comparing, as every other state
     /// comparison in the crate does.
     pub state: String,
-    /// The pull requests the hits are on, ascending. Named in the warning so an operator can open
-    /// the comment that was dropped rather than go looking for it.
-    pub prs: Vec<i64>,
+    /// The POLLED REPOSITORY's pull requests with a summons hit this tick, ascending — **not this
+    /// ticket's**, which has none; that is the fault being reported. Named in the warning anyway,
+    /// because on an unlinked ticket they are the only handle an operator has on the comment that
+    /// was dropped, and the field name says whose they are so `STUDIO-900 repo_prs=[154]` cannot be
+    /// read as "154 belongs to STUDIO-900".
+    ///
+    /// Deliberately NOT part of the report memo's key: see [`SummonDropLog`].
+    pub repo_prs: Vec<i64>,
 }
 
-/// Remembers which drops have already been reported, so the warning fires ONCE per ticket rather
+/// Remembers which tickets have already been reported, so the warning fires ONCE per ticket rather
 /// than on every poll.
 ///
 /// That is not a nicety. The pre-existing `linked_prs_total=0` line already said this, every ~35
 /// seconds, for eleven hours, and being repeated is exactly why nobody read it — a line that fires
 /// on every tick reads as background, and a misconfiguration reported as background is a
-/// misconfiguration nobody acts on. The key is the ticket AND the pull requests, so a genuinely new
-/// dropped summons (a second pull request on the same ticket) is reported again while the same one
-/// stays quiet.
+/// misconfiguration nobody acts on.
+///
+/// # The key is `(repo, ticket)` and nothing else
+///
+/// It is tempting to put [`UnlinkedSummons::repo_prs`] in the key so that "a new dropped summons"
+/// re-reports. Those numbers are not the ticket's, though — the ticket has none, which is the
+/// whole fault — they are every pull request in the POLLED REPOSITORY with a hit this tick, over a
+/// rolling `DEFAULT_GH_LOOKBACK` window (five minutes, `loop.rs`). That set changes
+/// whenever any summons anywhere in the repository lands or ages out, so keying on it re-fired the
+/// warning for EVERY unlinked in-review ticket on traffic that had nothing to do with any of them:
+/// two such tickets and one new summons comment cost four more warnings. The repetition this type
+/// exists to prevent, at WARN instead of DEBUG.
+///
+/// So a ticket is reported once per repository per daemon lifetime. There is deliberately no
+/// re-arm: the only honest one would be time-based, and the operator already has the line. A
+/// restart clears the memo, which is also when a re-report is WANTED, since a restart means
+/// somebody may have changed the configuration.
 ///
 /// Deliberately unbounded-in-principle and bounded-in-practice: it grows by one entry per ticket
 /// whose summons is being dropped, which is a population an operator is actively being told to
-/// shrink, and it is cleared by a daemon restart — which is also when a re-report is WANTED, since
-/// a restart means somebody may have changed the configuration.
+/// shrink.
 #[derive(Debug, Default)]
 pub struct SummonDropLog {
     seen: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl SummonDropLog {
-    /// Whether this drop has not been reported before, recording it either way.
+    /// Whether this ticket's drop has not been reported before for this repository, recording it
+    /// either way.
     fn claim(&self, repo: &str, drop: &UnlinkedSummons) -> bool {
-        let prs = drop
-            .prs
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let key = format!("{repo}#{prs}@{}", drop.identifier);
+        let key = format!("{repo}@{}", drop.identifier);
         // A poisoned lock is recovered rather than propagated: the worst a lost set costs is a
         // repeated warning, and panicking the poll path over a log memo would be absurd.
         self.seen
@@ -197,7 +210,7 @@ pub fn report_unlinked_summons(
         tracing::warn!(
             issue_identifier = %drop.identifier,
             repo = %slug,
-            prs = ?drop.prs,
+            repo_prs = ?drop.repo_prs,
             state = %drop.state,
             "github-summons: a summons was found on this repo's pull requests but this ticket has \
              no linked pull request, so it can never be re-engaged; link the pull request to the \
@@ -315,7 +328,7 @@ pub fn apply_github_summons(
             unlinked.push(UnlinkedSummons {
                 identifier: iss.identifier.clone(),
                 state: iss.state.clone(),
-                prs: hit_prs.clone(),
+                repo_prs: hit_prs.clone(),
             });
         }
     }
@@ -797,7 +810,7 @@ mod tests {
         vec![UnlinkedSummons {
             identifier: "STUDIO-872".to_string(),
             state: "In Review".to_string(),
-            prs: vec![154],
+            repo_prs: vec![154],
         }]
     }
 
@@ -818,7 +831,7 @@ mod tests {
             vec![UnlinkedSummons {
                 identifier: "STUDIO-872".to_string(),
                 state: "In Review".to_string(),
-                prs: vec![154],
+                repo_prs: vec![154],
             }],
             "the drop names the ticket AND the pull request the comment is on"
         );
@@ -948,7 +961,11 @@ mod tests {
             f.get("repo").map(String::as_str),
             Some("makewhatis/rhapsody")
         );
-        assert_eq!(f.get("prs").map(String::as_str), Some("[154]"));
+        assert_eq!(
+            f.get("repo_prs").map(String::as_str),
+            Some("[154]"),
+            "the repo's hits, named so the dropped comment can be opened"
+        );
         assert_eq!(
             events
                 .iter()
@@ -986,7 +1003,7 @@ mod tests {
         let drops = vec![UnlinkedSummons {
             identifier: "STUDIO-900".to_string(),
             state: "Todo".to_string(),
-            prs: vec![154],
+            repo_prs: vec![154],
         }];
         assert_eq!(
             report_unlinked_summons(&log, "makewhatis", "rhapsody", &drops, &review_states()),
@@ -994,24 +1011,72 @@ mod tests {
         );
     }
 
-    /// Once per DROP, not once per ticket forever: a ticket whose second pull request is also
-    /// dropped is a new fact, and silence there would hide the thing the first warning asked the
-    /// operator to fix coming back.
+    /// The churn the hit-set key could not survive. `UnlinkedSummons::repo_prs` is every pull
+    /// request in the POLLED REPO with a summons hit this tick — not the ticket's, which has none;
+    /// that is the defect — and that set is a rolling `DEFAULT_GH_LOOKBACK` window, so it changes
+    /// on its own as comments age out and as summons land on unrelated pull requests. A key
+    /// carrying those numbers therefore re-fired for EVERY unlinked in-review ticket on every
+    /// change to it, which is the "one line every ~35 seconds" this warning exists to replace,
+    /// wearing a WARN coat.
     #[test]
-    fn a_new_pull_request_on_the_same_ticket_is_reported_again() {
+    fn a_changed_repo_hit_set_does_not_re_warn_the_same_ticket() {
         let log = SummonDropLog::default();
         let states = review_states();
-        let one = drops();
-        let two = vec![UnlinkedSummons {
-            prs: vec![154, 160],
-            ..one[0].clone()
-        }];
+        let with = |prs: Vec<i64>| {
+            vec![UnlinkedSummons {
+                repo_prs: prs,
+                ..drops()[0].clone()
+            }]
+        };
         assert_eq!(
-            report_unlinked_summons(&log, "makewhatis", "rhapsody", &one, &states),
-            1
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &with(vec![154]), &states),
+            1,
+            "the first drop is said out loud"
+        );
+        for prs in [vec![154, 160], vec![160], vec![160, 161], vec![154]] {
+            assert_eq!(
+                report_unlinked_summons(&log, "makewhatis", "rhapsody", &with(prs), &states),
+                0,
+                "a summons on an unrelated pull request is not news about THIS ticket"
+            );
+        }
+    }
+
+    /// Once per TICKET, and per ticket: the memo must not silence a second unlinked ticket just
+    /// because the first one was reported from the same hit set.
+    #[test]
+    fn every_unlinked_ticket_is_warned_about_once() {
+        let log = SummonDropLog::default();
+        let states = review_states();
+        let two = vec![
+            drops()[0].clone(),
+            UnlinkedSummons {
+                identifier: "STUDIO-900".to_string(),
+                ..drops()[0].clone()
+            },
+        ];
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &two, &states),
+            2
         );
         assert_eq!(
             report_unlinked_summons(&log, "makewhatis", "rhapsody", &two, &states),
+            0
+        );
+    }
+
+    /// The same ticket in a different repository is a different fault with a different fix, so the
+    /// memo is keyed on both.
+    #[test]
+    fn the_same_ticket_in_another_repository_is_warned_about_in_its_own_right() {
+        let log = SummonDropLog::default();
+        let states = review_states();
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &drops(), &states),
+            1
+        );
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "tally", &drops(), &states),
             1
         );
     }
