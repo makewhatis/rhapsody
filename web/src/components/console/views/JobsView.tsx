@@ -232,6 +232,24 @@ function emptyMessage(total: number, loading: boolean): string {
 // a row that was actually stopped on is ever fetched.
 const SPARK_DWELL_MS = 120;
 
+// What the row's title cell LEADS with (STUDIO-834).
+//
+// Every other row on this page opens with a ticket key, and a review row used to open with
+// `pr:makewhatis/tally#238@jimmy` — the repository, the number and the reviewer, and nothing that
+// says which work is being reviewed. So a review row that resolved one leads with the TICKET, and
+// the pull request stays the secondary detail it already was: the title beside it still reads
+// `Review makewhatis/tally#238 at 7d185b6`, so nothing is lost by the substitution.
+//
+// It is only ever a LABEL. `row.issue` stays the route target and the `aria-label`'s subject stays
+// whatever is drawn, because the row opens the review RUN it shows and the ticket named here
+// belongs to somebody else's job.
+//
+// "" — an unresolved origin, or any ordinary row — falls back to the key, which is exactly what the
+// cell showed before the field existed.
+function jobLead(row: ConsoleJobRow): string {
+  return row.reviewOf === "" ? row.issue : row.reviewOf;
+}
+
 // One worklist row. It is a real activation target, not a div with a click handler: the whole
 // row navigates, so it owes Enter/Space and a focus ring as well as the pointer (§10 box 2.8).
 function JobsRow({
@@ -276,7 +294,7 @@ function JobsRow({
     <tr
       tabIndex={0}
       role="link"
-      aria-label={`${row.issue} ${row.title}`}
+      aria-label={`${jobLead(row)} ${row.title}`}
       onClick={() => onOpen(row.issue)}
       onMouseEnter={() => {
         hovering.current = true;
@@ -305,7 +323,7 @@ function JobsRow({
     >
       <td>
         <div className="ti">
-          {row.issue}
+          {jobLead(row)}
           {row.title === "" ? "" : ` · ${row.title}`}
         </div>
         <div className="pj">{row.project}</div>
