@@ -111,9 +111,10 @@ with no collision, so redirecting `CODEX_HOME` is not required for *correctness*
 runs sharing history. One codex turn took 128s against its partner's 19s in an earlier pair; that
 is a single observation with no isolated cause, not a measured contention finding.
 
-Every turn in every trial edited only its own `counter.txt` and reported a distinct session id.
-**No cross-talk was ever observed on any harness** — opencode's failure is refusal to start, not
-corruption of the other turn.
+Across the 42 concurrent turns in these transcripts, **5 were lost — all of them opencode on a
+shared state dir.** Each of the other 37 edited only its own `counter.txt` and reported a distinct
+session id. **No cross-talk was observed on any harness**: opencode's failure is a refusal to
+start (the lost turns edited nothing at all), not corruption of the other turn.
 
 ## Provenance — the exact command per capture
 
@@ -181,7 +182,7 @@ never ran; it exits 1 with an install error on stderr and runs nothing. A daemon
   leftover: an earlier ad-hoc burst of concurrent requests returned 200 across the board, but no
   transcript of it was kept, so it is not evidence and is not repeated here as a finding. What *is*
   committed is the two-turns-at-once case the ticket actually asked for, in each
-  `concurrency.txt` and `concurrency-trials*.txt` — and none of those 36 turns saw a 429 either.
+  `concurrency.txt` and `concurrency-trials*.txt` — and none of those 42 turns saw a 429 either.
   opencode's concurrent failures are a local SQLite lock, not a provider rate limit.
 - **A failing harness does not reliably say so in its exit code, and `claude` does not reliably say
   so in its stream.** The four `.exit` sidecars are the recorded spread: goose 401 → **0**,

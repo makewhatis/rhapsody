@@ -21,6 +21,9 @@ for i in $(seq 1 "$n"); do
   a="$root/$label-$i-a"; b="$root/$label-$i-b"
   for sb in "$a" "$b"; do
     "$here/mksandbox.sh" "$sb" >/dev/null
+    # Dropped in unconditionally, including for claude/codex sandboxes: only opencode
+    # reads it, and the prompt touches nothing but counter.txt, so an ignored config
+    # file is cheaper than branching on the harness. It is not read by the others.
     [ -f "$here/../opencode/opencode.json" ] && cp "$here/../opencode/opencode.json" "$sb/opencode.json"
     if [ "${SEED_XDG:-0}" = 1 ]; then
       mkdir -p "$sb/xdg/opencode"
