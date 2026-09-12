@@ -37,7 +37,7 @@ timings, exit code); `*.census.txt` is the kill test's process census.
 | Path | What it is |
 |---|---|
 | `acp-happy.jsonl` + `.client.jsonl` | The full multi-tool turn: shell read, typed `write`, shell `./check.sh`, the daemon MCP tool, final answer. 171 agent frames. |
-| `acp-resume.jsonl` + `.client.jsonl` | `session/load` of the happy turn's session **in a fresh process**, then a follow-up answered from context ("8"). The first 14 lines are the agent replaying history. |
+| `acp-resume.jsonl` + `.client.jsonl` | `session/load` of the happy turn's session **in a fresh process**, then a follow-up answered from context ("8"). Lines 2–14 are the agent replaying history; the `session/load` response is line 15. |
 | `acp-failure-401.jsonl` + `.client.jsonl` | A hard auth failure (bogus `FIREWORKS_API_KEY`): a JSON-RPC **error** on the `session/prompt` response. 7 frames, all valid JSON, stderr empty. |
 | `acp-home-redirect-provider-not-set.jsonl` | `HOME` redirected to a scratch dir: goose isolates cleanly but loses the macOS keychain, and the turn fails with `"Provider not set"`. |
 | `acp-client-delegation.jsonl` + `.client.jsonl` | The same turn with the client advertising `fs` **and** `terminal`. goose then asks the *client* to read files and to create terminals — and when the client refuses `terminal/create`, the model routes around it with a `delegate` subagent. 354 KB, 285 KB of which is 883 `agent_thought_chunk` frames. |
@@ -50,7 +50,11 @@ timings, exit code); `*.census.txt` is the kill test's process census.
 Full event streams were **not** committed for the four concurrency runs — `acp-happy.jsonl`
 already shows the stream shape, and the concurrency finding rests on the ids, the per-sandbox
 tool calls and the timings, which the driver logs carry. `.timing` files were not committed
-either; they are derived from the two `.jsonl` files.
+either; they are derived from the two `.jsonl` files. No `.stderr` file is committed because every
+run's stderr file came out **0 bytes** — an empty file is weaker evidence than saying so here. For
+the runs that ended normally the driver also prints the count it measured (`STDERR_BYTES=0`) into
+the `*.driver.txt`; the three kill runs have no such line, and their empty `.stderr` is **not**
+evidence either way, because the driver kills the process before the stderr reader finishes.
 
 ## Provenance — the exact command per capture
 
