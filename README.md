@@ -1258,9 +1258,16 @@ repository wants no write at all. A MERGED attachment deliberately does not coun
 second round of work opens a second pull request must have that one attached in its own right.
 
 **Best-effort, and the word is exact.** A refused link never fails the review introduction or the
-quorum fan-out that was actually asked for. It costs the NEXT summons on that pull request — which
-the next handoff, or the adoption sweep, tries again, and which the warning below names out loud if
-it does not.
+quorum fan-out that was actually asked for. It costs the NEXT summons on that pull request, and it
+is retried by whatever next resolves a pull request for that ticket — another handoff, or the
+adoption sweep. That is deliberately not "every tick", and on the quorum path it is not even every
+handoff (`fan_out` returns at `AlreadyRequestedAtHead` before resolving a tracker), so the backstop
+for a link that never lands is the warning below.
+
+Nothing depends on Linear de-duplicating the write. The gate above is what keeps a working
+installation silent; a duplicate that got through would give `linked_prs` two equal entries, which
+the summons walk attributes twice and advances once — untidy in Linear's UI, harmless to the
+routing.
 
 **The warning exists because the information already did.** The STUDIO-574 counters had been
 reporting `linked_prs_total=0 … matched=0 advanced=0` every ~35 seconds for eleven hours while three

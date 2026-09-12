@@ -23,10 +23,14 @@
 //! # Best-effort, and the word is load-bearing
 //!
 //! A failed link must never fail the thing that was actually asked for — the review introduction,
-//! or the quorum fan-out. It costs the NEXT summons on that pull request, which the next handoff
-//! (or [`crate::reviewadopt`]'s sweep) will try to repair, and which
-//! [`crate::ghenrich::UnattributableSummons`] names out loud if it does not. So every failure here
-//! is a warning and a return, never an error the caller has to thread.
+//! or the quorum fan-out. It costs the NEXT summons on that pull request, and it is retried by
+//! whatever next resolves a pull request for that ticket: another handoff, or
+//! [`crate::reviewadopt`]'s sweep. **That is not "every tick", and on the quorum path it is not
+//! even every handoff** — `fan_out` returns at `AlreadyRequestedAtHead` before it resolves a
+//! tracker, so a repeat handoff at an unchanged head retries nothing. The backstop for a link that
+//! never lands is therefore [`crate::ghenrich::UnlinkedSummons`], which names the ticket out loud
+//! rather than leaving it to be discovered. Every failure here is a warning and a return, never an
+//! error the caller has to thread.
 //!
 //! What it is NOT is silent: the two outcomes worth a line get one each, because "the daemon linked
 //! it" and "the daemon tried and Linear refused" are the two facts an operator staring at an idle
@@ -89,8 +93,9 @@ pub(crate) fn pr_link_target(
 /// or a tracker the quorum has already resolved for the parent's own project.
 #[async_trait]
 pub trait PrLinker: Send + Sync {
-    /// Attaches `url` to `issue_id`; see [`Tracker::link_pull_request`] for the idempotency
-    /// contract the callers lean on.
+    /// Attaches `url` to `issue_id`. Callers do not depend on the tracker de-duplicating: the
+    /// [`pr_link_target`] gate is what keeps a working installation from writing at all, and see
+    /// [`Tracker::link_pull_request`] for what a duplicate would and would not cost.
     async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError>;
 }
 

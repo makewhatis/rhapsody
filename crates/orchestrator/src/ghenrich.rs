@@ -292,7 +292,8 @@ pub fn apply_github_summons(
         // them can EVER reach this ticket — a routing fault (the ticket's project points at a
         // different repo than its PRs), not a quiet no-op. INFO because it is the one drop reason an
         // operator must act on, and it cannot fire for a correctly-routed ticket.
-        if iss_other_repo > 0 && iss_other_repo == prs.len() {
+        let all_in_another_repo = iss_other_repo > 0 && iss_other_repo == prs.len();
+        if all_in_another_repo {
             tracing::info!(
                 issue_identifier = %iss.identifier,
                 polled_repo = %format!("{owner}/{repo}"),
@@ -305,7 +306,12 @@ pub fn apply_github_summons(
         // that one could have reached. Reported rather than logged here, because whether it is
         // WORTH saying depends on state this pure function does not have — see
         // [`report_unlinked_summons`].
-        if !iss_reachable {
+        //
+        // NOT reported when STUDIO-574's line above already named this ticket: that one says the
+        // ticket's links are in another repository and names which, which is both truer and more
+        // actionable than "it has no linked pull request". Two lines about one ticket, one of them
+        // wrong, is worse than the single accurate line.
+        if !iss_reachable && !all_in_another_repo {
             unlinked.push(UnlinkedSummons {
                 identifier: iss.identifier.clone(),
                 state: iss.state.clone(),
@@ -862,6 +868,44 @@ mod tests {
             vec![in_review(
                 "STUDIO-872",
                 vec![linked("makewhatis", "rhapsody", 154, true)],
+            )],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert_eq!(got.unlinked.len(), 1);
+    }
+
+    /// STUDIO-574 already names this ticket, and names it better — "its links are all in
+    /// another repo, here is which". Reporting it AGAIN as "it has no linked pull request" would
+    /// put a second, untrue line beside the accurate one.
+    #[test]
+    fn an_issue_whose_links_are_all_in_another_repo_is_left_to_the_line_that_names_it() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review(
+                "STUDIO-872",
+                vec![linked("makewhatis", "tally", 246, false)],
+            )],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert!(got.unlinked.is_empty());
+    }
+
+    /// …but a ticket with SOME link in another repo and nothing reachable here is not covered by
+    /// that line (it only fires when EVERY link is foreign), so it is still reported.
+    #[test]
+    fn an_issue_with_a_foreign_link_and_a_merged_local_one_is_reported() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review(
+                "STUDIO-872",
+                vec![
+                    linked("makewhatis", "tally", 246, false),
+                    linked("makewhatis", "rhapsody", 154, true),
+                ],
             )],
             &by_pr,
             "makewhatis",

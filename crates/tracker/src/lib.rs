@@ -309,10 +309,13 @@ pub trait Tracker: Any + Send + Sync {
     /// Linear's GitHub integration, nothing else ever writes that link — so the daemon writes it
     /// itself, at the moment it resolves a pull request for a ticket.
     ///
-    /// **Idempotent.** The link is keyed on (issue, url), so re-linking a pull request already
-    /// attached to the same issue is a successful no-op. Callers rely on it: the link is attempted
-    /// at every review introduction, and a ticket handed off repeatedly must not grow an attachment
-    /// per handoff.
+    /// **Callers must not assume the tracker de-duplicates.** Linear's link mutations are keyed on
+    /// (issue, url) and a repeat is expected to be a no-op, but that is the tracker's behaviour and
+    /// not this contract's: the once-per-ticket guard belongs to the caller, exactly as
+    /// [`Tracker::create_issue`]'s once-per-parent guard does. A duplicate is cheap rather than
+    /// harmful — two attachments of the same pull request give `linked_prs` two equal entries, and
+    /// the summons walk attributes the same comment twice and advances once — so the guard is about
+    /// tidiness in the tracker's UI, not correctness.
     ///
     /// An adapter with no attachment surface returns an error rather than a silent success — the
     /// caller treats the link as best-effort, but "best-effort" must never mean "told it worked".

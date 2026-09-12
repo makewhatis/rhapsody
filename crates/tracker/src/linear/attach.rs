@@ -24,12 +24,14 @@
 //! points at the right pull request, and is still invisible to `linked_prs` — the original failure
 //! wearing a hat. So the GitHub-specific mutation is load-bearing, not cosmetic.
 //!
-//! # Idempotency
+//! # Repeats
 //!
 //! Linear keys a link attachment on (issue, url), so re-linking a pull request already attached to
-//! the same issue is a successful no-op rather than a duplicate. Callers lean on that: the link is
-//! attempted at every review introduction, and a ticket handed off three times must not grow three
-//! attachments.
+//! the same issue is expected to be a no-op. Nothing here DEPENDS on that: the caller's own gate
+//! (`prlink::pr_link_target` — "this ticket already has an unmerged linked pull request in this
+//! repository") is what keeps a working installation from writing at all, and a duplicate that got
+//! through would give `linked_prs` two equal entries, which the summons walk attributes twice and
+//! advances once. Untidy in Linear's UI, harmless to the routing.
 
 use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, query};
