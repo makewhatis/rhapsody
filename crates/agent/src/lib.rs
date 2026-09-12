@@ -21,6 +21,7 @@
 pub mod claude;
 pub mod fake;
 pub mod humanize;
+pub mod proctree;
 
 pub use humanize::{LogEntry, humanize_stream_line};
 

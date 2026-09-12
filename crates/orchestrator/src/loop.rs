@@ -1325,8 +1325,8 @@ impl Orchestrator {
     /// receiver (INF-250), launches a tokio task driving `run_agent_attempt`, and forwards its per-turn
     /// agent events + transcript-open + terminal exit back onto the control channel. Cancellation (from
     /// `terminate` / `shutdown`) races the run and drops it — and THAT drop is what kills the agent:
-    /// the turn's `KillGroupOnDrop` guard (`rhapsody_agent`) SIGKILLs the `claude` process group, the
-    /// stand-in for Go's `exec.CommandContext` + `cmd.Cancel` (STUDIO-840). Mirrors Go `spawnWorker`
+    /// the turn's `KillTreeOnDrop` guard (`rhapsody_agent`) SIGKILLs the `claude` process tree, the
+    /// stand-in for Go's `exec.CommandContext` + `cmd.Cancel` (STUDIO-840, widened by STUDIO-871). Mirrors Go `spawnWorker`
     /// (telemetry span links are P6).
     // The signature mirrors Go's flat `spawnWorker(wctx, iss, attempt, projectSlug, stackContext,
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)

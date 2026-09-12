@@ -53,10 +53,12 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
     "rt",
 ] }
-# libc (Unix only): `kill(-pgid, SIGKILL)` to signal the child's whole process group on a stall/turn
-# deadline — the parity mirror of Go `syscall.Kill(-cmd.Process.Pid, SIGKILL)`. tokio's `Child::kill`
-# signals only the direct child, which would orphan the agent's own children (e.g. fake-claude's
-# background stdin drain) and leave the stdout pipe open. Already in Cargo.lock (a tokio dependency).
+# libc (Unix only): `kill(…, SIGKILL)` from `proctree`, to signal the agent's whole process tree on a
+# stall/turn deadline or an operator Stop — the parity mirror of Go
+# `syscall.Kill(-cmd.Process.Pid, SIGKILL)`, widened past the process group by STUDIO-871 because
+# every harness puts its tool children in a group of their own. tokio's `Child::kill` signals only
+# the direct child, which would orphan the agent's own children (e.g. fake-claude's background stdin
+# drain) and leave the stdout pipe open. Already in Cargo.lock (a tokio dependency).
 libc = "0.2"
 # tracing: best-effort warn diagnostics when a transcript sink write fails (Go logs these via
 # `slog`; the workspace convention is `tracing`, as `rhapsody-tracker` records). Behavior is

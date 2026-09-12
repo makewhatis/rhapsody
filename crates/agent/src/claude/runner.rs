@@ -2,10 +2,12 @@
 //!
 //! [`Runner`] drives `claude` headlessly, one process per turn, inside the per-issue worktree. Each
 //! [`Session::run_turn`] spawns the child with the exact argv ([`build_args`]), in its own Unix
-//! process group so a stall/turn-deadline kill can `SIGKILL` the whole group (the agent's own
-//! children — e.g. a background stdin drain — die with it). stdin is held open as an operator-message
-//! mailbox that is continuously drained and folded into the live turn at the next step boundary,
-//! closed the instant the terminal result lands so nothing is ever written after it (INF-250). The
+//! process group; a stall/turn-deadline/Stop kill then goes through [`crate::proctree::kill_tree`],
+//! which SIGKILLs that group AND every other group the agent's descendant tree spans — the group
+//! alone is not the boundary, because every harness `setpgid`s the shell it runs a tool command in
+//! (STUDIO-871). stdin is held open as an operator-message mailbox that is continuously drained and
+//! folded into the live turn at the next step boundary, closed the instant the terminal result lands
+//! so nothing is ever written after it (INF-250). The
 //! turn deadline (Go's `context.WithTimeout`) is the single timeout: a hang produces `TurnTimedOut`
 //! (the "stalled" lifecycle), exactly as the reference does — the reference has no separate
 //! runner-level "stall timeout" (that knob is orchestrator-level; see `fake_claude_test.go`).
@@ -36,6 +38,7 @@ use crate::claude::{
     billing_guard_ok, build_args, classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars,
     split_command,
 };
+use crate::proctree::{KillTreeOnDrop, kill_tree};
 use crate::{
     AgentError, EVENT_OPERATOR_MESSAGE, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
     EVENT_TURN_FAILED, Event, Session, TURN_FAILED, TURN_SUCCEEDED, TURN_TIMED_OUT, Transcript,
@@ -387,7 +390,9 @@ impl Session for ClaudeSession {
             }
         }
         // New process group so the deadline/stall kill can SIGKILL the whole group (Go's
-        // `SysProcAttr{Setpgid: true}` + `syscall.Kill(-pid, SIGKILL)`).
+        // `SysProcAttr{Setpgid: true}` + `syscall.Kill(-pid, SIGKILL)`). Necessary, not sufficient:
+        // the agent's tool children put themselves in groups of their own, which is why every kill
+        // below is `kill_tree` and not a bare group kill (STUDIO-871).
         cmd.process_group(0);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -423,9 +428,11 @@ impl Session for ClaudeSession {
 
         // Every await below can be reached by a DROP rather than a return: an operator Stop (and a
         // daemon shutdown) cancels a run by dropping this future, and the child leads its own process
-        // group, so it would otherwise run on unattended. Arm the group kill for the whole turn and
-        // disarm it only once the child is reaped (STUDIO-840).
-        let mut group_kill = KillGroupOnDrop(pid);
+        // group, so it would otherwise run on unattended. Arm the tree kill for the whole turn and
+        // disarm it only once the child is reaped (STUDIO-840; STUDIO-871 widened the guard from the
+        // group to the whole descendant tree, since every harness puts its tool children in a group
+        // of their own).
+        let mut tree_kill = KillTreeOnDrop::new(pid);
 
         // The FIRST stdin line is the prompt as one stream-json user message (INF-250). A write
         // failure (child never drained stdin / exited early) is not fatal — the scan loop still runs.
@@ -462,10 +469,11 @@ impl Session for ClaudeSession {
 
         'outer: loop {
             tokio::select! {
-                // Turn deadline: kill the whole process group so a hung child (and its children)
-                // dies and the pipes EOF. A captured result still wins post-loop.
+                // Turn deadline: kill the whole process TREE so a hung child (and every command it
+                // launched, wherever it put them) dies and the pipes EOF. A captured result still
+                // wins post-loop.
                 _ = &mut deadline => {
-                    kill_group(pid);
+                    kill_tree(pid);
                     timed_out = true;
                     break 'outer;
                 }
@@ -507,14 +515,14 @@ impl Session for ClaudeSession {
                                     continue;
                                 }
                                 // Billing guard on the first system/init of THIS turn: apiKeySource
-                                // must be "none". Otherwise kill the group and abort.
+                                // must be "none". Otherwise kill the tree and abort.
                                 if guard_on
                                     && c.event.event_type == EVENT_SESSION_STARTED
                                     && !billing_checked
                                 {
                                     billing_checked = true;
                                     if !billing_guard_ok(&c.api_key_source) {
-                                        kill_group(pid);
+                                        kill_tree(pid);
                                         billing_failed = true;
                                         break 'outer;
                                     }
@@ -620,7 +628,7 @@ impl Session for ClaudeSession {
         };
         tokio::join!(drain_out, drain_err);
         let wait_res = child.wait().await;
-        group_kill.disarm(); // reaped — nothing left to signal, and the pid may now be recycled
+        tree_kill.disarm(); // reaped — nothing left to signal, and the pid may now be recycled
 
         // Billing abort (a system/init reported a non-"none" apiKeySource): refuse to bill.
         if billing_failed {
@@ -716,40 +724,6 @@ fn timed_out_result(usage: Usage) -> TurnResult {
         status: TURN_TIMED_OUT.to_string(),
         usage,
         result_text: String::new(),
-    }
-}
-
-/// SIGKILLs the child's whole process group when a turn is abandoned by having its future DROPPED,
-/// unless [`disarm`](KillGroupOnDrop::disarm)ed first. Go gets this from `exec.CommandContext(tctx,
-/// …)` + `cmd.Cancel`: cancelling the run's context kills the agent's group. Rust's cancellation IS
-/// the drop, and a dropped `tokio::process::Child` signals nothing, so before STUDIO-840 an operator
-/// Stop removed the running entry, moved the ticket and answered 200 while the real `claude` kept
-/// committing. Disarmed once the child has been reaped, so a kill can never reach a recycled pid.
-struct KillGroupOnDrop(u32);
-
-impl KillGroupOnDrop {
-    /// Stands the kill down (the child is reaped).
-    fn disarm(&mut self) {
-        self.0 = 0; // `kill_group` skips pid 0
-    }
-}
-
-impl Drop for KillGroupOnDrop {
-    fn drop(&mut self) {
-        kill_group(self.0);
-    }
-}
-
-/// Signals the whole process group led by `pid` with `SIGKILL` (Go `syscall.Kill(-pid, SIGKILL)`).
-/// A pid of 0 is skipped — `kill(0, …)` would target the daemon's OWN group.
-fn kill_group(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    // SAFETY: `kill(2)` with a negative pid signals the process group led by `pid`. SIGKILL cannot
-    // be caught, and the return is best-effort (mirrors Go's `_ = syscall.Kill(...)`).
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
@@ -1993,8 +1967,10 @@ mod tests {
     ///
     /// The property is "no process of the run survives the drop", which the entry map cannot observe.
     /// So this asserts on a GRANDCHILD the fake forks: it outlives its parent, and it writes the
-    /// marker only if something the group kill missed was still running a second after the drop.
+    /// marker only if something the drop's kill missed was still running a second after the drop.
     /// Killing just the direct child (`kill_on_drop`) leaves it, so the assertion reds on that too.
+    /// The grandchild stays in the agent's own group, so this pins 840's half; STUDIO-871's escaped
+    /// tool child is pinned in `proctree` and in `filetracker_e2e`.
     #[tokio::test]
     async fn dropping_a_turn_kills_the_whole_agent_process_group() {
         let _env = ENV_GUARD.read().await;

@@ -50,7 +50,9 @@ Go's real output. If you add a new default-path divergence, it likely needs a ma
   for the exact contract: drains stdin continuously so the runner's held-open stdin never blocks,
   first line must carry `apiKeySource:"none"`). Controlled by env: `FAKE_CLAUDE_SLEEP_S`,
   `FAKE_CLAUDE_OUTCOME` (`success`|`error`), `FAKE_CLAUDE_HANG` (never emits a result — exercises
-  the turn-timeout/kill path). `fake-claude-error` and `fake-claude-hang` are one-line wrappers
+  the turn-timeout/kill path), `FAKE_CLAUDE_ESCAPE` (a path: starts a child in a process group of
+  its own and reports that group there — the tool-child leak every real harness has, STUDIO-871).
+  `fake-claude-error` and `fake-claude-hang` are one-line wrappers
   that just set the env var and exec `fake-claude` — edit the real logic in `fake-claude` itself.
 - `linear-stub` is a full Rust crate (its own `Cargo.toml`; listed directly in the root workspace
   `members`, not covered by the `crates/*` glob). It answers exactly the GraphQL operations

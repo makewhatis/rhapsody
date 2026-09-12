@@ -261,8 +261,11 @@ the `Orchestrator` struct itself. Concretely:
   refusal, not the stop — dispatch the issue if you want the real path.
 - **Cancellation is a dropped future, and the drop is what kills the agent.** `terminate` fires
   `re.cancel`; `spawn_worker`'s `tokio::select!` then drops the run future, and the turn's
-  `KillGroupOnDrop` guard (`crates/agent`) SIGKILLs the `claude` process group — the stand-in for
-  Go's `exec.CommandContext` + `cmd.Cancel`. Nothing else kills an agent, so any new path that
+  `KillTreeOnDrop` guard (`crates/agent`) SIGKILLs the `claude` process TREE — the stand-in for
+  Go's `exec.CommandContext` + `cmd.Cancel`. The tree, not the group, since STUDIO-871: every
+  harness puts the shell it runs a tool command in into a process group of its own, so a group kill
+  left the model's `git push` running while the stop reported success. Nothing else kills an agent,
+  so any new path that
   abandons a run future must let it drop rather than `mem::forget`/detach it, and any new path that
   reports a run stopped owes the same armed-signal check `handle_stop_run` makes.
 - The control channel is `tokio::sync::mpsc::unbounded`, not Go's buffered-256 channel — a
