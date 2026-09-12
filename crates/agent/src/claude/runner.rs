@@ -36,6 +36,7 @@ use crate::claude::{
     billing_guard_ok, build_args, classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars,
     split_command,
 };
+use crate::proctree::{KillTreeOnDrop, kill_tree};
 use crate::{
     AgentError, EVENT_OPERATOR_MESSAGE, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
     EVENT_TURN_FAILED, Event, Session, TURN_FAILED, TURN_SUCCEEDED, TURN_TIMED_OUT, Transcript,
@@ -423,9 +424,11 @@ impl Session for ClaudeSession {
 
         // Every await below can be reached by a DROP rather than a return: an operator Stop (and a
         // daemon shutdown) cancels a run by dropping this future, and the child leads its own process
-        // group, so it would otherwise run on unattended. Arm the group kill for the whole turn and
-        // disarm it only once the child is reaped (STUDIO-840).
-        let mut group_kill = KillGroupOnDrop(pid);
+        // group, so it would otherwise run on unattended. Arm the tree kill for the whole turn and
+        // disarm it only once the child is reaped (STUDIO-840; STUDIO-871 widened the guard from the
+        // group to the whole descendant tree, since every harness puts its tool children in a group
+        // of their own).
+        let mut group_kill = KillTreeOnDrop::new(pid);
 
         // The FIRST stdin line is the prompt as one stream-json user message (INF-250). A write
         // failure (child never drained stdin / exited early) is not fatal — the scan loop still runs.
@@ -465,7 +468,7 @@ impl Session for ClaudeSession {
                 // Turn deadline: kill the whole process group so a hung child (and its children)
                 // dies and the pipes EOF. A captured result still wins post-loop.
                 _ = &mut deadline => {
-                    kill_group(pid);
+                    kill_tree(pid);
                     timed_out = true;
                     break 'outer;
                 }
@@ -514,7 +517,7 @@ impl Session for ClaudeSession {
                                 {
                                     billing_checked = true;
                                     if !billing_guard_ok(&c.api_key_source) {
-                                        kill_group(pid);
+                                        kill_tree(pid);
                                         billing_failed = true;
                                         break 'outer;
                                     }
@@ -716,40 +719,6 @@ fn timed_out_result(usage: Usage) -> TurnResult {
         status: TURN_TIMED_OUT.to_string(),
         usage,
         result_text: String::new(),
-    }
-}
-
-/// SIGKILLs the child's whole process group when a turn is abandoned by having its future DROPPED,
-/// unless [`disarm`](KillGroupOnDrop::disarm)ed first. Go gets this from `exec.CommandContext(tctx,
-/// …)` + `cmd.Cancel`: cancelling the run's context kills the agent's group. Rust's cancellation IS
-/// the drop, and a dropped `tokio::process::Child` signals nothing, so before STUDIO-840 an operator
-/// Stop removed the running entry, moved the ticket and answered 200 while the real `claude` kept
-/// committing. Disarmed once the child has been reaped, so a kill can never reach a recycled pid.
-struct KillGroupOnDrop(u32);
-
-impl KillGroupOnDrop {
-    /// Stands the kill down (the child is reaped).
-    fn disarm(&mut self) {
-        self.0 = 0; // `kill_group` skips pid 0
-    }
-}
-
-impl Drop for KillGroupOnDrop {
-    fn drop(&mut self) {
-        kill_group(self.0);
-    }
-}
-
-/// Signals the whole process group led by `pid` with `SIGKILL` (Go `syscall.Kill(-pid, SIGKILL)`).
-/// A pid of 0 is skipped — `kill(0, …)` would target the daemon's OWN group.
-fn kill_group(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    // SAFETY: `kill(2)` with a negative pid signals the process group led by `pid`. SIGKILL cannot
-    // be caught, and the return is best-effort (mirrors Go's `_ = syscall.Kill(...)`).
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
