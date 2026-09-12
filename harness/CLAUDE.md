@@ -2,12 +2,14 @@
 
 The whole parity-port fixture-capture and testing rig. The root CLAUDE.md only mentions the
 `harness-fixtures` crate and `harness/fixtures/` (the committed golden data); this file maps the
-other five subdirectories that produce or consume those goldens.
+other six subdirectories: the five that produce or consume those goldens, and `harness-spike/`,
+which deliberately does neither.
 
 | Dir | Role |
 |---|---|
 | `capture/` | `make fixtures`'s implementation: boots the reference Go daemon + the stubs below and records `harness/fixtures/` |
 | `fixtures/` | committed goldens (see root CLAUDE.md) |
+| `harness-spike/` | real captured event streams per candidate harness, from the STUDIO-869 and STUDIO-872 spikes — inputs for the adapter slices, NOT goldens |
 | `stubs/` | the fake agent (`fake-claude*`) and fake Linear (`linear-stub`, a real Rust crate) that every capture/e2e/test run drives against |
 | `release/` | standalone bash validators for the release pipeline (PR title, `make print-version`) — **not** part of `make test` |
 | `e2e/` | `boot.sh`, CI's boot gate — builds the *real* assembled `rhapsodyd` + web dashboard and drives it end-to-end |

@@ -4,6 +4,11 @@ Captured by the STUDIO-869 spike on 2026-09-11 and 2026-09-12 by running **one r
 against a real paid provider**, in a git sandbox, with the daemon's own MCP server attached. These
 are the samples the pluggable-harnesses adapter slices are built against.
 
+`goose/` was topped up by **STUDIO-872** on 2026-09-12, once a provider was armed: its multi-tool
+turn, resume, concurrency and kill path were captured over **ACP** (`goose acp`), not `goose run`.
+Those captures and their provenance are documented in `goose/README.md`; the written findings are in
+`~/.rhapsody/docs/STUDIO-872-goose-acp-spike-findings.md`.
+
 The written findings — failure classification, resume, concurrency, the kill path, real-provider
 behaviour, and the corrections they force on the design — live in
 `~/.rhapsody/docs/STUDIO-869-harness-spike-findings.md`, not in this repo.
@@ -53,8 +58,9 @@ Nothing in the Rust workspace reads these files yet. They are inputs for the ada
 | `opencode/concurrency-trials-shared.txt` | 5 paired trials on the shared state dir, database already created: **8/10 turns completed, 2 lost to `database is locked`**. |
 | `opencode/concurrency-trials-fresh-shared-xdg.txt` | The same 5 trials against a state dir with **no database yet**: **0/10 — every turn lost**. |
 | `opencode/concurrency-trials-isolated-xdg.txt` | The same 5 trials with a private `XDG_DATA_HOME` per turn: **10/10**. |
-| `goose/failure-401-exit0.stdout` | Goose failing a 401 while **exiting 0**, with the error on stdout. Failure path only — see below. |
+| `goose/failure-401-exit0.stdout` | Goose failing a 401 while **exiting 0**, with the error on stdout. The CLI surface; STUDIO-872's ACP captures sit beside it — see `goose/README.md`. |
 | `goose/failure-401-exit0.exit` | Its observed exit status: **0**. The filename's claim, recorded rather than asserted. |
+| `goose/acp-*.jsonl`, `.client.jsonl`, `.driver.txt`, `.census.txt`, `acp-session-id-race.txt` | STUDIO-872: the multi-tool turn, resume, concurrency (shared and isolated), three kill runs and a session-id race, all over ACP. Per-file table in `goose/README.md`. |
 | `sandbox/` | The scripts and prompts that produced all of the above. |
 
 `sandbox/mksandbox.sh` builds the sandbox repo (honours `$RHAPSODYD` and `$WORKFLOW`);
@@ -66,18 +72,24 @@ directory and passes only if each turn edited its own sandbox **and** the two re
 non-empty session-id sets; `sandbox/conctrials.sh` repeats that N times and reports how many turns
 survived, which is the only honest way to measure an intermittent failure. `SEED_XDG=1` gives each
 turn a private `XDG_DATA_HOME`; `SHARED_XDG=1` points a pair at one state dir that has no database
-yet.
+yet. `sandbox/acp_drive.py` is STUDIO-872's ACP client (`drive.py`'s one-way stdout loop cannot
+drive a bidirectional protocol); `sandbox/mkslow.sh` writes the `slow.sh` that
+`prompt-slow-child.txt` needs and `mksandbox.sh` does not create; `sandbox/idrace.py` opens N
+concurrent `session/new` calls and prints the ids; and `sandbox/prompt-resume.txt` is the follow-up
+prompt the resume captures use.
 
 Every `killtest.txt`, `concurrency.txt` and `concurrency-trials*.txt` here is the **stdout of the
 committed script that produced it** and nothing else — timestamps, argv and the leading `#` framing
-all come from the script (`$NOTE`), so re-running it reproduces the transcript. The one recorded
-thing that is not a script's stdout is `codex/concurrency-rollouts.txt`, which is the output of the
-`ls` in Provenance below and lives in its own file for exactly that reason. All of these carry
-their own elapsed times, which is why the kill and concurrency cases have no `.timing` sidecar.
+all come from the script (`$NOTE`), so re-running it reproduces the transcript. Among STUDIO-869's
+files the one recorded thing that is not a script's stdout is `codex/concurrency-rollouts.txt`,
+which is the output of the `ls` in Provenance below and lives in its own file for exactly that
+reason. (STUDIO-872's `goose/acp-*.driver.txt` are `acp_drive.py`'s **stderr** trace, not stdout —
+see `goose/README.md`.) All of these carry their own elapsed times, which is why the kill and
+concurrency cases have no `.timing` sidecar.
 
 ## What items 4 and 5 found
 
-**Item 5, the kill path — all three harnesses escape their process group.** Each `killtest.txt`
+**Item 5, the kill path — every CLI harness tested escapes its process group.** Each `killtest.txt`
 spawns the harness exactly as the daemon does (`process_group(0)`, then `kill(-pid, SIGKILL)`),
 waits 45s for the agent to get `./slow.sh` running, walks the ppid tree, kills, and re-checks:
 
@@ -86,15 +98,17 @@ waits 45s for the agent to get `./slow.sh` running, walks the ppid tree, kills, 
 | claude | 4 | **3** | the tool shell (`zsh` → `bash` → `sleep`), in its own pgid |
 | codex | 4 | **2** | the tool shell (`bash` → `sleep`); its MCP server also left the group but died with the leader |
 | opencode | 3 | **2** | the tool shell (`bash` → `sleep`), in its own pgid |
+| goose (ACP) | 3 | **0** | nothing survived — the MCP server left the group but died with its stdio pipe; 3 of 3 runs (STUDIO-872, `goose/acp-kill-*.census.txt`) |
 
-In every case the leader dies (`rc=-9`) and the command the agent was actually running does not.
+In every CLI case the leader dies (`rc=-9`) and the command the agent was actually running does not.
 This is [STUDIO-840](https://linear.app/studio49/issue/STUDIO-840) again one level down: that fix
 put the *harness* in a killable group, and these transcripts show the harness then puts its own
-tool children somewhere else. A stop still leaves real work running, whichever harness is in use.
-Killing the leader's group is therefore not a containment boundary for any candidate.
+tool children somewhere else. A stop still leaves real work running, whichever CLI harness is in
+use. Killing the leader's group is therefore not a containment boundary for any **CLI** candidate
+— goose over ACP is the one measured case where it does contain the work.
 
-**Item 4, concurrency — clean on claude and codex; on opencode the state directory is the whole
-story.**
+**Item 4, concurrency — clean on claude, codex and goose; on opencode the state directory is the
+whole story.**
 
 | Harness | One state dir for both turns | A private state dir per turn |
 |---|---|---|
@@ -102,6 +116,7 @@ story.**
 | codex | **8/8** turns completed (`codex/concurrency-trials.txt`) | not needed |
 | opencode, database already created | **8/10** (`opencode/concurrency-trials-shared.txt`) | **10/10** (`opencode/concurrency-trials-isolated-xdg.txt`) |
 | opencode, **no database yet** | **0/10 — both turns of every pair died** (`opencode/concurrency-trials-fresh-shared-xdg.txt`) | — |
+| goose (ACP) | **2/2** turns completed, distinct ids (STUDIO-872) | 2/2, but **both sessions get the same id** |
 
 ⚠️ **opencode loses turns to `database is locked` whenever two turns share one state directory.**
 The losing turn dies in **0–1s**, exits **1**, emits a **completely empty event stream** and no
@@ -225,10 +240,12 @@ never ran; it exits 1 with an install error on stderr and runs nothing. A daemon
 ## Reading these files honestly
 
 - **Every byte here was executed.** Nothing in this directory is transcribed from documentation.
-- **`goose/` is a failure-path capture only.** No goose provider with working credentials exists on
-  the capture machine — the capture points goose at OpenAI with a deliberately bogus key — so goose
-  got no happy-path, resume, concurrency or kill run. The one file present confirms the design's
-  §7.1 exit-0-on-failure claim by execution; everything else about goose remains unverified.
+- **`goose/` is now both.** `failure-401-exit0.stdout` is STUDIO-869's `goose run` capture against a
+  deliberately bogus key, and it still confirms the design's §7.1 exit-0-on-failure claim by
+  execution. Everything else in `goose/` is **STUDIO-872**, captured over ACP against a real
+  Fireworks provider on 2026-09-12: the multi-tool turn, resume, concurrency and the kill path. What
+  remains unverified for goose is listed in §8 of
+  `~/.rhapsody/docs/STUDIO-872-goose-acp-spike-findings.md`.
 - **No 429 was ever observed.** The rate-limit row is therefore Claude's `rate_limit_event` (real,
   in `claude/happy.jsonl`) and nothing else. The Fireworks side of that claim is a **[SURVEY]**
   leftover: an earlier ad-hoc burst of concurrent requests returned 200 across the board, but no
@@ -245,10 +262,12 @@ never ran; it exits 1 with an install error on stderr and runs nothing. A daemon
   original capture of the same prompt both make the same 11 tool calls in the same order-ish, but
   batched into 4 steps and 6 steps respectively. An adapter may key off tool calls; it must not
   assume a fixed number of `step_start`/`step_finish` pairs.
-- **The three harnesses name the daemon's MCP tools three different ways** — claude
+- **The four harnesses name the daemon's MCP tools four different ways** — claude
   `mcp__symphony__symphony_state`, opencode `symphony_symphony_state`, codex `symphony` +
-  `symphony_state` as separate fields. Rhapsody's prompts name tools by their claude-side names, so
-  the adapter owes a tool-name mapping, not only an event mapping.
+  `symphony_state` as separate fields, and goose `symphony__symphony_state` — the last of these in
+  `_meta.goose.toolCall.toolName` and not in an ACP protocol field at all, since ACP's own `title`
+  is the lossy prose `"symphony: symphony state"`. Rhapsody's prompts name tools by their
+  claude-side names, so the adapter owes a tool-name mapping, not only an event mapping.
 - The `claude/*.jsonl` captures contain two machine-specific artefacts: a ~7.6KB
   `system/hook_response` line carrying the capture machine's `SessionStart` hook text, and
   `/Users/david/...` paths in the `system/init` line. Both are the operator's environment, not part
