@@ -14,7 +14,9 @@
 # existing `lint` job rather than adding a branch-protection context that would not be required.
 #
 # NOTE: the leak scan searches ONLY the shipped directories, never this script, so the patterns
-# below can be spelled out plainly without the check passing on its own text.
+# below can be spelled out plainly without the check passing on its own text. Those patterns are
+# pinned by check-plugin_test.sh — a pattern nobody has watched fire is not a guard, which is how
+# the first, case-sensitive version of this scan shipped missing the very leak it was written for.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -88,11 +90,18 @@ PY
 done <<< "$SOURCES"
 
 # --- 3. nothing machine-local or private leaks into a public, installable artefact ------------
-# Each entry is "<what it is>|<extended regex>".
+# Each entry is "<what it is>|<extended regex>", matched case-INSENSITIVELY, because the forms these
+# strings actually travel in are not the ones a human writing a checklist would think of first: the
+# front-matter key this plugin was extracted from spelled the name `david`, all lower case, and the
+# workspace reaches a file as the `linear.app/<slug>/` of every pasted ticket link — no space and no
+# capital. A case-sensitive scan reports clean on both, which is worse than not scanning at all.
+# The workspace slug is matched with an OPTIONAL space and no other separator on purpose: widening
+# it to `studio[^a-z0-9]?49` would red on ticket ids STUDIO-490..STUDIO-499, which are not leaks.
+# check-plugin_test.sh reintroduces each form in turn and asserts this scan reds on it.
 LEAKS=(
-    "a private tailnet hostname|[A-Za-z0-9_-]+\.ts\.net"
-    "a personal name|David"
-    "a tracker workspace name|Studio 49"
+    "a private tailnet hostname|[a-z0-9_-]+\.ts\.net"
+    "a personal name|david"
+    "a tracker workspace name|studio ?49"
 )
 scan_dirs=(".claude-plugin")
 while IFS=$'\t' read -r _ src _; do
@@ -102,7 +111,7 @@ done <<< "$SOURCES"
 for entry in "${LEAKS[@]}"; do
     what="${entry%%|*}"
     pattern="${entry#*|}"
-    if hits=$(grep -rInE -- "$pattern" "${scan_dirs[@]}" 2>/dev/null); then
+    if hits=$(grep -rIniE -- "$pattern" "${scan_dirs[@]}" 2>/dev/null); then
         echo "$hits" >&2
         fail "shipped plugin files must not contain $what"
     fi

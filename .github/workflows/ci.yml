@@ -32,6 +32,11 @@ jobs:
       # `source` that does not resolve installs nothing while adding cleanly, and the shipped files
       # are public. Bash + python3 only, so it rides `lint` rather than adding a required context.
       - run: .github/scripts/check-plugin.sh
+      # ...and the leak scan inside it is itself pinned: a guard nobody has watched fire is not a
+      # guard. This reintroduces each leak into a throwaway copy of the shipped tree and asserts the
+      # scan reds on it — the first, case-sensitive version reported clean on a lower-case name and
+      # on the `linear.app/<slug>/` of a pasted ticket link, which is how both would have shipped.
+      - run: .github/scripts/check-plugin_test.sh
 
   test:
     if: >-
