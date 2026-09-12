@@ -1,0 +1,17 @@
+[  0.002] PID=24799 PGID=24799 argv=goose acp
+[  0.066] SESSION_ID=20260912_1
+SESSION_ID=20260912_1
+[  2.572] TOOL_CALL kind=None id=call_e566e91b224d47078bc730ab title='shell · cat NOTES.md; echo "---"; cat counter.txt; echo "---";...…'
+[  5.632] TOOL_CALL kind=None id=call_f460a14706a84c5a8e0e9935 title='shell · cat check.sh'
+[  7.318] TOOL_CALL kind=None id=call_be09b95e3511460cad063e53 title='write · counter.txt'
+[  8.790] TOOL_CALL kind=None id=call_8c5a2d7f760b4f40a7f6f2fd title='shell · ./check.sh'
+[  8.791] TOOL_CALL kind=None id=call_f3a566922b9947928636483d title='symphony: symphony state'
+[ 13.395] session/prompt -> {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn", "usage": {"totalTokens": 10448, "inputTokens": 10319, "outputTokens": 129}}}
+TOOL_CALLS=5
+    kind=None id=call_e566e91b224d47078bc730ab title='shell · cat NOTES.md; echo "---"; cat counter.txt; echo "---";...…'
+    kind=None id=call_f460a14706a84c5a8e0e9935 title='shell · cat check.sh'
+    kind=None id=call_be09b95e3511460cad063e53 title='write · counter.txt'
+    kind=None id=call_8c5a2d7f760b4f40a7f6f2fd title='shell · ./check.sh'
+    kind=None id=call_f3a566922b9947928636483d title='symphony: symphony state'
+[ 13.403] EXIT=0 STDERR_BYTES=0 TOTAL=13.403s
+EXIT=0 STDERR_BYTES=0

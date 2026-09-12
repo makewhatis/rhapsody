@@ -1,0 +1,21 @@
+[  0.002] PID=7517 PGID=7517 argv=goose acp
+[  0.052] SESSION_ID=20260912_2
+SESSION_ID=20260912_2
+[  3.105] TOOL_CALL kind=None id=call_9ee54d7bb1d44e4b8c5aa7a8 title='todo: todo write'
+[  3.105] TOOL_CALL kind=None id=call_f94197f4a53e4511bc8f0ac3 title='shell · cat NOTES.md; echo "---COUNTER---"; cat counter.txt'
+[  5.687] TOOL_CALL kind=None id=call_3c77c05e91914057b624acc5 title='write · /tmp/goosespike/sbB/counter.txt'
+[  5.687] TOOL_CALL kind=None id=call_a1e6b5c745ef4f7baf2ada93 title='shell · cat check.sh'
+[  6.876] TOOL_CALL kind=None id=call_9ec4636cd94c4939bc2a580b title='shell · ./check.sh'
+[  6.876] TOOL_CALL kind=None id=call_2c76d20325be48559de8266d title='symphony: symphony state'
+[  9.437] TOOL_CALL kind=None id=call_1da46d80819b409aac4e7ba8 title='todo: todo write'
+[ 10.960] session/prompt -> {"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn", "usage": {"totalTokens": 10446, "inputTokens": 10344, "outputTokens": 102}}}
+TOOL_CALLS=7
+    kind=None id=call_9ee54d7bb1d44e4b8c5aa7a8 title='todo: todo write'
+    kind=None id=call_f94197f4a53e4511bc8f0ac3 title='shell · cat NOTES.md; echo "---COUNTER---"; cat counter.txt'
+    kind=None id=call_3c77c05e91914057b624acc5 title='write · /tmp/goosespike/sbB/counter.txt'
+    kind=None id=call_a1e6b5c745ef4f7baf2ada93 title='shell · cat check.sh'
+    kind=None id=call_9ec4636cd94c4939bc2a580b title='shell · ./check.sh'
+    kind=None id=call_2c76d20325be48559de8266d title='symphony: symphony state'
+    kind=None id=call_1da46d80819b409aac4e7ba8 title='todo: todo write'
+[ 10.970] EXIT=0 STDERR_BYTES=0 TOTAL=10.970s
+EXIT=0 STDERR_BYTES=0
