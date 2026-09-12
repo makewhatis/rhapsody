@@ -28,6 +28,16 @@
 //! than left implicit — [`kill_tree`] re-walks up to [`SWEEP_ROUNDS`] times and only stops early on
 //! an empty round that FOLLOWS a kill round, so a single stale snapshot can never end the sweep.
 //! Whatever is still alive after the last round is logged, never panicked on.
+//!
+//! **Containment is not total, and the gap is inherent to the shape.** The sweep survives parents
+//! that die DURING it — membership is cumulative, so a child reparented to init mid-sweep stays in
+//! the tree — but a subtree already orphaned BEFORE the first walk is unreachable. If the model ran
+//! `something &` in a tool shell that then exited, the survivor's `ppid` is `1` by the time the stop
+//! arrives, no `ppid` walk can attribute it to this agent, and this module will not kill it. Closing
+//! that would take the spawn-side shape (a `kqueue`/`NOTE_EXIT` supervisor holding the tree open),
+//! which the pluggable-harnesses design's slice 6 is where it belongs. Until then: a stop contains
+//! everything the agent still has a parent chain to, which is every case STUDIO-869 measured, and
+//! not literally everything it ever started.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -56,8 +66,8 @@ struct Proc {
 
 /// SIGKILLs `pid`, its process group, and every descendant process it has — including the tool
 /// children that put themselves in a process group of their own, which a group kill alone misses.
-/// A pid of 0 is skipped, exactly as the group kill it replaces was: `kill(0, …)` would target the
-/// daemon's OWN group.
+/// A pid of 0 is skipped, exactly as the group kill it replaces was (`kill(0, …)` would target the
+/// daemon's OWN group), and so is a pid of 1.
 ///
 /// Best-effort by construction, like the Go `_ = syscall.Kill(…)` it descends from: every signal is
 /// unchecked, a process table that cannot be read degrades to the plain group kill (so STUDIO-840's
@@ -68,10 +78,16 @@ struct Proc {
 /// Synchronous, and it shells out to `ps`: callable from `Drop`, at the cost of blocking the calling
 /// thread for the sweep's duration.
 pub fn kill_tree(pid: u32) {
-    if pid == 0 {
+    let leader = pid as i32;
+    // A leader that is not itself a legal target roots no sweep at all. `0` is the disarmed guard
+    // (and `kill(0, …)` would signal the daemon's OWN group); `1` is init, whose descendants are
+    // every process on the machine, so even the per-pid half of a sweep rooted there is the blast
+    // radius [`signalable`] exists to refuse. Unlike the same check inside [`round_targets`] this
+    // one cannot be exercised red — a test that removed it would take the runner with it — so it is
+    // the second line of defence, and [`round_targets`] is the one the suite pins.
+    if !signalable(-leader) {
         return;
     }
-    let leader = pid as i32;
     // Every pid the sweep has ever seen in this tree, and the reason the walk still works after the
     // leader dies: a SIGKILLed leader's children are reparented to init at once, so a walk rooted at
     // `leader` alone would find nothing from round 1 on. Membership is by descent from anything
@@ -91,12 +107,9 @@ pub fn kill_tree(pid: u32) {
         if round == SWEEP_ROUNDS {
             break;
         }
-        for target in targets(&alive, leader, &known) {
+        for target in round_targets(&alive, leader, &known) {
             signal(target);
         }
-        // Unconditional, every round: STUDIO-840's group kill lands even when the process table
-        // could not be read and `targets` was therefore empty.
-        kill_group(leader);
         std::thread::sleep(SWEEP_PAUSE);
     }
     if !alive.is_empty() {
@@ -109,28 +122,19 @@ pub fn kill_tree(pid: u32) {
     }
 }
 
-/// SIGKILLs the process group led by `pid` (Go `syscall.Kill(-pid, SIGKILL)`).
-fn kill_group(pid: i32) {
-    signal(-pid);
-}
-
 /// Whether a SIGKILL may be aimed at `target` (negative = a process group). The chokepoint for the
 /// three arguments `kill(2)` reads as "something other than one process tree":
 /// `0` is the CALLER's own process group (the daemon and everything it leads), `1` is init, and
 /// `-1` is every process the user can signal at all. A leader pid of 1 is the whole distance
 /// between this module and that last one, and [`kill_tree`] is a public entry point a future
-/// harness adapter can hand a parsed or recycled id.
+/// harness adapter can hand a parsed or recycled id. Every signal the sweep delivers passes through
+/// here, because [`round_targets`] is the only thing [`kill_tree`] signals.
 fn signalable(target: i32) -> bool {
     target.abs() > 1
 }
 
 /// Delivers one unchecked SIGKILL. A negative `target` means the process group led by `-target`.
-/// Refuses the arguments [`signalable`] names — silently, because there is no caller that could act
-/// on being told, and the refusal is a guard rather than an expected outcome.
 fn signal(target: i32) {
-    if !signalable(target) {
-        return;
-    }
     // SAFETY: `kill(2)` is safe to call with any pid; SIGKILL cannot be caught, and the return is
     // deliberately ignored (an ESRCH just means the process died on its own first).
     unsafe {
@@ -160,27 +164,38 @@ fn live_tree(table: &[Proc], known: &mut BTreeSet<i32>) -> Vec<Proc> {
         .collect()
 }
 
-/// Picks one signal target per live process in the tree, de-duplicated: the whole process GROUP when
-/// the group's leader is itself part of the tree (the escaped tool shell's case — killing the group
-/// catches the children it forked since the snapshot too), and the bare pid otherwise (a process the
-/// harness put in some pre-existing group is not a licence to signal that group's other members).
+/// EVERY `kill(2)` argument one sweep round delivers — the whole decision, as a pure function, so
+/// that what the sweep may and may not signal is a property a test can assert rather than something
+/// spread across [`kill_tree`]'s loop body.
 ///
-/// The leader's own group is never returned — [`kill_tree`] kills it unconditionally — and neither
-/// is anything that would signal this process or the daemon's own group.
-fn targets(alive: &[Proc], leader: i32, known: &BTreeSet<i32>) -> BTreeSet<i32> {
+/// `-leader` is a member unconditionally, whatever the process table said: STUDIO-840's group kill
+/// has to land even on a machine where `ps` could not be read and `alive` is therefore empty. Each
+/// live process in the tree then contributes one more target, de-duplicated — the whole process
+/// GROUP when the group's leader is itself part of the tree (the escaped tool shell's case; killing
+/// the group catches the children it forked since the snapshot too), and the bare pid otherwise (a
+/// process the harness parked in some pre-existing group is not a licence to signal that group's
+/// other members).
+///
+/// The whole set, `-leader` included, then passes [`signalable`] and the two self-checks: nothing
+/// that would signal init, every process on the machine, this process, or the daemon's own group
+/// ever reaches [`signal`].
+fn round_targets(alive: &[Proc], leader: i32, known: &BTreeSet<i32>) -> BTreeSet<i32> {
     let me = std::process::id() as i32;
     // SAFETY: `getpgrp(2)` takes no arguments, touches no memory and cannot fail.
     let my_pgid = unsafe { libc::getpgrp() };
-    alive
-        .iter()
-        .filter(|p| p.pid != leader && p.pgid != leader)
-        .map(|p| {
-            if p.pgid > 1 && known.contains(&p.pgid) {
-                -p.pgid
-            } else {
-                p.pid
-            }
-        })
+    std::iter::once(-leader)
+        .chain(
+            alive
+                .iter()
+                .filter(|p| p.pid != leader && p.pgid != leader)
+                .map(|p| {
+                    if p.pgid > 1 && known.contains(&p.pgid) {
+                        -p.pgid
+                    } else {
+                        p.pid
+                    }
+                }),
+        )
         .filter(|t| {
             let subject = t.abs();
             signalable(*t) && subject != me && subject != my_pgid
@@ -262,6 +277,12 @@ impl Drop for KillTreeOnDrop {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    /// SIGKILLs the process group led by `pgid` — the fixtures' own cleanup. Not a production path:
+    /// [`kill_tree`] signals only what [`round_targets`] returns.
+    fn kill_group(pgid: i32) {
+        signal(-pgid);
+    }
 
     /// The `ps` rows for processes in the group led by `pgid` that are still ALIVE — zombies
     /// excluded, for the reason [`Proc::live`] gives. Each row is kept whole so a failure names
@@ -428,30 +449,35 @@ mod tests {
         );
     }
 
-    /// The one argument this module must never construct. `kill(-1, SIGKILL)` signals EVERY process
-    /// the user can signal — the daemon, the operator's shell, this test binary — and the whole
-    /// distance between the sweep and that call is a leader pid of 1: `kill_tree(1)` would reach
-    /// `kill_group(1)`, and `signal(-1)` is what that is. A pid of 1 is not reachable from
-    /// `Child::id()`, but `kill_tree` is a public entry point a future harness adapter can hand a
-    /// parsed or recycled id, and the blast radius of being wrong once is the whole machine.
+    /// The one signal this module must never deliver. `kill(-1, SIGKILL)` hits EVERY process the
+    /// user can signal — the daemon, the operator's shell, this test binary — and the whole distance
+    /// between the sweep and that call is a leader pid of 1, because every round signals the leader's
+    /// group. A pid of 1 is not reachable from `Child::id()`, but [`kill_tree`] is a public entry
+    /// point a future harness adapter can hand a parsed or recycled id, and the blast radius of being
+    /// wrong once is the whole machine.
     ///
-    /// Asserted on the predicate rather than by calling `kill_tree(1)`, because the red half of that
-    /// experiment cannot be run: an unguarded run would take the test runner, the daemon and the
-    /// operator's session down with it.
+    /// `kill_tree(1)` cannot be called here — the red half of that experiment takes the test runner,
+    /// the daemon and the operator's session with it — which is exactly why the round's ENTIRE
+    /// target set is a pure function: the requirement ("a sweep rooted at pid 1 delivers no signal
+    /// at all") is assertable without delivering one. Asserting `!signalable(-1)` instead would only
+    /// restate the implementation, and would stay green if the guard were deleted from the one place
+    /// that consults it.
     #[test]
-    fn nothing_may_ever_be_signalled_at_pid_one_or_the_callers_own_group() {
+    fn a_sweep_rooted_at_pid_one_signals_nothing_at_all() {
         assert!(
-            !signalable(-1),
-            "kill(-1, …) signals every process the user owns"
+            round_targets(&[], 1, &BTreeSet::from([1])).is_empty(),
+            "a leader of 1 makes the round's unconditional group kill kill(-1, …)"
         );
-        assert!(!signalable(1), "pid 1 is init");
-        assert!(
-            !signalable(0),
-            "kill(0, …) signals the caller's OWN process group"
-        );
-        assert!(
-            signalable(-424242) && signalable(424242),
-            "an ordinary pid/group is signalable"
+    }
+
+    /// STUDIO-840's half of the guarantee, pinned where it now lives: a process table that could not
+    /// be read yields no rows at all, and the round must still deliver the leader's group kill.
+    #[test]
+    fn round_targets_kill_the_leaders_group_even_with_an_unreadable_process_table() {
+        assert_eq!(
+            round_targets(&[], 424242, &BTreeSet::from([424242])),
+            BTreeSet::from([-424242]),
+            "the group kill must not depend on `ps` having been readable"
         );
     }
 
@@ -467,7 +493,7 @@ mod tests {
     /// The sweep must never aim at the process doing the sweeping or at its group, however the
     /// process table reads — a self-signal would kill the daemon on any operator Stop.
     #[test]
-    fn targets_never_include_this_process_or_its_group() {
+    fn round_targets_never_include_this_process_or_its_group() {
         let me = std::process::id() as i32;
         // SAFETY: `getpgrp(2)` takes no arguments and cannot fail.
         let my_pgid = unsafe { libc::getpgrp() };
@@ -487,8 +513,9 @@ mod tests {
             },
         ];
         let known = BTreeSet::from([leader, me, my_pgid, 1]);
-        assert!(
-            targets(&alive, leader, &known).is_empty(),
+        assert_eq!(
+            round_targets(&alive, leader, &known),
+            BTreeSet::from([-leader]),
             "the sweep aimed at its own process or group"
         );
     }
@@ -497,7 +524,7 @@ mod tests {
     /// between the snapshot and the signal die with it), while one parked in a group nobody in the
     /// tree leads is signalled as a bare pid (its group's other members are not ours to kill).
     #[test]
-    fn targets_prefer_the_group_only_when_the_tree_leads_it() {
+    fn round_targets_prefer_the_group_only_when_the_tree_leads_it() {
         let leader = 424242;
         let alive = vec![
             // The escaped tool shell: leads its own group.
@@ -531,9 +558,9 @@ mod tests {
         ];
         let known = BTreeSet::from([leader, 500, 501, 600, 700]);
         assert_eq!(
-            targets(&alive, leader, &known),
-            BTreeSet::from([-500, 600]),
-            "want the escaped group signalled once and the parked process signalled alone"
+            round_targets(&alive, leader, &known),
+            BTreeSet::from([-leader, -500, 600]),
+            "want the leader's group, the escaped group signalled once, and the parked process alone"
         );
     }
 
