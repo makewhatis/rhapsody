@@ -360,9 +360,9 @@ mod tests {
         )))
     }
 
-    /// The repository's six checks, all green — what a mergeable pull request looks like here.
-    /// The five `ci.yml` jobs plus `pr-title`; see `a_superseded_check_run_does_not_block_its_
-    /// green_sibling` for the shape a real head takes when one of them was superseded.
+    /// The repository's six checks, all green — what a mergeable pull request looks like here:
+    /// the five `ci.yml` jobs plus `pr-title`. A real head carries more ENTRIES than names when a
+    /// run was superseded; `a_superseded_check_run_does_not_block_its_green_sibling` has that shape.
     fn all_green() -> Arc<FakeChecks> {
         checks(&[
             ("lint", "SUCCESS"),
