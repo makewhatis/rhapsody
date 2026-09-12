@@ -769,29 +769,28 @@ where
                 .unwrap_or_default(),
             None,
         ));
-        // The auto-merge's `gh` seams (STUDIO-874), wired only when the operator asked for it.
-        // `review_auto_merge()` already requires Teams AND `review.mode: ticketless`, so a
-        // Teams-off daemon builds nothing here and the sink's merge path is inert — the D5
-        // invariant, kept at the composition root as well as in the gate.
-        let automerge = teams_cfg.review_auto_merge().then(|| {
-            Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeDeps {
-                prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
-                mergestate: Arc::clone(&gh)
-                    as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
-                policy: Arc::clone(&gh)
-                    as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdateSource>,
-                updater: Arc::clone(&gh)
-                    as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdater>,
-                checks: Arc::clone(&gh)
-                    as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
-                merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
-                allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
-            })
+        // The auto-merge's `gh` seams (STUDIO-874), wired UNCONDITIONALLY — like the findings
+        // route-back's `tickets` sink above, and for the same reason. The feature's gate is the
+        // config (`teams.review.auto_merge`, false by default) and it lives on the control task,
+        // where the plan is made: an installation that has not asked for it sends no plan, so this
+        // sink is never called and the D5 invariant holds without a second gate here.
+        //
+        // Gating the CONSTRUCTION on the config instead would break under a hot reload that turns
+        // the key on: `propose_auto_merge` reads the live config and would start handing out plans
+        // that a sink built at boot could not perform, warning once per tick forever.
+        let automerge = Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeDeps {
+            prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
+            mergestate: Arc::clone(&gh)
+                as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
+            policy: Arc::clone(&gh)
+                as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdateSource>,
+            updater: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdater>,
+            checks: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
+            merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
+            allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
         });
-        let mut sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone());
-        if let Some(deps) = automerge {
-            sink = sink.with_auto_merge(deps);
-        }
+        let sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone())
+            .with_auto_merge(automerge);
         let deps = rhapsody_orchestrator::reviewwatch::ReviewWatchDeps {
             pr_source: Some(
                 Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
