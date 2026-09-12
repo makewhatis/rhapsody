@@ -621,6 +621,11 @@ async fn file_tracker_e2e_stop_leaves_no_agent_process() {
 /// So the stub is told to escape its group (`FAKE_CLAUDE_ESCAPE`), reports the group it escaped INTO,
 /// and this asks the OS about that group — the assertion is process state, not the stop's return
 /// value. Reverting `kill_tree` to the bare group kill reds it with the survivors named.
+///
+/// STUDIO-860's flake shape does not reach here: the running entry comes from a real `on_tick`
+/// dispatch, which stamps `started_at` from `(o.now)()` itself, so `reconcile_stalled` measures this
+/// run against its own clock and has no reason to retire it mid-test — the hazard is only there for
+/// a hand-made `RunningEntry::empty`, whose zeroed `started_at` reads as a run that began in 1970.
 #[tokio::test(flavor = "multi_thread")]
 async fn file_tracker_e2e_stop_leaves_no_tool_child_that_escaped_the_group() {
     let dir = TempDir::new();
@@ -664,10 +669,14 @@ async fn file_tracker_e2e_stop_leaves_no_tool_child_that_escaped_the_group() {
         (re.pgid, re.run_id)
     };
     let escaped = read_escaped_pgid(&escaped_report, Duration::from_secs(10)).await;
-    // Reaped whatever the assertions below do, INCLUDING on a panic: this process is in a group of
-    // its own precisely so the group kill misses it, so a red run would otherwise leave a `sleep`
-    // on the machine for good.
+    // Armed BEFORE the first assertion, and on whatever was reported: this process is in a group of
+    // its own precisely so the group kill misses it, so a red run would otherwise leave a `sleep` on
+    // the machine for good. (`0` — never reported — reaps nothing, which is the honest outcome.)
     let _reaper = GroupReaper(escaped);
+    assert!(
+        escaped > 1,
+        "the stub never reported an escaped process group at {escaped_report}"
+    );
     assert_ne!(
         escaped, pgid,
         "the stub did not escape the agent's group, so this cannot prove containment"
@@ -700,8 +709,9 @@ async fn file_tracker_e2e_stop_leaves_no_tool_child_that_escaped_the_group() {
     teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
 }
 
-/// Polls until the stub has written the process group it escaped into, panicking if it never does
-/// (a silently missing report would make every assertion below it vacuous).
+/// Polls until the stub has written the process group it escaped into, returning `0` if it never
+/// does. Returns rather than panics so the caller can arm its reaper on whatever came back before
+/// asserting — a report that arrives a moment after the timeout still names a real `sleep 3600`.
 async fn read_escaped_pgid(path: &str, timeout: Duration) -> i32 {
     let deadline = Instant::now() + timeout;
     loop {
@@ -711,10 +721,9 @@ async fn read_escaped_pgid(path: &str, timeout: Duration) -> i32 {
         {
             return v;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the stub never reported an escaped process group at {path}"
-        );
+        if Instant::now() >= deadline {
+            return 0;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

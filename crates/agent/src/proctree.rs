@@ -114,11 +114,25 @@ fn kill_group(pid: i32) {
     signal(-pid);
 }
 
+/// Whether a SIGKILL may be aimed at `target` (negative = a process group). The chokepoint for the
+/// three arguments `kill(2)` reads as "something other than one process tree":
+/// `0` is the CALLER's own process group (the daemon and everything it leads), `1` is init, and
+/// `-1` is every process the user can signal at all. A leader pid of 1 is the whole distance
+/// between this module and that last one, and [`kill_tree`] is a public entry point a future
+/// harness adapter can hand a parsed or recycled id.
+fn signalable(target: i32) -> bool {
+    target.abs() > 1
+}
+
 /// Delivers one unchecked SIGKILL. A negative `target` means the process group led by `-target`.
+/// Refuses the arguments [`signalable`] names — silently, because there is no caller that could act
+/// on being told, and the refusal is a guard rather than an expected outcome.
 fn signal(target: i32) {
+    if !signalable(target) {
+        return;
+    }
     // SAFETY: `kill(2)` is safe to call with any pid; SIGKILL cannot be caught, and the return is
-    // deliberately ignored (an ESRCH just means the process died on its own first). Callers filter
-    // 0, ±1 and this process's own group out before reaching here.
+    // deliberately ignored (an ESRCH just means the process died on its own first).
     unsafe {
         libc::kill(target, libc::SIGKILL);
     }
@@ -169,7 +183,7 @@ fn targets(alive: &[Proc], leader: i32, known: &BTreeSet<i32>) -> BTreeSet<i32> 
         })
         .filter(|t| {
             let subject = t.abs();
-            subject > 1 && subject != me && *t != -my_pgid && subject != my_pgid
+            signalable(*t) && subject != me && subject != my_pgid
         })
         .collect()
 }
@@ -411,6 +425,33 @@ mod tests {
             wait_group_quiet(leader, Duration::from_secs(10)),
             "the agent leader survived its own kill: group {leader} still runs {:?}",
             live_rows_in_group(leader)
+        );
+    }
+
+    /// The one argument this module must never construct. `kill(-1, SIGKILL)` signals EVERY process
+    /// the user can signal — the daemon, the operator's shell, this test binary — and the whole
+    /// distance between the sweep and that call is a leader pid of 1: `kill_tree(1)` would reach
+    /// `kill_group(1)`, and `signal(-1)` is what that is. A pid of 1 is not reachable from
+    /// `Child::id()`, but `kill_tree` is a public entry point a future harness adapter can hand a
+    /// parsed or recycled id, and the blast radius of being wrong once is the whole machine.
+    ///
+    /// Asserted on the predicate rather than by calling `kill_tree(1)`, because the red half of that
+    /// experiment cannot be run: an unguarded run would take the test runner, the daemon and the
+    /// operator's session down with it.
+    #[test]
+    fn nothing_may_ever_be_signalled_at_pid_one_or_the_callers_own_group() {
+        assert!(
+            !signalable(-1),
+            "kill(-1, …) signals every process the user owns"
+        );
+        assert!(!signalable(1), "pid 1 is init");
+        assert!(
+            !signalable(0),
+            "kill(0, …) signals the caller's OWN process group"
+        );
+        assert!(
+            signalable(-424242) && signalable(424242),
+            "an ordinary pid/group is signalable"
         );
     }
 

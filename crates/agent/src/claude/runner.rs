@@ -428,7 +428,7 @@ impl Session for ClaudeSession {
         // disarm it only once the child is reaped (STUDIO-840; STUDIO-871 widened the guard from the
         // group to the whole descendant tree, since every harness puts its tool children in a group
         // of their own).
-        let mut group_kill = KillTreeOnDrop::new(pid);
+        let mut tree_kill = KillTreeOnDrop::new(pid);
 
         // The FIRST stdin line is the prompt as one stream-json user message (INF-250). A write
         // failure (child never drained stdin / exited early) is not fatal — the scan loop still runs.
@@ -465,8 +465,9 @@ impl Session for ClaudeSession {
 
         'outer: loop {
             tokio::select! {
-                // Turn deadline: kill the whole process group so a hung child (and its children)
-                // dies and the pipes EOF. A captured result still wins post-loop.
+                // Turn deadline: kill the whole process TREE so a hung child (and every command it
+                // launched, wherever it put them) dies and the pipes EOF. A captured result still
+                // wins post-loop.
                 _ = &mut deadline => {
                     kill_tree(pid);
                     timed_out = true;
@@ -623,7 +624,7 @@ impl Session for ClaudeSession {
         };
         tokio::join!(drain_out, drain_err);
         let wait_res = child.wait().await;
-        group_kill.disarm(); // reaped — nothing left to signal, and the pid may now be recycled
+        tree_kill.disarm(); // reaped — nothing left to signal, and the pid may now be recycled
 
         // Billing abort (a system/init reported a non-"none" apiKeySource): refuse to bill.
         if billing_failed {
