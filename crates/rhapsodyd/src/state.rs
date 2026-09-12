@@ -32,8 +32,8 @@ use rhapsody_orchestrator::{
     RefreshResult, ReloadError, ResumeResult, RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventQuery, EventRow, RunFilter, RunMessage, RunSummary, Store,
-    StoreError,
+    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ReviewWatchRow, RunFilter, RunMessage,
+    RunSummary, Store, StoreError,
 };
 
 /// Narrows the orchestrator's full [`Store`] handle to the httpapi read-only [`HistoryStore`]. The
@@ -75,6 +75,9 @@ impl HistoryStore for HistoryView {
     }
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError> {
         self.0.list_run_messages(run_id)
+    }
+    fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+        self.0.load_review_watch()
     }
 }
 

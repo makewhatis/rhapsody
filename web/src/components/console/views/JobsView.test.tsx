@@ -1521,3 +1521,79 @@ describe("a Jobs list left open (STUDIO-791)", () => {
     expect(stat("needs you")).toBe("1");
   });
 });
+
+// STUDIO-834 — "These PR job titles really need the ticket id in them. I have no idea what ticket /
+// job is being reviewed." (David, twice: 2026-09-10 and 2026-09-11.) Four review rows on screen,
+// none naming the work; every other row on the page is a ticket key.
+//
+// The rows below are the shape `/api/v1/history/issues` served on the operator's install when this
+// landed — and ALL THREE resolvable ones are `adopt:` origins (STUDIO-838), which is why a fix that
+// only understood `handoff:` would have shipped naming nothing.
+describe("a review row says which ticket it is reviewing", () => {
+  async function mountReviews() {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    serveStore([
+      run({
+        issue_identifier: "pr:makewhatis/tally#230@jimmy",
+        title: "Review makewhatis/tally#230 at 8805d12",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-654",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/strava#10@alice",
+        title: "Review makewhatis/strava#10 at ad81573",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-864",
+      }),
+      // No origin the daemon could resolve — an operator introduced this pull request through the
+      // console, which names a person and not a ticket.
+      run({
+        issue_identifier: "pr:makewhatis/rhapsody#147@alice",
+        title: "Review makewhatis/rhapsody#147 at fe579f4",
+        outcome: "completed",
+        review_run: true,
+      }),
+      run({ issue_identifier: "STUDIO-712", outcome: "completed", lifecycle: "in_review" }),
+    ]);
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+  }
+
+  it("leads with the ticket, and keeps the pull request as the detail beside it", async () => {
+    await mountReviews();
+    expect(rowKeys()).toContain("STUDIO-654");
+    expect(rowKeys()).toContain("STUDIO-864");
+    const row = [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.querySelector(".ti")?.textContent?.startsWith("STUDIO-654"),
+    )!;
+    expect(row.querySelector(".ti")?.textContent).toBe(
+      "STUDIO-654 · Review makewhatis/tally#230 at 8805d12",
+    );
+  });
+
+  it("leaves a row with no resolvable origin reading exactly as it did", async () => {
+    await mountReviews();
+    expect(rowKeys()).toContain("pr:makewhatis/rhapsody#147@alice");
+  });
+
+  // The label is not the route. Opening the row still opens the review RUN it shows — the ticket it
+  // names is somebody else's job, and sending the operator there would be a different screen.
+  it("still opens the review run, not the ticket it names", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    serveStore([
+      run({
+        issue_identifier: "pr:makewhatis/tally#230@jimmy",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-654",
+      }),
+    ]);
+    const onOpen = mount();
+    await waitFor(() => expect(rowKeys()).toEqual(["STUDIO-654"]));
+
+    fireEvent.click(document.querySelector(".jtbl tbody tr")!);
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("pr:makewhatis/tally#230@jimmy");
+  });
+});

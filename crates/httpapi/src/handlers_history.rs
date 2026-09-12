@@ -126,6 +126,10 @@ pub(crate) async fn handle_issue_runs(
             run_id: r.id,
         })
         .collect();
+    // The fourth decoration, and the one that asks no tracker at all: WHICH TICKET each `pr:` row
+    // is reviewing (STUDIO-834). It is the store's own answer, so it is resolved before the three
+    // awaits rather than joined with them.
+    let review_origins = review_origins(provider.history().as_ref(), &runs);
     let (lifecycles, assignees, reviews) = tokio::join!(
         provider.issue_lifecycles(&ids),
         provider.issue_assignees(&keys),
@@ -139,8 +143,67 @@ pub(crate) async fn handle_issue_runs(
             &lifecycles,
             &assignees,
             &reviews,
+            &review_origins,
         ),
     )
+}
+
+/// Review-run key (`pr:owner/repo#n@reviewer`) → the ticket that review is OF, for every row of
+/// `runs` the watch set can answer for (STUDIO-834).
+///
+/// THE LINK LIVES ONLY ON THE WATCH ROW. A `pr:` key carries the repository, the number and the
+/// reviewer and no ticket whatever, so nothing here parses one out of it; `introduced_by` is the
+/// record of how the pull request entered the watch set, and
+/// [`rhapsody_orchestrator::reviewdone::origin_ticket`] is the one reader of its spellings —
+/// called, never re-derived, so `handoff:` and `adopt:` resolve here exactly as they resolve for
+/// the two orchestrator paths that move a ticket by them.
+///
+/// ONE STORE READ FOR THE PAGE, AND NONE FOR A PAGE WITH NO REVIEW ROW. The watch set is read whole
+/// and matched in memory rather than probed per row: a per-row lookup is what STUDIO-836 cost on
+/// the lifecycle path, and this listing is polled every two seconds.
+///
+/// What comes BACK is bounded by the page rather than by the table, which is a different bound and
+/// the one that keeps: nothing prunes `rhapsody_review_watch` (a retirement is a soft delete), so
+/// it accumulates one row per (pull request, reviewer) the daemon has ever watched for the life of
+/// the install, while a page holds at most a few dozen. Keying every row instead would grow this
+/// map forever at poll rate for rows no page can ever show.
+///
+/// Best-effort, exactly like the three decorations beside it: a store error yields an empty map and
+/// every row renders as it did before the field existed. The key is compared BYTE-wise because both
+/// sides are minted by `review::review_key` from the same stored coordinate (`reviewwatch`'s
+/// dispatch derives the run's key from the row this join reads back), so no case folding is in
+/// play — unlike `Store::find_review_watch`, whose caller is handed a coordinate a person typed.
+fn review_origins(
+    history: &dyn crate::HistoryStore,
+    runs: &[rhapsody_store::RunSummary],
+) -> HashMap<String, String> {
+    let wanted: HashSet<&str> = runs
+        .iter()
+        .map(|r| r.issue_id.as_str())
+        .filter(|id| review::is_review_key(id))
+        .collect();
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(rows) = history.load_review_watch() else {
+        tracing::warn!("issue listing: reading the review watch set failed");
+        return HashMap::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let key = review::review_key(
+                &row.key.owner,
+                &row.key.repo,
+                row.key.number,
+                &row.key.reviewer,
+            );
+            if !wanted.contains(key.as_str()) {
+                return None;
+            }
+            let ticket = rhapsody_orchestrator::reviewdone::origin_ticket(&row.introduced_by)?;
+            Some((key, ticket.to_string()))
+        })
+        .collect()
 }
 
 /// `GET /api/v1/history/issues/counts`: how many ISSUES in the whole store carry each distinct
@@ -681,15 +744,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use super::{SUMMARY_RHYTHM_RUNS, local_day_start};
+    use super::{SUMMARY_RHYTHM_RUNS, local_day_start, review_origins};
     use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
     use rhapsody_agent::LogEntry;
     use rhapsody_orchestrator::{
         EventRecord, IssueKey, IssueLifecycle, IssueLifecycleRow, Snapshot, TokenCounts, Totals,
     };
     use rhapsody_store::{
-        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, RunEnd, RunProgress, RunStart, Sqlite,
-        Store, StorePath,
+        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, ReviewWatchKey, ReviewWatchRow, RunEnd,
+        RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError, StorePath,
     };
     use serde_json::{Value, json};
 
@@ -866,6 +929,95 @@ mod tests {
         let status = resp.status();
         let body: Value = serde_json::from_str(&resp.text().await.expect("body")).expect("json");
         (status, body)
+    }
+
+    /// The issue listing's rows keyed by `issue_identifier`, so a test asserts on a named row
+    /// rather than on the page's order.
+    fn by_identifier(body: &Value) -> std::collections::HashMap<&str, &Value> {
+        body["issues"]
+            .as_array()
+            .expect("issues array")
+            .iter()
+            .map(|r| (r["issue_identifier"].as_str().unwrap_or_default(), r))
+            .collect()
+    }
+
+    /// A [`crate::HistoryStore`] that forwards every read to a real store and counts the ones a
+    /// test is making a claim about. It exists for STUDIO-834's "one read per page, not one per
+    /// row" acceptance, which no assertion on the response body can express.
+    struct CountingHistory {
+        inner: Sqlite,
+        watch_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingHistory {
+        fn new(inner: Sqlite) -> Self {
+            Self {
+                inner,
+                watch_reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn watch_reads(&self) -> usize {
+            self.watch_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::HistoryStore for CountingHistory {
+        fn list_runs(&self, f: rhapsody_store::RunFilter) -> Result<Vec<RunSummary>, StoreError> {
+            Store::list_runs(&self.inner, f)
+        }
+        fn list_issue_runs(
+            &self,
+            f: rhapsody_store::RunFilter,
+        ) -> Result<Vec<RunSummary>, StoreError> {
+            Store::list_issue_runs(&self.inner, f)
+        }
+        fn day_totals(
+            &self,
+            since: &str,
+            now: &str,
+        ) -> Result<rhapsody_store::DayTotals, StoreError> {
+            Store::day_totals(&self.inner, since, now)
+        }
+        fn issue_history(
+            &self,
+            identifier: &str,
+            project: &str,
+            limit: i64,
+        ) -> Result<Vec<RunSummary>, StoreError> {
+            Store::issue_history(&self.inner, identifier, project, limit)
+        }
+        fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
+            Store::get_run(&self.inner, run_id)
+        }
+        fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError> {
+            Store::run_events(&self.inner, run_id)
+        }
+        fn search_events(
+            &self,
+            q: rhapsody_store::EventQuery,
+        ) -> Result<Vec<rhapsody_store::EventHit>, StoreError> {
+            Store::search_events(&self.inner, q)
+        }
+        fn metrics(
+            &self,
+            since_days: i64,
+            project: &str,
+        ) -> Result<Vec<rhapsody_store::DayRollup>, StoreError> {
+            Store::metrics(&self.inner, since_days, project)
+        }
+        fn list_run_messages(
+            &self,
+            run_id: i64,
+        ) -> Result<Vec<rhapsody_store::RunMessage>, StoreError> {
+            Store::list_run_messages(&self.inner, run_id)
+        }
+        fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+            self.watch_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Store::load_review_watch(&self.inner)
+        }
     }
 
     async fn post_status(url: &str) -> reqwest::StatusCode {
@@ -1305,6 +1457,166 @@ mod tests {
             by_ident[review_key],
         );
         assert_eq!(by_ident["MT-2"]["lifecycle"], "done");
+    }
+
+    // ---- STUDIO-834: which ticket a review row is reviewing ----
+
+    /// Seed one watch row for `owner/repo#number@reviewer` with `introduced_by` as its origin.
+    /// The key columns are spelled exactly as `review::review_key` spells them into a run's issue
+    /// id, because that byte equality is what the listing's join rests on.
+    fn seed_watch(store: &Sqlite, number: i64, reviewer: &str, introduced_by: &str) {
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number,
+                    reviewer: reviewer.into(),
+                },
+                introduced_by: introduced_by.into(),
+                open: true,
+                ..ReviewWatchRow::default()
+            })
+            .expect("save review watch");
+    }
+
+    // STUDIO-834 — a review row says which TICKET it is reviewing. The link lives only on the watch
+    // row's `introduced_by`; the `pr:` key carries the repo, the number and the reviewer and no
+    // ticket at all, so nothing here may parse it out of the key.
+    //
+    // BOTH ticket-bearing origins, and the `adopt:` one is not the afterthought: every review row
+    // on the operator's own install when this landed was an adoption (STUDIO-838), so a listing
+    // that only understood `handoff:` would have shipped naming nothing. The spellings are not
+    // re-derived either — `reviewdone::origin_ticket` is the one parser, shared with the two
+    // orchestrator paths that already move a ticket by it.
+    #[tokio::test]
+    async fn issue_runs_name_the_ticket_a_review_run_is_reviewing() {
+        let store = mem_store();
+        let handoff = "pr:makewhatis/rhapsody#147@alice";
+        let adopt = "pr:makewhatis/rhapsody#145@jimmy";
+        seed_run_for(handoff, handoff, "2026-08-01T00:00:00Z", &store);
+        seed_run_for(adopt, adopt, "2026-08-01T00:01:00Z", &store);
+        seed_watch(&store, 147, "alice", "handoff:STUDIO-839");
+        seed_watch(&store, 145, "jimmy", "adopt:STUDIO-838");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let rows = by_identifier(&body);
+        assert_eq!(rows[handoff]["review_of"], "STUDIO-839");
+        assert_eq!(rows[adopt]["review_of"], "STUDIO-838");
+    }
+
+    // STUDIO-834 decision 2 — a review row whose origin names no ticket carries NO field, and the
+    // console then renders it exactly as it did before the field existed (the `pr:` key it already
+    // shows). Two ways to get there, and both are real: a `console:` origin names an OPERATOR, not
+    // a ticket, and a run whose watch row never existed (or was written by a build that recorded no
+    // origin) has nothing to join against at all.
+    #[tokio::test]
+    async fn a_review_run_with_no_ticket_bearing_origin_carries_no_field() {
+        let store = mem_store();
+        let console = "pr:makewhatis/rhapsody#12@alice";
+        let unwatched = "pr:makewhatis/rhapsody#13@alice";
+        seed_run_for(console, console, "2026-08-01T00:00:00Z", &store);
+        seed_run_for(unwatched, unwatched, "2026-08-01T00:01:00Z", &store);
+        seed_watch(&store, 12, "alice", "console:david");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let rows = by_identifier(&body);
+        for key in [console, unwatched] {
+            assert_eq!(rows[key]["review_run"], true);
+            assert!(
+                rows[key].get("review_of").is_none(),
+                "no ticket in the origin => no field, never an empty string: {}",
+                rows[key],
+            );
+        }
+    }
+
+    // STUDIO-834 — the join reads the WHOLE watch set, dropped rows included. A review's row is
+    // retired the moment its pull request merges (`drop_review_watch`, a SOFT delete), and the run
+    // it produced stays in the history listing forever — so a join that only saw live rows would
+    // name the ticket for exactly as long as nobody had finished the work.
+    #[tokio::test]
+    async fn a_retired_watch_row_still_names_the_ticket_its_review_read() {
+        let store = mem_store();
+        let key = "pr:makewhatis/rhapsody#145@jimmy";
+        seed_run_for(key, key, "2026-08-01T00:00:00Z", &store);
+        seed_watch(&store, 145, "jimmy", "adopt:STUDIO-838");
+        store
+            .drop_review_watch(&ReviewWatchKey {
+                owner: "makewhatis".into(),
+                repo: "rhapsody".into(),
+                number: 145,
+                reviewer: "jimmy".into(),
+            })
+            .expect("drop review watch");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        assert_eq!(by_identifier(&body)[key]["review_of"], "STUDIO-838");
+    }
+
+    // STUDIO-834 — what the join MATERIALIZES is bounded by the page, not by the table. Nothing
+    // prunes `rhapsody_review_watch`: a retirement is a soft delete, so the table accumulates one
+    // row per (pull request, reviewer) for the life of the install, while a page holds a few dozen.
+    // Keying every row would grow the map forever at poll rate for rows no page can ever show.
+    #[test]
+    fn the_review_origin_map_holds_only_the_keys_the_page_asked_about() {
+        let store = mem_store();
+        let on_page = "pr:makewhatis/rhapsody#147@alice";
+        seed_watch(&store, 147, "alice", "handoff:STUDIO-839");
+        seed_watch(&store, 145, "jimmy", "adopt:STUDIO-838");
+        seed_watch(&store, 12, "bob", "handoff:STUDIO-1");
+        let page = vec![RunSummary {
+            issue_id: on_page.into(),
+            issue_identifier: on_page.into(),
+            ..RunSummary::default()
+        }];
+
+        let got = review_origins(&store as &dyn crate::HistoryStore, &page);
+        assert_eq!(
+            got,
+            HashMap::from([(on_page.to_string(), "STUDIO-839".to_string())]),
+            "two watch rows no row on the page names must not be carried",
+        );
+    }
+
+    // STUDIO-834 acceptance — no new PER-ROW round trip. The whole watch set is read ONCE for a
+    // page however many review rows it holds, and not at all for a page that holds none. A naive
+    // per-row lookup is what STUDIO-836 cost, which is why this is pinned by counting rather than
+    // left to be read off the code.
+    #[tokio::test]
+    async fn the_review_origin_join_reads_the_watch_set_once_per_page_at_most() {
+        for (rows, want) in [(0usize, 0usize), (3, 1)] {
+            let store = mem_store();
+            seed_run_for("iss_impl", "MT-2", "2026-08-01T00:00:00Z", &store);
+            for n in 0..rows {
+                let key = format!("pr:makewhatis/rhapsody#{}@alice", 200 + n);
+                seed_run_for(&key, &key, "2026-08-01T00:01:00Z", &store);
+                seed_watch(&store, 200 + n as i64, "alice", "handoff:STUDIO-1");
+            }
+            let counting = Arc::new(CountingHistory::new(store));
+            let provider = Arc::new(
+                FakeProvider::ok(empty_snapshot())
+                    .with_history(Arc::clone(&counting) as Arc<dyn crate::HistoryStore>),
+            );
+            let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+            let (status, _) = get_json(&format!("{base}/api/v1/history/issues")).await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                counting.watch_reads(),
+                want,
+                "{rows} review rows on the page must cost {want} watch-set reads",
+            );
+        }
     }
 
     // ---- GET /api/v1/history/issues/counts (STUDIO-828) ----

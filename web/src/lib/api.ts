@@ -194,6 +194,19 @@ export interface IssueRun extends RunSummary {
   // id or the row's title — both are conventions the daemon happens to follow, not facts. Positive-
   // only, on the same terms as `review_ticket`.
   review_run?: boolean;
+  // The TICKET this row's review run is reviewing, e.g. "STUDIO-838" (STUDIO-834). Only ever sent
+  // beside `review_run`.
+  //
+  // A `pr:owner/repo#n@reviewer` key carries the repository, the number and the reviewer and no
+  // ticket whatever, so this is the ONLY thing that connects a review row to the work — and a
+  // client must not try to parse one out of the key or the title. The daemon resolves it from the
+  // watch row's recorded origin, which is where the link actually lives.
+  //
+  // Absent — never an empty string — when the origin names no ticket (an operator introduced the
+  // pull request through the console) or no watch row survives for the key. Both mean "render this
+  // row as you rendered it before the field existed", which is the same absence-is-the-fallback
+  // shape `review_ticket` and `review_run` use above.
+  review_of?: string;
 }
 
 // IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —
