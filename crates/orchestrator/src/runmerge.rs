@@ -297,6 +297,10 @@ pub async fn resolve_and_merge(
             receipt.number,
             MERGE_METHOD,
             MERGE_AUTO,
+            // The console pins the head its own way — `confirm` above must echo the SHA this
+            // request just resolved — so it puts nothing extra on the `gh` command line and stays
+            // byte-identical to what it was before STUDIO-874 added the parameter.
+            None,
         )
         .await
     {
@@ -694,6 +698,7 @@ mod tests {
             number: i64,
             method: MergeMethod,
             auto: bool,
+            _match_head: Option<&str>,
         ) -> MergeResult {
             self.calls.lock().unwrap_or_else(|e| e.into_inner()).push((
                 format!("{owner}/{repo}"),
