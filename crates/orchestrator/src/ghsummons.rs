@@ -703,6 +703,52 @@ impl MergeSource for GH {
     }
 }
 
+/// Brings a BEHIND pull request's head branch up to date with its base (STUDIO-874).
+///
+/// The ACTION half of the `BEHIND` question, and deliberately a different seam from
+/// [`BranchUpdateSource`], which only READS whether the repository permits it. The read is a
+/// repository fact anybody may ask for; this one writes to the head branch, so a caller that holds
+/// the read cannot perform the write by mistake — the same split [`ResolveDeps`] makes between
+/// judging a merge and performing one.
+///
+/// [`ResolveDeps`]: crate::runmerge::ResolveDeps
+#[async_trait]
+pub trait BranchUpdater: Send + Sync {
+    async fn update_branch(&self, owner: &str, repo: &str, number: i64) -> MergeResult;
+}
+
+#[async_trait]
+impl BranchUpdater for GH {
+    /// One bounded `gh pr update-branch <number> --repo <owner>/<repo>`.
+    ///
+    /// No ref is named: `gh` merges the pull request's OWN base into its head, so there is no
+    /// branch name here for a caller to supply, and therefore none to supply wrongly.
+    ///
+    /// Everything GitHub refuses — a conflict with the base, a repository that will not allow the
+    /// update, a pull request already up to date — comes back as an `Err` carrying `gh`'s own
+    /// words, exactly as [`MergeSource::merge_pr`] does. The daemon never resolves a conflict on
+    /// the operator's behalf.
+    async fn update_branch(&self, owner: &str, repo: &str, number: i64) -> MergeResult {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Err(format!(
+                "gh pr update-branch: incomplete coordinate {owner}/{repo}#{number}"
+            )
+            .into());
+        }
+        let slug = format!("{owner}/{repo}");
+        let num = number.to_string();
+        let args = ["pr", "update-branch", num.as_str(), "--repo", slug.as_str()];
+        let out = self
+            .run_off_task(args.iter().map(|a| (*a).to_string()).collect())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("gh pr update-branch {num} --repo {slug}: {e}").into()
+            })?;
+        let said = String::from_utf8_lossy(&out);
+        Ok(said.trim().chars().take(MAX_MERGE_OUTPUT).collect())
+    }
+}
+
 /// GitHub's `mergeStateStatus` for a pull request whose head branch is behind its base.
 ///
 /// The one value the merge path acts on, named rather than spelled inline: with `main`'s
@@ -2427,6 +2473,44 @@ mod tests {
             vec!["pr merge 64 --repo o/r --squash --auto".to_string()],
             "exactly one gh call, and exactly these arguments"
         );
+    }
+
+    /// Updating a BEHIND branch is one bounded call, and it names no ref of its own: `gh` merges
+    /// the pull request's own base into it, so there is no branch name here for a caller to get
+    /// wrong (STUDIO-874).
+    #[tokio::test]
+    async fn update_branch_is_one_bounded_call() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "@symphony",
+            Some(run_recording(
+                "  ✓ Updated branch symphony/STUDIO-874\n",
+                Arc::clone(&seen),
+            )),
+        );
+
+        let said = src.update_branch("o", "r", 154).await.expect("update");
+
+        assert_eq!(said, "✓ Updated branch symphony/STUDIO-874");
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr update-branch 154 --repo o/r".to_string()]
+        );
+    }
+
+    /// An incomplete coordinate spawns no process: being asked to write at a coordinate that
+    /// cannot exist is a caller bug, exactly as it is for `merge_pr`.
+    #[tokio::test]
+    async fn update_branch_refuses_an_incomplete_coordinate_without_asking_github() {
+        for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0), ("o", "r", -3)] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+            assert!(src.update_branch(owner, repo, n).await.is_err());
+            assert!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "no process for {owner}/{repo}#{n}"
+            );
+        }
     }
 
     /// The atomic head guard the auto-merge path needs (STUDIO-874). `--match-head-commit` makes
