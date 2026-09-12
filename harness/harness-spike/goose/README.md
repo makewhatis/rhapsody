@@ -1,9 +1,10 @@
 # goose captures — `goose acp` (ACP over stdio), STUDIO-872
 
 The STUDIO-869 spike ran every harness but goose: no provider was configured on the capture
-machine, so only goose's zero-cost failure path ran (`failure-401-exit0.stdout`, still here,
-unchanged). The maintainer armed goose with a provider on 2026-09-12, and STUDIO-872 ran the four
-things that were left: one real multi-tool turn, resume, concurrency, and the kill path.
+machine, so only goose's zero-cost failure path ran (`failure-401-exit0.stdout`, which arrives with
+STUDIO-869's own pull request and is not touched here). The maintainer armed goose with a provider
+on 2026-09-12, and STUDIO-872 ran the four things that were left: one real multi-tool turn, resume,
+concurrency, and the kill path.
 
 **Everything here was driven over ACP**, not `goose run` — the design
 (`~/.rhapsody/docs/pluggable-harnesses-design.md` §9 slice 9) picks ACP for goose precisely to
@@ -45,7 +46,7 @@ timings, exit code); `*.census.txt` is the kill test's process census.
 | `acp-concurrent-isolated-{A,B}.driver.txt` | The same pair with per-run XDG state dirs. Both correct, the real store untouched — and **both got session id `20260912_1`**. |
 | `acp-kill-{1,2,3}.census.txt` + `.driver.txt` | The kill path, `killtest.py`'s exact method over ACP, three runs. `0` survivors every time. |
 | `acp-session-id-race.txt` | Six concurrent `session/new` calls against one store (no prompt, so no tokens): 6 distinct ids. |
-| `failure-401-exit0.stdout` | **STUDIO-869's** capture, untouched: `goose run` exiting 0 on a 401 with the error on stdout. |
+| `failure-401-exit0.stdout` | **STUDIO-869's** capture, arriving with that ticket's pull request and untouched here: `goose run` exiting 0 on a 401 with the error on stdout. |
 
 Full event streams were **not** committed for the four concurrency runs — `acp-happy.jsonl`
 already shows the stream shape, and the concurrency finding rests on the ids, the per-sandbox
@@ -55,6 +56,22 @@ run's stderr file came out **0 bytes** — an empty file is weaker evidence than
 the runs that ended normally the driver also prints the count it measured (`STDERR_BYTES=0`) into
 the `*.driver.txt`; the three kill runs have no such line, and their empty `.stderr` is **not**
 evidence either way, because the driver kills the process before the stderr reader finishes.
+
+## ⚠️ Merge-order prerequisite — `../README.md` still says goose is unverified
+
+The `harness/harness-spike/` directory index one level up is written by **STUDIO-869**, before any
+of this existed, and it states that `goose/` is a failure-path capture only and that *"everything
+else about goose remains unverified"*. It also enumerates STUDIO-869's five sandbox scripts and
+none of the four new files here, and says three harnesses name the daemon's MCP tools three ways
+— it is four now.
+
+STUDIO-872 deliberately does **not** edit that file: it is not on this branch's base, and adding a
+copy of the path here is the one thing that would make the two pull requests conflict — they are
+otherwise clean in either merge order. The exact delta, eight edits against exact line anchors, is
+**§7.3 of `~/.rhapsody/docs/STUDIO-872-goose-acp-spike-findings.md`**, to be applied by whichever
+of the two pull requests merges second. §7.3 also notes the one file *neither* pull request touches
+— `harness/CLAUDE.md`, which maps `harness/`'s subdirectories and does not know `harness-spike/`
+exists; both branches create it, so whichever merges first opens that gap.
 
 ## Provenance — the exact command per capture
 
@@ -120,3 +137,10 @@ sandbox/idrace.py 6 $SB/sb1
   (`/tmp/goosespike/...`, `/Users/david/...`) on purpose: they record what actually ran.
 - The kill captures list the MCP server as `ESCAPED` (its own pgid) and still report 0
   survivors — it dies when its stdio pipe to goose closes, not from the signal.
+- **`acp-happy.jsonl` embeds a snapshot of the capture machine's live daemon.** Line 51 is the
+  `symphony_state` result verbatim: two internal Linear issue UUIDs, run ids 934/935, ticket
+  titles, the repo's SSH URL and lifetime token totals. That is the point — it is the evidence the
+  MCP call really reached the daemon — but it is state, not schema: it will never reproduce, and a
+  capture on another machine differs there. No credential is in it (the captures were scanned for
+  `fw_`/`sk-`/`lin_api_`/`Bearer`/`ghp_`/`xox*`/`"token"`/`password`; the only hit anywhere is the
+  deliberate `fw_BOGUSKEY` in the provenance block above).
