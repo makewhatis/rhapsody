@@ -25,24 +25,69 @@ Nothing in the Rust workspace reads these files yet. They are inputs for the ada
 |---|---|
 | `claude/happy.jsonl` | Full multi-tool turn: 6 tool calls (2 `Read`, 1 `Edit`, 1 `Bash`, 1 `ToolSearch`, 1 `mcp__symphony__symphony_state`), terminal `result`. |
 | `claude/failure-unrecognized-model.jsonl` + `.stderr` | Deliberate failure (`--model no-such-model-xyz`). |
+| `claude/failure-unrecognized-model.exit` | Its observed exit status: **1**. |
 | `claude/resume.jsonl` | `--resume <session_id>`, same flags, answering from the prior turn's context. |
+| `claude/killtest.txt` | Item 5, executed: the daemon's kill against a claude turn running `./slow.sh`. |
+| `claude/concurrency.txt` | Item 4, executed: two claude turns at once over the shared `~/.claude`. |
 | `codex/happy.jsonl` | Same multi-tool turn, **with** `--dangerously-bypass-approvals-and-sandbox`. |
 | `codex/mcp-refused-approval-policy.jsonl` | The same turn **without** that flag: both MCP calls refused, `turn.completed`, exit 0. |
-| `codex/failure-401.jsonl` | Deliberate failure (bogus key): 5 non-terminal `error` retries, then `turn.failed`. |
+| `codex/failure-401.jsonl` | Deliberate failure (bogus key): **6** non-terminal `error` events, then `turn.failed`. |
+| `codex/failure-401.exit` | Its observed exit status: **1**. |
 | `codex/resume.jsonl` | `codex exec resume <thread_id>`. |
 | `codex/config.toml` | The `$CODEX_HOME/config.toml` that produced every codex capture. |
+| `codex/killtest.txt` | Item 5, executed. |
+| `codex/concurrency.txt` | Item 4, executed: two codex turns at once over one shared `$CODEX_HOME`. |
 | `opencode/happy.jsonl` | Same multi-tool turn. |
-| `opencode/long-turn.jsonl` | A longer turn: 11 tool calls over 6 steps, all correct. |
+| `opencode/long-turn.jsonl` | A longer turn: 11 tool calls over 4 steps, all correct. |
+| `opencode/long-turn.timing` | Per-event arrival offsets and sizes for that turn, from `drive.py`. |
 | `opencode/failure-401.jsonl` | Deliberate failure: one in-band `error` event carrying `statusCode` and `isRetryable`. |
+| `opencode/failure-401.exit` | Its observed exit status: **1**. |
 | `opencode/resume.jsonl` | `run -s <sessionID>`. |
 | `opencode/opencode.json` | The project config that produced every opencode capture. |
+| `opencode/killtest.txt` | Item 5, executed. |
+| `opencode/concurrency.txt` | Item 4, executed: two opencode turns at once over the shared state dir. |
 | `goose/failure-401-exit0.stdout` | Goose failing a 401 while **exiting 0**, with the error on stdout. Failure path only — see below. |
+| `goose/failure-401-exit0.exit` | Its observed exit status: **0**. The filename's claim, recorded rather than asserted. |
 | `sandbox/` | The scripts and prompts that produced all of the above. |
 
 `sandbox/mksandbox.sh` builds the sandbox repo (honours `$RHAPSODYD` and `$WORKFLOW`);
 `sandbox/drive.py` mimics the daemon's turn loop (own process group, stream stdout, close stdin on
-the terminal line, reap); `sandbox/killtest.py` reproduces the daemon's exact kill
-(`process_group(0)` + `kill(-pid, SIGKILL)`) and reports surviving descendants.
+the terminal line, reap) and writes a `.timing` sidecar; `sandbox/killtest.py` reproduces the
+daemon's exact kill (`process_group(0)` + `kill(-pid, SIGKILL)`) and reports surviving descendants;
+`sandbox/conctest.sh` runs two turns of one harness at once against its shared global state dir and
+checks each turn edited only its own sandbox.
+
+Every `killtest.txt` and `concurrency.txt` in this directory is the **verbatim stdout of those two
+scripts**, timestamps and argv included — re-running the committed script reproduces the committed
+transcript. Both carry their own elapsed times, which is why the kill and concurrency cases have no
+separate `.timing` sidecar.
+
+## What items 4 and 5 found
+
+**Item 5, the kill path — all three harnesses escape their process group.** Each `killtest.txt`
+spawns the harness exactly as the daemon does (`process_group(0)`, then `kill(-pid, SIGKILL)`),
+waits 45s for the agent to get `./slow.sh` running, walks the ppid tree, kills, and re-checks:
+
+| Harness | Descendants at kill | Survivors | What escaped |
+|---|---|---|---|
+| claude | 4 | **3** | the tool shell (`zsh` → `bash` → `sleep`), in its own pgid |
+| codex | 4 | **2** | the tool shell (`bash` → `sleep`); its MCP server also left the group but died with the leader |
+| opencode | 3 | **2** | the tool shell (`bash` → `sleep`), in its own pgid |
+
+In every case the leader dies (`rc=-9`) and the command the agent was actually running does not.
+This is [STUDIO-840](https://linear.app/studio49/issue/STUDIO-840) again one level down: that fix
+put the *harness* in a killable group, and these transcripts show the harness then puts its own
+tool children somewhere else. A stop still leaves real work running, whichever harness is in use.
+Killing the leader's group is therefore not a containment boundary for any candidate.
+
+**Item 4, concurrency — two turns at once is clean on all three.** Each `concurrency.txt` runs two
+turns of one harness simultaneously against that harness's *shared* global state dir, each in its
+own sandbox. All six turns exited 0, each edited only its own `counter.txt`, and each reported a
+distinct session id. Codex wrote one uniquely-named rollout per thread into the one shared
+`$CODEX_HOME` with no collision, so redirecting `CODEX_HOME` is not required for correctness here —
+only for isolation of the *history* two runs would otherwise share. One codex turn took 128s
+against its partner's 19s; that is a single observation with no isolated cause, not a measured
+contention finding.
 
 ## Provenance — the exact command per capture
 
@@ -78,8 +123,19 @@ opencode run --format json --auto --dir "$SB" \
 #   resume.jsonl:      same, plus -s <sessionID>
 
 # goose/failure-401-exit0.stdout — provider: OpenAI endpoint with a deliberately bogus key
+#   GOOSE_PROVIDER/GOOSE_MODEL are load-bearing. Without them a scratch HOME has no provider
+#   configured, and goose exits *1* with "No provider configured" before ever reaching the API —
+#   a different case entirely from the exit-0 one this file captures.
 HOME=<scratch> OPENAI_API_KEY=sk-BOGUSKEY GOOSE_DISABLE_KEYRING=1 \
+  GOOSE_PROVIDER=openai GOOSE_MODEL=gpt-4o-mini \
   goose run --no-session -t "Read NOTES.md and tell me the counter value."
+
+# killtest.txt, per harness — the daemon's exact kill against a turn running ./slow.sh
+sandbox/killtest.py <label> <sandbox> 45 <the harness argv above, prompt-slow-child.txt as the prompt>
+
+# concurrency.txt, per harness — two turns at once over that harness's shared global state dir
+PROMPT="$(cat sandbox/prompt-multitool.txt)" \
+  sandbox/conctest.sh <label> <sandbox-a> <sandbox-b> -- <the harness argv above>
 ```
 
 `opencode` must be the Homebrew build at `/opt/homebrew/Cellar/opencode/<v>/bin/opencode`. On the
@@ -90,12 +146,29 @@ never ran; it exits 1 with an install error on stderr and runs nothing. A daemon
 ## Reading these files honestly
 
 - **Every byte here was executed.** Nothing in this directory is transcribed from documentation.
-- **`goose/` is a failure-path capture only.** No goose provider is configured on the capture
-  machine, so goose got no happy-path, resume, concurrency or kill run. The one file present
-  confirms the design's §7.1 exit-0-on-failure claim by execution; everything else about goose
-  remains unverified.
-- **No 429 was ever observed.** 65 concurrent Fireworks requests all returned 200, so the
-  rate-limit row is Claude's `rate_limit_event` (real, in `claude/happy.jsonl`) and nothing else.
+- **`goose/` is a failure-path capture only.** No goose provider with working credentials exists on
+  the capture machine — the capture points goose at OpenAI with a deliberately bogus key — so goose
+  got no happy-path, resume, concurrency or kill run. The one file present confirms the design's
+  §7.1 exit-0-on-failure claim by execution; everything else about goose remains unverified.
+- **No 429 was ever observed.** The rate-limit row is therefore Claude's `rate_limit_event` (real,
+  in `claude/happy.jsonl`) and nothing else. The Fireworks side of that claim is a **[SURVEY]**
+  leftover: an earlier ad-hoc burst of concurrent requests returned 200 across the board, but no
+  transcript of it was kept, so it is not evidence and is not repeated here as a finding. What *is*
+  committed is the two-turns-at-once case the ticket actually asked for, in each
+  `concurrency.txt` — and none of those six turns saw a 429 either.
+- **A failing harness does not reliably say so in its exit code, and `claude` does not reliably say
+  so in its stream.** The four `.exit` sidecars are the recorded spread: goose 401 → **0**,
+  claude bad-model → 1, codex 401 → 1, opencode 401 → 1. Independently, `claude`'s terminal
+  `result` line for the bad-model failure carries `"subtype":"success"` *and* `"is_error":true` in
+  the same object, so `subtype` is not a verdict either.
+- **The same prompt does not produce the same step grouping.** `opencode/long-turn.jsonl` and the
+  original capture of the same prompt both make the same 11 tool calls in the same order-ish, but
+  batched into 4 steps and 6 steps respectively. An adapter may key off tool calls; it must not
+  assume a fixed number of `step_start`/`step_finish` pairs.
+- **The three harnesses name the daemon's MCP tools three different ways** — claude
+  `mcp__symphony__symphony_state`, opencode `symphony_symphony_state`, codex `symphony` +
+  `symphony_state` as separate fields. Rhapsody's prompts name tools by their claude-side names, so
+  the adapter owes a tool-name mapping, not only an event mapping.
 - The `claude/*.jsonl` captures contain two machine-specific artefacts: a ~7.6KB
   `system/hook_response` line carrying the capture machine's `SessionStart` hook text, and
   `/Users/david/...` paths in the `system/init` line. Both are the operator's environment, not part

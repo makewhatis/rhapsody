@@ -1,0 +1,11 @@
+# shared CODEX_HOME=/tmp/studio869-r2/codexhome for both turns
+[codex] at=2026-09-12T04:59:06Z
+[codex] argv=/opt/homebrew/bin/codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check <prompt>
+[codex] c2-cx-a exit=0 elapsed=128s counter=8 stderr_bytes=39
+    session ids seen: ['01a093fb-c9b2-7783-abe1-9a67163b55f4']
+[codex] c2-cx-b exit=0 elapsed=19s counter=8 stderr_bytes=39
+    session ids seen: ['01a093fb-c9b2-7923-84dd-2147218ba019']
+[codex] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+# rollout files the two turns wrote into the SHARED home:
+$CODEX_HOME/sessions/2026/09/11/rollout-2026-09-11T21-59-07-01a093fb-c9b2-7783-abe1-9a67163b55f4.jsonl
+$CODEX_HOME/sessions/2026/09/11/rollout-2026-09-11T21-59-07-01a093fb-c9b2-7923-84dd-2147218ba019.jsonl

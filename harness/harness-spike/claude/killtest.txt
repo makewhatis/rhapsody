@@ -1,0 +1,14 @@
+[claude] argv=['/Users/david/.local/bin/claude', '-p', 'Use your shell/bash tool to run the command `./slow.sh` in the current directory and report its output. It takes about two minutes; wait for it.', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions', '--model', 'claude-haiku-4-5-20251001', '--mcp-config', '/tmp/studio869-r2/k-claude/.symphony-mcp.json', '--strict-mcp-config']
+[claude] cwd=/tmp/studio869-r2/k-claude wait=45.0s at=2026-09-12T04:54:30Z
+[claude]   0.002s pid=83323 pgid=83323 daemon_pgid=83301
+[claude]  45.069s descendants=4
+    pid=83337 ppid=83323 pgid=83323 IN-GROUP /Applications/Rhapsody.app/Contents/Resources/rhapsodyd
+    pid=83526 ppid=83323 pgid=83526 ESCAPED /bin/zsh
+    pid=83529 ppid=83526 pgid=83526 ESCAPED /bin/bash
+    pid=83904 ppid=83529 pgid=83526 ESCAPED sleep
+[claude]  45.069s kill(-83323, SIGKILL)
+[claude]  45.069s leader rc=-9
+[claude]  46.607s SURVIVORS AFTER kill(-83323, SIGKILL): 3
+    ORPHAN pid=83526 pgid=83526 /bin/zsh
+    ORPHAN pid=83529 pgid=83526 /bin/bash
+    ORPHAN pid=83904 pgid=83526 sleep

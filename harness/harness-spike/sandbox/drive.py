@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mimic the daemon's turn loop: spawn in its own process group, stream stdout,
 close stdin on the terminal line, reap. Records timings and exit code."""
-import json, os, signal, subprocess, sys, threading, time
+import json, os, subprocess, sys, threading, time
 
 def main():
     out_prefix = sys.argv[1]
