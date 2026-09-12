@@ -1,7 +1,7 @@
-[claude] at=2026-09-12T04:58:40Z
+[claude] at=2026-09-12T05:08:14Z
 [claude] argv=/Users/david/.local/bin/claude -p --output-format stream-json --verbose --permission-mode bypassPermissions --model claude-haiku-4-5-20251001 --mcp-config {}/.symphony-mcp.json --strict-mcp-config <prompt>
-[claude] c2-cl-a exit=0 elapsed=18s counter=8 stderr_bytes=0
-    session ids seen: ['bd59c826-4559-469c-94ff-5adaeb9994e6']
-[claude] c2-cl-b exit=0 elapsed=17s counter=8 stderr_bytes=0
-    session ids seen: ['cc124278-e3af-4788-be33-f32ea7ebeb77']
+[claude] c3-cl-a exit=0 elapsed=21s counter=8 stderr_bytes=0
+    38 events; session ids seen: ['cbd4ab2f-7d37-44d8-99a0-f6bd0c1d5824']
+[claude] c3-cl-b exit=0 elapsed=23s counter=8 stderr_bytes=0
+    36 events; session ids seen: ['e862c123-4244-49a1-b0c1-7984f66b18b7']
 [claude] VERDICT: both turns edited their own sandbox to 8 - no cross-talk

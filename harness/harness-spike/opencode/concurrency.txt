@@ -1,8 +1,8 @@
 # shared XDG_DATA_HOME (default /Users/david/.local/share/opencode) for both turns
-[opencode] at=2026-09-12T05:01:23Z
+[opencode] at=2026-09-12T05:09:17Z
 [opencode] argv=/opt/homebrew/Cellar/opencode/1.18.30/bin/opencode run --format json --auto --dir {} -m fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash <prompt>
-[opencode] c2-oc-a exit=0 elapsed=24s counter=8 stderr_bytes=0
-    session ids seen: ['ses_f6c021b51ffe4LqAl7jE4T6HaR']
-[opencode] c2-oc-b exit=0 elapsed=25s counter=8 stderr_bytes=0
-    session ids seen: ['ses_f6c021b45ffe0AfULgGM1DY7wr']
-[opencode] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[opencode] c3-oc-a exit=0 elapsed=19s counter=8 stderr_bytes=0
+    14 events; session ids seen: ['ses_f6bfae0d6ffeisHIHVsymQPea3']
+[opencode] c3-oc-b exit=1 elapsed=1s counter=7 stderr_bytes=57
+    0 events; session ids seen: (none in stream)
+[opencode] VERDICT: UNEXPECTED counters a=8 b=7 (each should be 8)

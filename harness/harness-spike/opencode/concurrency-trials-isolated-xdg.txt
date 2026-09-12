@@ -1,0 +1,21 @@
+# opencode, item 4: the same 5 paired trials with a PRIVATE XDG_DATA_HOME per turn
+# (SEED_XDG=1 gives each turn <sandbox>/xdg and copies auth.json in, since
+#  opencode keeps its credentials in the same directory as its database)
+### oc-isolated — 5 paired trials, at=2026-09-12T05:16:23Z
+### argv=/usr/bin/env XDG_DATA_HOME={}/xdg /opt/homebrew/Cellar/opencode/1.18.30/bin/opencode run --format json --auto --dir {} -m fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash <prompt>   SEED_XDG=1
+[oc-isolated-1] oc-isolated-1-a exit=0 elapsed=47s counter=8 stderr_bytes=0
+[oc-isolated-1] oc-isolated-1-b exit=0 elapsed=47s counter=8 stderr_bytes=0
+[oc-isolated-1] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[oc-isolated-2] oc-isolated-2-a exit=0 elapsed=28s counter=8 stderr_bytes=0
+[oc-isolated-2] oc-isolated-2-b exit=0 elapsed=26s counter=8 stderr_bytes=0
+[oc-isolated-2] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[oc-isolated-3] oc-isolated-3-a exit=0 elapsed=35s counter=8 stderr_bytes=0
+[oc-isolated-3] oc-isolated-3-b exit=0 elapsed=32s counter=8 stderr_bytes=0
+[oc-isolated-3] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[oc-isolated-4] oc-isolated-4-a exit=0 elapsed=39s counter=8 stderr_bytes=0
+[oc-isolated-4] oc-isolated-4-b exit=0 elapsed=43s counter=8 stderr_bytes=0
+[oc-isolated-4] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[oc-isolated-5] oc-isolated-5-a exit=0 elapsed=18s counter=8 stderr_bytes=0
+[oc-isolated-5] oc-isolated-5-b exit=0 elapsed=35s counter=8 stderr_bytes=0
+[oc-isolated-5] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+### oc-isolated RESULT: 10/10 turns completed, 0 lost

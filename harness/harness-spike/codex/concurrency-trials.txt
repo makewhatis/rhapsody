@@ -1,0 +1,16 @@
+# codex, item 4: two turns at once against one shared $CODEX_HOME
+### cx-shared — 4 paired trials, at=2026-09-12T05:20:53Z
+### argv=/opt/homebrew/bin/codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check <prompt>   SEED_XDG=0
+[cx-shared-1] cx-shared-1-a exit=0 elapsed=22s counter=8 stderr_bytes=39
+[cx-shared-1] cx-shared-1-b exit=0 elapsed=20s counter=8 stderr_bytes=39
+[cx-shared-1] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[cx-shared-2] cx-shared-2-a exit=0 elapsed=20s counter=8 stderr_bytes=39
+[cx-shared-2] cx-shared-2-b exit=0 elapsed=26s counter=8 stderr_bytes=39
+[cx-shared-2] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[cx-shared-3] cx-shared-3-a exit=0 elapsed=9s counter=8 stderr_bytes=39
+[cx-shared-3] cx-shared-3-b exit=0 elapsed=11s counter=8 stderr_bytes=39
+[cx-shared-3] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+[cx-shared-4] cx-shared-4-a exit=0 elapsed=23s counter=8 stderr_bytes=39
+[cx-shared-4] cx-shared-4-b exit=0 elapsed=14s counter=8 stderr_bytes=39
+[cx-shared-4] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+### cx-shared RESULT: 8/8 turns completed, 0 lost

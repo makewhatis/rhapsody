@@ -1,11 +1,11 @@
-# shared CODEX_HOME=/tmp/studio869-r2/codexhome for both turns
-[codex] at=2026-09-12T04:59:06Z
+# shared CODEX_HOME for both turns (one config.toml, one sessions/ tree)
+[codex] at=2026-09-12T05:08:48Z
 [codex] argv=/opt/homebrew/bin/codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check <prompt>
-[codex] c2-cx-a exit=0 elapsed=128s counter=8 stderr_bytes=39
-    session ids seen: ['01a093fb-c9b2-7783-abe1-9a67163b55f4']
-[codex] c2-cx-b exit=0 elapsed=19s counter=8 stderr_bytes=39
-    session ids seen: ['01a093fb-c9b2-7923-84dd-2147218ba019']
+[codex] c3-cx-a exit=0 elapsed=20s counter=8 stderr_bytes=39
+    16 events; session ids seen: ['01a09404-a846-7581-8ffd-6b7d50511376']
+[codex] c3-cx-b exit=0 elapsed=23s counter=8 stderr_bytes=39
+    18 events; session ids seen: ['01a09404-a846-7392-b4d5-db22e09dc36d']
 [codex] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
-# rollout files the two turns wrote into the SHARED home:
-$CODEX_HOME/sessions/2026/09/11/rollout-2026-09-11T21-59-07-01a093fb-c9b2-7783-abe1-9a67163b55f4.jsonl
-$CODEX_HOME/sessions/2026/09/11/rollout-2026-09-11T21-59-07-01a093fb-c9b2-7923-84dd-2147218ba019.jsonl
+# rollout files the two turns wrote into that one shared home:
+$CODEX_HOME/sessions/2026/09/11/rollout-2026-09-11T22-08-48-01a09404-a846-7392-b4d5-db22e09dc36d.jsonl
+$CODEX_HOME/sessions/2026/09/11/rollout-2026-09-11T22-08-48-01a09404-a846-7581-8ffd-6b7d50511376.jsonl

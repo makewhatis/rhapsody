@@ -1,0 +1,24 @@
+# opencode, item 4: two turns at once against the SHARED state dir
+# (default XDG_DATA_HOME=/Users/david/.local/share/opencode, one opencode.db for both)
+### oc-shared — 5 paired trials, at=2026-09-12T05:15:05Z
+### argv=/opt/homebrew/Cellar/opencode/1.18.30/bin/opencode run --format json --auto --dir {} -m fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash <prompt>   SEED_XDG=0
+[oc-shared-1] oc-shared-1-a exit=0 elapsed=14s counter=8 stderr_bytes=0
+[oc-shared-1] oc-shared-1-b exit=1 elapsed=0s counter=7 stderr_bytes=57
+[oc-shared-1] VERDICT: UNEXPECTED counters a=8 b=7 (each should be 8)
+    FAILED TURN oc-shared-1-b: Error: Unexpected error  database is locked 
+[oc-shared-2] oc-shared-2-a exit=1 elapsed=0s counter=7 stderr_bytes=57
+[oc-shared-2] oc-shared-2-b exit=0 elapsed=13s counter=8 stderr_bytes=0
+[oc-shared-2] VERDICT: UNEXPECTED counters a=7 b=8 (each should be 8)
+    FAILED TURN oc-shared-2-a: Error: Unexpected error  database is locked 
+[oc-shared-3] oc-shared-3-a exit=1 elapsed=0s counter=7 stderr_bytes=57
+[oc-shared-3] oc-shared-3-b exit=0 elapsed=12s counter=8 stderr_bytes=0
+[oc-shared-3] VERDICT: UNEXPECTED counters a=7 b=8 (each should be 8)
+    FAILED TURN oc-shared-3-a: Error: Unexpected error  database is locked 
+[oc-shared-4] oc-shared-4-a exit=1 elapsed=0s counter=7 stderr_bytes=57
+[oc-shared-4] oc-shared-4-b exit=0 elapsed=12s counter=8 stderr_bytes=0
+[oc-shared-4] VERDICT: UNEXPECTED counters a=7 b=8 (each should be 8)
+    FAILED TURN oc-shared-4-a: Error: Unexpected error  database is locked 
+[oc-shared-5] oc-shared-5-a exit=0 elapsed=18s counter=8 stderr_bytes=0
+[oc-shared-5] oc-shared-5-b exit=0 elapsed=19s counter=8 stderr_bytes=0
+[oc-shared-5] VERDICT: both turns edited their own sandbox to 8 - no cross-talk
+### oc-shared RESULT: 6/10 turns completed, 4 lost

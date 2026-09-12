@@ -18,24 +18,28 @@ for sb in "$sba" "$sbb"; do
   ( cd "$sb" || exit 1
     args=(); for a in "$@"; do args+=("${a//\{\}/$sb}"); done
     s=$(date +%s)
-    out=$("${args[@]}" "$PROMPT" 2>"$sb/.stderr"); rc=$?
-    printf '%s\t%s\t%s\t%s\n' "$sb" "$rc" "$(( $(date +%s) - s ))" "$out" > "$sb/.result" ) &
+    # The event stream goes to its own file, NOT into a field of .result: it is
+    # multi-line, so embedding it would leave only its first line readable and
+    # the session-id scan below would silently see one event instead of all.
+    "${args[@]}" "$PROMPT" > "$sb/.stream" 2>"$sb/.stderr"; rc=$?
+    printf '%s\t%s\t%s\n' "$rc" "$(( $(date +%s) - s ))" "$sb" > "$sb/.result" ) &
 done
 wait
 for sb in "$sba" "$sbb"; do
-  IFS=$'\t' read -r p rc secs out < "$sb/.result"
-  echo "[$label] $(basename "$p") exit=$rc elapsed=${secs}s counter=$(cat "$p/counter.txt") stderr_bytes=$(wc -c <"$p/.stderr" | tr -d ' ')"
-  echo "$out" | python3 -c '
+  IFS=$'\t' read -r rc secs _ < "$sb/.result"
+  echo "[$label] $(basename "$sb") exit=$rc elapsed=${secs}s counter=$(cat "$sb/counter.txt") stderr_bytes=$(wc -c <"$sb/.stderr" | tr -d ' ')"
+  python3 -c '
 import json,sys
-ids=set()
-for ln in sys.stdin:
+ids=set(); n=0
+for ln in open(sys.argv[1]):
     ln=ln.strip()
     if not ln: continue
     try: d=json.loads(ln)
     except Exception: continue
+    n+=1
     for k in ("session_id","sessionID","thread_id"):
         if d.get(k): ids.add(d[k])
-print("    session ids seen:", sorted(ids) or "(none in stream)")'
+print(f"    {n} events; session ids seen:", sorted(ids) or "(none in stream)")' "$sb/.stream"
 done
 # prompt-multitool.txt asks for counter.txt == 8 in each turn's OWN sandbox.
 # A turn that edited the other's sandbox, or skipped the edit, shows up here.
