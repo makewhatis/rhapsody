@@ -141,6 +141,7 @@ sandbox/idrace.py 6 $SB/sb1
   `symphony_state` result verbatim: two internal Linear issue UUIDs, run ids 934/935, ticket
   titles, the repo's SSH URL and lifetime token totals. That is the point — it is the evidence the
   MCP call really reached the daemon — but it is state, not schema: it will never reproduce, and a
-  capture on another machine differs there. No credential is in it (the captures were scanned for
-  `fw_`/`sk-`/`lin_api_`/`Bearer`/`ghp_`/`xox*`/`"token"`/`password`; the only hit anywhere is the
-  deliberate `fw_BOGUSKEY` in the provenance block above).
+  capture on another machine differs there. No credential is in it: every file in
+  `harness/harness-spike/` was scanned for `fw_`/`sk-`/`lin_api_`/`Bearer`/`ghp_`/`xox*`/`"token"`/
+  `password` and **no capture file matched** — the only match in the directory is the deliberate
+  `fw_BOGUSKEY` in the provenance block above, and this sentence's own list of patterns.
