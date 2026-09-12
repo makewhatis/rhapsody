@@ -25,7 +25,7 @@
 //! supervisor shape would need a `kqueue`/`NOTE_EXIT` babysitter process per run, which is a great
 //! deal more machinery for a defect that is live today. The walk's known weakness is that it races:
 //! a process forked between the snapshot and the signal is missed. That race is bounded here rather
-//! than left implicit — [`kill_tree`] re-walks up to [`SWEEP_ROUNDS`] times and only stops early on
+//! than left implicit — [`kill_tree`] re-walks up to `SWEEP_ROUNDS` times and only stops early on
 //! an empty round that FOLLOWS a kill round, so a single stale snapshot can never end the sweep.
 //! Whatever is still alive after the last round is logged, never panicked on.
 //!
