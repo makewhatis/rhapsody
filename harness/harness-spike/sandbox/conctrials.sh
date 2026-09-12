@@ -19,6 +19,10 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 label="$1"; n="$2"; root="$3"; shift 3
 [ "${1:-}" = "--" ] && shift
+# SHARED_XDG rm -rf's a path built from these two, and mksandbox.sh wipes one per
+# turn, so refuse the values that would make those paths dangerous.
+case "$root" in ""|"/"|"$HOME"|"$HOME/") echo "conctrials.sh: refusing scratch root '${root:-<empty>}'" >&2; exit 2 ;; esac
+case "$label" in ""|*/*) echo "conctrials.sh: <label> must be non-empty and contain no '/'" >&2; exit 2 ;; esac
 export PROMPT="${PROMPT:-$(cat "$here/prompt-multitool.txt")}"
 [ -n "${NOTE:-}" ] && printf '%s\n' "$NOTE" | sed 's/^/# /'
 echo "### $label — $n paired trials, at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -65,8 +69,14 @@ for i in $(seq 1 "$n"); do
       # opencode failure are the same generic "Unexpected error / database is
       # locked" whatever went wrong, and the statement that actually failed is
       # below them. Losing those lines cost this spike a whole review round.
-      echo "    FAILED TURN $(basename "$sb"), stderr follows:"
-      tr -d '\033' <"$sb/.stderr" | sed 's/\[[0-9;]*m//g' | sed 's/^/      | /'
+      if [ -s "$sb/.stderr" ]; then
+        echo "    FAILED TURN $(basename "$sb"), stderr follows:"
+        tr -d '\033' <"$sb/.stderr" | sed 's/\[[0-9;]*m//g' | sed 's/^/      | /'
+      else
+        # Said out loud, because an empty block under a "stderr follows" header
+        # reads like the transcript lost something.
+        echo "    FAILED TURN $(basename "$sb"): stderr was empty"
+      fi
     fi
   done
 done
