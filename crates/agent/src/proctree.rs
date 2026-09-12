@@ -404,7 +404,7 @@ mod tests {
     /// launched running to completion.
     ///
     /// The assertion is on OS process state, never on a return value — reverting [`kill_tree`] to a
-    /// bare [`kill_group`] reds it with the survivors named.
+    /// bare `kill(-leader, SIGKILL)` reds it with the survivors named.
     #[test]
     fn kill_tree_kills_a_tool_child_that_escaped_the_agents_process_group() {
         let h = Harness::start();

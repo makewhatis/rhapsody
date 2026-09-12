@@ -1149,10 +1149,19 @@ installations never reach the producer, so their `GET /api/v1/projects` is byte-
 Go kills the agent through its context: `re.cancel()` cancels the run's `ctx`, the turn's
 `exec.CommandContext` fires `cmd.Cancel`, and `kill(-pid, SIGKILL)` takes the whole `claude` process
 group down. Rust has no context to inherit — a cancelled worker is a DROPPED future, and a dropped
-`tokio::process::Child` signals nothing. The port therefore adds a `KillGroupOnDrop` guard inside the
-turn (`crates/agent/src/claude/runner.rs`), disarmed once the child is reaped, so a drop performs the
-same group kill Go's `cmd.Cancel` does. This is an implementation divergence, not a behavioral one:
-it restores Go's observable outcome, which is that a stopped run leaves no process behind.
+`tokio::process::Child` signals nothing. The port therefore adds a `KillTreeOnDrop` guard inside the
+turn (`crates/agent/src/proctree.rs`), disarmed once the child is reaped, so a drop kills the agent
+where Go's `cmd.Cancel` does. This is an implementation divergence, not a behavioral one: it restores
+Go's observable outcome, which is that a stopped run leaves no process behind.
+
+The guard kills *more* than Go's one `kill(-pid, SIGKILL)`, and that is the same divergence rather
+than a second one — it is what "leaves no process behind" costs here. STUDIO-869 measured all three
+harnesses (Claude Code, opencode, codex) calling `setpgid` on the shell they run a tool command in,
+so the group Rhapsody created is not the boundary the agent's work lives in: Go's group kill takes
+the leader and leaves the model's `git push` running. `kill_tree` therefore walks the descendant tree
+at kill time and signals every process group it spans, the leader's group included and unconditionally
+(STUDIO-871). It is harness-agnostic by construction — it lives in `crates/agent/src/proctree.rs`,
+not in `claude/`, so a future opencode or codex backend arms the identical guard.
 
 One behavioral divergence rides with it, on `POST /api/v1/runs/{id}/stop`:
 

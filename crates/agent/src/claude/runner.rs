@@ -2,8 +2,10 @@
 //!
 //! [`Runner`] drives `claude` headlessly, one process per turn, inside the per-issue worktree. Each
 //! [`Session::run_turn`] spawns the child with the exact argv ([`build_args`]), in its own Unix
-//! process group so a stall/turn-deadline kill can `SIGKILL` the whole group (the agent's own
-//! children — e.g. a background stdin drain — die with it). stdin is held open as an operator-message
+//! process group; a stall/turn-deadline/Stop kill then goes through [`crate::proctree::kill_tree`],
+//! which SIGKILLs that group AND every other group the agent's descendant tree spans — the group
+//! alone is not the boundary, because every harness `setpgid`s the shell it runs a tool command in
+//! (STUDIO-871). stdin is held open as an operator-message
 //! mailbox that is continuously drained and folded into the live turn at the next step boundary,
 //! closed the instant the terminal result lands so nothing is ever written after it (INF-250). The
 //! turn deadline (Go's `context.WithTimeout`) is the single timeout: a hang produces `TurnTimedOut`
@@ -388,7 +390,9 @@ impl Session for ClaudeSession {
             }
         }
         // New process group so the deadline/stall kill can SIGKILL the whole group (Go's
-        // `SysProcAttr{Setpgid: true}` + `syscall.Kill(-pid, SIGKILL)`).
+        // `SysProcAttr{Setpgid: true}` + `syscall.Kill(-pid, SIGKILL)`). Necessary, not sufficient:
+        // the agent's tool children put themselves in groups of their own, which is why every kill
+        // below is `kill_tree` and not a bare group kill (STUDIO-871).
         cmd.process_group(0);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -511,7 +515,7 @@ impl Session for ClaudeSession {
                                     continue;
                                 }
                                 // Billing guard on the first system/init of THIS turn: apiKeySource
-                                // must be "none". Otherwise kill the group and abort.
+                                // must be "none". Otherwise kill the tree and abort.
                                 if guard_on
                                     && c.event.event_type == EVENT_SESSION_STARTED
                                     && !billing_checked
@@ -1963,8 +1967,10 @@ mod tests {
     ///
     /// The property is "no process of the run survives the drop", which the entry map cannot observe.
     /// So this asserts on a GRANDCHILD the fake forks: it outlives its parent, and it writes the
-    /// marker only if something the group kill missed was still running a second after the drop.
+    /// marker only if something the drop's kill missed was still running a second after the drop.
     /// Killing just the direct child (`kill_on_drop`) leaves it, so the assertion reds on that too.
+    /// The grandchild stays in the agent's own group, so this pins 840's half; STUDIO-871's escaped
+    /// tool child is pinned in `proctree` and in `filetracker_e2e`.
     #[tokio::test]
     async fn dropping_a_turn_kills_the_whole_agent_process_group() {
         let _env = ENV_GUARD.read().await;

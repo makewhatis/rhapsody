@@ -12,6 +12,7 @@ no `Cargo.toml` of its own and is just the crate's second backend, not a separat
 | `src/lib.rs` | `agent.go`, `errors.go` | `Runner`/`Session` traits, `Event`/`TurnResult`/`Usage`, `AgentError` |
 | `src/humanize.rs` | `humanize.go` | stream-json line → `LogEntry` for the `/log` API/dashboard |
 | `src/fake.rs` | `internal/agent/fake` | scriptable in-process backend, the orchestrator's test double |
+| `src/proctree.rs` | — | harness-agnostic process-TREE kill (`kill_tree`, `KillTreeOnDrop`); no Go counterpart |
 | `src/claude/mod.rs` | `internal/agent/claude` | re-exports; module doc lists the five submodules' Go files 1:1 |
 | `src/claude/args.rs` | `args.go` | `Config` + `build_args`/`split_command` |
 | `src/claude/billing.rs` | `billing.go` | env-scrub name sets + billing-guard decisions |
@@ -33,9 +34,14 @@ to understand the crate's actual behavior, not any single module in isolation:
 - **One process per turn.** `ClaudeSession::run_turn` spawns a fresh `claude` subprocess every turn
   (continuation turns pass `--resume <thread_id>`, captured from the first `session_id`-bearing
   stream line — even an unclassified one, so `--resume`/billing association is never lost). The child
-  runs in its own Unix process group (`process_group(0)`) so a stall/deadline kill (`kill_group`,
-  `SIGKILL` on `-pid`) takes down the agent's own children too. This crate is Unix-only as written
-  (`libc::kill`, `process_group`); there's no Windows path.
+  runs in its own Unix process group (`process_group(0)`), but the group is NOT the containment
+  boundary: every harness `setpgid`s the shell it runs a tool command in, so a group kill takes the
+  leader and leaves the model's `git push` running (STUDIO-871). A stall/deadline/Stop kill therefore
+  goes through `proctree::kill_tree`, which walks the descendant tree and signals every group it
+  spans — the leader's group unconditionally, so STUDIO-840's guarantee holds even when `ps` cannot
+  be read. It lives outside `claude/` deliberately: a future opencode or codex backend arms the same
+  `KillTreeOnDrop`. This crate is Unix-only as written (`libc::kill`, `process_group`); there's no
+  Windows path.
 - **stdin is an operator mailbox (INF-250).** stdin stays open after the initial prompt; a second
   `mpsc::Receiver<String>` (passed the SAME channel across continuation turns) is drained inside the
   same `tokio::select!` as the stdout scanner, folding queued operator messages into the live turn.
@@ -43,7 +49,7 @@ to understand the crate's actual behavior, not any single module in isolation:
   terminal result is classified — "no write after result" is structural, not just documented.
 - **Billing guard is fail-closed and per-turn.** Every turn's first `system`/`init` line must report
   `apiKeySource == "none"` (checked once per turn via `billing_checked`, since `--resume` re-emits its
-  own init). A non-`"none"` source kills the group immediately (`BillingGuard`); a result observed
+  own init). A non-`"none"` source kills the process tree immediately (`BillingGuard`); a result observed
   with `guard_on` but no init ever seen is *also* refused (`billing_guard_failed: no system/init
   observed`) — a result can't be trusted to be guard-compliant without positive confirmation.
 - **Env scrub is re-applied every turn**, including resumes: `TRACKER_ENV_VARS` (`LINEAR_API_KEY`,
