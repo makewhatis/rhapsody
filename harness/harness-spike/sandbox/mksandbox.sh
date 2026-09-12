@@ -1,7 +1,13 @@
 #!/bin/bash
 # mksandbox.sh <dir> — build a fresh single-file git repo sandbox for one spike turn.
-set -e
-d="$1"; rm -rf "$d"; mkdir -p "$d"; cd "$d"
+set -eu
+# This wipes its argument, so refuse anything that is not a plausible scratch path.
+d="${1:-}"
+case "$d" in
+  ""|"/"|"$HOME"|"$HOME/") echo "mksandbox.sh: refusing to wipe '${d:-<empty>}'" >&2; exit 2 ;;
+  -*)                      echo "mksandbox.sh: <dir> must not start with '-'" >&2;      exit 2 ;;
+esac
+rm -rf -- "$d"; mkdir -p "$d"; cd "$d"
 git init -q -b main .
 cat > NOTES.md <<'EOF'
 # Counter notes

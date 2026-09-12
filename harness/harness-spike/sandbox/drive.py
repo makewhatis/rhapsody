@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mimic the daemon's turn loop: spawn in its own process group, stream stdout,
 close stdin on the terminal line, reap. Records timings and exit code."""
-import json, os, signal, subprocess, sys, time
+import json, os, signal, subprocess, sys, threading, time
 
 def main():
     out_prefix = sys.argv[1]
@@ -27,6 +27,12 @@ def main():
     else:
         p.stdin.close(); p.stdin = None
 
+    # Drain stderr on its own thread. Reading it only after the stdout loop would deadlock
+    # any harness that writes more than a pipe buffer's worth before its terminal event.
+    err_buf = []
+    err_thread = threading.Thread(target=lambda: err_buf.append(p.stderr.read()), daemon=True)
+    err_thread.start()
+
     so = open(out_prefix + ".stdout", "wb")
     events = []
     first = None
@@ -41,7 +47,8 @@ def main():
             print(f"TERMINAL_AT={term_at:.3f}s", file=sys.stderr)
     if p.stdin:
         p.stdin.close()
-    err = p.stderr.read()
+    err_thread.join(timeout=10)
+    err = err_buf[0] if err_buf else b""
     rc = p.wait()
     so.close()
     open(out_prefix + ".stderr", "wb").write(err)
