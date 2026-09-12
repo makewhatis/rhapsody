@@ -1,0 +1,51 @@
+model = "accounts/fireworks/models/deepseek-v4p1-flash"
+model_provider = "fireworks"
+
+[model_providers.fireworks]
+name = "Fireworks"
+base_url = "https://api.fireworks.ai/inference/v1"
+env_key = "FIREWORKS_API_KEY"
+wire_api = "responses"
+
+[mcp_servers.symphony]
+command = "/Applications/Rhapsody.app/Contents/Resources/rhapsodyd"
+args = ["mcp", "/Users/david/.rhapsody/WORKFLOW.md"]
+
+[projects."/private/tmp/studio869-spike/codex-smoke"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/codex-happy"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/codex-approve-for-me"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/codex-policy-onreq"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/codex-bypass"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/codex-happy2"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/codex-badkey"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/cx-conc1"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/cx-conc2"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/kill-codex"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/k2-cx"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/k3-cxa"]
+trust_level = "trusted"
+
+[projects."/private/tmp/studio869-spike/k3-cxb"]
+trust_level = "trusted"

@@ -1,0 +1,10 @@
+Do all four steps below, in order, then stop.
+
+1. Read NOTES.md and counter.txt.
+2. Edit counter.txt so its only contents are the number 8.
+3. Run ./check.sh and report exactly what it printed.
+4. Call the tool named symphony_state from the "symphony" MCP server (it takes no
+   arguments) and report the value of its "status" field.
+
+Then print one final line: DONE <check.sh output> <status field>.
+Do nothing else. Do not create files. Do not commit.

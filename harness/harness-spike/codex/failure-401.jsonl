@@ -1,0 +1,10 @@
+{"type":"thread.started","thread_id":"01a09305-e8e6-7b62-9792-f1cac7722796"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `accounts/fireworks/models/deepseek-v4p1-flash` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (unexpected status 401 Unauthorized: The API key you provided is invalid., url: https://api.fireworks.ai/inference/v1/responses, request id: 1784a7db-e580-434d-bc33-64602430d3c6)"}
+{"type":"error","message":"Reconnecting... 2/5 (unexpected status 401 Unauthorized: The API key you provided is invalid., url: https://api.fireworks.ai/inference/v1/responses, request id: cd8e5586-8032-4569-abdb-a278f3552b46)"}
+{"type":"error","message":"Reconnecting... 3/5 (unexpected status 401 Unauthorized: The API key you provided is invalid., url: https://api.fireworks.ai/inference/v1/responses, request id: 1fa6df37-3dbc-4141-b04f-383bbe57feff)"}
+{"type":"error","message":"Reconnecting... 4/5 (unexpected status 401 Unauthorized: The API key you provided is invalid., url: https://api.fireworks.ai/inference/v1/responses, request id: e1d0e8b2-0162-42c8-afaa-53da7a79f259)"}
+{"type":"error","message":"Reconnecting... 5/5 (unexpected status 401 Unauthorized: The API key you provided is invalid., url: https://api.fireworks.ai/inference/v1/responses, request id: 111ab932-79e3-4775-99d2-5dcd862d9814)"}
+{"type":"error","message":"unexpected status 401 Unauthorized: The API key you provided is invalid., url: https://api.fireworks.ai/inference/v1/responses, request id: 3ac3958e-df94-42d4-a37c-1469026e9ab6"}
+{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: The API key you provided is invalid., url: https://api.fireworks.ai/inference/v1/responses, request id: 3ac3958e-df94-42d4-a37c-1469026e9ab6"}}
