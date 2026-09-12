@@ -136,6 +136,12 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
     // The head moved between the observation and now, so every verdict on record is about a commit
     // that is no longer what would land. `--match-head-commit` below would catch this too; catching
     // it here spends no merge attempt and says so precisely.
+    //
+    // Case-folded, unlike `automerge::auto_merge_verdict`'s deliberately exact comparison, and the
+    // difference is principled rather than an oversight: that one compares against a STORED row
+    // that two other predicates also compare exactly, so it must not be the loosest of the three.
+    // This compares two answers from GitHub about the same field, where a case difference would
+    // mean the same commit — so folding can only avoid a FALSE refusal, never admit a wrong head.
     if !snap.head_sha.eq_ignore_ascii_case(&plan.head) {
         return AutoMergeOutcome::Declined("the head moved after the verdicts were read");
     }
