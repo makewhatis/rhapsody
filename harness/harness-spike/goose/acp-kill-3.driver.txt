@@ -1,0 +1,6 @@
+[  0.003] PID=67819 PGID=67819 argv=goose acp
+[  0.060] SESSION_ID=20260912_18
+SESSION_ID=20260912_18
+[  3.600] TOOL_CALL kind=None id=call_7459f9931664489dbb6bbccf title='todo: todo write'
+[  4.759] TOOL_CALL kind=None id=call_72c1198e28ce4f549617e490 title='shell · ls -la slow.sh && cat slow.sh'
+[  7.616] TOOL_CALL kind=None id=call_1749f675e9bc401b9931c7e9 title='shell · ./slow.sh'
