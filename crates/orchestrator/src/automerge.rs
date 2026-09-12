@@ -116,8 +116,16 @@ impl AutoMergeRefusal {
 /// `rows` is every LIVE watch row of this one pull request. The answer is the approving reviewers
 /// on success, so the caller can name them in the audit record.
 ///
-/// The SHA comparison is case-insensitive because hexadecimal case is not semantic; it is an
-/// equality and never a prefix match, so an abbreviated SHA can never satisfy a full one.
+/// The SHA comparison is EXACT — byte equality, never a prefix and never case-folded.
+///
+/// Case-folding would be defensible on its own (hexadecimal case is not semantic), and it is still
+/// the wrong choice here, because this gate does not get to decide alone. `review_round_due` and
+/// [`handle_review_head_advanced`](crate::orchestrator::Orchestrator::handle_review_head_advanced)
+/// both compare the same two values with `==`, and they decide whether the row is re-armed for a
+/// FRESH review. A comparison looser than theirs is the one direction that breaks the whole
+/// arrangement: on a differently-cased head they would arm a re-review while this cleared the pull
+/// request to merge, which is exactly the "merging while a reviewer is mid-round" hazard. Matching
+/// them exactly makes the disagreement unrepresentable rather than merely unlikely.
 pub(crate) fn auto_merge_verdict(
     rows: &[&ReviewWatchRow],
     head: &str,
@@ -135,7 +143,7 @@ pub(crate) fn auto_merge_verdict(
                 // The head-keying, and the reason this is not merely `status == approved`: the
                 // verdict is a statement about the commit the reviewer READ, which is the SHA
                 // `mark_review_completed` stamped alongside it.
-                if !row.last_reviewed_sha.eq_ignore_ascii_case(head.trim()) {
+                if row.last_reviewed_sha != head.trim() {
                     return Err(AutoMergeRefusal::StaleVerdict);
                 }
                 approved_by.push(row.key.reviewer.clone());
@@ -306,14 +314,21 @@ mod tests {
         }
     }
 
-    /// Hexadecimal case is not semantic, so a differently-cased SHA is the same commit.
+    /// The comparison matches the rest of the subsystem exactly, and refuses a differently-cased
+    /// head rather than accepting it.
+    ///
+    /// Not because the case means anything — it does not, it is the same commit — but because
+    /// `review_round_due` and `handle_review_head_advanced` compare these two values with `==`. If
+    /// this gate were the looser of the three, a differently-cased head would have them arming a
+    /// fresh review while this one cleared the merge. Refusing costs one more tick of a case that
+    /// does not arise; agreeing to disagree costs a merge under a live reviewer.
     #[test]
-    fn the_head_comparison_ignores_hex_case() {
+    fn a_differently_cased_head_is_refused_rather_than_disagreeing_with_the_watcher() {
         let rows = [row("alice", REVIEW_STATUS_APPROVED, HEAD)];
         let refs: Vec<&ReviewWatchRow> = rows.iter().collect();
         assert_eq!(
             auto_merge_verdict(&refs, &HEAD.to_ascii_uppercase()),
-            Ok(vec!["alice".to_string()])
+            Err(AutoMergeRefusal::StaleVerdict)
         );
     }
 
