@@ -177,8 +177,9 @@ impl SummonDropLog {
     }
 }
 
-/// Warns, at most once per ticket, about every dropped summons a ticket AWAITING REVIEW could not
-/// be given. Returns how many warnings it emitted (the test seam; production ignores it).
+/// Warns, at most once per (repository, ticket), about every dropped summons a ticket AWAITING
+/// REVIEW could not be given. Returns how many warnings it emitted (the test seam; production
+/// ignores it). See [`SummonDropLog`] for why the key is that and not the hits.
 ///
 /// # Why only a review-state ticket
 ///

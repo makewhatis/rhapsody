@@ -1632,11 +1632,56 @@ mod tests {
         );
     }
 
-    /// A ticket the control task judged already linked costs no Linear write — which is what keeps
-    /// this free on an installation whose GitHub integration works.
+    /// No ticket to attach to — an issue the planner saw with no tracker id — is not a write.
     #[tokio::test]
-    async fn a_ticket_the_planner_did_not_mark_is_never_attached() {
+    async fn a_request_with_no_ticket_is_never_attached() {
         assert!(link_once(request(), resolved_pr()).await.is_empty());
+    }
+
+    /// What keeps this free on an installation whose GitHub integration works, end to end through
+    /// the task: the ticket already links the pull request the lookup just resolved, so there is
+    /// nothing to write. The gate is the RESOLVED number and not the attachment's `merged` flag,
+    /// which on the installations this exists for is a field nothing refreshes.
+    #[tokio::test]
+    async fn a_ticket_already_linking_the_resolved_pull_request_is_not_attached_again() {
+        let req = ReviewIntroRequest {
+            link: Some(crate::prlink::PrLinkTarget {
+                linked: vec![154],
+                ..request_wanting_a_link().link.expect("a link target")
+            }),
+            ..request_wanting_a_link()
+        };
+        assert!(link_once(req, resolved_pr()).await.is_empty());
+    }
+
+    /// And the round-2 sequence: the ticket links #154 (merged long ago, still reading unmerged
+    /// because nothing maintains that field), the branch has pushed again and #157 is what
+    /// resolved. #157 must be attached, or the review about to be requested on it files findings
+    /// that reach nobody.
+    #[tokio::test]
+    async fn a_second_pull_request_on_a_stale_linked_ticket_is_attached() {
+        let req = ReviewIntroRequest {
+            link: Some(crate::prlink::PrLinkTarget {
+                linked: vec![154],
+                ..request_wanting_a_link().link.expect("a link target")
+            }),
+            ..request_wanting_a_link()
+        };
+        let seen = link_once(
+            req,
+            Ok(Some(crate::ghsummons::OpenPr {
+                url: "https://github.com/makewhatis/rhapsody/pull/157".to_string(),
+                head_sha: "abc".to_string(),
+            })),
+        )
+        .await;
+        assert_eq!(
+            seen,
+            vec![(
+                "iss-uuid".to_string(),
+                "https://github.com/makewhatis/rhapsody/pull/157".to_string()
+            )]
+        );
     }
 
     /// No pull request, no attachment: there is nothing to link, and inventing a URL is the one
