@@ -1,0 +1,13 @@
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": true, "writeTextFile": true}, "terminal": true}}}
+{"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"cwd": "/tmp/goosespike/sbT", "mcpServers": [{"name": "symphony", "command": "/Applications/Rhapsody.app/Contents/Resources/rhapsodyd", "args": ["mcp", "/Users/david/.rhapsody/WORKFLOW.md"], "env": []}]}}
+{"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "20260912_14", "prompt": [{"type": "text", "text": "Do all four steps below, in order, then stop.\n\n1. Read NOTES.md and counter.txt.\n2. Edit counter.txt so its only contents are the number 8.\n3. Run ./check.sh and report exactly what it printed.\n4. Call the tool named symphony_state from the \"symphony\" MCP server (it takes no\n   arguments) and report the value of its \"status\" field.\n\nThen print one final line: DONE <check.sh output> <status field>.\nDo nothing else. Do not create files. Do not commit.\n"}]}}
+{"jsonrpc": "2.0", "id": "ad9aeecf-2849-4331-ab3f-e1cc76f0223a", "result": {"content": "# Counter notes\n\nThe build counter lives in `counter.txt`. It is a single integer on one line.\n`./check.sh` prints the current value. The counter must be bumped by exactly one\nwhenever the notes change.\n"}}
+{"jsonrpc": "2.0", "id": "24d52480-41e5-4ef0-9b55-8d967bcbf912", "result": {"content": "7\n"}}
+{"jsonrpc": "2.0", "id": "bae251ea-1a7d-40d3-944f-72a5e03e186e", "result": {"content": "7\n"}}
+{"jsonrpc": "2.0", "id": "98805738-f722-4416-8664-78f5516e4896", "result": null}
+{"jsonrpc": "2.0", "id": "73542b1f-43e0-4a81-92c8-9b02ff101783", "result": {"content": "8\n"}}
+{"jsonrpc": "2.0", "id": "1c45cb06-ea35-461c-9229-67e0e2905549", "error": {"code": -32601, "message": "client does not implement terminal/create"}}
+{"jsonrpc": "2.0", "id": "e0b7129a-4840-4199-bdc0-50988259952d", "result": {"content": "8\n"}}
+{"jsonrpc": "2.0", "id": "f93beb54-3cb4-438a-b60e-541fc45988f9", "error": {"code": -32601, "message": "client does not implement terminal/create"}}
+{"jsonrpc": "2.0", "id": "9c8d19c5-e236-4531-80b9-da9c603d1b9e", "result": {"content": "#!/bin/bash\necho \"counter=$(cat counter.txt)\"\n"}}
+{"jsonrpc": "2.0", "id": "77b8d8df-513a-4253-a77b-62e2ab6b052e", "error": {"code": -32601, "message": "client does not implement terminal/create"}}

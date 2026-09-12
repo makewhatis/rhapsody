@@ -1,0 +1,2 @@
+Without reading any files or running any commands, answer from this session only:
+what number did you write into counter.txt? Reply with only that number.
