@@ -96,12 +96,18 @@ pub struct ReviewDonePlan {
 /// [`crate::reviewadopt`], and the whole of this module's scope guard: a `console:` row (or a
 /// future origin nobody has written yet) yields `None` and moves no ticket.
 ///
+/// `pub` because the read side wants the same answer the write side acts on: the issue listing
+/// joins it onto each `pr:` row so a review job says which ticket it is reviewing (STUDIO-834).
+/// It is CALLED there rather than copied — a second implementation is how the `handoff:`-only
+/// reading STUDIO-839 spent a round removing gets reintroduced, and an adopted review showing no
+/// ticket is precisely the row STUDIO-834 exists to fix.
+///
 /// **Both ticket-bearing origins, not just the handoff** (STUDIO-838). The guard is "a ticket THIS
 /// DAEMON parked in a review state", and an adoption is that — resolved from the daemon's own run
 /// ledger and its own configured repository, through the same gates. A `console:` origin still
 /// yields `None` for the reason it always did, which is not that it is untrusted: it names an
 /// OPERATOR, so there is no ticket in it to move.
-pub(crate) fn origin_ticket(introduced_by: &str) -> Option<&str> {
+pub fn origin_ticket(introduced_by: &str) -> Option<&str> {
     let identifier = introduced_by
         .strip_prefix(REVIEW_ORIGIN_HANDOFF)
         .or_else(|| introduced_by.strip_prefix(REVIEW_ORIGIN_ADOPT))?
