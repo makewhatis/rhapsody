@@ -32,6 +32,7 @@
 //! telemetry attrs — compiles standalone and introduces none.
 
 pub mod agentupdate;
+pub mod automerge;
 pub mod backoff;
 pub mod claim;
 pub mod concurrency;
@@ -70,6 +71,7 @@ pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewprompt;
 pub mod reviewwatch;
+pub mod runautomerge;
 pub mod rundiff;
 pub mod runmerge;
 pub mod select;
