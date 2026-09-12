@@ -98,7 +98,7 @@ waits 45s for the agent to get `./slow.sh` running, walks the ppid tree, kills, 
 | claude | 4 | **3** | the tool shell (`zsh` → `bash` → `sleep`), in its own pgid |
 | codex | 4 | **2** | the tool shell (`bash` → `sleep`); its MCP server also left the group but died with the leader |
 | opencode | 3 | **2** | the tool shell (`bash` → `sleep`), in its own pgid |
-| goose (ACP) | 3 | **0** | nothing survived — the MCP server left the group but died with its stdio pipe; 3 of 3 runs (STUDIO-872, `goose/acp-kill-*.census.txt`) |
+| goose (ACP) | 3 | **0** | nothing survived — the MCP server left the group but died with its stdio pipe; 3 of 3 runs, `killtest.py`'s method over ACP (STUDIO-872, `goose/acp-kill-*.census.txt`) |
 
 In every CLI case the leader dies (`rc=-9`) and the command the agent was actually running does not.
 This is [STUDIO-840](https://linear.app/studio49/issue/STUDIO-840) again one level down: that fix
@@ -240,12 +240,13 @@ never ran; it exits 1 with an install error on stderr and runs nothing. A daemon
 ## Reading these files honestly
 
 - **Every byte here was executed.** Nothing in this directory is transcribed from documentation.
-- **`goose/` is now both.** `failure-401-exit0.stdout` is STUDIO-869's `goose run` capture against a
-  deliberately bogus key, and it still confirms the design's §7.1 exit-0-on-failure claim by
-  execution. Everything else in `goose/` is **STUDIO-872**, captured over ACP against a real
-  Fireworks provider on 2026-09-12: the multi-tool turn, resume, concurrency and the kill path. What
-  remains unverified for goose is listed in §8 of
-  `~/.rhapsody/docs/STUDIO-872-goose-acp-spike-findings.md`.
+- **`goose/` is now both.** `failure-401-exit0.*` are STUDIO-869's `goose run` capture against a
+  deliberately bogus key, and they still confirm the design's §7.1 exit-0-on-failure claim by
+  execution. Everything else in `goose/` is **STUDIO-872**, captured over ACP on 2026-09-12: the
+  multi-tool turn, resume, concurrency and the kill path against a real Fireworks provider, plus two
+  captures that deliberately never reach one — `acp-failure-401` (a bogus key) and
+  `acp-home-redirect-provider-not-set` (no provider resolved at all). What remains unverified for
+  goose is listed in §8 of `~/.rhapsody/docs/STUDIO-872-goose-acp-spike-findings.md`.
 - **No 429 was ever observed.** The rate-limit row is therefore Claude's `rate_limit_event` (real,
   in `claude/happy.jsonl`) and nothing else. The Fireworks side of that claim is a **[SURVEY]**
   leftover: an earlier ad-hoc burst of concurrent requests returned 200 across the board, but no

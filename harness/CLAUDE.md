@@ -1,9 +1,9 @@
 # CLAUDE.md — harness
 
-The whole parity-port fixture-capture and testing rig. The root CLAUDE.md only mentions the
-`harness-fixtures` crate and `harness/fixtures/` (the committed golden data); this file maps the
-other six subdirectories: the five that produce or consume those goldens, and `harness-spike/`,
-which deliberately does neither.
+The whole parity-port fixture-capture and testing rig. `ls -d harness/*/` lists eight directories;
+the root CLAUDE.md covers exactly one of them — `harness/fixtures/`, the committed golden data, via
+the `harness-fixtures` crate. This file maps the other seven, one table row each. Keep that count
+and that table derived from `ls -d harness/*/`, never from the table's own row count.
 
 | Dir | Role |
 |---|---|
@@ -12,6 +12,7 @@ which deliberately does neither.
 | `harness-spike/` | real captured event streams per candidate harness, from the STUDIO-869 and STUDIO-872 spikes — inputs for the adapter slices, NOT goldens |
 | `stubs/` | the fake agent (`fake-claude*`) and fake Linear (`linear-stub`, a real Rust crate) that every capture/e2e/test run drives against |
 | `release/` | standalone bash validators for the release pipeline (PR title, `make print-version`) — **not** part of `make test` |
+| `prompt/` | `prompt_test.sh` — pins `.rhapsody/PROMPT.md`'s prose invariants as a bash case table; a required gate inside `make lint` and CI's `lint` job, **not** part of `make test` |
 | `e2e/` | `boot.sh`, CI's boot gate — builds the *real* assembled `rhapsodyd` + web dashboard and drives it end-to-end |
 | `workflows/` | `smoke.md` — a template WORKFLOW.md kept in sync by hand with `capture/workflows/minimal.md`; not read by any script directly (see harness/workflows/CLAUDE.md) |
 
