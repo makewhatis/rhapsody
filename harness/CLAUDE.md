@@ -2,8 +2,9 @@
 
 The whole parity-port fixture-capture and testing rig. `ls -d harness/*/` lists eight directories;
 the root CLAUDE.md covers exactly one of them — `harness/fixtures/`, the committed golden data, via
-the `harness-fixtures` crate. This file maps the other seven, one table row each. Keep that count
-and that table derived from `ls -d harness/*/`, never from the table's own row count.
+the `harness-fixtures` crate. This file maps the other seven and keeps a pointer row for
+`fixtures/`, so the table below carries **one row per directory**. Keep it derived from
+`ls -d harness/*/`, never from its own row count.
 
 | Dir | Role |
 |---|---|
