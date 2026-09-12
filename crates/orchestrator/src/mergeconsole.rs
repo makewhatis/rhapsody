@@ -1369,6 +1369,7 @@ mod tests {
             _number: i64,
             _method: crate::ghsummons::MergeMethod,
             _auto: bool,
+            _match_head: Option<&str>,
         ) -> crate::ghsummons::MergeResult {
             self.touch();
             Err("merge_pr must not be reached".into())

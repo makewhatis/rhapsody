@@ -623,6 +623,8 @@ pub type MergeResult = Result<String, Box<dyn std::error::Error + Send + Sync>>;
 /// `async_trait`.
 #[async_trait]
 pub trait MergeSource: Send + Sync {
+    /// `match_head` pins the commit GitHub must still see at the head, or `None` to merge whatever
+    /// is there. See the implementation for why the auto-merge path always names one.
     async fn merge_pr(
         &self,
         owner: &str,
@@ -630,13 +632,20 @@ pub trait MergeSource: Send + Sync {
         number: i64,
         method: MergeMethod,
         auto: bool,
+        match_head: Option<&str>,
     ) -> MergeResult;
 }
 
 #[async_trait]
 impl MergeSource for GH {
-    /// One `gh pr merge <number> --repo <owner>/<repo> <--squash|--merge|--rebase> [--auto]`, and
-    /// nothing else on the command line.
+    /// One `gh pr merge <number> --repo <owner>/<repo> <--squash|--merge|--rebase> [--auto]
+    /// [--match-head-commit <sha>]`, and nothing else on the command line.
+    ///
+    /// `match_head` is GitHub's own optimistic-concurrency guard (STUDIO-874): the merge is
+    /// REFUSED, by GitHub, if the head has moved off that commit. The auto-merge path always names
+    /// one, because it decides on a head observed a moment earlier and a push in that window would
+    /// otherwise land a commit no reviewer ever approved. `None` — the console's confirm handshake,
+    /// which pins the head its own way — puts nothing on the command line.
     ///
     /// An incomplete coordinate is an ERROR rather than a quiet nothing, following
     /// [`PrCommentSink::post_pr_comment`]: a read at a coordinate that cannot exist has a true
@@ -654,6 +663,7 @@ impl MergeSource for GH {
         number: i64,
         method: MergeMethod,
         auto: bool,
+        match_head: Option<&str>,
     ) -> MergeResult {
         if owner.is_empty() || repo.is_empty() || number <= 0 {
             return Err(
@@ -672,6 +682,13 @@ impl MergeSource for GH {
         ];
         if auto {
             args.push("--auto");
+        }
+        // Trimmed, and an all-whitespace value is treated as absent rather than passed on: `gh`
+        // would reject it, and the caller meant "no pin".
+        let pin = match_head.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(sha) = pin {
+            args.push("--match-head-commit");
+            args.push(sha);
         }
         let out = self
             .run_off_task(args.into_iter().map(String::from).collect())
@@ -2367,7 +2384,7 @@ mod tests {
             for auto in [true, false] {
                 let seen = Arc::new(Mutex::new(Vec::new()));
                 let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
-                src.merge_pr("o", "r", 64, method, auto)
+                src.merge_pr("o", "r", 64, method, auto, None)
                     .await
                     .expect("merge");
                 let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -2397,7 +2414,7 @@ mod tests {
         );
 
         let said = src
-            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true, None)
             .await
             .expect("merge");
 
@@ -2412,6 +2429,43 @@ mod tests {
         );
     }
 
+    /// The atomic head guard the auto-merge path needs (STUDIO-874). `--match-head-commit` makes
+    /// GITHUB refuse a merge whose head has moved, which is the only way to close the window
+    /// between observing a head and merging it: a re-read on this side narrows that race and
+    /// cannot end it, and what lands on `main` if it is lost is a commit no reviewer approved.
+    #[tokio::test]
+    async fn merge_pr_pins_the_head_commit_when_one_is_given() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+
+        src.merge_pr("o", "r", 64, MergeMethod::Squash, false, Some("c366a61"))
+            .await
+            .expect("merge");
+
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr merge 64 --repo o/r --squash --match-head-commit c366a61".to_string()],
+            "the head GitHub must match is on the command line"
+        );
+    }
+
+    /// `None` adds nothing to the command line, so the console path is byte-identical to what it
+    /// was before the parameter existed.
+    #[tokio::test]
+    async fn merge_pr_without_a_head_is_the_command_line_it_always_was() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
+
+        src.merge_pr("o", "r", 64, MergeMethod::Squash, true, None)
+            .await
+            .expect("merge");
+
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            vec!["pr merge 64 --repo o/r --squash --auto".to_string()]
+        );
+    }
+
     /// Each method is spelled as its own `gh` flag, and `auto: false` simply omits `--auto` rather
     /// than passing anything in its place.
     #[tokio::test]
@@ -2423,7 +2477,7 @@ mod tests {
         ] {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
-            src.merge_pr("o", "r", 7, method, false)
+            src.merge_pr("o", "r", 7, method, false, None)
                 .await
                 .expect("merge");
             assert_eq!(
@@ -2447,7 +2501,7 @@ mod tests {
         );
 
         let err = src
-            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true, None)
             .await
             .expect_err("a conflict is an error");
 
@@ -2474,7 +2528,7 @@ mod tests {
             )),
         );
         let err = src
-            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true, None)
             .await
             .expect_err("red checks are an error");
         assert!(
@@ -2497,7 +2551,7 @@ mod tests {
             )),
         );
         let err = src
-            .merge_pr("o", "r", 64, MergeMethod::Squash, true)
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true, None)
             .await
             .expect_err("a missing PR is an error");
         assert!(err.to_string().contains("Could not resolve"), "{err}");
@@ -2511,7 +2565,7 @@ mod tests {
         let src = GH::new("@symphony", Some(run_recording("", Arc::clone(&seen))));
         for (owner, repo, n) in [("", "r", 1), ("o", "", 1), ("o", "r", 0), ("o", "r", -3)] {
             assert!(
-                src.merge_pr(owner, repo, n, MergeMethod::Squash, true)
+                src.merge_pr(owner, repo, n, MergeMethod::Squash, true, None)
                     .await
                     .is_err(),
                 "{owner}/{repo}#{n} should be refused"
@@ -2952,7 +3006,9 @@ mod tests {
         let src = GH::new("@symphony", Some(run)).with_exec_timeout(bound);
 
         let started = std::time::Instant::now();
-        let got = src.merge_pr("o", "r", 64, MergeMethod::Squash, true).await;
+        let got = src
+            .merge_pr("o", "r", 64, MergeMethod::Squash, true, None)
+            .await;
         let waited = started.elapsed();
         // Released BEFORE the assertions, not after: a panic here with the runner still spinning
         // would leave a blocking-pool thread that never returns, and dropping the test runtime
