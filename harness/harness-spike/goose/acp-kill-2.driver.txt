@@ -1,0 +1,4 @@
+[  0.003] PID=61763 PGID=61763 argv=goose acp
+[  0.057] SESSION_ID=20260912_17
+SESSION_ID=20260912_17
+[  2.552] TOOL_CALL kind=None id=call_d963f7571fcd4df7b388db7b title='shell · ./slow.sh'

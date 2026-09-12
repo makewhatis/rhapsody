@@ -1,0 +1,6 @@
+[goose-acp] pid=61763 pgid=61763 descendants=3
+    pid=61766 ppid=61763 pgid=61766 ESCAPED /Applications/Rhapsody.app/Contents/Resources/rhapsodyd
+    pid=62022 ppid=61763 pgid=61763 IN-GROUP /bin/bash
+    pid=63312 ppid=62022 pgid=61763 IN-GROUP sleep
+[goose-acp] leader rc=-9
+[goose-acp] SURVIVORS AFTER kill(-61763, SIGKILL): 0
