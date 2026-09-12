@@ -235,6 +235,12 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
 /// never re-ran — no green sibling — still blocks, which is why `CANCELLED` is not simply added to
 /// [`NON_BLOCKING_CHECKS`]. That would be the fail-open direction; this is not.
 ///
+/// What makes admitting the superseded entry safe at all is that the rollup is keyed to ONE commit:
+/// every entry in it, green or not, ran against the head about to be merged. So a SUCCESS sibling
+/// is evidence that this check name passed on exactly this code — not on an earlier push, which is
+/// the confusion a stale verdict would be. The head itself is pinned twice over, by the equality
+/// above and by `--match-head-commit` on the merge.
+///
 /// Quadratic in the rollup's length, which is a handful of entries per head: a map keyed by name
 /// would cost an allocation to save nothing measurable, and this way the entry REPORTED is the
 /// offending one rather than a name reconstructed from a key.
