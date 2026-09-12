@@ -193,14 +193,6 @@ impl ClaudeSession {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The config THIS turn's argv is built from: the session's own copy of the runner's config
-    /// (`start_session` already clones it, which is how per-session `mcp_config` injection works),
-    /// with the dispatched teammate's profile model/effort substituted where the profile names one
-    /// (STUDIO-868).
-    ///
-    /// Per-turn rather than applied once at `start_session`, because the override arrives AFTER the
-    /// session is built — the worker calls `set_model_override` on a `Box<dyn Session>`, exactly as
-    /// it calls `set_run_id`. One `Config` clone per turn, against a process spawn.
     /// The `[teammate …]` clause a failure message carries when this session's model/effort came
     /// from a dispatched teammate's profile; EMPTY when it did not, so an unrouted run's error text
     /// is unchanged (STUDIO-868). Only the fields the profile actually named are listed — reporting
@@ -225,6 +217,15 @@ impl ClaudeSession {
         format!("[{who} asked for {}] ", parts.join(" "))
     }
 
+    /// The config THIS turn's argv is built from: the session's own copy of the runner's config
+    /// (`start_session` already clones it, which is how per-session `mcp_config` injection works),
+    /// with the dispatched teammate's profile model/effort substituted where the profile names one
+    /// (STUDIO-868).
+    ///
+    /// Per-turn rather than applied once at `start_session`, because the override arrives AFTER the
+    /// session is built — the worker calls `set_model_override` on a `Box<dyn Session>`, exactly as
+    /// it calls `set_run_id`. One `Config` clone per turn, against a process spawn.
+    ///
     /// Precedence is per FIELD and non-empty-wins: a profile naming only a model keeps the global
     /// effort. Empty means INHERIT, never "clear", so an installation with no profiles directory —
     /// and every built-in profile, all of which ship `model: ""` — builds the same argv it always
