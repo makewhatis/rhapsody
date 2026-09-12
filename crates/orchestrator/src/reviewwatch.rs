@@ -1495,6 +1495,47 @@ mod tests {
         assert!(report.merge.is_empty(), "carol has not reviewed this head");
     }
 
+    /// ⚠️ The ticket bookkeeping, CONFIRMED rather than assumed (STUDIO-874 item 5): a pull request
+    /// this feature merges must land its ticket in Done through STUDIO-712's existing path.
+    ///
+    /// Two ticks, because that is how it really happens: the first clears the gate and hands the
+    /// merge out, and the merge itself writes nothing to the watch set — so the SECOND tick
+    /// observes the pull request as MERGED exactly as it would have observed a human's merge, and
+    /// the auto-Done transition fires on it unchanged. Nothing in the auto-merge path had to know
+    /// about tickets at all, which is the property this pins.
+    #[test]
+    fn a_pull_request_this_feature_merges_lands_its_ticket_in_done() {
+        let mut teams = ticketless_automerge(&["alice", "bob"]);
+        teams.review.done_state = "Done".to_string();
+        let (mut o, _d) = orch(teams);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        run_of(&o, "STUDIO-721");
+
+        // Tick one: the gate clears and the merge is handed to the off-loop half.
+        let first = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        assert_eq!(first.merge.len(), 1, "the merge was proposed");
+        assert!(first.done.is_empty(), "and nothing is Done yet");
+
+        // Tick two, after that merge landed. This is the ONLY thing that changed.
+        let second = o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert_eq!(
+            second.done,
+            vec![crate::reviewdone::ReviewDonePlan {
+                pr: format!("{OWNER}/{REPO}#64"),
+                issue_id: "ID-STUDIO-721".to_string(),
+                team_id: "TEAM-1".to_string(),
+                identifier: "STUDIO-721".to_string(),
+                state: "Done".to_string(),
+            }],
+            "the auto-merged pull request finishes its ticket like any other merge"
+        );
+        assert!(
+            second.merge.is_empty(),
+            "and a merged pull request is never proposed for merging again"
+        );
+    }
+
     // --- load-aware reviewer selection ------------------------------------------------------
 
     /// Acceptance: two review requests in ONE tick pick two different reviewers. This is the load
