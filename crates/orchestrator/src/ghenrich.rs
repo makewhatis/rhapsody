@@ -89,6 +89,138 @@ pub async fn fetch_github_summons(
     }
 }
 
+// ─── the drop nobody was reading (STUDIO-875) ──────────────────────────────────────────────────
+
+/// What one [`apply_github_summons`] pass produced: the enriched issues, and every ticket a hit
+/// could not be attributed to for want of a linked pull request.
+///
+/// The two halves are separated because they have different owners. The enrichment is pure and
+/// belongs to the poll path; the drop report is a MISCONFIGURATION finding, and whether it is worth
+/// saying out loud depends on the ticket's state and on what has already been said — neither of
+/// which this function has. See [`report_unlinked_summons`].
+#[derive(Debug, Default)]
+pub struct SummonApply {
+    /// The issues, enriched exactly as before.
+    pub issues: Vec<Issue>,
+    /// Tickets the polled repo's summons hits could not reach. See [`UnlinkedSummons`].
+    pub unlinked: Vec<UnlinkedSummons>,
+}
+
+/// A ticket that the polled repository's summons hits could not be attributed to, because it has no
+/// unmerged linked pull request there.
+///
+/// This is STUDIO-875's whole signature, and it is the one a reviewer's findings die in: the
+/// comment is posted, the scanner finds it, and the walk over `linked_prs` has nothing to walk. It
+/// fails IDENTICALLY to "the reviewer approved and there is nothing to do" — an idle board with an
+/// open pull request — which is why it cost eleven hours with the information sitting in the log
+/// the whole time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlinkedSummons {
+    /// The ticket, as a human reads it.
+    pub identifier: String,
+    /// Its tracker state, VERBATIM — the caller normalizes before comparing, as every other state
+    /// comparison in the crate does.
+    pub state: String,
+    /// The POLLED REPOSITORY's pull requests with a summons hit this tick, ascending — **not this
+    /// ticket's**, which has none; that is the fault being reported. Named in the warning anyway,
+    /// because on an unlinked ticket they are the only handle an operator has on the comment that
+    /// was dropped, and the field name says whose they are so `STUDIO-900 repo_prs=[154]` cannot be
+    /// read as "154 belongs to STUDIO-900".
+    ///
+    /// Deliberately NOT part of the report memo's key: see [`SummonDropLog`].
+    pub repo_prs: Vec<i64>,
+}
+
+/// Remembers which tickets have already been reported, so the warning fires ONCE per ticket rather
+/// than on every poll.
+///
+/// That is not a nicety. The pre-existing `linked_prs_total=0` line already said this, every ~35
+/// seconds, for eleven hours, and being repeated is exactly why nobody read it — a line that fires
+/// on every tick reads as background, and a misconfiguration reported as background is a
+/// misconfiguration nobody acts on.
+///
+/// # The key is `(repo, ticket)` and nothing else
+///
+/// It is tempting to put [`UnlinkedSummons::repo_prs`] in the key so that "a new dropped summons"
+/// re-reports. Those numbers are not the ticket's, though — the ticket has none, which is the
+/// whole fault — they are every pull request in the POLLED REPOSITORY with a hit this tick, over a
+/// rolling `DEFAULT_GH_LOOKBACK` window (five minutes, `loop.rs`). That set changes
+/// whenever any summons anywhere in the repository lands or ages out, so keying on it re-fired the
+/// warning for EVERY unlinked in-review ticket on traffic that had nothing to do with any of them:
+/// two such tickets and one new summons comment cost four more warnings. The repetition this type
+/// exists to prevent, at WARN instead of DEBUG.
+///
+/// So a ticket is reported once per repository per daemon lifetime. There is deliberately no
+/// re-arm: the only honest one would be time-based, and the operator already has the line. A
+/// restart clears the memo, which is also when a re-report is WANTED, since a restart means
+/// somebody may have changed the configuration.
+///
+/// Deliberately unbounded-in-principle and bounded-in-practice: it grows by one entry per ticket
+/// whose summons is being dropped, which is a population an operator is actively being told to
+/// shrink.
+#[derive(Debug, Default)]
+pub struct SummonDropLog {
+    seen: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl SummonDropLog {
+    /// Whether this ticket's drop has not been reported before for this repository, recording it
+    /// either way.
+    fn claim(&self, repo: &str, drop: &UnlinkedSummons) -> bool {
+        let key = format!("{repo}@{}", drop.identifier);
+        // A poisoned lock is recovered rather than propagated: the worst a lost set costs is a
+        // repeated warning, and panicking the poll path over a log memo would be absurd.
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key)
+    }
+}
+
+/// Warns, at most once per (repository, ticket), about every dropped summons a ticket AWAITING
+/// REVIEW could not be given. Returns how many warnings it emitted (the test seam; production
+/// ignores it). See [`SummonDropLog`] for why the key is that and not the hits.
+///
+/// # Why only a review-state ticket
+///
+/// A ticket with no pull request that nobody has worked yet is not a misconfiguration — it is a
+/// ticket in `Todo`. Warning about every candidate would put the loud line back into the
+/// background it is being rescued from, in a different coat. A ticket sitting in a configured
+/// REVIEW state with no linked pull request, while the repository is producing summons hits, is
+/// the actual fault: it is waiting for exactly the re-engagement that can never arrive.
+///
+/// `review_states` is the caller's already-normalized set, so the state comparison matches every
+/// other one in the crate (`normalize_state` then `contains`).
+pub fn report_unlinked_summons(
+    log: &SummonDropLog,
+    owner: &str,
+    repo: &str,
+    unlinked: &[UnlinkedSummons],
+    review_states: &std::collections::HashSet<String>,
+) -> usize {
+    let slug = format!("{owner}/{repo}");
+    let mut warned = 0usize;
+    for drop in unlinked {
+        if !review_states.contains(&rhapsody_core::normalize_state(&drop.state)) {
+            continue;
+        }
+        if !log.claim(&slug, drop) {
+            continue;
+        }
+        warned += 1;
+        tracing::warn!(
+            issue_identifier = %drop.identifier,
+            repo = %slug,
+            repo_prs = ?drop.repo_prs,
+            state = %drop.state,
+            "github-summons: a summons was found on this repo's pull requests but this ticket has \
+             no linked pull request, so it can never be re-engaged; link the pull request to the \
+             ticket, or connect the repository in the tracker's GitHub integration"
+        );
+    }
+    warned
+}
+
 /// Advances each issue's `latest_summon_at` (max only) — and, in the same update, `latest_summon_body`
 /// so time and body always describe the SAME comment (INF-448) — using a pre-fetched `by_pr` map for
 /// `owner`/`repo`, considering only UNMERGED linked PRs in that repo. Pure (its only side effects are
@@ -104,9 +236,12 @@ pub fn apply_github_summons(
     by_pr: &HashMap<i64, SummonHit>,
     owner: &str,
     repo: &str,
-) -> Vec<Issue> {
+) -> SummonApply {
     if by_pr.is_empty() {
-        return issues;
+        return SummonApply {
+            issues,
+            unlinked: Vec::new(),
+        };
     }
     // STUDIO-574 observability: every drop below is a `continue` with no trace, so a hit that never
     // reaches an issue is invisible. Count each drop REASON and emit one line per call, so
@@ -114,6 +249,11 @@ pub fn apply_github_summons(
     let issue_count = issues.len();
     let (mut linked, mut other_repo, mut merged, mut no_hit, mut matched, mut advanced) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    // The pull requests the hits are ON, named on every drop report so the warning can point at
+    // the comment somebody actually wrote. Sorted for a stable line across polls.
+    let mut hit_prs: Vec<i64> = by_pr.keys().copied().collect();
+    hit_prs.sort_unstable();
+    let mut unlinked: Vec<UnlinkedSummons> = Vec::new();
     for iss in issues.iter_mut() {
         // Clone the PR refs out so the loop can mutate the issue's summon fields without aliasing the
         // `linked_prs` borrow (Go iterates a slice field while assigning sibling fields — legal in Go,
@@ -127,6 +267,10 @@ pub fn apply_github_summons(
         // The distinct repos those PRs DO live in — the operator needs the repo to point the project
         // at, not just the count. Only grows for a foreign PR, which is the rare case.
         let mut iss_pr_repos: Vec<String> = Vec::new();
+        // Whether this issue has ANY pull request a summons on this repo could have reached — an
+        // unmerged one, in the polled repo. STUDIO-875: when it stays false the hits had nowhere to
+        // land on this ticket, and that is a misconfiguration rather than a quiet no-op.
+        let mut iss_reachable = false;
         for pr in &prs {
             // Skip PRs from a different repo — `by_pr` only holds data for owner/repo, so a matching PR
             // number from another repo would falsely advance `latest_summon_at` and trigger a spurious
@@ -145,6 +289,7 @@ pub fn apply_github_summons(
                 merged += 1;
                 continue;
             }
+            iss_reachable = true;
             let Some(hit) = by_pr.get(&pr.number) else {
                 no_hit += 1;
                 continue;
@@ -161,7 +306,8 @@ pub fn apply_github_summons(
         // them can EVER reach this ticket — a routing fault (the ticket's project points at a
         // different repo than its PRs), not a quiet no-op. INFO because it is the one drop reason an
         // operator must act on, and it cannot fire for a correctly-routed ticket.
-        if iss_other_repo > 0 && iss_other_repo == prs.len() {
+        let all_in_another_repo = iss_other_repo > 0 && iss_other_repo == prs.len();
+        if all_in_another_repo {
             tracing::info!(
                 issue_identifier = %iss.identifier,
                 polled_repo = %format!("{owner}/{repo}"),
@@ -169,6 +315,22 @@ pub fn apply_github_summons(
                 linked_prs = prs.len(),
                 "github-summons: issue's linked PRs are all in another repo; summons on them can never re-engage it"
             );
+        }
+        // STUDIO-875: this repo produced summons hits and this ticket has no pull request in it
+        // that one could have reached. Reported rather than logged here, because whether it is
+        // WORTH saying depends on state this pure function does not have — see
+        // [`report_unlinked_summons`].
+        //
+        // NOT reported when STUDIO-574's line above already named this ticket: that one says the
+        // ticket's links are in another repository and names which, which is both truer and more
+        // actionable than "it has no linked pull request". Two lines about one ticket, one of them
+        // wrong, is worse than the single accurate line.
+        if !iss_reachable && !all_in_another_repo {
+            unlinked.push(UnlinkedSummons {
+                identifier: iss.identifier.clone(),
+                state: iss.state.clone(),
+                repo_prs: hit_prs.clone(),
+            });
         }
     }
     // One line per apply pass: `hits > 0` with `matched == 0` is exactly the STUDIO-574 signature,
@@ -186,7 +348,7 @@ pub fn apply_github_summons(
         advanced,
         "github-summons: applied PR summons"
     );
-    issues
+    SummonApply { issues, unlinked }
 }
 
 /// Fetches summons for one repo and applies them — the single-repo convenience used by the legacy
@@ -200,10 +362,13 @@ pub async fn enrich_with_github_summons(
     owner: &str,
     repo: &str,
     since: DateTime<Utc>,
-) -> Vec<Issue> {
+) -> SummonApply {
     match fetch_github_summons(src, owner, repo, since).await {
         Some(by_pr) => apply_github_summons(issues, &by_pr, owner, repo),
-        None => issues,
+        None => SummonApply {
+            issues,
+            unlinked: Vec::new(),
+        },
     }
 }
 
@@ -304,7 +469,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            got[0].latest_summon_at,
+            got.issues[0].latest_summon_at,
             Some(summon),
             "want PR101; PR100 merged must be ignored"
         );
@@ -324,7 +489,7 @@ mod tests {
         let src = FakeSrc::ok(hits(&[(101, older)]));
         let got = enrich_with_github_summons(issues, Some(&src), "o", "r", older).await;
         assert_eq!(
-            got[0].latest_summon_at,
+            got.issues[0].latest_summon_at,
             Some(existing),
             "want unchanged (max only)"
         );
@@ -343,7 +508,7 @@ mod tests {
             enrich_with_github_summons(issues, Some(&src), "o", "r", utc(2026, 6, 25, 12, 0, 0))
                 .await;
         assert!(
-            got[0].latest_summon_at.is_none(),
+            got.issues[0].latest_summon_at.is_none(),
             "error must leave latest_summon_at nil"
         );
     }
@@ -370,7 +535,7 @@ mod tests {
         )
         .await;
         assert!(
-            got[0].latest_summon_at.is_none(),
+            got.issues[0].latest_summon_at.is_none(),
             "cross-repo PR must not advance latest_summon_at"
         );
     }
@@ -399,7 +564,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            got[0].latest_summon_at,
+            got.issues[0].latest_summon_at,
             Some(summon),
             "casing-only mismatch must still advance"
         );
@@ -600,7 +765,7 @@ mod tests {
             let issues = issues.clone();
             async move {
                 let got = apply_github_summons(issues, &by_pr, "studio49dev", "studio-infra");
-                assert_eq!(got[0].latest_summon_at, Some(summon));
+                assert_eq!(got.issues[0].latest_summon_at, Some(summon));
             }
         })
         .await;
@@ -616,6 +781,305 @@ mod tests {
         let f = only(&events, "github-summons: applied PR summons");
         assert_eq!(f.get("matched").map(String::as_str), Some("1"));
         assert_eq!(f.get("advanced").map(String::as_str), Some("1"));
+    }
+
+    // ── the drop nobody was reading (STUDIO-875) ────────────────────────────────────────────────
+    //
+    // The acceptance criterion these pin is the FAILURE branch, not the happy path: a summon hit
+    // that reaches an issue with empty `linked_prs` must be reported, once, naming the ticket and
+    // the pull request. A fix whose failure branch is untested is the same defect again.
+
+    const WARNING: &str = "github-summons: a summons was found on this repo's pull requests but \
+                           this ticket has no linked pull request, so it can never be re-engaged; \
+                           link the pull request to the ticket, or connect the repository in the \
+                           tracker's GitHub integration";
+
+    fn in_review(identifier: &str, prs: Vec<LinkedPRRef>) -> Issue {
+        Issue {
+            identifier: identifier.to_string(),
+            state: "In Review".to_string(),
+            linked_prs: (!prs.is_empty()).then_some(prs),
+            ..Default::default()
+        }
+    }
+
+    fn review_states() -> std::collections::HashSet<String> {
+        crate::testsupport::set_of(&["in review"])
+    }
+
+    fn drops() -> Vec<UnlinkedSummons> {
+        vec![UnlinkedSummons {
+            identifier: "STUDIO-872".to_string(),
+            state: "In Review".to_string(),
+            repo_prs: vec![154],
+        }]
+    }
+
+    /// STUDIO-875's exact shape, from the daemon's own log: `hits=1 … linked_prs_total=0
+    /// matched=0 advanced=0`. The hit is real, the ticket is in the set, and there is nothing to
+    /// match it against.
+    #[test]
+    fn a_hit_against_an_issue_with_no_linked_prs_is_reported() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review("STUDIO-872", vec![])],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert_eq!(
+            got.unlinked,
+            vec![UnlinkedSummons {
+                identifier: "STUDIO-872".to_string(),
+                state: "In Review".to_string(),
+                repo_prs: vec![154],
+            }],
+            "the drop names the ticket AND the pull request the comment is on"
+        );
+        assert_eq!(got.issues[0].latest_summon_at, None, "and nothing advanced");
+    }
+
+    /// The link working is the whole point; a ticket whose pull request IS attached is not a fault.
+    #[test]
+    fn a_linked_issue_is_not_reported() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review(
+                "STUDIO-872",
+                vec![linked("makewhatis", "rhapsody", 154, false)],
+            )],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert!(got.unlinked.is_empty());
+        assert!(got.issues[0].latest_summon_at.is_some(), "it matched");
+    }
+
+    /// A linked pull request with NO summons on it is not a broken link — the ticket is reachable,
+    /// nobody has summoned. Reporting it would be the every-poll noise in a different coat.
+    #[test]
+    fn a_linked_issue_with_no_hit_of_its_own_is_not_reported() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review(
+                "STUDIO-871",
+                vec![linked("makewhatis", "rhapsody", 155, false)],
+            )],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert!(got.unlinked.is_empty());
+    }
+
+    /// A merged attachment is invisible to the walk above it, so it must be invisible here: the
+    /// ticket is, for summons purposes, unlinked.
+    #[test]
+    fn an_issue_whose_only_link_is_merged_is_reported() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review(
+                "STUDIO-872",
+                vec![linked("makewhatis", "rhapsody", 154, true)],
+            )],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert_eq!(got.unlinked.len(), 1);
+    }
+
+    /// STUDIO-574 already names this ticket, and names it better — "its links are all in
+    /// another repo, here is which". Reporting it AGAIN as "it has no linked pull request" would
+    /// put a second, untrue line beside the accurate one.
+    #[test]
+    fn an_issue_whose_links_are_all_in_another_repo_is_left_to_the_line_that_names_it() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review(
+                "STUDIO-872",
+                vec![linked("makewhatis", "tally", 246, false)],
+            )],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert!(got.unlinked.is_empty());
+    }
+
+    /// …but a ticket with SOME link in another repo and nothing reachable here is not covered by
+    /// that line (it only fires when EVERY link is foreign), so it is still reported.
+    #[test]
+    fn an_issue_with_a_foreign_link_and_a_merged_local_one_is_reported() {
+        let by_pr = hits(&[(154, utc(2026, 9, 12, 5, 10, 29))]);
+        let got = apply_github_summons(
+            vec![in_review(
+                "STUDIO-872",
+                vec![
+                    linked("makewhatis", "tally", 246, false),
+                    linked("makewhatis", "rhapsody", 154, true),
+                ],
+            )],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+        );
+        assert_eq!(got.unlinked.len(), 1);
+    }
+
+    /// No hits, no finding: a repo nobody summoned on says nothing about anybody's links.
+    #[test]
+    fn an_empty_hit_map_reports_nothing() {
+        let got = apply_github_summons(
+            vec![in_review("STUDIO-872", vec![])],
+            &HashMap::new(),
+            "makewhatis",
+            "rhapsody",
+        );
+        assert!(got.unlinked.is_empty());
+    }
+
+    /// The acceptance criterion in full: the drop produces a WARNING naming the ticket and the
+    /// pull request — and does it exactly once, however many times the poll comes round. The old
+    /// line said this every ~35 seconds for eleven hours, which is why nobody read it.
+    #[tokio::test]
+    async fn the_warning_names_the_ticket_and_the_pr() {
+        // A fresh memo per pass, because `captured` deliberately runs its closure twice (callsite
+        // warm-up) and the whole point of the memo is that the second pass is silent.
+        let events = captured(|| async {
+            let log = SummonDropLog::default();
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &drops(), &review_states());
+        })
+        .await;
+
+        let f = only(&events, WARNING);
+        assert_eq!(
+            f.get("issue_identifier").map(String::as_str),
+            Some("STUDIO-872")
+        );
+        assert_eq!(
+            f.get("repo").map(String::as_str),
+            Some("makewhatis/rhapsody")
+        );
+        assert_eq!(
+            f.get("repo_prs").map(String::as_str),
+            Some("[154]"),
+            "the repo's hits, named so the dropped comment can be opened"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.message == WARNING)
+                .map(|e| e.level.as_str()),
+            Some("WARN"),
+            "a misconfiguration is a warning, not a debug line"
+        );
+    }
+
+    /// Making it loud is only half the fix: the pre-existing line ALREADY said this, every ~35
+    /// seconds for eleven hours, and being repeated is why nobody read it.
+    #[test]
+    fn the_warning_fires_once_per_ticket_not_every_poll() {
+        let log = SummonDropLog::default();
+        let states = review_states();
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &drops(), &states),
+            1
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                report_unlinked_summons(&log, "makewhatis", "rhapsody", &drops(), &states),
+                0,
+                "the same drop must not be reported on every poll"
+            );
+        }
+    }
+
+    /// A ticket nobody has started has no pull request and no fault; warning about it would put
+    /// the loud line straight back into the background.
+    #[test]
+    fn a_ticket_that_is_not_awaiting_review_is_not_warned_about() {
+        let log = SummonDropLog::default();
+        let drops = vec![UnlinkedSummons {
+            identifier: "STUDIO-900".to_string(),
+            state: "Todo".to_string(),
+            repo_prs: vec![154],
+        }];
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &drops, &review_states()),
+            0
+        );
+    }
+
+    /// The churn the hit-set key could not survive. `UnlinkedSummons::repo_prs` is every pull
+    /// request in the POLLED REPO with a summons hit this tick — not the ticket's, which has none;
+    /// that is the defect — and that set is a rolling `DEFAULT_GH_LOOKBACK` window, so it changes
+    /// on its own as comments age out and as summons land on unrelated pull requests. A key
+    /// carrying those numbers therefore re-fired for EVERY unlinked in-review ticket on every
+    /// change to it, which is the "one line every ~35 seconds" this warning exists to replace,
+    /// wearing a WARN coat.
+    #[test]
+    fn a_changed_repo_hit_set_does_not_re_warn_the_same_ticket() {
+        let log = SummonDropLog::default();
+        let states = review_states();
+        let with = |prs: Vec<i64>| {
+            vec![UnlinkedSummons {
+                repo_prs: prs,
+                ..drops()[0].clone()
+            }]
+        };
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &with(vec![154]), &states),
+            1,
+            "the first drop is said out loud"
+        );
+        for prs in [vec![154, 160], vec![160], vec![160, 161], vec![154]] {
+            assert_eq!(
+                report_unlinked_summons(&log, "makewhatis", "rhapsody", &with(prs), &states),
+                0,
+                "a summons on an unrelated pull request is not news about THIS ticket"
+            );
+        }
+    }
+
+    /// Once per TICKET, and per ticket: the memo must not silence a second unlinked ticket just
+    /// because the first one was reported from the same hit set.
+    #[test]
+    fn every_unlinked_ticket_is_warned_about_once() {
+        let log = SummonDropLog::default();
+        let states = review_states();
+        let two = vec![
+            drops()[0].clone(),
+            UnlinkedSummons {
+                identifier: "STUDIO-900".to_string(),
+                ..drops()[0].clone()
+            },
+        ];
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &two, &states),
+            2
+        );
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &two, &states),
+            0
+        );
+    }
+
+    /// The same ticket in a different repository is a different fault with a different fix, so the
+    /// memo is keyed on both.
+    #[test]
+    fn the_same_ticket_in_another_repository_is_warned_about_in_its_own_right() {
+        let log = SummonDropLog::default();
+        let states = review_states();
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "rhapsody", &drops(), &states),
+            1
+        );
+        assert_eq!(
+            report_unlinked_summons(&log, "makewhatis", "tally", &drops(), &states),
+            1
+        );
     }
 
     /// A minimal claude WORKFLOW with a GitHub repo and github_summons on. Mirrors Go `summonsWF`

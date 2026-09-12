@@ -905,7 +905,18 @@ impl Orchestrator {
         if let (Some(repo_url), Some(src)) = (enrich_repo, self.gh_source.as_deref()) {
             let (owner, repo) = ghsummons::parse_repo(&repo_url).unwrap_or_default();
             let since = self.gh_since();
-            issues = enrich_with_github_summons(issues, Some(src), &owner, &repo, since).await;
+            let applied = enrich_with_github_summons(issues, Some(src), &owner, &repo, since).await;
+            // The legacy path's half of STUDIO-875, against the top-level review states.
+            if let Some(eff) = self.eff.as_ref() {
+                crate::ghenrich::report_unlinked_summons(
+                    &self.summon_drops,
+                    &owner,
+                    &repo,
+                    &applied.unlinked,
+                    &eff.review_states,
+                );
+            }
+            issues = applied.issues;
         }
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
@@ -1005,6 +1016,9 @@ impl Orchestrator {
             gh_summons: bool,
             gh_owner: String,
             gh_repo: String,
+            /// The project's configured review states, already normalized — the population a
+            /// dropped summons is worth warning about (STUDIO-875).
+            review_states: std::collections::HashSet<String>,
         }
         /// One project's resolved GitHub-summons coordinates, kept for the fetch + apply passes
         /// (STUDIO-811). Built only for a project the enrichment gate admits, so its presence in
@@ -1016,6 +1030,9 @@ impl Orchestrator {
             owner: String,
             repo: String,
             group: String,
+            /// See [`ProjPoll::review_states`] — carried through so pass 3 can decide whether a
+            /// dropped summons is a misconfiguration or a ticket nobody has started yet.
+            review_states: std::collections::HashSet<String>,
         }
         let Some(eff) = self.eff.as_ref() else {
             return Vec::new();
@@ -1035,6 +1052,7 @@ impl Orchestrator {
                 gh_summons: p.github_summons,
                 gh_owner: p.gh_owner.clone(),
                 gh_repo: p.gh_repo.clone(),
+                review_states: p.review_states.clone(),
             })
             .collect();
         let src = self.gh_source.as_deref();
@@ -1061,6 +1079,7 @@ impl Orchestrator {
                             owner: p.gh_owner.clone(),
                             repo: p.gh_repo.clone(),
                             group: p.group.clone(),
+                            review_states: p.review_states.clone(),
                         },
                     )
                 })
@@ -1189,10 +1208,18 @@ impl Orchestrator {
                     continue;
                 };
                 let iss = std::mem::take(&mut ti.iss);
-                ti.iss = apply_github_summons(vec![iss], by_pr, &t.owner, &t.repo)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
+                let applied = apply_github_summons(vec![iss], by_pr, &t.owner, &t.repo);
+                // STUDIO-875: a hit this repo produced that reached nothing. Said ONCE per ticket,
+                // and only for a ticket sitting in review — which is the ticket that is waiting for
+                // exactly the re-engagement that can never arrive.
+                crate::ghenrich::report_unlinked_summons(
+                    &self.summon_drops,
+                    &t.owner,
+                    &t.repo,
+                    &applied.unlinked,
+                    &t.review_states,
+                );
+                ti.iss = applied.issues.into_iter().next().unwrap_or_default();
             }
             tagged
         }

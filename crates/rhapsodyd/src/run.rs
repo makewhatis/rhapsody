@@ -717,6 +717,10 @@ where
             sink: Arc::new(rhapsody_orchestrator::reviewintro::ControlIntroSink::new(
                 handle.clone(),
             )),
+            // STUDIO-875: the same handle again, for the Linear attachment the task writes beside
+            // the lookup. It resolves the LIVE tracker on each call (as the findings route-back's
+            // move does), so a reload is picked up without re-wiring the task.
+            linker: Some(Arc::new(handle.clone())),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::reviewintro::run_review_intro_task(intro_ctx, deps, rx).await;
