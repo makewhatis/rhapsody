@@ -103,9 +103,12 @@ waits 45s for the agent to get `./slow.sh` running, walks the ppid tree, kills, 
 In every CLI case the leader dies (`rc=-9`) and the command the agent was actually running does not.
 This is [STUDIO-840](https://linear.app/studio49/issue/STUDIO-840) again one level down: that fix
 put the *harness* in a killable group, and these transcripts show the harness then puts its own
-tool children somewhere else. A stop still leaves real work running, whichever CLI harness is in
-use. Killing the leader's group is therefore not a containment boundary for any **CLI** candidate
-— goose over ACP is the one measured case where it does contain the work.
+tool children somewhere else. A stop that kills only that group leaves real work running, whichever
+CLI harness is in use — which is what [STUDIO-871](https://linear.app/studio49/issue/STUDIO-871)
+then fixed daemon-side: `crates/agent`'s `proctree::kill_tree` signals every process group the
+descendant tree spans, not just the leader's. Killing the leader's group is therefore not a
+containment boundary for any **CLI** candidate — goose over ACP is the one measured case where it
+does contain the work.
 
 **Item 4, concurrency — clean on claude, codex and goose; on opencode the state directory is the
 whole story.**
