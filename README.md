@@ -1228,3 +1228,44 @@ rather than appended to, because the sweep re-observes the same orphan on every 
 ticket is one line, refreshed rather than duplicated, capped at
 `warnings::ORPHANED_REVIEW_WARN_CAP`. The endpoint's shape is unchanged and the two ported producers
 keep their golden ordering ahead of the additions.
+
+### The daemon writes the GitHub attachment its own summons routing reads (STUDIO-875)
+
+Go v0.4.0 only ever READ GitHub attachments. `applyGitHubSummons` attributes a summoning pull-request
+comment to an issue by walking that issue's `linked_prs`, which the tracker builds from the issue's
+GitHub attachments, and the frozen reference assumes Linear's own GitHub integration has written
+them. On a workspace whose repository is not connected in that integration, every issue comes back
+with `attachments: []` — so the walk has nothing to walk, and a review that files findings posts a
+perfectly good token-bearing comment which is then dropped on every poll, forever.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| Who links a pull request to its ticket | the tracker's GitHub integration, or nobody | the integration when it is configured, else the daemon |
+| When | — | at review introduction, off-loop, right after the head-branch lookup resolves the pull request |
+| Mutation | — | `attachmentLinkGitHubPR`, never the generic `attachmentLinkURL` |
+| A hit that reaches no ticket | one `continue` inside a per-tick debug line | one WARNING per ticket, naming the ticket and the pull requests |
+
+**The mutation choice is load-bearing, not cosmetic.** `normalize`'s `isGithubPR` admits an
+attachment only when its `sourceType` is `"github"`, and that field is not caller-supplied — it comes
+from WHICH link mutation created the attachment. A generic `attachmentLinkURL` would create an
+attachment that is visible in Linear, points at the right pull request, and is still invisible to
+`linked_prs`: the original failure wearing a hat.
+
+**A working installation pays nothing.** The gate is decided on the control task, where the
+candidate snapshot lives: a ticket that already carries an UNMERGED linked pull request in the
+repository wants no write at all. A MERGED attachment deliberately does not count, mirroring
+`applyGitHubSummons`' own guard — it skips a merged pull request when attributing, so a ticket whose
+second round of work opens a second pull request must have that one attached in its own right.
+
+**Best-effort, and the word is exact.** A refused link never fails the review introduction or the
+quorum fan-out that was actually asked for. It costs the NEXT summons on that pull request — which
+the next handoff, or the adoption sweep, tries again, and which the warning below names out loud if
+it does not.
+
+**The warning exists because the information already did.** The STUDIO-574 counters had been
+reporting `linked_prs_total=0 … matched=0 advanced=0` every ~35 seconds for eleven hours while three
+pull requests sat with blocking reviews and no running runs. A line that fires on every tick reads
+as background, so the report is now a WARNING, said once per (ticket, pull request) rather than once
+per poll, and only for a ticket sitting in a configured review state — a ticket nobody has started
+has no pull request and no fault, and warning about it would put the loud line straight back into
+the background it is being rescued from.
