@@ -61,12 +61,27 @@ PY
     found=0
     for skill in "$dir"/skills/*/; do
         [ -d "$skill" ] || continue
+        skill="${skill%/}"
         found=$((found + 1))
         [ -f "$skill/SKILL.md" ] || fail "skill '$skill' has no SKILL.md"
-        head -1 "$skill/SKILL.md" | grep -q '^---$' \
-            || fail "$skill/SKILL.md does not open with YAML front matter"
-        grep -q '^description:' "$skill/SKILL.md" \
-            || fail "$skill/SKILL.md has no front-matter 'description:' — it would never trigger"
+        # The `description:` must be in the FRONT MATTER, not merely somewhere in the file: it is
+        # what decides whether the skill ever triggers, and a whole-file grep would be satisfied by
+        # a body line — which the team-setup skill, whose subject is YAML front matter, can easily
+        # grow. Bounded to the block between the opening `---` and its closing delimiter.
+        set +e
+        awk '
+            NR == 1        { if ($0 != "---") { code = 2; done = 1; exit } ; next }
+            $0 == "---"    { code = found ? 0 : 1; done = 1; exit }
+            /^description:/ { found = 1 }
+            END            { if (!done) code = 3; exit code }
+        ' "$skill/SKILL.md"
+        case $? in
+            0) ;;
+            2) set -e; fail "$skill/SKILL.md does not open with YAML front matter" ;;
+            3) set -e; fail "$skill/SKILL.md has an unterminated YAML front-matter block" ;;
+            *) set -e; fail "$skill/SKILL.md has no front-matter 'description:' — it would never trigger" ;;
+        esac
+        set -e
     done
     [ "$found" -gt 0 ] || fail "plugin '$name' ships no skills"
     echo "ok: plugin '$name' -> $dir ($found skill(s)), manifests agree at v$version"
