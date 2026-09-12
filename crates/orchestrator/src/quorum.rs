@@ -294,12 +294,14 @@ pub struct QuorumRequest {
     pub pr_owner: String,
     pub pr_repo: String,
     pub pr_head_branch: String,
-    /// The ticket the resolved pull request should be ATTACHED to in the tracker, or `None` when it
-    /// already carries a link (STUDIO-875; the gate is [`crate::prlink::pr_link_target`]).
+    /// The ticket the resolved pull request should be ATTACHED to in the tracker, with the pull
+    /// requests it already links there (STUDIO-875; the gate is
+    /// [`crate::prlink::link_pr_best_effort`], over what [`crate::prlink::pr_link_target`] carries).
+    /// `None` only when there is no ticket to attach to at all.
     ///
-    /// `Some` here and a non-empty [`pr_url`](Self::pr_url) are mutually exclusive in practice, and
-    /// not by coincidence: the URL is READ off the attachment this field exists to WRITE, so a
-    /// request that has one never wants the other.
+    /// A non-empty [`pr_url`](Self::pr_url) is READ off an attachment this field exists to WRITE,
+    /// so a request that has one is already linked to that pull request — and the off-loop gate
+    /// sees exactly that and writes nothing.
     pub link: Option<crate::prlink::PrLinkTarget>,
     /// The roster identity the handed-off run wore. Excluded from its own review (§0.6: "at least
     /// two OTHER teammates").
@@ -2264,6 +2266,9 @@ mod tests {
             link: Some(crate::prlink::PrLinkTarget {
                 issue_id: "iss-1".into(),
                 identifier: "MT-1".into(),
+                owner: "o".into(),
+                repo: "r".into(),
+                linked: Vec::new(),
             }),
             ..request_without_attachment(&["bob"])
         };

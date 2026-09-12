@@ -1251,11 +1251,20 @@ from WHICH link mutation created the attachment. A generic `attachmentLinkURL` w
 attachment that is visible in Linear, points at the right pull request, and is still invisible to
 `linked_prs`: the original failure wearing a hat.
 
-**A working installation pays nothing.** The gate is decided on the control task, where the
-candidate snapshot lives: a ticket that already carries an UNMERGED linked pull request in the
-repository wants no write at all. A MERGED attachment deliberately does not count, mirroring
-`applyGitHubSummons`' own guard — it skips a merged pull request when attributing, so a ticket whose
-second round of work opens a second pull request must have that one attached in its own right.
+**A working installation pays nothing.** The control task carries the pull-request numbers the
+ticket already links in that repository; the off-loop write is skipped when the number it actually
+resolved is one of them. A connected workspace's attachment IS the resolved pull request, so it
+writes nothing — and a ticket's SECOND pull request is attached in its own right, because it is a
+different number.
+
+The decision is deliberately identity and never the attachment's `merged` flag, which is the shape
+this fix had first. `merged` comes from the attachment's `metadata.status`/`mergedAt`, fields
+maintained by the tracker's GitHub integration — and this whole divergence exists because that
+integration is absent. Where nothing writes attachments, nothing refreshes them either: a link the
+daemon wrote reads `unmerged` forever, including after its pull request merges, and a gate trusting
+it would refuse the ticket's next pull request while `applyGitHubSummons` counted the ticket as
+reachable on the strength of the stale link — the original defect one round later, with the warning
+below blind to it.
 
 **Best-effort, and the word is exact.** A refused link never fails the review introduction or the
 quorum fan-out that was actually asked for. It costs the NEXT summons on that pull request, and it
@@ -1263,6 +1272,10 @@ is retried by whatever next resolves a pull request for that ticket — another 
 adoption sweep. That is deliberately not "every tick", and on the quorum path it is not even every
 handoff (`fan_out` returns at `AlreadyRequestedAtHead` before resolving a tracker), so the backstop
 for a link that never lands is the warning below.
+
+On the quorum path the URL written is `resolve_open_pr`'s result, which falls back to the ticket's
+own attachment when the `gh` lookup fails; that fallback URL came off a link the ticket already has,
+so the worst it produces is a duplicate write, never a link to the wrong pull request.
 
 Nothing depends on Linear de-duplicating the write. The gate above is what keeps a working
 installation silent; a duplicate that got through would give `linked_prs` two equal entries, which

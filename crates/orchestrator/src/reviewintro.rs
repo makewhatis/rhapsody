@@ -132,12 +132,14 @@ pub struct ReviewIntroRequest {
     pub author: String,
     /// The origin tag written onto the watch-set row.
     pub introduced_by: String,
-    /// The ticket this pull request should be ATTACHED to in the tracker, or `None` when it is
-    /// already linked (STUDIO-875; see [`crate::prlink::pr_link_target`] for the gate).
+    /// The ticket this pull request should be ATTACHED to in the tracker, with the pull requests
+    /// it already links there, or `None` when there is no ticket to attach to at all (STUDIO-875;
+    /// see [`crate::prlink::pr_link_target`]).
     ///
     /// Decided here, on the control task, because only here is the candidate snapshot — and with it
-    /// what the ticket already carries — in hand. The off-loop task performs the write, beside the
-    /// lookup that produced the URL, and never at the cost of the introduction itself.
+    /// what the ticket already links — in hand. The off-loop task performs the write, beside the
+    /// lookup that produced the URL, and never at the cost of the introduction itself: only it
+    /// knows WHICH pull request was resolved, which is what "already linked" has to mean.
     pub link: Option<crate::prlink::PrLinkTarget>,
     /// Introduce this pull request ONLY if the watch set holds no row for it at all (STUDIO-838).
     ///
@@ -1597,6 +1599,9 @@ mod tests {
             link: Some(crate::prlink::PrLinkTarget {
                 issue_id: "iss-uuid".to_string(),
                 identifier: "STUDIO-720".to_string(),
+                owner: "makewhatis".to_string(),
+                repo: "rhapsody".to_string(),
+                linked: Vec::new(),
             }),
             ..request()
         }

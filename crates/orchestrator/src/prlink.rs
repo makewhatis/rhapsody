@@ -20,6 +20,21 @@
 //! itself, at the one moment it has both halves in hand: when it has just resolved a pull request
 //! for a ticket, off-loop, on the review-introduction path.
 //!
+//! # What it asks before writing
+//!
+//! Exactly one question, and it is asked of the pull request that was RESOLVED rather than of the
+//! ticket's state: is this pull request already among the ones the ticket links to in this
+//! repository? A healthy installation answers yes — its attachment IS the resolved pull request —
+//! and pays no tracker write at all. Anything else writes. The reason it cannot be the more
+//! obvious "does the ticket have an unmerged link here" is in [`pr_link_target`]: `merged` is
+//! maintained by the tracker's GitHub integration, whose absence is this module's whole premise, so
+//! on the installations that need a link it is a field nothing refreshes.
+//!
+//! On the quorum path the URL handed to the write is [`crate::quorum`]'s `resolve_open_pr` result,
+//! which falls back to the ticket's own attachment when the `gh` lookup fails. That fallback URL
+//! came OFF a link the ticket already has, so the worst it can produce is a duplicate write — never
+//! a link to the wrong pull request.
+//!
 //! # Best-effort, and the word is load-bearing
 //!
 //! A failed link must never fail the thing that was actually asked for — the review introduction,
@@ -42,33 +57,54 @@ use async_trait::async_trait;
 
 use rhapsody_tracker::{Tracker, TrackerError};
 
-/// The ticket a resolved pull request should be attached to.
+/// The ticket a resolved pull request should be attached to, and what that ticket already carries.
 ///
 /// Decided on the control task, where the candidate snapshot lives, so the off-loop task never has
-/// to ask what a ticket already carries. `None` on its `Option<PrLinkTarget>` holder means "nothing
-/// to link" — which is the ordinary case on an installation whose Linear GitHub integration works,
-/// and is why a correctly-configured workspace sees no new Linear writes at all.
+/// to ask what a ticket already carries. `None` on its `Option<PrLinkTarget>` holder means "there
+/// is no ticket to attach to at all" — not "there is nothing to do", which is a question only the
+/// resolved pull request can answer. See [`link_pr_best_effort`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrLinkTarget {
     /// The tracker id the attachment is written against.
     pub issue_id: String,
     /// The human identifier, for the log line. An operator reads `STUDIO-872`, not a UUID.
     pub identifier: String,
+    /// The repository the write is about, so the skip below compares pull requests and not merely
+    /// numbers. Case-folded on comparison, as everywhere else that touches a GitHub coordinate.
+    pub owner: String,
+    pub repo: String,
+    /// The pull-request numbers this ticket ALREADY carries a link to in that repository,
+    /// ascending. Identity, not state: see [`pr_link_target`] for why no `merged` flag appears
+    /// anywhere in this decision.
+    pub linked: Vec<i64>,
 }
 
-/// The link a ticket needs, or `None` when it already has one.
+/// The ticket a pull request could be attached to, and the numbers already attached to it.
 ///
-/// `None` in two cases, and they are different facts that happen to want the same answer:
+/// `None` only when the issue carries no tracker id — nothing to attach to, and nothing a write
+/// could fix. Everything else is carried through to [`link_pr_best_effort`], which is the only
+/// place that knows WHICH pull request was resolved and can therefore tell "already linked" from
+/// "linked to something else".
 ///
-/// * the issue carries no tracker id — nothing to attach to, and nothing a write could fix;
-/// * the issue already carries an UNMERGED linked pull request in this repository. Linear's own
-///   GitHub integration is doing its job here (or a previous link of ours did), so
-///   `apply_github_summons` can already attribute a summons and another write would buy nothing.
+/// # Why the decision is identity and never `merged`
 ///
-/// A MERGED linked pull request deliberately does NOT count, and the asymmetry mirrors
-/// `apply_github_summons`'s own guard: it skips a merged PR when attributing, so a ticket whose
-/// only attachment is a merged pull request is, for summons purposes, unlinked — and a second
-/// round of work on that ticket opens a second pull request that must be attached in its own right.
+/// The obvious gate is the one this function used to apply: skip when the ticket already carries an
+/// UNMERGED linked pull request here, since `apply_github_summons` can already attribute a summons
+/// to it. It reads correctly and it cannot work, because `merged` comes from the attachment's
+/// `metadata.status`/`mergedAt` — fields maintained by the tracker's GitHub integration, whose
+/// ABSENCE is the entire premise of this module. On the installations that need the link, nothing
+/// writes attachments and so nothing refreshes them: a link the daemon wrote reads `unmerged`
+/// forever, including long after its pull request has merged.
+///
+/// That stale `unmerged` would then refuse the ticket's SECOND pull request — the one a second
+/// round of review is about to file findings on — and the drop would be invisible, because
+/// `apply_github_summons` counts the ticket as reachable on the strength of the stale link and
+/// never reports it. This ticket's own bug, one round later, with its own instrument blind to it.
+///
+/// So the question asked is one whose answer this daemon maintains itself: **is the pull request we
+/// just resolved already among the ones this ticket links to?** A healthy installation still pays
+/// zero writes — its attachment IS the resolved pull request — and a stale one links the new pull
+/// request correctly.
 pub(crate) fn pr_link_target(
     iss: &rhapsody_core::Issue,
     owner: &str,
@@ -77,14 +113,23 @@ pub(crate) fn pr_link_target(
     if iss.id.is_empty() {
         return None;
     }
-    // GitHub owner/repo are case-insensitive, and the configured repo URL and a Linear attachment
+    // GitHub owner/repo are case-insensitive, and the configured repo URL and a tracker attachment
     // URL can legitimately differ in casing — the same reason `apply_github_summons` case-folds.
-    let already = iss.linked_prs.iter().flatten().any(|pr| {
-        !pr.merged && pr.owner.eq_ignore_ascii_case(owner) && pr.repo.eq_ignore_ascii_case(repo)
-    });
-    (!already).then(|| PrLinkTarget {
+    let mut linked: Vec<i64> = iss
+        .linked_prs
+        .iter()
+        .flatten()
+        .filter(|pr| pr.owner.eq_ignore_ascii_case(owner) && pr.repo.eq_ignore_ascii_case(repo))
+        .map(|pr| pr.number)
+        .collect();
+    linked.sort_unstable();
+    linked.dedup();
+    Some(PrLinkTarget {
         issue_id: iss.id.clone(),
         identifier: iss.identifier.clone(),
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        linked,
     })
 }
 
@@ -131,10 +176,12 @@ impl PrLinker for crate::stop::ControlHandle {
     }
 }
 
-/// Links `url` to `target`, reporting both outcomes and failing nothing.
+/// Links `url` to `target`, reporting every outcome and failing nothing.
 ///
-/// A `None` target is the configured-workspace case and says nothing; a `None` linker is a daemon
-/// with no tracker to write through, which is worth one debug line and no more.
+/// A `None` target is an issue with no tracker id and says nothing; a `None` linker is a daemon
+/// with no tracker to write through, which is worth one debug line and no more. A `url` the ticket
+/// demonstrably already links to is the configured-workspace case, and is the reason a healthy
+/// installation sees no new tracker writes at all.
 pub(crate) async fn link_pr_best_effort(
     linker: Option<&dyn PrLinker>,
     target: Option<&PrLinkTarget>,
@@ -144,6 +191,20 @@ pub(crate) async fn link_pr_best_effort(
         return;
     };
     if target.issue_id.is_empty() || url.is_empty() {
+        return;
+    }
+    // The skip, and it is deliberately the WEAK direction: only a pull request we can name, in the
+    // repository this target is about, and already among the ticket's links, buys silence. A URL
+    // this daemon cannot parse (or one naming another repository — `resolve_open_pr`'s attachment
+    // fallback can hand one back) falls through and writes, because a duplicate link costs the
+    // tracker's UI one redundant row while a wrong skip costs an author their next review.
+    if let Some(number) = resolved_number(url, &target.owner, &target.repo)
+        && target.linked.contains(&number)
+    {
+        tracing::debug!(
+            issue_identifier = %target.identifier, pr = %url,
+            "pr-link: the ticket already links this pull request, so nothing is written"
+        );
         return;
     }
     let Some(linker) = linker else {
@@ -166,6 +227,17 @@ pub(crate) async fn link_pr_best_effort(
              on it cannot re-engage the author until this succeeds"
         ),
     }
+}
+
+/// The pull-request number `url` names in `owner`/`repo`, or `None` when it names none.
+///
+/// Shares [`crate::teamsears::extract_pr_urls`] with the summons scanner rather than parsing a URL
+/// a second way, so "the pull request this URL is" means one thing across the crate.
+fn resolved_number(url: &str, owner: &str, repo: &str) -> Option<i64> {
+    crate::teamsears::extract_pr_urls(url)
+        .into_iter()
+        .find(|p| p.owner.eq_ignore_ascii_case(owner) && p.repo.eq_ignore_ascii_case(repo))
+        .map(|p| p.number)
 }
 
 #[cfg(test)]
@@ -211,6 +283,9 @@ mod tests {
         PrLinkTarget {
             issue_id: "iss-uuid".into(),
             identifier: "STUDIO-872".into(),
+            owner: "makewhatis".into(),
+            repo: "rhapsody".into(),
+            linked: Vec::new(),
         }
     }
 
@@ -273,43 +348,43 @@ mod tests {
         }
     }
 
-    /// STUDIO-875's population: `attachments: []` on every issue, so every ticket wants a link.
+    /// STUDIO-875's population: `attachments: []` on every issue, so every ticket carries an
+    /// empty link set and every resolved pull request is new to it.
     #[test]
-    fn a_ticket_with_no_linked_pull_request_wants_one() {
+    fn a_ticket_with_no_linked_pull_request_carries_an_empty_link_set() {
         assert_eq!(
             pr_link_target(&issue(vec![]), "makewhatis", "rhapsody"),
             Some(target())
         );
     }
 
-    /// A workspace whose Linear GitHub integration works must cost nothing: the daemon writes no
-    /// attachment for a ticket that already has one.
+    /// What the ticket links in THIS repository, whatever the tracker says about its state: the
+    /// numbers are the gate, and `merged` is a field nothing on these installations maintains.
     #[test]
-    fn a_ticket_that_is_already_linked_wants_nothing() {
-        let iss = issue(vec![linked("makewhatis", "rhapsody", 154, false)]);
-        assert_eq!(pr_link_target(&iss, "makewhatis", "rhapsody"), None);
+    fn the_target_carries_this_repository_s_linked_numbers_whatever_their_state() {
+        let iss = issue(vec![
+            linked("makewhatis", "rhapsody", 157, false),
+            linked("makewhatis", "rhapsody", 154, true),
+        ]);
+        let got = pr_link_target(&iss, "makewhatis", "rhapsody").expect("a target");
+        assert_eq!(got.linked, vec![154, 157], "ascending, merged included");
         assert_eq!(
-            pr_link_target(&iss, "MakeWhatIs", "Rhapsody"),
-            None,
+            pr_link_target(&iss, "MakeWhatIs", "Rhapsody").map(|t| t.linked),
+            Some(vec![154, 157]),
             "GitHub owner/repo are case-insensitive"
         );
     }
 
-    /// The guard is per-repository, exactly as `apply_github_summons`' walk is: an attachment in
-    /// another repository can never attribute a summons in this one.
+    /// The link set is per-repository, exactly as `apply_github_summons`' walk is: an attachment in
+    /// another repository can never attribute a summons in this one, so it can never make this
+    /// repository's pull request "already linked" either.
     #[test]
-    fn a_link_in_another_repository_does_not_count() {
+    fn a_link_in_another_repository_is_not_carried() {
         let iss = issue(vec![linked("makewhatis", "tally", 246, false)]);
-        assert!(pr_link_target(&iss, "makewhatis", "rhapsody").is_some());
-    }
-
-    /// A merged attachment is invisible to `apply_github_summons`, so it must be invisible here
-    /// too — otherwise a ticket's SECOND pull request is never linked and its reviews go nowhere,
-    /// which is the original defect with one extra step in front of it.
-    #[test]
-    fn a_merged_link_does_not_count() {
-        let iss = issue(vec![linked("makewhatis", "rhapsody", 154, true)]);
-        assert!(pr_link_target(&iss, "makewhatis", "rhapsody").is_some());
+        assert_eq!(
+            pr_link_target(&iss, "makewhatis", "rhapsody").map(|t| t.linked),
+            Some(Vec::new())
+        );
     }
 
     /// Nothing to attach to is not a link worth attempting.
@@ -320,5 +395,72 @@ mod tests {
             ..issue(vec![])
         };
         assert_eq!(pr_link_target(&iss, "makewhatis", "rhapsody"), None);
+    }
+
+    // ── the stale-link trap (round 2) ───────────────────────────────────────────────────────────
+    //
+    // These compose the two halves — the control task's gate and the off-loop write — because the
+    // defect they pin lives in neither alone: it is the gate answering a question about a FIELD
+    // NOBODY MAINTAINS on the very installations this module exists for.
+
+    /// The whole change is premised on Linear's GitHub integration being absent, so nothing keeps
+    /// an attachment's `metadata.status` fresh either: a daemon-written link reads `unmerged`
+    /// forever, including after its pull request has merged. A gate that trusted that field would
+    /// refuse to attach the ticket's SECOND pull request — and a reviewer's findings on it would
+    /// be dropped, silently, which is this ticket's own bug one round later.
+    #[tokio::test]
+    async fn a_stale_unmerged_link_does_not_block_the_ticket_s_next_pull_request() {
+        let iss = issue(vec![linked("makewhatis", "rhapsody", 154, false)]);
+        let target = pr_link_target(&iss, "makewhatis", "rhapsody");
+        let l = Recording::new(None);
+        link_pr_best_effort(
+            Some(l.as_ref()),
+            target.as_ref(),
+            "https://github.com/makewhatis/rhapsody/pull/157",
+        )
+        .await;
+        assert_eq!(
+            l.calls(),
+            vec![(
+                "iss-uuid".to_string(),
+                "https://github.com/makewhatis/rhapsody/pull/157".to_string()
+            )],
+            "a link to a DIFFERENT pull request says nothing about this one"
+        );
+    }
+
+    /// A URL the ticket's link set says nothing about writes, and both shapes reach here for real:
+    /// the quorum's `resolve_open_pr` falls back to the ticket's own attachment when the `gh`
+    /// lookup fails, and a malformed URL is always one refusal away. Writing a duplicate costs the
+    /// tracker one redundant row; skipping wrongly costs an author their next review.
+    #[tokio::test]
+    async fn a_pull_request_the_link_set_cannot_speak_for_is_written() {
+        let iss = issue(vec![linked("makewhatis", "rhapsody", 154, false)]);
+        let target = pr_link_target(&iss, "makewhatis", "rhapsody");
+        let l = Recording::new(None);
+        // #154 — the same NUMBER as the ticket's link, in a different repository.
+        link_pr_best_effort(
+            Some(l.as_ref()),
+            target.as_ref(),
+            "https://github.com/makewhatis/tally/pull/154",
+        )
+        .await;
+        link_pr_best_effort(Some(l.as_ref()), target.as_ref(), "not-a-pull-request-url").await;
+        assert_eq!(l.calls().len(), 2, "neither is provably already linked");
+    }
+
+    /// And the other side of the same gate, which is what keeps a healthy installation's Linear
+    /// write count at zero: the ticket's attachment IS the pull request just resolved, so there is
+    /// nothing to write.
+    #[tokio::test]
+    async fn a_ticket_already_linked_to_the_resolved_pull_request_costs_no_write() {
+        let iss = issue(vec![linked("makewhatis", "rhapsody", 154, false)]);
+        let target = pr_link_target(&iss, "makewhatis", "rhapsody");
+        let l = Recording::new(None);
+        link_pr_best_effort(Some(l.as_ref()), target.as_ref(), PR).await;
+        assert!(
+            l.calls().is_empty(),
+            "PR is #154, and #154 is already linked"
+        );
     }
 }

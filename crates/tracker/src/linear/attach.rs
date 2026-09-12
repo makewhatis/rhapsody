@@ -28,8 +28,8 @@
 //!
 //! Linear keys a link attachment on (issue, url), so re-linking a pull request already attached to
 //! the same issue is expected to be a no-op. Nothing here DEPENDS on that: the caller's own gate
-//! (`prlink::pr_link_target` — "this ticket already has an unmerged linked pull request in this
-//! repository") is what keeps a working installation from writing at all, and a duplicate that got
+//! (`prlink::link_pr_best_effort` — "this ticket already links the pull request that was just
+//! resolved") is what keeps a working installation from writing at all, and a duplicate that got
 //! through would give `linked_prs` two equal entries, which the summons walk attributes twice and
 //! advances once. Untidy in Linear's UI, harmless to the routing.
 
