@@ -40,3 +40,10 @@ at edit time, so the failure won't show up until a capture/e2e run tries to invo
   path (`|| true`, so a missing PID isn't fatal). On the hang path nothing inside the script ever
   reaps it — the caller's process-group SIGKILL (the turn-timeout/kill path being exercised) is
   what cleans it up.
+- **`FAKE_CLAUDE_ESCAPE` starts a child the stub's own process group does NOT contain**, which is
+  the entire point of it (STUDIO-871): `set -m` turns job control on so the background job leads a
+  new group, exactly as claude/opencode/codex do to a tool command's shell. Consequences worth
+  knowing: the child outlives the stub on the hang path (only a caller that walks the tree reaps
+  it, which is what the daemon now does), the group it reports is its own pid, and it is the one
+  thing in this stub a plain `kill(-stubpgid)` will not clean up — a test that sets this knob and
+  then leaks is leaking a `sleep 3600` onto the runner, so assert on the reported group.
