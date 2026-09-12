@@ -76,6 +76,11 @@ pub const MERGE_STATE_CLEAN: &str = "CLEAN";
 /// [`NON_BLOCKING_CHECKS`].
 const CHECK_SUCCESS: &str = "SUCCESS";
 
+/// The one conclusion an entry can carry and still be SUPERSEDED by a green sibling of its own
+/// name. Named for the same reason as [`CHECK_SUCCESS`]: [`blocking_check`] asks about it
+/// specifically, and the rescue is deliberately this narrow.
+const CHECK_CANCELLED: &str = "CANCELLED";
+
 /// Check conclusions that do not BLOCK a merge.
 ///
 /// `SKIPPED` and `NEUTRAL` are non-failures — a path-filtered job reports one and would otherwise
@@ -230,16 +235,31 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
 /// check was cancelled" and refuses a pull request GitHub reports `CLEAN`, forever, on every tick.
 /// Two of this repository's four open pull requests carried such an entry when this was written.
 ///
-/// The rule is deliberately the NARROW one: a non-green entry is superseded only by a
-/// [`CHECK_SUCCESS`] entry of the SAME name at the same head. So a check that was cancelled and
-/// never re-ran — no green sibling — still blocks, which is why `CANCELLED` is not simply added to
-/// [`NON_BLOCKING_CHECKS`]. That would be the fail-open direction; this is not.
+/// The rule is narrow in BOTH of its halves, and each half is a separate fail-open door held shut.
 ///
-/// What makes admitting the superseded entry safe at all is that the rollup is keyed to ONE commit:
-/// every entry in it, green or not, ran against the head about to be merged. So a SUCCESS sibling
-/// is evidence that this check name passed on exactly this code — not on an earlier push, which is
-/// the confusion a stale verdict would be. The head itself is pinned twice over, by the equality
-/// above and by `--match-head-commit` on the merge.
+/// The rescuing entry must be a [`CHECK_SUCCESS`] of the SAME name at the same head. So a check
+/// that was cancelled and never re-ran — no green sibling — still blocks, which is why `CANCELLED`
+/// is not simply added to [`NON_BLOCKING_CHECKS`].
+///
+/// The rescued entry must be [`CHECK_CANCELLED`], the one conclusion that means this run produced
+/// NO verdict on this head. That restriction is the whole safety argument, because the rollup is
+/// keyed to ONE commit: every entry in it ran against the head about to be merged, so a SUCCESS
+/// sibling is evidence that the name passed on exactly this code — but a `FAILURE` sibling is
+/// exactly as much evidence that the same name FAILED on exactly this code, and [`CheckRun`]
+/// carries no timestamp with which to tell which of the two ran later. Preferring the green one on
+/// that tie is a choice, and it is the fail-open choice; everywhere else this module meets the same
+/// uncertainty — an empty rollup, an unreadable lookup, a `mergeStateStatus` it does not know — it
+/// refuses. So `FAILURE`, `TIMED_OUT` and `ACTION_REQUIRED` are never superseded, and neither is a
+/// still-running `IN_PROGRESS`/`QUEUED`/`PENDING` entry, whose verdict simply has not arrived yet.
+///
+/// Narrowing to `CANCELLED` costs nothing real, because a re-run REPLACES a check run rather than
+/// appending one: a job re-run to green leaves one entry for its name, not a stale red beside it.
+/// `cancel-in-progress` is the only thing in this repository that strands an entry at all.
+///
+/// This matters most for the checks branch protection does NOT require — `pr-title` and `boot-e2e`
+/// are not required contexts here, so `mergeStateStatus` stays CLEAN while either is red and this
+/// read is the only gate on them. The head itself is pinned twice over, by the equality above and
+/// by `--match-head-commit` on the merge.
 ///
 /// Quadratic in the rollup's length, which is a handful of entries per head: a map keyed by name
 /// would cost an allocation to save nothing measurable, and this way the entry REPORTED is the
@@ -247,9 +267,10 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
 fn blocking_check(checks: &[CheckRun]) -> Option<&CheckRun> {
     checks.iter().find(|c| {
         !NON_BLOCKING_CHECKS.contains(&c.state.as_str())
-            && !checks
-                .iter()
-                .any(|sibling| sibling.name == c.name && sibling.state == CHECK_SUCCESS)
+            && !(c.state == CHECK_CANCELLED
+                && checks
+                    .iter()
+                    .any(|sibling| sibling.name == c.name && sibling.state == CHECK_SUCCESS))
     })
 }
 
@@ -786,6 +807,53 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .is_empty(),
                 "{rollup:?}"
+            );
+        }
+    }
+
+    /// The limit of the rescue, and the direction that is fail-OPEN if it is drawn too wide: a
+    /// green sibling clears a CANCELLED entry only. An entry that reached a VERDICT of its own —
+    /// `FAILURE`, `TIMED_OUT`, `ACTION_REQUIRED` — or that is still deciding — `IN_PROGRESS`,
+    /// `QUEUED` — is not superseded by anything, because the rollup carries no timestamp and a
+    /// green sibling is exactly as much evidence that the name passed as the failing entry is that
+    /// it failed. Reachable here rather than theoretical: `pr-title` runs on `edited` on purpose,
+    /// so retitling an at-head pull request to something release-please cannot parse leaves
+    /// `pr-title=SUCCESS` (the old title) beside `pr-title=FAILURE` (the new one) — and `pr-title`
+    /// is not a required context, so `mergeStateStatus` stays CLEAN and this read is the only gate
+    /// on it. Merging there writes an unparseable subject onto `main`, which is STUDIO-408.
+    #[tokio::test]
+    async fn a_green_sibling_does_not_clear_an_entry_that_judged_this_head() {
+        let states = ["FAILURE", "IN_PROGRESS", "TIMED_OUT", "ACTION_REQUIRED"];
+        for state in states {
+            let rollup: &[(&str, &str)] = &[
+                ("lint", "SUCCESS"),
+                ("test", "SUCCESS"),
+                ("web", "SUCCESS"),
+                ("boot-e2e", "SUCCESS"),
+                ("desktop", "SUCCESS"),
+                ("pr-title", "SUCCESS"),
+                ("pr-title", state),
+            ];
+            let merger = Arc::new(FakeMerger::default());
+            let d = deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                checks(rollup),
+                Arc::clone(&merger),
+            );
+
+            assert_eq!(
+                perform_auto_merge(&plan(), &d).await,
+                AutoMergeOutcome::Declined("a check is failing or has not finished"),
+                "{state}"
+            );
+            assert!(
+                merger
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty(),
+                "{state}"
             );
         }
     }
