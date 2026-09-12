@@ -1,0 +1,9 @@
+
+    __( O)>  ● new session · openai gpt-4o-mini
+   \____)    20260912_1 · /private/tmp/studio869-r2/goose-fail
+     L L     goose is ready
+
+error: Ran into this error: Authentication error: Authentication failed for https://api.openai.com/v1/chat/completions. Status: 401 Unauthorized. Response: Incorrect API key provided: sk-BOGUSKEY. You can find your API key at https://platform.openai.com/account/api-keys..
+
+Please retry if you think this is a transient or recoverable error.
+

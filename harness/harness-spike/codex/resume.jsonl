@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a09304-4059-7691-8aa6-932134044fac"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `accounts/fireworks/models/deepseek-v4p1-flash` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"8"}}
+{"type":"turn.completed","usage":{"input_tokens":79682,"cached_input_tokens":64966,"cache_write_input_tokens":0,"output_tokens":614,"reasoning_output_tokens":0}}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "symphony": {
+      "type": "local",
+      "enabled": true,
+      "command": ["/Applications/Rhapsody.app/Contents/Resources/rhapsodyd","mcp","/Users/david/.rhapsody/WORKFLOW.md"]
+    }
+  }
+}

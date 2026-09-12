@@ -1,0 +1,1 @@
+Use your shell/bash tool to run the command `./slow.sh` in the current directory and report its output. It takes about two minutes; wait for it.
