@@ -13,8 +13,8 @@
 //! handler rather than earlier.
 
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventQuery, EventRow, RunFilter, RunMessage, RunSummary,
-    StoreError,
+    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ReviewWatchRow, RunFilter, RunMessage,
+    RunSummary, StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -52,6 +52,14 @@ pub trait HistoryStore: Send + Sync {
     /// A run's operator messages with their delivery status, oldest first
     /// (`GET /api/v1/runs/{id}/messages`, INF-250). Mirrors Go `ListRunMessages`.
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError>;
+    /// The whole ticketless-review watch set — the only record of WHICH TICKET each review run is
+    /// reviewing, which the issue listing joins onto its `pr:` rows (STUDIO-834). Rhapsody-only;
+    /// Go has no review feature at all.
+    ///
+    /// [`rhapsody_store::Store::load_review_watch`] rather than its live-only sibling on purpose: a
+    /// retirement is a soft delete, so a merged pull request's row survives, and the run it
+    /// produced stays in this listing long after the watcher has stopped caring about it.
+    fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
 }
 
 /// Every thread-safe [`rhapsody_store::Store`] is a [`HistoryStore`] — the Rust analog of Go's
@@ -92,5 +100,8 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     }
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError> {
         rhapsody_store::Store::list_run_messages(self, run_id)
+    }
+    fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
+        rhapsody_store::Store::load_review_watch(self)
     }
 }

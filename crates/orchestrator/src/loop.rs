@@ -468,6 +468,8 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         stack_context: String::new(),
         capabilities_section: String::new(),
         teammate_section: String::new(),
+        // Per-dispatch, like `teammate_section` above: `spawn_worker` stamps the routed teammate's.
+        model_override: rhapsody_agent::ModelOverride::default(),
         pr_label: eff.pr_label.clone(),
         // Per-dispatch, like `stack_context` above: `spawn_worker` stamps the dispatched run's id.
         run_id: 0,
@@ -1329,9 +1331,10 @@ impl Orchestrator {
     // The signature mirrors Go's flat `spawnWorker(wctx, iss, attempt, projectSlug, stackContext,
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
-    // STUDIO-643 threads `teammate_section` identically, and STUDIO-675 threads `run_id` — which Go
-    // carries on `WorkerDeps` proper. Bundling these into a struct would diverge from the Go parity
-    // shape for no behavioral gain.
+    // STUDIO-643 threads `teammate_section` identically, STUDIO-675 threads `run_id` — which Go
+    // carries on `WorkerDeps` proper — and STUDIO-868 threads `model_override` beside the section it
+    // was resolved with. Bundling these into a struct would diverge from the Go parity shape for no
+    // behavioral gain.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_worker(
         &self,
@@ -1342,6 +1345,7 @@ impl Orchestrator {
         stack_context: String,
         capabilities_section: String,
         teammate_section: String,
+        model_override: rhapsody_agent::ModelOverride,
         run_id: i64,
         started_at: DateTime<Utc>,
         review: Option<crate::review::ReviewCheckout>,
@@ -1356,6 +1360,10 @@ impl Orchestrator {
         deps.stack_context = stack_context;
         deps.capabilities_section = capabilities_section;
         deps.teammate_section = teammate_section;
+        // The routed teammate's profile model/effort, which the worker lands on the session before
+        // its first turn (STUDIO-868). Empty leaves the runner's own `claude.model`/`effort` in
+        // place, so a dispatch that routed to nobody is byte-identical to today.
+        deps.model_override = model_override;
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
         // its `teams_post` / `teams_retain` can resolve WHICH run is speaking (STUDIO-675).
         deps.run_id = run_id;

@@ -564,10 +564,37 @@ pub(crate) struct TeamsDispatch {
     /// The turn-1 prepend. Empty ⇒ the `if !x.is_empty()` guard in
     /// `build_turn_prompt` skips it and the prompt is byte-identical (§2.4 row 5).
     pub section: String,
+    /// The model/effort the routed identity's profile asks for (STUDIO-868). Empty — the case for
+    /// every built-in profile and for every installation with no `teams/profiles/` directory — means
+    /// inherit the installation-wide `claude.model` / `claude.effort`.
+    pub model_override: rhapsody_agent::ModelOverride,
     /// [`EVENT_ROUTE`] or [`EVENT_UNROUTED`].
     pub kind: &'static str,
     /// The event text: the reason, and the identity when there is one.
     pub text: String,
+}
+
+/// What resolving a routed identity's profile yields: the turn-1 prompt section and the
+/// model/effort that profile asks for (STUDIO-868). Both come from ONE `profiles::resolve` call, so
+/// a run's prompt and its model can never disagree about which profile they came from.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedTeammate {
+    /// The turn-1 prepend; empty drops the section (§2.4 row 5).
+    section: String,
+    /// Empty ⇒ inherit the installation-wide `claude.model` / `claude.effort`.
+    model_override: rhapsody_agent::ModelOverride,
+}
+
+impl ResolvedTeammate {
+    /// A section with no model override: the identity named no profile, or there is no runtime home
+    /// to resolve one against. The run is genuinely worked as that identity; there is simply no
+    /// profile to take a model from.
+    fn section_only(section: String) -> ResolvedTeammate {
+        ResolvedTeammate {
+            section,
+            model_override: rhapsody_agent::ModelOverride::default(),
+        }
+    }
 }
 
 impl Orchestrator {
@@ -598,16 +625,30 @@ impl Orchestrator {
             return Some(TeamsDispatch {
                 identity: String::new(),
                 section: String::new(),
+                model_override: rhapsody_agent::ModelOverride::default(),
                 kind: EVENT_UNROUTED,
                 text: format!("reason={}", routed.reason.as_str()),
             });
         };
-        let section = self.teammate_section_for(teams, &identity, iss);
+        let resolved = self.teammate_profile_for(teams, &identity, iss);
+        // Observability (§4): the routing decision's own events row is where an operator sees which
+        // model a run ACTUALLY got, now that it varies per teammate. Appended, never prefixed, so
+        // `triage::route_event_identity` (which reads the first whitespace token) still parses — and
+        // omitted entirely when the profile names nothing, which keeps the row byte-identical for an
+        // installation with no profiles.
+        let mut text = format!("identity={identity} reason={}", routed.reason.as_str());
+        if !resolved.model_override.model.is_empty() {
+            text.push_str(&format!(" model={}", resolved.model_override.model));
+        }
+        if !resolved.model_override.effort.is_empty() {
+            text.push_str(&format!(" effort={}", resolved.model_override.effort));
+        }
         Some(TeamsDispatch {
             kind: EVENT_ROUTE,
-            text: format!("identity={identity} reason={}", routed.reason.as_str()),
+            text,
             identity,
-            section,
+            section: resolved.section,
+            model_override: resolved.model_override,
         })
     }
 
@@ -793,7 +834,7 @@ impl Orchestrator {
     /// a profile that failed to resolve drops the whole section, memory
     /// included, because a bare wall of recalled facts with no identity header
     /// is not a section anyone asked for.
-    fn teammate_section_for(&self, teams: &Teams, identity: &str, iss: &Issue) -> String {
+    fn teammate_profile_for(&self, teams: &Teams, identity: &str, iss: &Issue) -> ResolvedTeammate {
         let profile = teams
             .roster
             .iter()
@@ -802,17 +843,40 @@ impl Orchestrator {
             .unwrap_or_default();
         // This identity names no profile: the header alone.
         if profile.is_empty() {
-            return self.composed(teammate_section(identity, ""), teams, identity, iss);
+            return ResolvedTeammate::section_only(self.composed(
+                teammate_section(identity, ""),
+                teams,
+                identity,
+                iss,
+            ));
         }
         // Nowhere to resolve one from: the header alone. `teams_profiles_dir` is
         // `None` only when the daemon has no on-disk runtime home, which is also
         // the only way `self.teams` could have been set without one — in
         // production the two are resolved together at boot.
         let Some(dir) = self.teams_profiles_dir.as_ref() else {
-            return self.composed(teammate_section(identity, ""), teams, identity, iss);
+            return ResolvedTeammate::section_only(self.composed(
+                teammate_section(identity, ""),
+                teams,
+                identity,
+                iss,
+            ));
         };
+        // Local files only — `profiles::resolve` reads `<dir>/<name>.md` and the compiled-in
+        // built-ins, and creates nothing. That is what keeps the control task's no-I/O-over-the-
+        // network property intact now that the dispatch reads a model from here (STUDIO-868, §2).
         match rhapsody_config::profiles::resolve(dir, &profile) {
-            Ok(p) => self.composed(teammate_section(identity, &p.prompt), teams, identity, iss),
+            Ok(p) => ResolvedTeammate {
+                section: self.composed(teammate_section(identity, &p.prompt), teams, identity, iss),
+                // Empty means INHERIT the installation-wide `claude.model` / `claude.effort`, which
+                // is every built-in profile and so every teammate on an installation that has not
+                // written one (STUDIO-868).
+                model_override: rhapsody_agent::ModelOverride {
+                    identity: identity.to_string(),
+                    model: p.model,
+                    effort: p.effort,
+                },
+            },
             Err(e) => {
                 tracing::error!(
                     identity = %identity,
@@ -822,7 +886,9 @@ impl Orchestrator {
                     "teams profile failed to resolve; dispatching this run WITHOUT the teammate \
                      section (a broken profile must not block work)"
                 );
-                String::new()
+                // No section AND no model: a profile that could not be read has named neither, so
+                // the run inherits the global model rather than a half-resolved one.
+                ResolvedTeammate::default()
             }
         }
     }
@@ -2846,5 +2912,180 @@ mod tests {
 
         o.dispatch_issue(with_labels(&["docs"]), None, None, String::new());
         assert_eq!(o.running["1"].identity, "");
+    }
+
+    // ── Per-teammate model/effort (STUDIO-868) ──────────────────────────────────────────────────
+
+    /// Writes a profile file under the orchestrator's profiles dir, creating the dir.
+    fn write_profile(dir: &crate::testsupport::TempDir, name: &str, text: &str) {
+        let p = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&p).expect("create profiles dir");
+        std::fs::write(p.join(format!("{name}.md")), text).expect("write profile");
+    }
+
+    /// **The STUDIO-868 acceptance criterion, dispatch side.** Two teammates whose profiles name
+    /// different model/effort dispatch with different overrides — alice and jerry stop being the
+    /// same engineer.
+    #[test]
+    fn two_teammates_dispatch_with_their_own_profile_model_and_effort() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: strong-model\neffort: xhigh\n---\nStaff.\n",
+        );
+        write_profile(
+            &dir,
+            "swe1",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nSWE I.\n",
+        );
+        let mut teams = teams_with(vec![
+            ident("alice", &["rust"], 0),
+            ident("jerry", &["go"], 0),
+        ]);
+        teams.roster[0].profile = "staff".to_string();
+        teams.roster[1].profile = "swe1".to_string();
+        let (mut o, _) = orch_with_teams(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        o.dispatch_issue(
+            Issue {
+                labels: Some(vec!["go".to_string()]),
+                ..issue("2", "MT-2", "Todo")
+            },
+            None,
+            None,
+            String::new(),
+        );
+
+        assert_eq!(o.running["1"].identity, "alice");
+        assert_eq!(o.running["2"].identity, "jerry");
+        assert_eq!(
+            o.running["1"].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "strong-model".to_string(),
+                effort: "xhigh".to_string(),
+            }
+        );
+        assert_eq!(
+            o.running["2"].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "jerry".to_string(),
+                model: "cheap-model".to_string(),
+                effort: "low".to_string(),
+            }
+        );
+    }
+
+    /// A teammate whose profile leaves model/effort empty INHERITS: the dispatch carries no
+    /// override at all, so the session keeps the installation-wide pair. Every built-in profile
+    /// (`swe`, `reviewer`, `sre`) is this case, which is why nothing changes for anyone until a
+    /// profile sets a value.
+    #[test]
+    fn a_profile_naming_neither_value_dispatches_with_no_override() {
+        let dir = crate::testsupport::TempDir::new();
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.roster[0].profile = "swe".to_string();
+        let (mut o, _) = orch_with_teams(teams);
+        // The directory does not exist: `swe` resolves to the built-in, which ships `model: ""`.
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+
+        assert_eq!(o.running["1"].identity, "alice", "still routed");
+        assert!(
+            o.running["1"].model_override.is_empty(),
+            "an empty profile must contribute no override: {:?}",
+            o.running["1"].model_override
+        );
+    }
+
+    /// An installation with NO profiles directory at all — which is what this one is — behaves
+    /// exactly as it does now: routed, sectioned, and inheriting the global model.
+    #[test]
+    fn an_installation_with_no_profiles_directory_dispatches_with_no_override() {
+        let teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o, _) = orch_with_teams(teams);
+        assert!(o.teams_profiles_dir.is_none(), "no runtime home at all");
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        assert!(
+            o.running["1"].model_override.is_empty(),
+            "{:?}",
+            o.running["1"].model_override
+        );
+    }
+
+    /// A profile that fails to resolve must not block work — and must not smuggle a half-resolved
+    /// model onto the run either. The existing behaviour (no section, still routed) is unchanged.
+    #[test]
+    fn an_unresolvable_profile_contributes_no_override() {
+        let dir = crate::testsupport::TempDir::new();
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.roster[0].profile = "no-such-profile".to_string();
+        let (mut o, _) = orch_with_teams(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+
+        assert_eq!(o.running["1"].identity, "alice", "the run is still routed");
+        assert!(
+            o.running["1"].model_override.is_empty(),
+            "{:?}",
+            o.running["1"].model_override
+        );
+    }
+
+    /// **Observability (STUDIO-868 §4).** Once the model varies per teammate, the `teams.route`
+    /// events row — the per-run record of the routing decision — names the model that run actually
+    /// resolved. A run that inherits adds nothing, so the row stays byte-identical for every
+    /// installation with no profiles.
+    #[test]
+    fn the_route_event_names_a_resolved_model_and_stays_unchanged_without_one() {
+        let dir = crate::testsupport::TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: strong-model\neffort: xhigh\n---\nStaff.\n",
+        );
+        let mut teams = teams_with(vec![ident("alice", &["rust"], 0)]);
+        teams.roster[0].profile = "staff".to_string();
+        let (mut o, store) = orch_with_teams(teams);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        o.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let run_id = o.running["1"].run_id;
+        flush_events(&mut o);
+        assert_eq!(
+            events_of(store.as_ref(), run_id),
+            vec![(
+                "teams.route".to_string(),
+                "identity=alice reason=label_overlap model=strong-model effort=xhigh".to_string()
+            )]
+        );
+
+        // And the inheriting case is byte-identical to what the row said before STUDIO-868.
+        let plain = teams_with(vec![ident("alice", &["rust"], 0)]);
+        let (mut o2, store2) = orch_with_teams(plain);
+        o2.dispatch_issue(with_labels(&["rust"]), None, None, String::new());
+        let run2 = o2.running["1"].run_id;
+        flush_events(&mut o2);
+        assert_eq!(
+            events_of(store2.as_ref(), run2),
+            vec![(
+                "teams.route".to_string(),
+                "identity=alice reason=label_overlap".to_string()
+            )]
+        );
+    }
+
+    /// `route_event_identity` reads the FIRST whitespace token, so the appended model/effort must
+    /// not cost the lifecycle reconstruction its identity parse.
+    #[test]
+    fn the_identity_parse_survives_the_appended_model_fields() {
+        assert_eq!(
+            crate::triage::route_event_identity(
+                "identity=alice reason=label_overlap model=strong-model effort=xhigh"
+            ),
+            Some("alice".to_string())
+        );
     }
 }

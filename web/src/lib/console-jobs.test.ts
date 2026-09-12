@@ -17,6 +17,7 @@ import {
   mateStates,
   needsOperator,
   relativeSince,
+  reviewOfTickets,
   reviewRunIssues,
   reviewTicketIssues,
   statusNote,
@@ -214,6 +215,44 @@ describe("reviewRunIssues", () => {
 
   it("ignores a row with no key", () => {
     expect(reviewRunIssues([issueRow({ issue_identifier: "", review_run: true })]).size).toBe(0);
+  });
+});
+
+describe("reviewOfTickets", () => {
+  // STUDIO-834 — both ticket-bearing origins, and `adopt:` is not the afterthought: every review
+  // row on the operator's install when this landed was an adoption (STUDIO-838). Nothing here can
+  // tell the two apart, and that is the point — the daemon parses `introduced_by` with the one
+  // reader the orchestrator moves tickets by, and serves the answer.
+  it("collects the ticket each review row is reviewing", () => {
+    const got = reviewOfTickets([
+      issueRow({
+        issue_identifier: "pr:makewhatis/rhapsody#147@alice",
+        review_run: true,
+        review_of: "STUDIO-839",
+      }),
+      issueRow({
+        issue_identifier: "pr:makewhatis/rhapsody#145@jimmy",
+        review_run: true,
+        review_of: "STUDIO-838",
+      }),
+      issueRow({ issue_identifier: "STUDIO-712" }),
+    ]);
+    expect([...got]).toEqual([
+      ["pr:makewhatis/rhapsody#147@alice", "STUDIO-839"],
+      ["pr:makewhatis/rhapsody#145@jimmy", "STUDIO-838"],
+    ]);
+  });
+
+  // A review whose origin names no ticket — an operator introduced the pull request, or its watch
+  // row is gone — is SKIPPED rather than mapped to "", exactly as `durableAssignees` skips a row
+  // with no assignee: an absent key is what makes the row fall back to the key it already showed.
+  it("skips a row the daemon could not resolve", () => {
+    const got = reviewOfTickets([
+      issueRow({ issue_identifier: "pr:acme/x#1@alice", review_run: true }),
+      issueRow({ issue_identifier: "pr:acme/x#2@alice", review_run: true, review_of: "" }),
+      issueRow({ issue_identifier: "", review_run: true, review_of: "STUDIO-1" }),
+    ]);
+    expect(got.size).toBe(0);
   });
 });
 
@@ -880,6 +919,41 @@ describe("a page of ticketless review jobs", () => {
     NOW,
   );
   const row = (issue: string) => rows.find((r) => r.issue === issue);
+
+  // STUDIO-834 — the row says WHICH TICKET it is reviewing. `pr:makewhatis/rhapsody#135@jimmy`
+  // names the repository, the number and the reviewer; the operator asked which work it is, and
+  // that answer only ever arrives as `review_of`. A row the daemon could not resolve keeps "", and
+  // the table then leads with the `pr:` key exactly as it did before the field existed.
+  it("carries the ticket each review job is of", () => {
+    const withTickets = buildConsoleJobs(
+      [
+        job({ issue: "pr:makewhatis/rhapsody#135@jimmy", status: "completed" }),
+        job({ issue: "pr:makewhatis/rhapsody#136@alice", status: "completed" }),
+        job({ issue: "STUDIO-712", status: "completed" }),
+      ],
+      [
+        issueRow({
+          issue_identifier: "pr:makewhatis/rhapsody#135@jimmy",
+          review_run: true,
+          review_of: "STUDIO-696",
+        }),
+        issueRow({ issue_identifier: "pr:makewhatis/rhapsody#136@alice", review_run: true }),
+        issueRow({ issue_identifier: "STUDIO-712", lifecycle: "in_review" }),
+      ],
+      undefined,
+      NOW,
+    );
+    const at = (issue: string) => withTickets.find((r) => r.issue === issue);
+    expect(at("pr:makewhatis/rhapsody#135@jimmy")?.reviewOf).toBe("STUDIO-696");
+    expect(at("pr:makewhatis/rhapsody#136@alice")?.reviewOf).toBe("");
+    // The route target is untouched: the row still opens the RUN it shows, which is keyed by the
+    // `pr:` key and not by the ticket being reviewed.
+    expect(at("pr:makewhatis/rhapsody#135@jimmy")?.issue).toBe(
+      "pr:makewhatis/rhapsody#135@jimmy",
+    );
+    // An ordinary ticket never carries one, whatever the daemon sent.
+    expect(at("STUDIO-712")?.reviewOf).toBe("");
+  });
 
   it("paints the pill each review job's own run earned", () => {
     expect(row("pr:makewhatis/rhapsody#137@alice")?.statusLabel).toBe("reviewing");
