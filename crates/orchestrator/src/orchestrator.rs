@@ -102,6 +102,19 @@ pub struct RunningEntry {
     /// `capabilities_section` behaves.
     pub teammate_section: String,
 
+    /// The model/effort this run's routed teammate's PROFILE asks for, resolved at dispatch from the
+    /// same `profiles::resolve` call that produced `teammate_section` (STUDIO-868). Empty when Teams
+    /// is off, when nobody was routed, when the profile failed to resolve, or — the common case —
+    /// when the profile names neither, in which case the run inherits the installation-wide
+    /// `claude.model` / `claude.effort` and its argv is byte-identical to today.
+    ///
+    /// **In memory only**, exactly as `identity` is: the `runs` table is frozen here, and a durable
+    /// `runs.model` column arrives with the pluggable-harnesses design's §6.2
+    /// (`~/.rhapsody/docs/pluggable-harnesses-design.md`), which wants `harness` / `model` /
+    /// `provider` / `session_uuid` together. The per-run record meanwhile is the `teams.route`
+    /// events row, which names the model it resolved.
+    pub model_override: rhapsody_agent::ModelOverride,
+
     /// The `latest_summon_at` of the most recent mid-run summons already delivered to this run's
     /// mailbox (INF-448). The poll-side router delivers a summons only when it is strictly after BOTH
     /// `started_at` and this watermark, then advances it — so a stable summons is injected at most
@@ -183,6 +196,7 @@ impl RunningEntry {
             capabilities_section: String::new(),
             identity: String::new(),
             teammate_section: String::new(),
+            model_override: rhapsody_agent::ModelOverride::default(),
             last_delivered_summon_at: zero_time(),
             review: None,
             thread_id: String::new(),

@@ -468,6 +468,8 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         stack_context: String::new(),
         capabilities_section: String::new(),
         teammate_section: String::new(),
+        // Per-dispatch, like `teammate_section` above: `spawn_worker` stamps the routed teammate's.
+        model_override: rhapsody_agent::ModelOverride::default(),
         pr_label: eff.pr_label.clone(),
         // Per-dispatch, like `stack_context` above: `spawn_worker` stamps the dispatched run's id.
         run_id: 0,
@@ -1342,6 +1344,7 @@ impl Orchestrator {
         stack_context: String,
         capabilities_section: String,
         teammate_section: String,
+        model_override: rhapsody_agent::ModelOverride,
         run_id: i64,
         started_at: DateTime<Utc>,
         review: Option<crate::review::ReviewCheckout>,
@@ -1356,6 +1359,10 @@ impl Orchestrator {
         deps.stack_context = stack_context;
         deps.capabilities_section = capabilities_section;
         deps.teammate_section = teammate_section;
+        // The routed teammate's profile model/effort, which the worker lands on the session before
+        // its first turn (STUDIO-868). Empty leaves the runner's own `claude.model`/`effort` in
+        // place, so a dispatch that routed to nobody is byte-identical to today.
+        deps.model_override = model_override;
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
         // its `teams_post` / `teams_retain` can resolve WHICH run is speaking (STUDIO-675).
         deps.run_id = run_id;
