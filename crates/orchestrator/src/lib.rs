@@ -52,6 +52,7 @@ pub mod obslog;
 pub mod orchestrator;
 pub mod persist;
 pub mod preflight;
+pub mod prlink;
 pub mod promote;
 pub mod prstate;
 pub mod quorum;

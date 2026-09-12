@@ -294,6 +294,13 @@ pub struct QuorumRequest {
     pub pr_owner: String,
     pub pr_repo: String,
     pub pr_head_branch: String,
+    /// The ticket the resolved pull request should be ATTACHED to in the tracker, or `None` when it
+    /// already carries a link (STUDIO-875; the gate is [`crate::prlink::pr_link_target`]).
+    ///
+    /// `Some` here and a non-empty [`pr_url`](Self::pr_url) are mutually exclusive in practice, and
+    /// not by coincidence: the URL is READ off the attachment this field exists to WRITE, so a
+    /// request that has one never wants the other.
+    pub link: Option<crate::prlink::PrLinkTarget>,
     /// The roster identity the handed-off run wore. Excluded from its own review (§0.6: "at least
     /// two OTHER teammates").
     pub author: String,
@@ -643,6 +650,18 @@ where
         };
     };
     let tracker = tracker_for(&target, req);
+
+    // STUDIO-875: attach the pull request to its ticket, through the parent project's own tracker.
+    // Without the attachment `apply_github_summons` has nothing to attribute a reviewer's findings
+    // comment to, so the review this fan-out is about to request can never route its verdict back.
+    // Best-effort and unconditional on what follows: a ticket with no reviewer to ask still wants
+    // its pull request linked.
+    crate::prlink::link_pr_best_effort(
+        Some(&crate::prlink::TrackerLinker(Arc::clone(&tracker))),
+        req.link.as_ref(),
+        &pr_url,
+    )
+    .await;
 
     if req.reviewers.is_empty() {
         // §0.12: "zero ⇒ skip with a loud room post", never an error. A team of one is a valid
@@ -1322,6 +1341,8 @@ impl Orchestrator {
             re.project_repo.clone()
         };
         let (pr_owner, pr_repo) = crate::ghsummons::parse_repo(&repo_url).unwrap_or_default();
+        // Decided before the struct literal moves `pr_owner`/`pr_repo` into it (STUDIO-875).
+        let link = crate::prlink::pr_link_target(&re.issue, &pr_owner, &pr_repo);
         Some(QuorumRequest {
             parent_issue_id: re.issue.id.clone(),
             parent_team_id: re.issue.team_id.clone(),
@@ -1340,6 +1361,7 @@ impl Orchestrator {
             pr_owner,
             pr_repo,
             pr_head_branch: format!("symphony/{}", sanitize_key(&re.issue.identifier)),
+            link,
             author: re.identity.clone(),
             reviewers: select_reviewers(teams, &re.identity, &self.quorum_load),
             state_name: self.quorum_create_state(&re.project_slug),
@@ -2220,6 +2242,59 @@ mod tests {
             "a resolved fan-out marks the parent exactly as an attachment-driven one does"
         );
         assert_eq!(labels[0].label_name, QUORUM_REQUESTED_LABEL);
+    }
+
+    // ── the attachment the summons routing needs (STUDIO-875) ───────────────────────────────────
+
+    /// STUDIO-674 taught the fan-out to work without the attachment; this writes the attachment, so
+    /// the review it just requested can route its findings BACK. Without it
+    /// `apply_github_summons` walks an empty `linked_prs`, and the reviewer's token-bearing
+    /// comment is dropped on every poll forever.
+    #[tokio::test]
+    async fn a_pr_resolved_by_branch_is_attached_to_its_ticket() {
+        let tr = Arc::new(tracker_with_viewer());
+        let src =
+            FakePrSource::new(|| Ok(Some(open_pr("https://github.com/o/r/pull/64", "head-a"))));
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 1),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+        let req = QuorumRequest {
+            link: Some(crate::prlink::PrLinkTarget {
+                issue_id: "iss-1".into(),
+                identifier: "MT-1".into(),
+            }),
+            ..request_without_attachment(&["bob"])
+        };
+
+        fan(&d, &req).await;
+
+        let linked = tr.link_pr_calls();
+        assert_eq!(linked.len(), 1, "one attachment, for the parent ticket");
+        assert_eq!(linked[0].issue_id, "iss-1");
+        assert_eq!(linked[0].url, "https://github.com/o/r/pull/64");
+    }
+
+    /// A ticket Linear already links costs no write — the control task decided that, and the
+    /// off-loop fan-out does not second-guess it.
+    #[tokio::test]
+    async fn an_already_linked_ticket_is_not_re_attached() {
+        let tr = Arc::new(tracker_with_viewer());
+        let src =
+            FakePrSource::new(|| Ok(Some(open_pr("https://github.com/o/r/pull/64", "head-a"))));
+        let d = deps_with_pr_source(
+            teams_quorum(&["alice", "bob"], 1),
+            Arc::clone(&tr),
+            Arc::clone(&src),
+        );
+
+        fan(&d, &request_without_attachment(&["bob"])).await;
+
+        assert!(
+            tr.link_pr_calls().is_empty(),
+            "no link target, no attachment write"
+        );
     }
 
     // The attachment no longer skips the lookup (STUDIO-822): the head is what the repeat guard

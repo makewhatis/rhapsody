@@ -328,6 +328,10 @@ impl Orchestrator {
         if reviewers.is_empty() {
             return Verdict::Refuse("the roster holds nobody but the author");
         }
+        // STUDIO-875: the repair sweep repairs the attachment too. An orphaned pull request is
+        // exactly the population whose ticket was never linked, so adopting one without linking it
+        // would re-arm a review whose findings still reach nobody.
+        let link = crate::prlink::pr_link_target(iss, &owner, &repo);
         Verdict::Adopt(Box::new(ReviewIntroRequest {
             owner,
             repo,
@@ -337,6 +341,7 @@ impl Orchestrator {
             author,
             introduced_by: adopt_origin(&iss.identifier),
             only_if_unwatched: true,
+            link,
         }))
     }
 
@@ -597,6 +602,7 @@ mod tests {
                     "https://github.com/makewhatis/rhapsody/pull/144",
                 ))),
                 sink: Arc::new(crate::reviewintro::ControlIntroSink::new(handle)),
+                linker: None,
             },
             rx,
         ));
