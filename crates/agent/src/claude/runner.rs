@@ -5,9 +5,9 @@
 //! process group; a stall/turn-deadline/Stop kill then goes through [`crate::proctree::kill_tree`],
 //! which SIGKILLs that group AND every other group the agent's descendant tree spans — the group
 //! alone is not the boundary, because every harness `setpgid`s the shell it runs a tool command in
-//! (STUDIO-871). stdin is held open as an operator-message
-//! mailbox that is continuously drained and folded into the live turn at the next step boundary,
-//! closed the instant the terminal result lands so nothing is ever written after it (INF-250). The
+//! (STUDIO-871). stdin is held open as an operator-message mailbox that is continuously drained and
+//! folded into the live turn at the next step boundary, closed the instant the terminal result lands
+//! so nothing is ever written after it (INF-250). The
 //! turn deadline (Go's `context.WithTimeout`) is the single timeout: a hang produces `TurnTimedOut`
 //! (the "stalled" lifecycle), exactly as the reference does — the reference has no separate
 //! runner-level "stall timeout" (that knob is orchestrator-level; see `fake_claude_test.go`).

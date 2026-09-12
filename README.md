@@ -1158,9 +1158,10 @@ The guard kills *more* than Go's one `kill(-pid, SIGKILL)`, and that is the same
 than a second one — it is what "leaves no process behind" costs here. STUDIO-869 measured all three
 harnesses (Claude Code, opencode, codex) calling `setpgid` on the shell they run a tool command in,
 so the group Rhapsody created is not the boundary the agent's work lives in: Go's group kill takes
-the leader and leaves the model's `git push` running. `kill_tree` therefore walks the descendant tree
-at kill time and signals every process group it spans, the leader's group included and unconditionally
-(STUDIO-871). It is harness-agnostic by construction — it lives in `crates/agent/src/proctree.rs`,
+the leader and leaves the model's `git push` running. `kill_tree` therefore walks the descendant
+tree at kill time and signals every process group it spans, the leader's group included and
+unconditionally (STUDIO-871). It is harness-agnostic by construction — it lives in
+`crates/agent/src/proctree.rs`,
 not in `claude/`, so a future opencode or codex backend arms the identical guard.
 
 One behavioral divergence rides with it, on `POST /api/v1/runs/{id}/stop`:

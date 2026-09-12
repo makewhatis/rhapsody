@@ -49,8 +49,8 @@ to understand the crate's actual behavior, not any single module in isolation:
   terminal result is classified — "no write after result" is structural, not just documented.
 - **Billing guard is fail-closed and per-turn.** Every turn's first `system`/`init` line must report
   `apiKeySource == "none"` (checked once per turn via `billing_checked`, since `--resume` re-emits its
-  own init). A non-`"none"` source kills the process tree immediately (`BillingGuard`); a result observed
-  with `guard_on` but no init ever seen is *also* refused (`billing_guard_failed: no system/init
+  own init). A non-`"none"` source kills the process tree immediately (`BillingGuard`); a result
+  observed with `guard_on` but no init ever seen is *also* refused (`billing_guard_failed: no system/init
   observed`) — a result can't be trusted to be guard-compliant without positive confirmation.
 - **Env scrub is re-applied every turn**, including resumes: `TRACKER_ENV_VARS` (`LINEAR_API_KEY`,
   by name *and* by the configured credential's value) are always stripped; `BILLING_ENV_VARS`
