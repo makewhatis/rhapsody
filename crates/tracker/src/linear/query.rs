@@ -380,6 +380,27 @@ mutation CreateIssue($teamId: String!, $projectId: String, $title: String!, $des
   }
 }"#;
 
+// ─── the GitHub pull-request attachment (STUDIO-875; no Go v0.4.0 counterpart) ─────────────────
+
+/// `mutationAttachmentLinkGitHubPR` — links an already-open GitHub pull request to an issue as a
+/// **GitHub-sourced** attachment, which is what puts the pull request into the issue's
+/// `attachments` connection and therefore into `Issue::linked_prs`. STUDIO-875.
+///
+/// The source type is the whole point, and it is why this is `attachmentLinkGitHubPR` rather than
+/// the generic `attachmentLinkURL`: `normalize`'s `is_github_pr` admits an attachment only when
+/// `sourceType == "github"`, so a plain link attachment would be created, be visible in Linear, and
+/// still leave `linked_prs` empty — the exact failure this mutation exists to end.
+///
+/// Only `issueId` and `url` are sent. Linear derives owner/repo/number/title from the URL, and
+/// sending our own copies would be one more thing that can disagree with GitHub.
+pub const MUTATION_ATTACHMENT_LINK_GITHUB_PR: &str = r#"
+mutation LinkGitHubPr($issueId: String!, $url: String!) {
+  attachmentLinkGitHubPR(issueId: $issueId, url: $url) {
+    success
+    attachment { id }
+  }
+}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

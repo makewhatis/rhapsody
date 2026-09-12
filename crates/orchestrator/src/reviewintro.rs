@@ -132,6 +132,13 @@ pub struct ReviewIntroRequest {
     pub author: String,
     /// The origin tag written onto the watch-set row.
     pub introduced_by: String,
+    /// The ticket this pull request should be ATTACHED to in the tracker, or `None` when it is
+    /// already linked (STUDIO-875; see [`crate::prlink::pr_link_target`] for the gate).
+    ///
+    /// Decided here, on the control task, because only here is the candidate snapshot — and with it
+    /// what the ticket already carries — in hand. The off-loop task performs the write, beside the
+    /// lookup that produced the URL, and never at the cost of the introduction itself.
+    pub link: Option<crate::prlink::PrLinkTarget>,
     /// Introduce this pull request ONLY if the watch set holds no row for it at all (STUDIO-838).
     ///
     /// `false` — every handoff and every console introduction — is the RE-ARMING introduction the
@@ -232,6 +239,10 @@ pub struct ReviewIntroDeps {
     pub pr_source: Option<Arc<dyn OpenPrSource>>,
     /// Where a resolved introduction is handed back to the control task.
     pub sink: Arc<dyn ReviewIntroSink>,
+    /// Writes the Linear↔GitHub attachment for a pull request this task has just resolved
+    /// (STUDIO-875). `None` disables the write; nothing else changes, and an installation whose
+    /// Linear GitHub integration already links pull requests never notices either way.
+    pub linker: Option<Arc<dyn crate::prlink::PrLinker>>,
 }
 
 /// Consumes [`ReviewIntroRequest`]s until `ctx` is cancelled or every sender is dropped.
@@ -302,6 +313,13 @@ pub async fn run_review_intro_task(
             );
             continue;
         };
+        // STUDIO-875, and deliberately BEFORE the introduction rather than after it: the
+        // attachment is what lets the review's eventual findings comment reach this ticket, and
+        // that matters whether or not the watch-set write ends up introducing anything (a row
+        // already mid-review introduces nothing and still gets reviewed). Best-effort throughout —
+        // `link_pr_best_effort` reports and returns, so a Linear refusal costs the next summons,
+        // never this introduction.
+        crate::prlink::link_pr_best_effort(deps.linker.as_deref(), req.link.as_ref(), &url).await;
         let outcome = deps
             .sink
             .introduce(IntroducedPr {
@@ -453,6 +471,8 @@ impl Orchestrator {
             );
             return None;
         }
+        // Decided before the struct literal moves `owner`/`repo` into it.
+        let link = crate::prlink::pr_link_target(&re.issue, &owner, &repo);
         Some(ReviewIntroRequest {
             owner,
             repo,
@@ -464,6 +484,7 @@ impl Orchestrator {
             reviewers,
             author: re.identity.clone(),
             introduced_by: format!("{REVIEW_ORIGIN_HANDOFF}:{}", re.issue.identifier),
+            link,
             // A handoff RE-ARMS (STUDIO-838): a second handoff of the same ticket must put its row
             // back to `requested`, which is how a re-run gets re-reviewed. Only the adoption sweep
             // refuses to touch a row that already exists.
@@ -1519,7 +1540,114 @@ mod tests {
             author: "alice".to_string(),
             introduced_by: "handoff:STUDIO-720".to_string(),
             only_if_unwatched: false,
+            link: None,
         }
+    }
+
+    /// Records every attachment write the task asks for (STUDIO-875).
+    #[derive(Default)]
+    struct RecordingLinker(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl RecordingLinker {
+        fn seen(&self) -> Vec<(String, String)> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::prlink::PrLinker for RecordingLinker {
+        async fn link_pull_request(
+            &self,
+            issue_id: &str,
+            url: &str,
+        ) -> Result<(), rhapsody_tracker::TrackerError> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((issue_id.to_string(), url.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Drives the task over `req` with a recording linker and returns what it was asked to attach.
+    async fn link_once(req: ReviewIntroRequest, answer: OpenPrResult) -> Vec<(String, String)> {
+        let linker = Arc::new(RecordingLinker::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = CancelSignal::new();
+        let deps = ReviewIntroDeps {
+            pr_source: Some(Arc::new(FakeOpenPr(Box::new(move || match &answer {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(e.to_string().into()),
+            })))),
+            sink: Arc::new(RecordingSink::default()) as Arc<dyn ReviewIntroSink>,
+            linker: Some(Arc::clone(&linker) as Arc<dyn crate::prlink::PrLinker>),
+        };
+        let task = tokio::spawn(run_review_intro_task(signal.wait(), deps, rx));
+        tx.send(req).expect("send");
+        drop(tx);
+        task.await.expect("task");
+        linker.seen()
+    }
+
+    fn request_wanting_a_link() -> ReviewIntroRequest {
+        ReviewIntroRequest {
+            link: Some(crate::prlink::PrLinkTarget {
+                issue_id: "iss-uuid".to_string(),
+                identifier: "STUDIO-720".to_string(),
+            }),
+            ..request()
+        }
+    }
+
+    fn resolved_pr() -> OpenPrResult {
+        Ok(Some(crate::ghsummons::OpenPr {
+            url: "https://github.com/makewhatis/rhapsody/pull/154".to_string(),
+            head_sha: "abc".to_string(),
+        }))
+    }
+
+    // ── the attachment the summons routing needs (STUDIO-875) ───────────────────────────────────
+
+    /// The fix itself: the moment the task resolves a pull request for a ticket, it writes the
+    /// GitHub attachment that lets a later summons on that pull request reach the ticket. Without
+    /// it `apply_github_summons` walks an empty `linked_prs` and drops the reviewer's findings
+    /// comment on every poll, forever.
+    #[tokio::test]
+    async fn a_resolved_pull_request_is_attached_to_its_ticket() {
+        let seen = link_once(request_wanting_a_link(), resolved_pr()).await;
+        assert_eq!(
+            seen,
+            vec![(
+                "iss-uuid".to_string(),
+                "https://github.com/makewhatis/rhapsody/pull/154".to_string()
+            )]
+        );
+    }
+
+    /// A ticket the control task judged already linked costs no Linear write — which is what keeps
+    /// this free on an installation whose GitHub integration works.
+    #[tokio::test]
+    async fn a_ticket_the_planner_did_not_mark_is_never_attached() {
+        assert!(link_once(request(), resolved_pr()).await.is_empty());
+    }
+
+    /// No pull request, no attachment: there is nothing to link, and inventing a URL is the one
+    /// thing this module exists to refuse.
+    #[tokio::test]
+    async fn nothing_is_attached_when_no_pull_request_resolves() {
+        assert!(
+            link_once(request_wanting_a_link(), Ok(None))
+                .await
+                .is_empty()
+        );
+        assert!(
+            link_once(request_wanting_a_link(), Err("boom".into()))
+                .await
+                .is_empty()
+        );
     }
 
     /// Drives the task over one request and returns what reached the sink.
@@ -1533,6 +1661,7 @@ mod tests {
                 Err(e) => Err(e.to_string().into()),
             })))),
             sink: Arc::clone(&sink) as Arc<dyn ReviewIntroSink>,
+            linker: None,
         };
         let task = tokio::spawn(run_review_intro_task(signal.wait(), deps, rx));
         tx.send(request()).expect("send");
@@ -1599,6 +1728,7 @@ mod tests {
         let deps = ReviewIntroDeps {
             pr_source: None,
             sink: Arc::clone(&sink) as Arc<dyn ReviewIntroSink>,
+            linker: None,
         };
         let task = tokio::spawn(run_review_intro_task(signal.wait(), deps, rx));
         tx.send(request()).expect("send");

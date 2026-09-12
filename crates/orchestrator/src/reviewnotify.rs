@@ -533,6 +533,7 @@ mod tests {
             .await
             .expect("the summons query succeeds");
         apply_github_summons(vec![author_issue()], &by_pr, "makewhatis", "rhapsody")
+            .issues
             .first()
             .and_then(|i| i.latest_summon_at)
     }
@@ -1145,6 +1146,7 @@ mod tests {
         };
         assert_eq!(
             apply_github_summons(vec![unlinked], &by_pr, "makewhatis", "rhapsody")
+                .issues
                 .first()
                 .and_then(|i| i.latest_summon_at),
             None,
@@ -1175,6 +1177,7 @@ mod tests {
         };
         let got: HashMap<_, _> =
             apply_github_summons(vec![unlinked], &by_pr, "makewhatis", "rhapsody")
+                .issues
                 .into_iter()
                 .map(|i| (i.identifier, i.latest_summon_at))
                 .collect();

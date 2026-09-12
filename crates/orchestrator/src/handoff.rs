@@ -1257,6 +1257,7 @@ mod tests {
             crate::reviewintro::ReviewIntroDeps {
                 pr_source: Some(Arc::new(OnePr("https://github.com/o/r/pull/7"))),
                 sink: Arc::new(crate::reviewintro::ControlIntroSink::new(handle.clone())),
+                linker: None,
             },
             rx,
         ));
