@@ -444,7 +444,11 @@ impl Orchestrator {
 /// top-level. Mirrors Go `workerDepsFor` (dropping the telemetry fields — Tracer/Metrics/Model/
 /// DispatchSpanContext — per the P6 deferral; see `worker.rs`). `run_id` is per-dispatch, not
 /// per-project, so [`Orchestrator::spawn_worker`] stamps it (STUDIO-675).
-fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps {
+fn worker_deps_for(
+    eff: &Effective,
+    rp: Option<&ResolvedProject>,
+    drain: &crate::drain::DrainSignal,
+) -> WorkerDeps {
     // Local raw logging is enabled only when a log dir is configured (Go passes `o.eff.transcripts`,
     // which is nil when logging is off).
     let transcripts = if eff.log_dir.is_empty() {
@@ -480,6 +484,9 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
         review_handoff_state: eff.review_states.iter().next().cloned(),
+        // Daemon-wide rather than per-project (STUDIO-880): a drain settles the whole daemon so it
+        // can be restarted, and there is no restart of one project.
+        drain: drain.clone(),
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -1394,7 +1401,7 @@ impl Orchestrator {
         let Some(eff) = self.eff.as_ref() else {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
-        let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug));
+        let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug), &self.drain);
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
