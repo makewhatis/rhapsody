@@ -1596,4 +1596,45 @@ claude:
             &[159]
         );
     }
+
+    /// The counters an operator reads. STUDIO-882's acceptance names this line: a rhapsody hit must
+    /// report `matched=1 advanced=1`, and it must do so while `linked_prs_total` is still 0 —
+    /// which is the pair that says "the tracker classifies nothing, and it no longer matters".
+    #[tokio::test]
+    async fn the_applied_line_reports_the_daemon_link_beside_the_empty_tracker_count() {
+        let summon = utc(2026, 9, 13, 1, 46, 59);
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let events = captured(|| {
+            let links = links.clone();
+            async move {
+                apply_github_summons(
+                    vec![unlinked_issue("STUDIO-880")],
+                    &hits(&[(159, summon)]),
+                    "makewhatis",
+                    "rhapsody",
+                    &links,
+                );
+            }
+        })
+        .await;
+
+        let f = only(&events, "github-summons: applied PR summons");
+        assert_eq!(f.get("matched").map(String::as_str), Some("1"));
+        assert_eq!(f.get("advanced").map(String::as_str), Some("1"));
+        assert_eq!(
+            f.get("daemon_links").map(String::as_str),
+            Some("1"),
+            "the new source must be visible in the line, not only in its effect"
+        );
+        assert_eq!(
+            f.get("linked_prs_total").map(String::as_str),
+            Some("0"),
+            "the tracker still offers nothing — that is the point"
+        );
+    }
 }
