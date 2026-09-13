@@ -985,6 +985,54 @@ the only one of the eight with a Go counterpart and it keeps `GH_SUMMONS_TIMEOUT
 bound; the other seven are Rhapsody-only seams (console merge, review-comment posting, the quorum's
 and the review watcher's lookups) that Go Symphony does not have at all.
 
+### The daemon merges a pull request whose gates have cleared (STUDIO-874)
+
+Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it
+is the last link of the review loop: STUDIO-712 moves a ticket to Done when its pull request merges,
+but until now the merge itself waited on a human noticing. Two pull requests in one batch sat
+approved, all checks green and `mergeStateStatus: CLEAN` for roughly eleven hours, because the only
+thing that merges on this install is somebody happening to look.
+
+| A pull request whose reviewers approved it | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| what merges it | nothing | the existing ticketless review watcher, off-loop |
+| the verdict read | — | `rhapsody_review_watch.status`, keyed to `last_reviewed_sha` |
+| the CI gate | — | `mergeStateStatus: CLEAN` **and** every check in the rollup non-blocking |
+| how it merges | — | `gh pr merge --squash --match-head-commit <head>` |
+| default | — | **off**: `teams.review.auto_merge` is `false` unless an operator sets it |
+
+**The verdict is data, never prose.** `gh pr review --approve` errors on this install (GitHub
+refuses a self-review from the account that authored the pull request), so `reviewDecision` is empty
+on every pull request here and reviewer verdicts reach GitHub only as English. None of that is read.
+The ticketless review path already records its own verdict structurally: `review_exit_state` matches
+an EXACT `HANDOFF: approved` payload on the review agent's final result, and `mark_review_completed`
+stores the resulting `approved`/`reviewed` status beside the SHA that reviewer actually read. A gate
+that grepped comment bodies would have to call "I would happily approve on the next push" an
+approval; this one never sees it.
+
+**A verdict is about a COMMIT.** Every gate is keyed to the head observed this tick — an approval of
+`a324d2d` is not an approval of `c366a61`, and every review round in the batch that motivated this
+pushed new commits after a verdict. A pull request whose head has moved is refused and re-reviewed
+rather than merged.
+
+**GitHub's own auto-merge is deliberately NOT armed here**, unlike the console merge action
+(STUDIO-767), whose `--auto` is a guardrail for a human who has already decided. With nobody
+watching, an armed auto-merge fires LATER, at whatever head exists then — possibly one pushed after
+the arming that no reviewer approved. So this path verifies green itself, at a named commit, and
+merges immediately or not at all; `--match-head-commit` makes GitHub refuse a merge whose head moved
+inside the last window.
+
+**`BEHIND` updates and re-gates; it never merges.** STUDIO-784 is this bug already shipped once — the
+console armed an auto-merge on a behind branch that could never land. A behind branch's approval is
+for a commit that has not met its base, so the branch is updated (when `allow_update_branch` permits;
+otherwise the pull request is declined), the head advances, the review re-arms, and only a fresh
+approval of the new head can clear the gate again. The loop is bounded by `REVIEW_ROUNDS_PER_PR_CAP`,
+which already caps the review dispatches one pull request may draw.
+
+**Ticket bookkeeping is not duplicated.** An auto-merge writes nothing to the watch set, so the next
+sweep observes the pull request as `MERGED` exactly as it would a human's merge and STUDIO-712's
+existing transition finishes the ticket. There is no second Done path.
+
 ### A merged pull request moves its ticket to Done (STUDIO-712)
 
 Go v0.4.0 knows what a terminal state IS — `tracker.terminal_states` — but it only ever READS the
