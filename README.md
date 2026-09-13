@@ -1375,9 +1375,12 @@ one the GitHub integration wrote on a CONNECTED repository (tally STUDIO-844):
 | `metadata` | `{}` | `{ url, number, status, mergedAt, updatedAt, branch, … }` |
 | reaches `linked_prs` | no | yes |
 
-`attachmentLinkGitHubPR` only produces a `github`-sourced attachment where the GitHub integration is
-connected for that repository — which is the one population this divergence does not need to serve.
-Everywhere else it degrades to a plain API attachment.
+Stated exactly, because the distinction is this ticket's whole subject: what is MEASURED is that on
+an unconnected repository the mutation yields `sourceType: "api"` with empty metadata, and that a
+connected repository carries an admissible attachment written by the INTEGRATION. Whether the
+mutation itself would yield `"github"` on a connected repository is not measured here — it would
+mean writing to a production ticket to find out, and it does not change the outcome either way,
+because on a connected repository the integration has already written the attachment that counts.
 
 **So it fails twice, and the second failure is the one that matters.** `isGithubPR` rejects it on the
 `sourceType` gate; and widening that gate would still get nothing, because `linked_prs` is built by

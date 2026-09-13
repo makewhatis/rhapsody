@@ -30,6 +30,11 @@
 //! daemon can write on an unconnected repository that `linked_prs` will accept. Summons routing
 //! moved to the daemon's own record of the link instead (`ghenrich::DaemonPrLinks`).
 //!
+//! Precisely what was measured, since mistaking an inference for an observation is how the original
+//! claim survived review: the FIRST shape is this mutation's own output, the second is the
+//! INTEGRATION's. Whether this mutation would yield `"github"` on a connected repository was not
+//! tested, and does not matter — there the integration has already written the attachment.
+//!
 //! What the write still does, and the only reason it survives, is put `makewhatis/rhapsody#159`
 //! on the Linear issue as a link a PERSON can click. On an unconnected repository nothing else
 //! does.
