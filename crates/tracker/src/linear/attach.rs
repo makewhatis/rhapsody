@@ -1,28 +1,48 @@
-//! GitHub pull-request attachments — the link that makes a summons on a pull request reach the
-//! ticket that pull request belongs to (STUDIO-875). **No Go v0.4.0 counterpart**: Symphony only
-//! ever READ attachments, on the assumption that Linear's own GitHub integration had written them.
+//! GitHub pull-request attachments — putting a clickable link to the pull request on the ticket
+//! (STUDIO-875, corrected by STUDIO-882). **No Go v0.4.0 counterpart**: Symphony only ever READ
+//! attachments, on the assumption that Linear's own GitHub integration had written them.
 //!
-//! # Why the daemon writes this at all
+//! # What this write is for, and what it was believed to be for
 //!
-//! `apply_github_summons` attributes a summoning PR comment to an issue by walking that issue's
-//! `linked_prs`, and `linked_prs` is built in `normalize` from the issue's GitHub attachments. On a
-//! workspace where the repository is not connected in Linear's GitHub integration every issue comes
-//! back with `attachments: []`, so the walk has nothing to walk: a review that files findings posts
-//! a perfectly good `@rhapsody` comment and the daemon then drops it on every poll, forever, while
-//! the board looks exactly like "the reviewer approved and there is nothing to do".
+//! It was shipped to repair summons routing. `apply_github_summons` attributes a summoning PR
+//! comment to an issue by walking that issue's `linked_prs`, which `normalize` builds from the
+//! issue's GitHub attachments; on a workspace whose repository is not connected in Linear's GitHub
+//! integration every issue comes back with `attachments: []`, so a review that files findings posts
+//! a perfectly good `@rhapsody` comment and the daemon drops it on every poll, forever.
 //!
-//! Connecting the repository in Linear fixes it for that repository, invisibly to anyone reading
-//! the code, and silently omits the next repository somebody adds. Writing the attachment from the
-//! daemon — which knows the ticket and the pull request the moment it resolves one for the other —
-//! fixes it for every repository the daemon will ever touch.
+//! **That is not what this write achieves, and STUDIO-882 measured it rather than reasoning about
+//! it.** Read back off the live API, an attachment this function wrote for a repository with no
+//! GitHub integration answers:
+//!
+//! ```text
+//! sourceType: "api"      metadata: {}
+//! ```
+//!
+//! where an integration-written attachment on a CONNECTED repository answers:
+//!
+//! ```text
+//! sourceType: "github"   metadata: { url, number, status, mergedAt, … }
+//! ```
+//!
+//! So [`normalize::is_github_pr`](super::normalize) rejects it on the `sourceType` gate, and even
+//! with that gate widened `linked_prs` would still get nothing, because it is built by matching a
+//! pull-request url out of `metadata.url` and `metadata` is empty. There is no attachment this
+//! daemon can write on an unconnected repository that `linked_prs` will accept. Summons routing
+//! moved to the daemon's own record of the link instead (`ghenrich::DaemonPrLinks`).
+//!
+//! What the write still does, and the only reason it survives, is put `makewhatis/rhapsody#159`
+//! on the Linear issue as a link a PERSON can click. On an unconnected repository nothing else
+//! does.
 //!
 //! # `attachmentLinkGitHubPR`, not `attachmentLinkURL`
 //!
-//! [`normalize::is_github_pr`](super::normalize) admits an attachment only when its `sourceType` is
-//! `"github"`, and that field is not caller-supplied: it comes from WHICH link mutation created the
-//! attachment. A generic `attachmentLinkURL` would create an attachment that is visible in Linear,
-//! points at the right pull request, and is still invisible to `linked_prs` — the original failure
-//! wearing a hat. So the GitHub-specific mutation is load-bearing, not cosmetic.
+//! Kept, but no longer for the stated reason. The claim was that the mutation, not the caller,
+//! decides `sourceType`, so the GitHub-specific one yields `"github"` and the generic one would not
+//! — load-bearing, not cosmetic. The first half is true and the conclusion is false: what the
+//! mutation yields on an UNCONNECTED repository is `"api"`, the same as the generic one would, so
+//! neither reaches `linked_prs`. It is kept because on a repository that IS connected it is the
+//! honest mutation for what is being linked, and switching it now would be an unmeasured change to
+//! the case that works, for no gain in the case that does not.
 //!
 //! # Repeats
 //!
@@ -30,8 +50,7 @@
 //! the same issue is expected to be a no-op. Nothing here DEPENDS on that: the caller's own gate
 //! (`prlink::link_pr_best_effort` — "this ticket already links the pull request that was just
 //! resolved") is what keeps a working installation from writing at all, and a duplicate that got
-//! through would give `linked_prs` two equal entries, which the summons walk attributes twice and
-//! advances once. Untidy in Linear's UI, harmless to the routing.
+//! through would be two identical links in Linear's UI. Untidy, and nothing reads them.
 
 use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, query};
@@ -132,9 +151,13 @@ mod tests {
     const PR_URL: &str = "https://github.com/makewhatis/rhapsody/pull/154";
 
     /// The mutation carries exactly the two coordinates the link needs, and it is the GitHub-PR
-    /// mutation rather than the generic URL one — which is the whole of STUDIO-875: an attachment
-    /// whose `sourceType` is not `"github"` never reaches `Issue::linked_prs`, so the summons that
-    /// lands on the pull request still reaches nobody.
+    /// mutation rather than the generic URL one.
+    ///
+    /// STUDIO-882 note: this pins WHICH mutation is sent, and nothing more. It does NOT show that
+    /// the resulting attachment reaches `Issue::linked_prs` — measured against the live API, on an
+    /// unconnected repository it does not (`sourceType: "api"`, `metadata: {}`; see the module
+    /// doc). That gap between "the write is well-formed" and "the write counts" is what let 875
+    /// ship green and not work.
     #[tokio::test]
     async fn link_pull_request_sends_the_github_pr_mutation_with_the_issue_and_url() {
         let seen: Arc<Mutex<(String, serde_json::Value)>> =
