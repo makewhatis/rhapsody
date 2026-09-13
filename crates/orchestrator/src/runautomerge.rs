@@ -1468,6 +1468,21 @@ mod tests {
         );
     }
 
+    /// `classify_merge_error` lower-cases the error before looking, so a marker that is not itself
+    /// lower-case can never match — it would be a terminal error silently classified as transient,
+    /// which is the loop this ticket is about, reintroduced by a capital letter. Nothing about the
+    /// array's type says so, so this does.
+    #[test]
+    fn every_terminal_merge_marker_is_lower_case() {
+        for (marker, why) in TERMINAL_MERGE_ERRORS {
+            assert_eq!(
+                marker,
+                marker.to_ascii_lowercase(),
+                "the marker is compared against a lower-cased error ({why})"
+            );
+        }
+    }
+
     /// The ledger's whole contract, which is about what is SAID and never about what is decided:
     /// the same refusal at the same head is announced once, a DIFFERENT refusal is news, a
     /// different HEAD is news, and anything that is not a refusal forgets the pull request so its
