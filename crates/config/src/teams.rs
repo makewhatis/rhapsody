@@ -319,6 +319,23 @@ pub struct Review {
     /// implements. Naming a state here separates the third from the first two.
     #[serde(default)]
     pub changes_state: String,
+    /// Whether the daemon MERGES a watched pull request once every reviewer has
+    /// recorded a non-blocking verdict at its current head and CI is green
+    /// (STUDIO-874). `false` — the default — means only a human merges.
+    ///
+    /// Opt-in, and a boolean rather than an inferred always-on for Teams
+    /// installs, because merging is the one action in this subsystem that
+    /// cannot be undone by the next tick: a wrong review state re-reviews, a
+    /// wrong ticket move is re-moved, a wrong merge is on `main`. An operator
+    /// therefore says so once, explicitly.
+    ///
+    /// It lives in `review:` and not in a `merge:` block of its own because the
+    /// thing it consumes is this section's output — the per-(PR, reviewer)
+    /// verdict the ticketless path records — so it is dead without
+    /// `mode: ticketless` exactly as [`Review::done_state`] is, and
+    /// [`Teams::review_auto_merge`] gates it on the same predicate.
+    #[serde(default)]
+    pub auto_merge: bool,
 }
 
 impl Default for Review {
@@ -328,6 +345,7 @@ impl Default for Review {
             reviewers: DEFAULT_REVIEW_REVIEWERS,
             done_state: String::new(),
             changes_state: String::new(),
+            auto_merge: false,
         }
     }
 }
@@ -540,6 +558,20 @@ impl Teams {
         }
         let name = self.review.changes_state.trim();
         (!name.is_empty()).then_some(name)
+    }
+
+    /// Whether a watched pull request that has cleared every gate may be MERGED
+    /// by the daemon (STUDIO-874).
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason, with one extra
+    /// edge to it: the verdict this consumes — the per-(PR, reviewer)
+    /// `approved`/`reviewed` status keyed to a reviewed head — is written ONLY
+    /// by the ticketless path. On a `tickets` install the watch set is empty, so
+    /// an auto-merge there would not be conservative, it would be a merge with
+    /// no reviewer verdict to read at all.
+    pub fn review_auto_merge(&self) -> bool {
+        self.review_ticketless() && self.review.auto_merge
     }
 
     /// The configured `manager.timeout_ms` when it is too small for the model
@@ -1388,6 +1420,56 @@ mod tests {
         assert_eq!(Teams::disabled().review.mode, ReviewMode::Off);
     }
 
+    // ── review.auto_merge (STUDIO-874) ──────────────────────────────────────
+
+    /// The auto-merge gate's default is OFF, so every `teams.yaml` written
+    /// before the key existed keeps merging exactly nobody. An absent, null and
+    /// empty `review:` block all mean off, and so does an explicit `false`.
+    #[test]
+    fn review_auto_merge_is_absent_means_off() {
+        for text in [
+            "enabled: true\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\nroster:\n  - name: alice\n",
+            "enabled: true\nreview: {}\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: false\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert!(
+                !t.review_auto_merge(),
+                "auto-merge must be off unless asked for ({text:?})"
+            );
+            t.validate()
+                .unwrap_or_else(|e| panic!("must stay valid {text:?}: {e}"));
+        }
+        assert!(!Teams::disabled().review_auto_merge());
+    }
+
+    /// The D5 invariant, in the one predicate every caller reads: `auto_merge:
+    /// true` reaches nothing unless Teams is on AND review is ticketless. A
+    /// Teams-off install, and a `tickets`/`off` install, are unchanged however
+    /// the key is spelled — which matters because the verdict this gate consumes
+    /// is written only by the ticketless path.
+    #[test]
+    fn review_auto_merge_needs_teams_and_the_ticketless_path() {
+        let on = "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\nroster:\n  - name: alice\n";
+        assert!(Teams::parse(on).expect("parse").review_auto_merge());
+
+        for text in [
+            // Teams off — structurally unreachable, however the block reads.
+            "enabled: false\nreview:\n  mode: ticketless\n  auto_merge: true\nroster:\n  - name: alice\n",
+            // A review path that records no machine-readable verdict to gate on.
+            "enabled: true\nreview:\n  mode: tickets\n  auto_merge: true\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: off\n  auto_merge: true\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert!(
+                !t.review_auto_merge(),
+                "auto-merge must not reach a non-ticketless install ({text:?})"
+            );
+        }
+    }
+
     /// All three spellings decode, and nothing else does: a typo must be a loud
     /// parse error rather than a silent fall back to `off`, which would leave an
     /// operator who asked for review with none and no complaint.
@@ -1664,6 +1746,7 @@ mod tests {
                 reviewers: 3,
                 done_state: "Done".to_string(),
                 changes_state: "In Progress".to_string(),
+                auto_merge: true,
             },
             roster: vec![Identity {
                 name: "alice".to_string(),

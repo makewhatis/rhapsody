@@ -402,12 +402,21 @@ mod tests {
     /// state and records nothing, so its `ControlHandle` method reads the run row straight off the
     /// handle's own store and the control task is never involved. A stalled `gh pr diff` parks the
     /// one HTTP request that asked for it.
+    ///
+    /// `runautomerge.rs` (STUDIO-874) is the auto-merge's off-loop half and makes `runmerge.rs`'s
+    /// argument exactly: it holds no `Orchestrator`, and its loop-side decision lives in
+    /// `automerge.rs`, which appears on neither list because it makes no `gh` call at all. Its
+    /// caller is `ControlWatchSink::merge`, reached from the watcher's own task — so a stalled
+    /// `gh` parks the watcher's next tick and leaves the control task ticking. It re-resolves the
+    /// pull request rather than reusing the sweep's observation ON PURPOSE: the merge is
+    /// irreversible and the observation is already a tick old by the time it is acted on.
     const OFF_LOOP_CALLERS: &[&str] = &[
         "prstate.rs",
         "ghsummons.rs",
         "reviewwatch.rs",
         "runmerge.rs",
         "rundiff.rs",
+        "runautomerge.rs",
     ];
 
     /// The control task's own modules, named so that widening [`OFF_LOOP_CALLERS`] to include one
