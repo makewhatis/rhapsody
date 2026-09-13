@@ -302,6 +302,11 @@ pub(crate) fn blocker_identifier(b: &BlockerRef) -> String {
     "unknown".to_string()
 }
 
+/// How many held candidates [`Orchestrator::log_capacity_hold`] names before it falls back to a
+/// remainder count. The front of the sorted queue is what an operator needs; a board with fifty
+/// candidates does not need fifty of them on one line every poll.
+const HELD_SAMPLE: usize = 10;
+
 /// Returns the blocker's state name for log output, with original casing preserved (e.g.
 /// `"In Review"`). A `None`/empty state logs as `"unknown"` — the same value eligibility treats as
 /// non-terminal (conservative; INF-249). Mirrors Go `blockerStateName`.
@@ -328,6 +333,44 @@ impl Orchestrator {
                 "skipping dispatch: blocked by non-terminal blocker"
             );
         }
+    }
+
+    /// Surfaces the otherwise-SILENT drop of the candidates a selection pass never reached because
+    /// the GLOBAL concurrency cap was already full (STUDIO-885): one `tracing::info!` line naming
+    /// the tickets, the cap, and how many runs are holding it. `held` is the unexamined tail of the
+    /// sorted candidate list — the pass stops at the first one, so nothing below it was assessed
+    /// either; an empty slice logs nothing.
+    ///
+    /// It exists because "the board is full" and "this ticket is correctly suppressed" were
+    /// indistinguishable from outside. In the reported incident they SWAPPED with no signal at all:
+    /// for four minutes the ticket was eligible and merely capped, which the pass reported by
+    /// saying nothing, and thereafter it was suppressed again, which reads the same as the state it
+    /// had been in all along. One of those resolves on its own and one does not, and an operator
+    /// could not tell which they were looking at.
+    ///
+    /// The list is capped at [`HELD_SAMPLE`] names plus a remainder count: a busy board can hold
+    /// dozens of candidates and the point of the line is to name the ones at the front of the
+    /// queue, not to render the queue.
+    pub(crate) fn log_capacity_hold(&self, held: &[String], max_concurrent: i64) {
+        if held.is_empty() {
+            return;
+        }
+        let mut sample = held
+            .iter()
+            .take(HELD_SAMPLE)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if held.len() > HELD_SAMPLE {
+            sample.push_str(&format!(" (+{} more)", held.len() - HELD_SAMPLE));
+        }
+        tracing::info!(
+            held = %sample,
+            held_count = held.len(),
+            max_concurrent,
+            running = self.running.len(),
+            "skipping dispatch: no free concurrency slot; candidates held for capacity"
+        );
     }
 
     /// Reports whether a FRESH dispatch of `iss` should be suppressed because a prior run already
