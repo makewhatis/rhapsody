@@ -61,6 +61,14 @@
 //! the gates above it. What does not repeat is the REPORT — see [`AutoMergeLedger`], which is the
 //! only state this half keeps and holds what has been SAID rather than what GitHub answered.
 //!
+//! A refusal is deliberately NOT surfaced outside the log as well — not on the run, not on the pull
+//! request, not the way [`CREDENTIAL_DEAD_WARNING`](crate::preflight) reaches `/api/v1/projects` per
+//! project. That warning rides loop-owned state; this module holds no `Orchestrator`, sends no
+//! control event and takes no lock the control task takes, which is its whole containment guarantee
+//! (see the opening paragraph). Surfacing from here needs a new control event, which is a design
+//! change rather than a bug fix, and the volume problem that prompted the question is answered at
+//! its source: a stuck plan now says so once, with its reason, instead of once a minute.
+//!
 //! # BEHIND updates and re-gates; it never merges on a stale approval
 //!
 //! STUDIO-784 is this bug already shipped once: the console armed an auto-merge on a BEHIND branch
