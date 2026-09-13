@@ -441,7 +441,14 @@ pub fn apply_github_summons(
                     && pr.owner.eq_ignore_ascii_case(owner)
                     && pr.repo.eq_ignore_ascii_case(repo)
             }) {
-                continue; // the tracker already offered this one; the loop above handled it
+                // The tracker already offered this one, so the loop above has ruled on it — and
+                // its ruling stands, including when that ruling was `merged`. Deliberate: where
+                // the tracker knows a pull request at all its `merged` comes from a CONNECTED
+                // integration and is fresher than a watch row that a sweep has not yet retired, and
+                // the conservative error (not advancing a summons on a merged pull request) is the
+                // safe one. On the unconnected repositories this index exists for, the tracker
+                // offers nothing, so the two can never disagree there.
+                continue;
             }
             daemon_linked += 1;
             iss_reachable = true;

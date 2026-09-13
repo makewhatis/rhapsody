@@ -1225,7 +1225,16 @@ impl Orchestrator {
             // The daemon's own PR→ticket links (STUDIO-882), read ONCE per tick rather than per
             // issue: it is a single store read serving every repository in the pass, and the apply
             // step selects the rows it wants by repository out of it.
-            let links = self.daemon_pr_links();
+            //
+            // Skipped entirely when nothing was fetched, which is not merely an optimisation of the
+            // empty case: `targets` is empty the moment `tracker.github_summons` is off anywhere it
+            // applies, so an installation with the feature off would otherwise pay this store read
+            // every poll interval, forever, to attribute hits that do not exist.
+            let links = if fetched.is_empty() {
+                DaemonPrLinks::default()
+            } else {
+                self.daemon_pr_links()
+            };
             for ti in tagged.iter_mut() {
                 let Some(t) = ti.proj.and_then(|idx| targets.get(&idx)) else {
                     continue;
