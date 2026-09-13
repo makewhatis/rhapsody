@@ -736,6 +736,76 @@ impl Teams {
                     .to_string(),
             ));
         }
+        // STUDIO-891: the CEILING `review.reviewers` never had. `pick_reviewer`
+        // names only non-authors, so a roster of N can hold at most N−1 of one
+        // pull request's required reviews, and an introduction that asks for
+        // more truncates a ranked list already shorter than the count. The
+        // operator gets fewer eyes than they wrote, with nothing above `debug!`
+        // saying so — the fail-OPEN direction, which is why this refuses the
+        // file instead of clamping the count down to fit.
+        //
+        // Scoped to `ticketless` because that is the only path that READS
+        // `review.reviewers`; a Teams-off or fan-out installation validates
+        // exactly as before (the D5 invariant). Like every other rule here it
+        // fires regardless of `enabled`, so the complaint arrives while the file
+        // is still being edited.
+        //
+        // `quorum.reviewers` is deliberately left WITHOUT a ceiling even though
+        // its path has the same non-author constraint. Two reasons, and the
+        // first is decisive: it defaults to 2, so a two-person roster running
+        // the shipped quorum config would stop booting on an upgrade that
+        // changed nothing in the operator's file — the check would turn working
+        // installations off. And the quorum's degradation is a recorded design
+        // decision rather than an oversight (`select_reviewers`: "too few
+        // candidates degrades to however many exist — never an error, and never
+        // a wait"). `review.reviewers` defaults to 1, which every roster of two
+        // or more satisfies, so this ceiling can only ever reject a number an
+        // operator explicitly wrote.
+        //
+        // A roster of exactly N with `reviewers: N−1` is ALLOWED, not warned
+        // about: an introduction excludes only the author, so all N−1 rows are
+        // assignable. The peer exclusion that can strand one of them bites at
+        // REASSIGNMENT time — a teammate removed from the roster mid-flight —
+        // which is a runtime condition no boot check can see, and is surfaced by
+        // `reviewwatch`'s unassignable-round warning instead.
+        //
+        // `teams.yaml` is boot-only today, so validating at boot is sufficient.
+        // **If it is ever made hot-reloadable, this check has to move with it**
+        // — a roster shrunk by a reload would otherwise walk straight past it.
+        if self.review.mode == ReviewMode::Ticketless {
+            // The floor first: `reviewers: 0` is measured as the one reviewer it
+            // actually becomes, not as a free pass under the ceiling.
+            let asked = self.review.effective_reviewers();
+            let roster = self.roster.len();
+            let ceiling = roster.saturating_sub(1);
+            // The second conjunct keeps the promise the paragraph above makes:
+            // this rejects only a count an operator WROTE. One reviewer is the
+            // floor and the default, so a single-teammate roster — which cannot
+            // review anything whatever the count says — keeps booting and keeps
+            // getting `plan_review_intro`'s "the roster holds nobody but the
+            // author" warning, rather than having Teams switched off underneath
+            // it by an upgrade. That is a pre-existing, already-reported
+            // condition and not this ceiling's to escalate.
+            let written = asked > usize::try_from(MIN_QUORUM_REVIEWERS).unwrap_or(1);
+            if written && asked > ceiling {
+                // "Lower it to 0" is not advice — the floor clamps 0 back up to
+                // one — so a roster that cannot review at all is told the only
+                // remedy it actually has.
+                let or_lower = if ceiling == 0 {
+                    String::new()
+                } else {
+                    format!(", or lower `review.reviewers` to {ceiling}")
+                };
+                return Err(TeamsError::Invalid(format!(
+                    "review.reviewers is {asked}, but a roster of {roster} can satisfy at most \
+                     {ceiling} ({roster} teammates − 1 author): a pull request's reviewers must \
+                     be non-authors, so every round would arm {ceiling} of the {asked} reviews \
+                     asked for and drop the rest without saying so. To fix, add {} more \
+                     teammate(s) to `roster:`{or_lower}",
+                    asked + 1 - roster
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1617,6 +1687,110 @@ mod tests {
         }
     }
 
+    /// STUDIO-891: `review.reviewers` has a CEILING as well as a floor, and the
+    /// ceiling is the roster minus the author.
+    ///
+    /// `pick_reviewer` only ever names non-authors, so a roster of N supports at
+    /// most N−1 required reviews of one pull request. Asked for more, the
+    /// introduction path truncates a ranked list that is already shorter than the
+    /// count and arms fewer rows than the operator wrote — silently, with nothing
+    /// above `debug!` to say the config was not honoured. Rejecting the file is
+    /// the fail-CLOSED direction; reviewing with fewer eyes than were asked for
+    /// is the fail-open one.
+    ///
+    /// The boundary is the whole point, so it is asserted at all three points
+    /// either side of it.
+    #[test]
+    fn review_reviewers_above_the_rosters_ceiling_is_rejected() {
+        let yaml = |names: &[&str], reviewers: i64| {
+            let roster: String = names
+                .iter()
+                .map(|n| format!("  - name: {n}\n"))
+                .collect::<String>();
+            format!(
+                "enabled: true\nreview:\n  mode: ticketless\n  reviewers: {reviewers}\nroster:\n{roster}"
+            )
+        };
+        // roster 3 / reviewers 2 — satisfiable (decision 3: exactly N−1 is
+        // ALLOWED, not warned about; the author is the only exclusion an
+        // introduction makes).
+        Teams::parse(&yaml(&["alice", "jimmy", "jerry"], 2))
+            .expect("parses")
+            .validate()
+            .expect("roster 3 / reviewers 2 is satisfiable");
+        // roster 2 / reviewers 1 — satisfiable.
+        Teams::parse(&yaml(&["alice", "jimmy"], 1))
+            .expect("parses")
+            .validate()
+            .expect("roster 2 / reviewers 1 is satisfiable");
+        // roster 2 / reviewers 2 — the case that motivated the ticket.
+        let err = Teams::parse(&yaml(&["alice", "jimmy"], 2))
+            .expect("parses")
+            .validate()
+            .expect_err("roster 2 / reviewers 2 is unsatisfiable");
+        let TeamsError::Invalid(msg) = &err else {
+            panic!("expected Invalid, got {err}")
+        };
+        // The message names BOTH numbers and the arithmetic, so the operator can
+        // act without reading the source.
+        assert!(msg.contains("review.reviewers is 2"), "{msg}");
+        assert!(msg.contains("roster of 2"), "{msg}");
+        assert!(msg.contains("at most 1"), "{msg}");
+        assert!(msg.contains("non-author"), "{msg}");
+        assert!(!msg.contains("  "), "leaked source indentation: {msg}");
+
+        // A roster of one is NOT escalated to a boot rejection: one reviewer is
+        // the floor and the shipped default, so nobody wrote it, and rejecting
+        // here would switch Teams off under an installation whose file did not
+        // change. It cannot review anything either way, and `plan_review_intro`
+        // already warns that it holds nobody but the author.
+        for count in [0, 1] {
+            Teams::parse(&yaml(&["alice"], count))
+                .expect("parses")
+                .validate()
+                .unwrap_or_else(|e| panic!("reviewers: {count} on a solo roster: {e}"));
+        }
+        // But a count that WAS written is still measured against that roster.
+        let solo = Teams::parse(&yaml(&["alice"], 2))
+            .expect("parses")
+            .validate()
+            .expect_err("a roster of 1 has no non-author, so two is unsatisfiable");
+        assert!(solo.to_string().contains("at most 0"), "{solo}");
+    }
+
+    /// The D5 invariant: the ceiling is a rule about the path that READS
+    /// `review.reviewers`, so it fires only under `mode: ticketless`. A Teams-off
+    /// install, and any installation on the ticket fan-out, validate exactly as
+    /// they did before.
+    ///
+    /// `quorum.reviewers` is deliberately NOT given the same ceiling — see
+    /// [`Teams::validate`]'s note. Pinned here because it is a DECISION, not an
+    /// omission: a two-person roster running the quorum's default of two would
+    /// otherwise stop booting on upgrade, with nothing in the operator's file
+    /// having changed.
+    #[test]
+    fn the_reviewer_ceiling_is_scoped_to_the_ticketless_path() {
+        Teams::disabled()
+            .validate()
+            .expect("the off state is unaffected");
+        for mode in ["off", "tickets"] {
+            let t = Teams::parse(&format!(
+                "enabled: true\nreview:\n  mode: {mode}\n  reviewers: 9\nroster:\n  - name: alice\n  - name: jimmy\n"
+            ))
+            .expect("parses");
+            t.validate()
+                .unwrap_or_else(|e| panic!("mode {mode} must not consult the ceiling: {e}"));
+        }
+        // The quorum's own count, at its default, on the roster size that
+        // motivated the ticket.
+        Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\nroster:\n  - name: alice\n  - name: jimmy\n",
+        )
+        .expect("parses")
+        .validate()
+        .expect("quorum.reviewers has no ceiling; an upgrade must not turn this install off");
+    }
+
     /// STUDIO-712: the auto-Done transition is OFF unless somebody named the
     /// terminal state, and naming it is not enough on an installation whose
     /// review path cannot produce a merge edge to act on.
@@ -1748,10 +1922,16 @@ mod tests {
                 changes_state: "In Progress".to_string(),
                 auto_merge: true,
             },
-            roster: vec![Identity {
-                name: "alice".to_string(),
-                ..Identity::default()
-            }],
+            // Four, because `reviewers: 3` must be a config the ceiling accepts
+            // (STUDIO-891: a roster of N satisfies at most N−1). The property
+            // under test is the round-trip, and it is unchanged by the width.
+            roster: ["alice", "jimmy", "jerry", "june"]
+                .into_iter()
+                .map(|name| Identity {
+                    name: name.to_string(),
+                    ..Identity::default()
+                })
+                .collect(),
             ..Teams::disabled()
         };
 
