@@ -741,6 +741,25 @@ impl Orchestrator {
     /// candidate set, and re-checks per-project + per-state + global slots — then re-dispatches,
     /// requeues, or releases the claim. Mirrors Go `onRetry`. A control-loop (O7) entry point.
     pub async fn on_retry(&mut self, e: EvRetry) {
+        // STUDIO-880: the drain gate's SECOND entry point, and the one that is easy to miss.
+        // `on_tick` is not the only path that dispatches — a due retry dispatches straight from
+        // here, bypassing the tick entirely — so a drain that gated only `on_tick` would settle the
+        // daemon and then immediately re-dispatch every continuation it had just wound down.
+        //
+        // Parking, not dropping: the entry is left in `retry_attempts` EXACTLY as it is, so it keeps
+        // its claim, its due time and its ATTEMPT NUMBER. A drain is not a failure, and requeueing
+        // through the backoff path (as the no-slots case does) would inflate the attempt count for
+        // the whole length of the drain and could exhaust the ticket's retry budget. Only the timer
+        // is re-armed, so the gate is re-checked until the drain is cancelled or the daemon
+        // restarts and boot recovery re-arms it from the persisted row.
+        if self.drain.is_draining() && self.retry_attempts.contains_key(&e.issue_id) {
+            tracing::debug!(
+                issue_id = %e.issue_id,
+                "drain: parking a due retry; claim and attempt kept"
+            );
+            self.arm_retry_timer(&e.issue_id, crate::drain::DRAIN_REQUEUE_DELAY_MS);
+            return;
+        }
         let Some(re) = self.retry_attempts.remove(&e.issue_id) else {
             return;
         };

@@ -58,6 +58,15 @@ pub const DRAINING_WARNING: &str =
 /// how the credential preflight rate-limits its own steady state.
 pub const DRAIN_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// How long a due retry is parked for while a drain is armed, before its timer is re-armed and the
+/// gate is re-checked ([`crate::orchestrator::Orchestrator::on_retry`]).
+///
+/// It is a fixed short cadence rather than a failure backoff because a drain is NOT a failure: the
+/// entry keeps its attempt number, so a long drain cannot burn a ticket's retry budget. Short enough
+/// that a cancelled drain resumes work promptly; long enough that parking a ticket for ten minutes
+/// costs a couple of hundred no-op wakeups rather than six hundred.
+pub const DRAIN_REQUEUE_DELAY_MS: i64 = 5_000;
+
 /// Who asked for the drain. Carried so the console can say whether an operator asked to settle the
 /// daemon or an upgrade is waiting to install, which are the same mechanism with different urgency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -632,6 +641,67 @@ mod tests {
         assert!(
             out.contains("drain cancelled"),
             "the resume must be visible, got: {out}"
+        );
+    }
+
+    // ---- the retry gate (the on_retry seam) ----------------------------------------------------
+
+    // `on_tick` is not the only path that dispatches: a due retry dispatches straight from
+    // `on_retry`. This is the unit-level pin for that second entry point — the e2e catches it too,
+    // but only after a real seven-second run.
+    #[tokio::test]
+    async fn a_draining_daemon_parks_a_due_retry_instead_of_dispatching_it() {
+        let mut f = Fake::new();
+        f.candidates = vec![issue("1", "MT-1", "In Progress")];
+        let (mut o, dispatched) = crate::testsupport::orch_for_retry(std::sync::Arc::new(f), 10);
+        o.claimed.insert("1".into());
+        o.retry_attempts
+            .insert("1".into(), crate::testsupport::retry_entry("1", "MT-1", 3));
+        o.drain.arm(at(0), DrainReason::Update);
+
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+
+        assert!(
+            dispatched.lock().expect("dispatch sink").is_empty(),
+            "a draining daemon must not dispatch a due retry"
+        );
+        let parked = o
+            .retry_attempts
+            .get("1")
+            .expect("the parked retry must still be queued — a drain defers work, never drops it");
+        assert_eq!(
+            parked.attempt, 3,
+            "a drain is not a failure: parking must not burn the ticket's retry budget"
+        );
+        assert!(
+            o.claimed.contains("1"),
+            "the claim is kept across the park, so nothing else picks the ticket up"
+        );
+    }
+
+    // And the control: with no drain, the same due retry dispatches. Without this the test above
+    // would keep passing if `on_retry` stopped dispatching altogether.
+    #[tokio::test]
+    async fn an_undrained_daemon_still_dispatches_a_due_retry() {
+        let mut f = Fake::new();
+        f.candidates = vec![issue("1", "MT-1", "In Progress")];
+        let (mut o, dispatched) = crate::testsupport::orch_for_retry(std::sync::Arc::new(f), 10);
+        o.claimed.insert("1".into());
+        o.retry_attempts
+            .insert("1".into(), crate::testsupport::retry_entry("1", "MT-1", 3));
+
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+
+        assert_eq!(
+            *dispatched.lock().expect("dispatch sink"),
+            vec!["1".to_string()],
+            "an un-armed drain must leave the retry path exactly as it was"
         );
     }
 
