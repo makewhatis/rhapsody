@@ -52,6 +52,12 @@ use chrono::{DateTime, TimeZone, Utc};
 pub const DRAINING_WARNING: &str =
     "drain requested — dispatch paused; in-flight runs finish their current turn";
 
+/// While a drain stays armed, the steady-state "dispatch is paused" line is logged at most once per
+/// this window, so a drain that waits out a 30-minute turn keeps saying why without a line every
+/// tick. The transitions (armed, cancelled, fully drained) always log regardless of it — mirroring
+/// how the credential preflight rate-limits its own steady state.
+pub const DRAIN_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Who asked for the drain. Carried so the console can say whether an operator asked to settle the
 /// daemon or an upgrade is waiting to install, which are the same mechanism with different urgency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -228,11 +234,99 @@ fn from_millis(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
 
+/// What the dispatch gate remembers between ticks so its logging is legible rather than either
+/// silent or a line every 30 seconds. Control-task-owned; see [`crate::orchestrator::Orchestrator`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainGateLog {
+    /// When the steady-state "still draining" line was last emitted.
+    pub last_logged_at: DateTime<Utc>,
+    /// Whether the "drain complete, nothing in flight" line has already been emitted for this drain.
+    /// Cleared if a run reappears, so a second quiescence is reported as loudly as the first.
+    pub reported_idle: bool,
+}
+
+impl crate::orchestrator::Orchestrator {
+    /// The dispatch gate: `true` means skip this tick's dispatch entirely.
+    ///
+    /// Like the BO-59 credential preflight it runs BEFORE candidate fetch and claims nothing — a
+    /// drain that took a claim and then declined to run it would be strictly worse than no drain.
+    ///
+    /// The rest of this function is the *legibility* half, and it is not decoration: a daemon that
+    /// silently stops dispatching is indistinguishable from a wedged one, which is the failure mode
+    /// this feature has. Transitions — armed, quiesced, cancelled — always log; the steady state is
+    /// rate-limited to [`DRAIN_LOG_INTERVAL`] so a drain waiting out a long turn keeps saying why
+    /// without drowning `/api/v1/logs`.
+    pub(crate) fn drain_preflight(&mut self) -> bool {
+        if !self.drain.is_draining() {
+            // Cancelled between ticks (the gate is the only observer of the transition).
+            if self.drain_gate.take().is_some() {
+                tracing::warn!("drain cancelled; dispatch resuming");
+            }
+            return false;
+        }
+        let status = self.drain.status();
+        let reason = status.reason.as_str();
+        let running = self.running.len();
+        let now = (self.now)();
+        match self.drain_gate.as_mut() {
+            None => {
+                tracing::warn!(
+                    reason,
+                    running,
+                    "drain requested; dispatch paused — in-flight runs finish their current turn \
+                     and are not interrupted"
+                );
+                self.drain_gate = Some(DrainGateLog {
+                    last_logged_at: now,
+                    reported_idle: false,
+                });
+            }
+            Some(gate) => {
+                if running > 0 {
+                    // A run reappeared (only reachable if something outside dispatch adds one):
+                    // re-arm the quiesced report so a second quiescence is announced too.
+                    gate.reported_idle = false;
+                }
+                if running == 0 && !gate.reported_idle {
+                    tracing::warn!(
+                        reason,
+                        "drain complete; no runs in flight — restarting now interrupts nothing"
+                    );
+                    gate.reported_idle = true;
+                    gate.last_logged_at = now;
+                } else if due(gate.last_logged_at, now) {
+                    tracing::warn!(reason, running, "drain in progress; dispatch still paused");
+                    gate.last_logged_at = now;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Whether the steady-state line is due again. A `last` in the FUTURE (a clock that stepped
+/// backwards, or an injected test clock) reads as "not due" rather than panicking on the negative
+/// duration — the line is an advisory, and skipping one is the harmless direction.
+fn due(last: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(last)
+        .to_std()
+        .is_ok_and(|elapsed| elapsed >= DRAIN_LOG_INTERVAL)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
     use chrono::TimeZone;
+    use rhapsody_tracker::fake::Fake;
 
     use super::*;
+    use crate::orchestrator::Orchestrator;
+    use crate::testsupport::{
+        CapturedEvent, DispatchedEntries, TRACING_TEST_LOCK, empty_effective, issue,
+        record_entries, recording_subscriber, set_of,
+    };
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_780_000_000 + secs, 0)
@@ -352,5 +446,214 @@ mod tests {
         });
         assert_eq!(winners.load(Ordering::Relaxed), 1);
         assert!(d.is_draining());
+    }
+
+    // ---- the dispatch gate (the loop.rs on_tick seam) ------------------------------------------
+
+    /// A legacy-path orchestrator with one Todo candidate, wired exactly like the credential
+    /// preflight's `orch_with_probe` (and the loop.rs on_tick tests) so the two gates are pinned
+    /// against the same scenario.
+    fn orch_with_candidate() -> (Orchestrator, DispatchedEntries) {
+        let mut tr = Fake::new();
+        tr.candidates = vec![issue("1", "MT-1", "Todo")];
+        let mut eff = empty_effective(std::sync::Arc::new(tr));
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600); // no background ticks; the test drives on_tick
+        eff.max_retry_backoff_ms = 300_000;
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        (o, sink)
+    }
+
+    async fn drive_tick(o: &mut Orchestrator) {
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort(); // stop the poll timer on_tick re-arms
+        }
+    }
+
+    // THE acceptance property, and the one the credential preflight is pinned for at the same seam:
+    // a draining daemon skips dispatch WITHOUT claiming anything. A drain that claimed a ticket and
+    // then declined to run it would strand that claim for the whole drain — strictly worse than not
+    // draining at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_draining_daemon_claims_nothing() {
+        let (mut o, sink) = orch_with_candidate();
+        o.drain.arm(at(0), DrainReason::Update);
+        drive_tick(&mut o).await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "a drain must dispatch nothing"
+        );
+        assert!(
+            o.claimed.is_empty(),
+            "a drained tick must claim nothing (no stranded claim wedges the project)"
+        );
+        assert!(o.running.is_empty(), "a drained tick must start no run");
+        assert!(
+            o.retry_attempts.is_empty(),
+            "a drained tick must not touch the retry queue"
+        );
+    }
+
+    // The other half: an un-armed drain leaves dispatch completely unchanged, so a daemon nobody
+    // drains behaves exactly as it did before this feature existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_drain_dispatches_normally() {
+        let (mut o, sink) = orch_with_candidate();
+        drive_tick(&mut o).await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "an un-armed drain must not gate anything"
+        );
+    }
+
+    // Cancelling re-opens the gate on the very next tick, and the candidate that piled up behind the
+    // drain is simply dispatched — nothing had to be given back, because nothing was ever claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_drain_resumes_dispatch_on_the_next_tick() {
+        let (mut o, sink) = orch_with_candidate();
+        o.drain.arm(at(0), DrainReason::Operator);
+        drive_tick(&mut o).await;
+        assert!(sink.lock().expect("dispatch sink").is_empty());
+        o.drain.disarm();
+        drive_tick(&mut o).await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "a cancelled drain must dispatch the work that queued behind it"
+        );
+    }
+
+    /// Runs `f` under a recording subscriber and returns everything it logged, warming the
+    /// callsites with a throwaway pass first so a sibling test cannot pin them `Interest::never`
+    /// (TRA-243). `f` builds its own orchestrator, so running it twice is a clean repeat.
+    async fn captured<F, Fut>(f: F) -> Vec<CapturedEvent>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _serial = TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        f().await; // warm-up: force every callsite to register
+        tracing::callsite::rebuild_interest_cache();
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        f().await;
+        drop(guard);
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every captured message plus its fields, flattened, for substring assertions.
+    fn text(events: &[CapturedEvent]) -> String {
+        events
+            .iter()
+            .map(|e| {
+                let fields: Vec<String> =
+                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!("[{}] {} {}", e.level, e.message, fields.join(" "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // Silence is this feature's failure mode: a daemon that quietly stops dispatching looks exactly
+    // like a wedged one. The arming transition must therefore say so at WARN, and name the reason.
+    #[tokio::test]
+    async fn arming_the_drain_logs_the_pause_loudly() {
+        let events = captured(|| async {
+            let (mut o, _sink) = orch_with_candidate();
+            o.drain.arm(at(0), DrainReason::Update);
+            drive_tick(&mut o).await;
+        })
+        .await;
+        let out = text(&events);
+        assert!(
+            out.contains("drain requested") && out.contains("dispatch paused"),
+            "the arming transition must be visible in the log stream, got: {out}"
+        );
+        assert!(
+            out.contains("reason=update"),
+            "the pause must name who asked for it, got: {out}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("drain requested") && e.level == "WARN"),
+            "a paused dispatch is a WARN, not a debug line, got: {out}"
+        );
+    }
+
+    // The steady state is rate-limited, but quiescence — "nothing is in flight, a restart is safe
+    // now" — is the single most useful line a drain can emit, so it is a transition and always logs.
+    #[tokio::test]
+    async fn reaching_zero_in_flight_is_announced_once() {
+        let events = captured(|| async {
+            let (mut o, _sink) = orch_with_candidate();
+            o.drain.arm(at(0), DrainReason::Operator);
+            drive_tick(&mut o).await; // arming tick
+            drive_tick(&mut o).await; // nothing in flight → quiesced
+            drive_tick(&mut o).await; // and it is not repeated every tick
+        })
+        .await;
+        let out = text(&events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("drain complete"))
+                .count(),
+            1,
+            "quiescence is announced exactly once per drain, got: {out}"
+        );
+    }
+
+    // A cancelled drain reports the resume — the gate is the only observer of that transition, so if
+    // it stayed quiet an operator would have no way to tell a resumed daemon from a still-paused one.
+    #[tokio::test]
+    async fn cancelling_logs_the_resume() {
+        let events = captured(|| async {
+            let (mut o, _sink) = orch_with_candidate();
+            o.drain.arm(at(0), DrainReason::Operator);
+            drive_tick(&mut o).await;
+            o.drain.disarm();
+            drive_tick(&mut o).await;
+        })
+        .await;
+        let out = text(&events);
+        assert!(
+            out.contains("drain cancelled"),
+            "the resume must be visible, got: {out}"
+        );
+    }
+
+    // The rate limit itself: while a drain waits out a long turn the steady-state line repeats at
+    // DRAIN_LOG_INTERVAL and not at poll rate. Driven by the injected clock, so it costs no wall time.
+    #[test]
+    fn the_steady_state_line_is_rate_limited_to_the_interval() {
+        let t0 = at(0);
+        assert!(!due(t0, t0), "no time has passed");
+        assert!(
+            !due(t0, t0 + chrono::Duration::seconds(299)),
+            "just under the window is not due"
+        );
+        assert!(
+            due(t0, t0 + chrono::Duration::seconds(300)),
+            "the window itself is due"
+        );
+        assert!(
+            !due(t0 + chrono::Duration::seconds(10), t0),
+            "a clock that stepped backwards must read as not-due, never panic on the negative span"
+        );
     }
 }

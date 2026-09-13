@@ -765,6 +765,20 @@ impl Orchestrator {
             self.schedule_tick(poll);
             return;
         }
+        // STUDIO-880: the drain gate. Same seam, same property as the credential preflight below —
+        // skip ALL dispatch WITHOUT claiming anything, before candidate fetch — because a drain that
+        // claimed a ticket and then declined to run it would leave exactly the abandoned claim the
+        // "nothing is claimed" invariant exists to prevent. Deliberately ONE gate rather than a
+        // second "should we dispatch" test somewhere else: two of them is how one gets forgotten.
+        //
+        // It sits just ABOVE the credential preflight because the preflight SHELLS OUT (a bounded
+        // `claude -p` probe). A daemon that has been told to stop dispatching has no use for the
+        // answer, so asking would spend a subprocess every tick for a decision already made.
+        if self.drain_preflight() {
+            self.set_held_for_capacity(HashMap::new()); // see the retirement note above
+            self.schedule_tick(poll);
+            return;
+        }
         // BO-59: agent credential-liveness preflight. A dead backend credential (e.g. an expired Claude
         // OAuth login) skips ALL dispatch WITHOUT claiming anything, so an infrastructure fault fails
         // fast instead of claim→dispatch→die every ~5 min. Runs BEFORE candidate fetch (nothing is
