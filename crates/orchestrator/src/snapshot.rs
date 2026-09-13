@@ -326,6 +326,12 @@ impl Orchestrator {
         // paused, and an operator reading a project that has quietly stopped taking work needs to be
         // told why. Empty while not draining → the wire shape and the status fixtures are unaffected.
         let draining = self.drain.is_draining();
+        // STUDIO-891: and again for the third silent stall this surface now carries. Unlike the two
+        // above, this one does not pause dispatch — work keeps flowing and only REVIEW stops, which
+        // is precisely why it needs saying: the board looks healthy while pull requests pile up
+        // unreviewed and, with auto-merge on, unmerged. Empty while nothing is stalled → the wire
+        // shape and the status fixtures are unaffected.
+        let review_stalled = self.review_rounds_stalled();
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -350,6 +356,9 @@ impl Orchestrator {
             }
             if draining {
                 warnings.push(crate::drain::DRAINING_WARNING.to_string());
+            }
+            if review_stalled {
+                warnings.push(crate::reviewwatch::REVIEW_UNASSIGNABLE_WARNING.to_string());
             }
             out.push(ProjectStatus {
                 slug: group.clone(),
