@@ -22,6 +22,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
 use crate::app::App;
+use crate::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome};
 
 /// Emitted (once, non-blocking) by the quiet on-launch check when a newer version exists, so the UI can
 /// badge the update affordance without the user asking. Payload: [`UpdateInfo`].
@@ -67,6 +68,11 @@ pub struct InstallReport {
     pub installed: bool,
     /// The active-run count that blocked an unforced install (0 when the install was allowed to proceed).
     pub blocked_active_runs: i64,
+    /// What a requested drain did (STUDIO-880), or `None` when none was asked for. Present on BOTH
+    /// outcomes on purpose: an install that proceeded because the drain worked and one that was
+    /// deferred because the drain's budget expired must be distinguishable to whoever is watching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainOutcome>,
 }
 
 /// Shared updater session state: the [`Update`] the last successful `check()` found (so download/install
@@ -78,6 +84,16 @@ pub struct UpdateState {
     current: Mutex<Option<Update>>,
     /// Bytes from a completed [`update_download`], consumed by the next install; `None` until then.
     downloaded: Mutex<Option<Vec<u8>>>,
+}
+
+/// Logs a drain that did not settle the daemon, so an install that was deferred says why in the
+/// app's own output as well as in its return value. A drain that expired is the interesting case:
+/// nothing was interrupted and the install simply waits for the next graceful quit.
+fn tracing_note(outcome: &DrainOutcome) {
+    eprintln!(
+        "rhapsody-desktop: update install: the daemon did not settle ({outcome:?}); \
+         deferring the install to the next graceful quit"
+    );
 }
 
 /// The install guard's pure core, unit-tested headlessly: an install may proceed to restart the app only
@@ -247,7 +263,30 @@ pub async fn update_install(
     handle: AppHandle,
     state: State<'_, UpdateState>,
     force: bool,
+    drain: bool,
 ) -> Result<InstallReport, String> {
+    // STUDIO-880: `drain` makes "upgrade now, cleanly" possible for the first time. The deferred
+    // marker below exists precisely because an install COULD NOT interrupt work; a drain removes
+    // that constraint by letting the work finish instead of racing it.
+    //
+    // Ordering matters: drain BEFORE the guard reads the count, so the guard then sees the settled
+    // daemon rather than the busy one. `force` still skips everything, and is still the only way to
+    // install over live work.
+    let mut drained = None;
+    if drain && !force {
+        let outcome = app.drain_and_wait(DEFAULT_DRAIN_BUDGET).await;
+        drained = Some(outcome.clone());
+        if !matches!(
+            outcome,
+            DrainOutcome::AlreadyIdle | DrainOutcome::Drained { .. } | DrainOutcome::NotRunning
+        ) {
+            // The drain did not settle the daemon — expired budget, or it could not even be asked
+            // for. Fall through to the guard, which refuses and defers exactly as before; the
+            // `drain` field is what tells the caller WHICH of those happened, so an expired budget
+            // never reads as an ordinary "runs are active" refusal.
+            tracing_note(&outcome);
+        }
+    }
     let active = app.active_run_count().await;
     if !may_install_now(active, force) {
         // Refuse the restart now; defer to the next graceful quit when work has drained.
@@ -255,6 +294,7 @@ pub async fn update_install(
         return Ok(InstallReport {
             installed: false,
             blocked_active_runs: active,
+            drain: drained,
         });
     }
     install_update(&handle, &state, &app).await?;

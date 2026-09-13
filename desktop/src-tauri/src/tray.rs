@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use rhapsody_desktop::app::App;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+
+use rhapsody_desktop::drain::DEFAULT_DRAIN_BUDGET;
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
@@ -22,6 +24,7 @@ const ID_SETTINGS: &str = "tray-settings";
 const ID_START: &str = "tray-start";
 const ID_STOP: &str = "tray-stop";
 const ID_RESTART: &str = "tray-restart";
+const ID_DRAIN_RESTART: &str = "tray-drain-restart";
 const ID_QUIT: &str = "tray-quit";
 
 // `MenuItem::with_id` needs a concrete accelerator type even when there is none.
@@ -36,6 +39,7 @@ struct TrayItems<R: Runtime> {
     start: MenuItem<R>,
     stop: MenuItem<R>,
     restart: MenuItem<R>,
+    drain_restart: MenuItem<R>,
 }
 
 /// Registers the menu-bar tray on the running app and starts the status-refresh loop. Mirrors Go
@@ -47,6 +51,17 @@ pub fn start_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let start = MenuItem::with_id(app, ID_START, "Start Daemon", true, NO_ACCEL)?;
     let stop = MenuItem::with_id(app, ID_STOP, "Stop Daemon", true, NO_ACCEL)?;
     let restart = MenuItem::with_id(app, ID_RESTART, "Restart Daemon", true, NO_ACCEL)?;
+    // STUDIO-880: the safe counterpart of Restart. "Restart Daemon" throws away whatever turn is in
+    // flight; this one stops new work, waits for the in-flight turns to finish, and restarts only
+    // then. Offered in exactly the states Restart is, so the tray never enables an action that would
+    // immediately report "not running".
+    let drain_restart = MenuItem::with_id(
+        app,
+        ID_DRAIN_RESTART,
+        "Drain & Restart Daemon",
+        true,
+        NO_ACCEL,
+    )?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit Rhapsody", true, NO_ACCEL)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
@@ -55,7 +70,17 @@ pub fn start_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let menu = Menu::with_items(
         app,
         &[
-            &status, &sep1, &open, &settings, &sep2, &start, &stop, &restart, &sep3, &quit,
+            &status,
+            &sep1,
+            &open,
+            &settings,
+            &sep2,
+            &start,
+            &stop,
+            &restart,
+            &drain_restart,
+            &sep3,
+            &quit,
         ],
     )?;
 
@@ -79,6 +104,7 @@ pub fn start_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         start,
         stop,
         restart,
+        drain_restart,
     };
     spawn_refresh_loop(app.clone(), tray, items);
     Ok(())
@@ -112,6 +138,16 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
             let a = app_state(app);
             tauri::async_runtime::spawn(async move {
                 let _ = a.restart_daemon().await;
+            });
+        }
+        ID_DRAIN_RESTART => {
+            // Bounded and non-blocking: the drain can legitimately take many minutes, so it runs off
+            // the menu thread. The outcome is logged rather than swallowed — an expired budget
+            // restarts NOTHING, and an operator who sees no restart has to be able to find out why.
+            let a = app_state(app);
+            tauri::async_runtime::spawn(async move {
+                let outcome = a.drain_and_restart(DEFAULT_DRAIN_BUDGET).await;
+                eprintln!("rhapsody-desktop: drain and restart: {outcome:?}");
             });
         }
         ID_QUIT => {
@@ -159,6 +195,9 @@ fn spawn_refresh_loop<R: Runtime>(app: AppHandle<R>, tray: TrayIcon<R>, items: T
             let _ = items.start.set_enabled(model.can_start);
             let _ = items.stop.set_enabled(model.can_stop);
             let _ = items.restart.set_enabled(model.can_restart);
+            // Same states as Restart (STUDIO-880): a drain only means anything on a daemon that is
+            // taking work, which is exactly when a restart is offered.
+            let _ = items.drain_restart.set_enabled(model.can_restart);
             let tooltip = if model.tooltip.is_empty() {
                 "Rhapsody".to_string()
             } else {

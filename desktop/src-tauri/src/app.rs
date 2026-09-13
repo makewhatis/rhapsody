@@ -300,6 +300,12 @@ impl App {
     }
 
     /// The current supervisor (a cheap `Arc` clone), or `None` before OnStartup. Mirrors `getSup`.
+    /// The short-timeout loopback client the `/api/v1/state` probe uses, shared with the drain's
+    /// `/api/v1/drain` round trip (STUDIO-880) so both speak to the daemon with the same bounds.
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.inner.http
+    }
+
     pub fn get_sup(&self) -> Option<Supervisor> {
         lock(&self.inner.mu).sup.clone()
     }

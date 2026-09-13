@@ -62,6 +62,21 @@ export interface StateResponse {
   // Held dependents waiting on an uncleared blockedBy predecessor (INF-318/INF-320). Empty for a
   // disabled project (the hold is part of the opt-in orchestration). Defensive-coalesced in fetchState.
   blocked: BlockedEntry[];
+  // The armed drain (STUDIO-880), or ABSENT when the daemon is dispatching normally.
+  //
+  // Optional because the daemon emits the key ONLY while a drain is armed: /api/v1/state is
+  // byte-pinned to the Go daemon's golden, so a key present in every payload would be parity drift.
+  // Read it as `state.drain?.active` — an absent key and `active: false` mean the same thing.
+  drain?: DrainState;
+}
+
+// DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking
+// NEW work so its in-flight runs can reach a turn boundary before a restart. Nothing is interrupted
+// while it is armed; `requested_at` is how long it has been settling.
+export interface DrainState {
+  active: boolean;
+  reason: "operator" | "update";
+  requested_at: string; // RFC3339, or "" when unset
 }
 
 // IssueEvent is one entry in a running issue's activity timeline (oldest -> newest).
