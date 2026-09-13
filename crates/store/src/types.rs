@@ -354,3 +354,35 @@ pub struct ReviewWatchRow {
     /// on `status` as [`REVIEW_STATUS_DROPPED`].
     pub open: bool,
 }
+
+/// The newest summons Rhapsody has ever OBSERVED for one ticket — one row per ticket identifier,
+/// and the durable half of the summons re-engagement decision (STUDIO-885). No Go counterpart.
+///
+/// A summons is a durable fact: an `@symphony` comment that still exists on the pull request. The
+/// daemon nevertheless only ever SAW it as a transient one — GitHub enrichment asks for comments
+/// newer than `now - ghLookback` (five minutes), so `Issue::latest_summon_at` is re-derived from
+/// scratch every poll and reverts to unset the moment the comment ages out of that window. A
+/// ticket whose summons landed while the board was at its concurrency cap therefore lost the only
+/// thing that lifts `pr_suppressed`, and stayed suppressed for as long as the daemon ran.
+///
+/// Remembering the observation decouples the two: the comparison `pr_suppressed` actually makes —
+/// summons versus the ticket's LAST RUN START — is between two durable facts, so it keeps its
+/// meaning however long the ticket waits for a slot. It does NOT weaken the suppression: a ticket
+/// whose newest summons predates its last run start is still suppressed, which is the whole point
+/// of the rule.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SummonWatermark {
+    /// The ticket's tracker identifier (`STUDIO-879`) — the row's primary key. Identifier, not
+    /// opaque id, because that is the key `last_run_started_at` compares against.
+    pub identifier: String,
+    /// When the summons was posted, RFC3339 UTC at SECONDS precision with a `Z` suffix — the same
+    /// canonical form every other timestamp column in this store uses. Produced by
+    /// [`format_summon_at`](crate::format_summon_at) and by nothing else, so the column is
+    /// fixed-width and a lexicographic comparison (the retention cutoff in `prune`) is a
+    /// chronological one.
+    pub at: String,
+    /// The body of that SAME comment (INF-448 keeps time and body describing one comment), so a
+    /// re-engagement the watermark triggers can still seed the run with what the reviewer wrote.
+    /// Empty when the source could not surface one.
+    pub body: String,
+}

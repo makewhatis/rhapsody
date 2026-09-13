@@ -698,6 +698,18 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::ReviewWatchRow>, StoreError> {
             self.0.load_live_review_watch()
         }
+        fn record_summon_watermark(
+            &self,
+            w: rhapsody_store::SummonWatermark,
+        ) -> Result<(), StoreError> {
+            self.0.record_summon_watermark(w)
+        }
+        fn summon_watermark(
+            &self,
+            identifier: &str,
+        ) -> Result<Option<rhapsody_store::SummonWatermark>, StoreError> {
+            self.0.summon_watermark(identifier)
+        }
         fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
             self.0.prune(retention_days)
         }
