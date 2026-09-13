@@ -19,7 +19,7 @@ the `Orchestrator` struct itself. Concretely:
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
   they never lock anything and must never be called from another task.
-- Five exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+- Six exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -62,8 +62,18 @@ the `Orchestrator` struct itself. Concretely:
     a REFUSAL of a particular id is a verdict that memoizes as a bounded negative instead, and
     conflating them either re-opens the storm or makes one bad id stall every healthy row with it.
 
+  - `drain.rs`'s `DrainSignal` (`Orchestrator::drain`, STUDIO-880) — a lock-free `Arc`-shared
+    atomic flag, cloned onto the control task, onto EVERY dispatched worker, and onto
+    `ControlHandle`. The HTTP task is its only writer (`POST /api/v1/drain`); the control task reads
+    it on the dispatch gate and each worker reads it at its turn boundary. It rides beside
+    `retention_days` for that field's reason — both sides genuinely touch it and neither can wait for
+    the other — and being a plain atomic with no lock and no `.await`, it is a shared-state seam only
+    in the bookkeeping sense. **Two dispatch entry points read it, not one**: `on_tick`'s gate and
+    `on_retry`'s park. If you add a third path that dispatches, it needs the same test — that is the
+    failure this feature already had once.
+
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  five seams; if none fits, that's a real design decision — don't reach for a sixth ad hoc
+  six seams; if none fits, that's a real design decision — don't reach for a seventh ad hoc
   `Arc<Mutex<..>>` without updating this list.
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from

@@ -985,6 +985,66 @@ the only one of the eight with a Go counterpart and it keeps `GH_SUMMONS_TIMEOUT
 bound; the other seven are Rhapsody-only seams (console merge, review-comment posting, the quorum's
 and the review watcher's lookups) that Go Symphony does not have at all.
 
+### Drain and restart — an upgrade lets in-flight runs finish (STUDIO-880)
+
+Go v0.4.0 has no drain: restarting the daemon throws away whatever turn is in flight, and the turn is
+re-done from scratch afterwards. That is additive surface — one new route, one conditional key, one
+new operator action — and its whole design is forced by a constraint worth stating, because it is the
+first thing anyone proposes to design around.
+
+**Re-attaching a running agent to a fresh daemon is impossible, not merely unbuilt.** The runner
+spawns the agent with piped stdin/stdout/stderr and the DAEMON owns the read end, so a live turn is
+the daemon reading that stream; when the daemon exits the read end closes and the output has nowhere
+to go. A pipe cannot be handed to a successor process. On top of that `KillTreeOnDrop` deliberately
+kills the agent's whole tree as the daemon's task unwinds (STUDIO-871). So the unit that can survive
+a restart is not the run and not the turn — it is the **turn boundary**.
+
+| Restarting the daemon | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| in-flight turn | killed, re-done from scratch | finishes; the next turn is refused |
+| how a run ends | `interrupted`, via boot recovery | `continued` — claim kept, continuation queued |
+| new dispatch during | n/a | gated at the SAME seam as the BO-59 credential preflight |
+| visibility | none | `/api/v1/state`'s `drain` key, a per-project advisory, a console banner, WARN logs |
+| asking for one | n/a | `POST /api/v1/drain`, a tray action, the in-app updater |
+| default | n/a | **inert**: a daemon nobody drains behaves exactly as before |
+
+**The `drain` key on `/api/v1/state` is emitted ONLY while a drain is armed.** That conditional is
+load-bearing rather than tidy. `/api/v1/state` is byte-pinned to the Go daemon's
+`harness/fixtures/api/state.json`, which is why `teams_enabled` lives on `/api/v1/version` instead of
+there. A key that appears only in a state the Go daemon cannot be in leaves every payload it CAN
+produce byte-identical, so the golden still passes unchanged — and a second test asserts the key is
+ABSENT on a non-draining daemon, so the conditional cannot quietly decay into an unconditional one.
+
+**There are TWO dispatch entry points, and both are gated.** `on_tick` is the obvious one; a due
+retry dispatches straight from `on_retry`, bypassing the tick entirely. Gating only the tick let a
+drain settle the daemon and then immediately re-dispatch every continuation it had just wound down.
+A draining daemon PARKS a due retry instead: the entry keeps its claim, its due time and its attempt
+number, because a drain is not a failure and must not burn a ticket's retry budget.
+
+**What a drained run loses is the agent's conversation thread, and only that.** `--resume` is driven
+by the session's in-memory thread id, seeded from the first turn's stream; a re-dispatch builds a
+fresh session whose thread id starts empty, and nothing reads a stored id back into it.
+`runs.session_uuid` cannot help — `persist_start_run` leaves that column empty; it is reserved, never
+written. Everything durable survives: the worktree, the branch, the commits, the claim and the retry
+row. That is exactly why the turn boundary is the right cut — it is the point at which the agent has
+just finished a unit of work, so the conversation is the cheapest thing on the table.
+
+**An expired drain budget interrupts nothing.** The daemon-side drain owns no budget at all and never
+kills anything; the WAITING belongs to whoever asked (the desktop's `drain_and_restart`), because the
+only thing a timeout could do from inside the daemon is interrupt the work the drain exists to
+protect. When the desktop's wait expires it restarts NOTHING, reports how many runs are still in
+flight, and leaves the drain armed. It never silently falls through to the interrupting restart — an
+expiry that restarted anyway would make the whole feature a slower version of the bug. That makes the
+budget a policy number rather than a correctness one: a drain is bounded below by
+`claude.turn_timeout_ms` (one hour by default), so any shorter budget can legitimately expire, and
+expiry is safe by construction.
+
+**The orphan class this removes.** The supervisor SIGTERMs the daemon's process group and escalates
+to SIGKILL after `stop_grace` (5s). A SIGKILL means `Drop` never runs, which means `KillTreeOnDrop`
+never runs, which means the live agent and its whole tree are orphaned. After a drain there is no
+agent process left to kill, so there is nothing a kill could orphan — asserted on process state, with
+a `setpgid`-ing child in the fixture so the assertion is about a tree rather than a single pid.
+
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
 
 Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it
