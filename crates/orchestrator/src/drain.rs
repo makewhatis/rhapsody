@@ -637,6 +637,44 @@ mod tests {
         );
     }
 
+    // The per-project advisory (GET /api/v1/projects), the same operator surface the dead-credential
+    // pause uses. An operator looking at a project that has quietly stopped taking work must be able
+    // to tell "deliberately paused" from "broken" without reading the log stream.
+    #[test]
+    fn a_drain_surfaces_the_per_project_advisory() {
+        let tr: Arc<dyn rhapsody_tracker::Tracker> = Arc::new(Fake::new());
+        let mut eff = empty_effective(Arc::clone(&tr));
+        eff.projects = vec![crate::testsupport::empty_resolved_project(
+            "alpha",
+            Arc::clone(&tr),
+        )];
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+
+        let before = o.project_statuses();
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0].warnings.iter().all(|w| w != DRAINING_WARNING),
+            "a daemon nobody drains surfaces no drain advisory"
+        );
+
+        o.drain.arm(at(0), DrainReason::Operator);
+        let after = o.project_statuses();
+        assert!(
+            after[0].warnings.iter().any(|w| w == DRAINING_WARNING),
+            "an armed drain must surface an operator advisory on the project status"
+        );
+
+        o.drain.disarm();
+        assert!(
+            o.project_statuses()[0]
+                .warnings
+                .iter()
+                .all(|w| w != DRAINING_WARNING),
+            "cancelling takes the advisory away again"
+        );
+    }
+
     // The rate limit itself: while a drain waits out a long turn the steady-state line repeats at
     // DRAIN_LOG_INTERVAL and not at poll rate. Driven by the injected clock, so it costs no wall time.
     #[test]
