@@ -9,7 +9,7 @@ import {
   StatusDot,
 } from "@/components/ui";
 import type { Updater } from "@/hooks/useUpdater";
-import { downloadPercent, formatBytes } from "@/lib/updater-model";
+import { deferredSubline, downloadPercent, formatBytes } from "@/lib/updater-model";
 
 export interface UpdatesTabProps {
   /** The single shell-owned update model (shared with the toolbar gear dot). */
@@ -25,7 +25,8 @@ export interface UpdatesTabProps {
 export function UpdatesTab({ updater }: UpdatesTabProps) {
   const { phase, info } = updater;
   // "Check for updates" is inert while a check/download/install is already running.
-  const busy = phase === "checking" || phase === "downloading" || phase === "installing";
+  const busy =
+    phase === "checking" || phase === "downloading" || phase === "draining" || phase === "installing";
   const notes = info?.notes?.trim() ?? "";
   // Show release notes wherever there is a pending update carrying them.
   const showNotes =
@@ -136,6 +137,18 @@ function StatusBlock({ updater }: { updater: Updater }) {
       );
     case "downloading":
       return <DownloadingRow updater={updater} />;
+    case "draining":
+      // STUDIO-880: the slow, lossless path. It can legitimately sit here for many minutes, so the
+      // subline says WHY nothing appears to be happening — an unexplained pulsing dot on a 30-minute
+      // wait reads as a hang.
+      return (
+        <Line
+          dot="var(--rust-text)"
+          pulse
+          title="Waiting for the agents to finish…"
+          sub="No new work is being started. The update installs as soon as they reach a turn boundary — nothing is interrupted."
+        />
+      );
     case "installing":
       return <Line dot="var(--rust-text)" pulse title="Installing…" />;
     case "ready":
@@ -156,7 +169,7 @@ function StatusBlock({ updater }: { updater: Updater }) {
         <Line
           dot="var(--amber)"
           title="Update scheduled"
-          sub="Rhapsody will install it on your next quit — the agents keep playing until then."
+          sub={deferredSubline(updater.drainOutcome)}
           action={
             <Button variant="primary" size="sm" onClick={updater.confirmInstallNow}>
               Restart &amp; update now
@@ -276,11 +289,12 @@ function DownloadingRow({ updater }: { updater: Updater }) {
   );
 }
 
-// ActiveRunsDialog — the safety confirm before an install stops running agents (spec: "never
-// silently restart with active runs"). Rendered only when an install is awaiting confirmation. Three
-// choices: update now (stops the agents), install on next quit (leaves them playing), or cancel.
-// Escape / overlay-click cancels. Mirrors ConfirmDialog's surface but needs a second action, so it
-// is local rather than the shared single-confirm primitive.
+// ActiveRunsDialog — the safety confirm before an install disturbs running agents (spec: "never
+// silently restart with active runs"). Rendered only when an install is awaiting confirmation. Four
+// choices: wait for the agents to finish and update then (STUDIO-880's drain — the default, since it
+// is the only one that loses no work), update now (stops them), install on next quit (leaves them
+// playing), or cancel. Escape / overlay-click cancels. Mirrors ConfirmDialog's surface but needs
+// more than one action, so it is local rather than the shared single-confirm primitive.
 function ActiveRunsDialog({ updater }: { updater: Updater }) {
   const n = updater.activeRunsPrompt;
   const { dismissPrompt } = updater;
@@ -327,18 +341,22 @@ function ActiveRunsDialog({ updater }: { updater: Updater }) {
       >
         <div style={{ fontSize: 16, fontWeight: 600, color: "var(--tx)" }}>{label}</div>
         <div style={{ fontSize: 13, color: "var(--tx-3)", lineHeight: 1.5 }}>
-          Updating now will stop them and restart Rhapsody. You can install immediately, or wait and let the
-          update apply the next time you quit.
+          Rhapsody can stop taking new work and wait for them to finish the turn they’re on, then update —
+          nothing is interrupted, though it may take a while. Updating now stops them mid-turn instead, and
+          that work is lost. Or leave them playing and let the update apply the next time you quit.
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
           <Button type="button" variant="ghost" onClick={dismissPrompt}>
             Cancel
           </Button>
+          <Button type="button" variant="subtle" onClick={updater.confirmInstallNow}>
+            Update now (stops them)
+          </Button>
           <Button type="button" variant="subtle" onClick={updater.deferToQuit}>
             Install on next quit
           </Button>
-          <Button type="button" variant="primary" onClick={updater.confirmInstallNow}>
-            Update now
+          <Button type="button" variant="primary" onClick={updater.drainThenInstall}>
+            Wait, then update
           </Button>
         </div>
       </div>
