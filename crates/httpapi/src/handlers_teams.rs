@@ -1106,6 +1106,43 @@ mod tests {
         );
     }
 
+    /// STUDIO-891: the unsatisfiable-`review.reviewers` rejection reaches the dashboard, which is
+    /// the second surface an operator has that needs no log access (`rhapsodyd teams show` is the
+    /// first). Nothing here changed to make that true — the endpoint already reports a
+    /// present-but-rejected file WITH its reason — and this pins that the new rule rides that
+    /// route rather than being a startup line only.
+    #[tokio::test]
+    async fn an_unsatisfiable_reviewer_count_is_reported_by_the_config_endpoint() {
+        let dir = TempDir::new();
+        let path = dir.0.join("teams.yaml");
+        std::fs::write(
+            &path,
+            "enabled: true\nreview:\n  mode: ticketless\n  reviewers: 2\nroster:\n  - name: alice\n  - name: jimmy\n",
+        )
+        .expect("write teams.yaml");
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_config_path(path.to_string_lossy()),
+        ))
+        .await;
+
+        let body = body_json(
+            reqwest::get(&format!("{url}/api/v1/teams/config"))
+                .await
+                .expect("GET"),
+        )
+        .await;
+        assert_eq!(body["present"], true, "{body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("review.reviewers is 2") && error.contains("at most 1"),
+            "the reason must name both numbers: {body}"
+        );
+        assert_eq!(
+            body["config"]["enabled"], false,
+            "the endpoint reports the off state the daemon actually booted into: {body}"
+        );
+    }
+
     /// **The explicit enable, round-tripped.** A POST writes the file and the echoed view is read
     /// back off disk — so what the editor shows next is what the daemon will boot.
     #[tokio::test]

@@ -544,6 +544,15 @@ pub struct Orchestrator {
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
     pub(crate) review_rounds: crate::reviewwatch::ReviewRounds,
+    /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
+    /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
+    /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
+    /// a row gets a reviewer, and dropped when the pull request leaves the watch set.
+    ///
+    /// Separate from [`Orchestrator::review_rounds`] because it counts the opposite thing: that one
+    /// bounds how much review a pull request may be GIVEN, this one notices when it is being given
+    /// none at all.
+    pub(crate) review_unassignable: HashMap<String, usize>,
     /// Pull-request coordinates a console merge is currently attempting, and since when
     /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
     /// id, because two runs of one ticket share a branch and therefore share the pull request a
@@ -789,6 +798,7 @@ impl Orchestrator {
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
+            review_unassignable: HashMap::new(),
             merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
