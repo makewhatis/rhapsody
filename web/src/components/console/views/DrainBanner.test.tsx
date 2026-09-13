@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { StateResponse } from "@/lib/api";
 
@@ -8,11 +8,11 @@ import type { StateResponse } from "@/lib/api";
 // exactly like a wedged one from the outside (tickets sit, nothing dispatches), so the banner's
 // ABSENCE on an ordinary daemon and its PRESENCE on a draining one are both requirements.
 
-const h = vi.hoisted(() => ({ fetchState: vi.fn() }));
+const h = vi.hoisted(() => ({ fetchState: vi.fn(), setDrain: vi.fn() }));
 
 vi.mock("@/lib/api", async (orig) => {
   const actual = await orig<typeof import("@/lib/api")>();
-  return { ...actual, fetchState: h.fetchState };
+  return { ...actual, fetchState: h.fetchState, setDrain: h.setDrain };
 });
 
 const { DrainBanner } = await import("./DrainBanner");
@@ -82,6 +82,41 @@ describe("DrainBanner", () => {
     const note = await screen.findByRole("status");
     expect(note.textContent).toMatch(/nothing is in flight/i);
     expect(note.textContent).not.toMatch(/for an update/i);
+  });
+
+  // STUDIO-880 — the way OUT. A drain outlives whatever asked for one: an expired desktop budget
+  // leaves it armed on purpose, so without this the daemon takes no work at all and the only
+  // remedies are a restart (throwing away the turn the drain was protecting) or a hand-rolled curl.
+  it("cancels the drain over the API and re-reads the daemon's answer", async () => {
+    h.setDrain.mockResolvedValue({ active: false, reason: "operator", requested_at: "" });
+    h.fetchState.mockResolvedValue(
+      state({ drain: { active: true, reason: "operator", requested_at: "" } }),
+    );
+    renderBanner();
+    const button = await screen.findByRole("button", { name: /cancel drain/i });
+    fireEvent.click(button);
+    // `false` — the banner ENDS a drain and can never arm one.
+    await waitFor(() => expect(h.setDrain).toHaveBeenCalledWith(false));
+
+    // Once the daemon stops reporting a drain the banner goes, so the control cannot be left
+    // showing against a daemon that is dispatching again.
+    h.fetchState.mockResolvedValue(state());
+    const { container } = renderBanner();
+    await waitFor(() => expect(container.innerHTML).toBe(""));
+  });
+
+  // A refused cancel must not read as a successful one: the operator is still in the state the
+  // banner exists to make visible, and has to be told the button did not work.
+  it("says so when the daemon refuses the cancel, and leaves the banner up", async () => {
+    h.setDrain.mockRejectedValue(new Error("drain cancel failed: 503"));
+    h.fetchState.mockResolvedValue(
+      state({ drain: { active: true, reason: "operator", requested_at: "" } }),
+    );
+    renderBanner();
+    fireEvent.click(await screen.findByRole("button", { name: /cancel drain/i }));
+    const note = await screen.findByRole("status");
+    await waitFor(() => expect(note.textContent).toMatch(/refused the cancel/i));
+    expect(note.textContent).toMatch(/no new work is being started/i);
   });
 
   // `active: false` and an absent key mean the same thing — a daemon that cancelled a drain must not

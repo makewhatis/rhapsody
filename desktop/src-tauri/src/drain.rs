@@ -202,6 +202,21 @@ impl App {
     }
 }
 
+/// Whether a [`App::drain_and_restart`] outcome actually restarted the daemon.
+///
+/// Reads that function's contract rather than restating a policy: only `AlreadyIdle` and `Drained`
+/// reach the restart at all, and `Drained` is returned unchanged only when it succeeded. Every other
+/// variant means the daemon is still up and still on the old build — and for [`DrainOutcome::Expired`]
+/// still DRAINING, because an expired budget deliberately leaves the drain armed. `NotRunning` is not
+/// a restart either: there was nothing to restart, and an operator who asked for one should be told
+/// that rather than left to assume.
+pub fn restarted(outcome: &DrainOutcome) -> bool {
+    matches!(
+        outcome,
+        DrainOutcome::AlreadyIdle | DrainOutcome::Drained { .. }
+    )
+}
+
 /// Waits for `count` to report zero, giving up after `budget`.
 ///
 /// `Ok(waited)` ⇒ it reached zero (a zero `waited` means it already was). `Err((last, waited))` ⇒
@@ -359,6 +374,36 @@ mod tests {
             out.map_err(|(n, _)| n),
             Err(1),
             "an unreachable daemon must hold the restart, never wave it through"
+        );
+    }
+
+    // STUDIO-880: the tray asks for a drain-and-restart and then has to decide whether anything
+    // visible happened. A drain that did NOT restart leaves the daemon Running — so the tray still
+    // reads Running — and an expired one leaves it drained and taking no work at all. Getting this
+    // predicate wrong is the difference between surfacing that and an `eprintln!` nobody reads.
+    #[test]
+    fn only_a_settled_daemon_is_ever_actually_restarted() {
+        assert!(restarted(&DrainOutcome::AlreadyIdle));
+        assert!(restarted(&DrainOutcome::Drained { waited_secs: 7 }));
+        assert!(
+            !restarted(&DrainOutcome::Expired {
+                running: 2,
+                waited_secs: 1800
+            }),
+            "an expired budget restarts NOTHING and leaves the drain armed"
+        );
+        assert!(
+            !restarted(&DrainOutcome::NotRunning),
+            "there was nothing to restart — not the same as having restarted it"
+        );
+        assert!(!restarted(&DrainOutcome::RequestFailed {
+            error: "connection refused".into()
+        }));
+        assert!(
+            !restarted(&DrainOutcome::RestartFailed {
+                error: "spawn failed".into()
+            }),
+            "the restart was attempted and FAILED — the daemon is still on the old build"
         );
     }
 }

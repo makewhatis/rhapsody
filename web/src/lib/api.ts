@@ -408,6 +408,29 @@ export async function fetchRunDetail(runID: number): Promise<RunDetail> {
   return d;
 }
 
+// setDrain arms or cancels the daemon's drain (STUDIO-880), resolving to the drain's state
+// afterwards — the SAME three fields `/api/v1/state`'s `drain` key carries, so a caller never has to
+// follow up with a read.
+//
+// Deliberately over HTTP rather than through the desktop's Tauri bridge: the console is served both
+// by the daemon itself (a plain browser) and as the desktop window's content, and only the HTTP
+// route exists in both. A drain the operator can end from one host and not the other would be the
+// same gap the feature already had.
+//
+// `reason` annotates an ARM only; the daemon ignores it when cancelling and when a drain is already
+// armed (re-arming never rewrites the drain that is running).
+export async function setDrain(active: boolean, reason = "operator"): Promise<DrainState> {
+  const res = await fetch("/api/v1/drain", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active, reason }),
+  });
+  if (!res.ok) {
+    throw new Error(`drain ${active ? "arm" : "cancel"} failed: ${res.status}`);
+  }
+  return (await res.json()) as DrainState;
+}
+
 export async function postRefresh(): Promise<void> {
   const res = await fetch("/api/v1/refresh", { method: "POST" });
   if (!res.ok && res.status !== 202) {

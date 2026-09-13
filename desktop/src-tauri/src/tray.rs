@@ -14,7 +14,7 @@ use std::time::Duration;
 use rhapsody_desktop::app::App;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
-use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, REASON_OPERATOR};
+use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, REASON_OPERATOR, restarted};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
@@ -142,14 +142,24 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
         }
         ID_DRAIN_RESTART => {
             // Bounded and non-blocking: the drain can legitimately take many minutes, so it runs off
-            // the menu thread. The outcome is logged rather than swallowed — an expired budget
-            // restarts NOTHING, and an operator who sees no restart has to be able to find out why.
+            // the menu thread.
             let a = app_state(app);
+            let handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 let outcome = a
                     .drain_and_restart(DEFAULT_DRAIN_BUDGET, REASON_OPERATOR)
                     .await;
                 eprintln!("rhapsody-desktop: drain and restart: {outcome:?}");
+                if !restarted(&outcome) {
+                    // A drain that did not restart leaves nothing for the operator to see: the
+                    // daemon is still Running, so the tray still reads Running, and stderr is not a
+                    // surface anybody is looking at half an hour later. An EXPIRED budget also
+                    // leaves the drain ARMED on purpose — from then on the daemon takes no work at
+                    // all — so bring the window forward, where the console's drain banner says so
+                    // and offers the cancel. Silence is this feature's failure mode.
+                    show_window(&handle);
+                    navigate(&handle, "dashboard");
+                }
             });
         }
         ID_QUIT => {

@@ -22,7 +22,6 @@ import {
   installUpdate,
   activeRunCount,
   drainAndRestart,
-  setDaemonDrain,
   onUpdateAvailable,
   onUpdateDownloadProgress,
   pickDirectory,
@@ -245,12 +244,6 @@ describe("bindings — Tauri host present", () => {
     invokeMock.mockResolvedValueOnce({ outcome: "drained", waited_secs: 42 });
     expect(await drainAndRestart()).toEqual({ outcome: "drained", waited_secs: 42 });
     expect(invokeMock).toHaveBeenCalledWith("drain_and_restart");
-  });
-
-  it("setDaemonDrain passes the flag and returns whether a drain is armed", async () => {
-    invokeMock.mockResolvedValueOnce(true);
-    expect(await setDaemonDrain(true)).toBe(true);
-    expect(invokeMock).toHaveBeenCalledWith("set_daemon_drain", { active: true });
   });
 
   it("activeRunCount invokes active_run_count and returns the count", async () => {

@@ -68,13 +68,6 @@ async fn drain_and_restart(app: tauri::State<'_, App>) -> Result<DrainOutcome, S
         .await)
 }
 
-/// Arm or cancel the daemon's drain without restarting anything (STUDIO-880) — so a console can show
-/// "pausing new work" as its own state, and can take it back.
-#[tauri::command]
-async fn set_daemon_drain(app: tauri::State<'_, App>, active: bool) -> Result<bool, String> {
-    app.set_daemon_drain(active, REASON_OPERATOR).await
-}
-
 // ---- D4 settings commands (Tauri stand-ins for the Wails-bound App methods) -----------------------
 
 /// Probe the external CLIs (claude, gh, gt, git) for the Tool-doctor panel. Mirrors Go `App.ProbeTools`.
@@ -199,7 +192,6 @@ fn run() -> tauri::Result<()> {
             stop_daemon,
             restart_daemon,
             drain_and_restart,
-            set_daemon_drain,
             probe_tools,
             set_tool_override,
             credential_status,

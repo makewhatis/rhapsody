@@ -1005,7 +1005,8 @@ a restart is not the run and not the turn — it is the **turn boundary**.
 | how a run ends | `interrupted`, via boot recovery | `continued` — claim kept, continuation queued |
 | new dispatch during | n/a | gated at the SAME seam as the BO-59 credential preflight |
 | visibility | none | `/api/v1/state`'s `drain` key, a per-project advisory, a console banner, WARN logs |
-| asking for one | n/a | `POST /api/v1/drain`, a tray action, the in-app updater |
+| asking for one | n/a | `POST /api/v1/drain`, a tray action, the in-app updater's "Wait, then update" |
+| ending one | n/a | `POST /api/v1/drain` `{"active": false}`, or the console banner's **Cancel drain** |
 | default | n/a | **inert**: a daemon nobody drains behaves exactly as before |
 
 **The `drain` key on `/api/v1/state` is emitted ONLY while a drain is armed.** That conditional is
@@ -1038,6 +1039,15 @@ expiry that restarted anyway would make the whole feature a slower version of th
 budget a policy number rather than a correctness one: a drain is bounded below by
 `claude.turn_timeout_ms` (one hour by default), so any shorter budget can legitimately expire, and
 expiry is safe by construction.
+
+**Which is why a drain has to be cancellable from the product, not just over HTTP.** An expired
+budget leaves the daemon armed and taking no work at all, and the thing that asked for the drain —
+a tray click, an updater — is long gone by then. The console banner that announces a drain also ends
+one, over the same HTTP route rather than the desktop bridge, because the console is served both by
+the daemon itself and as the desktop window's content and only the HTTP route exists in both. The
+tray's own drain brings the window forward when it does NOT restart, for the same reason: a daemon
+that is still running still reads "Running" in the tray, so nothing else would tell the operator the
+restart never happened.
 
 **The orphan class this removes.** The supervisor SIGTERMs the daemon's process group and escalates
 to SIGKILL after `stop_grace` (5s). A SIGKILL means `Drop` never runs, which means `KillTreeOnDrop`

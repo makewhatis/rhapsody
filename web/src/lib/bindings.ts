@@ -131,13 +131,6 @@ export async function drainAndRestart(): Promise<DrainOutcome | null> {
   return invoke<DrainOutcome>("drain_and_restart");
 }
 
-// setDaemonDrain arms or cancels the daemon's drain without restarting anything, resolving to whether
-// a drain is armed afterwards. Returns null in a plain browser (no bridge).
-export async function setDaemonDrain(active: boolean): Promise<boolean | null> {
-  if (!tauriAvailable()) return null;
-  return invoke<boolean>("set_daemon_drain", { active });
-}
-
 export async function probeTools(): Promise<ToolResult[]> {
   if (!tauriAvailable()) return [];
   return invoke<ToolResult[]>("probe_tools");
