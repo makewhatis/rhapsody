@@ -528,9 +528,10 @@ impl Orchestrator {
         if sweeps < REVIEW_UNASSIGNABLE_SWEEPS {
             return false;
         }
-        if sweeps == REVIEW_UNASSIGNABLE_SWEEPS
-            || (sweeps - REVIEW_UNASSIGNABLE_SWEEPS).is_multiple_of(REVIEW_UNASSIGNABLE_LOG_EVERY)
-        {
+        // The crossing sweep and the rate-limited repeats in ONE condition: at the crossing the
+        // difference is zero, and zero is a multiple of everything. Spelling the crossing out as a
+        // separate disjunct would read as a second rule while deciding nothing.
+        if (sweeps - REVIEW_UNASSIGNABLE_SWEEPS).is_multiple_of(REVIEW_UNASSIGNABLE_LOG_EVERY) {
             tracing::warn!(
                 pr = %pr, reviewer, sweeps,
                 "ticketless review: this round has had no eligible reviewer for {sweeps} \
@@ -545,7 +546,7 @@ impl Orchestrator {
     /// Forgets `id`'s consecutive-deferral count, logging the RECOVERY when there was a reported
     /// stall to recover from — the edge [`note_unassignable`](Self::note_unassignable) is the other
     /// half of. A round that never reached the threshold clears silently: it was never news.
-    fn clear_unassignable(&mut self, id: &str, pr: &PrCoord, reviewer: &str) {
+    fn clear_unassignable(&mut self, pr: &PrCoord, id: &str, reviewer: &str) {
         if let Some(sweeps) = self.review_unassignable.remove(id)
             && sweeps >= REVIEW_UNASSIGNABLE_SWEEPS
         {
@@ -728,7 +729,7 @@ impl Orchestrator {
             // owed before is settled. Cleared BEFORE the dispatch, because a dispatch that fails
             // further down is a different problem with its own log line, and leaving the count
             // standing would let this row keep claiming a stall it no longer has.
-            self.clear_unassignable(&id, pr, &row.key.reviewer);
+            self.clear_unassignable(pr, &id, &row.key.reviewer);
             let reassigned = chosen != row.key.reviewer;
             let picked = chosen.clone();
             let run = ReviewRun {
@@ -1812,6 +1813,22 @@ mod tests {
         o.teams = Some(ticketless(&["alice", "bob"]));
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
         assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
+    }
+
+    /// The operator advisory is PROSE that goes out on the wire, and a backslash-continued Rust
+    /// literal is exactly where source indentation leaks into shipped text. A test that compares
+    /// the constant to itself would never see it, so this reads the rendered value.
+    #[test]
+    fn the_stalled_round_advisory_renders_as_one_sentence() {
+        assert!(
+            !REVIEW_UNASSIGNABLE_WARNING.contains("  ")
+                && !REVIEW_UNASSIGNABLE_WARNING.contains('\n'),
+            "leaked source indentation: {REVIEW_UNASSIGNABLE_WARNING:?}"
+        );
+        assert!(
+            REVIEW_UNASSIGNABLE_WARNING.contains("review.reviewers"),
+            "the advisory must name the knob an operator turns"
+        );
     }
 
     /// STUDIO-891: a round that keeps deferring stops being a quiet one.
