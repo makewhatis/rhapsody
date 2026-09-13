@@ -142,6 +142,17 @@ pub struct ControlHandle {
     /// [`Orchestrator::lifecycle`](crate::orchestrator::Orchestrator), so every HTTP task that asks
     /// what state a ticket is in shares one TTL window instead of each keeping its own
     /// (STUDIO-702). Read-only with respect to the control task, which never touches it.
+    /// The SAME `Arc`-shared drain flag as
+    /// [`Orchestrator::drain`](crate::orchestrator::Orchestrator) (STUDIO-880), so the HTTP layer
+    /// arms and cancels a drain with **no control round-trip at all**.
+    ///
+    /// It rides here, beside `retention_days`, for the reason that field does: both sides genuinely
+    /// touch it, and neither can wait for the other. The control task READS it on the dispatch gate
+    /// and each worker READS it at its turn boundary; the HTTP task is the only writer, and a
+    /// `POST /api/v1/drain` queued behind a network-bound tick would be answering minutes after the
+    /// operator asked — which on the updater's path is exactly when it matters. It is a lock-free
+    /// atomic, so it is not a sixth state seam.
+    pub(crate) drain: crate::drain::DrainSignal,
     pub(crate) lifecycle: std::sync::Arc<crate::lifecycle::LifecycleCache>,
     /// The `gh` seams the console's merge action drives (STUDIO-767), snapshotted from
     /// [`Orchestrator::merge_deps`](crate::orchestrator::Orchestrator). It lives on the handle
@@ -181,6 +192,7 @@ impl crate::orchestrator::Orchestrator {
             teams_memory: self.teams_memory.as_ref().map(std::sync::Arc::clone),
             quorum: self.quorum_tx.clone(),
             review_intro: self.review_intro_tx.clone(),
+            drain: self.drain.clone(),
             lifecycle: std::sync::Arc::clone(&self.lifecycle),
             merge: self.merge_deps.as_ref().map(std::sync::Arc::clone),
             diff: self.diff_deps.as_ref().map(std::sync::Arc::clone),
@@ -193,6 +205,33 @@ impl ControlHandle {
     /// `None` when the daemon has no Teams runtime, which the handlers render as `teams_disabled`.
     pub fn teams_memory(&self) -> Option<&std::sync::Arc<crate::teamsmemory::TeamsMemory>> {
         self.teams_memory.as_ref()
+    }
+
+    /// Arms or cancels the drain (`POST /api/v1/drain`, STUDIO-880), answering the state that
+    /// resulted. Infallible and immediate: the flag is an atomic, so this never waits on the control
+    /// task and there is no outcome a caller could fail to get.
+    ///
+    /// Arming stops new dispatch from the next tick and winds in-flight runs down at their turn
+    /// boundaries; it interrupts nothing and kills nothing. Cancelling resumes dispatch. Both are
+    /// idempotent — `reason` annotates the drain that is armed, so re-arming keeps the original.
+    pub fn set_drain(
+        &self,
+        active: bool,
+        reason: crate::drain::DrainReason,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::drain::DrainStatus {
+        if active {
+            self.drain.arm(now, reason);
+        } else {
+            self.drain.disarm();
+        }
+        self.drain.status()
+    }
+
+    /// The drain's current state (`GET /api/v1/drain`) — what a waiter polls alongside
+    /// `counts.running` to decide whether a restart is safe yet.
+    pub fn drain_status(&self) -> crate::drain::DrainStatus {
+        self.drain.status()
     }
 }
 

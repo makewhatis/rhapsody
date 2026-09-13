@@ -181,9 +181,7 @@ impl DrainSignal {
         self.inner
             .requested_at_ms
             .store(at.timestamp_millis(), Ordering::Relaxed);
-        self.inner
-            .reason
-            .store(reason.to_bits(), Ordering::Relaxed);
+        self.inner.reason.store(reason.to_bits(), Ordering::Relaxed);
         // `swap` rather than `store`: two concurrent arms must agree on which one won, so exactly one
         // caller is told it armed the drain.
         !self.inner.active.swap(true, Ordering::AcqRel)
