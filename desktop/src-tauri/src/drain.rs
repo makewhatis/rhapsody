@@ -236,11 +236,22 @@ where
 {
     let started = tokio::time::Instant::now();
     let deadline = started + budget;
+    let mut first = true;
     loop {
         let n = count().await;
         if n <= 0 {
-            return Ok(started.elapsed());
+            // A daemon that was ALREADY idle waited zero, and must report zero. `started.elapsed()`
+            // cannot say so: `started` is taken before the first `count()`, which is a loopback
+            // round trip, so on a real clock it is never zero and `DrainOutcome::AlreadyIdle` was
+            // unreachable outside a test with `start_paused`. The distinction is the one the type
+            // exists for — "nothing was in flight" is not "the runs finished in under a second".
+            return Ok(if first {
+                Duration::ZERO
+            } else {
+                started.elapsed()
+            });
         }
+        first = false;
         let now = tokio::time::Instant::now();
         if now >= deadline {
             // The last count, never an assumed-idle 0: an expiry that reported zero would be
@@ -294,6 +305,32 @@ mod tests {
         let (count, calls) = scripted(&[0]);
         let waited = wait_for_idle(DEFAULT_DRAIN_BUDGET, DRAIN_POLL_INTERVAL, count).await;
         assert_eq!(waited, Ok(Duration::ZERO));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one read, no sleep");
+    }
+
+    // The SAME assertion on a REAL clock, which is the only place the bug lived. `started` is taken
+    // before the first `count()` — a loopback round trip — so `started.elapsed()` is never zero
+    // outside a `start_paused` test, and an idle daemon used to report `Drained { waited_secs: 0 }`
+    // instead of `AlreadyIdle`. The variant the type documents as distinguishable was unreachable in
+    // production, and every test that "covered" it had the clock frozen.
+    #[tokio::test]
+    async fn an_idle_daemon_reports_zero_on_a_real_clock_too() {
+        // A count that is not instantaneous, the way a real `/api/v1/state` probe is not.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let count = move || {
+            let c = c.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                c.fetch_add(1, Ordering::SeqCst);
+                0_i64
+            }
+        };
+        assert_eq!(
+            wait_for_idle(DEFAULT_DRAIN_BUDGET, DRAIN_POLL_INTERVAL, count).await,
+            Ok(Duration::ZERO),
+            "nothing was in flight, so nothing was waited for — however long the probe took"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one read, no sleep");
     }
 

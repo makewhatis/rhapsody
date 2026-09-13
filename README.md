@@ -1016,11 +1016,19 @@ there. A key that appears only in a state the Go daemon cannot be in leaves ever
 produce byte-identical, so the golden still passes unchanged — and a second test asserts the key is
 ABSENT on a non-draining daemon, so the conditional cannot quietly decay into an unconditional one.
 
-**There are TWO dispatch entry points, and both are gated.** `on_tick` is the obvious one; a due
-retry dispatches straight from `on_retry`, bypassing the tick entirely. Gating only the tick let a
-drain settle the daemon and then immediately re-dispatch every continuation it had just wound down.
-A draining daemon PARKS a due retry instead: the entry keeps its claim, its due time and its attempt
-number, because a drain is not a failure and must not burn a ticket's retry budget.
+**There are THREE dispatch entry points, and each is gated at its own door.** `on_tick` is the
+obvious one; a due retry dispatches straight from `on_retry`, bypassing the tick entirely. Gating
+only the tick let a drain settle the daemon and then immediately re-dispatch every continuation it
+had just wound down. A draining daemon PARKS a due retry instead: the entry keeps its claim, its due
+time and its attempt number, because a drain is not a failure and must not burn a ticket's retry
+budget. The third is the ticketless review sweep (`Event::ReviewSweep` → `dispatch_review`), which
+has no production caller today but reaches dispatch past both of the others; it refuses BEFORE its
+watch-set writes, because a row recorded as in-flight is edge-triggered and that head would never be
+offered again. They are three gates rather than one because each owns bookkeeping a late refusal
+would strand — which is also why the shared `dispatch_issue` underneath them only WARNS when it is
+reached while draining. That warn is the mechanical net: a fourth path added without its own gate
+cannot be silent, and the run it dispatches is self-limiting anyway, since the worker reads the same
+flag and winds down at its first turn boundary.
 
 **What a drained run loses is the agent's conversation thread, and only that.** `--resume` is driven
 by the session's in-memory thread id, seeded from the first turn's stream; a re-dispatch builds a

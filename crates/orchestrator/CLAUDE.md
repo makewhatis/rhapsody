@@ -68,9 +68,14 @@ the `Orchestrator` struct itself. Concretely:
     it on the dispatch gate and each worker reads it at its turn boundary. It rides beside
     `retention_days` for that field's reason — both sides genuinely touch it and neither can wait for
     the other — and being a plain atomic with no lock and no `.await`, it is a shared-state seam only
-    in the bookkeeping sense. **Two dispatch entry points read it, not one**: `on_tick`'s gate and
-    `on_retry`'s park. If you add a third path that dispatches, it needs the same test — that is the
-    failure this feature already had once.
+    in the bookkeeping sense. **Three dispatch entry points read it, not one**: `on_tick`'s gate,
+    `on_retry`'s park, and `dispatch_review`'s refusal (the `Event::ReviewSweep` path, which has no
+    production caller today but reaches dispatch past both of the others). Each refuses in its OWN
+    idiom because each owns bookkeeping a late refusal would strand — a claim, a retry entry, a watch
+    row recorded as in-flight — which is also why `dispatch_issue` only WARNS when it is reached
+    while draining rather than refusing there. If you add a fourth path that dispatches, gate it at
+    its own door and give it the same test: forgetting the second one is the failure this feature
+    already had once, and the warn is what will tell you if a fifth slips through.
 
   If you need to touch orchestrator state from outside the loop task, route through one of these
   six seams; if none fits, that's a real design decision — don't reach for a seventh ad hoc
