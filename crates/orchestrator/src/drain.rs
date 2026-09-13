@@ -689,6 +689,44 @@ mod tests {
         );
     }
 
+    // The other end of the park, and the one that would lose work if it were wrong: once the drain
+    // is cancelled, the SAME parked entry dispatches. A park that could not be un-parked would strand
+    // the ticket silently — it keeps its claim, so nothing else would ever pick it up either.
+    #[tokio::test]
+    async fn a_parked_retry_dispatches_once_the_drain_is_cancelled() {
+        let mut f = Fake::new();
+        f.candidates = vec![issue("1", "MT-1", "In Progress")];
+        let (mut o, dispatched) = crate::testsupport::orch_for_retry(std::sync::Arc::new(f), 10);
+        o.claimed.insert("1".into());
+        o.retry_attempts
+            .insert("1".into(), crate::testsupport::retry_entry("1", "MT-1", 3));
+        o.drain.arm(at(0), DrainReason::Update);
+
+        // The timer fires while draining: parked.
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert!(dispatched.lock().expect("dispatch sink").is_empty());
+
+        // The operator cancels, and the re-armed timer fires again.
+        o.drain.disarm();
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+
+        assert_eq!(
+            *dispatched.lock().expect("dispatch sink"),
+            vec!["1".to_string()],
+            "a cancelled drain must release the work it parked, not strand it"
+        );
+        assert!(
+            !o.retry_attempts.contains_key("1"),
+            "the entry leaves the queue on the dispatch that finally took it"
+        );
+    }
+
     // And the control: with no drain, the same due retry dispatches. Without this the test above
     // would keep passing if `on_retry` stopped dispatching altogether.
     #[tokio::test]
