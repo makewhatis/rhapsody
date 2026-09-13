@@ -224,6 +224,11 @@ impl ReviewWatchSink for ControlWatchSink {
             crate::runautomerge::AutoMergeOutcome::Declined(why) => {
                 tracing::info!(pr = %plan.pr, reason = why, "auto-merge: declined")
             }
+            // The same refusal as last tick, at the same head. Said once, above, on the tick it
+            // was decided; saying it again every minute is what STUDIO-881 measured 182 of.
+            crate::runautomerge::AutoMergeOutcome::Held(why) => {
+                tracing::debug!(pr = %plan.pr, reason = why, "auto-merge: still declined")
+            }
             crate::runautomerge::AutoMergeOutcome::Failed(err) => {
                 tracing::warn!(pr = %plan.pr, %err, "auto-merge: a gate could not be read; not merging")
             }
@@ -994,6 +999,7 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup: PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: head.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -1007,6 +1013,7 @@ mod tests {
     /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
     fn merged_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: head.to_string(),
             status: PrStatus::Merged,
             merged_at: chrono::DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
@@ -1019,6 +1026,7 @@ mod tests {
     /// One observation of a pull request that was CLOSED without merging.
     fn closed_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: head.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -1253,12 +1261,14 @@ mod tests {
     #[test]
     fn a_retired_pull_request_leaves_the_watch_set() {
         let merged = PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Merged,
             merged_at: None,
             head_repo: format!("{OWNER}/{REPO}"),
         });
         let closed = PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -2199,6 +2209,7 @@ mod tests {
             _allow: &HeadAllowlist,
         ) -> PrStateResult {
             Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: format!("{number:040}"),
                 status: PrStatus::Open,
                 merged_at: None,

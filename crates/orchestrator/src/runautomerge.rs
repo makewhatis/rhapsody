@@ -21,7 +21,7 @@
 //! The merge carries `--match-head-commit`, so if the author pushed between the observation and
 //! the merge, GITHUB refuses it rather than this daemon noticing afterwards.
 //!
-//! # Only `CLEAN` proceeds
+//! # Only `CLEAN` proceeds — and `CLEAN` is not sufficient
 //!
 //! The `mergeStateStatus` gate is an ALLOWLIST of one. GitHub's vocabulary here is open and has
 //! grown before, and every other value it currently spells is a reason not to merge — `DRAFT`,
@@ -29,6 +29,13 @@
 //! of the ones known today would merge on the one added tomorrow, which is this batch's signature
 //! defect: a guard that does not guard. `BEHIND` is the single value with a branch of its own,
 //! because it is the one that can be CLEARED — see below.
+//!
+//! ⚠️ It is nonetheless NECESSARY and not sufficient, and STUDIO-881 is what that cost: a DRAFT
+//! pull request with approvals at the head and green checks reports `CLEAN`, not `DRAFT`. Both of
+//! the live pull requests that motivated that ticket did. So `isDraft` is read separately, off the
+//! snapshot step 1 already takes, and refused there — see [`DECLINE_DRAFT`]. Reading the state
+//! GitHub volunteers was never going to be enough on its own; the field that answers the question
+//! has to be asked for.
 //!
 //! The check rollup is then read anyway, at the same head, even though `CLEAN` already means
 //! GitHub's required contexts passed. Two independent reads of "is it green" is the ticket's
@@ -39,6 +46,20 @@
 //!
 //! That rollup is resolved per check NAME, not per entry — one head carries several entries for a
 //! name and the non-green ones are routinely superseded rather than owed. See [`blocking_check`].
+//!
+//! # A refusal is not an unreadable gate
+//!
+//! Every failed `gh pr merge` used to become [`AutoMergeOutcome::Failed`], logged as *"a gate could
+//! not be read"*. That phrase is a claim — that nothing is KNOWN, and the next tick may learn more
+//! — and for `GraphQL: Pull Request is still a draft` it is false: the gate was read perfectly and
+//! the answer was no. The daemon re-asked it every minute for three hours, 182 times, and each
+//! attempt cost the three reads that precede it as well.
+//!
+//! [`classify_merge_error`] draws the line at whether GitHub ANSWERED, and the default is to retry,
+//! because the fail-open direction here is abandoning a mergeable pull request on a blip. Nothing
+//! latches: a refusal is re-decided from a fresh reading of GitHub on the next tick, exactly like
+//! the gates above it. What does not repeat is the REPORT — see [`AutoMergeLedger`], which is the
+//! only state this half keeps and holds what has been SAID rather than what GitHub answered.
 //!
 //! # BEHIND updates and re-gates; it never merges on a stale approval
 //!
@@ -55,13 +76,15 @@
 //! branches, or whose policy cannot be read, is DECLINED — never merged — which is the same
 //! direction [`crate::runmerge`] fails in and for the same reason.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::automerge::AutoMergePlan;
 use crate::ghsummons::{
     BranchUpdateSource, BranchUpdater, CheckRun, HeadAllowlist, MERGE_STATE_BEHIND, MergeMethod,
     MergeSource, MergeStateSource, PrChecksSource, PrLookup, PrStateSource, PrStatus,
 };
+use crate::prstate::PrCoord;
 
 /// How an auto-merge merges. `--squash` is the repository's convention — the squash subject is the
 /// pull-request title release-please parses — matching [`crate::runmerge::MERGE_METHOD`].
@@ -70,6 +93,11 @@ pub const AUTO_MERGE_METHOD: MergeMethod = MergeMethod::Squash;
 /// The one `mergeStateStatus` an auto-merge proceeds on. See the module doc: an allowlist, because
 /// GitHub's vocabulary is open.
 pub const MERGE_STATE_CLEAN: &str = "CLEAN";
+
+/// The refusal a DRAFT pull request gets (STUDIO-881). Named because two gates answer with it —
+/// the snapshot read below, and the classifier that reads GitHub's own refusal if a draft somehow
+/// reaches the merge anyway.
+const DECLINE_DRAFT: &str = "the pull request is still a draft";
 
 /// The one conclusion that says a check NAME judged this head and passed. Named because
 /// [`blocking_check`] asks about it specifically, not merely as a member of
@@ -108,6 +136,8 @@ pub struct AutoMergeDeps {
     pub merger: Arc<dyn MergeSource>,
     /// The head repositories a watched pull request may come from besides the base's own owner.
     pub allow: HeadAllowlist,
+    /// What this half has already SAID, and the only state it keeps. See [`AutoMergeLedger`].
+    pub ledger: AutoMergeLedger,
 }
 
 /// What one auto-merge attempt did.
@@ -121,6 +151,12 @@ pub enum AutoMergeOutcome {
     /// A gate refused. The reason is a fixed phrase, so the same refusal reads identically in the
     /// log every time it happens.
     Declined(&'static str),
+    /// The same gate refused for the same reason at the same head as last time, so there is
+    /// nothing new to say (STUDIO-881). The decision is identical to [`AutoMergeOutcome::Declined`]
+    /// — nothing merged — and it is reported apart from it only so the caller can stay quiet: a
+    /// refusal repeated once a minute for three hours is not a signal anyone reads, and it is
+    /// indistinguishable from a daemon that is stuck.
+    Held(&'static str),
     /// A lookup could not be MADE. Distinct from a refusal: nothing is known, so nothing is
     /// concluded and the next tick asks again.
     Failed(String),
@@ -129,22 +165,37 @@ pub enum AutoMergeOutcome {
 /// Runs every gate that needs GitHub and, if they all clear, merges `plan`'s pull request.
 ///
 /// The order is cheapest-refusal-first and, more importantly, safest-first: the pull request is
-/// re-resolved before anything else, so a merged, closed or MOVED head costs one call and stops.
+/// re-resolved before anything else, so a merged, closed, DRAFT or moved head costs one call and
+/// stops.
 pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoMergeOutcome {
+    let outcome = attempt_auto_merge(plan, deps).await;
+    // Anything that is not a refusal is a change of subject, so the next refusal is news again.
+    // Done in one place rather than on each of the four such returns, because a path that forgot
+    // would go silent instead of loud and nothing would notice.
+    if !matches!(
+        outcome,
+        AutoMergeOutcome::Declined(_) | AutoMergeOutcome::Held(_)
+    ) {
+        deps.ledger.forget(&plan.pr);
+    }
+    outcome
+}
+
+async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoMergeOutcome {
     let (owner, repo, number) = (&plan.pr.owner, &plan.pr.repo, plan.pr.number);
 
     // 1. Is this still the pull request the verdicts were about? The control task decided from a
     //    watch-set snapshot and an observation from earlier in the tick; both can be stale by now.
     let snap = match deps.prs.pr_state(owner, repo, number, &deps.allow).await {
         Ok(PrLookup::Found(snap)) => snap,
-        Ok(PrLookup::Gone) => return AutoMergeOutcome::Declined("the pull request is gone"),
+        Ok(PrLookup::Gone) => return refuse(plan, deps, "the pull request is gone"),
         Ok(PrLookup::Untrusted) => {
-            return AutoMergeOutcome::Declined("the head repository is not trusted");
+            return refuse(plan, deps, "the head repository is not trusted");
         }
         Err(e) => return AutoMergeOutcome::Failed(e.to_string()),
     };
     if snap.status != PrStatus::Open {
-        return AutoMergeOutcome::Declined("the pull request is no longer open");
+        return refuse(plan, deps, "the pull request is no longer open");
     }
     // The head moved between the observation and now, so every verdict on record is about a commit
     // that is no longer what would land. `--match-head-commit` below would catch this too; catching
@@ -156,7 +207,19 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
     // This compares two answers from GitHub about the same field, where a case difference would
     // mean the same commit — so folding can only avoid a FALSE refusal, never admit a wrong head.
     if !snap.head_sha.eq_ignore_ascii_case(&plan.head) {
-        return AutoMergeOutcome::Declined("the head moved after the verdicts were read");
+        return refuse(plan, deps, "the head moved after the verdicts were read");
+    }
+    // A DRAFT is a definite no, and it is invisible to every gate below: GitHub reports a draft
+    // with approvals and green checks as `CLEAN` (STUDIO-881 measured exactly that on both of the
+    // pull requests it was filed for), so only `isDraft` catches it. Refusing HERE, off the
+    // snapshot step 1 has already paid for, is what stops the merge_state/pr_checks reads and the
+    // `gh pr merge` write that used to follow — 182 of them in the three hours the ticket covers.
+    //
+    // Re-read from GitHub on every tick, and deliberately not remembered: marking a draft ready
+    // for review does NOT move the head, so a gate that latched on this answer would strand a pull
+    // request the author had already un-drafted. Only the REPORT is de-duplicated — see `refuse`.
+    if snap.is_draft {
+        return refuse(plan, deps, DECLINE_DRAFT);
     }
 
     // 2. GitHub's own verdict on whether this can merge at all.
@@ -174,7 +237,11 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
             pr = %plan.pr, %state,
             "auto-merge: declining a pull request GitHub does not report as CLEAN"
         );
-        return AutoMergeOutcome::Declined("GitHub does not report the pull request as mergeable");
+        return refuse(
+            plan,
+            deps,
+            "GitHub does not report the pull request as mergeable",
+        );
     }
 
     // 3. The checks, read at the same head. `CLEAN` covers the REQUIRED contexts; this covers the
@@ -186,14 +253,14 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
     if checks.is_empty() {
         // Not "no checks, so nothing failed": an empty rollup is no EVIDENCE of green, and this
         // repository always runs several. Fails closed.
-        return AutoMergeOutcome::Declined("no checks have reported on this head");
+        return refuse(plan, deps, "no checks have reported on this head");
     }
     if let Some(bad) = blocking_check(&checks) {
         tracing::info!(
             pr = %plan.pr, check = %bad.name, state = %bad.state,
             "auto-merge: declining on a check that is not green"
         );
-        return AutoMergeOutcome::Declined("a check is failing or has not finished");
+        return refuse(plan, deps, "a check is failing or has not finished");
     }
 
     // 4. Merge, pinned to the head every verdict was recorded against.
@@ -220,7 +287,120 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
             );
             AutoMergeOutcome::Merged(said)
         }
-        Err(e) => AutoMergeOutcome::Failed(e.to_string()),
+        Err(e) => classify_merge_error(plan, deps, e.to_string()),
+    }
+}
+
+/// The `gh pr merge` errors that are GitHub ANSWERING "no", mapped to the refusal each one is.
+///
+/// An ALLOWLIST, and small on purpose. Everything absent from it — a network error, an `HTTP 503`,
+/// a message GitHub adds next year — is a FAILURE and is asked again next tick, because the
+/// fail-open direction here is abandoning a mergeable pull request on a blip. The motivating log
+/// carries both shapes against the same pull request within the same hour: `GraphQL: Pull Request
+/// is still a draft (mergePullRequest)`, which will say the same thing forever, and `HTTP 503:
+/// Service Unavailable`, which was gone on the next tick.
+///
+/// A phrase earns a place here by being observed LOOPING, not by seeming plausible.
+const TERMINAL_MERGE_ERRORS: [(&str, &str); 2] = [
+    // STUDIO-881's own error, measured 182 times in three hours. Reachable even with the `isDraft`
+    // gate above, because that gate reads a snapshot taken one call earlier.
+    ("pull request is still a draft", DECLINE_DRAFT),
+    // A conflict with the base. `MERGE_STATE_CLEAN` normally catches this first; when it does not,
+    // the merge cannot succeed until somebody pushes — and a push moves the head, which re-gates
+    // the pull request from the top.
+    (
+        "pull request is not mergeable",
+        "GitHub does not report the pull request as mergeable",
+    ),
+];
+
+/// What a failed `gh pr merge` was: GitHub refusing, or GitHub not answering.
+///
+/// **This is the distinction the module was missing** (STUDIO-881). Every error from the merge used
+/// to become [`AutoMergeOutcome::Failed`] — logged as *"a gate could not be read"* — which is a
+/// claim that nothing is KNOWN and the next tick may learn more. For `Pull Request is still a
+/// draft` that claim is simply false: the gate was read perfectly and the answer was no, and the
+/// daemon re-asked it once a minute for three hours to be told the same thing.
+///
+/// So the rule is about whether an answer was GIVEN, not about how bad it was:
+///
+/// * GitHub refused, in words this daemon recognises ⇒ a [`AutoMergeOutcome::Declined`], reported
+///   like any other gate's refusal and announced once (see [`AutoMergeLedger`]).
+/// * Anything else ⇒ [`AutoMergeOutcome::Failed`], retried next tick.
+///
+/// Nothing here latches. A refusal is re-decided from a fresh reading of GitHub on the next tick,
+/// exactly like the gates above it, so a draft marked ready or a conflict resolved clears on its
+/// own without bookkeeping. What does not repeat is the REPORT.
+fn classify_merge_error(
+    plan: &AutoMergePlan,
+    deps: &AutoMergeDeps,
+    err: String,
+) -> AutoMergeOutcome {
+    let lower = err.to_ascii_lowercase();
+    match TERMINAL_MERGE_ERRORS
+        .iter()
+        .find(|(marker, _)| lower.contains(marker))
+    {
+        Some((_, why)) => {
+            tracing::info!(
+                pr = %plan.pr, head = %plan.head, %err,
+                "auto-merge: GitHub refused the merge; this is a refusal, not an unreadable gate"
+            );
+            refuse(plan, deps, why)
+        }
+        None => AutoMergeOutcome::Failed(err),
+    }
+}
+
+/// Reports `why` as this pull request's refusal, quietly if it is the same refusal as last time.
+///
+/// See [`AutoMergeLedger`] for why the second and later reports are held rather than repeated.
+fn refuse(plan: &AutoMergePlan, deps: &AutoMergeDeps, why: &'static str) -> AutoMergeOutcome {
+    deps.ledger.refuse(&plan.pr, &plan.head, why)
+}
+
+/// The refusal this half has already ANNOUNCED for each pull request, and the only state it keeps.
+///
+/// It remembers what was SAID, never what GitHub answered: every gate above is re-read from GitHub
+/// on every tick and re-decided from scratch, so nothing here can strand a pull request whose
+/// refusal has since cleared. Marking a draft ready for review, resolving a conflict and a slow
+/// check turning green all clear on the very next tick, and the ledger has no say in it.
+///
+/// What it stops is the noise. STUDIO-881's daemon logged the same refusal every minute for three
+/// hours; as the ticket puts it, a refusal that repeats forever is indistinguishable from a daemon
+/// that is stuck. So a refusal is announced when it is NEWS — the first time it is decided, and
+/// again whenever the reason or the head changes — and [`AutoMergeOutcome::Held`] otherwise.
+///
+/// Anything that is not a refusal forgets the pull request, so the next refusal is news again.
+///
+/// The map holds one entry per pull request this daemon has refused, which the open watch set
+/// bounds in practice; [`LEDGER_CAPACITY`] bounds it in a daemon that runs for months anyway, at a
+/// cost of one repeated log line per pull request on the tick it is emptied.
+#[derive(Default)]
+pub struct AutoMergeLedger(Mutex<HashMap<PrCoord, (String, &'static str)>>);
+
+/// See [`AutoMergeLedger`]. Comfortably above any plausible open watch set.
+const LEDGER_CAPACITY: usize = 256;
+
+impl AutoMergeLedger {
+    fn refuse(&self, pr: &PrCoord, head: &str, why: &'static str) -> AutoMergeOutcome {
+        let mut seen = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() >= LEDGER_CAPACITY && !seen.contains_key(pr) {
+            seen.clear();
+        }
+        match seen.insert(pr.clone(), (head.to_string(), why)) {
+            Some((was_head, was_why)) if was_head == head && was_why == why => {
+                AutoMergeOutcome::Held(why)
+            }
+            _ => AutoMergeOutcome::Declined(why),
+        }
+    }
+
+    fn forget(&self, pr: &PrCoord) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(pr);
     }
 }
 
@@ -280,7 +460,9 @@ async fn update_behind_branch(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> Aut
     match deps.policy.allows_branch_update(owner, repo).await {
         Ok(true) => {}
         Ok(false) => {
-            return AutoMergeOutcome::Declined(
+            return refuse(
+                plan,
+                deps,
                 "the branch is behind its base and the repository will not update it",
             );
         }
@@ -293,7 +475,9 @@ async fn update_behind_branch(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> Aut
                 "auto-merge: the branch is behind its base and the repository's branch-update \
                  policy could not be read; declining"
             );
-            return AutoMergeOutcome::Declined(
+            return refuse(
+                plan,
+                deps,
                 "the branch is behind its base and the repository will not update it",
             );
         }
@@ -321,6 +505,7 @@ mod tests {
     use crate::prstate::PrCoord;
     use async_trait::async_trait;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const HEAD: &str = "c366a61c366a61c366a61c366a61c366a61c366a";
     const OTHER: &str = "a324d2da324d2da324d2da324d2da324d2da324d";
@@ -333,42 +518,82 @@ mod tests {
         }
     }
 
-    struct FakePrs(Option<PrLookup>);
+    /// The answer is behind a `Mutex` so a test can run several TICKS against one set of deps and
+    /// change what GitHub says between them — which is the only way to assert that un-drafting a
+    /// pull request is noticed, and that a refusal is announced once rather than once a tick.
+    struct FakePrs(Mutex<Option<PrLookup>>);
     #[async_trait]
     impl PrStateSource for FakePrs {
         async fn pr_state(&self, _: &str, _: &str, _: i64, _: &HeadAllowlist) -> PrStateResult {
-            match &self.0 {
+            match &*self.0.lock().unwrap_or_else(|e| e.into_inner()) {
                 Some(l) => Ok(l.clone()),
                 None => Err("gh pr view: HTTP 502".into()),
             }
         }
     }
 
-    fn found(head: &str, status: PrStatus) -> Arc<FakePrs> {
-        Arc::new(FakePrs(Some(PrLookup::Found(PrSnapshot {
-            head_sha: head.to_string(),
-            status,
-            merged_at: None,
-            head_repo: "makewhatis/tally".to_string(),
-        }))))
+    impl FakePrs {
+        fn set(&self, lookup: PrLookup) {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(lookup);
+        }
     }
 
-    struct FakeState(Option<&'static str>);
+    fn snapshot(head: &str, status: PrStatus, is_draft: bool) -> PrLookup {
+        PrLookup::Found(PrSnapshot {
+            head_sha: head.to_string(),
+            status,
+            is_draft,
+            merged_at: None,
+            head_repo: "makewhatis/tally".to_string(),
+        })
+    }
+
+    fn found(head: &str, status: PrStatus) -> Arc<FakePrs> {
+        Arc::new(FakePrs(Mutex::new(Some(snapshot(head, status, false)))))
+    }
+
+    /// The shape STUDIO-881 was filed for: approved, green — and still a draft.
+    fn found_draft(head: &str) -> Arc<FakePrs> {
+        Arc::new(FakePrs(Mutex::new(Some(snapshot(
+            head,
+            PrStatus::Open,
+            true,
+        )))))
+    }
+
+    /// Each GitHub seam counts its calls as well as answering, because the STUDIO-881 gates are
+    /// about what is NOT asked: a refusal that still spends four `gh` calls a tick is the bug.
+    struct FakeState {
+        answer: Option<&'static str>,
+        calls: AtomicUsize,
+    }
     #[async_trait]
     impl MergeStateSource for FakeState {
         async fn merge_state(&self, _: &str, _: &str, _: i64) -> MergeStateResult {
-            match self.0 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.answer {
                 Some(s) => Ok(s.to_string()),
                 None => Err("gh pr view: HTTP 502".into()),
             }
         }
     }
 
-    struct FakeChecks(Option<Vec<CheckRun>>);
+    fn merge_state(answer: Option<&'static str>) -> Arc<FakeState> {
+        Arc::new(FakeState {
+            answer,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    struct FakeChecks {
+        answer: Option<Vec<CheckRun>>,
+        calls: AtomicUsize,
+    }
     #[async_trait]
     impl PrChecksSource for FakeChecks {
         async fn pr_checks(&self, _: &str, _: &str, _: i64) -> PrChecksResult {
-            match &self.0 {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.answer {
                 Some(c) => Ok(c.clone()),
                 None => Err("gh pr view: HTTP 502".into()),
             }
@@ -376,15 +601,25 @@ mod tests {
     }
 
     fn checks(states: &[(&str, &str)]) -> Arc<FakeChecks> {
-        Arc::new(FakeChecks(Some(
-            states
-                .iter()
-                .map(|(n, s)| CheckRun {
-                    name: (*n).to_string(),
-                    state: (*s).to_string(),
-                })
-                .collect(),
-        )))
+        Arc::new(FakeChecks {
+            answer: Some(
+                states
+                    .iter()
+                    .map(|(n, s)| CheckRun {
+                        name: (*n).to_string(),
+                        state: (*s).to_string(),
+                    })
+                    .collect(),
+            ),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn no_checks() -> Arc<FakeChecks> {
+        Arc::new(FakeChecks {
+            answer: None,
+            calls: AtomicUsize::new(0),
+        })
     }
 
     /// The repository's six checks, all green — what a mergeable pull request looks like here:
@@ -474,12 +709,13 @@ mod tests {
     ) -> AutoMergeDeps {
         AutoMergeDeps {
             prs,
-            mergestate: Arc::new(FakeState(Some(state))),
+            mergestate: merge_state(Some(state)),
             policy: Arc::new(FakePolicy(Some(true))),
             updater: Arc::new(FakeUpdater::default()),
             checks,
             merger,
             allow: HeadAllowlist::none(),
+            ledger: AutoMergeLedger::default(),
         }
     }
 
@@ -618,9 +854,13 @@ mod tests {
         );
     }
 
-    /// Only `CLEAN` proceeds. A draft, a conflict, a blocked pull request and a state this daemon
-    /// has never heard of are all refused by the same allowlist — which is the point: the value
-    /// GitHub adds next year is refused too.
+    /// Only `CLEAN` proceeds. A conflict, a blocked pull request and a state this daemon has never
+    /// heard of are all refused by the same allowlist — which is the point: the value GitHub adds
+    /// next year is refused too.
+    ///
+    /// `DRAFT` is in this set because GitHub spells it, NOT because it is how a draft is caught:
+    /// STUDIO-881 measured `CLEAN` on two live drafts, which is why `isDraft` has a gate of its own
+    /// (`a_draft_pull_request_is_never_attempted_on_any_tick`).
     #[tokio::test]
     async fn only_a_clean_merge_state_proceeds() {
         for state in [
@@ -635,7 +875,7 @@ mod tests {
         ] {
             let merger = Arc::new(FakeMerger::default());
             let d = AutoMergeDeps {
-                mergestate: Arc::new(FakeState(Some(state))),
+                mergestate: merge_state(Some(state)),
                 ..deps(
                     found(HEAD, PrStatus::Open),
                     MERGE_STATE_CLEAN,
@@ -948,7 +1188,7 @@ mod tests {
         ] {
             let merger = Arc::new(FakeMerger::default());
             let d = AutoMergeDeps {
-                prs: Arc::new(FakePrs(Some(lookup.clone()))),
+                prs: Arc::new(FakePrs(Mutex::new(Some(lookup.clone())))),
                 ..deps(
                     found(HEAD, PrStatus::Open),
                     MERGE_STATE_CLEAN,
@@ -982,7 +1222,7 @@ mod tests {
             (
                 "pr state",
                 Box::new(|m| AutoMergeDeps {
-                    prs: Arc::new(FakePrs(None)),
+                    prs: Arc::new(FakePrs(Mutex::new(None))),
                     ..deps(
                         found(HEAD, PrStatus::Open),
                         MERGE_STATE_CLEAN,
@@ -994,7 +1234,7 @@ mod tests {
             (
                 "merge state",
                 Box::new(|m| AutoMergeDeps {
-                    mergestate: Arc::new(FakeState(None)),
+                    mergestate: merge_state(None),
                     ..deps(
                         found(HEAD, PrStatus::Open),
                         MERGE_STATE_CLEAN,
@@ -1009,7 +1249,7 @@ mod tests {
                     deps(
                         found(HEAD, PrStatus::Open),
                         MERGE_STATE_CLEAN,
-                        Arc::new(FakeChecks(None)),
+                        no_checks(),
                         m,
                     )
                 }),
@@ -1052,5 +1292,243 @@ mod tests {
             perform_auto_merge(&plan(), &d).await,
             AutoMergeOutcome::Failed(e) if e.contains("Head branch was modified")
         ));
+    }
+
+    // ── STUDIO-881: a draft is a definite no, and a definite no is not an unreadable gate ───────
+
+    /// ⚠️ The ticket's headline acceptance criterion, asserted across FIVE ticks rather than one,
+    /// because the defect was never about a single wrong outcome: the daemon reached the same
+    /// refusal 182 times in three hours, one `gh pr merge` plus three reads each time.
+    ///
+    /// A draft with approvals at the head and every check green — and `mergeStateStatus` reporting
+    /// `CLEAN`, which is what both live pull requests reported and why the allowlist above did not
+    /// catch them. Nothing is asked of GitHub past the snapshot, nothing is attempted, and the
+    /// refusal names `draft`.
+    #[tokio::test]
+    async fn a_draft_pull_request_is_never_attempted_on_any_tick() {
+        let merger = Arc::new(FakeMerger::default());
+        let state = merge_state(Some(MERGE_STATE_CLEAN));
+        let checks = all_green();
+        let d = AutoMergeDeps {
+            prs: found_draft(HEAD),
+            mergestate: Arc::clone(&state) as Arc<dyn MergeStateSource>,
+            checks: Arc::clone(&checks) as Arc<dyn PrChecksSource>,
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+
+        let got: Vec<AutoMergeOutcome> = {
+            let mut out = Vec::new();
+            for _ in 0..5 {
+                out.push(perform_auto_merge(&plan(), &d).await);
+            }
+            out
+        };
+
+        assert_eq!(
+            got,
+            vec![
+                AutoMergeOutcome::Declined(DECLINE_DRAFT),
+                AutoMergeOutcome::Held(DECLINE_DRAFT),
+                AutoMergeOutcome::Held(DECLINE_DRAFT),
+                AutoMergeOutcome::Held(DECLINE_DRAFT),
+                AutoMergeOutcome::Held(DECLINE_DRAFT),
+            ],
+            "the refusal names draft, and is announced once rather than once a tick"
+        );
+        assert!(
+            merger
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "no merge may be attempted at all"
+        );
+        assert_eq!(
+            (
+                state.calls.load(Ordering::SeqCst),
+                checks.calls.load(Ordering::SeqCst)
+            ),
+            (0, 0),
+            "and the reads that used to precede each attempt are not made either"
+        );
+    }
+
+    /// The other half of the same gate, and the reason it is re-read every tick instead of
+    /// remembered: marking a draft ready for review does NOT move the head, so a gate that latched
+    /// would strand the pull request forever. The very next tick after the author un-drafts it
+    /// merges, with no push and nothing else changed.
+    #[tokio::test]
+    async fn un_drafting_a_pull_request_merges_it_on_the_next_tick() {
+        let merger = Arc::new(FakeMerger::default());
+        let prs = found_draft(HEAD);
+        let d = AutoMergeDeps {
+            prs: Arc::clone(&prs) as Arc<dyn PrStateSource>,
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+        prs.set(snapshot(HEAD, PrStatus::Open, false));
+
+        assert!(matches!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        assert_eq!(
+            merger.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1
+        );
+    }
+
+    /// ⚠️ The classifier, in the direction that was the bug: GitHub ANSWERED, and the answer was
+    /// no. The error text is the one the motivating daemon log carries verbatim.
+    ///
+    /// Reachable even with the snapshot gate above, because that gate reads an answer from one
+    /// call earlier — so this is the second, independent place `draft` is refused rather than
+    /// retried. A `Failed` here would be a claim that nothing is known and the next tick may learn
+    /// more, which is exactly the claim that repeated 182 times.
+    ///
+    /// Mutation check: drop the draft entry from `TERMINAL_MERGE_ERRORS` and this test reds.
+    #[tokio::test]
+    async fn a_merge_github_refuses_for_good_is_a_refusal_not_an_unreadable_gate() {
+        let merger = Arc::new(FakeMerger {
+            calls: Mutex::new(Vec::new()),
+            fail: Some(
+                "gh pr merge 247 --repo makewhatis/tally --squash --match-head-commit da6cfbfa \
+                 exited with exit status: 1: GraphQL: Pull Request is still a draft \
+                 (mergePullRequest)",
+            ),
+        });
+        let d = deps(
+            found(HEAD, PrStatus::Open),
+            MERGE_STATE_CLEAN,
+            all_green(),
+            Arc::clone(&merger),
+        );
+
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Held(DECLINE_DRAFT),
+            "and the second identical refusal says nothing new"
+        );
+    }
+
+    /// ⚠️ The classifier in the OTHER direction, and the fail-open the ticket warns about: a
+    /// transient error must still be retried, every tick, or one network blip abandons a mergeable
+    /// pull request permanently. This text is also verbatim from the motivating log — the same
+    /// pull request, the same hour, as the draft refusal above.
+    ///
+    /// Mutation check: add `503` to `TERMINAL_MERGE_ERRORS` and this test reds.
+    #[tokio::test]
+    async fn a_transient_merge_failure_is_retried_on_every_tick() {
+        let merger = Arc::new(FakeMerger {
+            calls: Mutex::new(Vec::new()),
+            fail: Some(
+                "gh pr merge 238 --repo makewhatis/tally --squash --match-head-commit f30a7498 \
+                 exited with exit status: 1: HTTP 503: 503 Service Unavailable \
+                 (https://api.github.com/graphql)",
+            ),
+        });
+        let d = deps(
+            found(HEAD, PrStatus::Open),
+            MERGE_STATE_CLEAN,
+            all_green(),
+            Arc::clone(&merger),
+        );
+
+        for tick in 0..5 {
+            assert!(
+                matches!(
+                    perform_auto_merge(&plan(), &d).await,
+                    AutoMergeOutcome::Failed(e) if e.contains("503")
+                ),
+                "(tick {tick})"
+            );
+        }
+        assert_eq!(
+            merger.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            5,
+            "a gate that could not be READ is asked again, every tick"
+        );
+    }
+
+    /// The ledger's whole contract, which is about what is SAID and never about what is decided:
+    /// the same refusal at the same head is announced once, a DIFFERENT refusal is news, a
+    /// different HEAD is news, and anything that is not a refusal forgets the pull request so its
+    /// next refusal is news again.
+    #[tokio::test]
+    async fn a_refusal_is_announced_once_per_head_and_reason() {
+        let merger = Arc::new(FakeMerger::default());
+        let prs = found_draft(HEAD);
+        let d = AutoMergeDeps {
+            prs: Arc::clone(&prs) as Arc<dyn PrStateSource>,
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::clone(&merger),
+            )
+        };
+
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Held(DECLINE_DRAFT)
+        );
+
+        // A different reason at the same head is news.
+        prs.set(snapshot(HEAD, PrStatus::Closed, true));
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Declined("the pull request is no longer open")
+        );
+
+        // The same reason at a DIFFERENT head is news too — a re-drafted pull request that has
+        // since been pushed to is a fresh situation, not the one already reported.
+        prs.set(snapshot(HEAD, PrStatus::Open, true));
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+        let moved = AutoMergePlan {
+            head: OTHER.to_string(),
+            ..plan()
+        };
+        prs.set(snapshot(OTHER, PrStatus::Open, true));
+        assert_eq!(
+            perform_auto_merge(&moved, &d).await,
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+
+        // A merge is not a refusal, so the pull request is forgotten and the next one is news.
+        prs.set(snapshot(OTHER, PrStatus::Open, false));
+        assert!(matches!(
+            perform_auto_merge(&moved, &d).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        prs.set(snapshot(OTHER, PrStatus::Open, true));
+        assert_eq!(
+            perform_auto_merge(&moved, &d).await,
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
     }
 }
