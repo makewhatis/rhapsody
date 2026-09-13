@@ -142,6 +142,7 @@ pub struct ControlHandle {
     /// [`Orchestrator::lifecycle`](crate::orchestrator::Orchestrator), so every HTTP task that asks
     /// what state a ticket is in shares one TTL window instead of each keeping its own
     /// (STUDIO-702). Read-only with respect to the control task, which never touches it.
+    pub(crate) lifecycle: std::sync::Arc<crate::lifecycle::LifecycleCache>,
     /// The SAME `Arc`-shared drain flag as
     /// [`Orchestrator::drain`](crate::orchestrator::Orchestrator) (STUDIO-880), so the HTTP layer
     /// arms and cancels a drain with **no control round-trip at all**.
@@ -153,7 +154,6 @@ pub struct ControlHandle {
     /// operator asked — which on the updater's path is exactly when it matters. It is a lock-free
     /// atomic, so it is not a sixth state seam.
     pub(crate) drain: crate::drain::DrainSignal,
-    pub(crate) lifecycle: std::sync::Arc<crate::lifecycle::LifecycleCache>,
     /// The `gh` seams the console's merge action drives (STUDIO-767), snapshotted from
     /// [`Orchestrator::merge_deps`](crate::orchestrator::Orchestrator). It lives on the handle
     /// rather than being reached through [`Self::events`] because every call it makes BLOCKS
@@ -595,6 +595,75 @@ impl ControlHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No field on [`ControlHandle`] absorbs the next field's doc block.
+    ///
+    /// rustdoc attaches a contiguous run of `///` lines to the NEXT item, so a field inserted INTO
+    /// an existing doc block — with no blank line to close it — silently takes that block over and
+    /// leaves the field below it undocumented. Nothing observable changes: `cargo fmt`, clippy and
+    /// every behavioural test stay green, and the only way to see it is to render the docs. It
+    /// shipped three times in one batch of tickets (STUDIO-868 at `runner.rs:196`; both halves of
+    /// STUDIO-880, caught in review), which is why the convention this crate's `CLAUDE.md` states —
+    /// every sanctioned seam is documented — gets a check rather than a habit.
+    ///
+    /// The check is on ADJACENCY, because adjacency is the mechanism: a field declaration sitting
+    /// directly under another declaration is a field whose doc block, if it had one, now renders on
+    /// the field above it. The first field needs no exemption (the line above it is the struct's own
+    /// brace), and the assertion is an EQUALITY against the two fields that genuinely carry no doc
+    /// of their own — so closing the gap by adding a third name is a visible choice, not a silent
+    /// one.
+    #[test]
+    fn no_field_on_the_control_handle_absorbs_the_next_field_s_doc() {
+        /// The only two fields that sit under another declaration on purpose, both self-evident and
+        /// both older than this check: `store` is the handle's `Arc<dyn Store>`, and
+        /// `retention_loaded` is covered by `retention_days`' block just above it, which names it.
+        /// A THIRD entry here is almost certainly an absorbed doc block — fix the blank line
+        /// instead.
+        const UNDOCUMENTED_ON_PURPOSE: [&str; 2] = ["store", "retention_loaded"];
+
+        let src = include_str!("stop.rs");
+        let open = "pub struct ControlHandle {";
+        let start = src
+            .find(open)
+            .expect("the off-loop HTTP surface is still called ControlHandle");
+        // Bounded to the struct body, so this module's own text — and this test's — is not scanned.
+        let body_at = start + open.len();
+        let end = body_at
+            + src[body_at..]
+                .find("\n}")
+                .expect("the ControlHandle body is still closed by a column-0 brace");
+
+        // A field declaration, as opposed to a doc line, an attribute, a blank, or the continuation
+        // line of a multi-line field type (which starts with neither `pub` nor `pub(crate)`).
+        let declares = |l: &str| {
+            let t = l.trim_start();
+            (t.starts_with("pub ") || t.starts_with("pub(crate) ")) && t.contains(':')
+        };
+
+        let mut prev = open; // the opening brace: not a declaration, so the first field is fine
+        let mut adjacent: Vec<&str> = Vec::new();
+        for line in src[body_at..end].lines() {
+            if declares(line) && declares(prev) {
+                let t = line.trim_start();
+                adjacent.push(
+                    t.trim_start_matches("pub(crate) ")
+                        .trim_start_matches("pub ")
+                        .split(':')
+                        .next()
+                        .unwrap_or(t),
+                );
+            }
+            if !line.trim().is_empty() {
+                prev = line;
+            }
+        }
+        assert_eq!(
+            adjacent, UNDOCUMENTED_ON_PURPOSE,
+            "a ControlHandle field sits directly under another field declaration, so its own doc \
+             block is rendered on the field ABOVE it and it documents nothing. Close the previous \
+             block with a blank line and give each field its own doc."
+        );
+    }
     use crate::control_loop::{CancelSignal, CancelWait, Event};
     use crate::orchestrator::Orchestrator;
     use crate::retry::EvWorkerExit;
