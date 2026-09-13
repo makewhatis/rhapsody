@@ -22,7 +22,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
 use crate::app::App;
-use crate::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome};
+use crate::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_UPDATE};
 
 /// Emitted (once, non-blocking) by the quiet on-launch check when a newer version exists, so the UI can
 /// badge the update affordance without the user asking. Payload: [`UpdateInfo`].
@@ -274,7 +274,9 @@ pub async fn update_install(
     // install over live work.
     let mut drained = None;
     if drain && !force {
-        let outcome = app.drain_and_wait(DEFAULT_DRAIN_BUDGET).await;
+        let outcome = app
+            .drain_and_wait(DEFAULT_DRAIN_BUDGET, REASON_UPDATE)
+            .await;
         drained = Some(outcome.clone());
         if !matches!(
             outcome,

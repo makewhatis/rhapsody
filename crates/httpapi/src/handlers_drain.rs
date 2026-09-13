@@ -36,7 +36,6 @@ use axum::response::Response;
 use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
 use serde::Deserialize;
 
-use crate::handlers::require_get;
 use crate::responses::{write_error, write_json};
 use crate::server::StateProvider;
 
@@ -68,9 +67,17 @@ pub(crate) async fn handle_drain(
     if method == Method::POST {
         return post(provider.as_ref(), &body);
     }
-    // GET/HEAD read the state; anything else is a 405 naming both verbs.
-    if let Some(resp) = require_get(&method) {
-        return resp;
+    // GET/HEAD read the state; anything else is a 405. The shared `require_get` is deliberately NOT
+    // reused here: its envelope says `Allow: GET, HEAD`, which is right for a read-only route and
+    // wrong for this one — the only route on this API serving both verbs. A client that discovers
+    // methods from `Allow` would conclude the drain could be read but never armed.
+    if method != Method::GET && method != Method::HEAD {
+        return write_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "use GET to read the drain, or POST to arm or cancel it",
+            Some("GET, HEAD, POST"),
+        );
     }
     write_json(StatusCode::OK, &status_json(&provider.drain_status()))
 }
@@ -251,7 +258,7 @@ mod tests {
     // The route is registered method-agnostically so a mismatch yields a real 405 rather than the
     // SPA fallback swallowing it into a 200 HTML page (see the crate's routing convention).
     #[tokio::test]
-    async fn an_unsupported_method_gets_a_405_not_the_spa_fallback() {
+    async fn an_unsupported_method_gets_a_405_naming_every_verb_this_route_serves() {
         let base = spawn().await;
         let resp = reqwest::Client::new()
             .delete(format!("{base}/api/v1/drain"))
@@ -259,5 +266,15 @@ mod tests {
             .await
             .expect("DELETE");
         assert_eq!(resp.status(), 405);
+        // The header, not just the status: this is the API's only route serving a read AND a write,
+        // so the shared read-only guard's `Allow: GET, HEAD` would tell a client the drain can be
+        // read but never armed.
+        assert_eq!(
+            resp.headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "GET, HEAD, POST"
+        );
     }
 }

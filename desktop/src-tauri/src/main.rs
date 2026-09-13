@@ -9,7 +9,7 @@ mod tray;
 use std::time::Duration;
 
 use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
-use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome};
+use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_OPERATOR};
 use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
 use rhapsody_desktop::toolcheck::ToolResult;
@@ -63,14 +63,16 @@ async fn restart_daemon(app: tauri::State<'_, App>) -> Result<(), String> {
 /// given the interrupting restart it was trying to avoid.
 #[tauri::command]
 async fn drain_and_restart(app: tauri::State<'_, App>) -> Result<DrainOutcome, String> {
-    Ok(app.drain_and_restart(DEFAULT_DRAIN_BUDGET).await)
+    Ok(app
+        .drain_and_restart(DEFAULT_DRAIN_BUDGET, REASON_OPERATOR)
+        .await)
 }
 
 /// Arm or cancel the daemon's drain without restarting anything (STUDIO-880) — so a console can show
 /// "pausing new work" as its own state, and can take it back.
 #[tauri::command]
 async fn set_daemon_drain(app: tauri::State<'_, App>, active: bool) -> Result<bool, String> {
-    app.set_daemon_drain(active, "operator").await
+    app.set_daemon_drain(active, REASON_OPERATOR).await
 }
 
 // ---- D4 settings commands (Tauri stand-ins for the Wails-bound App methods) -----------------------

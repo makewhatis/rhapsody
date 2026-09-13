@@ -60,6 +60,14 @@ use crate::supervisor::State;
 /// outlasts it is reported, not interrupted.
 pub const DEFAULT_DRAIN_BUDGET: Duration = Duration::from_secs(30 * 60);
 
+/// `reason` for a drain a human asked for (the tray action, the console). Mirrors the daemon's
+/// `DrainReason` wire spelling; an unrecognized value there reads as this one.
+pub const REASON_OPERATOR: &str = "operator";
+
+/// `reason` for a drain an upgrade asked for, so the console can say the daemon is settling to
+/// install rather than because somebody paused it.
+pub const REASON_UPDATE: &str = "update";
+
 /// How often the wait re-reads the in-flight count. Each read is one loopback request, so a few
 /// seconds keeps a 30-minute wait to a few hundred requests while still restarting promptly once the
 /// last run lands.
@@ -140,14 +148,19 @@ impl App {
     ///
     /// A success is [`DrainOutcome::AlreadyIdle`] or [`DrainOutcome::Drained`]; every other variant
     /// means the caller must NOT proceed as if the daemon were idle.
-    pub async fn drain_and_wait(&self, budget: Duration) -> DrainOutcome {
+    ///
+    /// `reason` ([`REASON_OPERATOR`] / [`REASON_UPDATE`]) is what `/api/v1/state` reports and what
+    /// the console banner renders, so it is the CALLER's to supply: telling an operator who paused
+    /// the daemon themselves that it is "draining for an update" is the one thing this annotation
+    /// exists to get right.
+    pub async fn drain_and_wait(&self, budget: Duration, reason: &str) -> DrainOutcome {
         match self.get_sup() {
             Some(sup) if sup.status().state == State::Running => {}
             _ => return DrainOutcome::NotRunning,
         }
         // Ask first, THEN look at the count. The other order has a hole: a run dispatched between
         // reading "0 running" and arming the drain would be killed by the restart.
-        if let Err(e) = self.set_daemon_drain(true, "update").await {
+        if let Err(e) = self.set_daemon_drain(true, reason).await {
             return DrainOutcome::RequestFailed { error: e };
         }
         let app = self.clone();
@@ -173,8 +186,8 @@ impl App {
     /// See the module docs for what each outcome means, and in particular for why an expired budget
     /// restarts nothing: the restart happens ONLY on a drained or already-idle daemon, so the
     /// supervisor's 5-second SIGKILL grace has no live agent to orphan.
-    pub async fn drain_and_restart(&self, budget: Duration) -> DrainOutcome {
-        let drained = self.drain_and_wait(budget).await;
+    pub async fn drain_and_restart(&self, budget: Duration, reason: &str) -> DrainOutcome {
+        let drained = self.drain_and_wait(budget, reason).await;
         match drained {
             DrainOutcome::AlreadyIdle | DrainOutcome::Drained { .. } => {}
             // Expired / NotRunning / RequestFailed: nothing is idle, so nothing is restarted.
@@ -247,6 +260,16 @@ mod tests {
             std::future::ready(counts[i.min(last)])
         };
         (f, calls)
+    }
+
+    // The desktop cannot import the daemon's `DrainReason`, so these two spellings are a hand-copied
+    // cross-process contract. A drift is SILENT — the daemon's parse is total and degrades anything
+    // it does not recognize to "operator" — so a renamed constant would quietly relabel every
+    // update drain as an operator pause rather than failing anywhere.
+    #[test]
+    fn the_reason_spellings_are_the_daemons_own_vocabulary() {
+        assert_eq!(REASON_OPERATOR, "operator");
+        assert_eq!(REASON_UPDATE, "update");
     }
 
     // An idle daemon is not made to wait: the FIRST read happens before any sleep, so a restart of

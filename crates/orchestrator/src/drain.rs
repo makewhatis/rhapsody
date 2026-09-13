@@ -182,7 +182,14 @@ impl DrainSignal {
     /// cannot reset the clock a waiter is measuring against.
     ///
     /// The two annotation fields are stored BEFORE `active` is released, so any thread that observes
-    /// `active == true` also observes the annotations that go with it.
+    /// `active == true` also observes a complete, self-consistent pair.
+    ///
+    /// Under genuinely CONCURRENT arms the surviving annotation may belong to a call that lost the
+    /// `swap` — both write before either swaps. That is deliberate rather than overlooked: exactly
+    /// one caller is still told it armed the drain, and the racing annotations differ by microseconds
+    /// and, in practice, by nothing at all. What the idempotence above guarantees is the case that
+    /// matters — a LATER arm, seconds or minutes into a drain, cannot reset the clock a waiter is
+    /// measuring against.
     pub fn arm(&self, at: DateTime<Utc>, reason: DrainReason) -> bool {
         if self.inner.active.load(Ordering::Acquire) {
             return false;

@@ -14,7 +14,7 @@ use std::time::Duration;
 use rhapsody_desktop::app::App;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
-use rhapsody_desktop::drain::DEFAULT_DRAIN_BUDGET;
+use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, REASON_OPERATOR};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
@@ -146,7 +146,9 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
             // restarts NOTHING, and an operator who sees no restart has to be able to find out why.
             let a = app_state(app);
             tauri::async_runtime::spawn(async move {
-                let outcome = a.drain_and_restart(DEFAULT_DRAIN_BUDGET).await;
+                let outcome = a
+                    .drain_and_restart(DEFAULT_DRAIN_BUDGET, REASON_OPERATOR)
+                    .await;
                 eprintln!("rhapsody-desktop: drain and restart: {outcome:?}");
             });
         }
