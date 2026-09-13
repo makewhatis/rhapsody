@@ -1468,6 +1468,44 @@ mod tests {
         );
     }
 
+    /// The ledger's bound, watched rather than merely written down: a daemon that runs for months
+    /// must not accumulate an entry per pull request it has ever refused. Emptying costs one
+    /// repeated log line per pull request on the tick it happens, which is the whole price.
+    #[test]
+    fn the_ledger_is_bounded_and_an_emptied_entry_is_merely_re_announced() {
+        let ledger = AutoMergeLedger::default();
+        let pr = |n: i64| PrCoord::new("makewhatis", "tally", n);
+
+        // The first pull request is refused, and stays held while the map has room.
+        assert_eq!(
+            ledger.refuse(&pr(1), HEAD, DECLINE_DRAFT),
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+        assert_eq!(
+            ledger.refuse(&pr(1), HEAD, DECLINE_DRAFT),
+            AutoMergeOutcome::Held(DECLINE_DRAFT)
+        );
+
+        // Fill it to the bound with distinct pull requests. The last one to arrive empties it.
+        for n in 2..=(LEDGER_CAPACITY as i64 + 1) {
+            ledger.refuse(&pr(n), HEAD, DECLINE_DRAFT);
+        }
+        assert!(
+            ledger.0.lock().unwrap_or_else(|e| e.into_inner()).len() <= LEDGER_CAPACITY,
+            "the ledger must not grow without bound"
+        );
+
+        // Whose only consequence is that an emptied pull request's refusal is news once more.
+        assert_eq!(
+            ledger.refuse(&pr(1), HEAD, DECLINE_DRAFT),
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+        assert_eq!(
+            ledger.refuse(&pr(1), HEAD, DECLINE_DRAFT),
+            AutoMergeOutcome::Held(DECLINE_DRAFT)
+        );
+    }
+
     /// `classify_merge_error` lower-cases the error before looking, so a marker that is not itself
     /// lower-case can never match — it would be a terminal error silently classified as transient,
     /// which is the loop this ticket is about, reintroduced by a capital letter. Nothing about the
