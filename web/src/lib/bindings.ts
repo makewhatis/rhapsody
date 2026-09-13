@@ -111,6 +111,26 @@ export async function restartDaemon(): Promise<void> {
   await invoke("restart_daemon");
 }
 
+// DrainOutcome mirrors the Rust drain::DrainOutcome: what a drain-and-restart actually did. Every
+// variant is distinguishable on purpose — in particular `expired` means the budget ran out with work
+// still in flight, so NOTHING was interrupted and the daemon was NOT restarted. It is never a
+// silently-successful restart.
+export type DrainOutcome =
+  | { outcome: "already_idle" }
+  | { outcome: "drained"; waited_secs: number }
+  | { outcome: "expired"; running: number; waited_secs: number }
+  | { outcome: "not_running" }
+  | { outcome: "request_failed"; error: string }
+  | { outcome: "restart_failed"; error: string };
+
+// drainAndRestart stops the daemon taking NEW work, waits (bounded) for in-flight runs to reach a
+// turn boundary, and restarts only then — so an upgrade no longer throws a live turn away. It can
+// take many minutes. Returns null in a plain browser (no bridge).
+export async function drainAndRestart(): Promise<DrainOutcome | null> {
+  if (!tauriAvailable()) return null;
+  return invoke<DrainOutcome>("drain_and_restart");
+}
+
 export async function probeTools(): Promise<ToolResult[]> {
   if (!tauriAvailable()) return [];
   return invoke<ToolResult[]>("probe_tools");
@@ -240,6 +260,10 @@ export interface UpdateDownloadProgress {
 export interface InstallReport {
   installed: boolean;
   blocked_active_runs: number;
+  // What a requested drain did (absent when none was asked for). Present on BOTH outcomes: an
+  // install that proceeded because the drain worked and one deferred because the drain's budget
+  // expired must be distinguishable, so an expired budget never reads as a plain "runs are active".
+  drain?: DrainOutcome;
 }
 
 // checkForUpdate asks the host to check the release feed for a newer version, returning its metadata (or
@@ -261,9 +285,14 @@ export async function downloadUpdate(): Promise<void> {
 // in which case it refuses, persists a pending flag (install on next graceful quit), and returns the
 // blocking run count in `blocked_active_runs`. On the allowed path the app relaunches, so this usually
 // does not resolve. Returns null in a plain browser (no bridge).
-export async function installUpdate(force = false): Promise<InstallReport | null> {
+//
+// With `drain` the host first asks the daemon to stop taking new work and waits for in-flight runs to
+// finish their current turn, so an upgrade can proceed cleanly instead of being deferred indefinitely.
+// The `drain` field of the report says what that wait did — notably `expired`, where nothing was
+// interrupted and the install fell back to the deferred path.
+export async function installUpdate(force = false, drain = false): Promise<InstallReport | null> {
   if (!tauriAvailable()) return null;
-  return invoke<InstallReport>("update_install", { force });
+  return invoke<InstallReport>("update_install", { force, drain });
 }
 
 // activeRunCount returns how many runs the daemon is actively executing right now — the count the install

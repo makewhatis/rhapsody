@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { downloadPercent, formatBytes, updatePending } from "@/lib/updater-model";
+import { deferredSubline, downloadPercent, formatBytes, updatePending } from "@/lib/updater-model";
 
 describe("downloadPercent", () => {
   it("is null with no progress yet (nothing to show)", () => {
@@ -48,6 +48,29 @@ describe("updatePending", () => {
   it("is false when there is nothing to act on", () => {
     for (const phase of ["idle", "checking", "up-to-date", "error"] as const) {
       expect(updatePending(phase)).toBe(false);
+    }
+  });
+});
+
+// STUDIO-880 — a deferral has three causes now, and only one of them is the pre-existing one.
+describe("deferredSubline", () => {
+  it("with no drain, says what it always said: it installs on the next quit", () => {
+    expect(deferredSubline(null)).toMatch(/next quit/i);
+    expect(deferredSubline(null)).not.toMatch(/draining/i);
+  });
+
+  // The one an operator must not miss: nothing was interrupted, AND the daemon is still drained.
+  it("names the still-armed drain after an expired budget", () => {
+    const sub = deferredSubline({ outcome: "expired", running: 2, waited_secs: 1800 });
+    expect(sub).toMatch(/still draining/i);
+    expect(sub).toMatch(/won't take new work|cancelled/i);
+  });
+
+  // Saying "we waited" when the daemon could not even be asked would be a plain lie.
+  it("says no wait happened when the daemon could not be asked", () => {
+    for (const outcome of ["request_failed", "not_running"] as const) {
+      const d = outcome === "request_failed" ? { outcome, error: "connection refused" } : { outcome };
+      expect(deferredSubline(d)).toMatch(/nothing waited/i);
     }
   });
 });

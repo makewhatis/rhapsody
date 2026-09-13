@@ -1,6 +1,6 @@
 // Pure, framework-free helpers for the P11-U3 in-app update UI. The stateful wiring (commands +
 // events) lives in `useUpdater`; the display math lives here so it is unit-testable without React.
-import type { UpdateDownloadProgress } from "@/lib/bindings";
+import type { DrainOutcome, UpdateDownloadProgress } from "@/lib/bindings";
 
 // The update UI's state machine (drives the Settings "Updates" surface + the gear/rail dot):
 //   idle       — the app hasn't checked yet (or a check was reset); offer "Check for updates".
@@ -9,6 +9,8 @@ import type { UpdateDownloadProgress } from "@/lib/bindings";
 //   available  — a newer version exists (not yet downloading); offer "What's new" + "Download".
 //   downloading— the update is downloading; show a progress bar.
 //   ready      — the update downloaded; offer "Restart to finish".
+//   draining   — an install is waiting for the running agents to reach a turn boundary before it
+//                proceeds (STUDIO-880). Nothing is interrupted; this can take many minutes.
 //   installing — an install is in flight (may relaunch, or defer when runs are active).
 //   deferred   — the install was deferred to the next quit (runs were active); offer restart-now.
 //   error      — the last check/download/install failed; surface the message + a retry.
@@ -19,6 +21,7 @@ export type UpdaterPhase =
   | "available"
   | "downloading"
   | "ready"
+  | "draining"
   | "installing"
   | "deferred"
   | "error";
@@ -51,7 +54,36 @@ export function updatePending(phase: UpdaterPhase): boolean {
     phase === "available" ||
     phase === "downloading" ||
     phase === "ready" ||
+    phase === "draining" ||
     phase === "installing" ||
     phase === "deferred"
   );
+}
+
+// deferredSubline explains a DEFERRED install — the one outcome whose reason is not self-evident
+// (STUDIO-880). Without a drain it is the pre-existing case: runs were active, so the install waits
+// for the next quit. With one, two things went differently and the operator has to be told both:
+//
+//   - `expired` — the wait ran out with work still in flight. Nothing was interrupted, and the drain
+//     is deliberately LEFT ARMED, so the daemon is now taking no new work at all. That is a state
+//     somebody has to be able to leave (the console's drain banner cancels it), and an operator told
+//     only "scheduled for your next quit" would never learn they were in it.
+//   - `request_failed` / `not_running` — the daemon could not be asked to settle, so the wait never
+//     happened. Saying "we waited" here would be a plain lie.
+//
+// `already_idle` / `drained` never reach a deferral: the install proceeds and the host relaunches.
+export function deferredSubline(drain: DrainOutcome | null): string {
+  const next = "Rhapsody will install it on your next quit.";
+  switch (drain?.outcome) {
+    case "expired":
+      return (
+        `The agents didn't finish in time, so nothing was interrupted. ${next} ` +
+        "The daemon is still draining and won't take new work until the drain is cancelled."
+      );
+    case "request_failed":
+    case "not_running":
+      return `The daemon couldn't be asked to settle, so nothing waited. ${next}`;
+    default:
+      return `${next} The agents keep playing until then.`;
+  }
 }

@@ -669,6 +669,9 @@ impl Orchestrator {
                 // is precisely what the guard exists for. Next tick.
                 ReviewDispatchOutcome::AlreadyInFlight => report.deferred += 1,
                 ReviewDispatchOutcome::TeamsOff => report.deferred += 1,
+                // A drain is armed: the row is untouched and this head is re-offered on the sweep
+                // after the drain is cancelled, exactly as a deferred one is.
+                ReviewDispatchOutcome::Draining => report.deferred += 1,
                 ReviewDispatchOutcome::Refused(why) => {
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");

@@ -62,6 +62,21 @@ export interface StateResponse {
   // Held dependents waiting on an uncleared blockedBy predecessor (INF-318/INF-320). Empty for a
   // disabled project (the hold is part of the opt-in orchestration). Defensive-coalesced in fetchState.
   blocked: BlockedEntry[];
+  // The armed drain (STUDIO-880), or ABSENT when the daemon is dispatching normally.
+  //
+  // Optional because the daemon emits the key ONLY while a drain is armed: /api/v1/state is
+  // byte-pinned to the Go daemon's golden, so a key present in every payload would be parity drift.
+  // Read it as `state.drain?.active` — an absent key and `active: false` mean the same thing.
+  drain?: DrainState;
+}
+
+// DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking
+// NEW work so its in-flight runs can reach a turn boundary before a restart. Nothing is interrupted
+// while it is armed; `requested_at` is how long it has been settling.
+export interface DrainState {
+  active: boolean;
+  reason: "operator" | "update";
+  requested_at: string; // RFC3339, or "" when unset
 }
 
 // IssueEvent is one entry in a running issue's activity timeline (oldest -> newest).
@@ -391,6 +406,29 @@ export async function fetchRunDetail(runID: number): Promise<RunDetail> {
   // Defensive: tolerate a server that omits/nulls recent_events so the timeline can .map().
   d.recent_events ??= [];
   return d;
+}
+
+// setDrain arms or cancels the daemon's drain (STUDIO-880), resolving to the drain's state
+// afterwards — the SAME three fields `/api/v1/state`'s `drain` key carries, so a caller never has to
+// follow up with a read.
+//
+// Deliberately over HTTP rather than through the desktop's Tauri bridge: the console is served both
+// by the daemon itself (a plain browser) and as the desktop window's content, and only the HTTP
+// route exists in both. A drain the operator can end from one host and not the other would be the
+// same gap the feature already had.
+//
+// `reason` annotates an ARM only; the daemon ignores it when cancelling and when a drain is already
+// armed (re-arming never rewrites the drain that is running).
+export async function setDrain(active: boolean, reason = "operator"): Promise<DrainState> {
+  const res = await fetch("/api/v1/drain", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active, reason }),
+  });
+  if (!res.ok) {
+    throw new Error(`drain ${active ? "arm" : "cancel"} failed: ${res.status}`);
+  }
+  return (await res.json()) as DrainState;
 }
 
 export async function postRefresh(): Promise<void> {

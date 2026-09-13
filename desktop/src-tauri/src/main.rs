@@ -9,6 +9,7 @@ mod tray;
 use std::time::Duration;
 
 use rhapsody_desktop::app::{App, CloseDecision, CredentialStatusDto, StatusDto};
+use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_OPERATOR};
 use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
 use rhapsody_desktop::toolcheck::ToolResult;
@@ -49,6 +50,22 @@ async fn stop_daemon(app: tauri::State<'_, App>) -> Result<(), String> {
 #[tauri::command]
 async fn restart_daemon(app: tauri::State<'_, App>) -> Result<(), String> {
     app.restart_daemon().await.map_err(|e| e.to_string())
+}
+
+/// Drain the daemon and restart it once nothing is in flight (STUDIO-880).
+///
+/// Unlike [`restart_daemon`], this stops the daemon taking NEW work, waits (bounded) for in-flight
+/// runs to reach a turn boundary, and only then restarts — so an upgrade no longer throws a live
+/// turn away, and the supervisor's 5s SIGKILL grace has no live agent to orphan.
+///
+/// It always resolves, and the [`DrainOutcome`] says what really happened. In particular an expired
+/// budget restarts NOTHING and reports the runs still in flight: the caller is told, never quietly
+/// given the interrupting restart it was trying to avoid.
+#[tauri::command]
+async fn drain_and_restart(app: tauri::State<'_, App>) -> Result<DrainOutcome, String> {
+    Ok(app
+        .drain_and_restart(DEFAULT_DRAIN_BUDGET, REASON_OPERATOR)
+        .await)
 }
 
 // ---- D4 settings commands (Tauri stand-ins for the Wails-bound App methods) -----------------------
@@ -174,6 +191,7 @@ fn run() -> tauri::Result<()> {
             start_daemon,
             stop_daemon,
             restart_daemon,
+            drain_and_restart,
             probe_tools,
             set_tool_override,
             credential_status,

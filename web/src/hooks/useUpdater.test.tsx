@@ -9,7 +9,7 @@ import type { InstallReport, UpdateDownloadProgress, UpdateInfo } from "@/lib/bi
 const h = vi.hoisted(() => ({
   checkForUpdate: vi.fn<() => Promise<UpdateInfo | null>>(),
   downloadUpdate: vi.fn<() => Promise<void>>(),
-  installUpdate: vi.fn<(force?: boolean) => Promise<InstallReport | null>>(),
+  installUpdate: vi.fn<(force?: boolean, drain?: boolean) => Promise<InstallReport | null>>(),
   activeRunCount: vi.fn<() => Promise<number>>(),
   availableCb: null as null | ((i: UpdateInfo) => void),
   progressCb: null as null | ((p: UpdateDownloadProgress) => void),
@@ -117,7 +117,7 @@ describe("useUpdater", () => {
     act(() => result.current.download());
     await waitFor(() => expect(result.current.phase).toBe("ready"));
     act(() => result.current.requestInstall());
-    await waitFor(() => expect(h.installUpdate).toHaveBeenCalledWith(false));
+    await waitFor(() => expect(h.installUpdate).toHaveBeenCalledWith(false, false));
     expect(result.current.activeRunsPrompt).toBeNull();
   });
 
@@ -142,7 +142,7 @@ describe("useUpdater", () => {
     act(() => result.current.requestInstall());
     await waitFor(() => expect(result.current.activeRunsPrompt).toBe(2));
     act(() => result.current.confirmInstallNow());
-    await waitFor(() => expect(h.installUpdate).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(h.installUpdate).toHaveBeenCalledWith(true, false));
     expect(result.current.activeRunsPrompt).toBeNull();
   });
 
@@ -156,9 +156,62 @@ describe("useUpdater", () => {
     act(() => result.current.requestInstall());
     await waitFor(() => expect(result.current.activeRunsPrompt).toBe(2));
     act(() => result.current.deferToQuit());
-    await waitFor(() => expect(h.installUpdate).toHaveBeenCalledWith(false));
+    await waitFor(() => expect(h.installUpdate).toHaveBeenCalledWith(false, false));
     await waitFor(() => expect(result.current.phase).toBe("deferred"));
     expect(result.current.pending).toBe(true);
+  });
+
+  // STUDIO-880 — the fourth choice the warn dialog exists to offer. Round 1 shipped the whole
+  // drain-on-install path in Rust and TypeScript and then never called it: `installUpdate(force)`
+  // passed one argument, so the host's `drain` was false on every path a shipped app could take.
+  it("drainThenInstall asks the host to drain first and shows the wait while it does", async () => {
+    h.activeRunCount.mockResolvedValue(1);
+    // Resolve on demand: the phase during the wait is the thing under test, and a drain legitimately
+    // takes many minutes, so the install must not settle before it is observed.
+    let finish: (r: InstallReport) => void = () => {};
+    h.installUpdate.mockReturnValue(
+      new Promise<InstallReport | null>((res) => {
+        finish = res;
+      }),
+    );
+    const { result } = renderHook(() => useUpdater());
+    act(() => h.availableCb?.(info()));
+    act(() => result.current.download());
+    await waitFor(() => expect(result.current.phase).toBe("ready"));
+    act(() => result.current.requestInstall());
+    await waitFor(() => expect(result.current.activeRunsPrompt).toBe(1));
+
+    act(() => result.current.drainThenInstall());
+    // force=false (a drain that stopped the agents anyway would be pointless) and drain=true.
+    await waitFor(() => expect(h.installUpdate).toHaveBeenCalledWith(false, true));
+    // NOT "installing": nothing is being installed yet, and the wait is the part that is slow.
+    expect(result.current.phase).toBe("draining");
+    expect(result.current.pending).toBe(true);
+    expect(result.current.activeRunsPrompt).toBeNull();
+
+    await act(async () => {
+      finish({ installed: true, blocked_active_runs: 0, drain: { outcome: "drained", waited_secs: 91 } });
+    });
+    await waitFor(() => expect(result.current.drainOutcome).toEqual({ outcome: "drained", waited_secs: 91 }));
+  });
+
+  // An expired budget is NOT an ordinary "runs are active" deferral: nothing was interrupted, and
+  // the drain is deliberately left armed, so the daemon is taking no new work at all afterwards.
+  // The hook has to carry that outcome out, or the deferred copy cannot say which happened.
+  it("an expired drain defers the install and keeps the outcome distinguishable", async () => {
+    h.activeRunCount.mockResolvedValue(1);
+    h.installUpdate.mockResolvedValue({
+      installed: false,
+      blocked_active_runs: 1,
+      drain: { outcome: "expired", running: 1, waited_secs: 1800 },
+    });
+    const { result } = renderHook(() => useUpdater());
+    act(() => h.availableCb?.(info()));
+    act(() => result.current.download());
+    await waitFor(() => expect(result.current.phase).toBe("ready"));
+    act(() => result.current.drainThenInstall());
+    await waitFor(() => expect(result.current.phase).toBe("deferred"));
+    expect(result.current.drainOutcome).toEqual({ outcome: "expired", running: 1, waited_secs: 1800 });
   });
 
   it("dismissPrompt cancels the warn dialog without installing", async () => {
