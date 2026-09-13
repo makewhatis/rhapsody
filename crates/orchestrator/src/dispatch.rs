@@ -338,8 +338,13 @@ impl Orchestrator {
     /// Surfaces the otherwise-SILENT drop of the candidates a selection pass never reached because
     /// the GLOBAL concurrency cap was already full (STUDIO-885): one `tracing::info!` line naming
     /// the tickets, the cap, and how many runs are holding it. `held` is the unexamined tail of the
-    /// sorted candidate list — the pass stops at the first one, so nothing below it was assessed
-    /// either; an empty slice logs nothing.
+    /// sorted candidate list, minus the daemon's own in-flight work (see
+    /// [`Orchestrator::is_unworked_candidate`]); an empty slice logs nothing.
+    ///
+    /// It says "not considered", not "would have dispatched", and the distinction is deliberate:
+    /// the pass stops at the first of these, so none of them was assessed. A named ticket may still
+    /// turn out to be blocked, unlabelled or suppressed once a slot frees. What the line reports
+    /// honestly is that the cap, and not a verdict about the ticket, is why nothing happened.
     ///
     /// It exists because "the board is full" and "this ticket is correctly suppressed" were
     /// indistinguishable from outside. In the reported incident they SWAPPED with no signal at all:
@@ -365,12 +370,29 @@ impl Orchestrator {
             sample.push_str(&format!(" (+{} more)", held.len() - HELD_SAMPLE));
         }
         tracing::info!(
-            held = %sample,
-            held_count = held.len(),
+            not_considered = %sample,
+            not_considered_count = held.len(),
             max_concurrent,
             running = self.running.len(),
-            "skipping dispatch: no free concurrency slot; candidates held for capacity"
+            "skipping dispatch: no global concurrency slot; candidates not considered this tick"
         );
+    }
+
+    /// Whether `iss` is a candidate the selection pass would genuinely have ASSESSED, rather than
+    /// the daemon's own work coming back round: the candidate fetch is a state query, so every
+    /// running, claimed and recovery-owned issue is in it, and `eligibility` drops them further
+    /// down the pass. Used only by [`Orchestrator::log_capacity_hold`], which stops ABOVE that
+    /// point and would otherwise report a ticket that is running right now as one waiting for a
+    /// slot.
+    pub(crate) fn is_unworked_candidate(
+        &self,
+        iss: &Issue,
+        running: &HashSet<String>,
+        recovered: &HashSet<String>,
+    ) -> bool {
+        !running.contains(&iss.id)
+            && !self.claimed.contains(&iss.id)
+            && !recovered.contains(&iss.identifier)
     }
 
     /// Reports whether a FRESH dispatch of `iss` should be suppressed because a prior run already

@@ -98,11 +98,15 @@ impl Orchestrator {
         let mut issues = issues.into_iter();
         while let Some(iss) = issues.next() {
             if global_remaining <= 0 {
-                // Name what the cap is holding before stopping (STUDIO-885). The candidates are
-                // sorted, so everything from `iss` onward is unexamined — collected only on this
-                // branch, so a pass that never runs out of slots pays nothing for the diagnostic.
-                let held: Vec<String> = std::iter::once(iss.identifier)
-                    .chain(issues.by_ref().map(|i| i.identifier))
+                // Name what the cap turned away before stopping (STUDIO-885). The candidates are
+                // sorted, so everything from `iss` onward is unexamined — and the fetch includes
+                // the daemon's OWN in-flight work, which `eligibility` would have dropped further
+                // down, so those are filtered out here rather than reported as waiting. Collected
+                // only on this branch, so a pass that never runs out of slots pays nothing.
+                let held: Vec<String> = std::iter::once(iss)
+                    .chain(issues.by_ref())
+                    .filter(|i| self.is_unworked_candidate(i, &running, &recovered_claims))
+                    .map(|i| i.identifier)
                     .collect();
                 self.log_capacity_hold(&held, eff.max_concurrent);
                 break;
@@ -302,11 +306,13 @@ impl Orchestrator {
         let mut tagged = tagged.into_iter();
         while let Some(ti) = tagged.next() {
             if global_remaining <= 0 {
-                // See the single-project ladder: the same diagnostic, on the pass a `projects:`
-                // install actually runs. Two ladders means two call sites or the feature is
-                // silently absent for whichever one is missing it.
-                let held: Vec<String> = std::iter::once(ti.iss.identifier)
-                    .chain(tagged.by_ref().map(|t| t.iss.identifier))
+                // See the single-project ladder: the same diagnostic, same filter, on the pass a
+                // `projects:` install actually runs. Two ladders means two call sites or the
+                // feature is silently absent for whichever one is missing it.
+                let held: Vec<String> = std::iter::once(ti)
+                    .chain(tagged.by_ref())
+                    .filter(|t| self.is_unworked_candidate(&t.iss, &running, &recovered_claims))
+                    .map(|t| t.iss.identifier)
                     .collect();
                 self.log_capacity_hold(&held, eff.max_concurrent);
                 break;
@@ -514,7 +520,7 @@ mod tests {
 
     const SKIP_BLOCKED: &str = "skipping dispatch: blocked by non-terminal blocker";
     const HELD_FOR_CAPACITY: &str =
-        "skipping dispatch: no free concurrency slot; candidates held for capacity";
+        "skipping dispatch: no global concurrency slot; candidates not considered this tick";
 
     /// A single-project select orchestrator (active `{todo, in progress}`, terminal `{done}`).
     /// Mirrors Go `orchForSelect` / `orchForSelectWithLog` (logging is captured via
@@ -826,11 +832,14 @@ mod tests {
             .find(|e| e.message == HELD_FOR_CAPACITY)
             .expect("a capacity-hold line");
         assert_eq!(
-            ev.fields.get("held").map(String::as_str),
+            ev.fields.get("not_considered").map(String::as_str),
             Some("A-2, A-3"),
             "the unexamined tail of the sorted queue, named"
         );
-        assert_eq!(ev.fields.get("held_count").map(String::as_str), Some("2"));
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("2")
+        );
         assert_eq!(
             ev.fields.get("max_concurrent").map(String::as_str),
             Some("1")
@@ -871,9 +880,40 @@ mod tests {
             .find(|e| e.message == HELD_FOR_CAPACITY)
             .expect("a capacity-hold line on the multi ladder");
         assert_eq!(
-            ev.fields.get("held").map(String::as_str),
+            ev.fields.get("not_considered").map(String::as_str),
             Some("A-2, A-3"),
             "the tagged pass names the issues, not the projects"
+        );
+    }
+
+    // The candidate fetch is a state query, so the daemon's OWN in-flight work comes back in it —
+    // and it sorts alongside everything else. Reporting a ticket that is running right now as one
+    // waiting for a slot would be worse than the silence this line replaces.
+    #[test]
+    fn the_hold_never_names_the_daemons_own_in_flight_work() {
+        let mut running = HashMap::new();
+        running.insert(
+            "1".to_string(),
+            running_entry(issue("1", "A-1", "In Progress"), "p", "p"),
+        );
+        let o = orch_for_select(1, HashMap::new(), Some(running));
+        // A-1 is RUNNING and sorts first; A-2 is the ticket genuinely waiting for a slot.
+        let input = vec![issue("1", "A-1", "In Progress"), issue("2", "A-2", "Todo")];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert!(got.is_empty(), "cap 1, one already running ⇒ no slot");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-2"),
+            "only the unworked candidate; the running one must not be reported as waiting"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
         );
     }
 
@@ -890,13 +930,16 @@ mod tests {
             .iter()
             .find(|e| e.message == HELD_FOR_CAPACITY)
             .expect("a capacity-hold line");
-        let held = ev.fields.get("held").expect("held field");
+        let held = ev.fields.get("not_considered").expect("sample field");
         assert!(
             held.ends_with("(+4 more)"),
             "14 held, 10 named, 4 counted; got {held:?}"
         );
         assert_eq!(held.matches(", ").count(), 9, "exactly 10 names");
-        assert_eq!(ev.fields.get("held_count").map(String::as_str), Some("14"));
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("14")
+        );
     }
 
     // Mirrors Go `TestSelectDispatchMultiGlobalCap`.
