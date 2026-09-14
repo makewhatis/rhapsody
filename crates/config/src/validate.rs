@@ -131,7 +131,7 @@ pub fn validate(config: &mut Resolved) -> Result<(), ValidationError> {
             return Err(ValidationError::UnsupportedTrackerKind(other.to_string()));
         }
     }
-    if config.agent.backend != "claude" && config.agent.backend != "codex" {
+    if !crate::harness::HARNESS_NAMES.contains(&config.agent.backend.as_str()) {
         return Err(ValidationError::UnsupportedAgentBackend(
             config.agent.backend.clone(),
         ));

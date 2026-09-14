@@ -780,4 +780,47 @@ claude:
             "codex backend must return UnsupportedBackend(\"codex\")"
         );
     }
+
+    /// `runner_for_backend` hardcodes `"claude"` as the one backend it can build a [`Runner`]
+    /// for. That name must stay a member of the shared harness registry
+    /// (`rhapsody_config::HARNESS_NAMES`, STUDIO-893 §1.3/§4.3) — the registry is what `validate`
+    /// consults to decide which names even reach `build_effective`, so if `claude` ever dropped
+    /// out of it, config validation would reject every config before this function's one working
+    /// arm could run.
+    #[test]
+    fn implemented_backend_is_a_known_harness_name() {
+        assert!(
+            rhapsody_config::HARNESS_NAMES.contains(&"claude"),
+            "runner_for_backend's one implemented backend must remain in the shared registry"
+        );
+    }
+
+    /// `validate`'s `UnsupportedAgentBackend` check and `runner_for_backend` here each used to
+    /// hardcode their own notion of "which backend names exist" (design record §1.3): the two
+    /// disagreed (`codex` passed validation, then failed here) with nothing to stop a THIRD name
+    /// from drifting the same way. STUDIO-893 gives both a single registry to read from
+    /// (`rhapsody_config::HARNESS_NAMES`); this pins that both sides still reference it, since a
+    /// black-box behavioural test cannot distinguish "reads the shared registry" from "hardcodes
+    /// its own copy that happens to agree today."
+    ///
+    /// The needle is assembled at run time on purpose: `include_str!` pulls in this file too, so
+    /// a needle spelled as a literal here would match its own source and the pin would pass no
+    /// matter what `runner_for_backend` actually does (the idiom `run.rs`/`runmerge.rs` already
+    /// use for wiring no run-time assertion can reach).
+    #[test]
+    fn config_validator_and_runner_constructor_consult_one_harness_registry() {
+        let needle = format!("{}_{}", "HARNESS", "NAMES");
+
+        let validate_src = include_str!("../../config/src/validate.rs");
+        assert!(
+            validate_src.contains(&needle),
+            "config::validate no longer references the shared harness registry"
+        );
+
+        let effective_src = include_str!("effective.rs");
+        assert!(
+            effective_src.contains(&needle),
+            "effective.rs no longer references the shared harness registry"
+        );
+    }
 }
