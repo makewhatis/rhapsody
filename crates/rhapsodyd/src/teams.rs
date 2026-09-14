@@ -162,7 +162,17 @@ fn show(
     let (name, room_tail) = parse_show_args(args)?;
     // Best-effort: a broken teams.yaml must not stop an operator inspecting a
     // profile, so `show` falls back to treating the arg as a profile name.
-    let teams = Teams::load(teams_path);
+    //
+    // `try_load` rather than `load` since STUDIO-891, for the REASON and not for
+    // the value: a rejected config degrades to the off state and the daemon
+    // still exits 0, so the only evidence an operator gets is an absence — a
+    // roster that silently does not resolve. This command needs no daemon and no
+    // log access, which makes it the right place to say what was refused. The
+    // `Err` arm still yields the off state, so the fallback above is unchanged.
+    let (teams, rejected) = match Teams::try_load(teams_path) {
+        Ok(t) => (t, String::new()),
+        Err(e) => (Teams::disabled(), e.to_string()),
+    };
     let identity = teams.roster.iter().find(|i| i.name == name);
     let profile_name = match identity {
         Some(i) if i.profile.is_empty() => {
@@ -190,7 +200,27 @@ fn show(
         identity.map(|i| i.name.as_str()),
         &resolved,
         &room,
+        &render_rejection_for(teams_path, &rejected),
     ))
+}
+
+/// The banner a rejected `teams.yaml` gets, above everything else `show` prints
+/// so it cannot scroll off the top of a long prompt.
+///
+/// It states three things in the order an operator needs them: that the file was
+/// refused, what the daemon is therefore doing (Teams OFF — the consequence, and
+/// the half that explains an idle board), and the daemon's own reason quoted
+/// VERBATIM. Verbatim matters: a second wording here would be a second place for
+/// the rule to be explained, free to drift from the one that actually decides
+/// whether the file loads.
+fn render_rejection_for(path: &Path, reason: &str) -> String {
+    if reason.is_empty() {
+        return String::new();
+    }
+    format!(
+        "!!! {} was REJECTED; Teams is OFF for this daemon !!!\n    {reason}\n\n",
+        path.display()
+    )
 }
 
 /// `show`'s arguments: one positional name plus the optional `--room N`.
@@ -312,8 +342,12 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// resolved prompt is unbounded prose, and a glance an operator has to scroll a
 /// screenful of it to reach is not a glance. It is empty whenever Teams is off
 /// or `--room 0` was passed, and then this renders exactly what it always did.
-fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str) -> String {
+fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str, rejection: &str) -> String {
     let mut out = String::new();
+    // First, so it is the line an operator reads before anything else. Empty on
+    // every accepted config, which keeps an ordinary `show` byte-identical to
+    // what it printed before this existed (STUDIO-670's property).
+    out.push_str(rejection);
     if let Some(i) = identity {
         out.push_str(&format!("identity:     {i}\n"));
     }
@@ -544,6 +578,59 @@ mod tests {
             "out = {out}"
         );
         assert!(!profiles_dir.exists(), "show must not create the dir");
+    }
+
+    /// STUDIO-891: a REJECTED `teams.yaml` is reported by the command, not only
+    /// by a log line the operator has to go looking for.
+    ///
+    /// The rejection path degrades to `Teams::disabled()` and still exits 0, so
+    /// without this the evidence that a config was refused is an absence — the
+    /// roster silently not resolving, and a board that quietly stops being
+    /// reviewed. `teams show` is the surface that needs no daemon and no log
+    /// access, so it is where the reason belongs.
+    ///
+    /// The command still SUCCEEDS: §4's "best-effort" contract is that a broken
+    /// `teams.yaml` must not stop an operator inspecting a profile.
+    #[test]
+    fn show_reports_a_rejected_teams_config_without_refusing_to_run() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        // Unsatisfiable: two teammates cannot supply two non-author reviewers.
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  reviewers: 2\nroster:\n  - name: alice\n  - name: jimmy\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "swe"], &env[0]).expect("a rejected config must not fail `show`");
+        assert!(
+            out.contains("teams.yaml was REJECTED"),
+            "the rejection must be stated, not implied: {out}"
+        );
+        assert!(
+            out.contains("review.reviewers is 2") && out.contains("at most 1"),
+            "the daemon's own reason must be quoted verbatim: {out}"
+        );
+        assert!(
+            out.contains("Teams is OFF"),
+            "the consequence is the half an operator acts on: {out}"
+        );
+        assert!(
+            out.contains("--- resolved prompt ---"),
+            "the profile is still shown: {out}"
+        );
+
+        // A config the daemon accepts prints no such banner — the report is the
+        // exception, so an ordinary `show` is byte-identical to what it was.
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n",
+        )
+        .expect("rewrite teams.yaml");
+        let ok = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            !ok.contains("REJECTED"),
+            "no banner on a valid config: {ok}"
+        );
     }
 
     /// An overlay's provenance — including the pin's drift line — is what the

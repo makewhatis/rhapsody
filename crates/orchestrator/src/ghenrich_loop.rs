@@ -812,6 +812,209 @@ async fn the_enrichment_advisory_clears_when_github_summons_goes_away() {
     }
 }
 
+// --- STUDIO-882: the unconnected repository, end to end ----------------------------------------
+
+/// The SAME ticket as [`RAW_IN_REVIEW_ISSUE`], carrying the attachment STUDIO-875's
+/// `attachmentLinkGitHubPR` write actually produces on a repository whose GitHub integration is not
+/// connected.
+///
+/// These two field values are an OBSERVED fact, not a model of one. Read back from the live Linear
+/// API on 2026-09-13 for the attachment the daemon wrote for STUDIO-880 at 01:36:31:
+///
+/// ```text
+/// { "id": "744fbf5a-…", "title": "makewhatis/rhapsody#159",
+///   "url": "https://github.com/makewhatis/rhapsody/pull/159",
+///   "sourceType": "api", "metadata": {} }
+/// ```
+///
+/// against the integration-written attachment on a CONNECTED repository (tally STUDIO-844), which
+/// is `sourceType: "github"` with a fully populated `metadata` — the shape
+/// [`RAW_IN_REVIEW_ISSUE`] carries.
+///
+/// So the write is invisible to `linked_prs` twice over: the `sourceType` gate rejects it, and the
+/// coordinate `linked_prs` is built from (`metadata.url`) is not there to read either. That second
+/// half is why widening the gate would not have been a fix.
+const RAW_UNCONNECTED_REPO_ISSUE: &str = r#"{
+  "id": "iss-569",
+  "identifier": "STUDIO-569",
+  "title": "Discovery: persistent named agents",
+  "state": { "name": "In Review" },
+  "team": { "id": "team-1" },
+  "attachments": { "nodes": [
+    { "sourceType": "api", "metadata": {} }
+  ] },
+  "comments": { "nodes": [] }
+}"#;
+
+/// Normalizes [`RAW_UNCONNECTED_REPO_ISSUE`] through the REAL Linear normalizer.
+fn normalized_unconnected_issue() -> Issue {
+    let raw: rhapsody_tracker::linear::RawIssue =
+        serde_json::from_str(RAW_UNCONNECTED_REPO_ISSUE).expect("raw issue decodes");
+    let client = rhapsody_tracker::linear::new(rhapsody_tracker::linear::Config {
+        endpoint: String::new(),
+        api_key: "k".to_string(),
+        project_slug: "studio-infra".to_string(),
+        active_states: vec!["Todo".to_string(), "In Progress".to_string()],
+        review_states: vec!["In Review".to_string()],
+        summon_token: "@rhapsody".to_string(),
+        milestone: String::new(),
+        claim_mode: String::new(),
+    });
+    client.normalize_issue(raw)
+}
+
+/// The daemon-written attachment reaches `linked_prs` not at all — the whole of STUDIO-882's
+/// diagnosis, pinned against the real normalizer so a future change to `is_github_pr` cannot make
+/// this claim quietly false.
+#[test]
+fn the_daemon_written_attachment_produces_no_linked_pr() {
+    let iss = normalized_unconnected_issue();
+    assert!(
+        !iss.linked_pr,
+        "a sourceType=api attachment must not register as a linked PR"
+    );
+    assert_eq!(
+        iss.linked_prs, None,
+        "STUDIO-875's write lands in Linear and contributes NO linked PR: {:?}",
+        iss.linked_prs
+    );
+}
+
+/// [`studio574_orch`], but on an UNCONNECTED repository: the tracker offers no linked PR, and the
+/// daemon's own watch set carries the ticket→PR link instead.
+fn studio882_orch() -> (
+    Orchestrator,
+    crate::testsupport::DispatchedEntries,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let iss = normalized_unconnected_issue();
+    assert!(
+        !iss.linked_pr,
+        "the fixture must reproduce the unconnected repo: no linked PR"
+    );
+    let mut p = summon_project("studio-infra", "studio49dev", "studio-infra", vec![iss]);
+    p.active_states = set_of(&["todo", "in progress"]);
+    p.review_states = set_of(&["in review"]);
+    let (mut o, spawned) = orch_for_retry_multi(vec![p], 10);
+    if let Some(eff) = o.eff.as_mut() {
+        eff.review_promote_state = "In Progress".to_string();
+        eff.review_states = set_of(&["in review"]);
+        eff.active_states = set_of(&["todo", "in progress"]);
+    }
+    o.now = Box::new(studio574_now);
+    let endpoints = Arc::new(Mutex::new(Vec::new()));
+    o.gh_source = Some(gh_source_for("@rhapsody", Arc::clone(&endpoints)));
+    let store: Arc<dyn Store + Send + Sync> =
+        Arc::new(Sqlite::open(StorePath::InMemory).expect("in-memory store"));
+    seed_run(
+        store.as_ref(),
+        "iss-569",
+        "STUDIO-569",
+        studio574_run_start() + chrono::Duration::minutes(1),
+    );
+    // The link the daemon recorded for itself when it parked the ticket in review — the row shape
+    // `~/.rhapsody/rhapsody.db` really holds (`introduced_by = 'handoff:STUDIO-880'` for
+    // makewhatis/rhapsody#159, observed 2026-09-13).
+    store
+        .save_review_watch(rhapsody_store::ReviewWatchRow {
+            key: rhapsody_store::ReviewWatchKey {
+                owner: "studio49dev".to_string(),
+                repo: "studio-infra".to_string(),
+                number: 71,
+                reviewer: "jimmy".to_string(),
+            },
+            introduced_by: "handoff:STUDIO-569".to_string(),
+            open: true,
+            status: rhapsody_store::REVIEW_STATUS_REVIEWED.to_string(),
+            ..Default::default()
+        })
+        .expect("seed the watch row");
+    o.set_store(store);
+    (o, spawned, endpoints)
+}
+
+/// THE acceptance case: on a repository the tracker's GitHub integration is NOT connected to, a
+/// reviewer's summons on the pull request reaches the ticket and re-engages its author — with no
+/// attachment that `linked_prs` will accept, because none can exist.
+#[tokio::test]
+async fn a_summons_reaches_an_unconnected_repos_ticket_through_the_daemons_own_link() {
+    let (o, _spawned, _eps) = studio882_orch();
+
+    let tagged = o.poll_all_projects().await;
+
+    assert_eq!(tagged.len(), 1, "the candidate must survive the poll");
+    let iss = &tagged[0].iss;
+    assert_eq!(
+        iss.linked_prs, None,
+        "the tracker must still offer nothing — the fix must not depend on it"
+    );
+    assert_eq!(
+        iss.latest_summon_at,
+        Utc.with_ymd_and_hms(2026, 8, 24, 21, 48, 32).single(),
+        "the summons must land via the daemon's own PR->ticket link"
+    );
+    assert!(
+        iss.latest_summon_body
+            .contains("Reposting with the correct"),
+        "the summons body must ride along with its time, got {:?}",
+        iss.latest_summon_body
+    );
+}
+
+/// ...and the re-engagement actually happens: the review-state ticket is promoted and dispatched,
+/// which is the outcome STUDIO-875 shipped without and STUDIO-880 sat eleven hours waiting for.
+#[tokio::test]
+async fn an_unconnected_repos_review_ticket_is_reopened_by_the_summons() {
+    let (mut o, spawned, _eps) = studio882_orch();
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        entries.len(),
+        1,
+        "the summoned review ticket must be promoted and dispatched"
+    );
+    assert_eq!(entries[0].issue.identifier, "STUDIO-569");
+}
+
+/// The same tick with the watch row absent re-engages nobody — so the two tests above are measuring
+/// the daemon's link and not some other path that would have worked anyway.
+#[tokio::test]
+async fn without_the_daemons_link_the_same_summons_still_reaches_nobody() {
+    let (mut o, spawned, _eps) = studio882_orch();
+    o.store()
+        .drop_review_watch(&rhapsody_store::ReviewWatchKey {
+            owner: "studio49dev".to_string(),
+            repo: "studio-infra".to_string(),
+            number: 71,
+            reviewer: "jimmy".to_string(),
+        })
+        .expect("retire the watch row");
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        entries.is_empty(),
+        "with no daemon link and no tracker link the summons must still be dropped, got {:?}",
+        entries
+            .iter()
+            .map(|e| &e.issue.identifier)
+            .collect::<Vec<_>>()
+    );
+}
+
 // --- STUDIO-885: a summons must survive the lookback window it was observed in -------------------
 
 /// The reported incident's clock, moment by moment. The comment lands at 04:29:21 and the board is

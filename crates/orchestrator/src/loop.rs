@@ -47,7 +47,8 @@ use crate::agentupdate::AgentUpdate;
 use crate::dispatch::dependency_mode_enabled;
 use crate::effective::{Effective, ResolvedProject};
 use crate::ghenrich::{
-    GH_SUMMONS_TIMEOUT, apply_github_summons, enrich_with_github_summons, fetch_github_summons,
+    DaemonPrLinks, GH_SUMMONS_TIMEOUT, apply_github_summons, enrich_with_github_summons,
+    fetch_github_summons,
 };
 use crate::ghsummons::{self, GH, SummonHit};
 use crate::handoff::HandoffPlan;
@@ -732,6 +733,25 @@ impl Orchestrator {
         (self.now)() - chrono::Duration::seconds(DEFAULT_GH_LOOKBACK.as_secs() as i64)
     }
 
+    /// This daemon's own PR→ticket links, for the tick's summons attribution (STUDIO-882).
+    ///
+    /// Built from the LIVE watch rows, so a merged or retired pull request has already left it and
+    /// no separate merge check is owed downstream. See [`DaemonPrLinks`].
+    ///
+    /// A store error yields an empty index — the enrichment degrades to the tracker's `linked_prs`
+    /// exactly as before this ticket, which is the only safe default — and warns, because the
+    /// silent version of this is the eleven hours STUDIO-875 cost. The `Noop` store answers `Ok`
+    /// with no rows, so storage being off is quiet rather than a warning per tick.
+    fn daemon_pr_links(&self) -> DaemonPrLinks {
+        match self.store().load_live_review_watch() {
+            Ok(rows) => DaemonPrLinks::from_watch_rows(&rows),
+            Err(e) => {
+                tracing::warn!(err = %e, "github-summons: the daemon's own pull-request links could not be read; a summons can only reach a ticket the tracker has linked this tick");
+                DaemonPrLinks::default()
+            }
+        }
+    }
+
     /// The wall clock this tick's GitHub-summons enrichment phase may spend before it defers the
     /// repos it has not reached to the next tick (STUDIO-811). See [`GH_ENRICH_BUDGET_DIVISOR`].
     ///
@@ -926,7 +946,9 @@ impl Orchestrator {
         if let (Some(repo_url), Some(src)) = (enrich_repo, self.gh_source.as_deref()) {
             let (owner, repo) = ghsummons::parse_repo(&repo_url).unwrap_or_default();
             let since = self.gh_since();
-            let applied = enrich_with_github_summons(issues, Some(src), &owner, &repo, since).await;
+            let links = self.daemon_pr_links();
+            let applied =
+                enrich_with_github_summons(issues, Some(src), &owner, &repo, since, &links).await;
             // The legacy path's half of STUDIO-875, against the top-level review states.
             if let Some(eff) = self.eff.as_ref() {
                 crate::ghenrich::report_unlinked_summons(
@@ -1225,6 +1247,19 @@ impl Orchestrator {
             }
 
             // --- Pass 3: the pure apply, over the KEPT copies (after the dedup, as Go does). ------
+            // The daemon's own PR→ticket links (STUDIO-882), read ONCE per tick rather than per
+            // issue: it is a single store read serving every repository in the pass, and the apply
+            // step selects the rows it wants by repository out of it.
+            //
+            // Skipped entirely when nothing was fetched, which is not merely an optimisation of the
+            // empty case: `targets` is empty the moment `tracker.github_summons` is off anywhere it
+            // applies, so an installation with the feature off would otherwise pay this store read
+            // every poll interval, forever, to attribute hits that do not exist.
+            let links = if fetched.is_empty() {
+                DaemonPrLinks::default()
+            } else {
+                self.daemon_pr_links()
+            };
             for ti in tagged.iter_mut() {
                 let Some(t) = ti.proj.and_then(|idx| targets.get(&idx)) else {
                     continue;
@@ -1233,7 +1268,7 @@ impl Orchestrator {
                     continue;
                 };
                 let iss = std::mem::take(&mut ti.iss);
-                let applied = apply_github_summons(vec![iss], by_pr, &t.owner, &t.repo);
+                let applied = apply_github_summons(vec![iss], by_pr, &t.owner, &t.repo, &links);
                 // STUDIO-875: a hit this repo produced that reached nothing. Said ONCE per ticket,
                 // and only for a ticket sitting in review — which is the ticket that is waiting for
                 // exactly the re-engagement that can never arrive.

@@ -653,11 +653,11 @@ where
     };
     let tracker = tracker_for(&target, req);
 
-    // STUDIO-875: attach the pull request to its ticket, through the parent project's own tracker.
-    // Without the attachment `apply_github_summons` has nothing to attribute a reviewer's findings
-    // comment to, so the review this fan-out is about to request can never route its verdict back.
-    // Best-effort and unconditional on what follows: a ticket with no reviewer to ask still wants
-    // its pull request linked.
+    // STUDIO-875: attach the pull request to its ticket, through the parent project's own tracker,
+    // so the ticket carries a link a reader can click through to the code. Best-effort and
+    // unconditional on what follows: a ticket with no reviewer to ask still wants its pull request
+    // linked. It is NOT what routes the review's verdict back — see `prlink`'s module doc and
+    // STUDIO-882; that is `ghenrich::DaemonPrLinks`, off this daemon's own watch set.
     crate::prlink::link_pr_best_effort(
         Some(&crate::prlink::TrackerLinker(Arc::clone(&tracker))),
         req.link.as_ref(),
@@ -2248,10 +2248,12 @@ mod tests {
 
     // ── the attachment the summons routing needs (STUDIO-875) ───────────────────────────────────
 
-    /// STUDIO-674 taught the fan-out to work without the attachment; this writes the attachment, so
-    /// the review it just requested can route its findings BACK. Without it
-    /// `apply_github_summons` walks an empty `linked_prs`, and the reviewer's token-bearing
-    /// comment is dropped on every poll forever.
+    /// STUDIO-674 taught the fan-out to work without the attachment; this pins that the fan-out
+    /// still WRITES one, so the ticket carries a link to the pull request for a human reader.
+    ///
+    /// It deliberately asserts nothing about summons routing (STUDIO-882): the attachment this
+    /// produces never reaches `linked_prs` on an unconnected repository, and the review's findings
+    /// route back through the daemon's own watch set instead.
     #[tokio::test]
     async fn a_pr_resolved_by_branch_is_attached_to_its_ticket() {
         let tr = Arc::new(tracker_with_viewer());
