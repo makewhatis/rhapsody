@@ -21,6 +21,7 @@ import {
   downloadUpdate,
   installUpdate,
   activeRunCount,
+  drainAndRestart,
   onUpdateAvailable,
   onUpdateDownloadProgress,
   pickDirectory,
@@ -212,15 +213,37 @@ describe("bindings — Tauri host present", () => {
     expect(invokeMock).toHaveBeenCalledWith("update_download");
   });
 
-  it("installUpdate passes the force flag and returns the blocked-run report", async () => {
+  it("installUpdate passes the force and drain flags and returns the blocked-run report", async () => {
     invokeMock.mockResolvedValueOnce({ installed: false, blocked_active_runs: 2 });
-    const report = await installUpdate(); // defaults to force=false
-    expect(invokeMock).toHaveBeenCalledWith("update_install", { force: false });
+    const report = await installUpdate(); // defaults to force=false, drain=false
+    expect(invokeMock).toHaveBeenCalledWith("update_install", { force: false, drain: false });
     expect(report?.blocked_active_runs).toBe(2);
 
     invokeMock.mockResolvedValueOnce({ installed: true, blocked_active_runs: 0 });
     await installUpdate(true);
-    expect(invokeMock).toHaveBeenLastCalledWith("update_install", { force: true });
+    expect(invokeMock).toHaveBeenLastCalledWith("update_install", { force: true, drain: false });
+  });
+
+  // STUDIO-880: an install can now ask the host to settle the daemon first rather than being
+  // deferred indefinitely, and the report says what that wait did.
+  it("installUpdate can request a drain and surfaces its outcome", async () => {
+    invokeMock.mockResolvedValueOnce({
+      installed: false,
+      blocked_active_runs: 1,
+      drain: { outcome: "expired", running: 1, waited_secs: 1800 },
+    });
+    const report = await installUpdate(false, true);
+    expect(invokeMock).toHaveBeenLastCalledWith("update_install", { force: false, drain: true });
+    // An expired budget is NOT an ordinary "runs are active" refusal: nothing was interrupted, and
+    // the caller has to be able to tell the two apart.
+    expect(report?.drain).toEqual({ outcome: "expired", running: 1, waited_secs: 1800 });
+  });
+
+  // STUDIO-880: the drain-and-restart action itself.
+  it("drainAndRestart invokes drain_and_restart and returns the outcome", async () => {
+    invokeMock.mockResolvedValueOnce({ outcome: "drained", waited_secs: 42 });
+    expect(await drainAndRestart()).toEqual({ outcome: "drained", waited_secs: 42 });
+    expect(invokeMock).toHaveBeenCalledWith("drain_and_restart");
   });
 
   it("activeRunCount invokes active_run_count and returns the count", async () => {

@@ -109,6 +109,36 @@ use crate::teams::LoadSnapshot;
 /// which is the correct outcome for an operator who restarted the daemon to unstick something.
 pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
+/// How many CONSECUTIVE sweeps a round may find nobody to take it before the daemon stops treating
+/// that as ordinary back-pressure and calls it stalled (STUDIO-891).
+///
+/// Deferring is normal and usually momentary: the reviewer is mid-round, or this tick's dispatch
+/// budget is spent. What is not normal is deferring for the same reason forever, which is what a
+/// roster that shrank underneath a live watch row produces — the incumbent is gone, every remaining
+/// teammate is either the author or already holds another of this pull request's required reviews,
+/// and no tick will ever change that on its own. Boot validation cannot see it: the config was
+/// satisfiable when it was written.
+///
+/// Three, not one, because the first deferral of a round is usually the concurrency budget and
+/// saying "stalled" there would cry wolf on every busy tick; and not thirty, because the whole
+/// point is that an operator finds out before they mistake it for an idle board.
+pub const REVIEW_UNASSIGNABLE_SWEEPS: usize = 3;
+
+/// While a round stays stalled, the steady-state line is logged once per this many sweeps rather
+/// than on every one. The transitions — crossing [`REVIEW_UNASSIGNABLE_SWEEPS`], and recovering —
+/// always log regardless, mirroring how [`crate::preflight`] and [`crate::drain`] rate-limit
+/// theirs. In sweeps rather than in a `Duration` because this counter is already in sweeps and a
+/// clock here would be a second unit to keep honest.
+pub const REVIEW_UNASSIGNABLE_LOG_EVERY: usize = 20;
+
+/// The operator advisory surfaced on each project's `/api/v1/projects` status while any watched
+/// round has been unassignable for [`REVIEW_UNASSIGNABLE_SWEEPS`] sweeps — the state-visible half,
+/// exactly as [`crate::preflight::CREDENTIAL_DEAD_WARNING`] and [`crate::drain::DRAINING_WARNING`]
+/// are for a paused dispatch. Silence is this condition's failure mode: a pull request that has
+/// quietly stopped being reviewed looks precisely like one nobody has pushed to.
+pub const REVIEW_UNASSIGNABLE_WARNING: &str = "a pull request review cannot be assigned — every eligible teammate is the author or already \
+     holds one of its reviews; add a teammate or lower `review.reviewers`";
+
 /// What one watcher tick did, reported rather than logged-and-forgotten so a caller (and a test)
 /// can tell the four outcomes apart — they look identical in a silent no-op.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -140,6 +170,10 @@ pub struct ReviewSweepReport {
     /// an irreversible one, which must not happen on the control task. Empty on every installation
     /// that has not set `teams.review.auto_merge`, and on every tick where nothing cleared.
     pub merge: Vec<crate::automerge::AutoMergePlan>,
+    /// Rows that have now found nobody eligible for [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive
+    /// sweeps (STUDIO-891) — a SUBSET of [`ReviewSweepReport::deferred`], and the part of it that
+    /// is not going to resolve itself. Always `<= deferred`.
+    pub stalled: usize,
 }
 
 /// Delivers the watcher's two control-task round-trips. A trait for [`ReviewIntroSink`]'s reason:
@@ -310,6 +344,10 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 dispatched = report.dispatched,
                 retired = report.retired,
                 deferred = report.deferred,
+                // The subset of `deferred` that is not going to resolve itself (STUDIO-891). Its
+                // own field rather than folded into the count above, so a tick line that reads
+                // "deferred = 1" every 30 seconds can be told apart from one that is waiting.
+                stalled = report.stalled,
                 armed = report.armed,
                 done = report.done.len(),
                 merge = report.merge.len(),
@@ -480,6 +518,59 @@ impl Orchestrator {
         report
     }
 
+    /// Records that `id`'s round found nobody this sweep, and answers whether that has now been
+    /// true for [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive sweeps.
+    ///
+    /// The log follows [`crate::drain`]'s discipline exactly: the sweep that CROSSES the threshold
+    /// says so loudly and once, and the steady state repeats at [`REVIEW_UNASSIGNABLE_LOG_EVERY`]
+    /// rather than at poll rate — a stalled round would otherwise emit a warning every 30 seconds
+    /// for as long as the pull request stays open, which is how an operator learns to filter the
+    /// one line that mattered.
+    fn note_unassignable(&mut self, pr: &PrCoord, id: &str, reviewer: &str) -> bool {
+        let sweeps = self.review_unassignable.entry(id.to_string()).or_insert(0);
+        *sweeps += 1;
+        let sweeps = *sweeps;
+        if sweeps < REVIEW_UNASSIGNABLE_SWEEPS {
+            return false;
+        }
+        // The crossing sweep and the rate-limited repeats in ONE condition: at the crossing the
+        // difference is zero, and zero is a multiple of everything. Spelling the crossing out as a
+        // separate disjunct would read as a second rule while deciding nothing.
+        if (sweeps - REVIEW_UNASSIGNABLE_SWEEPS).is_multiple_of(REVIEW_UNASSIGNABLE_LOG_EVERY) {
+            tracing::warn!(
+                pr = %pr, reviewer, sweeps,
+                "ticketless review: this round has had no eligible reviewer for {sweeps} \
+                 consecutive sweeps and will not resolve on its own — every teammate left is \
+                 either the pull request's author or already holds one of its reviews. Add a \
+                 teammate to `teams.yaml`, or lower `review.reviewers`."
+            );
+        }
+        true
+    }
+
+    /// Forgets `id`'s consecutive-deferral count, logging the RECOVERY when there was a reported
+    /// stall to recover from — the edge [`note_unassignable`](Self::note_unassignable) is the other
+    /// half of. A round that never reached the threshold clears silently: it was never news.
+    fn clear_unassignable(&mut self, pr: &PrCoord, id: &str, reviewer: &str) {
+        if let Some(sweeps) = self.review_unassignable.remove(id)
+            && sweeps >= REVIEW_UNASSIGNABLE_SWEEPS
+        {
+            tracing::info!(
+                pr = %pr, reviewer, sweeps,
+                "ticketless review: a round that had been unassignable for {sweeps} sweeps has a \
+                 reviewer again"
+            );
+        }
+    }
+
+    /// Whether any watched round is currently stalled — read by `project_statuses` to surface
+    /// [`REVIEW_UNASSIGNABLE_WARNING`] (STUDIO-891).
+    pub(crate) fn review_rounds_stalled(&self) -> bool {
+        self.review_unassignable
+            .values()
+            .any(|n| *n >= REVIEW_UNASSIGNABLE_SWEEPS)
+    }
+
     /// Drops every live row of one pull request out of the watch set and forgets its churn budget.
     /// Returns how many rows were dropped.
     fn retire_review_pr(&mut self, pr: &PrCoord, why: &str) -> usize {
@@ -493,10 +584,20 @@ impl Orchestrator {
             }
         };
         let mut dropped = 0usize;
+        // Collected as the rows go, rather than reconstructed by prefix-matching `review_key`'s
+        // format from here: the key's spelling is that function's business, and a second place
+        // that knows it is a second place for it to drift.
+        let mut retired_ids: Vec<String> = Vec::new();
         for row in rows {
             if !row_is(&row, pr) || (!row.open && row.status == REVIEW_STATUS_DROPPED) {
                 continue;
             }
+            retired_ids.push(review_key(
+                &row.key.owner,
+                &row.key.repo,
+                row.key.number,
+                &row.key.reviewer,
+            ));
             match self.store().drop_review_watch(&row.key) {
                 Ok(()) => dropped += 1,
                 Err(e) => {
@@ -508,8 +609,14 @@ impl Orchestrator {
             tracing::info!(pr = %pr, reason = why, rows = dropped, "ticketless review: pull request dropped from the watch set");
         }
         // A dropped pull request can be re-introduced later; its old churn budget should not follow
-        // it, and leaving the entry would grow this map for the daemon's whole life.
+        // it, and leaving the entry would grow this map for the daemon's whole life. The
+        // consecutive-deferral counts go with it for both of those reasons (STUDIO-891) — and for a
+        // third: a retired pull request that kept a stall count would keep the operator advisory
+        // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        for id in retired_ids {
+            self.review_unassignable.remove(&id);
+        }
         dropped
     }
 
@@ -604,6 +711,10 @@ impl Orchestrator {
                      re-considered next tick"
                 );
                 report.deferred += 1;
+                // STUDIO-891: "re-considered next tick" is only reassuring while some tick can
+                // change the answer. Count the consecutive ones so a round that no tick will ever
+                // resolve stops presenting as ordinary back-pressure.
+                report.stalled += usize::from(self.note_unassignable(pr, &id, &row.key.reviewer));
                 continue;
             };
             // THE dispatch-side allowlist re-check (the slice-6 F-SEC review's item (a)). The row
@@ -619,6 +730,11 @@ impl Orchestrator {
                 report.deferred += 1;
                 continue;
             };
+            // The recovery edge (STUDIO-891): this round found somebody, so whatever it had been
+            // owed before is settled. Cleared BEFORE the dispatch, because a dispatch that fails
+            // further down is a different problem with its own log line, and leaving the count
+            // standing would let this row keep claiming a stall it no longer has.
+            self.clear_unassignable(pr, &id, &row.key.reviewer);
             let reassigned = chosen != row.key.reviewer;
             let picked = chosen.clone();
             let run = ReviewRun {
@@ -674,6 +790,9 @@ impl Orchestrator {
                 // is precisely what the guard exists for. Next tick.
                 ReviewDispatchOutcome::AlreadyInFlight => report.deferred += 1,
                 ReviewDispatchOutcome::TeamsOff => report.deferred += 1,
+                // A drain is armed: the row is untouched and this head is re-offered on the sweep
+                // after the drain is cancelled, exactly as a deferred one is.
+                ReviewDispatchOutcome::Draining => report.deferred += 1,
                 ReviewDispatchOutcome::Refused(why) => {
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");
@@ -1704,6 +1823,107 @@ mod tests {
         o.teams = Some(ticketless(&["alice", "bob"]));
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
         assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
+    }
+
+    /// The operator advisory is PROSE that goes out on the wire, and a backslash-continued Rust
+    /// literal is exactly where source indentation leaks into shipped text. A test that compares
+    /// the constant to itself would never see it, so this reads the rendered value.
+    #[test]
+    fn the_stalled_round_advisory_renders_as_one_sentence() {
+        assert!(
+            !REVIEW_UNASSIGNABLE_WARNING.contains("  ")
+                && !REVIEW_UNASSIGNABLE_WARNING.contains('\n'),
+            "leaked source indentation: {REVIEW_UNASSIGNABLE_WARNING:?}"
+        );
+        assert!(
+            REVIEW_UNASSIGNABLE_WARNING.contains("review.reviewers"),
+            "the advisory must name the knob an operator turns"
+        );
+    }
+
+    /// STUDIO-891: a round that keeps deferring stops being a quiet one.
+    ///
+    /// Boot validation cannot see this case — the config was satisfiable when it was written and
+    /// the roster shrank underneath it — so the deferral has to report itself. The failure shape
+    /// this whole batch keeps producing is an idle board: the round defers, `deferred` ticks up in
+    /// a report nobody reads, and a `debug!` line is the only record. After
+    /// [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive sweeps the row is called stalled, and that fact
+    /// reaches `/api/v1/projects` — the same surface a paused dispatch uses.
+    #[test]
+    fn a_round_that_defers_for_several_sweeps_is_reported_as_stalled() {
+        let (mut o, _dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![ident("alice", 0)],
+        ));
+        introduce(&o, row(12, "bob"));
+
+        // `alice` authored it and is the whole roster, so no sweep can ever assign this round.
+        for sweep in 1..REVIEW_UNASSIGNABLE_SWEEPS {
+            let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+            assert_eq!((report.deferred, report.stalled), (1, 0), "sweep {sweep}");
+            assert!(
+                o.project_statuses()[0]
+                    .warnings
+                    .iter()
+                    .all(|w| w != REVIEW_UNASSIGNABLE_WARNING),
+                "a round that has only just started deferring is not yet news (sweep {sweep})"
+            );
+        }
+        // The sweep that crosses the threshold.
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!((report.deferred, report.stalled), (1, 1));
+        assert!(
+            o.project_statuses()[0]
+                .warnings
+                .iter()
+                .any(|w| w == REVIEW_UNASSIGNABLE_WARNING),
+            "a stalled round must reach the operator's project status"
+        );
+        // It stays reported for as long as it stays stalled.
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).stalled, 1);
+
+        // A roster that can service the round again clears BOTH the count and the advisory on the
+        // very next sweep — the recovery edge, which is the half a warning that only ever latches
+        // would get wrong.
+        o.teams = Some(ticketless(&["alice", "bob"]));
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!((report.dispatched, report.stalled), (1, 0));
+        assert!(
+            o.project_statuses()[0]
+                .warnings
+                .iter()
+                .all(|w| w != REVIEW_UNASSIGNABLE_WARNING),
+            "a round that got a reviewer is no longer stalled"
+        );
+    }
+
+    /// The counter is per ROW and self-cleaning: a pull request that leaves the watch set takes its
+    /// stall count with it, so the map cannot grow for the daemon's whole life and a re-introduced
+    /// pull request does not inherit an old grievance.
+    #[test]
+    fn a_retired_pull_request_forgets_its_stall_count() {
+        let (mut o, _dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![ident("alice", 0)],
+        ));
+        introduce(&o, row(12, "bob"));
+        for _ in 0..REVIEW_UNASSIGNABLE_SWEEPS {
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        }
+        assert!(!o.review_unassignable.is_empty());
+        assert!(o.review_rounds_stalled());
+
+        o.handle_review_sweep(&[PrObservation {
+            pr: coord(12),
+            lookup: PrLookup::Gone,
+        }]);
+        assert!(
+            o.review_unassignable.is_empty(),
+            "a retired pull request must not leave a counter behind"
+        );
+        assert!(!o.review_rounds_stalled());
     }
 
     /// An author-less row (written before the column existed, or by a caller that supplied none)

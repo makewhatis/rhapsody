@@ -19,11 +19,13 @@ function stub(over: Partial<Updater> = {}): Updater {
     progress: null,
     error: null,
     activeRunsPrompt: null,
+    drainOutcome: null,
     pending: false,
     check: vi.fn(),
     download: vi.fn(),
     requestInstall: vi.fn(),
     confirmInstallNow: vi.fn(),
+    drainThenInstall: vi.fn(),
     deferToQuit: vi.fn(),
     dismissPrompt: vi.fn(),
     ...over,
@@ -102,7 +104,39 @@ describe("UpdatesTab", () => {
     expect(screen.getByText(/3 agents are playing/i)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /install on next quit/i }));
     expect(u.deferToQuit).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole("button", { name: /update now|restart.*update/i }));
+    fireEvent.click(screen.getByRole("button", { name: /update now/i }));
     expect(u.confirmInstallNow).toHaveBeenCalledOnce();
+  });
+
+  // STUDIO-880 — the choice this ticket exists to make possible. Before it, the dialog offered
+  // three and its body said "Updating now will stop them", which was accurate only BECAUSE no
+  // button could ask for a drain.
+  it("active-runs warn dialog: offers waiting for the agents, and says nothing is interrupted", () => {
+    const u = stub({ phase: "ready", info: info(), pending: true, activeRunsPrompt: 1 });
+    render(<UpdatesTab updater={u} />);
+    expect(screen.getByText(/nothing is interrupted/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /wait, then update/i }));
+    expect(u.drainThenInstall).toHaveBeenCalledOnce();
+    expect(u.confirmInstallNow).not.toHaveBeenCalled();
+  });
+
+  it("draining: explains why nothing appears to be happening", () => {
+    const u = stub({ phase: "draining", info: info(), pending: true });
+    render(<UpdatesTab updater={u} />);
+    expect(screen.getByText(/waiting for the agents to finish/i)).toBeTruthy();
+    expect(screen.getByText(/no new work is being started/i)).toBeTruthy();
+  });
+
+  // An expired budget leaves the daemon drained. "Scheduled for your next quit" alone would send
+  // the operator away from a daemon that has silently stopped taking work.
+  it("deferred after an expired drain: says the daemon is still draining", () => {
+    const u = stub({
+      phase: "deferred",
+      info: info(),
+      pending: true,
+      drainOutcome: { outcome: "expired", running: 2, waited_secs: 1800 },
+    });
+    render(<UpdatesTab updater={u} />);
+    expect(screen.getByText(/still draining/i)).toBeTruthy();
   });
 });

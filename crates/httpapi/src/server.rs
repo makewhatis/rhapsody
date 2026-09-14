@@ -11,6 +11,7 @@ use axum::handler::Handler;
 use axum::routing::any;
 use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
+use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -27,6 +28,7 @@ use rhapsody_store::StoreError;
 
 use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_version};
 use crate::handlers_config::{handle_capabilities, handle_config};
+use crate::handlers_drain::handle_drain;
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_history_summary, handle_issue_counts,
     handle_issue_history, handle_issue_runs, handle_metrics, handle_run_detail, handle_run_events,
@@ -177,6 +179,34 @@ pub trait StateProvider: Send + Sync {
     /// `backlog_full`); a clean accept carries the inserted `id` + `identifier` (→ 202). Mirrors the
     /// O6 `ControlHandle::send_run_message` surface this forwards to.
     async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult;
+
+    /// The drain's current state (`GET /api/v1/drain`, STUDIO-880) — whether new dispatch is
+    /// paused so in-flight runs can reach a turn boundary before a restart.
+    ///
+    /// Rhapsody-only (no Go v0.4.0 counterpart). The default answers "not draining", which is the
+    /// truth for a provider with no control loop to pause — the parity fake, and anything embedding
+    /// this crate for the Go-shaped API.
+    fn drain_status(&self) -> DrainStatus {
+        DrainStatus {
+            active: false,
+            requested_at: None,
+            reason: DrainReason::Operator,
+        }
+    }
+
+    /// Arm (`active`) or cancel a drain (`POST /api/v1/drain`, STUDIO-880), answering the state that
+    /// resulted.
+    ///
+    /// Infallible on purpose: the flag is an atomic the HTTP task writes directly, so there is no
+    /// round trip to fail and no outcome a caller could be denied. It KILLS NOTHING — arming stops
+    /// new dispatch and lets in-flight runs wind down at their own turn boundaries — so there is no
+    /// state in which asking for one is unsafe.
+    ///
+    /// The default is the read's counterpart: a provider that cannot pause a control loop reports
+    /// that it is not draining, whatever it is asked.
+    fn set_drain(&self, _active: bool, _reason: DrainReason) -> DrainStatus {
+        self.drain_status()
+    }
 
     /// Request a coalesced poll+reconcile tick (`POST /api/v1/refresh`, Go `Refresh`). Synchronous +
     /// infallible like Go's non-blocking channel send: the returned [`RefreshResult`] reports whether
@@ -503,6 +533,9 @@ where
         // Coalesced poll+reconcile trigger (H3): POST-only, 202. Registered method-agnostically so a
         // GET yields a 405 envelope rather than the SPA fallback.
         .route("/api/v1/refresh", any(handle_refresh))
+        // STUDIO-880 (Rhapsody-only): GET reads the drain, POST arms or cancels it. One route for
+        // both — the POST answers exactly what the GET would.
+        .route("/api/v1/drain", any(handle_drain))
         // Read-write config (H3): GET returns the on-disk WORKFLOW.md view; POST validates + atomically
         // rewrites it (the watcher then hot-reloads). Loopback-only by server construction.
         .route("/api/v1/config", any(handle_config))

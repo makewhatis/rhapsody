@@ -130,6 +130,13 @@ pub struct Snapshot {
     /// Per-project live status rollup (INF-224). One entry per configured project, in declaration
     /// order; empty when no resolved projects (test-injected effectives).
     pub projects: Vec<ProjectStatus>,
+    /// The armed drain, or `None` when dispatch is not gated (STUDIO-880).
+    ///
+    /// `None` is the load-bearing half: [`crate::snapshot_json::render`] emits the `drain` key ONLY
+    /// when this is `Some`, so a daemon nobody drains serves a `/api/v1/state` payload byte-identical
+    /// to the Go daemon's — which is what the committed `harness/fixtures/api/state.json` golden
+    /// pins. See the README divergence entry.
+    pub drain: Option<crate::drain::DrainStatus>,
 }
 
 /// The outcome of a `POST /api/v1/refresh` trigger (§13.7.2). Mirrors Go `orchestrator.RefreshResult`
@@ -230,6 +237,12 @@ impl Orchestrator {
             // `rateLimits` here, which the wire layer renders as `[]`.
             rate_limits: Vec::new(),
             projects: self.project_statuses(),
+            // STUDIO-880: `None` unless a drain is armed, which keeps the wire payload — and the
+            // golden — exactly as it was on every daemon that is not draining.
+            drain: match self.drain.status() {
+                st if st.active => Some(st),
+                _ => None,
+            },
         }
     }
 
@@ -309,6 +322,16 @@ impl Orchestrator {
         // cause (the log stream is the primary surface). Empty while healthy → the wire shape and the
         // existing status fixtures are unaffected.
         let credential_dead = self.credential_probe_dead();
+        // STUDIO-880: same treatment for the same reason — while a drain is armed ALL dispatch is
+        // paused, and an operator reading a project that has quietly stopped taking work needs to be
+        // told why. Empty while not draining → the wire shape and the status fixtures are unaffected.
+        let draining = self.drain.is_draining();
+        // STUDIO-891: and again for the third silent stall this surface now carries. Unlike the two
+        // above, this one does not pause dispatch — work keeps flowing and only REVIEW stops, which
+        // is precisely why it needs saying: the board looks healthy while pull requests pile up
+        // unreviewed and, with auto-merge on, unmerged. Empty while nothing is stalled → the wire
+        // shape and the status fixtures are unaffected.
+        let review_stalled = self.review_rounds_stalled();
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -330,6 +353,12 @@ impl Orchestrator {
             let mut warnings = self.project_warnings_for(group);
             if credential_dead {
                 warnings.push(crate::preflight::CREDENTIAL_DEAD_WARNING.to_string());
+            }
+            if draining {
+                warnings.push(crate::drain::DRAINING_WARNING.to_string());
+            }
+            if review_stalled {
+                warnings.push(crate::reviewwatch::REVIEW_UNASSIGNABLE_WARNING.to_string());
             }
             out.push(ProjectStatus {
                 slug: group.clone(),

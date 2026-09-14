@@ -19,6 +19,7 @@ use rhapsody_core::Project;
 use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
+use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -212,6 +213,17 @@ impl StateProvider for DaemonState {
 
     fn refresh(&self) -> RefreshResult {
         self.handle.refresh()
+    }
+
+    fn drain_status(&self) -> DrainStatus {
+        self.handle.drain_status()
+    }
+
+    fn set_drain(&self, active: bool, reason: DrainReason) -> DrainStatus {
+        // `Utc::now()` rather than the orchestrator's injectable clock: the handle is off-loop and
+        // the loop-owned `now` is not reachable from here. The timestamp is an operator annotation
+        // (how long has this drain been waiting), never an input to a decision.
+        self.handle.set_drain(active, reason, Utc::now())
     }
 
     fn workflow_path(&self) -> &str {
