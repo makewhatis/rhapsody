@@ -1110,7 +1110,19 @@ hours (182 attempts) to be told the same thing. The split is now about whether G
 a refusal it recognises is a decline, and everything else — a network error, an `HTTP 503`, a message
 GitHub adds next year — stays a failure and is retried next tick, because abandoning a mergeable pull
 request on a blip is the worse direction. Nothing latches either way; what does not repeat is the
-REPORT, which is announced once per pull request, head and reason and held quietly afterwards.
+REPORT.
+
+**Announced once, on both sides of the seam.** A gate that holds holds for as long as its condition
+does, and the daemon re-decides it every tick — so a line spoken on the way to the decision is a
+line a minute until something changes. The three-hour log this ticket was filed from carried 383 of
+them for two stuck pull requests: 189 WARNs from the merge attempt, and 97 and 96 INFO lines from
+the control task announcing the plan it had just re-formed. Both halves are now announced only when
+they are NEWS — the plan once per pull request and head (with the approvals that cleared it), the
+refusal once per pull request, head and reason, and the detail a gate adds to its refusal only on
+the tick the refusal itself is announced. Everything repeated is at DEBUG. A stuck pull request
+therefore costs two INFO lines — the plan and the refusal — plus the one detail line its particular
+gate adds, and then silence. It still merges the tick its gate clears: the plan is re-formed and
+re-attempted every tick regardless, because it is only the REPORT that is held.
 
 **GitHub's own auto-merge is deliberately NOT armed here**, unlike the console merge action
 (STUDIO-767), whose `--auto` is a guardrail for a human who has already decided. With nobody
