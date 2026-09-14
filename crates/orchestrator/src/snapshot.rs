@@ -130,6 +130,14 @@ pub struct Snapshot {
     /// Per-project live status rollup (INF-224). One entry per configured project, in declaration
     /// order; empty when no resolved projects (test-injected effectives).
     pub projects: Vec<ProjectStatus>,
+    /// The pull requests whose board state and activity disagree (STUDIO-898), or EMPTY on a healthy
+    /// board.
+    ///
+    /// Empty is the load-bearing half, exactly as [`Snapshot::drain`]'s `None` is:
+    /// [`crate::snapshot_json::render`] emits the `review_divergence` key ONLY when this is
+    /// non-empty, so a daemon with nothing to report serves a `/api/v1/state` payload byte-identical
+    /// to the Go daemon's — which is what `harness/fixtures/api/state.json` pins.
+    pub review_divergence: Vec<crate::reviewreconcile::Divergence>,
     /// The armed drain, or `None` when dispatch is not gated (STUDIO-880).
     ///
     /// `None` is the load-bearing half: [`crate::snapshot_json::render`] emits the `drain` key ONLY
@@ -237,6 +245,9 @@ impl Orchestrator {
             // `rateLimits` here, which the wire layer renders as `[]`.
             rate_limits: Vec::new(),
             projects: self.project_statuses(),
+            // STUDIO-898: empty unless the reconciliation sweep reported something, which keeps the
+            // wire payload — and the golden — exactly as it was on every healthy daemon.
+            review_divergence: self.review_divergences().to_vec(),
             // STUDIO-880: `None` unless a drain is armed, which keeps the wire payload — and the
             // golden — exactly as it was on every daemon that is not draining.
             drain: match self.drain.status() {
@@ -332,6 +343,11 @@ impl Orchestrator {
         // unreviewed and, with auto-merge on, unmerged. Empty while nothing is stalled → the wire
         // shape and the status fixtures are unaffected.
         let review_stalled = self.review_rounds_stalled();
+        // STUDIO-898: and a fourth, for the class the three above are instances of. Unlike them it
+        // names no cause — the sweep genuinely does not know one — so the advisory points at
+        // `/api/v1/state`'s `review_divergence`, which says WHICH pull request and how. Empty while
+        // healthy → the wire shape and the status fixtures are unaffected.
+        let review_diverged = !self.review_divergences().is_empty();
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -359,6 +375,9 @@ impl Orchestrator {
             }
             if review_stalled {
                 warnings.push(crate::reviewwatch::REVIEW_UNASSIGNABLE_WARNING.to_string());
+            }
+            if review_diverged {
+                warnings.push(crate::reviewreconcile::REVIEW_DIVERGENCE_WARNING.to_string());
             }
             out.push(ProjectStatus {
                 slug: group.clone(),

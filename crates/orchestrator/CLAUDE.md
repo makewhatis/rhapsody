@@ -118,6 +118,14 @@ the `Orchestrator` struct itself. Concretely:
   Testing below). `issuelog.rs` is the `/log` transcript humanizer. `warnings.rs` is the two
   advisory producers (`GET /api/v1/projects`), resolved off the control task with a
   generation-counter guard against a slow pass clobbering a newer reload.
+  `reviewreconcile.rs` (STUDIO-898; Rhapsody-only) is the reconciliation sweep: it compares each
+  watched pull request's board state against the `runs` ledger and REPORTS divergence on both
+  surfaces, acting on nothing. Loop-confined and local-only — no `gh`, no tracker — which is why it
+  runs from `on_tick` ABOVE the validate/drain/credential gates rather than from the review watcher:
+  a daemon held by one of those gates is exactly one whose board may have quietly stopped. Its rule
+  is a pure function (`reconcile_pr`) so each of the six incidents it exists for is a table fixture;
+  if you add a divergence shape, mutation-check it, and keep the default for an unrecognised status
+  SILENT.
 - **GitHub summons integration**: `ghsummons.rs` (repo parsing + the `SummonSource` trait + the
   real `gh`-exec impl) and `ghenrich.rs` (fetch/apply the enrichment onto a candidate). Both are
   Go `internal/orchestrator/*.go` ports, not to be confused with the next group. The fetch still
