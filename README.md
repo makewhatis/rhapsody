@@ -393,7 +393,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | --- | --- |
 | `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
-| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active |
+| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
@@ -664,7 +664,7 @@ needs a durable home, and the Go v0.4.0 reference — which has no review featur
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **8** |
+| `PRAGMA user_version` | 6 | **8** at this step — **9** today, see STUDIO-885 below |
 | tables | `runs`, `events`, `retry_queue`, `claims`, `totals`, `run_messages` | the same 6, byte-identical, **plus** `rhapsody_review_watch` |
 
 One row per (PR, reviewer): repository owner/name, PR **number**, the reviewing teammate, the pull
@@ -694,16 +694,56 @@ The exclusion is a name rule, not a loosened assertion. A Go-created object can 
 `rhapsody_*`, so all six ported tables stay gated byte-strictly, and a **new un-prefixed table still
 turns the golden red** — which is the correct outcome for anything that is a port of Go behaviour.
 `divergent_objects_are_gated_by_name_only` asserts exactly that: every live schema object is either
-byte-present in the committed golden or carries the prefix, and the divergent set is pinned to this
-one name. The mechanism is documented again at the top of `crates/store/src/sqlite.rs`.
+byte-present in the committed golden or carries the prefix, and the divergent set is pinned by name —
+to this one name at this step, and to both names since STUDIO-885 below. The mechanism is documented
+again at the top of `crates/store/src/sqlite.rs`.
 
 **Off is still off.** The table is created by the migration on every daemon, including one that has
 never enabled Teams, and on a Go-written database opened by Rhapsody. It is inert: the whole review
 subsystem is gated on `teams.enabled` (design §16), nothing outside that path writes a row, and an
 empty table changes no query, no endpoint and no payload. A database that Rhapsody has opened is no
 longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
-runs steps at or above its own `user_version`, so a v8 database is left alone rather than corrupted,
-and running both daemons against one file was never supported in either direction.
+runs steps at or above its own `user_version`, so a database ahead of it (v8 at this step, v9 today)
+is left alone rather than corrupted, and running both daemons against one file was never supported in
+either direction.
+
+### A second schema table with no Go counterpart — `rhapsody_summon_watermark` (STUDIO-885)
+
+A summons is a durable fact: an `@symphony` comment that still exists on the pull request. The Go
+daemon nevertheless only ever SEES it as a transient one. Its GitHub enrichment asks the source for
+comments newer than `now - ghLookback` — five minutes — so `Issue.latestSummonAt` is re-derived from
+scratch on every poll and reverts to unset the moment the comment ages out of that window.
+
+`prSuppressed` meanwhile treats a ticket with a linked pull request as suppressed unless a summons
+is newer than the ticket's last run start. The two together give a summons a five-minute half-life:
+if no concurrency slot happens to free inside that window, the ticket returns to suppressed and
+stays there for as long as the daemon runs. On the reported incident an entirely ordinary busy
+period (four running agents against `max_concurrent_agents: 4`) was enough, and the ticket was
+silently unreachable for twelve hours with the comment still sitting on the pull request.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **9** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch` and `rhapsody_summon_watermark` |
+
+One row per ticket identifier: the newest summons ever OBSERVED for it and that same comment's body.
+The candidate-fetch seam of both dispatch ladders reconciles each candidate against it — the newer of
+the two wins — so the comparison `pr_suppressed` actually makes is between two durable facts and
+keeps its meaning however long the ticket waits for a slot.
+
+**It does not weaken the suppression, which is the point.** A ticket does not become permanently
+dispatchable because it was summoned once: the watermark lifts the suppression only while it is
+newer than the last run start, and dispatching the ticket advances that start past it. A merged pull
+request with an old summons stays suppressed exactly as before. Widening `ghLookback` instead was
+rejected as the cheaper change that closes nothing — it converts "stranded after five minutes of
+contention" into "stranded after N minutes of contention".
+
+The gate is the same name rule step 7 established (`schema_dump` excludes objects by the literal
+`rhapsody_` prefix and nothing else), and `divergent_objects_are_gated_by_name_only` now pins both
+names. The table is pruned on the same retention cutoff as the runs it is compared against, so a
+watermark never outlives the history it is measured against. **Off is still off:** with
+`storage.path: off` there is nowhere to remember an observation, so the daemon keeps the pre-885
+behaviour of seeing only what the lookback window covers right now.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 

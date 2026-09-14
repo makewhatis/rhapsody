@@ -961,6 +961,10 @@ impl Orchestrator {
             }
             issues = applied.issues;
         }
+        // The legacy ladder's half of STUDIO-885 — the multi-project one is at the end of
+        // `poll_all_projects`. Two ladders means two seams; the ONLY way a candidate reaches
+        // dispatch without its remembered summons is for one of them to be missing.
+        self.restore_summon_watermarks(issues.iter_mut());
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
@@ -1277,6 +1281,13 @@ impl Orchestrator {
                 );
                 ti.iss = applied.issues.into_iter().next().unwrap_or_default();
             }
+            // --- The durable summons watermark (STUDIO-885). -------------------------------
+            // LAST, so it reconciles what every source above produced — the enrichment's view and
+            // the tracker's own — against what the store remembers, and every consumer downstream
+            // (mid-run delivery, the select ladder, `pr_suppressed`, `review_reopen_eligible`)
+            // sees one already-complete answer. Ungated: a Linear-comment summons arrives through
+            // the tracker rather than through enrichment, and is worth remembering just the same.
+            self.restore_summon_watermarks(tagged.iter_mut().map(|ti| &mut ti.iss));
             tagged
         }
         .instrument(tracing::info_span!("symphony.fetch_candidates"))
