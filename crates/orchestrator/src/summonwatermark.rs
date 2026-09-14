@@ -237,6 +237,79 @@ mod tests {
         );
     }
 
+    // The mirror image, and the arm that stops a live view from dragging a candidate BACKWARDS: a
+    // Linear-comment summons reaches `latest_summon_at` through the tracker rather than through
+    // enrichment, and `apply_github_summons`' unmerged-only rule can surface an older comment than
+    // the watermark already holds. Either way the newer fact wins, and it is the remembered one.
+    #[test]
+    fn an_older_observation_is_overridden_by_the_remembered_one() {
+        let o = orch_with_store();
+        o.store()
+            .record_summon_watermark(SummonWatermark {
+                identifier: "A-1".into(),
+                at: "2026-09-13T04:33:00Z".into(),
+                body: "newer".into(),
+            })
+            .expect("seed");
+        let mut iss = issue("1", "A-1", "Todo");
+        iss.latest_summon_at = Some(at(29));
+        iss.latest_summon_body = "older".into();
+
+        o.restore_summon_watermarks(std::iter::once(&mut iss));
+
+        assert_eq!(
+            iss.latest_summon_at,
+            Some(at(33)),
+            "an older live view must not drag the candidate backwards"
+        );
+        assert_eq!(iss.latest_summon_body, "newer");
+        assert_eq!(
+            o.store()
+                .summon_watermark("A-1")
+                .expect("read")
+                .map(|w| w.at),
+            Some("2026-09-13T04:33:00Z".into()),
+            "and the watermark itself must not move backwards either"
+        );
+    }
+
+    // Equal times: this poll saw exactly the comment that is already remembered, so the pass does
+    // NEITHER a write nor a restore. The two bodies differ only so that both halves of that are
+    // observable at once — a re-write would push the live body into the store, and a restore would
+    // clobber the live body with the stored copy of the same comment. Neither may happen, and the
+    // steady state (the same comment re-observed on every poll of a long wait) must stay a pure
+    // read rather than re-writing the row forever.
+    #[test]
+    fn an_unchanged_observation_neither_writes_nor_restores() {
+        let o = orch_with_store();
+        o.store()
+            .record_summon_watermark(SummonWatermark {
+                identifier: "A-1".into(),
+                at: "2026-09-13T04:29:00Z".into(),
+                body: "as remembered".into(),
+            })
+            .expect("seed");
+        let mut iss = issue("1", "A-1", "Todo");
+        iss.latest_summon_at = Some(at(29));
+        iss.latest_summon_body = "as observed".into();
+
+        o.restore_summon_watermarks(std::iter::once(&mut iss));
+
+        assert_eq!(
+            iss.latest_summon_body, "as observed",
+            "the live body must not be overwritten with the stored copy"
+        );
+        assert_eq!(
+            o.store().summon_watermark("A-1").expect("read"),
+            Some(SummonWatermark {
+                identifier: "A-1".into(),
+                at: "2026-09-13T04:29:00Z".into(),
+                body: "as remembered".into(),
+            }),
+            "an unchanged observation must not re-write the row"
+        );
+    }
+
     // A ticket nobody has ever summoned gains nothing and writes nothing — the overwhelmingly
     // common case must stay a pure read.
     #[test]

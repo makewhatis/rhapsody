@@ -1022,3 +1022,81 @@ async fn a_remembered_summons_older_than_the_last_run_still_suppresses() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The same reported board on the LEGACY single-tracker ladder (no `projects:`): one `Todo` ticket
+/// whose work already shipped as an UNMERGED linked pull request, a store holding both that
+/// ticket's last completed run and the remembered summons, and NO GitHub source at all — the
+/// comment aged out of the lookback window twelve hours ago, so the watermark is the only place the
+/// summons still exists. `max_concurrent` is 1, and nothing is running, so the one slot is free.
+fn studio885_legacy_orch() -> (Orchestrator, crate::testsupport::DispatchedEntries) {
+    let mut tr = Fake::new();
+    tr.candidates = vec![issue_with_pr("iss-879", "STUDIO-879", "o", "r", 249)];
+    let (mut o, _ids) = crate::testsupport::orch_for_retry(Arc::new(tr), 1);
+    assert!(
+        o.eff.as_ref().is_some_and(|e| e.projects.is_empty()),
+        "this fixture must exercise the LEGACY ladder, not the multi-project one"
+    );
+    let spawned: crate::testsupport::DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+    o.spawn = Some(crate::testsupport::record_entries(&spawned));
+    o.now = Box::new(|| studio885_summon_at() + chrono::Duration::hours(12));
+
+    let store: Arc<dyn Store + Send + Sync> =
+        Arc::new(Sqlite::open(StorePath::InMemory).expect("in-memory store"));
+    seed_run(
+        store.as_ref(),
+        "iss-879",
+        "STUDIO-879",
+        studio885_summon_at() - chrono::Duration::hours(4),
+    );
+    store
+        .record_summon_watermark(rhapsody_store::SummonWatermark {
+            identifier: "STUDIO-879".to_string(),
+            at: "2026-09-13T04:29:21Z".to_string(),
+            body: "@rhapsody the memory tier is still 404ing".to_string(),
+        })
+        .expect("seed the remembered summons");
+    o.set_store(store);
+    (o, spawned)
+}
+
+// The LEGACY ladder's own seam. `restore_summon_watermarks` is called from two places — the end of
+// `poll_all_projects` and the legacy single-tracker fetch — and a test that only drives the
+// multi-project ladder cannot tell whether the second call still exists. It is not test-only code:
+// the legacy branch is what every install without `projects:` runs. So this pins the legacy call
+// site on its own, end to end: with the comment long outside the lookback and no GitHub source at
+// all, the ONLY thing that can lift `pr_suppressed` is the remembered summons being put back on the
+// candidate before selection sees it.
+#[tokio::test]
+async fn the_legacy_ladder_also_restores_a_remembered_summons() {
+    let (mut o, spawned) = studio885_legacy_orch();
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        entries.len(),
+        1,
+        "the legacy ladder must restore the remembered summons and dispatch, got {:?}",
+        entries
+            .iter()
+            .map(|e| &e.issue.identifier)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(entries[0].issue.identifier, "STUDIO-879");
+    // The restored value really rode the whole way through: it is on the issue the run was
+    // dispatched with, not merely consulted somewhere inside the pass.
+    assert_eq!(
+        entries[0].issue.latest_summon_at,
+        Some(studio885_summon_at()),
+        "the dispatched candidate must carry the restored summons"
+    );
+    assert_eq!(
+        entries[0].issue.latest_summon_body,
+        "@rhapsody the memory tier is still 404ing"
+    );
+}

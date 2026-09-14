@@ -917,6 +917,44 @@ mod tests {
         );
     }
 
+    // `running` is only ONE of the three ways a candidate is already the daemon's own work, and
+    // the other two come back in the same state query. A ticket whose claim this daemon holds (pool
+    // mode, keyed by the opaque id) and one a recovered retry owns by identifier are both in
+    // flight; naming either as a ticket waiting for a slot is the same misreport.
+    #[test]
+    fn the_hold_never_names_claimed_or_recovery_owned_work() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.claimed.insert("2".to_string());
+        let mut re = retry_entry("3", "A-3", 1);
+        re.recovered = true;
+        o.retry_attempts.insert("3".to_string(), re);
+
+        // Sorted lexicographically: A-1 takes the one slot, and A-2/A-3/A-4 are the unexamined
+        // tail — of which only A-4 is genuinely waiting.
+        let input = vec![
+            issue("1", "A-1", "Todo"),
+            issue("2", "A-2", "Todo"),
+            issue("3", "A-3", "Todo"),
+            issue("4", "A-4", "Todo"),
+        ];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert_eq!(got.len(), 1, "cap 1");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-4"),
+            "the claimed and recovery-owned tickets must not be reported as waiting"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
+        );
+    }
+
     // A busy board holds more candidates than are worth printing: the line names the front of the
     // queue and counts the rest, rather than rendering the queue on every poll.
     #[test]
