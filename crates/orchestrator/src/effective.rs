@@ -786,7 +786,11 @@ claude:
     /// (`rhapsody_config::HARNESS_NAMES`, STUDIO-893 §1.3/§4.3) — the registry is what `validate`
     /// consults to decide which names even reach `build_effective`, so if `claude` ever dropped
     /// out of it, config validation would reject every config before this function's one working
-    /// arm could run.
+    /// arm could run. The coupling this pins is by convention, not by a shared symbol: if
+    /// `runner_for_backend`'s one implemented arm were ever renamed away from the literal
+    /// `"claude"`, this assertion would keep passing on the registry's `"claude"` entry while the
+    /// renamed arm silently stopped matching it — the behavioural tests above (`build_effective`
+    /// selecting a claude runner) are what would actually catch that.
     #[test]
     fn implemented_backend_is_a_known_harness_name() {
         assert!(
@@ -795,32 +799,29 @@ claude:
         );
     }
 
-    /// `validate`'s `UnsupportedAgentBackend` check and `runner_for_backend` here each used to
-    /// hardcode their own notion of "which backend names exist" (design record §1.3): the two
-    /// disagreed (`codex` passed validation, then failed here) with nothing to stop a THIRD name
-    /// from drifting the same way. STUDIO-893 gives both a single registry to read from
-    /// (`rhapsody_config::HARNESS_NAMES`); this pins that both sides still reference it, since a
-    /// black-box behavioural test cannot distinguish "reads the shared registry" from "hardcodes
-    /// its own copy that happens to agree today."
+    /// `validate`'s `UnsupportedAgentBackend` check used to hardcode its own notion of "which
+    /// backend names exist" (design record §1.3); STUDIO-893 makes it read
+    /// `rhapsody_config::HARNESS_NAMES` instead. This is a SOURCE pin, not a behavioural one: a
+    /// black-box test cannot distinguish "reads the shared registry" from "hardcodes its own copy
+    /// that happens to agree today." The needle is assembled at run time on purpose: `include_str!`
+    /// pulls in this file too, so a needle spelled as a literal here would match its own source
+    /// (the idiom `run.rs`/`runmerge.rs` already use for wiring no run-time assertion can reach).
     ///
-    /// The needle is assembled at run time on purpose: `include_str!` pulls in this file too, so
-    /// a needle spelled as a literal here would match its own source and the pin would pass no
-    /// matter what `runner_for_backend` actually does (the idiom `run.rs`/`runmerge.rs` already
-    /// use for wiring no run-time assertion can reach).
+    /// `runner_for_backend` in THIS file is deliberately not pinned the same way, and does not
+    /// appear in the scanned source: per this module's top-of-file doc, "recognized by config"
+    /// and "implemented by this build" are different questions on purpose (Go's own reference
+    /// keeps `ValidateDispatch` and `runnerForBackend` separate too), so there is no production
+    /// reference to the registry here for a source pin to find. The regression that matters on
+    /// this side — that the one name this function implements never falls out of the registry
+    /// `validate` reads — is `implemented_backend_is_a_known_harness_name` above instead.
     #[test]
-    fn config_validator_and_runner_constructor_consult_one_harness_registry() {
+    fn config_validator_reads_the_shared_harness_registry() {
         let needle = format!("{}_{}", "HARNESS", "NAMES");
 
         let validate_src = include_str!("../../config/src/validate.rs");
         assert!(
             validate_src.contains(&needle),
             "config::validate no longer references the shared harness registry"
-        );
-
-        let effective_src = include_str!("effective.rs");
-        assert!(
-            effective_src.contains(&needle),
-            "effective.rs no longer references the shared harness registry"
         );
     }
 }
