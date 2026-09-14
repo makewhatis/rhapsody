@@ -20,6 +20,7 @@ import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { viewForStatus } from "@/lib/daemon-status";
 import { DrainBanner } from "./DrainBanner";
+import { DivergenceBanner } from "./DivergenceBanner";
 import { FirstRunView, OnboardErrorBanner } from "./FirstRunView";
 import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
@@ -139,6 +140,7 @@ export function ConsoleApp() {
       >
         <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
         <DrainBanner />
+        <DivergenceBanner />
         <ConsoleBody
           route={route}
           teamsEnabled={teamsEnabled}

@@ -1103,6 +1103,45 @@ never runs, which means the live agent and its whole tree are orphaned. After a 
 agent process left to kill, so there is nothing a kill could orphan — asserted on process state, with
 a `setpgid`-ing child in the fixture so the assertion is about a tree rather than a single pid.
 
+### A reconciliation sweep reports a ticket whose state and activity disagree (STUDIO-898)
+
+Go v0.4.0 has no ticketless review, so it has nothing to reconcile. This entry is here for the one
+thing the addition touches that IS parity-pinned: a conditional key on `/api/v1/state`.
+
+Six defects between 2026-09-12 and 2026-09-14 all presented as an idle board — a missing tracker
+attachment, an attachment resolving to the wrong `sourceType`, a five-minute summons window, an
+unsatisfiable `review.reviewers`, an approving review recorded as changes-requested, and a summons
+never applied. Each was fixed on its own terms and the CLASS stayed open: STUDIO-885 shipped and
+STUDIO-893 stalled anyway. The invariant nothing asserted is that **a ticket with an open pull request
+is either progressing or blocked, and the daemon can say which.**
+
+The sweep runs on the control tick, reads only the watch set and the `runs` ledger, and asks ONE
+cause-agnostic question of each watched pull request: each live row names a party who owes the next
+move, so has that party moved since the row started owing it? It **reports and never acts** —
+re-dispatching on a rule nobody has watched fire is how a stall becomes a loop, so acting is left to
+its own reviewed change.
+
+| A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| detection | none (the feature does not exist) | a threshold sweep, 90 min, cause-agnostic |
+| visibility | n/a | `/api/v1/state`'s `review_divergence` key, a per-project advisory, a console banner, WARN logs |
+| what it changes | n/a | **nothing** — it dispatches, arms, merges and moves nothing |
+| default | n/a | **inert**: silent with Teams off, off the ticketless path, and on a healthy board |
+
+**The `review_divergence` key on `/api/v1/state` is emitted ONLY when the sweep has something to
+report**, for the `drain` key's reason above and under the same two guards: the golden still passes
+unchanged, and a second test asserts the key is ABSENT on a healthy daemon so the conditional cannot
+decay into an unconditional `[]`. The advisory on `/api/v1/projects` is a fixed string, so the key
+carries the DETAIL — an operator's next question after "something is stuck" is always "which one".
+
+**The threshold is a threshold, not a tick**, and the number is measured rather than chosen: on the
+operator's own store (n=197 completed runs) run durations were p50 7.3 min, p90 26.3 min, longest ever
+61.1 min, so 90 minutes is ~1.5x the longest run this daemon has taken and far below the six and
+eleven hours the incidents actually cost. A pull request mid-round is silent, an in-flight run is
+activity however long it runs, and a row the `runs` ledger cannot date is reported as nothing at all —
+under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
+
+
 ### The daemon merges a pull request whose gates have cleared (STUDIO-874)
 
 Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it
