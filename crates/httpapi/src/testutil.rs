@@ -803,6 +803,7 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         rate_limits: Vec::new(),
         drain: None,
         projects: Vec::new(),
+        review_divergence: Vec::new(),
     }
 }
 

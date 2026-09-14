@@ -68,6 +68,29 @@ export interface StateResponse {
   // byte-pinned to the Go daemon's golden, so a key present in every payload would be parity drift.
   // Read it as `state.drain?.active` — an absent key and `active: false` mean the same thing.
   drain?: DrainState;
+  // Pull requests whose board state and activity disagree (STUDIO-898), or ABSENT on a healthy
+  // board.
+  //
+  // Optional for `drain`'s reason and under the same constraint: the daemon emits the key ONLY when
+  // the reconciliation sweep has something to report, because /api/v1/state is byte-pinned to the Go
+  // daemon's golden. Read it as `state.review_divergence?.length` — an absent key and an empty array
+  // mean the same thing.
+  review_divergence?: ReviewDivergence[];
+}
+
+// ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
+// that is neither progressing nor reported blocked.
+//
+// `detail` is the daemon's own sentence for `kind`, carried on the wire deliberately — a console copy
+// of the wording is how the two drift apart. `kind` is still given because it is stable and a client
+// may want to group on it; new kinds can appear, so never switch on it exhaustively.
+export interface ReviewDivergence {
+  pr: string; // owner/repo#number
+  kind: string;
+  detail: string;
+  ticket: string; // "" when the origin names no ticket
+  reviewer: string; // "" when the divergence is a property of every reviewer
+  stale_secs: number;
 }
 
 // DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking
