@@ -1031,6 +1031,8 @@ async fn a_remembered_summons_older_than_the_last_run_still_suppresses() {
 fn studio885_legacy_orch() -> (Orchestrator, crate::testsupport::DispatchedEntries) {
     let mut tr = Fake::new();
     tr.candidates = vec![issue_with_pr("iss-879", "STUDIO-879", "o", "r", 249)];
+    // `orch_for_retry` is the legacy-ladder builder (no `projects:`); its id-only recorder is
+    // swapped below for the entry recorder, because this test asserts on the dispatched ISSUE.
     let (mut o, _ids) = crate::testsupport::orch_for_retry(Arc::new(tr), 1);
     assert!(
         o.eff.as_ref().is_some_and(|e| e.projects.is_empty()),
