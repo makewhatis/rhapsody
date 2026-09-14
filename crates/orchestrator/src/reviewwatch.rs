@@ -29,10 +29,12 @@
 //! * a row `in_flight` at a head with **no live run** is a CRASHED round — the exit path leaves the
 //!   marker exactly where the dispatch put it (§14.1, "clear on crash"), so this is where it gets
 //!   cleared, which is what re-surfaces a crashed review without a daemon restart;
-//! * a row `truncated` is a round whose agent burned its whole turn budget without finishing
-//!   (STUDIO-721's carried slice-4 nit) — the head was read partially at best, and
-//!   `last_reviewed_sha` was deliberately not advanced, so nothing but the status distinguishes it
-//!   from a row nobody has looked at.
+//! * a row `truncated` is a round that ended without a declared verdict — either the agent burned
+//!   its whole turn budget without finishing (STUDIO-721's carried slice-4 nit) or it declared a
+//!   hand-off whose payload was neither `approved` nor a recognised rejection (STUDIO-894) — the
+//!   head was read partially at best (or not conclusively at all), and `last_reviewed_sha` was
+//!   deliberately not advanced, so nothing but the status distinguishes it from a row nobody has
+//!   looked at.
 //!
 //! # Reviewer selection is re-made at DISPATCH, not trusted from introduction (§14.2)
 //!
@@ -395,8 +397,8 @@ pub(crate) fn review_round_due(row: &ReviewWatchRow, head: &str, in_flight_now: 
         REVIEW_STATUS_REVIEWED | REVIEW_STATUS_APPROVED => row.last_reviewed_sha != head,
         // Everything else still owes a review of this head, INCLUDING at the same SHA: `requested`
         // was never dispatched, `in_flight` without a live run is a crashed round, and `truncated`
-        // is a round that ran out of turns mid-review. The last two are why this is a status match
-        // and not a SHA comparison — a SHA comparison calls all three "already handled".
+        // is a round that ended without a declared verdict. The last two are why this is a status
+        // match and not a SHA comparison — a SHA comparison calls all three "already handled".
         _ => true,
     }
 }

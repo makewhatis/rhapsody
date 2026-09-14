@@ -1086,7 +1086,9 @@ The ticketless review path already records its own verdict structurally: `review
 an EXACT `HANDOFF: approved` payload on the review agent's final result, and `mark_review_completed`
 stores the resulting `approved`/`reviewed` status beside the SHA that reviewer actually read. A gate
 that grepped comment bodies would have to call "I would happily approve on the next push" an
-approval; this one never sees it.
+approval; this one never sees it. A hand-off whose payload is neither `approved` nor a recognised
+rejection is not guessed into either status either — it is recorded `truncated`, which this gate
+already refuses as a round still owed.
 
 **A verdict is about a COMMIT.** Every gate is keyed to the head observed this tick — an approval of
 `a324d2d` is not an approval of `c366a61`, and every review round in the batch that motivated this

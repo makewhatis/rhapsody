@@ -1173,11 +1173,18 @@ mod tests {
 
     /// STUDIO-894, the acceptance criterion round-tripped through the real exit path: a reviewer
     /// that DID declare a hand-off (so the max_turns branch above does not fire) but whose payload
-    /// is not a recognised verdict must not be recorded `reviewed` — the exact defect PR #161's
-    /// round 3 hit, which blocked auto-merge on an approval that was never read as one. The row is
-    /// left non-terminal (distinguishable from both `approved` and `reviewed` "in the row"), no
-    /// author-facing comment is queued (an undeclared round is not a completion), and the daemon
-    /// says so loudly rather than silently ("in the log").
+    /// is not a recognised verdict must not be recorded `reviewed`. The row is left non-terminal
+    /// (distinguishable from both `approved` and `reviewed` "in the row"), no author-facing comment
+    /// is queued (an undeclared round is not a completion), and the daemon says so loudly rather
+    /// than silently ("in the log").
+    ///
+    /// This is NOT the shape PR #161's round 3 hit — that run's own transcript emitted an explicit
+    /// `HANDOFF: findings`, a declared and correctly-parsed rejection, despite prose that concluded
+    /// "Approve." (jimmy's STUDIO-894 review, round 1). That is a reviewer-prompt ambiguity — the
+    /// binary approved/findings vocabulary has no way to say "approve, with non-blocking nits" — and
+    /// is out of scope here; see the pull request body for the follow-up. What this test pins is the
+    /// narrower, real gap this ticket is about: a `HANDOFF:` line whose payload cannot be parsed as
+    /// either verdict must not be guessed at as a rejection.
     #[test]
     fn an_undeclared_verdict_is_recorded_non_terminally_and_logged_loudly_not_as_changes_requested()
     {
@@ -1381,20 +1388,26 @@ mod tests {
     /// STUDIO-894, the acceptance criterion: a `HANDOFF:` line whose payload is neither `approved`
     /// nor a recognised rejection is UNDECLARED, not a silent "changes requested". The old behaviour
     /// defaulted every one of these — including a reviewer's own approval spelled slightly
-    /// differently — to [`REVIEW_STATE_FINDINGS`], which is precisely how PR #161's round-3 approval
-    /// was recorded as blocking. A result with no `HANDOFF:` line at all falls in the same bucket:
-    /// this function never sees that case in production (the `declared_handoff` check ahead of it in
-    /// [`Orchestrator::on_review_exit`] intercepts it first), but the function's own domain must not
-    /// silently call it a rejection either.
+    /// differently — to [`REVIEW_STATE_FINDINGS`] with no signal that anything had been guessed at.
+    /// The literal PR #161 heading below is included for that reason — it pins the function's OWN
+    /// domain contract in isolation — not because it is the input that produced #161's incident: that
+    /// run's actual payload was a declared, well-formed `HANDOFF: findings`, which is (correctly)
+    /// [`REVIEW_STATE_FINDINGS`] both before and after this change (see
+    /// `handoff_findings_records_as_changes_requested` above). A result with no `HANDOFF:` line at
+    /// all falls in the same UNDECLARED bucket: this function never sees that case in production (the
+    /// `declared_handoff` check ahead of it in [`Orchestrator::on_review_exit`] intercepts it first),
+    /// but the function's own domain must not silently call it a rejection either.
     #[test]
     fn an_unrecognised_payload_is_undeclared_rather_than_a_guessed_rejection() {
         for undeclared in [
+            // No `HANDOFF:` line at all — unreachable in production (`declared_handoff`
+            // intercepts it first), pinned here as the function's own domain contract.
             "",
+            "## Review round 3 — @symphony: approve",
             "HANDOFF: review-posted",
             "HANDOFF: approved with nits",
             "approved",
             "I approved of the change\nHANDOFF: 3 findings",
-            "## Review round 3 — @symphony: approve",
         ] {
             assert_eq!(
                 review_exit_state(undeclared),
