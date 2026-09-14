@@ -14,6 +14,7 @@ pub mod capabilities;
 pub mod decode;
 pub mod effective_json;
 pub mod encode;
+pub mod harness;
 pub mod hindsight;
 pub mod memory;
 pub mod model;
@@ -28,6 +29,7 @@ pub mod workflow;
 
 pub use decode::{ConfigError, decode};
 pub use encode::{encode, go_duration_string};
+pub use harness::HARNESS_NAMES;
 pub use model::{
     Agent, CLAIM_MODE_ASSIGNEE, CLAIM_MODE_POOL, Claude, ClaudeOverride, Codex, Config,
     DEFAULT_DEP_MODE_PROMPT_FILE, DEFAULT_OTEL_ENDPOINT, DEPENDENCY_MODE_DAG,
