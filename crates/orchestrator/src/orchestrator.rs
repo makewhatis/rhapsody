@@ -544,6 +544,16 @@ pub struct Orchestrator {
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
     pub(crate) review_rounds: crate::reviewwatch::ReviewRounds,
+    /// What the watcher has already ANNOUNCED about each watched pull request's auto-merge plan,
+    /// keyed by [`churn_key`](crate::reviewwatch::churn_key) exactly as
+    /// [`review_rounds`](Orchestrator::review_rounds) is, and dropped with it when the pull request
+    /// leaves the watch set. Written and read only by the watcher's loop-side handler. STUDIO-881.
+    ///
+    /// It remembers what was SAID, never what was decided: the plan itself is re-formed from the
+    /// watch rows on every tick and this map has no say in it. See
+    /// [`AutoMergeLedger`](crate::runautomerge::AutoMergeLedger), which does the same job for the
+    /// refusals on the other side of the seam.
+    pub(crate) auto_merge_announced: crate::reviewwatch::AnnouncedPlans,
     /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
     /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
     /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
@@ -798,6 +808,7 @@ impl Orchestrator {
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
+            auto_merge_announced: HashMap::new(),
             review_unassignable: HashMap::new(),
             merge_inflight: HashMap::new(),
             totals: Totals::default(),

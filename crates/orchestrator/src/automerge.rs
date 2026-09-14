@@ -52,7 +52,9 @@
 //!   no value.
 //!
 //! The remaining gates — draft, BEHIND, a conflict, a check that is failing or still running —
-//! need GitHub and live in [`crate::runautomerge`].
+//! need GitHub and live in [`crate::runautomerge`]. `draft` was named in that set from the start
+//! and went unchecked until STUDIO-881, which is why it now has a gate of its own there rather
+//! than relying on `mergeStateStatus`: a draft reports `CLEAN`.
 
 use rhapsody_store::{
     REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED,

@@ -1116,6 +1116,7 @@ thing that merges on this install is somebody happening to look.
 | what merges it | nothing | the existing ticketless review watcher, off-loop |
 | the verdict read | — | `rhapsody_review_watch.status`, keyed to `last_reviewed_sha` |
 | the CI gate | — | `mergeStateStatus: CLEAN` **and** every check in the rollup non-blocking |
+| the draft gate | — | `isDraft` read on the same `gh pr view`; a draft is refused, never attempted |
 | how it merges | — | `gh pr merge --squash --match-head-commit <head>` |
 | default | — | **off**: `teams.review.auto_merge` is `false` unless an operator sets it |
 
@@ -1134,6 +1135,36 @@ already refuses as a round still owed.
 `a324d2d` is not an approval of `c366a61`, and every review round in the batch that motivated this
 pushed new commits after a verdict. A pull request whose head has moved is refused and re-reviewed
 rather than merged.
+
+**`CLEAN` is necessary and not sufficient: a DRAFT reports `CLEAN`** (STUDIO-881). A draft pull
+request with approvals at the head and every check green reports `mergeStateStatus: CLEAN`, so the
+allowlist above does not catch it — `gh pr merge` then fails with `GraphQL: Pull Request is still a
+draft`. `isDraft` is therefore read off the same `gh pr view` that re-resolves the pull request, and
+a draft is refused there, before the merge-state and check reads and before any merge is attempted.
+The answer is re-read every tick and never remembered, because marking a draft ready for review does
+not move the head: a gate that latched on it would strand a pull request the author had already
+un-drafted.
+
+**A refusal is not an unreadable gate.** A failed `gh pr merge` used to be reported wholesale as *"a
+gate could not be read"* — a claim that nothing is known and the next tick may learn more. For
+`Pull Request is still a draft` that claim is false, and the daemon re-asked once a minute for three
+hours (182 attempts) to be told the same thing. The split is now about whether GitHub ANSWERED:
+a refusal it recognises is a decline, and everything else — a network error, an `HTTP 503`, a message
+GitHub adds next year — stays a failure and is retried next tick, because abandoning a mergeable pull
+request on a blip is the worse direction. Nothing latches either way; what does not repeat is the
+REPORT.
+
+**Announced once, on both sides of the seam.** A gate that holds holds for as long as its condition
+does, and the daemon re-decides it every tick — so a line spoken on the way to the decision is a
+line a minute until something changes. The three-hour log this ticket was filed from carried 383 of
+them for two stuck pull requests: 189 WARNs from the merge attempt, and 97 and 96 INFO lines from
+the control task announcing the plan it had just re-formed. Both halves are now announced only when
+they are NEWS — the plan once per pull request and head (with the approvals that cleared it), the
+refusal once per pull request, head and reason, and the detail a gate adds to its refusal only on
+the tick the refusal itself is announced. Everything repeated is at DEBUG. A stuck pull request
+therefore costs two INFO lines — the plan and the refusal — plus the one detail line its particular
+gate adds, and then silence. It still merges the tick its gate clears: the plan is re-formed and
+re-attempted every tick regardless, because it is only the REPORT that is held.
 
 **GitHub's own auto-merge is deliberately NOT armed here**, unlike the console merge action
 (STUDIO-767), whose `--auto` is a guardrail for a human who has already decided. With nobody

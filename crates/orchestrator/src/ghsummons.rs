@@ -1156,6 +1156,17 @@ pub struct PrSnapshot {
     /// `headRefOid` — the exact commit at the head of the pull request.
     pub head_sha: String,
     pub status: PrStatus,
+    /// `isDraft` — whether the pull request is still a draft, and so cannot be merged by anyone.
+    ///
+    /// Read because `mergeStateStatus` does NOT cover it: a draft with approvals and green checks
+    /// reports `CLEAN`, and `gh pr merge` then fails with `GraphQL: Pull Request is still a draft`
+    /// (STUDIO-881). It is on this payload rather than a seam of its own so the gate costs no extra
+    /// round trip — the auto-merge already re-resolves the pull request here before merging.
+    ///
+    /// Absent or non-boolean reads as `true`, which is the direction that REFUSES: a daemon that
+    /// cannot tell whether a pull request is a draft must not merge it. The only caller is the
+    /// auto-merge gate, so the safe default costs a stalled merge and never a wrong one.
+    pub is_draft: bool,
     /// `mergedAt`, when GitHub states one it can parse. Informational: [`PrStatus::Merged`] is what
     /// a caller acts on.
     pub merged_at: Option<DateTime<Utc>>,
@@ -1289,7 +1300,7 @@ fn is_gone_message(err: &str) -> bool {
 #[async_trait]
 impl PrStateSource for GH {
     /// One bounded `gh pr view <number> --repo <owner>/<repo> --json
-    /// headRefOid,state,mergedAt,headRepository,headRepositoryOwner`.
+    /// headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner`.
     ///
     /// An empty owner or repo, or a non-positive number, is not an error and not a query: nothing
     /// can ever be observed at a coordinate like that, so it answers [`PrLookup::Gone`] — the same
@@ -1319,7 +1330,7 @@ impl PrStateSource for GH {
             "--repo",
             slug.as_str(),
             "--json",
-            "headRefOid,state,mergedAt,headRepository,headRepositoryOwner",
+            "headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner",
         ];
         let body = match self.run_off_task(args.map(String::from).into()).await {
             Ok(b) => b,
@@ -1393,6 +1404,13 @@ impl PrStateSource for GH {
                 .into());
             }
         };
+        // `true` when the field is absent or is not a boolean: see [`PrSnapshot::is_draft`]. An
+        // error here would be worse than a refusal, because it would take the watcher's head
+        // observation down with it for a field only the merge gate reads.
+        let is_draft = pr
+            .get("isDraft")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         let merged_at = pr
             .get("mergedAt")
             .and_then(serde_json::Value::as_str)
@@ -1401,6 +1419,7 @@ impl PrStateSource for GH {
         Ok(PrLookup::Found(PrSnapshot {
             head_sha,
             status,
+            is_draft,
             merged_at,
             head_repo,
         }))
@@ -2097,12 +2116,14 @@ mod tests {
     // ── pr_state (STUDIO-710, slice 1; design record §14.2, §15; no Go counterpart) ─────────────
 
     /// The captured payload of a live open pull request (`gh pr view 86 --repo makewhatis/rhapsody
-    /// --json headRefOid,state,mergedAt,headRepository,headRepositoryOwner`, 2026-09-02), with the
-    /// owner renamed to the `o/r` the other tests use.
+    /// --json headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner`, 2026-09-02),
+    /// with the owner renamed to the `o/r` the other tests use. `isDraft` joined the field list in
+    /// STUDIO-881 and is re-captured here with it.
     const PR_VIEW_OPEN: &str = r#"{
         "headRefOid":"93db6e8ec3b7c54071eb031ebac3be71eee1008a",
         "headRepository":{"id":"R_kgDOTcp16A","name":"r","nameWithOwner":"o/r"},
         "headRepositoryOwner":{"id":"MDQ6VXNlcjczMDg0OA==","name":"David Johansen","login":"o"},
+        "isDraft":false,
         "mergedAt":null,
         "state":"OPEN"
     }"#;
@@ -2112,6 +2133,7 @@ mod tests {
         "headRefOid":"df574d9a665c6987d7c72d65f052ff5422862bc3",
         "headRepository":{"id":"R_kgDOTcp16A","name":"r","nameWithOwner":"o/r"},
         "headRepositoryOwner":{"id":"MDQ6VXNlcjczMDg0OA==","name":"David Johansen","login":"o"},
+        "isDraft":false,
         "mergedAt":"2026-09-02T04:37:59Z",
         "state":"MERGED"
     }"#;
@@ -2135,6 +2157,7 @@ mod tests {
         assert_eq!(
             got,
             PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: "93db6e8ec3b7c54071eb031ebac3be71eee1008a".to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -2145,7 +2168,7 @@ mod tests {
             seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             vec![
                 "pr view 86 --repo o/r --json \
-                 headRefOid,state,mergedAt,headRepository,headRepositoryOwner"
+                 headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner"
                     .to_string()
             ],
         );
@@ -2170,6 +2193,7 @@ mod tests {
         assert_eq!(
             got,
             PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: "df574d9a665c6987d7c72d65f052ff5422862bc3".to_string(),
                 status: PrStatus::Merged,
                 merged_at: Some(utc(2026, 9, 2, 4, 37, 59)),
@@ -2180,7 +2204,7 @@ mod tests {
         let closed = GH::new(
             "@symphony",
             Some(run_recording(
-                r#"{"headRefOid":"abc","state":"CLOSED","mergedAt":null,
+                r#"{"headRefOid":"abc","isDraft":false,"state":"CLOSED","mergedAt":null,
                      "headRepository":{"nameWithOwner":"o/r"},
                      "headRepositoryOwner":{"login":"o"}}"#,
                 Arc::new(Mutex::new(Vec::new())),
@@ -2192,6 +2216,7 @@ mod tests {
                 .await
                 .expect("pr_state"),
             PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: "abc".to_string(),
                 status: PrStatus::Closed,
                 merged_at: None,
@@ -2199,6 +2224,59 @@ mod tests {
             }),
             "a closed-unmerged PR must not be reported as merged"
         );
+    }
+
+    /// STUDIO-881: `isDraft` is read off the same payload, because `mergeStateStatus` does not
+    /// cover it — the two live drafts that motivated the ticket both reported `CLEAN`.
+    ///
+    /// A payload with no `isDraft` at all reads as a DRAFT, which is the direction that refuses to
+    /// merge. An error would be the wrong shape: this call is also the review watcher's head
+    /// observation, and one field only the merge gate reads must not be able to blind it.
+    #[tokio::test]
+    async fn pr_state_reads_is_draft_and_treats_an_absent_field_as_one() {
+        for (payload, want, why) in [
+            (
+                r#"{"headRefOid":"abc","state":"OPEN","isDraft":true,
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                true,
+                "a draft is reported as one",
+            ),
+            (
+                r#"{"headRefOid":"abc","state":"OPEN","isDraft":false,
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                false,
+                "a ready pull request is not a draft",
+            ),
+            (
+                r#"{"headRefOid":"abc","state":"OPEN",
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                true,
+                "an absent isDraft refuses rather than merging blind",
+            ),
+            (
+                r#"{"headRefOid":"abc","state":"OPEN","isDraft":"no",
+                     "headRepository":{"nameWithOwner":"o/r"},
+                     "headRepositoryOwner":{"login":"o"}}"#,
+                true,
+                "a non-boolean isDraft refuses too",
+            ),
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(payload, Arc::new(Mutex::new(Vec::new())))),
+            );
+            let PrLookup::Found(snap) = src
+                .pr_state("o", "r", 247, &HeadAllowlist::none())
+                .await
+                .expect("pr_state")
+            else {
+                panic!("expected a found pull request ({why})");
+            };
+            assert_eq!(snap.is_draft, want, "({why})");
+        }
     }
 
     /// A pull request (or repository) GitHub can no longer resolve is `Gone` — a distinct answer
@@ -2367,7 +2445,7 @@ mod tests {
         let src = GH::new(
             "@symphony",
             Some(run_recording(
-                r#"{"headRefOid":"abc","state":"MERGED","mergedAt":"yesterday",
+                r#"{"headRefOid":"abc","isDraft":false,"state":"MERGED","mergedAt":"yesterday",
                      "headRepositoryOwner":{"login":"o"},
                      "headRepository":{"nameWithOwner":"o/r"}}"#,
                 Arc::new(Mutex::new(Vec::new())),
@@ -2378,6 +2456,7 @@ mod tests {
                 .await
                 .expect("lookup"),
             PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: "abc".to_string(),
                 status: PrStatus::Merged,
                 merged_at: None,

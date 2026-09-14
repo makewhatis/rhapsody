@@ -792,6 +792,7 @@ where
             checks: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
             merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
             allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+            ledger: Default::default(),
         });
         let sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone())
             .with_auto_merge(automerge);
