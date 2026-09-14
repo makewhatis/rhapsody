@@ -1537,6 +1537,41 @@ claude:
         assert!(got.unlinked.is_empty());
     }
 
+    /// The merged-deference rule, observed rather than merely commented: where BOTH sources offer
+    /// the pull request and the tracker says `merged`, the tracker's ruling stands and no summons
+    /// advances — even though the watch row the index is built from still exists.
+    ///
+    /// This is reachable, not hypothetical: `prstate`'s sweep retires a watch row AFTER the merge,
+    /// and `retire_review_pr` warns and returns on a store error, so a merged pull request with a
+    /// live watch row is an ordinary state rather than a race. Without the deference the daemon
+    /// walk would advance `latest_summon_at` on it and re-engage a finished ticket.
+    #[test]
+    fn a_merged_tracker_link_is_not_re_offered_by_a_live_watch_row() {
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let mut iss = unlinked_issue("STUDIO-880");
+        iss.linked_prs = Some(vec![linked("makewhatis", "rhapsody", 159, true)]);
+        let got = apply_github_summons(
+            vec![iss],
+            &hits(&[(159, utc(2026, 9, 13, 1, 46, 59))]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        assert_eq!(
+            got.issues[0].latest_summon_at, None,
+            "the tracker ruled this pull request merged, so a live watch row must not re-offer it"
+        );
+        // And the ticket is still REPORTED as having nothing a summons could reach, exactly as it
+        // is without the index — the deference must not quietly make the drop invisible either.
+        assert_eq!(got.unlinked.len(), 1, "the drop must still be reported");
+        assert_eq!(got.unlinked[0].identifier, "STUDIO-880");
+    }
+
     /// A ticket whose ONLY tracker link is foreign, but which the daemon linked in the polled
     /// repository, is reachable — and must not be accused of pointing at the wrong repository.
     #[test]
