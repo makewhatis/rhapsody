@@ -250,13 +250,18 @@ impl ReviewWatchSink for ControlWatchSink {
         };
         // Infallible by contract: no outcome has a caller with anything to do about it, and every
         // one of them is logged — the two that CHANGED something where the change happens, in
-        // `runautomerge`, which holds the fields describing it, and the two that changed nothing
-        // here. A decline is re-considered on the next tick.
+        // `runautomerge`, which holds the fields describing it, and the three that changed nothing
+        // here. A refusal is re-considered on the next tick.
         match crate::runautomerge::perform_auto_merge(&plan, deps).await {
             crate::runautomerge::AutoMergeOutcome::Merged(_) => {}
             crate::runautomerge::AutoMergeOutcome::Updated => {}
             crate::runautomerge::AutoMergeOutcome::Declined(why) => {
                 tracing::info!(pr = %plan.pr, reason = why, "auto-merge: declined")
+            }
+            // The same refusal as last tick, at the same head. Said once, above, on the tick it
+            // was decided; saying it again every minute is what STUDIO-881 measured 182 of.
+            crate::runautomerge::AutoMergeOutcome::Held(why) => {
+                tracing::debug!(pr = %plan.pr, reason = why, "auto-merge: still declined")
             }
             crate::runautomerge::AutoMergeOutcome::Failed(err) => {
                 tracing::warn!(pr = %plan.pr, %err, "auto-merge: a gate could not be read; not merging")
@@ -609,6 +614,8 @@ impl Orchestrator {
         // third: a retired pull request that kept a stall count would keep the operator advisory
         // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        // And what was announced about its auto-merge plan, for the first two of those reasons.
+        self.auto_merge_announced.remove(&churn_key(pr));
         for id in retired_ids {
             self.review_unassignable.remove(&id);
         }
@@ -809,7 +816,7 @@ impl Orchestrator {
     /// is at an older head is stale on either. So the opening snapshot cannot clear a gate the
     /// closing one would refuse.
     fn propose_auto_merge(
-        &self,
+        &mut self,
         mine: &[&ReviewWatchRow],
         pr: &PrCoord,
         head: &str,
@@ -824,11 +831,24 @@ impl Orchestrator {
         }
         match crate::automerge::auto_merge_verdict(mine, head) {
             Ok(approved_by) => {
-                tracing::info!(
-                    pr = %pr, head, ?approved_by,
-                    "auto-merge: every reviewer approved this head; the remaining gates are \
-                     asked of GitHub off-loop"
-                );
+                // At INFO when it is news, and at DEBUG for as long as it stays the same plan.
+                // The gate is re-decided from the watch rows on EVERY tick and the plan is handed
+                // out on every tick — a pull request held by a gate on the other side of the seam
+                // must still merge the moment that gate clears. What is quieted is only the line:
+                // STUDIO-881's log carried 97 of these for ONE draft pull request, at INFO, in
+                // lockstep with the refusal they led to.
+                if self.auto_merge_plan_is_news(pr, head, &approved_by) {
+                    tracing::info!(
+                        pr = %pr, head, ?approved_by,
+                        "auto-merge: every reviewer approved this head; the remaining gates are \
+                         asked of GitHub off-loop"
+                    );
+                } else {
+                    tracing::debug!(
+                        pr = %pr, head, ?approved_by,
+                        "auto-merge: the same plan as the last tick; still asking GitHub"
+                    );
+                }
                 report.merge.push(crate::automerge::AutoMergePlan {
                     pr: pr.clone(),
                     head: head.to_string(),
@@ -841,6 +861,35 @@ impl Orchestrator {
                 tracing::debug!(pr = %pr, head, reason = why.why(), "auto-merge: not merging")
             }
         }
+    }
+
+    /// Whether announcing this auto-merge plan says anything that has not been said, remembering
+    /// it when it does (STUDIO-881).
+    ///
+    /// News is a plan whose HEAD or whose set of approvals differs from the one last announced for
+    /// this pull request — the two things the line itself claims. Anything else is the same
+    /// sentence about the same commit, and a pull request held by a gate downstream re-forms that
+    /// plan once a minute for as long as the hold lasts.
+    ///
+    /// This governs the REPORT and nothing else: [`Self::propose_auto_merge`] hands the plan out
+    /// either way, so a refusal that clears is merged on the very next tick whatever this answers.
+    fn auto_merge_plan_is_news(
+        &mut self,
+        pr: &PrCoord,
+        head: &str,
+        approved_by: &[String],
+    ) -> bool {
+        let key = churn_key(pr);
+        if self
+            .auto_merge_announced
+            .get(&key)
+            .is_some_and(|(was_head, was_by)| was_head == head && was_by == approved_by)
+        {
+            return false;
+        }
+        self.auto_merge_announced
+            .insert(key, (head.to_string(), approved_by.to_vec()));
+        true
     }
 
     /// Who reviews this round: the incumbent where continuity means something, otherwise the
@@ -931,6 +980,11 @@ pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
 
 /// The per-pull-request re-review budget, keyed by `owner/repo#number`.
 pub type ReviewRounds = HashMap<String, usize>;
+
+/// The auto-merge plan each watched pull request has already been ANNOUNCED for: its head and the
+/// approvals that cleared the gate at that head, keyed by [`churn_key`] as [`ReviewRounds`] is.
+/// See [`Orchestrator::auto_merge_announced`]. STUDIO-881.
+pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
 
 impl ControlHandle {
     /// The coordinates the watcher should ask GitHub about. Empty when the subsystem is off or the
@@ -1113,6 +1167,7 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup: PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: head.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -1126,6 +1181,7 @@ mod tests {
     /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
     fn merged_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: head.to_string(),
             status: PrStatus::Merged,
             merged_at: chrono::DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
@@ -1138,6 +1194,7 @@ mod tests {
     /// One observation of a pull request that was CLOSED without merging.
     fn closed_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: head.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -1372,12 +1429,14 @@ mod tests {
     #[test]
     fn a_retired_pull_request_leaves_the_watch_set() {
         let merged = PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Merged,
             merged_at: None,
             head_repo: format!("{OWNER}/{REPO}"),
         });
         let closed = PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -1653,6 +1712,161 @@ mod tests {
         assert!(
             second.merge.is_empty(),
             "and a merged pull request is never proposed for merging again"
+        );
+    }
+
+    /// Every `tracing` event a test emits, by level and message. Enough of a `Subscriber` to
+    /// COUNT lines, which is the only question STUDIO-881 asks of the log: the ticket was filed
+    /// off `grep | sort | uniq -c`, and "announced once" is a claim about that count.
+    #[derive(Default, Clone)]
+    struct CountedLog(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl CountedLog {
+        /// The messages logged at `level`, in order.
+        fn at(&self, level: tracing::Level) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(l, _)| *l == level)
+                .map(|(_, m)| m.clone())
+                .collect()
+        }
+    }
+
+    /// Pulls the `message` field out of an event and ignores its structured fields.
+    struct MessageOf<'a>(&'a mut String);
+    impl tracing::field::Visit for MessageOf<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CountedLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MessageOf(&mut message));
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((*event.metadata().level(), message));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// ⚠️ The ticket's own measurement, run forward: twenty ticks of a pull request that is stuck
+    /// downstream cost ONE line at INFO, not twenty. The log this ticket was filed from carried 97
+    /// of this exact line for one draft pull request — the count is the defect, so the count is
+    /// what this asserts, and it is counted rather than reasoned about.
+    #[test]
+    fn twenty_ticks_of_a_stuck_pull_request_cost_one_info_line() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        let log = CountedLog::default();
+
+        tracing::subscriber::with_default(log.clone(), || {
+            for _ in 0..20 {
+                let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+                assert_eq!(report.merge.len(), 1, "and every tick still proposes it");
+            }
+        });
+
+        assert_eq!(
+            log.at(tracing::Level::INFO).len(),
+            1,
+            "at INFO: {:?}",
+            log.at(tracing::Level::INFO)
+        );
+        assert!(
+            log.at(tracing::Level::INFO)[0].starts_with("auto-merge: every reviewer approved"),
+            "{:?}",
+            log.at(tracing::Level::INFO)
+        );
+        assert!(
+            log.at(tracing::Level::WARN).is_empty(),
+            "nothing here is a warning: {:?}",
+            log.at(tracing::Level::WARN)
+        );
+    }
+
+    /// ⚠️ STUDIO-881's second half, at the site that actually dominated the log: the plan line is
+    /// announced when it is NEWS and quiet afterwards, while the PLAN itself is re-proposed on
+    /// every tick. Both halves matter — the log the ticket was filed from carried 97 identical
+    /// INFO lines for one stuck draft, and a "fix" that stopped re-proposing would strand the pull
+    /// request the tick its refusal cleared.
+    #[test]
+    fn an_unchanged_plan_is_announced_once_and_proposed_every_tick() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let first = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        let second = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        let third = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert_eq!(first.merge.len(), 1, "the gate cleared");
+        assert_eq!(
+            second.merge, first.merge,
+            "and keeps clearing: the plan is re-proposed"
+        );
+        assert_eq!(third.merge, first.merge);
+        assert!(
+            !o.auto_merge_plan_is_news(&coord(64), HEAD_A, &["bob".to_string()]),
+            "said on the first tick; saying it again every minute is what the ticket measured"
+        );
+    }
+
+    /// What makes the announcement news again: a different head, or a different set of approvals
+    /// at the same head. Either changes the claim the line makes, so either is worth saying.
+    #[test]
+    fn a_new_head_or_a_new_approver_is_news_again() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        let bob = vec!["bob".to_string()];
+
+        assert!(o.auto_merge_plan_is_news(&coord(64), HEAD_A, &bob), "first");
+        assert!(!o.auto_merge_plan_is_news(&coord(64), HEAD_A, &bob));
+        assert!(
+            o.auto_merge_plan_is_news(&coord(64), HEAD_B, &bob),
+            "a head the operator has not been told cleared"
+        );
+        assert!(
+            o.auto_merge_plan_is_news(
+                &coord(64),
+                HEAD_B,
+                &["bob".to_string(), "carol".to_string()]
+            ),
+            "a second approval at that head is a different claim"
+        );
+        assert!(
+            o.auto_merge_plan_is_news(&coord(65), HEAD_B, &bob),
+            "and another pull request is its own subject"
+        );
+    }
+
+    /// The announcement is dropped with the pull request, exactly as its churn budget is: a
+    /// coordinate re-introduced later is announced again, and the map does not grow for the
+    /// daemon's whole life.
+    #[test]
+    fn retiring_a_pull_request_forgets_what_was_announced_about_it() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert!(
+            o.auto_merge_plan_is_news(&coord(64), HEAD_A, &["bob".to_string()]),
+            "the retirement forgot it"
         );
     }
 
@@ -2419,6 +2633,7 @@ mod tests {
             _allow: &HeadAllowlist,
         ) -> PrStateResult {
             Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: format!("{number:040}"),
                 status: PrStatus::Open,
                 merged_at: None,
