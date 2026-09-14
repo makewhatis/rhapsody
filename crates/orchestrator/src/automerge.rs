@@ -17,10 +17,12 @@
 //! It never has to guess, because the ticketless path already records the verdict structurally.
 //! [`review_exit_state`](crate::review::review_exit_state) reads an EXACT `HANDOFF: approved` line
 //! off the review agent's final result — the payload must equal `approved`, so `HANDOFF: not
-//! approved` is what it says it is — and that becomes the row's
+//! approved` is what it says it is — and a declared verdict becomes the row's
 //! [`REVIEW_STATUS_APPROVED`]/[`REVIEW_STATUS_REVIEWED`] status, written by `mark_review_completed`
-//! together with the SHA the reviewer actually read. So the fact this module needs is a stored
-//! enum keyed to a head commit, not English.
+//! together with the SHA the reviewer actually read. A hand-off with no readable verdict at all
+//! (STUDIO-894) is never guessed into either bucket — it parks the row `REVIEW_STATUS_TRUNCATED`,
+//! which [`auto_merge_verdict`] below already refuses as a round still owed. So the fact this
+//! module needs is a stored enum keyed to a head commit, not English.
 //!
 //! That is also why the whole feature is gated on
 //! [`review_auto_merge`](rhapsody_config::teams::Teams::review_auto_merge), which requires
@@ -50,7 +52,9 @@
 //!   no value.
 //!
 //! The remaining gates — draft, BEHIND, a conflict, a check that is failing or still running —
-//! need GitHub and live in [`crate::runautomerge`].
+//! need GitHub and live in [`crate::runautomerge`]. `draft` was named in that set from the start
+//! and went unchecked until STUDIO-881, which is why it now has a gate of its own there rather
+//! than relying on `mergeStateStatus`: a draft reports `CLEAN`.
 
 use rhapsody_store::{
     REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REQUESTED,

@@ -54,6 +54,19 @@ pub fn parse_store_path(s: &str) -> StorePath {
     }
 }
 
+/// Renders a summons timestamp in the ONE canonical form [`SummonWatermark::at`] is ever stored in:
+/// RFC3339 UTC, seconds precision, `Z` suffix — identical to the format every other timestamp
+/// column in this store uses.
+///
+/// It exists so the comparison "is what I just observed newer than what I remember?" can be made on
+/// the STRINGS. Formatting both sides through here makes that comparison both chronological (the
+/// form is fixed-width) and exactly round-trip stable — a summons whose source reports sub-second
+/// precision renders to the same string every poll, so a stable comment is never rewritten tick
+/// after tick just because its stored form lost a fraction of a second.
+pub fn format_summon_at(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// The error type for store operations. Go's store returns bare `error` values (wrapped with
 /// `fmt.Errorf`); Rust makes the failure modes explicit while staying dependency-free.
 #[derive(Debug)]
@@ -238,9 +251,10 @@ pub trait Store {
         status: &str,
     ) -> Result<(), StoreError>;
 
-    /// Records that a reviewer run ENDED without finishing its round — it burned its whole turn
-    /// budget mid-review — by parking `status` at [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER
-    /// SHA column (STUDIO-721).
+    /// Records that a reviewer run ENDED without a declared verdict — it either burned its whole
+    /// turn budget mid-review (STUDIO-721) or declared a hand-off whose payload was neither
+    /// `approved` nor a recognised rejection (STUDIO-894) — by parking `status` at
+    /// [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER SHA column.
     ///
     /// Deliberately not a `mark_review_completed` with a third status: that method's contract is to
     /// advance `last_reviewed_sha`, and advancing it here is precisely the bug — the head was read
@@ -298,6 +312,22 @@ pub trait Store {
     /// rows are permanent. Callers whose predicate is genuinely broader — retirement, which must
     /// also see a closed-but-undropped row — still use [`Store::load_review_watch`].
     fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
+
+    // --- summons watermark (STUDIO-885; no Go counterpart — see [`SummonWatermark`]) ---
+
+    /// Remembers `w` as this ticket's observed summons, replacing any row already there.
+    ///
+    /// Deliberately a last-write-wins upsert rather than a max-only one: the caller has just read
+    /// [`Store::summon_watermark`] to decide whether what it observed is newer, and putting the
+    /// same rule in SQL as well would mean two places could disagree about what "newer" means.
+    /// The caller is the single-threaded control loop, so the read-then-write is not racing
+    /// anything.
+    fn record_summon_watermark(&self, w: SummonWatermark) -> Result<(), StoreError>;
+
+    /// This ticket's remembered summons, or `None` when none was ever observed (or the store is
+    /// disabled — with persistence off there is nowhere to remember one, so the daemon keeps the
+    /// pre-STUDIO-885 behaviour of seeing only what is inside the lookback window right now).
+    fn summon_watermark(&self, identifier: &str) -> Result<Option<SummonWatermark>, StoreError>;
 
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).

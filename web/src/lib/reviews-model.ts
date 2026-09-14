@@ -52,15 +52,16 @@ export interface ReviewRow {
  * * `reviewed` and `approved` are both a round that FINISHED — the difference is whether findings
  *   were posted, which is on the pull request, not here.
  * * `requested` and `truncated` are both a round that is OWED. `truncated` is the one that would
- *   mislead if it were dressed as a finished review: the reviewer ran out of turns mid-diff, so
- *   the head was only partly read and the daemon deliberately did not advance `last_reviewed_sha`.
+ *   mislead if it were dressed as a finished review: either the reviewer ran out of turns mid-diff,
+ *   or it declared a hand-off with no readable verdict (STUDIO-894) — either way the head was not
+ *   conclusively read, and the daemon deliberately did not advance `last_reviewed_sha`.
  */
 const STATUS_LOOK: Record<ReviewStatus, { variant: PillVariant; label: string }> = {
   requested: { variant: "queued", label: "Queued" },
   in_flight: { variant: "run", label: "Reviewing" },
   reviewed: { variant: "done", label: "Reviewed" },
   approved: { variant: "done", label: "Approved" },
-  truncated: { variant: "blocked", label: "Ran out of turns" },
+  truncated: { variant: "blocked", label: "No verdict" },
   dropped: { variant: "queued", label: "Dropped" },
 };
 

@@ -21,7 +21,9 @@ use rhapsody_tracker::fake::Fake;
 use super::*;
 use crate::effective::ResolvedProject;
 use crate::ghsummons::{GH, RunFn, SummonHit, SummonResult, SummonSource};
-use crate::testsupport::{orch_for_retry_multi, proj_with_tracker, seed_run, set_of};
+use crate::testsupport::{
+    issue, orch_for_retry_multi, proj_with_tracker, running_entry, seed_run, set_of,
+};
 
 /// A deterministic clock for asserting the github-summons `since` watermark. Mirrors Go `fixedNow`.
 fn fixed_now() -> DateTime<Utc> {
@@ -1010,5 +1012,296 @@ async fn without_the_daemons_link_the_same_summons_still_reaches_nobody() {
             .iter()
             .map(|e| &e.issue.identifier)
             .collect::<Vec<_>>()
+    );
+}
+
+// --- STUDIO-885: a summons must survive the lookback window it was observed in -------------------
+
+/// The reported incident's clock, moment by moment. The comment lands at 04:29:21 and the board is
+/// at its cap until well past 04:34 — the moment the five-minute lookback stops covering it.
+fn studio885_summon_at() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 9, 13, 4, 29, 21)
+        .single()
+        .expect("summon time")
+}
+
+/// A [`SummonSource`] with the REAL lookback semantics the `gh` source has: it answers with the
+/// comment only while the caller's `since` still covers it, and with nothing once the window has
+/// slid past. That behaviour is the whole defect — a fake that always answers cannot reproduce it.
+struct LookbackSrc {
+    at: DateTime<Utc>,
+    body: String,
+    number: i64,
+    log: Arc<SrcLog>,
+}
+
+#[async_trait::async_trait]
+impl SummonSource for LookbackSrc {
+    async fn summons_since(&self, owner: &str, repo: &str, since: DateTime<Utc>) -> SummonResult {
+        self.log.calls.fetch_add(1, Ordering::SeqCst);
+        self.log
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((owner.to_string(), repo.to_string(), since));
+        if since > self.at {
+            return Ok(HashMap::new()); // aged out of the window — GitHub returns nothing
+        }
+        Ok(HashMap::from([(
+            self.number,
+            SummonHit {
+                at: self.at,
+                body: self.body.clone(),
+            },
+        )]))
+    }
+}
+
+/// The reported board: one project on `o/r`, a `Todo` ticket whose work already shipped as an
+/// UNMERGED linked pull request, a durable store holding that ticket's last (completed) run, and a
+/// movable clock. `max_concurrent` is 1 so a single running entry fills the board.
+fn studio885_orch() -> (
+    Orchestrator,
+    crate::testsupport::DispatchedEntries,
+    Arc<Mutex<DateTime<Utc>>>,
+    Arc<SrcLog>,
+) {
+    let iss = issue_with_pr("iss-879", "STUDIO-879", "o", "r", 249);
+    let (mut o, spawned) = orch_for_retry_multi(vec![summon_project("x", "o", "r", vec![iss])], 1);
+
+    let clock = Arc::new(Mutex::new(studio885_summon_at()));
+    let read = Arc::clone(&clock);
+    o.now = Box::new(move || {
+        *read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+
+    let log = Arc::new(SrcLog::default());
+    o.gh_source = Some(Box::new(LookbackSrc {
+        at: studio885_summon_at(),
+        body: "@rhapsody the memory tier is still 404ing".to_string(),
+        number: 249,
+        log: Arc::clone(&log),
+    }));
+
+    let store: Arc<dyn Store + Send + Sync> =
+        Arc::new(Sqlite::open(StorePath::InMemory).expect("in-memory store"));
+    // The last run ended four hours before the summons, so the summons is genuinely newer than the
+    // run start `pr_suppressed` compares it against — the suppression SHOULD lift.
+    seed_run(
+        store.as_ref(),
+        "iss-879",
+        "STUDIO-879",
+        studio885_summon_at() - chrono::Duration::hours(4),
+    );
+    o.set_store(store);
+    (o, spawned, clock, log)
+}
+
+// THE REPORTED INCIDENT, in the order that makes it a bug: the summons is OBSERVED while the board
+// is at capacity, the selection pass admits nothing, the comment then ages past the five-minute
+// lookback, and only AFTER that does a slot free. Freeing the slot inside the window passes with or
+// without the fix — the strand requires contention that spans it.
+#[tokio::test]
+async fn a_summons_observed_at_capacity_still_dispatches_after_the_lookback_expires() {
+    let (mut o, spawned, clock, log) = studio885_orch();
+
+    // --- 04:29:30. The comment is inside the window; the board is full. ---
+    o.running.insert(
+        "other".to_string(),
+        running_entry(issue("other", "STUDIO-880", "In Progress"), "x", "x"),
+    );
+    let tagged = o.poll_all_projects().await;
+    assert_eq!(tagged.len(), 1, "the candidate must survive the poll");
+    assert_eq!(
+        tagged[0].iss.latest_summon_at,
+        Some(studio885_summon_at()),
+        "the live enrichment must see the comment while it is inside the window"
+    );
+    let (picked, reopen, _held) = o.select_dispatch_multi_with_reopens(tagged);
+    assert!(
+        picked.is_empty() && reopen.is_empty(),
+        "the board is at max_concurrent: nothing may be admitted this tick"
+    );
+
+    // The observation outlived the pass that discarded it.
+    assert_eq!(
+        o.store()
+            .summon_watermark("STUDIO-879")
+            .expect("read watermark")
+            .map(|w| (w.at, w.body)),
+        Some((
+            "2026-09-13T04:29:21Z".to_string(),
+            "@rhapsody the memory tier is still 404ing".to_string()
+        )),
+        "a summons seen while the board was full must be remembered"
+    );
+
+    // --- 16:19. Twelve hours on: the comment is long outside the lookback, and a slot frees. ---
+    *clock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        studio885_summon_at() + chrono::Duration::hours(12);
+    o.running.clear();
+    let before = log.calls();
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    // The source really was asked, and really did answer with nothing — so the dispatch below can
+    // only have come from the remembered watermark.
+    let queries = log
+        .seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(log.calls() > before, "the tick must re-query the source");
+    assert!(
+        queries
+            .last()
+            .expect("a query")
+            .2
+            .gt(&studio885_summon_at()),
+        "the lookback watermark must now be PAST the comment, i.e. it is invisible to the source"
+    );
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        entries.len(),
+        1,
+        "the summoned ticket must dispatch once a slot frees, however long that took"
+    );
+    assert_eq!(entries[0].issue.identifier, "STUDIO-879");
+}
+
+// The other half of the rule, and the one a naive "dispatch if ever summoned" fix breaks: a
+// remembered summons that is OLDER than the ticket's last run start must keep the ticket
+// suppressed. That is what `pr_suppressed` is for, and STUDIO-885 must not weaken it.
+#[tokio::test]
+async fn a_remembered_summons_older_than_the_last_run_still_suppresses() {
+    let (mut o, spawned, clock, _log) = studio885_orch();
+
+    // A run that STARTED after the summons — the daemon has already consumed this feedback.
+    seed_run(
+        o.store(),
+        "iss-879",
+        "STUDIO-879",
+        studio885_summon_at() + chrono::Duration::hours(2),
+    );
+
+    // Observe the summons while it is still inside the window, then let it age out.
+    let _ = o.poll_all_projects().await;
+    assert!(
+        o.store()
+            .summon_watermark("STUDIO-879")
+            .expect("read watermark")
+            .is_some(),
+        "the summons is still remembered"
+    );
+    *clock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        studio885_summon_at() + chrono::Duration::hours(12);
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        entries.is_empty(),
+        "a summons the last run already began after must not re-dispatch the ticket, got {:?}",
+        entries
+            .iter()
+            .map(|e| &e.issue.identifier)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The same reported board on the LEGACY single-tracker ladder (no `projects:`): one `Todo` ticket
+/// whose work already shipped as an UNMERGED linked pull request, a store holding both that
+/// ticket's last completed run and the remembered summons, and NO GitHub source at all — the
+/// comment aged out of the lookback window twelve hours ago, so the watermark is the only place the
+/// summons still exists. `max_concurrent` is 1, and nothing is running, so the one slot is free.
+fn studio885_legacy_orch() -> (Orchestrator, crate::testsupport::DispatchedEntries) {
+    let mut tr = Fake::new();
+    tr.candidates = vec![issue_with_pr("iss-879", "STUDIO-879", "o", "r", 249)];
+    // `orch_for_retry` is the legacy-ladder builder (no `projects:`); its id-only recorder is
+    // swapped below for the entry recorder, because this test asserts on the dispatched ISSUE.
+    let (mut o, _ids) = crate::testsupport::orch_for_retry(Arc::new(tr), 1);
+    assert!(
+        o.eff.as_ref().is_some_and(|e| e.projects.is_empty()),
+        "this fixture must exercise the LEGACY ladder, not the multi-project one"
+    );
+    let spawned: crate::testsupport::DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+    o.spawn = Some(crate::testsupport::record_entries(&spawned));
+    o.now = Box::new(|| studio885_summon_at() + chrono::Duration::hours(12));
+
+    let store: Arc<dyn Store + Send + Sync> =
+        Arc::new(Sqlite::open(StorePath::InMemory).expect("in-memory store"));
+    seed_run(
+        store.as_ref(),
+        "iss-879",
+        "STUDIO-879",
+        studio885_summon_at() - chrono::Duration::hours(4),
+    );
+    store
+        .record_summon_watermark(rhapsody_store::SummonWatermark {
+            identifier: "STUDIO-879".to_string(),
+            at: "2026-09-13T04:29:21Z".to_string(),
+            body: "@rhapsody the memory tier is still 404ing".to_string(),
+        })
+        .expect("seed the remembered summons");
+    o.set_store(store);
+    (o, spawned)
+}
+
+// The LEGACY ladder's own seam. `restore_summon_watermarks` is called from two places — the end of
+// `poll_all_projects` and the legacy single-tracker fetch — and a test that only drives the
+// multi-project ladder cannot tell whether the second call still exists. It is not test-only code:
+// the legacy branch is what every install without `projects:` runs. So this pins the legacy call
+// site on its own, end to end: with the comment long outside the lookback and no GitHub source at
+// all, the ONLY thing that can lift `pr_suppressed` is the remembered summons being put back on the
+// candidate before selection sees it.
+#[tokio::test]
+async fn the_legacy_ladder_also_restores_a_remembered_summons() {
+    let (mut o, spawned) = studio885_legacy_orch();
+
+    o.on_tick().await;
+    if let Some(t) = o.tick_timer.take() {
+        t.abort();
+    }
+
+    let entries = spawned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        entries.len(),
+        1,
+        "the legacy ladder must restore the remembered summons and dispatch, got {:?}",
+        entries
+            .iter()
+            .map(|e| &e.issue.identifier)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(entries[0].issue.identifier, "STUDIO-879");
+    // The restored value really rode the whole way through: it is on the issue the run was
+    // dispatched with, not merely consulted somewhere inside the pass.
+    assert_eq!(
+        entries[0].issue.latest_summon_at,
+        Some(studio885_summon_at()),
+        "the dispatched candidate must carry the restored summons"
+    );
+    assert_eq!(
+        entries[0].issue.latest_summon_body,
+        "@rhapsody the memory tier is still 404ing"
     );
 }

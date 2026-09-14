@@ -80,6 +80,7 @@ pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;
 pub mod stop;
+pub mod summonwatermark;
 pub mod teams;
 pub mod teamsanswer;
 mod teamscompose;

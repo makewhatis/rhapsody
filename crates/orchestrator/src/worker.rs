@@ -1856,9 +1856,10 @@ mod tests {
         );
         assert_eq!(
             last,
-            crate::review::REVIEW_STATE_FINDINGS,
+            crate::review::REVIEW_STATE_UNDECLARED,
             "a synthetic review issue carries no tracker state, so the slot carries the agent's \
-             verdict instead — and `HANDOFF: review-posted` is not an approval"
+             verdict instead — and `HANDOFF: review-posted` is neither `approved` nor a recognised \
+             rejection, so it must not be guessed as changes requested (STUDIO-894)"
         );
     }
 

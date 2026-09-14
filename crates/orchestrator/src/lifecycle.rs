@@ -2739,6 +2739,18 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::ReviewWatchRow>, rhapsody_store::StoreError> {
             self.0.load_live_review_watch()
         }
+        fn record_summon_watermark(
+            &self,
+            a0: rhapsody_store::SummonWatermark,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.record_summon_watermark(a0)
+        }
+        fn summon_watermark(
+            &self,
+            a0: &str,
+        ) -> Result<Option<rhapsody_store::SummonWatermark>, rhapsody_store::StoreError> {
+            self.0.summon_watermark(a0)
+        }
         fn prune(&self, a0: i64) -> Result<(), rhapsody_store::StoreError> {
             self.0.prune(a0)
         }

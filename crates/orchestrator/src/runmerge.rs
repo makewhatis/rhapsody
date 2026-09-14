@@ -629,6 +629,7 @@ mod tests {
         fn found(status: PrStatus, head: &str) -> Arc<FakeState> {
             Arc::new(FakeState {
                 lookup: Some(PrLookup::Found(PrSnapshot {
+                    is_draft: false,
                     head_sha: head.to_string(),
                     status,
                     merged_at: None,

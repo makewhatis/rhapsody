@@ -393,7 +393,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | --- | --- |
 | `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
-| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active |
+| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
@@ -664,7 +664,7 @@ needs a durable home, and the Go v0.4.0 reference — which has no review featur
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **8** |
+| `PRAGMA user_version` | 6 | **8** at this step — **9** today, see STUDIO-885 below |
 | tables | `runs`, `events`, `retry_queue`, `claims`, `totals`, `run_messages` | the same 6, byte-identical, **plus** `rhapsody_review_watch` |
 
 One row per (PR, reviewer): repository owner/name, PR **number**, the reviewing teammate, the pull
@@ -694,16 +694,56 @@ The exclusion is a name rule, not a loosened assertion. A Go-created object can 
 `rhapsody_*`, so all six ported tables stay gated byte-strictly, and a **new un-prefixed table still
 turns the golden red** — which is the correct outcome for anything that is a port of Go behaviour.
 `divergent_objects_are_gated_by_name_only` asserts exactly that: every live schema object is either
-byte-present in the committed golden or carries the prefix, and the divergent set is pinned to this
-one name. The mechanism is documented again at the top of `crates/store/src/sqlite.rs`.
+byte-present in the committed golden or carries the prefix, and the divergent set is pinned by name —
+to this one name at this step, and to both names since STUDIO-885 below. The mechanism is documented
+again at the top of `crates/store/src/sqlite.rs`.
 
 **Off is still off.** The table is created by the migration on every daemon, including one that has
 never enabled Teams, and on a Go-written database opened by Rhapsody. It is inert: the whole review
 subsystem is gated on `teams.enabled` (design §16), nothing outside that path writes a row, and an
 empty table changes no query, no endpoint and no payload. A database that Rhapsody has opened is no
 longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
-runs steps at or above its own `user_version`, so a v8 database is left alone rather than corrupted,
-and running both daemons against one file was never supported in either direction.
+runs steps at or above its own `user_version`, so a database ahead of it (v8 at this step, v9 today)
+is left alone rather than corrupted, and running both daemons against one file was never supported in
+either direction.
+
+### A second schema table with no Go counterpart — `rhapsody_summon_watermark` (STUDIO-885)
+
+A summons is a durable fact: an `@symphony` comment that still exists on the pull request. The Go
+daemon nevertheless only ever SEES it as a transient one. Its GitHub enrichment asks the source for
+comments newer than `now - ghLookback` — five minutes — so `Issue.latestSummonAt` is re-derived from
+scratch on every poll and reverts to unset the moment the comment ages out of that window.
+
+`prSuppressed` meanwhile treats a ticket with a linked pull request as suppressed unless a summons
+is newer than the ticket's last run start. The two together give a summons a five-minute half-life:
+if no concurrency slot happens to free inside that window, the ticket returns to suppressed and
+stays there for as long as the daemon runs. On the reported incident an entirely ordinary busy
+period (four running agents against `max_concurrent_agents: 4`) was enough, and the ticket was
+silently unreachable for twelve hours with the comment still sitting on the pull request.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **9** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch` and `rhapsody_summon_watermark` |
+
+One row per ticket identifier: the newest summons ever OBSERVED for it and that same comment's body.
+The candidate-fetch seam of both dispatch ladders reconciles each candidate against it — the newer of
+the two wins — so the comparison `pr_suppressed` actually makes is between two durable facts and
+keeps its meaning however long the ticket waits for a slot.
+
+**It does not weaken the suppression, which is the point.** A ticket does not become permanently
+dispatchable because it was summoned once: the watermark lifts the suppression only while it is
+newer than the last run start, and dispatching the ticket advances that start past it. A merged pull
+request with an old summons stays suppressed exactly as before. Widening `ghLookback` instead was
+rejected as the cheaper change that closes nothing — it converts "stranded after five minutes of
+contention" into "stranded after N minutes of contention".
+
+The gate is the same name rule step 7 established (`schema_dump` excludes objects by the literal
+`rhapsody_` prefix and nothing else), and `divergent_objects_are_gated_by_name_only` now pins both
+names. The table is pruned on the same retention cutoff as the runs it is compared against, so a
+watermark never outlives the history it is measured against. **Off is still off:** with
+`storage.path: off` there is nowhere to remember an observation, so the daemon keeps the pre-885
+behaviour of seeing only what the lookback window covers right now.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
@@ -1076,6 +1116,7 @@ thing that merges on this install is somebody happening to look.
 | what merges it | nothing | the existing ticketless review watcher, off-loop |
 | the verdict read | — | `rhapsody_review_watch.status`, keyed to `last_reviewed_sha` |
 | the CI gate | — | `mergeStateStatus: CLEAN` **and** every check in the rollup non-blocking |
+| the draft gate | — | `isDraft` read on the same `gh pr view`; a draft is refused, never attempted |
 | how it merges | — | `gh pr merge --squash --match-head-commit <head>` |
 | default | — | **off**: `teams.review.auto_merge` is `false` unless an operator sets it |
 
@@ -1086,12 +1127,44 @@ The ticketless review path already records its own verdict structurally: `review
 an EXACT `HANDOFF: approved` payload on the review agent's final result, and `mark_review_completed`
 stores the resulting `approved`/`reviewed` status beside the SHA that reviewer actually read. A gate
 that grepped comment bodies would have to call "I would happily approve on the next push" an
-approval; this one never sees it.
+approval; this one never sees it. A hand-off whose payload is neither `approved` nor a recognised
+rejection is not guessed into either status either — it is recorded `truncated`, which this gate
+already refuses as a round still owed.
 
 **A verdict is about a COMMIT.** Every gate is keyed to the head observed this tick — an approval of
 `a324d2d` is not an approval of `c366a61`, and every review round in the batch that motivated this
 pushed new commits after a verdict. A pull request whose head has moved is refused and re-reviewed
 rather than merged.
+
+**`CLEAN` is necessary and not sufficient: a DRAFT reports `CLEAN`** (STUDIO-881). A draft pull
+request with approvals at the head and every check green reports `mergeStateStatus: CLEAN`, so the
+allowlist above does not catch it — `gh pr merge` then fails with `GraphQL: Pull Request is still a
+draft`. `isDraft` is therefore read off the same `gh pr view` that re-resolves the pull request, and
+a draft is refused there, before the merge-state and check reads and before any merge is attempted.
+The answer is re-read every tick and never remembered, because marking a draft ready for review does
+not move the head: a gate that latched on it would strand a pull request the author had already
+un-drafted.
+
+**A refusal is not an unreadable gate.** A failed `gh pr merge` used to be reported wholesale as *"a
+gate could not be read"* — a claim that nothing is known and the next tick may learn more. For
+`Pull Request is still a draft` that claim is false, and the daemon re-asked once a minute for three
+hours (182 attempts) to be told the same thing. The split is now about whether GitHub ANSWERED:
+a refusal it recognises is a decline, and everything else — a network error, an `HTTP 503`, a message
+GitHub adds next year — stays a failure and is retried next tick, because abandoning a mergeable pull
+request on a blip is the worse direction. Nothing latches either way; what does not repeat is the
+REPORT.
+
+**Announced once, on both sides of the seam.** A gate that holds holds for as long as its condition
+does, and the daemon re-decides it every tick — so a line spoken on the way to the decision is a
+line a minute until something changes. The three-hour log this ticket was filed from carried 383 of
+them for two stuck pull requests: 189 WARNs from the merge attempt, and 97 and 96 INFO lines from
+the control task announcing the plan it had just re-formed. Both halves are now announced only when
+they are NEWS — the plan once per pull request and head (with the approvals that cleared it), the
+refusal once per pull request, head and reason, and the detail a gate adds to its refusal only on
+the tick the refusal itself is announced. Everything repeated is at DEBUG. A stuck pull request
+therefore costs two INFO lines — the plan and the refusal — plus the one detail line its particular
+gate adds, and then silence. It still merges the tick its gate clears: the plan is re-formed and
+re-attempted every tick regardless, because it is only the REPORT that is held.
 
 **GitHub's own auto-merge is deliberately NOT armed here**, unlike the console merge action
 (STUDIO-767), whose `--auto` is a guardrail for a human who has already decided. With nobody

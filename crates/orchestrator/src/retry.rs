@@ -1291,7 +1291,7 @@ mod tests {
     /// without a `HANDOFF:` marker. The run must be stored `completed` with no error, and the claim
     /// must be released rather than a continuation scheduled.
     #[test]
-    fn on_worker_exit_review_state_undeclared_records_completed() {
+    fn on_worker_exit_ticket_review_without_handoff_records_completed() {
         let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
         let store_handle: Arc<dyn Store + Send + Sync> = Arc::new(
             rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),

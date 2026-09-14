@@ -102,9 +102,9 @@ describe("reviewRow", () => {
     expect(reviewRow(job({ open: true, status: "in_flight" })).label).toBe("Reviewing");
   });
 
-  // A round that ran out of turns read the head only PARTLY, which is why the daemon deliberately
-  // does not advance `last_reviewed_sha` for it. Dressing it as a finished review is how a review
-  // that never happened ships as if it had.
+  // A truncated round (turns exhausted, or an unreadable hand-off — STUDIO-894) read the head only
+  // PARTLY at best, which is why the daemon deliberately does not advance `last_reviewed_sha` for
+  // it. Dressing it as a finished review is how a review that never happened ships as if it had.
   it("does not present a truncated round as a finished one", () => {
     const truncated = reviewRow(job({ status: "truncated", last_reviewed_sha: "" }));
     const reviewed = reviewRow(job({ status: "reviewed" }));
