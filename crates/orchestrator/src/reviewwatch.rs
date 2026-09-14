@@ -250,8 +250,8 @@ impl ReviewWatchSink for ControlWatchSink {
         };
         // Infallible by contract: no outcome has a caller with anything to do about it, and every
         // one of them is logged — the two that CHANGED something where the change happens, in
-        // `runautomerge`, which holds the fields describing it, and the two that changed nothing
-        // here. A decline is re-considered on the next tick.
+        // `runautomerge`, which holds the fields describing it, and the three that changed nothing
+        // here. A refusal is re-considered on the next tick.
         match crate::runautomerge::perform_auto_merge(&plan, deps).await {
             crate::runautomerge::AutoMergeOutcome::Merged(_) => {}
             crate::runautomerge::AutoMergeOutcome::Updated => {}
@@ -614,6 +614,8 @@ impl Orchestrator {
         // third: a retired pull request that kept a stall count would keep the operator advisory
         // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        // And what was announced about its auto-merge plan, for the first two of those reasons.
+        self.auto_merge_announced.remove(&churn_key(pr));
         for id in retired_ids {
             self.review_unassignable.remove(&id);
         }
@@ -814,7 +816,7 @@ impl Orchestrator {
     /// is at an older head is stale on either. So the opening snapshot cannot clear a gate the
     /// closing one would refuse.
     fn propose_auto_merge(
-        &self,
+        &mut self,
         mine: &[&ReviewWatchRow],
         pr: &PrCoord,
         head: &str,
@@ -829,11 +831,24 @@ impl Orchestrator {
         }
         match crate::automerge::auto_merge_verdict(mine, head) {
             Ok(approved_by) => {
-                tracing::info!(
-                    pr = %pr, head, ?approved_by,
-                    "auto-merge: every reviewer approved this head; the remaining gates are \
-                     asked of GitHub off-loop"
-                );
+                // At INFO when it is news, and at DEBUG for as long as it stays the same plan.
+                // The gate is re-decided from the watch rows on EVERY tick and the plan is handed
+                // out on every tick — a pull request held by a gate on the other side of the seam
+                // must still merge the moment that gate clears. What is quieted is only the line:
+                // STUDIO-881's log carried 97 of these for ONE draft pull request, at INFO, in
+                // lockstep with the refusal they led to.
+                if self.auto_merge_plan_is_news(pr, head, &approved_by) {
+                    tracing::info!(
+                        pr = %pr, head, ?approved_by,
+                        "auto-merge: every reviewer approved this head; the remaining gates are \
+                         asked of GitHub off-loop"
+                    );
+                } else {
+                    tracing::debug!(
+                        pr = %pr, head, ?approved_by,
+                        "auto-merge: the same plan as the last tick; still asking GitHub"
+                    );
+                }
                 report.merge.push(crate::automerge::AutoMergePlan {
                     pr: pr.clone(),
                     head: head.to_string(),
@@ -846,6 +861,35 @@ impl Orchestrator {
                 tracing::debug!(pr = %pr, head, reason = why.why(), "auto-merge: not merging")
             }
         }
+    }
+
+    /// Whether announcing this auto-merge plan says anything that has not been said, remembering
+    /// it when it does (STUDIO-881).
+    ///
+    /// News is a plan whose HEAD or whose set of approvals differs from the one last announced for
+    /// this pull request — the two things the line itself claims. Anything else is the same
+    /// sentence about the same commit, and a pull request held by a gate downstream re-forms that
+    /// plan once a minute for as long as the hold lasts.
+    ///
+    /// This governs the REPORT and nothing else: [`Self::propose_auto_merge`] hands the plan out
+    /// either way, so a refusal that clears is merged on the very next tick whatever this answers.
+    fn auto_merge_plan_is_news(
+        &mut self,
+        pr: &PrCoord,
+        head: &str,
+        approved_by: &[String],
+    ) -> bool {
+        let key = churn_key(pr);
+        if self
+            .auto_merge_announced
+            .get(&key)
+            .is_some_and(|(was_head, was_by)| was_head == head && was_by == approved_by)
+        {
+            return false;
+        }
+        self.auto_merge_announced
+            .insert(key, (head.to_string(), approved_by.to_vec()));
+        true
     }
 
     /// Who reviews this round: the incumbent where continuity means something, otherwise the
@@ -936,6 +980,11 @@ pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
 
 /// The per-pull-request re-review budget, keyed by `owner/repo#number`.
 pub type ReviewRounds = HashMap<String, usize>;
+
+/// The auto-merge plan each watched pull request has already been ANNOUNCED for: its head and the
+/// approvals that cleared the gate at that head, keyed by [`churn_key`] as [`ReviewRounds`] is.
+/// See [`Orchestrator::auto_merge_announced`]. STUDIO-881.
+pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
 
 impl ControlHandle {
     /// The coordinates the watcher should ask GitHub about. Empty when the subsystem is off or the
@@ -1663,6 +1712,76 @@ mod tests {
         assert!(
             second.merge.is_empty(),
             "and a merged pull request is never proposed for merging again"
+        );
+    }
+
+    /// ⚠️ STUDIO-881's second half, at the site that actually dominated the log: the plan line is
+    /// announced when it is NEWS and quiet afterwards, while the PLAN itself is re-proposed on
+    /// every tick. Both halves matter — the log the ticket was filed from carried 97 identical
+    /// INFO lines for one stuck draft, and a "fix" that stopped re-proposing would strand the pull
+    /// request the tick its refusal cleared.
+    #[test]
+    fn an_unchanged_plan_is_announced_once_and_proposed_every_tick() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let first = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        let second = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        let third = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert_eq!(first.merge.len(), 1, "the gate cleared");
+        assert_eq!(
+            second.merge, first.merge,
+            "and keeps clearing: the plan is re-proposed"
+        );
+        assert_eq!(third.merge, first.merge);
+        assert!(
+            !o.auto_merge_plan_is_news(&coord(64), HEAD_A, &["bob".to_string()]),
+            "said on the first tick; saying it again every minute is what the ticket measured"
+        );
+    }
+
+    /// What makes the announcement news again: a different head, or a different set of approvals
+    /// at the same head. Either changes the claim the line makes, so either is worth saying.
+    #[test]
+    fn a_new_head_or_a_new_approver_is_news_again() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        let bob = vec!["bob".to_string()];
+
+        assert!(o.auto_merge_plan_is_news(&coord(64), HEAD_A, &bob), "first");
+        assert!(!o.auto_merge_plan_is_news(&coord(64), HEAD_A, &bob));
+        assert!(
+            o.auto_merge_plan_is_news(&coord(64), HEAD_B, &bob),
+            "a head the operator has not been told cleared"
+        );
+        assert!(
+            o.auto_merge_plan_is_news(
+                &coord(64),
+                HEAD_B,
+                &["bob".to_string(), "carol".to_string()]
+            ),
+            "a second approval at that head is a different claim"
+        );
+        assert!(
+            o.auto_merge_plan_is_news(&coord(65), HEAD_B, &bob),
+            "and another pull request is its own subject"
+        );
+    }
+
+    /// The announcement is dropped with the pull request, exactly as its churn budget is: a
+    /// coordinate re-introduced later is announced again, and the map does not grow for the
+    /// daemon's whole life.
+    #[test]
+    fn retiring_a_pull_request_forgets_what_was_announced_about_it() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert!(
+            o.auto_merge_plan_is_news(&coord(64), HEAD_A, &["bob".to_string()]),
+            "the retirement forgot it"
         );
     }
 
