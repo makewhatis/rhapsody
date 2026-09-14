@@ -158,6 +158,13 @@ impl Store for Noop {
         Ok(Vec::new())
     }
 
+    fn record_summon_watermark(&self, _w: SummonWatermark) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn summon_watermark(&self, _identifier: &str) -> Result<Option<SummonWatermark>, StoreError> {
+        Ok(None)
+    }
+
     fn prune(&self, _retention_days: i64) -> Result<(), StoreError> {
         Ok(())
     }

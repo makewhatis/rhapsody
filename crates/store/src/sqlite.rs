@@ -6,12 +6,12 @@
 //! and [`Sqlite::open`] applies the same pragmas and the same idempotent `user_version`
 //! migration loop. The `Store` trait, CRUD, queries, and retention land in S3.
 //!
-//! # The one divergent schema object, and how the golden still gates the rest (STUDIO-711)
+//! # The divergent schema objects, and how the golden still gates the rest (STUDIO-711)
 //!
-//! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column) have no Go
-//! counterpart: they are the ticketless
-//! PR-review watch set, a feature the frozen v0.4.0 reference does not have. That creates a
-//! problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
+//! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column) and step 9
+//! (`rhapsody_summon_watermark`, STUDIO-885) have no Go counterpart: they are the ticketless
+//! PR-review watch set and the per-ticket summons watermark, neither of which the frozen v0.4.0
+//! reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
 //! `schema_matches_committed_golden` permanently red with no honest way to fix it. Hand-editing
@@ -24,7 +24,7 @@
 //! The exclusion is therefore a name rule, not a loosened assertion — a Go table can never be
 //! named `rhapsody_*`, so the golden keeps gating all 6 ported tables byte-strictly, and a NEW
 //! table added without the prefix still turns it red. `divergent_objects_are_gated_by_name_only`
-//! asserts that property directly, and pins the divergent object set to exactly one name.
+//! asserts that property directly, and pins the divergent object set to exactly those names.
 //!
 //! A new schema object that is a PORT of Go behaviour must never take the prefix: it belongs in
 //! the golden, recaptured with `make fixtures`.
@@ -38,10 +38,10 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 and 8 are Rhapsody-only (the ticketless review watch set, then its
-/// `author` column) and are the one documented reason this number is ahead of the reference — see
-/// the module doc above.
-const SCHEMA_VERSION: i64 = 8;
+/// Go v0.4.0 froze at 6. Steps 7, 8 and 9 are Rhapsody-only (the ticketless review watch set, then
+/// its `author` column, then the summons watermark) and are the one documented reason this number
+/// is ahead of the reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 9;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -166,6 +166,21 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_watch (
     // which the reviewer-selection path reads as "author unknown" and fails closed on.
     r#"
 ALTER TABLE rhapsody_review_watch ADD COLUMN author TEXT NOT NULL DEFAULT '';
+"#,
+    // v8 -> v9: the per-ticket summons watermark (STUDIO-885). Rhapsody-only — the Go reference
+    // re-derives `latest_summon_at` from a five-minute GitHub lookback every poll and keeps it
+    // nowhere, which is precisely the defect this table exists to close. Named with the
+    // `rhapsody_` prefix so the schema golden gates it out by name, exactly as step 7 is.
+    //
+    // `identifier TEXT PRIMARY KEY` on a rowid table gets SQLite's implicit auto-index, whose
+    // `sqlite_master.sql IS NULL`, so — as with step 7 — no explicit index is added and nothing
+    // further reaches the golden comparison.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_summon_watermark (
+  identifier  TEXT    NOT NULL PRIMARY KEY,
+  summon_at   TEXT    NOT NULL,
+  summon_body TEXT    NOT NULL DEFAULT ''
+);
 "#,
 ];
 
@@ -1199,6 +1214,39 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn record_summon_watermark(&self, w: SummonWatermark) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_summon_watermark (identifier, summon_at, summon_body)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(identifier) DO UPDATE SET
+               summon_at   = excluded.summon_at,
+               summon_body = excluded.summon_body",
+            params![w.identifier, w.at, w.body],
+        )?;
+        Ok(())
+    }
+
+    fn summon_watermark(&self, identifier: &str) -> Result<Option<SummonWatermark>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT identifier, summon_at, summon_body FROM rhapsody_summon_watermark \
+               WHERE identifier = ?1",
+        )?;
+        // The primary key makes this at most one row; absent is Ok(None), not an error.
+        let mut rows = stmt.query_map(params![identifier], |row| {
+            Ok(SummonWatermark {
+                identifier: row.get(0)?,
+                at: row.get(1)?,
+                body: row.get(2)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
         if retention_days <= 0 {
             return Ok(()); // 0 = keep forever
@@ -1226,6 +1274,16 @@ impl Store for Sqlite {
         )?;
         tx.execute(
             "DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at <> '' AND ended_at < ?1",
+            params![cutoff],
+        )?;
+        // A summons watermark is only ever read by comparing it against the ticket's LAST RUN
+        // START (STUDIO-885), so it is pruned on the same cutoff as the runs: keeping one whose
+        // counterpart history has just been deleted would leave a years-old comment able to lift a
+        // suppression with nothing left to compare it to. Both columns are written in the same
+        // canonical fixed-width form (`format_summon_at`, seconds precision), which is what makes
+        // this string comparison a chronological one.
+        tx.execute(
+            "DELETE FROM rhapsody_summon_watermark WHERE summon_at < ?1",
             params![cutoff],
         )?;
         tx.commit()?;
@@ -3742,8 +3800,11 @@ mod tests {
         }
         assert_eq!(
             divergent,
-            vec!["rhapsody_review_watch".to_string()],
-            "exactly one documented divergent object exists today (README `Divergences`)"
+            vec![
+                "rhapsody_review_watch".to_string(),
+                "rhapsody_summon_watermark".to_string(),
+            ],
+            "exactly the documented divergent objects exist today (README `Divergences`)"
         );
     }
 
@@ -3763,5 +3824,130 @@ mod tests {
             "only the literal `rhapsody_` prefix is excluded; a look-alike must still be compared \
              against the golden"
         );
+    }
+
+    // --- the summons watermark (STUDIO-885) ---------------------------------------------------
+
+    fn watermark(identifier: &str, at: &str, body: &str) -> SummonWatermark {
+        SummonWatermark {
+            identifier: identifier.into(),
+            at: at.into(),
+            body: body.into(),
+        }
+    }
+
+    // A ticket nobody has ever summoned has no row, and that is Ok(None) rather than an error —
+    // the caller reads this for EVERY candidate on every poll, so "absent" must be the cheap,
+    // ordinary answer.
+    #[test]
+    fn summon_watermark_absent_is_none() {
+        let st = open_mem();
+        assert_eq!(
+            st.summon_watermark("STUDIO-879").expect("read"),
+            None,
+            "never-summoned ticket has no watermark"
+        );
+    }
+
+    // Time and body are written and read back as ONE comment (INF-448), keyed by identifier.
+    #[test]
+    fn summon_watermark_round_trips() {
+        let st = open_mem();
+        st.record_summon_watermark(watermark(
+            "STUDIO-879",
+            "2026-09-13T04:29:21Z",
+            "@symphony the hindsight tier is still 404ing",
+        ))
+        .expect("record");
+        let got = st.summon_watermark("STUDIO-879").expect("read");
+        assert_eq!(
+            got,
+            Some(watermark(
+                "STUDIO-879",
+                "2026-09-13T04:29:21Z",
+                "@symphony the hindsight tier is still 404ing",
+            ))
+        );
+        assert_eq!(
+            st.summon_watermark("STUDIO-880").expect("read other"),
+            None,
+            "the row is keyed by identifier; another ticket must not see it"
+        );
+    }
+
+    // Last write wins, ON CONFLICT, for BOTH columns together — never a new row, and never a
+    // timestamp left describing a different comment's body.
+    #[test]
+    fn summon_watermark_upserts_in_place() {
+        let st = open_mem();
+        st.record_summon_watermark(watermark("STUDIO-879", "2026-09-13T04:29:21Z", "first"))
+            .expect("record first");
+        st.record_summon_watermark(watermark("STUDIO-879", "2026-09-13T16:21:00Z", "second"))
+            .expect("record second");
+        assert_eq!(
+            st.summon_watermark("STUDIO-879").expect("read"),
+            Some(watermark("STUDIO-879", "2026-09-13T16:21:00Z", "second")),
+            "the newer observation replaces both columns"
+        );
+        let rows: i64 = st
+            .lock()
+            .query_row("SELECT COUNT(*) FROM rhapsody_summon_watermark", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(rows, 1, "upsert, not insert");
+    }
+
+    // Retention applies to the watermark on the SAME cutoff as the runs it is compared against: a
+    // watermark whose run history has just been pruned has nothing left to be newer than.
+    #[test]
+    fn prune_drops_watermarks_past_retention() {
+        let st = open_mem();
+        st.record_summon_watermark(watermark("OLD", &days_ago_rfc3339(40), "old"))
+            .expect("record OLD");
+        st.record_summon_watermark(watermark("NEW", &days_ago_rfc3339(1), "new"))
+            .expect("record NEW");
+
+        st.prune(0).expect("prune 0");
+        assert!(
+            st.summon_watermark("OLD").expect("read OLD").is_some(),
+            "retention 0 keeps everything forever"
+        );
+
+        st.prune(30).expect("prune 30");
+        assert_eq!(
+            st.summon_watermark("OLD").expect("read OLD"),
+            None,
+            "a watermark older than retention is pruned"
+        );
+        assert!(
+            st.summon_watermark("NEW").expect("read NEW").is_some(),
+            "a watermark inside retention survives"
+        );
+    }
+
+    // The canonical column format is fixed-width, which is what makes prune's string comparison a
+    // chronological one — and it is EXACTLY round-trip stable, so a summons whose source reports
+    // sub-second precision renders to the same string on every poll instead of being rewritten
+    // forever because its stored form lost a fraction of a second.
+    #[test]
+    fn format_summon_at_is_canonical_and_stable() {
+        let precise = chrono::DateTime::parse_from_rfc3339("2026-09-13T04:29:21.837Z")
+            .expect("parse")
+            .with_timezone(&chrono::Utc);
+        let once = crate::format_summon_at(precise);
+        assert_eq!(once, "2026-09-13T04:29:21Z", "seconds precision, Z suffix");
+        let reparsed = chrono::DateTime::parse_from_rfc3339(&once)
+            .expect("reparse")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            crate::format_summon_at(reparsed),
+            once,
+            "formatting the stored value again must not move it"
+        );
+        // Fixed width: every rendering is the same length, so `<` on the strings is `<` in time.
+        let later = crate::format_summon_at(precise + chrono::Duration::days(400));
+        assert_eq!(later.len(), once.len());
+        assert!(once < later, "lexicographic order is chronological order");
     }
 }
