@@ -304,6 +304,12 @@ impl App {
         lock(&self.inner.mu).sup.clone()
     }
 
+    /// The short-timeout loopback client the `/api/v1/state` probe uses, shared with the drain's
+    /// `/api/v1/drain` round trip (STUDIO-880) so both speak to the daemon with the same bounds.
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.inner.http
+    }
+
     /// Installs `s` as the current supervisor. Mirrors `setSup`.
     pub fn set_sup(&self, s: Supervisor) {
         lock(&self.inner.mu).sup = Some(s);

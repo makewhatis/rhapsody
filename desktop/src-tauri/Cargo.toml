@@ -79,7 +79,11 @@ bytes = "1"
 # supervisor lifecycle tests are integration tests (tests/): they launch the real compiled
 # `fakedaemon` bin (via CARGO_BIN_EXE_fakedaemon) and drive start/health/restart/drain, mirroring
 # $REF/desktop/internal/supervisor/supervisor_test.go. libc is used to assert the process-group setup.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+# `test-util` gives the paused virtual clock STUDIO-880's drain-wait tests need — the same reason
+# `crates/orchestrator` already takes it: the budget under test is THIRTY MINUTES, which real time
+# cannot wait out and which a test-only shrunken budget would only pretend to check. Test-only,
+# already in Cargo.lock (no new crate).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
 libc = "0.2"
 # The P7-D5 parity e2e (tests/parity_e2e.rs) drives the app's apiproxy + a dashboard fetch against the
 # real supervised daemon. These are ALREADY regular dependencies (same versions/features) — repeating

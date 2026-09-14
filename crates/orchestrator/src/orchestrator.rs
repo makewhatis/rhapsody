@@ -544,6 +544,15 @@ pub struct Orchestrator {
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
     pub(crate) review_rounds: crate::reviewwatch::ReviewRounds,
+    /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
+    /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
+    /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
+    /// a row gets a reviewer, and dropped when the pull request leaves the watch set.
+    ///
+    /// Separate from [`Orchestrator::review_rounds`] because it counts the opposite thing: that one
+    /// bounds how much review a pull request may be GIVEN, this one notices when it is being given
+    /// none at all.
+    pub(crate) review_unassignable: HashMap<String, usize>,
     /// Pull-request coordinates a console merge is currently attempting, and since when
     /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
     /// id, because two runs of one ticket share a branch and therefore share the pull request a
@@ -700,6 +709,17 @@ pub struct Orchestrator {
     /// tick. A field (not a const) so tests can shrink it; defaulted to
     /// [`PROBE_TIMEOUT`](crate::preflight::PROBE_TIMEOUT).
     pub(crate) probe_timeout: std::time::Duration,
+
+    // --- STUDIO-880: drain (Rhapsody-only; see `drain.rs`). ---
+    /// The shared "stop starting new work" flag, cloned onto every dispatched worker and onto the
+    /// off-loop [`ControlHandle`](crate::stop::ControlHandle) the HTTP layer drives. Default (never
+    /// armed) makes the whole mechanism inert, so a daemon nobody drains behaves exactly as it did
+    /// before the feature existed.
+    pub(crate) drain: crate::drain::DrainSignal,
+    /// What the last tick observed about the armed drain, for the gate's logging. `Some` exactly
+    /// when the previous tick found the drain armed, which is what makes the cancel transition
+    /// observable. Mutated only by `on_tick` on the single control task, like [`Self::probe_cache`].
+    pub(crate) drain_gate: Option<crate::drain::DrainGateLog>,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -778,6 +798,7 @@ impl Orchestrator {
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
+            review_unassignable: HashMap::new(),
             merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
@@ -809,6 +830,10 @@ impl Orchestrator {
             cred_probe: None,
             probe_cache: None,
             probe_timeout: crate::preflight::PROBE_TIMEOUT,
+            // STUDIO-880: never draining by default → the gate and the turn-boundary check are both
+            // inert, i.e. byte-identical to a daemon built before the feature.
+            drain: crate::drain::DrainSignal::new(),
+            drain_gate: None,
         }
     }
 

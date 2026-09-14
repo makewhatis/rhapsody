@@ -287,6 +287,23 @@ impl Orchestrator {
         route: Option<DispatchRoute>,
         stack_context: String,
     ) {
+        // STUDIO-880, a backstop and NOT a gate. Every path that decides whether to dispatch refuses
+        // or parks above this line — `on_tick`, `on_retry`, `dispatch_review` — because each of them
+        // owns bookkeeping a refusal here would strand (a claim, a retry entry, a watch row recorded
+        // as in-flight). So this cannot refuse; what it can do is be LOUD, which is what the two
+        // paths that already got this wrong lacked.
+        //
+        // It is not an invariant violation: a drain armed by the HTTP task DURING a tick's candidate
+        // fetch legitimately lands here. Either way the run is self-limiting — the worker reads the
+        // same flag and winds down at its first turn boundary — so the line says what happened
+        // rather than claiming something is broken.
+        if self.drain.is_draining() {
+            tracing::warn!(
+                issue = %iss.identifier,
+                "drain: dispatching anyway — this path did not consult the drain gate, or the drain \
+                 armed mid-tick; the run will wind down at its first turn boundary"
+            );
+        }
         // A graphite auto-promote stashed a predecessor stacking hint for this issue's first dispatch
         // (it moved the ticket Backlog→Todo and left the slot-accounted dispatch to the select path).
         // Consume it when the caller didn't pass one explicitly, rendering the workspace_mode-aware
@@ -741,6 +758,25 @@ impl Orchestrator {
     /// candidate set, and re-checks per-project + per-state + global slots — then re-dispatches,
     /// requeues, or releases the claim. Mirrors Go `onRetry`. A control-loop (O7) entry point.
     pub async fn on_retry(&mut self, e: EvRetry) {
+        // STUDIO-880: the drain gate's SECOND entry point, and the one that is easy to miss.
+        // `on_tick` is not the only path that dispatches — a due retry dispatches straight from
+        // here, bypassing the tick entirely — so a drain that gated only `on_tick` would settle the
+        // daemon and then immediately re-dispatch every continuation it had just wound down.
+        //
+        // Parking, not dropping: the entry is left in `retry_attempts` EXACTLY as it is, so it keeps
+        // its claim, its due time and its ATTEMPT NUMBER. A drain is not a failure, and requeueing
+        // through the backoff path (as the no-slots case does) would inflate the attempt count for
+        // the whole length of the drain and could exhaust the ticket's retry budget. Only the timer
+        // is re-armed, so the gate is re-checked until the drain is cancelled or the daemon
+        // restarts and boot recovery re-arms it from the persisted row.
+        if self.drain.is_draining() && self.retry_attempts.contains_key(&e.issue_id) {
+            tracing::debug!(
+                issue_id = %e.issue_id,
+                "drain: parking a due retry; claim and attempt kept"
+            );
+            self.arm_retry_timer(&e.issue_id, crate::drain::DRAIN_REQUEUE_DELAY_MS);
+            return;
+        }
         let Some(re) = self.retry_attempts.remove(&e.issue_id) else {
             return;
         };
@@ -1443,6 +1479,51 @@ mod tests {
             "issue should be claimed and running"
         );
         assert_eq!(*dispatched.lock().unwrap(), vec!["1".to_string()]);
+    }
+
+    /// STUDIO-880's backstop: a dispatch that reached here while draining says so.
+    ///
+    /// Every path that DECIDES to dispatch refuses or parks above this function, because each owns
+    /// bookkeeping a refusal here would strand. So the backstop cannot refuse — the run still
+    /// dispatches, and is self-limiting because the worker reads the same flag and winds down at its
+    /// first turn boundary. What it must not be is silent: the two entry points that already got
+    /// this wrong were caught by a test and a reviewer, not by anything the running daemon said.
+    #[test]
+    fn a_dispatch_that_slipped_past_every_drain_gate_is_loud_about_it() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        o.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        });
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("did not consult the drain gate")),
+            "a dispatch while draining must be reported: {:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(
+            o.running.contains_key("1"),
+            "and it must still dispatch — refusing here would strand the claim this took"
+        );
+    }
+
+    /// …and the same call on an undrained daemon says nothing, so the line above cannot become
+    /// noise every operator learns to scroll past.
+    #[test]
+    fn an_ordinary_dispatch_says_nothing_about_the_drain() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let (_, events) = crate::testsupport::capture_events(|| {
+            o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        });
+        assert!(
+            !events.iter().any(|e| e.message.contains("drain")),
+            "no drain is armed, so nothing here may mention one: {:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     // Mirrors Go `TestOnWorkerExitNormalSchedulesContinuation`.

@@ -445,7 +445,11 @@ impl Orchestrator {
 /// top-level. Mirrors Go `workerDepsFor` (dropping the telemetry fields — Tracer/Metrics/Model/
 /// DispatchSpanContext — per the P6 deferral; see `worker.rs`). `run_id` is per-dispatch, not
 /// per-project, so [`Orchestrator::spawn_worker`] stamps it (STUDIO-675).
-fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps {
+fn worker_deps_for(
+    eff: &Effective,
+    rp: Option<&ResolvedProject>,
+    drain: &crate::drain::DrainSignal,
+) -> WorkerDeps {
     // Local raw logging is enabled only when a log dir is configured (Go passes `o.eff.transcripts`,
     // which is nil when logging is off).
     let transcripts = if eff.log_dir.is_empty() {
@@ -481,6 +485,9 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
         review_handoff_state: eff.review_states.iter().next().cloned(),
+        // Daemon-wide rather than per-project (STUDIO-880): a drain settles the whole daemon so it
+        // can be restarted, and there is no restart of one project.
+        drain: drain.clone(),
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -782,6 +789,20 @@ impl Orchestrator {
             // indefinitely against a teammate who is neither queued nor running. This count exists
             // to tell "queued" apart from "broken"; on these paths the honest answer is "broken".
             self.set_held_for_capacity(HashMap::new());
+            self.schedule_tick(poll);
+            return;
+        }
+        // STUDIO-880: the drain gate. Same seam, same property as the credential preflight below —
+        // skip ALL dispatch WITHOUT claiming anything, before candidate fetch — because a drain that
+        // claimed a ticket and then declined to run it would leave exactly the abandoned claim the
+        // "nothing is claimed" invariant exists to prevent. Deliberately ONE gate rather than a
+        // second "should we dispatch" test somewhere else: two of them is how one gets forgotten.
+        //
+        // It sits just ABOVE the credential preflight because the preflight SHELLS OUT (a bounded
+        // `claude -p` probe). A daemon that has been told to stop dispatching has no use for the
+        // answer, so asking would spend a subprocess every tick for a decision already made.
+        if self.drain_preflight() {
+            self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;
         }
@@ -1415,7 +1436,7 @@ impl Orchestrator {
         let Some(eff) = self.eff.as_ref() else {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
-        let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug));
+        let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug), &self.drain);
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;

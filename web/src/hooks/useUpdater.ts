@@ -6,6 +6,7 @@ import {
   installUpdate,
   onUpdateAvailable,
   onUpdateDownloadProgress,
+  type DrainOutcome,
   type UpdateDownloadProgress,
   type UpdateInfo,
 } from "@/lib/bindings";
@@ -24,6 +25,15 @@ export interface Updater {
   error: string | null;
   /** The active-run count when an install is awaiting confirmation (drives the warn dialog); else null. */
   activeRunsPrompt: number | null;
+  /**
+   * What the last drain-then-install actually did (STUDIO-880), or null when none was asked for.
+   *
+   * It is the difference between the two ways an install can end up deferred: the agents were still
+   * playing and we never waited, or we waited the whole budget and they did not finish. The
+   * "deferred" copy says which, because an expired budget ALSO leaves the daemon drained — taking
+   * no new work — and an operator told only "scheduled for next quit" would never learn that.
+   */
+  drainOutcome: DrainOutcome | null;
   /** True while an update is waiting on the user — lights the gear + "Updates" rail dot. */
   pending: boolean;
   /** Run a manual check ("Check for updates"). */
@@ -34,6 +44,11 @@ export interface Updater {
   requestInstall: () => void;
   /** Warn dialog → stop the active agents and install + relaunch now. */
   confirmInstallNow: () => void;
+  /**
+   * Warn dialog → drain first: stop the daemon taking NEW work, let the agents finish the turn they
+   * are on, and install only then. Interrupts nothing, and can take many minutes.
+   */
+  drainThenInstall: () => void;
   /** Warn dialog → install on the next graceful quit instead (leaves the agents running). */
   deferToQuit: () => void;
   /** Warn dialog → cancel, leaving the update ready. */
@@ -48,7 +63,13 @@ function errMessage(e: unknown): string {
 // downloading/installing (or deferred), a re-fired `update:available` should not bounce them back to
 // the bare "available" affordance.
 function inFlight(phase: UpdaterPhase): boolean {
-  return phase === "downloading" || phase === "ready" || phase === "installing" || phase === "deferred";
+  return (
+    phase === "downloading" ||
+    phase === "ready" ||
+    phase === "draining" ||
+    phase === "installing" ||
+    phase === "deferred"
+  );
 }
 
 // useUpdater wires U1's Tauri update commands + events (TRA-260) into the phase machine the U3 UI
@@ -62,6 +83,7 @@ export function useUpdater(): Updater {
   const [progress, setProgress] = React.useState<UpdateDownloadProgress | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [activeRunsPrompt, setActiveRunsPrompt] = React.useState<number | null>(null);
+  const [drainOutcome, setDrainOutcome] = React.useState<DrainOutcome | null>(null);
 
   // Guard against state updates after unmount: the actions resolve asynchronously and the install
   // path may outlive the panel (the user navigates away while it downloads).
@@ -133,19 +155,27 @@ export function useUpdater(): Updater {
   // Install the update, letting U1's guard defer (unless `force`) when runs are active. On the
   // allowed path the host relaunches and this never resolves; a resolved report means either a
   // deferral (blocked_active_runs > 0) or no bridge (null → nothing happened).
-  const doInstall = React.useCallback((force: boolean) => {
+  //
+  // `drain` (STUDIO-880) asks the host to settle the daemon FIRST — new dispatch stops, the running
+  // agents finish the turn they are on, and only then does the guard read the count. It interrupts
+  // nothing, so it is the one path that can install over live work without throwing a turn away,
+  // and it is the slow one: the host's budget is 30 minutes. It is meaningless with `force`, which
+  // skips the guard entirely, so the two are never both set.
+  const doInstall = React.useCallback((force: boolean, drain = false) => {
     setError(null);
     setActiveRunsPrompt(null);
-    setPhase("installing");
-    void installUpdate(force)
+    setDrainOutcome(null);
+    setPhase(drain ? "draining" : "installing");
+    void installUpdate(force, drain)
       .then((report) => {
         if (!mounted.current) return;
         if (!report) {
           setPhase("ready"); // no bridge — restore the ready affordance
           return;
         }
+        setDrainOutcome(report.drain ?? null);
         if (report.blocked_active_runs > 0) setPhase("deferred");
-        // else: installed; the host relaunch is imminent, leave "installing".
+        // else: installed; the host relaunch is imminent, leave the in-flight phase showing.
       })
       .catch((e: unknown) => {
         if (!mounted.current) return;
@@ -170,6 +200,7 @@ export function useUpdater(): Updater {
   }, [doInstall]);
 
   const confirmInstallNow = React.useCallback(() => doInstall(true), [doInstall]);
+  const drainThenInstall = React.useCallback(() => doInstall(false, true), [doInstall]);
   const deferToQuit = React.useCallback(() => doInstall(false), [doInstall]);
   const dismissPrompt = React.useCallback(() => setActiveRunsPrompt(null), []);
 
@@ -179,11 +210,13 @@ export function useUpdater(): Updater {
     progress,
     error,
     activeRunsPrompt,
+    drainOutcome,
     pending: updatePending(phase),
     check,
     download,
     requestInstall,
     confirmInstallNow,
+    drainThenInstall,
     deferToQuit,
     dismissPrompt,
   };

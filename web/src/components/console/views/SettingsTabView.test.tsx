@@ -165,11 +165,13 @@ function stubUpdater(over: Partial<Updater> = {}): Updater {
     progress: null,
     error: null,
     activeRunsPrompt: null,
+    drainOutcome: null,
     pending: false,
     check: vi.fn(),
     download: vi.fn(),
     requestInstall: vi.fn(),
     confirmInstallNow: vi.fn(),
+    drainThenInstall: vi.fn(),
     deferToQuit: vi.fn(),
     dismissPrompt: vi.fn(),
     ...over,
@@ -213,11 +215,14 @@ describe("Updates — the desktop auto-update path in console chrome (audit G3)"
     mount(<UpdatesView onNavigate={onNavigate} updater={u} />);
     const dialog = screen.getByRole("dialog");
     expect(dialog.getAttribute("aria-label")).toBe("2 agents are playing");
-    // All three of the shipped choices survive: stop them now, wait for the next quit, or cancel.
+    // All four choices are reachable from console chrome too: wait for the agents to finish
+    // (STUDIO-880), stop them now, wait for the next quit, or cancel.
     fireEvent.click(within(dialog).getByRole("button", { name: "Install on next quit" }));
     expect(u.deferToQuit).toHaveBeenCalledOnce();
-    fireEvent.click(within(dialog).getByRole("button", { name: "Update now" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Update now (stops them)" }));
     expect(u.confirmInstallNow).toHaveBeenCalledOnce();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Wait, then update" }));
+    expect(u.drainThenInstall).toHaveBeenCalledOnce();
   });
 });
 

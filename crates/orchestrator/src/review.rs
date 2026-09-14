@@ -241,6 +241,9 @@ pub enum ReviewDispatchOutcome {
     /// A run for this exact (PR, reviewer) is already running or claimed — THE overwrite guard
     /// (design §14.1 F-DUP). Nothing was touched.
     AlreadyInFlight,
+    /// A drain is armed, so the daemon is taking no new work of any kind (STUDIO-880). Nothing was
+    /// touched; the row stays where it is and the sweep re-offers it once the drain is cancelled.
+    Draining,
     /// The coordinates cannot produce a review run; the payload names which.
     Refused(&'static str),
 }
@@ -265,6 +268,19 @@ impl Orchestrator {
         // §16: gated on teams.enabled, structurally, before anything is observed or written.
         if !self.teams.as_ref().is_some_and(|t| t.enabled) {
             return ReviewDispatchOutcome::TeamsOff;
+        }
+        // STUDIO-880: the drain gate's THIRD entry point. `on_tick` gates and `on_retry` parks, but
+        // `Event::ReviewSweep` reaches dispatch through here, past both. It has no production caller
+        // today (`ControlHandle::review_sweep` is unwired), so this gate is a backstop rather than a
+        // live fix — but the path exists in-tree, and forgetting the second entry point is the bug
+        // this feature already shipped once.
+        //
+        // It must refuse HERE rather than inside `dispatch_issue`: the writes below record the head
+        // as requested and mark the row in-flight, so a refusal further down would leave the watcher
+        // believing a review was dispatched and never re-offering this head. Refusing before them
+        // leaves the row exactly where it was.
+        if self.drain.is_draining() {
+            return ReviewDispatchOutcome::Draining;
         }
         if run.owner.is_empty() || run.repo.is_empty() {
             return ReviewDispatchOutcome::Refused("pull request has no owner/repo");
@@ -385,11 +401,20 @@ impl Orchestrator {
             // partial — or entirely absent — review as a complete one, because the watcher's
             // edge-trigger would then see `last_reviewed_sha == head` and never look again. The row
             // is parked NON-terminally instead, which re-arms this same head for another round.
+            // The CLASSIFICATION is the same either way — a partial read is parked non-terminally
+            // and the head is re-reviewed — but the attributed CAUSE is not. A drained review wound
+            // down at a turn boundary on purpose and burned no budget doing it; calling that "the
+            // max_turns backstop" sends whoever reads this line looking for a review that ran away.
+            let cause = if self.drain.is_draining() {
+                "wound down at a turn boundary for an armed drain"
+            } else {
+                "ended on the max_turns backstop"
+            };
             tracing::warn!(
                 review = %run.key(),
                 head = %run.head_sha,
-                "review run ended on the max_turns backstop without declaring it had finished; \
-                 recording the round as truncated so the head is reviewed again"
+                "review run {cause} without declaring it had finished; recording the round as \
+                 truncated so the head is reviewed again"
             );
             self.record_review_truncated(run);
             (store::OUTCOME_COMPLETED, "")
@@ -1102,6 +1127,101 @@ mod tests {
             row.requested_sha, HEAD_A,
             "the head that still needs reviewing is left in place"
         );
+    }
+
+    /// STUDIO-880: the third dispatch entry point refuses a drain, and refuses it BEFORE it writes.
+    ///
+    /// `handle_review_sweep` → `dispatch_review` → `dispatch_issue` reaches dispatch from
+    /// `Event::ReviewSweep`, past both `on_tick`'s gate and `on_retry`'s park. The refusal has to
+    /// come before the watch-set writes: those record the head as requested and mark the row
+    /// in-flight, and a watcher that believes a review is in flight is edge-triggered and never
+    /// offers this head again. So the assertion is on the ROW as much as on the outcome.
+    #[test]
+    fn a_draining_daemon_refuses_a_review_dispatch_and_writes_nothing() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
+
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Draining
+        );
+        assert!(
+            o.store()
+                .get_review_watch(&run.watch_key())
+                .expect("read watch row")
+                .is_none(),
+            "the refusal happened before the watch-set write, so there is no row claiming a review \
+             is in flight at this head"
+        );
+        assert!(
+            !o.running.contains_key(&run.key()) && !o.claimed.contains(&run.key()),
+            "and nothing was claimed"
+        );
+
+        // Cancelling the drain re-opens the same dispatch: a drain defers review work, it does not
+        // consume it.
+        o.drain.disarm();
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+    }
+
+    /// STUDIO-880: the SAME non-terminal parking, attributed to the right cause.
+    ///
+    /// A drained review reaches the truncation branch too — the drain ends the turn loop at a
+    /// boundary and the agent never gets to declare `HANDOFF:` — so both causes land here and the
+    /// bookkeeping is right for both. Only the log line distinguishes them, and "ended on the
+    /// max_turns backstop" sends whoever reads it looking for a review that ran away, when what
+    /// happened was an operator asking the daemon to settle.
+    #[test]
+    fn a_drained_review_is_not_logged_as_a_runaway_one() {
+        for draining in [false, true] {
+            let (mut o, _d) = orch_with_review(true);
+            let run = review_run("alice", HEAD_A);
+            o.dispatch_review(run.clone());
+            if draining {
+                o.drain
+                    .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
+            }
+
+            let (_, events) = crate::testsupport::capture_events(|| {
+                exit_review_as(&mut o, &run, false, "", false, REVIEW_STATE_FINDINGS);
+            });
+            let line = events
+                .iter()
+                .find(|e| e.message.contains("without declaring it had finished"))
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| panic!("draining={draining}: the truncation warning is gone"));
+
+            if draining {
+                assert!(
+                    line.contains("wound down at a turn boundary for an armed drain"),
+                    "a drained review must name the drain: {line}"
+                );
+                assert!(
+                    !line.contains("max_turns"),
+                    "…and must not blame the turn budget it never spent: {line}"
+                );
+            } else {
+                assert!(
+                    line.contains("ended on the max_turns backstop"),
+                    "an undrained one still names the backstop: {line}"
+                );
+            }
+
+            // The classification is identical either way — that is the point of pinning the cause
+            // rather than the outcome.
+            let row = o
+                .store()
+                .get_review_watch(&run.watch_key())
+                .expect("read watch row")
+                .expect("row exists");
+            assert_eq!(row.status, rhapsody_store::REVIEW_STATUS_TRUNCATED);
+            assert_eq!(row.requested_sha, HEAD_A);
+        }
     }
 
     /// §15-c: a review that found nothing declares `HANDOFF: approved`, and the round is recorded

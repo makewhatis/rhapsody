@@ -19,6 +19,7 @@ import { useUpdater, type Updater } from "@/hooks/useUpdater";
 import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { viewForStatus } from "@/lib/daemon-status";
+import { DrainBanner } from "./DrainBanner";
 import { FirstRunView, OnboardErrorBanner } from "./FirstRunView";
 import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
@@ -137,6 +138,7 @@ export function ConsoleApp() {
         overlayTitlebar={overlayTitlebar}
       >
         <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
+        <DrainBanner />
         <ConsoleBody
           route={route}
           teamsEnabled={teamsEnabled}
