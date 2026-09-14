@@ -664,7 +664,7 @@ needs a durable home, and the Go v0.4.0 reference — which has no review featur
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **8** |
+| `PRAGMA user_version` | 6 | **8** at this step — **9** today, see STUDIO-885 below |
 | tables | `runs`, `events`, `retry_queue`, `claims`, `totals`, `run_messages` | the same 6, byte-identical, **plus** `rhapsody_review_watch` |
 
 One row per (PR, reviewer): repository owner/name, PR **number**, the reviewing teammate, the pull
@@ -694,16 +694,18 @@ The exclusion is a name rule, not a loosened assertion. A Go-created object can 
 `rhapsody_*`, so all six ported tables stay gated byte-strictly, and a **new un-prefixed table still
 turns the golden red** — which is the correct outcome for anything that is a port of Go behaviour.
 `divergent_objects_are_gated_by_name_only` asserts exactly that: every live schema object is either
-byte-present in the committed golden or carries the prefix, and the divergent set is pinned to this
-one name. The mechanism is documented again at the top of `crates/store/src/sqlite.rs`.
+byte-present in the committed golden or carries the prefix, and the divergent set is pinned by name —
+to this one name at this step, and to both names since STUDIO-885 below. The mechanism is documented
+again at the top of `crates/store/src/sqlite.rs`.
 
 **Off is still off.** The table is created by the migration on every daemon, including one that has
 never enabled Teams, and on a Go-written database opened by Rhapsody. It is inert: the whole review
 subsystem is gated on `teams.enabled` (design §16), nothing outside that path writes a row, and an
 empty table changes no query, no endpoint and no payload. A database that Rhapsody has opened is no
 longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
-runs steps at or above its own `user_version`, so a v8 database is left alone rather than corrupted,
-and running both daemons against one file was never supported in either direction.
+runs steps at or above its own `user_version`, so a database ahead of it (v8 at this step, v9 today)
+is left alone rather than corrupted, and running both daemons against one file was never supported in
+either direction.
 
 ### A second schema table with no Go counterpart — `rhapsody_summon_watermark` (STUDIO-885)
 
