@@ -445,7 +445,7 @@ mod tests {
     use rhapsody_tracker::fake::Fake;
 
     use super::*;
-    use crate::ghenrich::apply_github_summons;
+    use crate::ghenrich::{DaemonPrLinks, apply_github_summons};
     use crate::ghsummons::{GH, PrCommentResult, RunFn, SummonSource};
     use crate::testsupport::{empty_effective, empty_resolved_project};
 
@@ -532,10 +532,16 @@ mod tests {
             .summons_since("makewhatis", "rhapsody", at - chrono::Duration::hours(1))
             .await
             .expect("the summons query succeeds");
-        apply_github_summons(vec![author_issue()], &by_pr, "makewhatis", "rhapsody")
-            .issues
-            .first()
-            .and_then(|i| i.latest_summon_at)
+        apply_github_summons(
+            vec![author_issue()],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+            &DaemonPrLinks::default(),
+        )
+        .issues
+        .first()
+        .and_then(|i| i.latest_summon_at)
     }
 
     // ── acceptance 1: a review-completion comment reopens the author's ticket ────────────────────
@@ -1145,10 +1151,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            apply_github_summons(vec![unlinked], &by_pr, "makewhatis", "rhapsody")
-                .issues
-                .first()
-                .and_then(|i| i.latest_summon_at),
+            apply_github_summons(
+                vec![unlinked],
+                &by_pr,
+                "makewhatis",
+                "rhapsody",
+                &DaemonPrLinks::default()
+            )
+            .issues
+            .first()
+            .and_then(|i| i.latest_summon_at),
             None,
             "the state move and the run re-engagement disagree, which is the reported case"
         );
@@ -1175,12 +1187,17 @@ mod tests {
             linked_prs: None,
             ..Default::default()
         };
-        let got: HashMap<_, _> =
-            apply_github_summons(vec![unlinked], &by_pr, "makewhatis", "rhapsody")
-                .issues
-                .into_iter()
-                .map(|i| (i.identifier, i.latest_summon_at))
-                .collect();
+        let got: HashMap<_, _> = apply_github_summons(
+            vec![unlinked],
+            &by_pr,
+            "makewhatis",
+            "rhapsody",
+            &DaemonPrLinks::default(),
+        )
+        .issues
+        .into_iter()
+        .map(|i| (i.identifier, i.latest_summon_at))
+        .collect();
         assert_eq!(got.get("STUDIO-999"), Some(&None));
     }
 }

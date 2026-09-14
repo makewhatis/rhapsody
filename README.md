@@ -1365,7 +1365,14 @@ ticket is one line, refreshed rather than duplicated, capped at
 `warnings::ORPHANED_REVIEW_WARN_CAP`. The endpoint's shape is unchanged and the two ported producers
 keep their golden ordering ahead of the additions.
 
-### The daemon writes the GitHub attachment its own summons routing reads (STUDIO-875)
+### The daemon links a pull request to its ticket, and routes summons off its own record (STUDIO-875, corrected by STUDIO-882)
+
+> **Read this first.** STUDIO-875 shipped this divergence on the belief that the attachment it
+> writes is what `applyGitHubSummons` reads. **It is not, and no attachment this daemon writes can
+> be.** STUDIO-882 measured the live API and moved routing to the daemon's own review watch set; the
+> write survives only as a link a person can click. The measurement and the replacement are the last
+> two subsections here — the sections between them describe the write, which still happens, and no
+> longer describe how a summons reaches a ticket.
 
 Go v0.4.0 only ever READ GitHub attachments. `applyGitHubSummons` attributes a summoning pull-request
 comment to an issue by walking that issue's `linked_prs`, which the tracker builds from the issue's
@@ -1381,11 +1388,13 @@ perfectly good token-bearing comment which is then dropped on every poll, foreve
 | Mutation | — | `attachmentLinkGitHubPR`, never the generic `attachmentLinkURL` |
 | A hit that reaches no ticket | one `continue` inside a per-tick debug line | one WARNING per (repository, ticket), naming the ticket and the repository's hit pull requests |
 
-**The mutation choice is load-bearing, not cosmetic.** `normalize`'s `isGithubPR` admits an
-attachment only when its `sourceType` is `"github"`, and that field is not caller-supplied — it comes
-from WHICH link mutation created the attachment. A generic `attachmentLinkURL` would create an
-attachment that is visible in Linear, points at the right pull request, and is still invisible to
-`linked_prs`: the original failure wearing a hat.
+**The mutation choice was believed load-bearing; it is not.** The reasoning was that `normalize`'s
+`isGithubPR` admits an attachment only when its `sourceType` is `"github"`, that the field is not
+caller-supplied — it comes from WHICH link mutation created the attachment — and that the
+GitHub-specific mutation therefore yields an admissible attachment where `attachmentLinkURL` would
+not. The premise is true and the conclusion is false: see "What the write actually produces" below.
+`attachmentLinkGitHubPR` is kept because it is the honest mutation for what is being linked, not
+because it changes what `linked_prs` sees.
 
 **A working installation pays nothing.** The control task carries the pull-request numbers the
 ticket already links in that repository; the off-loop write is skipped when the number it actually
@@ -1398,25 +1407,23 @@ this fix had first. `merged` comes from the attachment's `metadata.status`/`merg
 maintained by the tracker's GitHub integration — and this whole divergence exists because that
 integration is absent. Where nothing writes attachments, nothing refreshes them either: a link the
 daemon wrote reads `unmerged` forever, including after its pull request merges, and a gate trusting
-it would refuse the ticket's next pull request while `applyGitHubSummons` counted the ticket as
-reachable on the strength of the stale link — the original defect one round later, with the warning
-below blind to it.
+it would refuse the ticket's next pull request. (When this gate was believed to be routing, that
+staleness was also a dropped review — `applyGitHubSummons` counting the ticket as reachable on the
+strength of the stale link, with the warning below blind to it. STUDIO-882 removed the routing half;
+the watch set it moved to maintains its own liveness.)
 
 **Best-effort, and the word is exact.** A refused link never fails the review introduction or the
-quorum fan-out that was actually asked for. It costs the NEXT summons on that pull request, and it
-is retried by whatever next resolves a pull request for that ticket — another handoff, or the
-adoption sweep. That is deliberately not "every tick", and on the quorum path it is not even every
-handoff (`fan_out` returns at `AlreadyRequestedAtHead` before resolving a tracker), so the backstop
-for a link that never lands is the warning below.
+quorum fan-out that was actually asked for. Since STUDIO-882 it costs a link in the tracker's UI and
+nothing else; it is retried by whatever next resolves a pull request for that ticket — another
+handoff, or the adoption sweep.
 
 On the quorum path the URL written is `resolve_open_pr`'s result, which falls back to the ticket's
 own attachment when the `gh` lookup fails; that fallback URL came off a link the ticket already has,
 so the worst it produces is a duplicate write, never a link to the wrong pull request.
 
 Nothing depends on Linear de-duplicating the write. The gate above is what keeps a working
-installation silent; a duplicate that got through would give `linked_prs` two equal entries, which
-the summons walk attributes twice and advances once — untidy in Linear's UI, harmless to the
-routing.
+installation silent; a duplicate that got through would be two identical links in Linear's UI.
+Untidy, and nothing reads them.
 
 **The warning exists because the information already did.** The STUDIO-574 counters had been
 reporting `linked_prs_total=0 … matched=0 advanced=0` every ~35 seconds for eleven hours while three
@@ -1433,3 +1440,57 @@ warning for every unlinked in-review ticket whenever any summons anywhere in the
 or aged out: the same repetition, at WARN. The numbers stay in the line, under the name `repo_prs`,
 because on an unlinked ticket they are the only handle an operator has on the comment that was
 dropped.
+
+#### What the write actually produces (STUDIO-882, measured)
+
+The attachment lands, Linear shows it on the issue, and `linked_prs` stays empty. Read back off the
+live Linear API — the attachment the daemon wrote for STUDIO-880 at 01:36:31 on 2026-09-13, beside
+one the GitHub integration wrote on a CONNECTED repository (tally STUDIO-844):
+
+| | daemon's `attachmentLinkGitHubPR`, unconnected repo | integration, connected repo |
+| --- | --- | --- |
+| `sourceType` | `"api"` | `"github"` |
+| `metadata` | `{}` | `{ url, number, status, mergedAt, updatedAt, branch, … }` |
+| reaches `linked_prs` | no | yes |
+
+Stated exactly, because the distinction is this ticket's whole subject: what is MEASURED is that on
+an unconnected repository the mutation yields `sourceType: "api"` with empty metadata, and that a
+connected repository carries an admissible attachment written by the INTEGRATION. Whether the
+mutation itself would yield `"github"` on a connected repository is not measured here — it would
+mean writing to a production ticket to find out, and it does not change the outcome either way,
+because on a connected repository the integration has already written the attachment that counts.
+
+**So it fails twice, and the second failure is the one that matters.** `isGithubPR` rejects it on the
+`sourceType` gate; and widening that gate would still get nothing, because `linked_prs` is built by
+matching a pull-request url out of `metadata.url` — and `metadata` is empty. The coordinate is only
+in the attachment's top-level `url`, which the ported candidate queries do not even select. Widening
+would therefore mean adding a field to eight ported GraphQL queries and then building a PR
+coordinate out of a value any caller of `attachmentLinkURL` can set to anything — dismantling a
+deliberate trust boundary (the regex-from-`metadata.url` shape exists so a caller cannot inject an
+arbitrary owner/repo/number) to admit a class of attachment the daemon would then have to trust. It
+was not done.
+
+#### Where the link is read from instead (STUDIO-882)
+
+`applyGitHubSummons` takes a second source of the PR→ticket mapping: `DaemonPrLinks`, built from the
+`rhapsody_review_watch` rows this daemon wrote itself. A row exists because the daemon parked a
+ticket in a review state for a pull request it resolved on the run's own trusted repository binding;
+`introduced_by` names the ticket as `handoff:<id>` / `adopt:<id>`, read through the same
+`reviewdone::origin_ticket` that already governs the auto-done transition, and a `console:` origin
+names an operator rather than a ticket and contributes nothing.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| PR→ticket mapping | the tracker's attachments, only | the tracker's attachments, **plus** the daemon's own watch set |
+| Liveness of a link | the attachment's `merged` flag, refreshed by the integration | the watch row's `open`/`status`, refreshed by the daemon's own PR-state sweep |
+| Where a hit lands | `latest_summon_at`, unchanged | `latest_summon_at`, unchanged |
+
+This is additive: an empty index leaves the pass byte-identical to Go's, and on a connected
+repository both sources offer the same pull request and it is walked once. It also settles the
+staleness problem the write could not — the watch row's liveness is maintained by the daemon rather
+than by an integration whose absence is the premise.
+
+The trust argument is the reverse of the one against widening `isGithubPR`. A watch row's
+owner/repo/number were written by this daemon from its own resolved repository binding and are never
+taken from room text (the review design's F-SEC rule); a tracker attachment can be written by anyone
+with tracker access. The daemon's own record is the stricter source, not the looser one.
