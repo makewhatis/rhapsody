@@ -251,9 +251,10 @@ pub trait Store {
         status: &str,
     ) -> Result<(), StoreError>;
 
-    /// Records that a reviewer run ENDED without finishing its round — it burned its whole turn
-    /// budget mid-review — by parking `status` at [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER
-    /// SHA column (STUDIO-721).
+    /// Records that a reviewer run ENDED without a declared verdict — it either burned its whole
+    /// turn budget mid-review (STUDIO-721) or declared a hand-off whose payload was neither
+    /// `approved` nor a recognised rejection (STUDIO-894) — by parking `status` at
+    /// [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER SHA column.
     ///
     /// Deliberately not a `mark_review_completed` with a third status: that method's contract is to
     /// advance `last_reviewed_sha`, and advancing it here is precisely the bug — the head was read

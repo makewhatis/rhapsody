@@ -168,9 +168,22 @@ fn short_sha(sha: &str) -> &str {
 /// declared `HANDOFF: approved` (STUDIO-721; design §15-c, "approved-pauses, push-re-arms").
 pub(crate) const REVIEW_STATE_APPROVED: &str = "review:approved";
 
-/// The synthetic issue's EXIT "state" for every other declared review completion: findings were
-/// posted, or the agent declared done without a verdict this daemon recognises.
+/// The synthetic issue's EXIT "state" for a DECLARED rejection: the agent's `HANDOFF:` payload is
+/// `findings` (the wording `reviewprompt/review-base.md` instructs) or `not approved` (an older
+/// spelling this daemon still honours). Either way the reviewer said no, explicitly.
 pub(crate) const REVIEW_STATE_FINDINGS: &str = "review:findings";
+
+/// The synthetic issue's EXIT "state" when the agent emitted a `HANDOFF:` line — so
+/// [`EvWorkerExit::declared_handoff`](crate::retry::EvWorkerExit) is `true` and the max_turns
+/// backstop never fired — but its payload is neither `approved` nor a recognised rejection
+/// (STUDIO-894). A reviewer who approves in prose without the exact line the prompt asks for lands
+/// here, and so does one whose payload merely drifted from the instructed wording. Neither is
+/// `findings`: recording either one `reviewed` would silently block a pull request nobody actually
+/// asked for changes on, which is the defect this state exists to stop reproducing. See
+/// [`Orchestrator::on_review_exit`](crate::orchestrator::Orchestrator::on_review_exit) for how it is
+/// handled — the same non-terminal parking the max_turns backstop uses, logged loudly and distinctly
+/// from it.
+pub(crate) const REVIEW_STATE_UNDECLARED: &str = "review:undeclared";
 
 /// Reads a review agent's VERDICT off its final result text, as the state a review run exits in.
 ///
@@ -182,19 +195,29 @@ pub(crate) const REVIEW_STATE_FINDINGS: &str = "review:findings";
 /// ever reaching (STUDIO-716), and the review branch below is unreachable for a run with no
 /// [`ReviewRun`].
 ///
-/// The payload must be exactly `approved` (case- and whitespace-insensitive) rather than merely
-/// containing it, so that `HANDOFF: not approved` is what it says it is.
+/// Every payload compared here is an EXACT match (case- and whitespace-insensitive), never a
+/// substring — widening this to `contains` is the fail-open direction the whole function exists to
+/// refuse: it would read `HANDOFF: not approved` as an approval (STUDIO-874 leans on the strictness
+/// to avoid prose-sniffing). A payload this function does not recognise is not guessed at either
+/// way; it becomes [`REVIEW_STATE_UNDECLARED`] rather than defaulting to a rejection, which is the
+/// STUDIO-894 fix — the old default silently recorded every unrecognised payload, including a
+/// reviewer's own approval spelled slightly differently, as changes requested forever.
 pub(crate) fn review_exit_state(result_text: &str) -> &'static str {
-    let approved = result_text.lines().any(|ln| {
-        ln.trim()
-            .strip_prefix("HANDOFF:")
-            .is_some_and(|payload| payload.trim().eq_ignore_ascii_case("approved"))
-    });
-    if approved {
-        REVIEW_STATE_APPROVED
-    } else {
-        REVIEW_STATE_FINDINGS
+    let payloads: Vec<String> = result_text
+        .lines()
+        .filter_map(|ln| ln.trim().strip_prefix("HANDOFF:"))
+        .map(|payload| payload.trim().to_ascii_lowercase())
+        .collect();
+    if payloads.iter().any(|p| p == "approved") {
+        return REVIEW_STATE_APPROVED;
     }
+    if payloads
+        .iter()
+        .any(|p| p == "findings" || p == "not approved")
+    {
+        return REVIEW_STATE_FINDINGS;
+    }
+    REVIEW_STATE_UNDECLARED
 }
 
 /// The watch-set status a DECLARED review completion is recorded with, from the verdict
@@ -415,6 +438,25 @@ impl Orchestrator {
                 head = %run.head_sha,
                 "review run {cause} without declaring it had finished; recording the round as \
                  truncated so the head is reviewed again"
+            );
+            self.record_review_truncated(run);
+            (store::OUTCOME_COMPLETED, "")
+        } else if e.last_state == REVIEW_STATE_UNDECLARED {
+            // STUDIO-894: the agent DID emit a `HANDOFF:` line — the branch above did not fire —
+            // but `review_exit_state` could not read its payload as `approved` or as a declared
+            // rejection. Guessing either way is the defect this branch exists to avoid (a reviewer
+            // who approved in prose without the exact line must not be recorded `reviewed`, which
+            // would block the pull request forever since nothing then advances the head), so the
+            // round is parked exactly where the max_turns backstop above parks one: non-terminally,
+            // which re-offers this same head for another round. Logged at `error` rather than
+            // `warn` — unlike the backstop, this is not an expected shape of a clean exit, and an
+            // operator reading the log needs it to stand out from routine truncation.
+            tracing::error!(
+                review = %run.key(),
+                head = %run.head_sha,
+                "review run declared a hand-off but its payload is neither `approved` nor a \
+                 recognised rejection; recording the round as truncated rather than guessing a \
+                 verdict"
             );
             self.record_review_truncated(run);
             (store::OUTCOME_COMPLETED, "")
@@ -1129,6 +1171,59 @@ mod tests {
         );
     }
 
+    /// STUDIO-894, the acceptance criterion round-tripped through the real exit path: a reviewer
+    /// that DID declare a hand-off (so the max_turns branch above does not fire) but whose payload
+    /// is not a recognised verdict must not be recorded `reviewed`. The row is left non-terminal
+    /// (distinguishable from both `approved` and `reviewed` "in the row"), no author-facing comment
+    /// is queued (an undeclared round is not a completion), and the daemon says so loudly rather
+    /// than silently ("in the log").
+    ///
+    /// This is NOT the shape PR #161's round 3 hit — that run's own transcript emitted an explicit
+    /// `HANDOFF: findings`, a declared and correctly-parsed rejection, despite prose that concluded
+    /// "Approve." (jimmy's STUDIO-894 review, round 1). That is a reviewer-prompt ambiguity — the
+    /// binary approved/findings vocabulary has no way to say "approve, with non-blocking nits" — and
+    /// is out of scope here; see the pull request body for the follow-up. What this test pins is the
+    /// narrower, real gap this ticket is about: a `HANDOFF:` line whose payload cannot be parsed as
+    /// either verdict must not be guessed at as a rejection.
+    #[test]
+    fn an_undeclared_verdict_is_recorded_non_terminally_and_logged_loudly_not_as_changes_requested()
+    {
+        let (mut o, _d) = orch_with_review(true);
+        let mut rx = o.open_review_notify_channel();
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_UNDECLARED);
+        });
+
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("row exists");
+        assert_eq!(
+            row.status,
+            rhapsody_store::REVIEW_STATUS_TRUNCATED,
+            "an undeclared verdict must not be recorded as either approved or reviewed"
+        );
+        assert_eq!(
+            row.last_reviewed_sha, "",
+            "nothing this daemon could parse as a verdict was recorded as having been read"
+        );
+        assert!(
+            drain_notifications(&mut rx).is_empty(),
+            "an undeclared round is not a completion, so the author is not summoned over it"
+        );
+        assert!(
+            events.iter().any(|e| e.message.contains(
+                "declared a hand-off but its payload is neither `approved` nor a recognised \
+                 rejection"
+            )),
+            "the daemon must say loudly, in the log, that it would not guess a verdict: {events:?}"
+        );
+    }
+
     /// STUDIO-880: the third dispatch entry point refuses a drain, and refuses it BEFORE it writes.
     ///
     /// `handle_review_sweep` → `dispatch_review` → `dispatch_issue` reaches dispatch from
@@ -1245,7 +1340,7 @@ mod tests {
     }
 
     /// The verdict is read off the agent's OWN hand-off line, and only an exact `approved` payload
-    /// counts — so `HANDOFF: not approved` is what it says it is rather than an approval.
+    /// counts as an approval.
     #[test]
     fn only_an_exact_approved_payload_reads_as_an_approval() {
         for approving in [
@@ -1259,18 +1354,65 @@ mod tests {
                 "{approving:?}"
             );
         }
-        for not_approving in [
+    }
+
+    /// ⚠️ STUDIO-894's mutation target, pinned on its own: `HANDOFF: not approved` — the exact
+    /// phrase [`crate::automerge`]'s module docs and every reader of this function assume still
+    /// works — must keep reading as a DECLARED rejection, never as an approval and never as
+    /// undeclared. A change that loosens the approval check would flip this to an approval; a
+    /// change that narrows the rejection check to `findings` only would flip it to undeclared.
+    /// Either mutation must turn this assertion red on its own.
+    #[test]
+    fn handoff_not_approved_still_records_as_changes_requested() {
+        assert_eq!(
+            review_exit_state("HANDOFF: not approved"),
+            REVIEW_STATE_FINDINGS
+        );
+        assert_eq!(
+            review_exit_state("  HANDOFF:  Not Approved  "),
+            REVIEW_STATE_FINDINGS,
+            "case- and whitespace-insensitive, like every other payload comparison here"
+        );
+    }
+
+    /// The wording `reviewprompt/review-base.md` actually instructs for a rejection — `HANDOFF:
+    /// findings` — reads as the same declared rejection as `not approved` does.
+    #[test]
+    fn handoff_findings_records_as_changes_requested() {
+        assert_eq!(
+            review_exit_state("posted 2 findings\nHANDOFF: findings"),
+            REVIEW_STATE_FINDINGS
+        );
+    }
+
+    /// STUDIO-894, the acceptance criterion: a `HANDOFF:` line whose payload is neither `approved`
+    /// nor a recognised rejection is UNDECLARED, not a silent "changes requested". The old behaviour
+    /// defaulted every one of these — including a reviewer's own approval spelled slightly
+    /// differently — to [`REVIEW_STATE_FINDINGS`] with no signal that anything had been guessed at.
+    /// The literal PR #161 heading below is included for that reason — it pins the function's OWN
+    /// domain contract in isolation — not because it is the input that produced #161's incident: that
+    /// run's actual payload was a declared, well-formed `HANDOFF: findings`, which is (correctly)
+    /// [`REVIEW_STATE_FINDINGS`] both before and after this change (see
+    /// `handoff_findings_records_as_changes_requested` above). A result with no `HANDOFF:` line at
+    /// all falls in the same UNDECLARED bucket: this function never sees that case in production (the
+    /// `declared_handoff` check ahead of it in [`Orchestrator::on_review_exit`] intercepts it first),
+    /// but the function's own domain must not silently call it a rejection either.
+    #[test]
+    fn an_unrecognised_payload_is_undeclared_rather_than_a_guessed_rejection() {
+        for undeclared in [
+            // No `HANDOFF:` line at all — unreachable in production (`declared_handoff`
+            // intercepts it first), pinned here as the function's own domain contract.
             "",
-            "HANDOFF: not approved",
+            "## Review round 3 — @symphony: approve",
             "HANDOFF: review-posted",
             "HANDOFF: approved with nits",
             "approved",
             "I approved of the change\nHANDOFF: 3 findings",
         ] {
             assert_eq!(
-                review_exit_state(not_approving),
-                REVIEW_STATE_FINDINGS,
-                "{not_approving:?}"
+                review_exit_state(undeclared),
+                REVIEW_STATE_UNDECLARED,
+                "{undeclared:?}"
             );
         }
     }

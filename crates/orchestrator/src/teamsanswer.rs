@@ -1104,8 +1104,10 @@ fn one_line(s: &str) -> String {
 /// yet, `in_flight` means a review is running right now, and `dropped` means the pull request
 /// merged, closed or went away — and all three are reachable with an EMPTY run outcome and an EMPTY
 /// end time, which is exactly the shape that reads as "reviewed, result unknown". `truncated` is a
-/// round that ran out of turns mid-review, which the watcher records precisely so a partial review
-/// does not ship as a finished one.
+/// round that ended without a declared verdict — the agent ran out of turns mid-review (STUDIO-721)
+/// or it declared a hand-off whose payload was neither `approved` nor a recognised rejection
+/// (STUDIO-894) — which the watcher records precisely so a partial or unreadable review does not
+/// ship as a finished one.
 ///
 /// So the word "verdict:" appears for the two statuses that ARE decisions and for nothing else, and
 /// every other branch says "no verdict" in its own words. A status this daemon grows later travels
@@ -1121,9 +1123,7 @@ fn verdict_phrase(status: &str) -> String {
             "no verdict — a review was asked for and nobody has started it".to_string()
         }
         REVIEW_STATUS_IN_FLIGHT => "no verdict yet — a review is running right now".to_string(),
-        REVIEW_STATUS_TRUNCATED => {
-            "no verdict — the review ran out of turns before it finished".to_string()
-        }
+        REVIEW_STATUS_TRUNCATED => "no verdict — the review round ended without one".to_string(),
         REVIEW_STATUS_DROPPED => {
             "no verdict was recorded — the pull request left the watch set (merged, closed or gone)"
                 .to_string()
