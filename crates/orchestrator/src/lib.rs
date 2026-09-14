@@ -72,6 +72,7 @@ pub mod reviewdone;
 pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewprompt;
+pub mod reviewreconcile;
 pub mod reviewwatch;
 pub mod runautomerge;
 pub mod rundiff;

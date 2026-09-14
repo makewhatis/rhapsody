@@ -774,6 +774,15 @@ impl Orchestrator {
     pub(crate) async fn on_tick(&mut self) {
         let poll = self.poll_interval();
         self.reconcile().await;
+        // STUDIO-898: the review reconciliation sweep — compare each watched pull request's board
+        // state against its activity and REPORT any that disagree. Local reads only (the watch set
+        // + the `runs` ledger), no network, and it acts on nothing.
+        //
+        // Here, ABOVE every early return below, and deliberately so: a daemon whose dispatch is
+        // gated by a bad config, an armed drain or a dead credential is exactly a daemon whose board
+        // has quietly stopped, and that is when this report is worth the most. It also runs before
+        // the publish so the snapshot below carries the same tick's verdict.
+        self.reconcile_review_divergence();
         // Reconcile is the network-bound half of the tick AND the half that retires finished runs;
         // republish here so `/state` reflects them without waiting for fetch-candidates + dispatch
         // to finish (STUDIO-551).
@@ -1710,6 +1719,58 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STUDIO-898: `on_tick` still runs the review reconciliation sweep, and runs it ABOVE the three
+    /// gates that return early.
+    ///
+    /// Asserted on source because the property is architectural and invisible at run time. The
+    /// sweep's ONLY production seam is that one call; delete it and every behavioural test in this
+    /// crate — including the twenty-five in `reviewreconcile` — stays green while the feature is
+    /// dead. This daemon has shipped that exact shape twice (STUDIO-822, STUDIO-839), both times a
+    /// feature whose whole wiring was one line nothing pinned.
+    ///
+    /// The POSITION is half the property. Below `validate()`, the drain gate or the credential
+    /// preflight, the sweep would stop running on precisely the daemons whose boards have quietly
+    /// stopped — the state it exists to report.
+    #[test]
+    fn on_tick_runs_the_review_reconciliation_sweep_before_every_early_return() {
+        let src = include_str!("loop.rs");
+        // Assembled at run time so this test's own text is not an occurrence of what it checks for.
+        let call: String = ["self.", "reconcile_review_divergence", "()"].concat();
+
+        let start = src
+            .find("pub(crate) async fn on_tick(")
+            .expect("on_tick is still a method on this module");
+        let end = start
+            + src[start..]
+                .find("\n    }")
+                .expect("on_tick is still a braced method inside an impl block");
+        let body = &src[start..end];
+
+        let at = body.find(call.as_str()).unwrap_or_else(|| {
+            panic!(
+                "on_tick no longer runs the review reconciliation sweep; without that call the \
+                 sweep never runs in production and nothing else would fail (STUDIO-898)"
+            )
+        });
+        // Every early return below is guarded by one of these three; the sweep must precede all of
+        // them, so it must precede the FIRST of them.
+        for gate in [
+            "self.validate()",
+            "self.drain_preflight()",
+            "self.credential_preflight()",
+        ] {
+            let gate_at = body
+                .find(gate)
+                .unwrap_or_else(|| panic!("on_tick no longer consults {gate}"));
+            assert!(
+                at < gate_at,
+                "the reconciliation sweep runs at byte {at} of on_tick, AFTER {gate} at \
+                 {gate_at} — a daemon held by that gate is exactly one whose board may have \
+                 quietly stopped, and it would stop being swept (STUDIO-898)"
+            );
+        }
+    }
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::{
         DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,

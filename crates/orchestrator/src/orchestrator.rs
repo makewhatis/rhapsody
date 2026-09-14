@@ -563,6 +563,19 @@ pub struct Orchestrator {
     /// bounds how much review a pull request may be GIVEN, this one notices when it is being given
     /// none at all.
     pub(crate) review_unassignable: HashMap<String, usize>,
+    /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
+    /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
+    /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
+    /// `project_statuses` and `build_snapshot` to surface it.
+    pub(crate) review_divergence: Vec<crate::reviewreconcile::Divergence>,
+    /// How many CONSECUTIVE sweeps each reported pull request has been diverged, keyed by
+    /// `owner/repo#number` (STUDIO-898). Only the log rate-limit reads it: the crossing sweep and
+    /// the recovery say so loudly, and the steady state repeats at
+    /// [`RECONCILE_LOG_EVERY`](crate::reviewreconcile::RECONCILE_LOG_EVERY) instead of every tick.
+    ///
+    /// Separate from [`Orchestrator::review_divergence`] because it must SURVIVE a sweep that
+    /// reports the same pull request again; the vector above is replaced wholesale.
+    pub(crate) review_divergent: HashMap<String, usize>,
     /// Pull-request coordinates a console merge is currently attempting, and since when
     /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
     /// id, because two runs of one ticket share a branch and therefore share the pull request a
@@ -810,6 +823,8 @@ impl Orchestrator {
             review_rounds: HashMap::new(),
             auto_merge_announced: HashMap::new(),
             review_unassignable: HashMap::new(),
+            review_divergence: Vec::new(),
+            review_divergent: HashMap::new(),
             merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),

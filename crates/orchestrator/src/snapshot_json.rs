@@ -67,6 +67,36 @@ pub fn render(s: &Snapshot) -> Value {
             }),
         );
     }
+    // STUDIO-898: the review_divergence key is emitted ONLY when the reconciliation sweep has
+    // something to report, for the `drain` key's reason above and under the same two guards — the
+    // golden comparison plus `a_healthy_daemon_emits_no_review_divergence_key`, which asserts the
+    // ABSENCE directly so this cannot decay into an unconditional `[]` on a Go-pinned surface.
+    //
+    // The DETAIL and not just a flag, because the advisory on `/api/v1/projects` is a fixed string
+    // and an operator's next question is always "which one". Clients read
+    // `state.review_divergence?.length`.
+    if !s.review_divergence.is_empty()
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "review_divergence".to_string(),
+            Value::Array(
+                s.review_divergence
+                    .iter()
+                    .map(|d| {
+                        json!({
+                            "pr": d.pr,
+                            "kind": d.kind.as_str(),
+                            "detail": d.kind.detail(),
+                            "ticket": d.ticket,
+                            "reviewer": d.reviewer,
+                            "stale_secs": d.stale_secs,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
     out
 }
 
@@ -254,6 +284,57 @@ mod tests {
         assert!(
             rendered.get("drain").is_none(),
             "a non-draining daemon must serve the Go-identical payload, got: {rendered}"
+        );
+    }
+
+    // STUDIO-898, the same parity guard for the same reason: a healthy daemon emits NO
+    // `review_divergence` key. The sweep reports nothing on the overwhelming majority of ticks, so
+    // an unconditional `[]` here would be a Rhapsody-only key on every payload of a Go-pinned
+    // surface — and `state_json_matches_state_fixture` would keep passing if the golden were
+    // recaptured with it. This asserts the ABSENCE directly.
+    #[test]
+    fn a_healthy_daemon_emits_no_review_divergence_key() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        let rendered = render(&o.build_snapshot());
+        assert!(
+            rendered.get("review_divergence").is_none(),
+            "a healthy daemon must serve the Go-identical payload, got: {rendered}"
+        );
+    }
+
+    // And the other half: a reported divergence reaches `/api/v1/state` with enough to act on —
+    // WHICH pull request, which ticket, how it diverged and for how long. The advisory on
+    // `/api/v1/projects` is a fixed string, so this is the only surface that can say which.
+    #[test]
+    fn a_reported_divergence_reaches_state_with_its_detail() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.review_divergence = vec![crate::reviewreconcile::Divergence {
+            pr: "makewhatis/rhapsody#164".to_string(),
+            kind: crate::reviewreconcile::DivergenceKind::ChangesRequestedNoRun,
+            ticket: "STUDIO-893".to_string(),
+            reviewer: "jimmy".to_string(),
+            stale_secs: 21_600,
+        }];
+
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["review_divergence"]
+            .as_array()
+            .expect("review_divergence is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["pr"], "makewhatis/rhapsody#164");
+        assert_eq!(rows[0]["kind"], "changes_requested_no_run");
+        assert_eq!(rows[0]["ticket"], "STUDIO-893");
+        assert_eq!(rows[0]["reviewer"], "jimmy");
+        assert_eq!(rows[0]["stale_secs"], 21_600);
+        // The human sentence travels with it: a console must not have to own a copy of the wording,
+        // which is how the two drift apart.
+        assert_eq!(
+            rows[0]["detail"],
+            "a reviewer asked for changes and the ticket has had no run since"
         );
     }
 
