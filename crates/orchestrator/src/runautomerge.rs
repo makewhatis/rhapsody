@@ -59,7 +59,10 @@
 //! because the fail-open direction here is abandoning a mergeable pull request on a blip. Nothing
 //! latches: a refusal is re-decided from a fresh reading of GitHub on the next tick, exactly like
 //! the gates above it. What does not repeat is the REPORT — see [`AutoMergeLedger`], which is the
-//! only state this half keeps and holds what has been SAID rather than what GitHub answered.
+//! only state this half keeps and holds what has been SAID rather than what GitHub answered. The
+//! detail lines the gates emit on the way to a refusal go through the same verdict
+//! ([`refuse_loudly`]), because a line spoken before the ledger rules repeats however the ledger
+//! rules.
 //!
 //! A refusal is deliberately NOT surfaced outside the log as well — not on the run, not on the pull
 //! request, not the way [`CREDENTIAL_DEAD_WARNING`](crate::preflight) reaches `/api/v1/projects` per
@@ -67,7 +70,9 @@
 //! control event and takes no lock the control task takes, which is its whole containment guarantee
 //! (see the opening paragraph). Surfacing from here needs a new control event, which is a design
 //! change rather than a bug fix, and the volume problem that prompted the question is answered at
-//! its source: a stuck plan now says so once, with its reason, instead of once a minute.
+//! its source, on BOTH sides of the seam: the control task announces a plan once per head
+//! ([`crate::reviewwatch`]) and this half announces its refusal once per head and reason, where the
+//! two of them together logged 383 lines for two stuck pull requests in three hours.
 //!
 //! # BEHIND updates and re-gates; it never merges on a stale approval
 //!
@@ -177,12 +182,19 @@ pub enum AutoMergeOutcome {
 /// stops.
 pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoMergeOutcome {
     let outcome = attempt_auto_merge(plan, deps).await;
-    // Anything that is not a refusal is a change of subject, so the next refusal is news again.
-    // Done in one place rather than on each of the four such returns, because a path that forgot
-    // would go silent instead of loud and nothing would notice.
-    if !matches!(
+    // A pull request that MOVED is a change of subject, so its next refusal is news again. Done in
+    // one place rather than on each of the returns that qualify, because a path that forgot would
+    // go silent instead of loud and nothing would notice.
+    //
+    // A `Failed` deliberately does not qualify, though it is not a refusal either: nothing was
+    // learned, so the subject did not change. Forgetting on one would let a single flaky `gh pr
+    // view` between two draft ticks re-announce the same refusal, and a source flapping every
+    // other tick would restore half the noise this ledger removes. Nothing is lost by keeping it:
+    // a refusal that has genuinely cleared reappears as a `Merged`, an `Updated` or a different
+    // `why`, and all three are news on their own.
+    if matches!(
         outcome,
-        AutoMergeOutcome::Declined(_) | AutoMergeOutcome::Held(_)
+        AutoMergeOutcome::Merged(_) | AutoMergeOutcome::Updated
     ) {
         deps.ledger.forget(&plan.pr);
     }
@@ -241,14 +253,16 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     if state != MERGE_STATE_CLEAN {
         // Every other value, including one this daemon has never seen. Named in the log rather
         // than in the refusal, which is a fixed phrase.
-        tracing::info!(
-            pr = %plan.pr, %state,
-            "auto-merge: declining a pull request GitHub does not report as CLEAN"
-        );
-        return refuse(
+        return refuse_loudly(
             plan,
             deps,
             "GitHub does not report the pull request as mergeable",
+            || {
+                tracing::info!(
+                    pr = %plan.pr, %state,
+                    "auto-merge: declining a pull request GitHub does not report as CLEAN"
+                )
+            },
         );
     }
 
@@ -264,11 +278,12 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         return refuse(plan, deps, "no checks have reported on this head");
     }
     if let Some(bad) = blocking_check(&checks) {
-        tracing::info!(
-            pr = %plan.pr, check = %bad.name, state = %bad.state,
-            "auto-merge: declining on a check that is not green"
-        );
-        return refuse(plan, deps, "a check is failing or has not finished");
+        return refuse_loudly(plan, deps, "a check is failing or has not finished", || {
+            tracing::info!(
+                pr = %plan.pr, check = %bad.name, state = %bad.state,
+                "auto-merge: declining on a check that is not green"
+            )
+        });
     }
 
     // 4. Merge, pinned to the head every verdict was recorded against.
@@ -349,13 +364,12 @@ fn classify_merge_error(
         .iter()
         .find(|(marker, _)| lower.contains(marker))
     {
-        Some((_, why)) => {
+        Some((_, why)) => refuse_loudly(plan, deps, why, || {
             tracing::info!(
                 pr = %plan.pr, head = %plan.head, %err,
                 "auto-merge: GitHub refused the merge; this is a refusal, not an unreadable gate"
-            );
-            refuse(plan, deps, why)
-        }
+            )
+        }),
         None => AutoMergeOutcome::Failed(err),
     }
 }
@@ -365,6 +379,32 @@ fn classify_merge_error(
 /// See [`AutoMergeLedger`] for why the second and later reports are held rather than repeated.
 fn refuse(plan: &AutoMergePlan, deps: &AutoMergeDeps, why: &'static str) -> AutoMergeOutcome {
     deps.ledger.refuse(&plan.pr, &plan.head, why)
+}
+
+/// [`refuse`], plus a `detail` line that only the ANNOUNCED refusal emits.
+///
+/// The ledger de-duplicates what the CALLER says about an outcome; it cannot reach a `tracing`
+/// call this module makes on its own way to a refusal. Four gates want to name something their
+/// fixed refusal phrase cannot carry — the mergeable state GitHub reported, the check that is red,
+/// `gh`'s own words, the branch-update policy that would not read — and each of them holds for as
+/// long as the condition does, so speaking BEFORE the ledger has ruled is one line a minute no
+/// matter what the ledger decides. A red non-required check is the ordinary case: it leaves
+/// `mergeStateStatus` at `CLEAN`, so it is refused here and nowhere else, forever (see
+/// [`blocking_check`]).
+///
+/// `detail` therefore runs after the verdict and only on [`AutoMergeOutcome::Declined`]. It is a
+/// closure rather than a pre-formatted string so that a held refusal does no formatting at all.
+fn refuse_loudly(
+    plan: &AutoMergePlan,
+    deps: &AutoMergeDeps,
+    why: &'static str,
+    detail: impl FnOnce(),
+) -> AutoMergeOutcome {
+    let outcome = refuse(plan, deps, why);
+    if matches!(outcome, AutoMergeOutcome::Declined(_)) {
+        detail();
+    }
+    outcome
 }
 
 /// The refusal this half has already ANNOUNCED for each pull request, and the only state it keeps.
@@ -379,7 +419,10 @@ fn refuse(plan: &AutoMergePlan, deps: &AutoMergeDeps, why: &'static str) -> Auto
 /// that is stuck. So a refusal is announced when it is NEWS — the first time it is decided, and
 /// again whenever the reason or the head changes — and [`AutoMergeOutcome::Held`] otherwise.
 ///
-/// Anything that is not a refusal forgets the pull request, so the next refusal is news again.
+/// A pull request that MOVED — merged, or updated onto a new head — is forgotten, so its next
+/// refusal is news again. A [`AutoMergeOutcome::Failed`] deliberately is not, even though it is no
+/// refusal: nothing was learned, so the subject did not change, and forgetting on one would let a
+/// flaky source re-announce the same refusal every other tick.
 ///
 /// The map holds one entry per pull request this daemon has refused, which the open watch set
 /// bounds in practice; [`LEDGER_CAPACITY`] bounds it in a daemon that runs for months anyway, at a
@@ -478,15 +521,17 @@ async fn update_behind_branch(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> Aut
         // payload for a token with admin permission, so this read fails on perfectly healthy
         // repositories — and the refusal is true regardless of how it went: the branch IS behind.
         Err(e) => {
-            tracing::warn!(
-                pr = %plan.pr, err = %e,
-                "auto-merge: the branch is behind its base and the repository's branch-update \
-                 policy could not be read; declining"
-            );
-            return refuse(
+            return refuse_loudly(
                 plan,
                 deps,
                 "the branch is behind its base and the repository will not update it",
+                || {
+                    tracing::warn!(
+                        pr = %plan.pr, err = %e,
+                        "auto-merge: the branch is behind its base and the repository's \
+                         branch-update policy could not be read; declining"
+                    )
+                },
             );
         }
     }
@@ -543,6 +588,10 @@ mod tests {
     impl FakePrs {
         fn set(&self, lookup: PrLookup) {
             *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(lookup);
+        }
+        /// The source stops answering — a blip, not a verdict.
+        fn unset(&self) {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 
@@ -1527,6 +1576,79 @@ mod tests {
                 "the marker is compared against a lower-cased error ({why})"
             );
         }
+    }
+
+    /// ⚠️ The ledger de-duplicates the caller's line; it does not reach the `tracing` calls this
+    /// module makes on the way to [`refuse`]. Four gates name the detail their fixed refusal
+    /// phrase cannot carry — the mergeable state, the red check, `gh`'s own words, the unreadable
+    /// branch-update policy — and all four used to speak before the ledger had ruled, which is one
+    /// INFO line a minute for as long as the gate holds. The most reachable of them needs nothing
+    /// exotic: a red NON-REQUIRED check leaves `mergeStateStatus` at `CLEAN`, so `pr-title` going
+    /// red on an approved pull request is exactly this shape.
+    ///
+    /// So the detail is emitted THROUGH the ledger's verdict, and a held refusal says nothing at
+    /// all.
+    #[test]
+    fn a_refusals_detail_line_is_spoken_only_when_the_refusal_is() {
+        let d = deps(
+            found(HEAD, PrStatus::Open),
+            MERGE_STATE_CLEAN,
+            all_green(),
+            Arc::new(FakeMerger::default()),
+        );
+        let said = std::cell::Cell::new(0usize);
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(refuse_loudly(&plan(), &d, "a check is failing", || {
+                said.set(said.get() + 1)
+            }));
+        }
+
+        assert_eq!(
+            got,
+            vec![
+                AutoMergeOutcome::Declined("a check is failing"),
+                AutoMergeOutcome::Held("a check is failing"),
+                AutoMergeOutcome::Held("a check is failing"),
+                AutoMergeOutcome::Held("a check is failing"),
+            ]
+        );
+        assert_eq!(said.get(), 1, "four ticks, one line");
+    }
+
+    /// A transient failure learned NOTHING, so it is not a change of subject: the ledger keeps
+    /// what it has said across one. Otherwise a single flaky `gh pr view` between two draft ticks
+    /// re-announces the same refusal, and a source flapping every other tick restores half the
+    /// noise this ticket removes.
+    #[tokio::test]
+    async fn a_transient_failure_between_two_refusals_does_not_re_announce_it() {
+        let prs = found_draft(HEAD);
+        let d = AutoMergeDeps {
+            prs: Arc::clone(&prs) as Arc<dyn PrStateSource>,
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Declined(DECLINE_DRAFT)
+        );
+        prs.unset(); // the source blips
+        assert!(matches!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Failed(_)
+        ));
+        prs.set(snapshot(HEAD, PrStatus::Open, true));
+
+        assert_eq!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Held(DECLINE_DRAFT),
+            "the same refusal, already announced"
+        );
     }
 
     /// The ledger's whole contract, which is about what is SAID and never about what is decided:
