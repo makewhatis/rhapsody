@@ -494,8 +494,9 @@ fn field(value: &str, o: Origin) -> String {
 /// avoid. The mark is only ever appended — `<value> [origin]` stays byte-identical for the
 /// implemented harnesses that are the overwhelmingly common case, so a mark means something.
 ///
-/// The inherit branch above is deliberately UNMARKED, including when `agent.backend` itself names
-/// a harness this build cannot run: the mark's justification is `spawn_worker`'s silent fallback,
+/// The empty-`harness` branch is deliberately UNMARKED, including when `agent.backend` itself
+/// names a harness this build cannot run: the mark's justification is `spawn_worker`'s silent
+/// fallback,
 /// and there is none here — `runner_for_backend` rejecting the backend makes `build_effective`
 /// fail and the daemon refuses to boot, and `validate` rejects an unknown name outright, so both
 /// are loud and a second report would only be noisier.
