@@ -40,8 +40,8 @@ pub enum LinearErrorKind {
     MilestoneNotFound,
     /// `linear_viewer_unresolved` — the `viewer` query returned no user id for the API key.
     ViewerUnresolved,
-    /// `linear_duplicate_attachment` — `attachmentLinkGitHubPR` was refused because the same
-    /// (issue, url) is already attached. **Rhapsody-only, and not a failure**: the post-condition
+    /// `linear_duplicate_attachment` — `attachmentLinkGitHubPR` was refused because this issue
+    /// already links this pull request. **Rhapsody-only, and not a failure**: the post-condition
     /// the caller cares about is "the ticket links this pull request", and a duplicate refusal
     /// proves it. See [`classify_graphql_errors`].
     DuplicateAttachment,
@@ -206,7 +206,8 @@ mod tests {
 
     /// The payload is the one the live tracker answered STUDIO-902's second run with, verbatim
     /// (`~/.rhapsody/logs/rhapsodyd.2026-09-15.log`, 05:33). Its shape — `INPUT_ERROR` on the
-    /// `attachmentLinkGitHubPR` path — is what the classifier keys on.
+    /// `attachmentLinkGitHubPR` path **and** this top-level `message` — is what the classifier keys
+    /// on.
     const DUPLICATE_ATTACHMENT_ERRORS: &str = r#"[
       {
         "extensions": {

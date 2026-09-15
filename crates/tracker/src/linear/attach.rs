@@ -125,7 +125,7 @@ struct AttachmentIdNode {
 ///
 /// The one refusal that is NOT an error is a duplicate: Linear answering
 /// [`INPUT_ERROR` + `attachmentLinkGitHubPR` + the duplicate message](LinearErrorKind::DuplicateAttachment)
-/// means the same (issue, url) is already attached, so the link landed — just not from this call.
+/// means this issue already links this pull request, so the link landed — just not from this call.
 /// The message coordinate is what keeps this from absorbing the rest of `INPUT_ERROR`, which is
 /// Linear's general user-error bucket for the mutation. See the module doc's "Repeats".
 pub(super) async fn link_pull_request(
