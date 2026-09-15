@@ -136,6 +136,39 @@ impl crate::Runner for Runner {
     }
 }
 
+/// Claude's declared capabilities (STUDIO-900; design record
+/// `~/.rhapsody/docs/pluggable-harnesses-design.md` §3), matching what this file actually does
+/// rather than the CLI's documentation: `events` and `tool_naming` per §3's `[RAN]` capture
+/// (`mcp__symphony__symphony_state`); `steering: Live` per the INF-250 mailbox above; `resume:
+/// Flags` per `--resume <thread_id>` (`build_args`); `mcp: true` and `sandbox: ToolAllowlist` per
+/// `allowed_tools`/`disallowed_tools` (independent of each other for Claude — the mcp/sandbox
+/// exclusivity defect this crate's `harness` module defers to slice 5 is a codex-only constraint);
+/// `usage: Tokens` (no dollar cost in Claude's `Usage`); `budgets: false` (the turn deadline above
+/// is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per the mailbox.
+const CAPABILITIES: crate::harness::HarnessCapabilities = crate::harness::HarnessCapabilities {
+    events: crate::harness::EventFidelity::Structured {
+        tool_level: crate::harness::ToolEventGranularity::FileLevel,
+    },
+    steering: crate::harness::Steering::Live,
+    resume: crate::harness::Resume::Flags,
+    mcp: true,
+    sandbox: crate::harness::Sandbox::ToolAllowlist,
+    usage: crate::harness::UsageDetail::Tokens,
+    budgets: false,
+    tool_naming: crate::harness::ToolNaming::McpDoubleUnderscore,
+    stdin: crate::harness::StdinPolicy::HeldOpen,
+};
+
+impl crate::harness::Harness for Runner {
+    fn id(&self) -> crate::harness::HarnessId {
+        crate::harness::HarnessId::Claude
+    }
+
+    fn capabilities(&self) -> &crate::harness::HarnessCapabilities {
+        &CAPABILITIES
+    }
+}
+
 /// One live Claude conversation for one issue (Go `session`). Per-turn state that Go mutates on the
 /// value receiver (`turnN`, `threadID`, the transcript sink, the warn-once flag) lives behind
 /// interior mutability here because the [`Session`] trait's `run_turn` takes `&self`.
@@ -2314,5 +2347,38 @@ mod tests {
             msg, "turn_failed: exit status: 1: error: unknown model\n",
             "an unrouted run's failure text must be unchanged"
         );
+    }
+
+    // STUDIO-900: Claude is re-expressed behind the pluggable-harnesses contract. This pins the
+    // declared identity/capabilities rather than just the fact that `Runner` implements `Harness`
+    // (the compiler already enforces that); a mutation that routed the claude backend through the
+    // wrong `HarnessId` or reported a capability Claude does not actually have would pass every
+    // other test in this file while failing only this one.
+    #[test]
+    fn claude_runner_declares_its_identity_and_capabilities() {
+        use crate::harness::{
+            EventFidelity, Harness, HarnessId, Resume, Sandbox, StdinPolicy, Steering,
+            ToolEventGranularity, ToolNaming, UsageDetail,
+        };
+        let r = Runner::new(Config::default());
+        assert_eq!(r.id(), HarnessId::Claude);
+        let caps = r.capabilities();
+        assert_eq!(
+            caps.events,
+            EventFidelity::Structured {
+                tool_level: ToolEventGranularity::FileLevel
+            }
+        );
+        assert_eq!(caps.steering, Steering::Live, "INF-250 holds stdin open");
+        assert_eq!(caps.resume, Resume::Flags, "--resume <thread_id>");
+        assert!(caps.mcp, "the daemon's MCP server is injected by default");
+        assert_eq!(caps.sandbox, Sandbox::ToolAllowlist);
+        assert_eq!(caps.usage, UsageDetail::Tokens, "no dollar cost reported");
+        assert!(
+            !caps.budgets,
+            "the daemon's turn deadline is not a CLI budget"
+        );
+        assert_eq!(caps.tool_naming, ToolNaming::McpDoubleUnderscore);
+        assert_eq!(caps.stdin, StdinPolicy::HeldOpen);
     }
 }
