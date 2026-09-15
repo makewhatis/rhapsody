@@ -20,9 +20,15 @@
 
 pub mod claude;
 pub mod fake;
+pub mod harness;
 pub mod humanize;
 pub mod proctree;
 
+pub use harness::{
+    EventFidelity, Harness, HarnessCapabilities, HarnessId, HarnessKnobs, HarnessSpec, Provider,
+    ProviderAuth, Resume, Sandbox, StdinPolicy, Steering, ToolEventGranularity, ToolNaming,
+    UsageDetail,
+};
 pub use humanize::{LogEntry, humanize_stream_line};
 
 use async_trait::async_trait;
@@ -244,6 +250,12 @@ pub trait Session: Send + Sync {
 pub trait Runner: Send + Sync {
     /// Prepares a session whose subprocess(es) run with the given absolute workspace path as cwd
     /// (upstream §10.1, §10.2). A `None` transcript disables local raw-output logging.
+    ///
+    /// **Child stdin is per-harness, not a shared assumption** (`harness::StdinPolicy`,
+    /// STUDIO-900): Claude requires it held open as the INF-250 operator-message mailbox
+    /// (`claude::runner`'s `ClaudeSession::run_turn`), while codex hangs forever if it is (design
+    /// record `~/.rhapsody/docs/pluggable-harnesses-design.md` §7.2). An implementation of this
+    /// trait owns that decision for its own child process; nothing here defaults it.
     async fn start_session(
         &self,
         workspace_path: &str,

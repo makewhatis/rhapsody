@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rhapsody_agent::{Runner, claude};
+use rhapsody_agent::{HarnessId, HarnessKnobs, HarnessSpec, Runner, claude};
 use rhapsody_config::{Config, EffectiveConfig, effective_for, resolve_projects};
 use rhapsody_core::normalize_state;
 use rhapsody_tracker::{self as tracker, Tracker};
@@ -187,28 +187,57 @@ impl Effective {
     }
 }
 
-/// Builds an [`Runner`] from a [`claude::Config`]. The injectable seam that lets
+/// Builds a [`Runner`] from a [`HarnessSpec`] (STUDIO-900; design record
+/// `~/.rhapsody/docs/pluggable-harnesses-design.md` §3/§9). The injectable seam that lets
 /// [`build_effective_with_runner`] construct one runner per resolved project (and the top-level
-/// legacy runner) while tests assert which [`claude::Config`] each project receives. Mirrors Go's
-/// `runnerFactory func(claude.Config) agent.Runner`.
-pub type RunnerFactory<'a> = &'a dyn Fn(claude::Config) -> Arc<dyn Runner>;
+/// legacy runner) while tests assert which spec each project receives. Mirrors Go's
+/// `runnerFactory func(claude.Config) agent.Runner`, generalized: the factory used to be typed to
+/// Claude's own config (design §1.2's "the seam cannot construct a non-Claude runner"); it now
+/// takes the harness-agnostic spec, though `"claude"` remains the only backend
+/// [`runner_for_backend`] implements — see that function's doc.
+pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Runner>;
 
 /// The production seam: build a claude runner. Mirrors Go `defaultRunnerFactory` (`claude.New`).
-fn default_runner_factory(cc: claude::Config) -> Arc<dyn Runner> {
+///
+/// [`HarnessKnobs`] has exactly one variant today, so this destructures it directly rather than
+/// matching — the moment a second variant exists, this line stops compiling instead of silently
+/// falling through a wildcard arm.
+fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Runner> {
+    let HarnessKnobs::Claude(cc) = spec.knobs;
     Arc::new(claude::Runner::new(cc))
 }
 
 /// Maps a (materialized) [`Config`] onto an [`Runner`] via the named backend, returning
 /// [`OrchestratorError::UnsupportedBackend`] for any backend this build does not implement. Both the
 /// top-level legacy runner and every per-project runner route through this single switch. Today
-/// only `"claude"` is implemented. Mirrors Go `runnerForBackend`.
+/// only `"claude"` is implemented — STUDIO-900 generalized the SHAPE the factory is called with
+/// (a [`HarnessSpec`], not a bare [`claude::Config`]) without changing which backend names this
+/// function accepts; see this module's top-of-file doc and `implemented_backend_is_a_known_harness_name`
+/// below for why "recognized by config" and "implemented here" stay two different questions on
+/// purpose. Mirrors Go `runnerForBackend`.
 fn runner_for_backend(
     cfg: &Config,
     new_runner: RunnerFactory<'_>,
 ) -> Result<Arc<dyn Runner>, OrchestratorError> {
     match cfg.agent.backend.as_str() {
-        "claude" => Ok(new_runner(claude_config_from_cfg(cfg))),
+        "claude" => Ok(new_runner(harness_spec_from_cfg(cfg))),
         other => Err(OrchestratorError::UnsupportedBackend(other.to_string())),
+    }
+}
+
+/// Wraps [`claude_config_from_cfg`]'s (untouched) mapping in a [`HarnessSpec`] (STUDIO-900).
+/// `model`/`provider` are `None`: Claude's equivalent values already live inside the `knobs` block
+/// this builds, and nothing here resolves them independently yet — that is slice 4's dispatch-time
+/// resolution chain (design §4.1), deliberately not done by this slice (see `crates/agent/src/harness.rs`'s
+/// module doc). Because this is the ONLY place a [`HarnessSpec`] is built, and it wraps the exact
+/// [`claude::Config`] the pre-STUDIO-900 code passed straight to [`claude::Runner::new`], the argv
+/// [`claude::args::build_args`] produces from it is unchanged.
+fn harness_spec_from_cfg(cfg: &Config) -> HarnessSpec {
+    HarnessSpec {
+        harness: HarnessId::Claude,
+        model: None,
+        provider: None,
+        knobs: HarnessKnobs::Claude(claude_config_from_cfg(cfg)),
     }
 }
 
@@ -709,7 +738,9 @@ claude:
 ";
         let cfg = decode_cfg(WF, "top prompt body");
         let got_configs: RefCell<Vec<claude::Config>> = RefCell::new(Vec::new());
-        let factory = |cc: claude::Config| -> Arc<dyn Runner> {
+        let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
+            assert_eq!(spec.harness, HarnessId::Claude);
+            let HarnessKnobs::Claude(cc) = spec.knobs;
             got_configs.borrow_mut().push(cc.clone());
             Arc::new(claude::Runner::new(cc))
         };
@@ -750,7 +781,9 @@ claude:
     fn single_project_runner_uses_top_level() {
         let cfg = decode_cfg(CLAUDE_WF, "Do {{ issue.identifier }}.");
         let got_configs: RefCell<Vec<claude::Config>> = RefCell::new(Vec::new());
-        let factory = |cc: claude::Config| -> Arc<dyn Runner> {
+        let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
+            assert_eq!(spec.harness, HarnessId::Claude);
+            let HarnessKnobs::Claude(cc) = spec.knobs;
             got_configs.borrow_mut().push(cc.clone());
             Arc::new(claude::Runner::new(cc))
         };
