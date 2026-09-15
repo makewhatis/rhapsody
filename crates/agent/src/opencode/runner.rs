@@ -521,6 +521,22 @@ impl Session for OpencodeSession {
                                     // Per-STEP: summed, never replaced (see `super::parse`).
                                     add_usage(&mut usage, &step);
                                 }
+                                let mut ev = c.event.clone();
+                                ev.pid = pid as i64;
+                                // ⚠️ A usage-bearing NOTIFICATION must carry the RUNNING TURN TOTAL,
+                                // not this step's own figures. The orchestrator's live estimate is
+                                // LAST-WINS, not additive (`agentupdate.rs`: "the assistant
+                                // message.usage is CUMULATIVE-within-the-turn, so the LATEST
+                                // snapshot already IS the current turn total"). Claude satisfies
+                                // that because its per-message usage really is cumulative; opencode's
+                                // `step_finish.tokens` is PER STEP and resets every step, so passing
+                                // it through unchanged would make the dashboard's live token count
+                                // jump DOWN at each step boundary and finish reporting one step
+                                // instead of the turn. Substituting the accumulator restores the
+                                // contract the consumer documents.
+                                if c.step_usage.is_some() {
+                                    ev.usage = Some(usage);
+                                }
                                 if !c.text.is_empty() {
                                     result_text = c.text.clone();
                                 }
@@ -529,8 +545,6 @@ impl Session for OpencodeSession {
                                     failure.get_or_insert(f);
                                 }
                                 if c.ok {
-                                    let mut ev = c.event.clone();
-                                    ev.pid = pid as i64;
                                     on_event(ev);
                                 }
                                 if c.terminal {
@@ -787,7 +801,7 @@ impl CappedBuffer {
 mod tests {
     use super::*;
     use crate::opencode::testdir::TempDir;
-    use crate::{ENV_GUARD, Runner as _};
+    use crate::{ENV_GUARD, EVENT_NOTIFICATION, Runner as _};
     use std::sync::Arc;
 
     /// A fake `opencode` that reproduces the ONE failure this adapter exists to prevent.
@@ -1017,6 +1031,66 @@ exit 0
             "stderr must carry the real reason: {:?}",
             String::from_utf8_lossy(&lost.stderr)
         );
+    }
+
+    // ⚠️ The live token estimate must only ever go UP, and must finish at the turn total.
+    //
+    // The consumer (`rhapsody_orchestrator::agentupdate`) treats a notification's usage as
+    // LAST-WINS, not additive, because claude's per-message usage is cumulative within a turn.
+    // opencode's `step_finish.tokens` is PER STEP and resets every step, so forwarding it unchanged
+    // would make the dashboard's live count fall at each step boundary and settle on one step's
+    // figures. This pins the substitution that fixes it — and it is a regression test for a real
+    // defect found by running the adapter against the live CLI, not a hypothetical.
+    #[tokio::test]
+    async fn live_usage_notifications_are_the_running_total_not_one_step() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        // Three steps of 10 billed tokens each: 6 in + 3 out + 1 reasoning (folded into output).
+        // A raw string keeps the JSON's own quotes readable; `{reason}` is substituted by
+        // `replace` rather than `format!` so no brace in the JSON needs doubling.
+        let step = |reason: &str| {
+            const TMPL: &str = r#"printf '{"type":"step_finish","sessionID":"ses_x","part":{"reason":"REASON","tokens":{"total":10,"input":6,"output":3,"reasoning":1,"cache":{"write":0,"read":0}}}}\n'
+"#;
+            TMPL.replace("REASON", reason)
+        };
+        let body = format!(
+            "{}{}{}",
+            step("tool-calls"),
+            step("tool-calls"),
+            step("stop")
+        );
+        let script = write_script(&scripts, "steps.sh", &body);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+
+        let live: Vec<i64> = events_of(&seen)
+            .iter()
+            .filter(|e| e.event_type == EVENT_NOTIFICATION)
+            .filter_map(|e| e.usage.map(|u| u.total_tokens))
+            .collect();
+        assert_eq!(
+            live,
+            vec![10, 20, 30],
+            "each notification must carry the RUNNING total, not its own step's 10"
+        );
+        assert_eq!(
+            tr.usage.total_tokens, 30,
+            "and the committed turn total is the sum of every step"
+        );
+        // The invariant stated plainly: a last-wins consumer reading only the final notification
+        // must land on the same number the turn commits.
+        assert_eq!(live.last().copied(), Some(tr.usage.total_tokens));
     }
 
     // ⚠️ The empty-stream case as the RUNNER sees it: "stream ended with no terminal event" must be
