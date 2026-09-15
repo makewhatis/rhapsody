@@ -34,8 +34,10 @@
 //!    back — even a richer one — would reintroduce the defect this fix removes.
 //! 3. **`Resume` assumed continuation differs only by flags.** Codex resumes via a subcommand with a
 //!    positional id (`codex exec resume <thread_id>`), not a flag `claude`/`opencode` share
-//!    (`--resume <id>` / `-s <id>`). **Fixed**: [`Resume`] has a `Subcommand` variant alongside
-//!    `Flags`, so the shape can name the difference instead of forcing every harness through one.
+//!    (`--resume <id>` / `-s <id>`). **Fixed for codex, NOT for goose** (see the STUDIO-872 section
+//!    below — this fix is not the full close of the defect): [`Resume`] has a `Subcommand` variant
+//!    alongside `Flags`, so the shape can name codex's difference instead of forcing every harness
+//!    through one.
 //! 4. **`EventFidelity::Structured { tool_level: bool }` couldn't separate opencode from codex**
 //!    (opencode emits typed `read`/`edit`/`bash` events; codex has no file-level events at all — it
 //!    shells `cat`/`printf`, so everything is `command_execution`). **Fixed**: `tool_level` is now
@@ -46,6 +48,27 @@
 //! (§7.2). **Fixed**: [`HarnessCapabilities::stdin`] ([`StdinPolicy`]) declares which a harness
 //! needs, and [`crate::Runner::start_session`]'s own doc comment now states that the requirement is
 //! per-harness, not a shared assumption.
+//!
+//! ## STUDIO-872 (goose over ACP) widened the list after §3 and STUDIO-869 were both written
+//!
+//! STUDIO-872's spike (**[RAN]**, 2026-09-12) found goose defeats two more shapes that the four
+//! defects above do not cover, because that spike ran after STUDIO-869 named them. Recorded here so
+//! "Fixed" above is not read as the full story:
+//!
+//! - **`Resume` still doesn't fit, even with `Subcommand`.** goose resumes via `session/load
+//!   {sessionId, cwd, mcpServers}` — a *protocol method* over the SAME argv (`goose acp` on every
+//!   turn), not a subcommand and not a flag. STUDIO-872 §7 concludes codex and goose together
+//!   "retire `SameFlags | Narrowed | None` entirely," and this slice's fix only carries the codex
+//!   half of that. **Deferred to slice 9** — a protocol-call case belongs with the goose adapter
+//!   that can validate it, not guessed at here with nothing to test it against. Separately, and for
+//!   the same "nothing to validate it against" reason, §3's own `Resume::Narrowed { drops }` variant
+//!   is dropped rather than carried forward: no measured harness (STUDIO-869 or STUDIO-872)
+//!   exercises a resume that narrows scope.
+//! - **[`ToolNaming`]'s three variants have no case for goose.** goose's real tool name lives in a
+//!   vendor `_meta.goose.toolCall.toolName` field; ACP's own standard `title` field is lossy human
+//!   prose ("goose: goose state"), not a name a prompt template can address. **Deferred to slice
+//!   9** for the same reason as `Resume` above — a fourth variant added now, with no adapter to
+//!   exercise it, would be a guess about ACP's shape rather than a measured one.
 //!
 //! ## What this slice deliberately does NOT do
 //!
@@ -61,6 +84,8 @@
 //!   per-run-isolated session id can still serve as an identity key) is store/runs-schema territory
 //!   (design §6.2, slice 3), and no type in this module carries or interprets one. Nothing here
 //!   assumes a resolution either way.
+
+use std::fmt;
 
 use crate::Runner;
 
@@ -83,11 +108,24 @@ pub struct Provider {
 }
 
 /// How a [`Provider`] authenticates. `ApiKey` carries the credential itself (design §4.5: the
-/// daemon does not write provider configs, so this is passed through, never stored).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// daemon does not write provider configs, so this is passed through, never stored). `Debug` is
+/// hand-written to redact the key — the repo's convention for a secret-bearing type
+/// (`crates/orchestrator/src/reads.rs`'s `ReadsTarget` masks the same way) — because `HarnessSpec`
+/// derives `Debug` transitively and a future `tracing::debug!(?spec)` must never write a raw
+/// credential to the rotating file logs.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderAuth {
     ApiKey(String),
     None,
+}
+
+impl fmt::Debug for ProviderAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.write_str("ApiKey(***)"),
+            Self::None => f.write_str("None"),
+        }
+    }
 }
 
 /// The per-harness opaque knob block (design §4.2: "a normalized core plus an opaque per-harness
@@ -144,12 +182,14 @@ pub enum Steering {
     None,
 }
 
-/// How a harness continues a prior conversation (design §3, fixed per defect 3). `Flags` covers
-/// claude (`--resume <id>`) and opencode (`-s <id>`) — genuinely the same shape, an unchanged flag
-/// added to an otherwise-normal invocation. `Subcommand` covers codex (`codex exec resume
-/// <thread_id>`), whose continuation is a different positional-argument invocation shape entirely,
-/// not an extra flag on the same one. Collapsing these into one `SameFlags` variant (the original
-/// §3 shape) is exactly the defect being fixed.
+/// How a harness continues a prior conversation (design §3, defect 3 — fixed for codex, NOT for
+/// goose; see the module doc's STUDIO-872 section). `Flags` covers claude (`--resume <id>`) and
+/// opencode (`-s <id>`) — genuinely the same shape, an unchanged flag added to an otherwise-normal
+/// invocation. `Subcommand` covers codex (`codex exec resume <thread_id>`), whose continuation is a
+/// different positional-argument invocation shape entirely, not an extra flag on the same one.
+/// Collapsing these into one `SameFlags` variant (the original §3 shape) was the defect codex
+/// motivated fixing — but goose's `session/load` protocol-method resume fits neither variant here,
+/// so this enum does not yet cover every harness the design names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resume {
     None,
@@ -177,6 +217,8 @@ pub enum UsageDetail {
 /// How a harness spells an injected MCP tool name in its own event/tool-call vocabulary (design §3:
 /// "three harnesses, three spellings," [RAN] against real CLIs). Prompt text naming a tool must be
 /// templated per this value, or an agent is instructed to call a tool name that does not exist.
+/// Covers claude/opencode/codex only — goose's `_meta.goose.toolCall.toolName` spelling has no case
+/// here yet (module doc's STUDIO-872 section).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolNaming {
     /// `mcp__<server>__<tool>` (claude).
@@ -229,4 +271,25 @@ pub struct HarnessCapabilities {
 pub trait Harness: Runner {
     fn id(&self) -> HarnessId;
     fn capabilities(&self) -> &HarnessCapabilities;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A `{:?}` on a `ProviderAuth::ApiKey` must never print the credential it carries — `Debug`
+    // is hand-written specifically to redact it (see the doc comment on `ProviderAuth`), and the
+    // derive that would print it is the mistake this test catches on any regression back to it.
+    #[test]
+    fn provider_auth_debug_redacts_the_api_key() {
+        let secret = ProviderAuth::ApiKey("sk-super-secret-value".to_string());
+        let rendered = format!("{secret:?}");
+        assert!(
+            !rendered.contains("sk-super-secret-value"),
+            "Debug output leaked the raw key: {rendered}"
+        );
+        assert_eq!(rendered, "ApiKey(***)");
+
+        assert_eq!(format!("{:?}", ProviderAuth::None), "None");
+    }
 }

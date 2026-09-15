@@ -147,8 +147,14 @@ impl crate::Runner for Runner {
 /// Flags` per `--resume <thread_id>` (`build_args`); `mcp: true` and `sandbox: ToolAllowlist` per
 /// `allowed_tools`/`disallowed_tools` (independent of each other for Claude — the mcp/sandbox
 /// exclusivity defect this crate's `harness` module defers to slice 5 is a codex-only constraint);
-/// `usage: Tokens` (no dollar cost in Claude's `Usage`); `budgets: false` (the turn deadline above
-/// is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per the mailbox.
+/// `usage: TokensAndCost` — the harness itself reports cost: the committed
+/// `harness/harness-spike/claude/happy.jsonl` capture's `result` line carries `total_cost_usd`
+/// (`STUDIO-869-harness-spike-findings.md` §2, `[RAN]`), even though the `Usage` struct this crate
+/// currently populates (`lib.rs`) has no cost field yet — extracting `total_cost_usd` into `Usage`
+/// is unstarted, adapter-owned work (design §3's "usage extraction is the adapter's job") that
+/// belongs to slice 5/§7.4's spend-budget routing, not this slice; `budgets: false` (the turn
+/// deadline above is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per
+/// the mailbox.
 const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     events: EventFidelity::Structured {
         tool_level: ToolEventGranularity::FileLevel,
@@ -157,7 +163,7 @@ const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     resume: Resume::Flags,
     mcp: true,
     sandbox: Sandbox::ToolAllowlist,
-    usage: UsageDetail::Tokens,
+    usage: UsageDetail::TokensAndCost,
     budgets: false,
     tool_naming: ToolNaming::McpDoubleUnderscore,
     stdin: StdinPolicy::HeldOpen,
@@ -2373,7 +2379,11 @@ mod tests {
         assert_eq!(caps.resume, Resume::Flags, "--resume <thread_id>");
         assert!(caps.mcp, "the daemon's MCP server is injected by default");
         assert_eq!(caps.sandbox, Sandbox::ToolAllowlist);
-        assert_eq!(caps.usage, UsageDetail::Tokens, "no dollar cost reported");
+        assert_eq!(
+            caps.usage,
+            UsageDetail::TokensAndCost,
+            "the harness reports total_cost_usd, even though Usage does not extract it yet"
+        );
         assert!(
             !caps.budgets,
             "the daemon's turn deadline is not a CLI budget"
