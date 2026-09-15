@@ -11,7 +11,7 @@
 //! [`ResolvedProject::tracker`] (pointer identity is asserted by the tests) and every project shares
 //! the one workspace manager.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +106,11 @@ pub struct ResolvedProject {
     pub gh_repo: String,
 
     pub agent: Arc<dyn Runner>,
+    /// One runner per implemented `agent.backend`, so a routed teammate whose profile names a
+    /// `harness` runs on that one while every other teammate keeps [`Self::agent`] (STUDIO-902).
+    /// Always populated; [`Self::agent`] remains the configured backend's runner and is what every
+    /// dispatch that names no harness uses, which is what keeps this additive.
+    pub agents: BTreeMap<String, Arc<dyn Runner>>,
     pub workspace: Arc<Manager>,
 }
 
@@ -116,6 +121,11 @@ pub struct Effective {
     pub tracker: Arc<dyn Tracker>,
     pub workspace: Arc<Manager>,
     pub agent: Arc<dyn Runner>,
+    /// One runner per implemented `agent.backend`, so a routed teammate whose profile names a
+    /// `harness` runs on that one while every other teammate keeps [`Self::agent`] (STUDIO-902).
+    /// Always populated; [`Self::agent`] remains the configured backend's runner and is what every
+    /// dispatch that names no harness uses, which is what keeps this additive.
+    pub agents: BTreeMap<String, Arc<dyn Runner>>,
     pub prompt_tmpl: String,
     pub active_states: HashSet<String>,
     pub terminal_states: HashSet<String>,
@@ -225,6 +235,37 @@ fn runner_for_backend(
         "claude" | "opencode" => Ok(new_runner(harness_spec_from_cfg(cfg))),
         other => Err(OrchestratorError::UnsupportedBackend(other.to_string())),
     }
+}
+
+/// The `agent.backend` names [`runner_for_backend`] can actually build. A superset of what any one
+/// installation uses: every one of these gets a runner in [`runners_by_harness`] so a teammate
+/// profile can name one (STUDIO-902). `codex` is absent because no runner exists for it — which is
+/// the same "recognized by config, not implemented here" split `rhapsody_config::HARNESS_NAMES`
+/// documents, and `implemented_backends_are_known_harness_names` pins.
+pub(crate) const IMPLEMENTED_BACKENDS: &[&str] = &["claude", "opencode"];
+
+/// Builds one runner per [`IMPLEMENTED_BACKENDS`] entry, so a dispatch can SELECT a harness without
+/// constructing anything (STUDIO-902).
+///
+/// Every runner is built, not only the configured one, because construction is pure — `Runner::new`
+/// for both backends just materializes defaults — while doing it at dispatch would mean holding the
+/// `Config` and the factory past the reload that produced them. ⚠️ Building an opencode runner on an
+/// installation that never configured one is harmless precisely because nothing is provisioned
+/// until `start_session`, which is also where a missing credential is refused.
+///
+/// This is deliberately SELECTION over a fixed set, not slice 4's resolution chain: see
+/// `rhapsody_config::profiles`'s module doc for exactly what is deferred.
+fn runners_by_harness(
+    cfg: &Config,
+    new_runner: RunnerFactory<'_>,
+) -> BTreeMap<String, Arc<dyn Runner>> {
+    let mut out = BTreeMap::new();
+    for name in IMPLEMENTED_BACKENDS {
+        let mut c = cfg.clone();
+        (*name).clone_into(&mut c.agent.backend);
+        out.insert((*name).to_string(), new_runner(harness_spec_from_cfg(&c)));
+    }
+    out
 }
 
 /// Wraps [`claude_config_from_cfg`]'s (untouched) mapping in a [`HarnessSpec`] (STUDIO-900).
@@ -425,6 +466,7 @@ pub fn build_effective_with_runner(
     // runners are built below from each project's effective config, routed through the same
     // `runner_for_backend` switch so both paths share one backend gate.
     let runner = runner_for_backend(cfg, new_runner)?;
+    let top_agents = runners_by_harness(cfg, new_runner);
 
     // The top-level (legacy/nil-rp) stall timeout; per-project stall timeouts are computed from each
     // project's materialized claude config below. Only the claude backend carries a stall timeout
@@ -490,6 +532,7 @@ pub fn build_effective_with_runner(
         // so the per-project runner == the top-level runner (backward compat).
         let mcfg = materialize_config(cfg, &rp.eff);
         let project_runner = runner_for_backend(&mcfg, new_runner)?;
+        let project_agents = runners_by_harness(&mcfg, new_runner);
         let github_summons = mcfg.tracker.github_summons;
 
         // github-summons routing (AIE-299): parse owner/repo from the project repo once. Inert when
@@ -525,6 +568,7 @@ pub fn build_effective_with_runner(
             stall_timeout: Duration::from_millis(rp.eff.claude.stall_timeout_ms.max(0) as u64),
             mcfg,
             agent: project_runner,
+            agents: project_agents,
             workspace: Arc::clone(&wm),
         });
     }
@@ -533,6 +577,7 @@ pub fn build_effective_with_runner(
         tracker: Arc::clone(&tr),
         workspace: Arc::clone(&wm),
         agent: runner,
+        agents: top_agents,
         prompt_tmpl: cfg.prompt_template.clone(),
         prompt_file: cfg.prompt_file.clone(),
         git_flow: cfg.git_flow.clone(),
@@ -776,24 +821,34 @@ claude:
 ";
         let cfg = decode_cfg(WF, "top prompt body");
         let got_configs: RefCell<Vec<claude::Config>> = RefCell::new(Vec::new());
+        // ⚠️ Since STUDIO-902 the factory is called for the ALTERNATE harness too — `build_effective`
+        // pre-builds one runner per implemented backend so a teammate profile can select one
+        // (`runners_by_harness`). Only the claude specs are collected here; the opencode ones are
+        // asserted to be well-formed and then built, so this test keeps measuring the thing it was
+        // written to measure (which claude::Config each project's runner gets) rather than
+        // accidentally measuring the new pre-build.
         let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
-            assert_eq!(spec.harness, HarnessId::Claude);
-            // `let ... else` rather than an irrefutable binding since STUDIO-902 added a second
-            // knobs variant. These fixtures configure `backend: claude`, so the other arm is
-            // genuinely unreachable and asserting that is the point.
-            let HarnessKnobs::Claude(cc) = spec.knobs else {
-                panic!("a claude-configured fixture produced non-claude knobs")
-            };
-            got_configs.borrow_mut().push(cc.clone());
-            Arc::new(claude::Runner::new(cc))
+            match spec.knobs {
+                HarnessKnobs::Claude(cc) => {
+                    assert_eq!(spec.harness, HarnessId::Claude);
+                    got_configs.borrow_mut().push(cc.clone());
+                    Arc::new(claude::Runner::new(cc))
+                }
+                HarnessKnobs::Opencode(oc) => {
+                    assert_eq!(spec.harness, HarnessId::Opencode);
+                    Arc::new(opencode::Runner::new(oc))
+                }
+            }
         };
         let eff = build_effective_with_runner(&cfg, &factory).expect("build_effective");
 
         assert_eq!(eff.projects.len(), 2, "expected 2 resolved projects");
         assert_eq!(
             got_configs.borrow().len(),
-            eff.projects.len() + 1,
-            "factory: top-level + one per resolved project"
+            // One per `runner_for_backend` call (top-level + per project) PLUS one per
+            // `runners_by_harness` call, which builds a claude runner for every one of those too.
+            (eff.projects.len() + 1) * 2,
+            "factory: top-level + one per resolved project, each also pre-built by harness"
         );
 
         let by_model: HashMap<String, claude::Config> = got_configs
@@ -824,28 +879,70 @@ claude:
     fn single_project_runner_uses_top_level() {
         let cfg = decode_cfg(CLAUDE_WF, "Do {{ issue.identifier }}.");
         let got_configs: RefCell<Vec<claude::Config>> = RefCell::new(Vec::new());
+        // ⚠️ Since STUDIO-902 the factory is called for the ALTERNATE harness too — `build_effective`
+        // pre-builds one runner per implemented backend so a teammate profile can select one
+        // (`runners_by_harness`). Only the claude specs are collected here; the opencode ones are
+        // asserted to be well-formed and then built, so this test keeps measuring the thing it was
+        // written to measure (which claude::Config each project's runner gets) rather than
+        // accidentally measuring the new pre-build.
         let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
-            assert_eq!(spec.harness, HarnessId::Claude);
-            // `let ... else` rather than an irrefutable binding since STUDIO-902 added a second
-            // knobs variant. These fixtures configure `backend: claude`, so the other arm is
-            // genuinely unreachable and asserting that is the point.
-            let HarnessKnobs::Claude(cc) = spec.knobs else {
-                panic!("a claude-configured fixture produced non-claude knobs")
-            };
-            got_configs.borrow_mut().push(cc.clone());
-            Arc::new(claude::Runner::new(cc))
+            match spec.knobs {
+                HarnessKnobs::Claude(cc) => {
+                    assert_eq!(spec.harness, HarnessId::Claude);
+                    got_configs.borrow_mut().push(cc.clone());
+                    Arc::new(claude::Runner::new(cc))
+                }
+                HarnessKnobs::Opencode(oc) => {
+                    assert_eq!(spec.harness, HarnessId::Opencode);
+                    Arc::new(opencode::Runner::new(oc))
+                }
+            }
         };
         let eff = build_effective_with_runner(&cfg, &factory).expect("build_effective");
         assert_eq!(eff.projects.len(), 1, "expected exactly 1 resolved project");
         assert_eq!(
             got_configs.borrow().len(),
-            2,
-            "factory: top-level + single project"
+            // Top-level + single project, each built twice: once by `runner_for_backend` and once
+            // by STUDIO-902's `runners_by_harness` pre-build (see the factory comment above).
+            4,
+            "factory: top-level + single project, each also pre-built by harness"
         );
         for cc in got_configs.borrow().iter() {
             assert_eq!(cc.command, "claude", "runner built with top-level command");
             assert_eq!(cc.model, "", "runner built with top-level (empty) model");
         }
+    }
+
+    /// STUDIO-902: every implemented backend gets a runner at effective-build time, on the
+    /// top-level effective AND on every resolved project, so a routed teammate's profile can name
+    /// one without anything being constructed at dispatch.
+    ///
+    /// ⚠️ Also pins the property that keeps this additive: `agent` — what every dispatch naming no
+    /// harness uses — stays the CONFIGURED backend's runner, not an arbitrary member of the pool.
+    #[test]
+    fn every_implemented_backend_gets_a_prebuilt_runner() {
+        let cfg = decode_cfg(CLAUDE_WF, "Do {{ issue.identifier }}.");
+        let eff = build_effective(&cfg).expect("build_effective");
+
+        for name in IMPLEMENTED_BACKENDS {
+            assert!(
+                eff.agents.contains_key(*name),
+                "top-level pool is missing {name}: {:?}",
+                eff.agents.keys().collect::<Vec<_>>()
+            );
+            for p in &eff.projects {
+                assert!(
+                    p.agents.contains_key(*name),
+                    "project {} is missing {name}",
+                    p.slug
+                );
+            }
+        }
+        assert!(
+            !eff.agents.contains_key("codex"),
+            "codex is recognized by config but has no runner; it must not appear here"
+        );
+        assert_eq!(eff.agents.len(), IMPLEMENTED_BACKENDS.len());
     }
 
     // Mirrors Go `TestBuildEffectiveCodexUnsupported`.

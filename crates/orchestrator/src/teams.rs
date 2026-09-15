@@ -568,6 +568,11 @@ pub(crate) struct TeamsDispatch {
     /// every built-in profile and for every installation with no `teams/profiles/` directory — means
     /// inherit the installation-wide `claude.model` / `claude.effort`.
     pub model_override: rhapsody_agent::ModelOverride,
+    /// The `agent.backend` the routed identity's profile asks for (STUDIO-902). Empty — the case
+    /// for every built-in profile and for every installation with no `teams/profiles/` directory —
+    /// means inherit the configured backend, so a dispatch that routed to nobody, or to a teammate
+    /// whose profile is silent, uses exactly the runner it always did.
+    pub harness: String,
     /// [`EVENT_ROUTE`] or [`EVENT_UNROUTED`].
     pub kind: &'static str,
     /// The event text: the reason, and the identity when there is one. Deliberately carries no
@@ -585,6 +590,8 @@ pub(crate) struct ResolvedTeammate {
     section: String,
     /// Empty ⇒ inherit the installation-wide `claude.model` / `claude.effort`.
     model_override: rhapsody_agent::ModelOverride,
+    /// Empty ⇒ inherit the configured `agent.backend` (STUDIO-902).
+    harness: String,
 }
 
 impl ResolvedTeammate {
@@ -595,6 +602,7 @@ impl ResolvedTeammate {
         ResolvedTeammate {
             section,
             model_override: rhapsody_agent::ModelOverride::default(),
+            harness: String::new(),
         }
     }
 }
@@ -628,6 +636,7 @@ impl Orchestrator {
                 identity: String::new(),
                 section: String::new(),
                 model_override: rhapsody_agent::ModelOverride::default(),
+                harness: String::new(),
                 kind: EVENT_UNROUTED,
                 text: format!("reason={}", routed.reason.as_str()),
             });
@@ -646,6 +655,7 @@ impl Orchestrator {
             identity,
             section: resolved.section,
             model_override: resolved.model_override,
+            harness: resolved.harness,
         })
     }
 
@@ -873,6 +883,10 @@ impl Orchestrator {
                     model: p.model,
                     effort: p.effort,
                 },
+                // Empty means INHERIT the configured `agent.backend` (STUDIO-902), on the same
+                // terms as `model`/`effort` above and for the same reason: every built-in profile
+                // ships it empty, so this changes nothing until an operator writes one.
+                harness: p.harness,
             },
             Err(e) => {
                 tracing::error!(

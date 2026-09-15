@@ -115,6 +115,15 @@ pub struct RunningEntry {
     /// events row, which names the model it resolved.
     pub model_override: rhapsody_agent::ModelOverride,
 
+    /// The `agent.backend` the routed teammate's profile asked for (STUDIO-902). Empty ⇒ the
+    /// configured backend, which is every dispatch that routed to nobody or to a teammate whose
+    /// profile is silent about it.
+    ///
+    /// **In memory only**, for the same reason [`Self::model_override`] is: a durable `runs.harness`
+    /// column is the pluggable-harnesses design's §6.2, which wants `harness` / `model` /
+    /// `provider` / `session_uuid` added together rather than one at a time.
+    pub harness: String,
+
     /// The `latest_summon_at` of the most recent mid-run summons already delivered to this run's
     /// mailbox (INF-448). The poll-side router delivers a summons only when it is strictly after BOTH
     /// `started_at` and this watermark, then advances it — so a stable summons is injected at most
@@ -197,6 +206,7 @@ impl RunningEntry {
             identity: String::new(),
             teammate_section: String::new(),
             model_override: rhapsody_agent::ModelOverride::default(),
+            harness: String::new(),
             last_delivered_summon_at: zero_time(),
             review: None,
             thread_id: String::new(),
