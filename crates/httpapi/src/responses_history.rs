@@ -357,9 +357,11 @@ pub(crate) fn issue_counts_response(buckets: &BTreeMap<IssueStatusKey, i64>) -> 
 ///
 /// `providers` (STUDIO-909) is the same window's tokens split by the provider each run actually
 /// billed — the whole point of running two providers, and unanswerable while a run's tokens could
-/// not be attributed to one. Whole-store in SQL, like every other figure here, so it is never a
-/// fold over one fetched page. A legacy run with no recorded provider is absent from every bucket,
-/// not folded into a nameless one.
+/// not be attributed to one. Aggregated in SQL, like every other figure here, so it is never a fold
+/// over one fetched page; and time-filtered on `started_at` like `day_totals`, so `providers`
+/// decomposes the `total_tokens` beside it rather than reporting a lifetime total under the same
+/// heading. A legacy run with no recorded provider is absent from every bucket, not folded into a
+/// nameless one.
 pub(crate) fn history_summary_response(
     since: &str,
     t: &DayTotals,

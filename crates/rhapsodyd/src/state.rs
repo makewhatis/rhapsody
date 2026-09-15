@@ -89,8 +89,8 @@ impl HistoryStore for HistoryView {
     ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
         self.0.load_run_provenances(run_ids)
     }
-    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError> {
-        self.0.tokens_by_provider()
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
+        self.0.tokens_by_provider(since)
     }
 }
 

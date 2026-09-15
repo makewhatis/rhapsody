@@ -221,21 +221,11 @@ pub struct RunProvenance {
     pub provider: String,
 }
 
-impl RunProvenance {
-    /// Whether every field is empty — a row with nothing to say, which consumers render as unknown.
-    pub fn is_empty(&self) -> bool {
-        self.harness.is_empty()
-            && self.harness_origin.is_empty()
-            && self.model.is_empty()
-            && self.model_origin.is_empty()
-            && self.provider.is_empty()
-    }
-}
-
-/// The whole-store token tally for ONE provider — the cost question STUDIO-909 exists to answer
-/// ("what did Fireworks save us?"), which is unanswerable while a run's tokens cannot be attributed
-/// to a provider. Aggregated in SQL over the `runs` ⋈ `rhapsody_run_provenance` join so the figure
-/// never depends on which page a client happened to fetch.
+/// The windowed token tally for ONE provider — the cost question STUDIO-909 exists to answer
+/// ("what did Fireworks save us this week?"), which is unanswerable while a run's tokens cannot be
+/// attributed to a provider. Aggregated in SQL over the `runs` ⋈ `rhapsody_run_provenance` join so
+/// the figure never depends on which page a client happened to fetch, and bounded by the same
+/// `since` as `day_totals` so the split and the total describe one window.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderTokens {
     /// The recorded provider; empty for a run that recorded none (a legacy row, or a harness whose

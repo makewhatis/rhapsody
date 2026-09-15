@@ -522,6 +522,13 @@ impl Orchestrator {
         } else if !re.model_override.model.is_empty() {
             "profile".to_string()
         } else {
+            // The value is `configured_model_for`'s answer at persist time. KNOWN IMPRECISION
+            // (alice round 1 on PR #173): on a multi-project install whose project block overrides
+            // `claude.model`, that value comes from `projects.<slug>.claude.model` while this label
+            // names the flat `claude.model` key. `mcfg` cannot tell an explicit project override from
+            // an inherited one, so a project-scoped spelling here could name a key that supplied
+            // nothing — worse than the flat one. The value is still the run's true model; only the
+            // pointer is coarser. `opencode` is not per-project overlaid, so its arm is exact.
             format!("{actual_harness}.model")
         };
         if let Some(r) = &route {
@@ -1467,6 +1474,37 @@ mod tests {
         assert_eq!(p.model, "claude-sonnet-4");
         assert_eq!(p.model_origin, "claude.model");
         assert_eq!(p.provider, "anthropic");
+    }
+
+    /// STUDIO-909 round 1: a harness with no model knob records NO model and therefore NO
+    /// `model_origin`. `agent.backend: codex` is a recognized `HARNESS_NAMES` value this build has no
+    /// runner for, so `configured_model_for` answers empty — the origin must not then name a
+    /// `codex.model` key that supplied nothing.
+    #[test]
+    fn dispatch_records_no_model_origin_when_no_model_resolved() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "codex".to_string();
+        }
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store is on, so the run has a row");
+        let p = store
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(p.harness, "codex");
+        assert_eq!(p.model, "", "codex has no model knob in this build");
+        assert_eq!(
+            p.model_origin, "",
+            "an origin for a model that was never resolved asserts something untrue"
+        );
+        assert_eq!(p.provider, "");
     }
 
     // BO-12: dispatch computes the ADDITIVE capability set (project defaults ∪ the ticket's

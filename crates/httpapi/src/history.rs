@@ -73,9 +73,10 @@ pub trait HistoryStore: Send + Sync {
         &self,
         run_ids: &[i64],
     ) -> Result<HashMap<i64, RunProvenance>, StoreError>;
-    /// Whole-store token totals grouped by recorded provider — the cost-attribution tally the
-    /// dashboard's summary carries (STUDIO-909). Rhapsody-only; Go cannot attribute a token at all.
-    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError>;
+    /// Token totals grouped by recorded provider over the same window as `day_totals` — the
+    /// cost-attribution tally the dashboard's summary carries (STUDIO-909). Rhapsody-only; Go cannot
+    /// attribute a token at all.
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
 }
 
 /// Every thread-safe [`rhapsody_store::Store`] is a [`HistoryStore`] — the Rust analog of Go's
@@ -129,7 +130,7 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     ) -> Result<HashMap<i64, RunProvenance>, StoreError> {
         rhapsody_store::Store::load_run_provenances(self, run_ids)
     }
-    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError> {
-        rhapsody_store::Store::tokens_by_provider(self)
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
+        rhapsody_store::Store::tokens_by_provider(self, since)
     }
 }

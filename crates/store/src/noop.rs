@@ -104,7 +104,7 @@ impl Store for Noop {
     ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
         Ok(std::collections::HashMap::new())
     }
-    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError> {
+    fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }
 

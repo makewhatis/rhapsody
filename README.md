@@ -782,9 +782,12 @@ renders each value with it. `provider` is DERIVED once, at the same dispatch, fr
 harness and model string (`fireworks-ai/…` names its own provider; a Claude model with no `/` is
 Anthropic; anything else is unknown), so it can never later disagree with the model it describes.
 
-**The cost question is answerable in one query.** `tokens_by_provider` groups the whole store's
-tokens by recorded provider, and `GET /api/v1/history/summary` carries the same split for its window
-(`providers`), both computed in SQL over the `runs` ⋈ provenance join rather than folded over a page.
+**The cost question is answerable in one query.** `tokens_by_provider` groups the window's tokens by
+recorded provider, and `GET /api/v1/history/summary` carries that split (`providers`) over the same
+`since` as its `runs`/`total_tokens` figures; both are computed in SQL over the `runs` ⋈ provenance
+join rather than folded over a page. Scoping the split to the window (STUDIO-909 round 1) is what lets
+it be read *beside* the totals it decomposes instead of answering a lifetime question under a "today"
+heading.
 The compact provider also rides each row of the additive `GET /api/v1/history/issues`, so "which of
 these four runs is on Fireworks" is a scan. `/api/v1/runs/{id}` and `/api/v1/history` are byte-pinned
 to the Go capture and grew nothing.

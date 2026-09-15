@@ -244,12 +244,22 @@ impl Orchestrator {
         } else {
             re.model_override.model.clone()
         };
+        // An origin is only meaningful beside a value (STUDIO-909 round 1). `re.model_origin` can
+        // name a key that resolved nothing — `agent.backend: codex` is a recognized harness this
+        // build has no runner for, so `configured_model_for` answers empty while the origin fallback
+        // would still spell `codex.model`. Recording an origin for a model that was never resolved
+        // asserts something untrue about the row; drop it instead.
+        let model_origin = if model.is_empty() {
+            String::new()
+        } else {
+            re.model_origin.clone()
+        };
         store::RunProvenance {
             provider: derive_provider(&harness, &model),
             harness,
             harness_origin: re.harness_origin.clone(),
             model,
-            model_origin: re.model_origin.clone(),
+            model_origin,
         }
     }
 

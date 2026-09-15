@@ -192,8 +192,9 @@ pub trait Store {
     // `rhapsody_run_provenance` table (see the README "Divergences" entry); a run with no row is
     // "unknown", which is why [`Store::run_provenance`] returns `None` rather than a zero value.
     //
-    // [`Store::set_run_provenance`] is a no-op when there is no such run row only in the sense that
-    // it inserts regardless; callers pass the id [`Store::start_run`] returned.
+    // [`Store::set_run_provenance`] inserts (upserting on `run_id`) unconditionally and does not
+    // check that `run_id` names a live `runs` row; callers pass the id [`Store::start_run`]
+    // returned.
     fn set_run_provenance(&self, run_id: i64, p: &RunProvenance) -> Result<(), StoreError>;
     /// One run's provenance, or `Ok(None)` when the run predates this feature (or recorded nothing).
     fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError>;
@@ -204,10 +205,15 @@ pub trait Store {
         &self,
         run_ids: &[i64],
     ) -> Result<HashMap<i64, RunProvenance>, StoreError>;
-    /// Whole-store token totals grouped by recorded provider — the cost-attribution question this
-    /// feature exists to answer. One row per distinct provider, empty provider included, run
-    /// count descending then provider ascending so the order is stable.
-    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError>;
+    /// Token totals grouped by recorded provider over the runs that started at or after `since` —
+    /// the cost-attribution question this feature exists to answer, scoped to the same window as
+    /// [`Store::day_totals`] so the two figures can be read beside each other. One row per distinct
+    /// provider, empty provider included, run count descending then provider ascending so the order
+    /// is stable.
+    ///
+    /// The window is the point (STUDIO-909 round 1): a lifetime total rendered under a "today"
+    /// heading answers a question nobody asked and cannot be reconciled with `day_totals`.
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
 
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`

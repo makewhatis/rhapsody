@@ -417,6 +417,11 @@ fn map_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
 /// provenance read, read positionally by [`map_run_provenance`].
 const PROVENANCE_COLS: &str = "harness, harness_origin, model, model_origin, provider";
 
+/// How many run ids [`Sqlite::load_run_provenances`] binds per statement. Well under SQLite's
+/// 32766-variable ceiling, and small enough that a very large page is a few queries rather than one
+/// that fails closed (STUDIO-909 round 1).
+const PROVENANCE_BIND_CHUNK: usize = 500;
+
 /// Map a provenance row starting at column `off` (0 for a bare [`PROVENANCE_COLS`] select; 1 when
 /// the query leads with `run_id`).
 fn map_run_provenance_at(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<RunProvenance> {
@@ -929,26 +934,37 @@ impl Store for Sqlite {
         if run_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let placeholders = vec!["?"; run_ids.len()].join(", ");
-        let q = format!(
-            "SELECT run_id, {PROVENANCE_COLS} FROM rhapsody_run_provenance \
-              WHERE run_id IN ({placeholders})"
-        );
         let conn = self.lock();
-        let mut stmt = conn.prepare(&q)?;
-        let rows = stmt.query_map(params_from_iter(run_ids.iter().copied()), |row| {
-            Ok((row.get::<_, i64>(0)?, map_run_provenance_at(row, 1)?))
-        })?;
         let mut out = std::collections::HashMap::new();
-        for r in rows {
-            let (id, p) = r?;
-            out.insert(id, p);
+        // Chunked because `/api/v1/history/issues?limit=` is caller-controlled and `effective_run_limit`
+        // caps nothing, so one page can carry more ids than SQLite allows bind variables in a single
+        // statement (32766). Un-chunked, that fails closed — `unwrap_or_default()` on the caller side
+        // silently drops EVERY badge on the page, not just the overflowing ones (STUDIO-909 round 1).
+        for chunk in run_ids.chunks(PROVENANCE_BIND_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let q = format!(
+                "SELECT run_id, {PROVENANCE_COLS} FROM rhapsody_run_provenance \
+                  WHERE run_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&q)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |row| {
+                Ok((row.get::<_, i64>(0)?, map_run_provenance_at(row, 1)?))
+            })?;
+            for r in rows {
+                let (id, p) = r?;
+                out.insert(id, p);
+            }
         }
         Ok(out)
     }
 
-    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError> {
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         let conn = self.lock();
+        // Time-filtered on `started_at` exactly like `day_totals`, so `providers` and `runs` /
+        // `total_tokens` on the same `/history/summary` response describe one window (STUDIO-909
+        // round 1). A pre-window run with provenance must NOT appear in a bucket: the whole point of
+        // the field is the per-window cost split, and an unbounded lifetime total cannot be
+        // reconciled with the totals beside it.
         let mut stmt = conn.prepare(
             "SELECT p.provider,
                     COUNT(*),
@@ -957,10 +973,11 @@ impl Store for Sqlite {
                     COALESCE(SUM(r.total_tokens), 0)
                FROM runs r
                JOIN rhapsody_run_provenance p ON p.run_id = r.id
+              WHERE r.started_at >= ?1
               GROUP BY p.provider
               ORDER BY COUNT(*) DESC, p.provider ASC",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([since], |row| {
             Ok(ProviderTokens {
                 provider: row.get(0)?,
                 runs: row.get(1)?,
@@ -3575,11 +3592,13 @@ mod tests {
         assert_eq!(store.run_provenance(with).expect("get"), Some(rewritten));
     }
 
-    // The cost question this exists to answer: every token attributed to the provider that spent it,
-    // summed over the WHOLE store rather than one page. A run with no provenance row is a different
-    // bucket — it is absent entirely, never folded into the empty-string provider.
+    // The cost question this exists to answer: every token in the WINDOW attributed to the provider
+    // that spent it, summed over that window's rows rather than one page. A run with no provenance
+    // row is a different bucket — it is absent entirely, never folded into the empty-string provider
+    // — and a run BEFORE the window is excluded, so `providers` decomposes `day_totals`'s totals
+    // rather than an unbounded lifetime figure sitting beside a windowed one (STUDIO-909 round 1).
     #[test]
-    fn tokens_by_provider_sums_every_matching_run() {
+    fn tokens_by_provider_sums_every_matching_run_in_the_window() {
         let store = Sqlite::open(StorePath::InMemory).expect("open");
         let fireworks_a = start_provenance_run(&store, "fw-a");
         let fireworks_b = start_provenance_run(&store, "fw-b");
@@ -3624,8 +3643,37 @@ mod tests {
                 },
             )
             .expect("end");
+        // BEFORE the window, with provenance: it must not be bucketed, or `providers` would answer a
+        // different question than the `day_totals` it ships beside.
+        let before = store
+            .start_run(RunStart {
+                issue_id: "iss_old".into(),
+                issue_identifier: "old".into(),
+                title: "pre-window".into(),
+                started_at: "2026-09-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start pre-window");
+        store
+            .set_run_provenance(
+                before,
+                &provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            )
+            .expect("set pre-window");
+        store
+            .end_run(
+                before,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 5000,
+                    ..Default::default()
+                },
+            )
+            .expect("end pre-window");
 
-        let tallies = store.tokens_by_provider().expect("tokens_by_provider");
+        let tallies = store
+            .tokens_by_provider("2026-09-15T00:00:00Z")
+            .expect("tokens_by_provider");
         assert_eq!(
             tallies.len(),
             2,
@@ -3644,6 +3692,10 @@ mod tests {
         assert!(
             tallies.iter().all(|t| t.total_tokens != 9999),
             "an unattributed run has no provider to be summed under"
+        );
+        assert!(
+            tallies.iter().all(|t| t.total_tokens != 5000),
+            "a run before the window must not be bucketed: {tallies:?}"
         );
     }
 
@@ -3673,7 +3725,12 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         let runs = store.list_runs(RunFilter::default()).expect("list");
         assert!(runs.is_empty());
-        assert!(store.tokens_by_provider().expect("tally").is_empty());
+        assert!(
+            store
+                .tokens_by_provider("1970-01-01T00:00:00Z")
+                .expect("tally")
+                .is_empty()
+        );
     }
 
     // A database already at the shipped step-7 schema migrates forward to step 8 rather than

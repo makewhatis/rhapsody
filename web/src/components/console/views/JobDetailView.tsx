@@ -365,6 +365,7 @@ function RunTrace({
         resolvingWho={identityRead.isPending}
         roster={roster}
         provenance={provenance.data}
+        resolvingProvenance={provenance.isPending}
         vitals={vitals}
         inFlight={inFlight}
         composerId={!raw && tab === "messages" ? MESSAGE_COMPOSER_ID : undefined}
@@ -499,6 +500,7 @@ function TraceHeader({
   resolvingWho,
   roster,
   provenance,
+  resolvingProvenance,
   vitals,
   inFlight,
   composerId,
@@ -517,6 +519,8 @@ function TraceHeader({
   roster: readonly string[];
   /** What this run actually ran on, with each value's origin (STUDIO-909); undefined until it loads. */
   provenance: RunProvenance | undefined;
+  /** Whether that fetch may still answer — see the provenance line and the assignee slot. */
+  resolvingProvenance: boolean;
   vitals: RunVitals;
   inFlight: boolean;
   /** The rail composer's element id while it is actually on screen; undefined otherwise. */
@@ -541,16 +545,29 @@ function TraceHeader({
             from, because the failure that motivated the field was an override (`review.model.opencode`)
             that no other surface named. A run that recorded nothing renders `unknown` for all three
             rather than a value inferred from whatever config is live now — the config hot-reloads,
-            the run is history. */}
-        <div className="prov">
-          {provenanceFields(provenance).map((f) => (
-            <span className="pf" key={f.label}>
-              <span className="pl">{f.label}</span>
-              <span className="pv">{f.value}</span>
-              {f.origin === "" ? null : <span className="po">[{f.origin}]</span>}
+            the run is history.
+
+            While the fetch is still in flight the header says NOTHING, exactly like the assignee
+            slot below: `provenanceFields(undefined)` cannot tell loading from "recorded nothing", and
+            rendering three `unknown`s for the first frame would assert a fact the run may not have
+            (STUDIO-909 round 1). */}
+        {resolvingProvenance ? (
+          <div className="prov" role="status">
+            <span className="whoskel">
+              <span className="vh">Resolving what ran this…</span>
             </span>
-          ))}
-        </div>
+          </div>
+        ) : (
+          <div className="prov">
+            {provenanceFields(provenance).map((f) => (
+              <span className="pf" key={f.label}>
+                <span className="pl">{f.label}</span>
+                <span className="pv">{f.value}</span>
+                {f.origin === "" ? null : <span className="po">[{f.origin}]</span>}
+              </span>
+            ))}
+          </div>
+        )}
       </div>
       {/* The persistent assignee (§3A). A run nothing can name keeps the slot and reads "—":
           the header's job is to say who ran this, and an omitted element says nothing at all —

@@ -478,9 +478,11 @@ pub(crate) async fn handle_history_summary(
         Err(_) => return store_error("history summary query failed"),
     };
     let rhythm: Vec<i64> = recent.iter().rev().map(|r| r.total_tokens).collect();
-    // Per-provider token attribution (STUDIO-909). Best-effort like the history decorations: a
-    // store that cannot answer yields no buckets rather than failing the whole summary.
-    let providers = history.tokens_by_provider().unwrap_or_default();
+    // Per-provider token attribution (STUDIO-909), scoped to the SAME `since`-bounded window as
+    // `day_totals` and the rhythm series so the split can be read beside the totals it decomposes.
+    // Best-effort like the history decorations: a store that cannot answer yields no buckets rather
+    // than failing the whole summary.
+    let providers = history.tokens_by_provider(&since).unwrap_or_default();
     write_json(
         StatusCode::OK,
         &history_summary_response(&since, &totals, &rhythm, &providers),
@@ -1088,8 +1090,11 @@ mod tests {
         {
             Store::load_run_provenances(&self.inner, run_ids)
         }
-        fn tokens_by_provider(&self) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
-            Store::tokens_by_provider(&self.inner)
+        fn tokens_by_provider(
+            &self,
+            since: &str,
+        ) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
+            Store::tokens_by_provider(&self.inner, since)
         }
     }
 
@@ -2533,13 +2538,86 @@ mod tests {
             .expect("set provenance");
         let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
 
-        let (status, body) = get_json(&format!("{base}/api/v1/history/summary")).await;
+        // An explicit window containing the seeded run (now - 1h) rather than the local-midnight
+        // default, which between 00:00 and 01:00 local would put the run BEFORE `since` and make
+        // this test fail for the clock rather than the code (STUDIO-909 round 1).
+        let since = rfc3339(Utc::now() - ChronoDuration::hours(2));
+        let (status, body) =
+            get_json(&format!("{base}/api/v1/history/summary?since={since}")).await;
         assert_eq!(status, 200);
         let providers = body["providers"].as_array().expect("providers");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0]["provider"], "anthropic");
         assert_eq!(providers[0]["runs"], 1);
         assert_eq!(providers[0]["total_tokens"], 150);
+    }
+
+    /// Round 1 (PR #173) caught `providers` summing the whole store while every sibling figure on the
+    /// response was `since`-bounded: a run outside the window could ship a bucket beside
+    /// `total_tokens: 0`. This pins the boundary — an out-of-window run with its own provider must
+    /// not be bucketed, so `providers` decomposes `total_tokens`.
+    #[tokio::test]
+    async fn history_summary_providers_ignore_runs_before_the_window() {
+        let store = mem_store();
+        let recent = seed_completed_run(&store); // now - 1h, inside the default (local-midnight) window
+        store
+            .set_run_provenance(
+                recent,
+                &rhapsody_store::RunProvenance {
+                    harness: "claude".into(),
+                    harness_origin: "agent.backend".into(),
+                    model: "claude-sonnet-4".into(),
+                    model_origin: "claude.model".into(),
+                    provider: "anthropic".into(),
+                },
+            )
+            .expect("set provenance");
+        let old = store
+            .start_run(RunStart {
+                issue_id: "old".into(),
+                issue_identifier: "MT-OLD".into(),
+                title: "before the window".into(),
+                attempt: 1,
+                started_at: "2025-01-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start old");
+        store
+            .set_run_provenance(
+                old,
+                &rhapsody_store::RunProvenance {
+                    harness: "opencode".into(),
+                    harness_origin: "profile".into(),
+                    model: "fireworks-ai/dsv4".into(),
+                    model_origin: "opencode.model".into(),
+                    provider: "fireworks-ai".into(),
+                },
+            )
+            .expect("set old provenance");
+        store
+            .end_run(
+                old,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 900_000,
+                    ..Default::default()
+                },
+            )
+            .expect("end old");
+
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+        // A window that contains the recent run (now - 1h) but not the 2025 one.
+        let since = rfc3339(Utc::now() - ChronoDuration::hours(2));
+        let (status, body) =
+            get_json(&format!("{base}/api/v1/history/summary?since={since}")).await;
+        assert_eq!(status, 200, "body: {body}");
+        let providers = body["providers"].as_array().expect("providers");
+        assert_eq!(
+            providers.len(),
+            1,
+            "the pre-window run must not be bucketed: {body}"
+        );
+        assert_eq!(providers[0]["provider"], "anthropic");
     }
 
     // Mirrors Go `TestRunDetailLiveThenFinished`: the SAME run_id resolves live first, then from the

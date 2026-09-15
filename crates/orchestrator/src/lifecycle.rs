@@ -2684,8 +2684,9 @@ mod tests {
         }
         fn tokens_by_provider(
             &self,
+            a0: &str,
         ) -> Result<Vec<rhapsody_store::ProviderTokens>, rhapsody_store::StoreError> {
-            self.0.tokens_by_provider()
+            self.0.tokens_by_provider(a0)
         }
         fn insert_run_message(
             &self,

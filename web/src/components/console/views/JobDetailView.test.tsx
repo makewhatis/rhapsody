@@ -370,6 +370,10 @@ afterEach(() => {
   h.fetchRunMergeability.mockReset();
   h.fetchRunDiff.mockReset();
   h.fetchRunMessages.mockReset();
+  // Provenance joins the same list (STUDIO-909 round 1): while the header flashed `unknown` during
+  // the fetch, a leaked mock was invisible to the "recorded nothing" test; now that the header waits
+  // for the answer, a test that configured provenance would otherwise hand it to every test after.
+  h.fetchRunProvenance.mockReset();
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
   h.fetchRunIdentityEvents.mockReset();
@@ -592,6 +596,35 @@ describe("zone A — the sticky header (§3A)", () => {
       const line = document.querySelector(".trhd .prov");
       expect(line?.textContent).toContain("unknown");
       expect(line?.textContent).not.toContain("[");
+    });
+  });
+
+  it("says nothing while the provenance fetch is in flight, rather than flashing unknown", async () => {
+    // `undefined` cannot tell loading from "recorded nothing"; rendering `unknown` here would assert
+    // a fact the run may not have. The line waits for the answer, like the assignee slot.
+    let release: (p: Record<string, unknown>) => void = () => {};
+    h.fetchRunProvenance.mockImplementation(
+      () => new Promise<Record<string, unknown>>((resolve) => (release = resolve)),
+    );
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547, started_at: "2026-09-01T19:11:00Z" })]);
+
+    await waitFor(() => {
+      expect(document.querySelector(".trhd .prov")).not.toBeNull();
+    });
+    // The fetch is still in flight, so the line has no value to assert.
+    expect(document.querySelector(".trhd .prov")?.textContent).not.toContain("unknown");
+
+    release({
+      run_id: 547,
+      harness: "opencode",
+      harness_origin: "profile",
+      model: "deepseek-v4p1-flash",
+      model_origin: "review.model.opencode",
+      provider: "fireworks-ai",
+    });
+    await waitFor(() => {
+      expect(document.querySelector(".trhd .prov")?.textContent).toContain("fireworks-ai");
     });
   });
 
