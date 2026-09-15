@@ -427,13 +427,50 @@ fn materialize_config(top: &Config, eff: &EffectiveConfig) -> Config {
 /// An unimplemented backend keeps `Duration::ZERO`, which `runner_for_backend` rejects before this
 /// is ever reached. A harness-agnostic liveness signal is design §7.3 / slice 6; this only stops
 /// the existing subprocess-shaped one from silently not applying.
+///
+/// This is the per-CONFIG half. A run whose teammate profile names a harness the config's own
+/// backend is not resolves per RUN — see [`stall_timeout_for_harness`], which
+/// `Orchestrator::stall_timeout_for` consults first.
 fn stall_timeout_for(cfg: &Config) -> Duration {
-    let ms = match cfg.agent.backend.as_str() {
-        "claude" => cfg.claude.stall_timeout_ms,
-        "opencode" => cfg.opencode.stall_timeout_ms,
-        _ => 0,
-    };
+    let ms = stall_timeout_ms_for(cfg, &cfg.agent.backend).unwrap_or(0);
     Duration::from_millis(ms.max(0) as u64)
+}
+
+/// The stall-timeout knob of one named backend, or `None` when this build implements no such
+/// backend. The single place the knob's per-backend location is spelled, so the config-level and
+/// run-level resolutions below cannot drift apart.
+fn stall_timeout_ms_for(cfg: &Config, backend: &str) -> Option<i64> {
+    match backend {
+        "claude" => Some(cfg.claude.stall_timeout_ms),
+        "opencode" => Some(cfg.opencode.stall_timeout_ms),
+        _ => None,
+    }
+}
+
+/// The stall timeout of the harness a RUN was DISPATCHED on, when that harness differs from the
+/// backend its config names — `None` otherwise, which leaves the precomputed
+/// [`Effective::stall_timeout`] / [`ResolvedProject::stall_timeout`] in force.
+///
+/// ⚠️ [`stall_timeout_for`] resolves per CONFIG, which is only the whole answer while every run of a
+/// config shares its backend. STUDIO-902 admits a second harness one PROFILE at a time
+/// ([`Effective::agents`]), so the headline arrangement is `agent.backend: claude` with ONE
+/// teammate's profile naming `harness: opencode` — and there the run's harness and its config's
+/// backend legitimately disagree. Resolving only per config would then govern that opencode run by
+/// `claude.stall_timeout_ms` and leave `opencode.stall_timeout_ms` consulted by nothing: the same
+/// "knob that silently does nothing" design §1.4 warned about, one level down. Both default to
+/// 300000, so this changes nothing until an operator tunes one — which is exactly the operator who
+/// would be misled.
+///
+/// An unrecognized harness name yields `None`, the same skip-don't-refuse posture
+/// `Loop::spawn_worker` takes when a profile names a harness this build has no runner for: the run
+/// is still perfectly runnable on the default, so it keeps the default's liveness window rather than
+/// losing stall detection to a typo.
+pub(crate) fn stall_timeout_for_harness(cfg: &Config, harness: &str) -> Option<Duration> {
+    if harness.is_empty() || harness == cfg.agent.backend {
+        return None;
+    }
+    let ms = stall_timeout_ms_for(cfg, harness)?;
+    Some(Duration::from_millis(ms.max(0) as u64))
 }
 
 /// Normalizes a state slice into a set, lowercasing/trimming each entry. Mirrors Go `normalizeSet`

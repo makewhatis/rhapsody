@@ -51,7 +51,7 @@ pub const SERVER_KEY: &str = "symphony";
 /// The claude-side tool-name prefix that [`rewrite_tool_names`] rewrites away.
 const CLAUDE_PREFIX: &str = "mcp__";
 
-/// Writes the daemon's MCP config into `state_dir` and returns `(path, kept_operator_server)`.
+/// Writes the daemon's MCP config into `state_dir` and returns its path, for `OPENCODE_CONFIG`.
 ///
 /// Returns `Ok(None)` — inject nothing — when the workspace's own `opencode.json` already defines a
 /// `symphony` server, so the operator's definition wins exactly as it does for the claude backend.
@@ -62,7 +62,7 @@ pub fn inject_daemon_mcp(
     ws_path: &str,
     daemon_bin: &str,
     workflow_path: &str,
-) -> Result<Option<(PathBuf, bool)>, AgentError> {
+) -> Result<Option<PathBuf>, AgentError> {
     if daemon_bin.is_empty() {
         return Err(AgentError::Other("no daemon binary path".to_string()));
     }
@@ -93,7 +93,7 @@ pub fn inject_daemon_mcp(
     let dst = state_dir.join(INJECTED_CONFIG_NAME);
     std::fs::write(&dst, out)
         .map_err(|e| AgentError::Other(format!("write opencode mcp config: {e}")))?;
-    Ok(Some((dst, false)))
+    Ok(Some(dst))
 }
 
 /// Whether the workspace's own `opencode.json` already defines a `symphony` MCP server. Any read or
@@ -205,7 +205,7 @@ mod tests {
     fn writes_a_config_naming_the_daemon_and_the_workflow() {
         let tmp = TempDir::new();
         let ws = TempDir::new();
-        let (path, kept) = inject_daemon_mcp(
+        let path = inject_daemon_mcp(
             tmp.path(),
             &ws.path().to_string_lossy(),
             "/opt/rhapsodyd",
@@ -213,7 +213,6 @@ mod tests {
         )
         .expect("inject")
         .expect("a config was written");
-        assert!(!kept);
         assert_eq!(path, tmp.path().join(INJECTED_CONFIG_NAME));
 
         let v: serde_json::Value =

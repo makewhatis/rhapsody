@@ -178,7 +178,9 @@ pub struct Opencode {
     /// Encode round-trips an explicit `false`.
     pub auto_approve: Option<bool>,
     pub turn_timeout_ms: i64,
-    /// Feeds the daemon's own stall detection (`Effective::stall_timeout`). ⚠️ There is
+    /// Feeds the daemon's own stall detection — `Effective::stall_timeout` when `agent.backend` is
+    /// `opencode`, and per run (over the configured backend's value) for a teammate whose profile
+    /// names `harness: opencode` under a different backend. ⚠️ There is
     /// deliberately no `read_timeout_ms` beside it, unlike the `claude:` block: claude's is a Go
     /// parity field that nothing in this port reads for behaviour, and adding a second
     /// never-consulted knob to a NEW block would just be a setting that silently does nothing.

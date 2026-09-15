@@ -59,8 +59,14 @@ pub struct Config {
     /// likewise independent of any billing guard.
     pub tracker_api_key: String,
 
-    /// MCP injection. When `true`, the runner merges a `symphony` server into the workspace's
-    /// `opencode.json` so the dispatched agent can reach the daemon's own tools.
+    /// MCP injection. When `true`, the runner writes a config declaring a `symphony` server into
+    /// the run's PRIVATE STATE DIRECTORY and points the child's `OPENCODE_CONFIG` at it, so the
+    /// dispatched agent can reach the daemon's own tools.
+    ///
+    /// ⚠️ Nothing is written into the workspace. `opencode.json` is a name a real project may
+    /// already track, and the agent is about to `git add -A` in that worktree — see
+    /// [`crate::opencode::mcpinject`]'s module doc, which owns the reasoning, and the test
+    /// `nothing_is_written_into_the_workspace`.
     pub inject_mcp: bool,
     /// Absolute path to the running daemon binary, used as the injected server's command.
     pub daemon_bin: String,

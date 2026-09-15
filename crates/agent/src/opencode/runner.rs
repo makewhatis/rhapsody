@@ -170,7 +170,7 @@ impl crate::Runner for Runner {
                 &self.cfg.daemon_bin,
                 &self.cfg.workflow_path,
             ) {
-                Ok(Some((path, _))) => config_path = path.to_string_lossy().into_owned(),
+                Ok(Some(path)) => config_path = path.to_string_lossy().into_owned(),
                 Ok(None) => tracing::warn!(
                     issue = %issue.identifier,
                     "mcp injection: the workspace already defines a `symphony` MCP server; keeping theirs"
