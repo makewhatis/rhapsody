@@ -782,3 +782,580 @@ impl CappedBuffer {
         &self.buf
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opencode::testdir::TempDir;
+    use crate::{ENV_GUARD, Runner as _};
+    use std::sync::Arc;
+
+    /// A fake `opencode` that reproduces the ONE failure this adapter exists to prevent.
+    ///
+    /// ⚠️ It models the real hazard rather than mimicking a success: on entry it tries to
+    /// `mkdir "$XDG_DATA_HOME/opencode/.lock"`, and **if that directory already exists it behaves
+    /// exactly as a real opencode turn that loses the `database is locked` race** — nothing at all
+    /// on stdout, the CLI's own two-line error on stderr, exit 1. `$XDG_DATA_HOME/opencode/` is
+    /// where the real SQLite database lives, so "two turns reached the same state directory" is the
+    /// same condition in the fake and in the CLI.
+    ///
+    /// That is what makes the concurrency test below a real test: delete the per-run isolation and
+    /// it goes red the way production does, with an empty event stream, rather than staying green
+    /// because a stub always succeeds.
+    const FAKE_OPENCODE: &str = r#"
+set -u
+lock="$XDG_DATA_HOME/opencode/.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  # A real losing turn: zero events, the reason only on stderr, exit 1.
+  printf 'Error: Unexpected error\n' >&2
+  printf 'database is locked\n' >&2
+  exit 1
+fi
+# The session id is derived from the state directory, so two isolated turns necessarily report
+# different ones — the real CLI mints a random `ses_…` per session and the committed
+# `concurrency-trials-isolated-xdg.txt` shows ten isolated turns with ten distinct ids.
+sid="ses_$(basename "$XDG_DATA_HOME" | tr -cd 'A-Za-z0-9')"
+printf '{"type":"step_start","sessionID":"%s","part":{"type":"step-start"}}\n' "$sid"
+# Hold the state directory long enough that a concurrent partner really does overlap with it.
+sleep 0.4
+printf '{"type":"tool_use","sessionID":"%s","part":{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"/x"},"output":"ok"}}}\n' "$sid"
+printf '{"type":"text","sessionID":"%s","part":{"type":"text","text":"done"}}\n' "$sid"
+printf '{"type":"step_finish","sessionID":"%s","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":6,"output":3,"reasoning":1,"cache":{"write":0,"read":0}}}}\n' "$sid"
+exit 0
+"#;
+
+    fn write_script(dir: &TempDir, name: &str, body: &str) -> String {
+        let p = dir.path().join(name);
+        std::fs::write(&p, body).expect("write fake opencode");
+        p.to_string_lossy().into_owned()
+    }
+
+    fn seeded_auth(dir: &TempDir) -> String {
+        let p = dir.path().join("auth.json");
+        std::fs::write(&p, b"{\"fireworks-ai\":{\"type\":\"api\"}}").expect("write auth");
+        p.to_string_lossy().into_owned()
+    }
+
+    fn make_ws(root: &TempDir, id: &str) -> String {
+        let p = root.path().join(id);
+        std::fs::create_dir_all(&p).expect("create workspace");
+        // The runner's containment invariant compares canonical paths; on macOS `/var` is a symlink
+        // to `/private/var`, so both sides must be canonicalized the same way.
+        std::fs::canonicalize(&p)
+            .expect("canonicalize workspace")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn root_path(root: &TempDir) -> String {
+        std::fs::canonicalize(root.path())
+            .expect("canonicalize root")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn issue(identifier: &str) -> rhapsody_core::Issue {
+        rhapsody_core::Issue {
+            id: identifier.to_string(),
+            identifier: identifier.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn runner_for(script: &str, root: &TempDir, auth: &str, state_root: &str) -> Runner {
+        Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root_path(root),
+            turn_timeout: std::time::Duration::from_secs(30),
+            auth_source: auth.to_string(),
+            state_root: state_root.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Collects the normalized events a turn emits, so assertions are on the EVENT STREAM.
+    fn collector() -> (Arc<Mutex<Vec<Event>>>, impl Fn(Event) + Send + Sync) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        (seen, move |e: Event| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(e);
+        })
+    }
+
+    fn events_of(seen: &Arc<Mutex<Vec<Event>>>) -> Vec<Event> {
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    // ⚠️⚠️ THE ACCEPTANCE TEST. "Two concurrent opencode runs lose no turns. Assert on the event
+    // streams, not on exit codes — the failure mode is an empty stream with exit 1."
+    //
+    // Both turns run at once against a runner whose fake CLI refuses any state directory that is
+    // already in use. They pass only because each SESSION was provisioned its own `XDG_DATA_HOME`.
+    #[tokio::test]
+    async fn two_concurrent_turns_lose_no_turns() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(&scripts, "fake-opencode.sh", FAKE_OPENCODE);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws_a = make_ws(&root, "a");
+        let ws_b = make_ws(&root, "b");
+
+        let runner = Arc::new(runner_for(
+            &script,
+            &root,
+            &auth,
+            &state_root.path().to_string_lossy(),
+        ));
+        let sess_a = runner
+            .start_session(&ws_a, issue("STUDIO-902-A"), None)
+            .await
+            .expect("session a");
+        let sess_b = runner
+            .start_session(&ws_b, issue("STUDIO-902-B"), None)
+            .await
+            .expect("session b");
+
+        let (seen_a, on_a) = collector();
+        let (seen_b, on_b) = collector();
+        let (res_a, res_b) = tokio::join!(
+            sess_a.run_turn("prompt a", None, None, &on_a),
+            sess_b.run_turn("prompt b", None, None, &on_b),
+        );
+
+        for (label, (tr, err), seen) in [("a", res_a, &seen_a), ("b", res_b, &seen_b)] {
+            let evs = events_of(seen);
+            // The event stream first: a lost turn emits NOTHING, which is the shape being ruled out.
+            assert!(
+                !evs.is_empty(),
+                "turn {label} emitted an EMPTY event stream — the `database is locked` signature"
+            );
+            assert!(
+                evs.iter().any(|e| e.event_type == EVENT_SESSION_STARTED),
+                "turn {label} never established a session: {evs:#?}"
+            );
+            assert!(
+                evs.iter().any(|e| e.event_type == EVENT_TURN_COMPLETED),
+                "turn {label} never completed: {evs:#?}"
+            );
+            assert!(
+                !evs.iter().any(|e| e.event_type == EVENT_TURN_FAILED),
+                "turn {label} reported a failure: {evs:#?}"
+            );
+            assert_eq!(tr.status, TURN_SUCCEEDED, "turn {label}: {err:?}");
+            assert_eq!(tr.result_text, "done", "turn {label}");
+            assert!(err.is_none(), "turn {label}: {err:?}");
+        }
+
+        // ⚠️ And the reason they both survived: two DIFFERENT state directories, hence two different
+        // session ids. Equal ids here would mean one directory was shared and the test passed by
+        // luck rather than by isolation.
+        assert_ne!(
+            sess_a.thread_id(),
+            sess_b.thread_id(),
+            "both turns reported the same session id, so they shared a state directory"
+        );
+        assert!(sess_a.thread_id().starts_with("ses_"));
+    }
+
+    /// The same fake, proving the test above can actually fail: pointed at ONE shared state
+    /// directory, a concurrent pair really does lose a turn, and it loses it as an EMPTY event
+    /// stream. Without this, "both turns completed" could just mean the stub never refuses
+    /// anything.
+    #[tokio::test]
+    async fn sharing_one_state_directory_loses_a_turn_with_an_empty_stream() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(&scripts, "fake-opencode.sh", FAKE_OPENCODE);
+        let root = TempDir::new();
+        let ws = make_ws(&root, "shared");
+        // One directory, pre-created and seeded exactly as `RunState` would, then handed to both
+        // turns directly — the "no isolation" arrangement this adapter exists to avoid.
+        let shared = TempDir::new();
+        std::fs::create_dir_all(shared.path().join("opencode")).expect("mkdir");
+
+        let run_one = |label: &'static str| {
+            let script = script.clone();
+            let ws = ws.clone();
+            let xdg = shared.path().to_string_lossy().into_owned();
+            async move {
+                let out = tokio::process::Command::new("bash")
+                    .arg(&script)
+                    .current_dir(&ws)
+                    .env("XDG_DATA_HOME", &xdg)
+                    .output()
+                    .await
+                    .expect("spawn fake opencode");
+                (label, out)
+            }
+        };
+        let (a, b) = tokio::join!(run_one("a"), run_one("b"));
+
+        let losers: Vec<&str> = [&a, &b]
+            .iter()
+            .filter(|(_, o)| !o.status.success())
+            .map(|(l, _)| *l)
+            .collect();
+        assert_eq!(
+            losers.len(),
+            1,
+            "exactly one of the pair must lose the race; got {losers:?}"
+        );
+        let (_, lost) = if losers[0] == "a" { &a } else { &b };
+        assert!(
+            lost.stdout.is_empty(),
+            "the losing turn must emit ZERO events; got {:?}",
+            String::from_utf8_lossy(&lost.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&lost.stderr).contains("database is locked"),
+            "stderr must carry the real reason: {:?}",
+            String::from_utf8_lossy(&lost.stderr)
+        );
+    }
+
+    // ⚠️ The empty-stream case as the RUNNER sees it: "stream ended with no terminal event" must be
+    // a named, diagnosable failure, not an impossible state. The message has to carry the stderr,
+    // because that is the only place the reason exists.
+    #[tokio::test]
+    async fn a_turn_with_zero_events_fails_with_the_stderr_reason() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(
+            &scripts,
+            "loser.sh",
+            "printf 'Error: Unexpected error\\ndatabase is locked\\n' >&2\nexit 1\n",
+        );
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert!(events_of(&seen).is_empty(), "the fixture emits no events");
+        assert_eq!(tr.status, TURN_FAILED);
+        let msg = err.expect("a zero-event turn must be an error").to_string();
+        assert!(
+            msg.contains("stream ended without a terminal step_finish"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("database is locked"),
+            "the reason must survive: {msg}"
+        );
+        assert!(
+            msg.contains("two turns shared one opencode state directory"),
+            "a zero-event turn must name its most likely cause: {msg}"
+        );
+    }
+
+    // ⚠️ STUDIO-840/871, for THIS backend. The point is not that `kill_tree` works — `proctree.rs`
+    // owns that test — but that this runner ARMS it: a turn killed by its deadline must take the
+    // tool child the agent put in its OWN process group, not just the leader. A bare
+    // `kill(-leader, SIGKILL)` here would leave the grandchild running and re-certify STUDIO-840.
+    #[tokio::test]
+    async fn a_deadline_kill_takes_a_tool_child_that_escaped_the_process_group() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let pgid_file = scripts.path().join("escaped.pgid");
+        // `set -m` puts the background job in a process group of its OWN — exactly what the spike
+        // measured opencode doing to the shell it runs a tool command in (2 of 3 descendants
+        // survived a group kill, `harness/harness-spike/opencode/killtest.txt`). The child reports
+        // its own pgid, written-then-renamed so a reader never sees a partial file.
+        let body = format!(
+            "set -m\n\
+             bash -c 'ps -o pgid= -p $$ | tr -d \" \" > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
+             while true; do sleep 3600; done' _ \"{p}\" &\n\
+             set +m\n\
+             while true; do sleep 3600; done\n",
+            p = pgid_file.display()
+        );
+        let script = write_script(&scripts, "slow.sh", &body);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let mut cfg = Config {
+            command: format!("bash {script}"),
+            workspace_root: root_path(&root),
+            // Long enough for the grandchild to exist and report, short enough to keep the test fast.
+            turn_timeout: std::time::Duration::from_secs(6),
+            auth_source: auth.clone(),
+            state_root: state_root.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        cfg.inject_mcp = false;
+        let runner = Runner::new(cfg);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+
+        let (_seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert_eq!(tr.status, TURN_TIMED_OUT, "{err:?}");
+        assert!(matches!(err, Some(AgentError::TurnTimeout)), "{err:?}");
+
+        let escaped: i32 = std::fs::read_to_string(&pgid_file)
+            .expect("the fixture never reported an escaped process group")
+            .trim()
+            .parse()
+            .expect("parse escaped pgid");
+        // Assert on OS process state, never on a return value.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let survivors = live_in_group(escaped);
+            if survivors.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the escaped tool child survived the deadline kill: {survivors:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Live (non-zombie) processes in `pgid`, as `ps` reports them.
+    fn live_in_group(pgid: i32) -> Vec<String> {
+        let out = std::process::Command::new("ps")
+            .args(["-Ao", "pid=,pgid=,stat=,comm="])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let pid = f.next()?;
+                let grp: i32 = f.next()?.parse().ok()?;
+                let stat = f.next()?;
+                let comm = f.next().unwrap_or("");
+                (grp == pgid && !stat.starts_with('Z')).then(|| format!("{pid} {stat} {comm}"))
+            })
+            .collect()
+    }
+
+    // The loud-and-early refusal: no credential, no process. This is the "what an unsupported
+    // capability does until slice 5" path, and the whole point is that it happens at
+    // `start_session` rather than as a 401 mid-turn that reads like a provider problem.
+    #[tokio::test]
+    async fn start_session_refuses_a_missing_credential_before_spawning_anything() {
+        let scripts = TempDir::new();
+        let script = write_script(&scripts, "never-runs.sh", "touch \"$0.RAN\"\n");
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let state_root = TempDir::new();
+
+        let runner = runner_for(
+            &script,
+            &root,
+            &scripts.path().join("absent.json").to_string_lossy(),
+            &state_root.path().to_string_lossy(),
+        );
+        let err = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .err()
+            .expect("must refuse");
+        assert!(
+            err.to_string().starts_with("opencode_auth_missing:"),
+            "{err}"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{script}.RAN")).exists(),
+            "the refusal must happen before anything is spawned"
+        );
+    }
+
+    // ⚠️ The prompt reaches the child in OPENCODE's tool spelling, as a positional argument, with
+    // stdin closed. All three at once, because they are one decision: no mailbox, prompt on argv.
+    #[tokio::test]
+    async fn the_prompt_is_a_positional_in_opencodes_tool_spelling_and_stdin_is_closed() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let dump = scripts.path().join("argv.txt");
+        let stdin_state = scripts.path().join("stdin.txt");
+        let body = format!(
+            "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{argv}\"\n\
+             if head -c 1 /dev/stdin >/dev/null 2>&1; then echo open > \"{si}\"; else echo closed > \"{si}\"; fi\n\
+             printf '{{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{{\"reason\":\"stop\"}}}}\\n'\n",
+            argv = dump.display(),
+            si = stdin_state.display()
+        );
+        let script = write_script(&scripts, "argv.sh", &body);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        let (_seen, on_event) = collector();
+        let (tr, err) = sess
+            .run_turn(
+                "Call `mcp__symphony__symphony_handoff` when done.",
+                None,
+                None,
+                &on_event,
+            )
+            .await;
+        assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+
+        let argv: Vec<String> = std::fs::read_to_string(&dump)
+            .expect("argv dump")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("Call `symphony_symphony_handoff` when done."),
+            "the prompt must be LAST and rewritten into opencode's spelling: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("mcp__")),
+            "no claude tool spelling may reach the child: {argv:?}"
+        );
+        assert_eq!(argv[0], "run");
+        assert!(argv.contains(&"--dir".to_string()) && argv.contains(&ws));
+    }
+
+    // ⚠️ The env the child actually gets: a PRIVATE XDG_DATA_HOME (never the operator's), the "me"
+    // identity that the injected MCP server defaults its tools to, and no tracker credential.
+    #[tokio::test]
+    async fn the_child_gets_a_private_xdg_and_no_tracker_credential() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let dump = scripts.path().join("env.txt");
+        let body = format!(
+            "env > \"{d}\"\n\
+             printf '{{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{{\"reason\":\"stop\"}}}}\\n'\n",
+            d = dump.display()
+        );
+        let script = write_script(&scripts, "env.sh", &body);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let mut cfg = Config {
+            command: format!("bash {script}"),
+            workspace_root: root_path(&root),
+            turn_timeout: std::time::Duration::from_secs(30),
+            auth_source: auth.clone(),
+            state_root: state_root.path().to_string_lossy().into_owned(),
+            tracker_api_key: "lin_api_SECRET".to_string(),
+            ..Default::default()
+        };
+        cfg.inject_mcp = false;
+        let runner = Runner::new(cfg);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        sess.set_run_id(77);
+        let (_seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+
+        let text = std::fs::read_to_string(&dump).expect("env dump");
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .map(str::to_string)
+        };
+        let xdg = get("XDG_DATA_HOME").expect("XDG_DATA_HOME must be set");
+        assert!(
+            xdg.starts_with(&state_root.path().to_string_lossy().into_owned()),
+            "the child must get its PRIVATE state dir, got {xdg}"
+        );
+        assert!(
+            std::path::Path::new(&xdg)
+                .join("opencode/auth.json")
+                .is_file(),
+            "the private state dir must carry the seeded credential"
+        );
+        assert_eq!(get("SYMPHONY_ISSUE").as_deref(), Some("STUDIO-902"));
+        assert_eq!(get("SYMPHONY_RUN_ID").as_deref(), Some("77"));
+        assert!(
+            !text.contains("lin_api_SECRET"),
+            "the tracker credential must be withheld by VALUE, not only by name"
+        );
+    }
+
+    // `stop` really releases the state directory — unlike claude's no-op, this backend holds a
+    // resource past the turn, and a daemon that leaked one per run would fill the disk.
+    #[tokio::test]
+    async fn stop_removes_the_private_state_directory() {
+        let scripts = TempDir::new();
+        let script = write_script(&scripts, "noop.sh", "exit 0\n");
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        let before: Vec<_> = std::fs::read_dir(state_root.path())
+            .expect("read")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(before.len(), 1, "one state dir was provisioned");
+
+        sess.stop().await.expect("stop");
+        let after: Vec<_> = std::fs::read_dir(state_root.path())
+            .expect("read")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            after.is_empty(),
+            "stop must remove the state dir, left: {after:?}"
+        );
+    }
+
+    // A turn is refused if the workspace escapes the configured root — the same containment
+    // invariant the claude runner enforces, not a weaker one because this backend is newer.
+    #[tokio::test]
+    async fn a_workspace_outside_the_root_is_refused() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(&scripts, "noop.sh", "exit 0\n");
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let outside = TempDir::new();
+        let ws = make_ws(&outside, "elsewhere");
+
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        let (_seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert_eq!(tr.status, TURN_FAILED);
+        assert!(
+            err.is_some(),
+            "a workspace outside the root must be refused"
+        );
+    }
+}

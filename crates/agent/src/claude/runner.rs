@@ -867,13 +867,11 @@ mod tests {
 
     use rhapsody_core::Issue;
 
-    // Serializes the two env-scrub tests' `set_var`/`remove_var` (edition-2024 `unsafe`, and racy vs
-    // another test's `std::env::vars_os()` because Rust's std::env is not internally synchronized).
-    // A write lock excludes all readers; every run_turn-invoking test takes a read lock while its
-    // child env is built. Go's os package is mutex-guarded and needs no such lock; this restores that
-    // invariant for the port. A tokio RwLock (not std) is used so the guard may be held across the
-    // run_turn await without tripping `clippy::await_holding_lock`.
-    static ENV_GUARD: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+    // The guard these tests take now lives at the crate root (`crate::ENV_GUARD`, STUDIO-902):
+    // there is a second backend whose runner also reads `std::env::vars_os()`, and a guard private
+    // to this module would not serialize the two env-mutating tests below against it. The rule is
+    // unchanged — read lock to invoke `run_turn`, write lock to mutate the process environment.
+    use crate::ENV_GUARD;
 
     /// RAII temp dir, unique per pid+counter, auto-removed (the port of Go's `t.TempDir()`).
     struct TempDir {
