@@ -22,6 +22,7 @@ pub mod claude;
 pub mod fake;
 pub mod harness;
 pub mod humanize;
+pub mod opencode;
 pub mod proctree;
 
 pub use harness::{
