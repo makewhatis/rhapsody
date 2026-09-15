@@ -200,9 +200,9 @@ fn show(
     // (STUDIO-901; `Teams::review_ticketless`) — on any other install (including the default,
     // `mode: off`) `dispatch_issue` never reaches the block that reads them, so a set value is
     // dead config. `None` here is what makes `render_show` suppress the two lines entirely rather
-    // than asserting an override that install cannot honour, and keeps a Teams-off `show` (no
-    // `teams.yaml` at all) byte-identical to what it printed before this existed (STUDIO-670's
-    // property, which the ticketless-only gate restores for this addition too).
+    // than asserting an override that install cannot honour, so a Teams-off `show` (no
+    // `teams.yaml` at all) prints no line this addition did not exist to add (the alignment fix
+    // widened every label's gutter by one, so it is not byte-identical to pre-STUDIO-901 output).
     let review = teams.review_ticketless().then_some(&teams.review);
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
