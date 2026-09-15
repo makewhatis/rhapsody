@@ -111,8 +111,11 @@ pub struct Provider {
 /// How a [`Provider`] authenticates. `ApiKey` carries the credential itself (design §4.5: the
 /// daemon does not write provider configs, so this is passed through, never stored). `Debug` is
 /// hand-written to redact the key, because `HarnessSpec` derives `Debug` transitively and a future
-/// `tracing::debug!(?spec)` must never write a raw credential to the rotating file logs. This is a
-/// new redacting-`Debug` pattern in the crate, not a repeat of an existing one: the repo's other
+/// `tracing::debug!(?spec)` must never write a raw credential to the rotating file logs.
+/// `HarnessKnobs::Claude`'s own `crate::claude::Config` carries a second credential
+/// (`tracker_api_key`, the resolved Linear key) reachable the same way, so its `Debug` is likewise
+/// hand-written rather than derived — both fields are covered, not just this one. This is a new
+/// redacting-`Debug` pattern in the crate, not a repeat of an existing one: the repo's other
 /// secret-bearing type, `crates/orchestrator/src/reads.rs`'s `ReadsTarget`, has no `Debug` impl at
 /// all and masks only at its reporting boundary (`mask_token`) — the convention both share is that a
 /// secret-bearing type never lets the raw value reach a log line, not the specific mechanism.
@@ -294,5 +297,35 @@ mod tests {
         assert_eq!(rendered, "ApiKey(***)");
 
         assert_eq!(format!("{:?}", ProviderAuth::None), "None");
+    }
+
+    // A full `HarnessSpec`'s `{:?}` reaches two credentials transitively — `Provider::auth` and
+    // `HarnessKnobs::Claude`'s `tracker_api_key` — and neither must ever appear raw in a
+    // `tracing::debug!(?spec)` line. This is the round-3 review finding: `ProviderAuth`'s own test
+    // above only proves that ONE of the two is redacted in isolation, not that a real, fully
+    // populated spec is safe end to end.
+    #[test]
+    fn harness_spec_debug_redacts_every_credential_it_carries() {
+        let spec = HarnessSpec {
+            harness: HarnessId::Claude,
+            model: None,
+            provider: Some(Provider {
+                base_url: "https://example".to_string(),
+                auth: ProviderAuth::ApiKey("sk-provider-secret".to_string()),
+            }),
+            knobs: HarnessKnobs::Claude(crate::claude::Config {
+                tracker_api_key: "lin-tracker-secret".to_string(),
+                ..Default::default()
+            }),
+        };
+        let rendered = format!("{spec:?}");
+        assert!(
+            !rendered.contains("sk-provider-secret"),
+            "Debug output leaked the provider key: {rendered}"
+        );
+        assert!(
+            !rendered.contains("lin-tracker-secret"),
+            "Debug output leaked the tracker key: {rendered}"
+        );
     }
 }
