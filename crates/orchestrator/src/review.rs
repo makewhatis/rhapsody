@@ -919,6 +919,169 @@ mod tests {
         );
     }
 
+    /// Writes a profile file under a temp dir's `profiles/` subdirectory, creating it — the same
+    /// helper `teams.rs`'s STUDIO-868 tests use, duplicated here rather than shared because the two
+    /// modules' test scaffolding (`orch_with_review` vs `orch_with_teams`) does not otherwise touch.
+    fn write_profile(dir: &TempDir, name: &str, text: &str) {
+        let p = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&p).expect("create profiles dir");
+        std::fs::write(p.join(format!("{name}.md")), text).expect("write profile");
+    }
+
+    // ── review.model / review.effort (STUDIO-901) ───────────────────────────
+
+    /// **The whole ticket's acceptance criterion.** A review run whose reviewer's OWN profile
+    /// names a model/effort still uses `review.model`/`review.effort` when the operator set them —
+    /// the review is what is being priced, not that teammate's own work (decision 1: review.model
+    /// wins for a review run).
+    #[test]
+    fn review_model_wins_over_the_reviewers_own_profile_for_a_review_run() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = "premium-model".to_string();
+            teams.review.effort = "xhigh".to_string();
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "premium-model".to_string(),
+                effort: "xhigh".to_string(),
+            },
+            "review.model/effort must win over the reviewer's own profile for a review run"
+        );
+    }
+
+    /// **Precedence in the other direction (acceptance: "tested in both directions").** The SAME
+    /// teammate, dispatched as an ordinary ticket (an implementation run, not a review), keeps
+    /// their own profile's model/effort untouched — `review.model` must never leak onto a run it
+    /// was not written for.
+    #[test]
+    fn review_model_does_not_apply_to_an_implementation_run() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, dispatched) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = "premium-model".to_string();
+            teams.review.effort = "xhigh".to_string();
+        }
+
+        o.dispatch_issue(
+            rhapsody_core::Issue {
+                id: "1".into(),
+                identifier: "STUDIO-1".into(),
+                title: "work".into(),
+                state: "Todo".into(),
+                // Routes directly to alice (tier 0), the same mechanism the review path's
+                // synthetic issue uses — so this run is routed to the SAME identity the review
+                // above was, and only the run KIND differs.
+                labels: Some(vec!["rhapsody:@alice".to_string()]),
+                ..Default::default()
+            },
+            None,
+            None,
+            String::new(),
+        );
+
+        let entries = dispatched.lock().expect("dispatched lock");
+        assert_eq!(entries[0].identity, "alice", "sanity: routed to alice");
+        assert_eq!(
+            entries[0].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "cheap-model".to_string(),
+                effort: "low".to_string(),
+            },
+            "an implementation run must keep the routed teammate's own profile model/effort"
+        );
+    }
+
+    /// **Absent means inherit (acceptance: byte-identical without `review.model`).** With
+    /// `review.model`/`review.effort` unset — the default — a review run resolves exactly the
+    /// model/effort its reviewer's profile would have given an ordinary dispatch: nothing new to
+    /// observe on an installation that never wrote the key.
+    #[test]
+    fn absent_review_model_leaves_a_review_run_on_the_reviewers_own_profile() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+        }
+        assert!(o.teams.as_ref().is_some_and(|t| t.review.model.is_empty()));
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "cheap-model".to_string(),
+                effort: "low".to_string(),
+            },
+            "an unset review.model/effort must not change the reviewer's own profile override"
+        );
+    }
+
+    /// A partial override — `review.model` alone — leaves `effort` at whatever the profile (or the
+    /// installation) already had, the same per-field non-empty-wins shape `turn_cfg` already
+    /// applies to a profile override.
+    #[test]
+    fn review_model_alone_leaves_effort_at_the_profiles_own_value() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = "premium-model".to_string();
+            // review.effort left unset.
+        }
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "premium-model".to_string(),
+                effort: "low".to_string(),
+            }
+        );
+    }
+
     /// A ticket dispatch is untouched by any of this: no review coordinates, so the worker takes the
     /// existing provisioning path and the agent gets no review env.
     #[test]

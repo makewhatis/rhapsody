@@ -397,6 +397,29 @@ impl Orchestrator {
             // the installation-wide pair and the argv is byte-identical to today.
             re.model_override = td.model_override.clone();
         }
+        // A review run's model/effort come from `review.model`/`review.effort` when the operator
+        // set them, regardless of what the routed teammate's own profile asked for (STUDIO-901).
+        // `review` is `Some` only for a run `dispatch_review` staged in `pending_review`, so an
+        // ordinary ticket dispatch — where this would otherwise silently apply to every run — never
+        // reaches the branch. Per-field non-empty-wins, the same shape `turn_cfg` already applies to
+        // a profile override: naming only `model` leaves `effort` at whatever the reviewer's profile
+        // (or the installation) already had.
+        //
+        // Review-scoped rather than a teammate field, and deliberately outranking the reviewer's own
+        // profile: the operator's intent here is role-based (keep review on the premium model, per
+        // the operator's own words on the ticket) while a profile's `model` is person-based
+        // (STUDIO-868) — the two answer different questions, and when both are set it is the PR
+        // under review being priced, not that teammate's own work.
+        if review.is_some()
+            && let Some(teams) = self.teams.as_ref()
+        {
+            if !teams.review.model.is_empty() {
+                re.model_override.model = teams.review.model.clone();
+            }
+            if !teams.review.effort.is_empty() {
+                re.model_override.effort = teams.review.effort.clone();
+            }
+        }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
         re.model = match &route {
