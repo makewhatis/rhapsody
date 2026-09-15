@@ -38,6 +38,10 @@ use crate::claude::{
     billing_guard_ok, build_args, classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars,
     split_command,
 };
+use crate::harness::{
+    EventFidelity, Harness, HarnessCapabilities, HarnessId, Resume, Sandbox, StdinPolicy, Steering,
+    ToolEventGranularity, ToolNaming, UsageDetail,
+};
 use crate::proctree::{KillTreeOnDrop, kill_tree};
 use crate::{
     AgentError, EVENT_OPERATOR_MESSAGE, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
@@ -145,26 +149,26 @@ impl crate::Runner for Runner {
 /// exclusivity defect this crate's `harness` module defers to slice 5 is a codex-only constraint);
 /// `usage: Tokens` (no dollar cost in Claude's `Usage`); `budgets: false` (the turn deadline above
 /// is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per the mailbox.
-const CAPABILITIES: crate::harness::HarnessCapabilities = crate::harness::HarnessCapabilities {
-    events: crate::harness::EventFidelity::Structured {
-        tool_level: crate::harness::ToolEventGranularity::FileLevel,
+const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
+    events: EventFidelity::Structured {
+        tool_level: ToolEventGranularity::FileLevel,
     },
-    steering: crate::harness::Steering::Live,
-    resume: crate::harness::Resume::Flags,
+    steering: Steering::Live,
+    resume: Resume::Flags,
     mcp: true,
-    sandbox: crate::harness::Sandbox::ToolAllowlist,
-    usage: crate::harness::UsageDetail::Tokens,
+    sandbox: Sandbox::ToolAllowlist,
+    usage: UsageDetail::Tokens,
     budgets: false,
-    tool_naming: crate::harness::ToolNaming::McpDoubleUnderscore,
-    stdin: crate::harness::StdinPolicy::HeldOpen,
+    tool_naming: ToolNaming::McpDoubleUnderscore,
+    stdin: StdinPolicy::HeldOpen,
 };
 
-impl crate::harness::Harness for Runner {
-    fn id(&self) -> crate::harness::HarnessId {
-        crate::harness::HarnessId::Claude
+impl Harness for Runner {
+    fn id(&self) -> HarnessId {
+        HarnessId::Claude
     }
 
-    fn capabilities(&self) -> &crate::harness::HarnessCapabilities {
+    fn capabilities(&self) -> &HarnessCapabilities {
         &CAPABILITIES
     }
 }
@@ -2356,10 +2360,6 @@ mod tests {
     // other test in this file while failing only this one.
     #[test]
     fn claude_runner_declares_its_identity_and_capabilities() {
-        use crate::harness::{
-            EventFidelity, Harness, HarnessId, Resume, Sandbox, StdinPolicy, Steering,
-            ToolEventGranularity, ToolNaming, UsageDetail,
-        };
         let r = Runner::new(Config::default());
         assert_eq!(r.id(), HarnessId::Claude);
         let caps = r.capabilities();
