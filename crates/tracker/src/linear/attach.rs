@@ -51,11 +51,27 @@
 //!
 //! # Repeats
 //!
-//! Linear keys a link attachment on (issue, url), so re-linking a pull request already attached to
-//! the same issue is expected to be a no-op. Nothing here DEPENDS on that: the caller's own gate
-//! (`prlink::link_pr_best_effort` — "this ticket already links the pull request that was just
-//! resolved") is what keeps a working installation from writing at all, and a duplicate that got
-//! through would be two identical links in Linear's UI. Untidy, and nothing reads them.
+//! Linear keys a link attachment on (issue, url) and answers a second write of the same pull
+//! request with a REFUSAL rather than a no-op. Measured against the live API (STUDIO-904), the
+//! refusal is:
+//!
+//! ```text
+//! code INPUT_ERROR      path ["attachmentLinkGitHubPR"]
+//! message "Duplicate attachment for duplicate url"
+//! ```
+//!
+//! **That refusal is not a failure here.** The post-condition this write exists for is "the ticket
+//! links this pull request", and a duplicate error proves it — so [`link_pull_request`] returns
+//! `Ok` for it, classified on the error's machine-readable SHAPE (`INPUT_ERROR` on the
+//! `attachmentLinkGitHubPR` path) and never on `userPresentableMessage`, which is presentation
+//! text. Every other refusal is still an error.
+//!
+//! The caller's own gate (`prlink::link_pr_best_effort` — "this ticket already links the pull
+//! request that was just resolved") still keeps a healthy installation from writing at all. This
+//! earns its place where that gate cannot see the link: it is built from the ticket's `linked_prs`,
+//! and a daemon-written attachment on a repository with no GitHub integration never enters
+//! `linked_prs` at all (see this module's opening section) — so the ticket's own first write goes
+//! on to be retried by the next run, and this is the answer to that retry.
 
 use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, query};
@@ -95,6 +111,11 @@ struct AttachmentIdNode {
 /// write that reports success without producing anything, and for the same reason: a caller must be
 /// able to tell that the link did not land, because the whole point of the call is that something
 /// LATER reads the attachment back.
+///
+/// The one refusal that is NOT an error is a duplicate: Linear answering
+/// [`INPUT_ERROR` + `attachmentLinkGitHubPR`](LinearErrorKind::DuplicateAttachment) means the same
+/// (issue, url) is already attached, so the link landed — just not from this call. See the module
+/// doc's "Repeats".
 pub(super) async fn link_pull_request(
     c: &Client,
     issue_id: &str,
@@ -109,9 +130,18 @@ pub(super) async fn link_pull_request(
             .into());
         }
         let vars = json!({ "issueId": issue_id, "url": url });
-        let resp: AttachmentLinkResp = c
+        let resp: AttachmentLinkResp = match c
             .do_graphql(query::MUTATION_ATTACHMENT_LINK_GITHUB_PR, Some(vars))
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            // The link the caller asked for is already there. See the module doc's "Repeats":
+            // this is the one refusal that proves the post-condition holds.
+            Err(TrackerError::Linear(e)) if e.kind == LinearErrorKind::DuplicateAttachment => {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let id = resp
             .attachment_link
             .attachment
@@ -222,6 +252,79 @@ mod tests {
             .await
             .expect_err("an empty attachment id must error");
         assert!(is_kind(&err, LinearErrorKind::MoveRejected), "got {err:?}");
+    }
+
+    /// STUDIO-904's whole fix, at the boundary where the answer arrives: Linear refusing a second
+    /// write of the same pull request means the link is there, so the call succeeds.
+    ///
+    /// The payload is the live refusal, verbatim (`~/.rhapsody/logs/rhapsodyd.2026-09-15.log`,
+    /// 05:33). A mutation that stops classifying it — `classify_graphql_errors` returning
+    /// `GraphqlErrors`, or this function no longer matching the kind — reds here.
+    #[tokio::test]
+    async fn a_duplicate_attachment_is_success_because_the_link_is_already_there() {
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{
+                        "code":"INPUT_ERROR","statusCode":400,"type":"invalid input",
+                        "userError":true,
+                        "userPresentableMessage":"An attachment with the same URL already exists."
+                    },
+                    "locations":[{"column":3,"line":3}],
+                    "message":"Duplicate attachment for duplicate url",
+                    "path":["attachmentLinkGitHubPR"]
+                }]}"#,
+            )
+        })
+        .await;
+        client_at(server.url())
+            .link_pull_request("iss-uuid", PR_URL)
+            .await
+            .expect("a duplicate means the link landed");
+    }
+
+    /// The other half of that boundary, and the half worth keeping: a refusal that only LOOKS like
+    /// a duplicate is still an error. Making every GraphQL refusal read as success would red this.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_a_duplicate_is_still_an_error() {
+        // Same path, different code — Linear refusing the mutation for another reason (a bad
+        // token, a renamed repo, an outage surfaces here too when it comes back as a GraphQL error).
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{"code":"INTERNAL_SERVER_ERROR","userPresentableMessage":"Something went wrong."},
+                    "message":"Something went wrong",
+                    "path":["attachmentLinkGitHubPR"]
+                }]}"#,
+            )
+        })
+        .await;
+        let err = client_at(server.url())
+            .link_pull_request("iss-uuid", PR_URL)
+            .await
+            .expect_err("a non-duplicate refusal must error");
+        assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
+    }
+
+    /// And the wording is not the trigger: the identical English sentence on an error that does not
+    /// name the attachment mutation is a failure, so a fix keyed on the prose reds here.
+    #[tokio::test]
+    async fn the_presentable_message_alone_does_not_make_a_refusal_a_duplicate() {
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{"code":"INPUT_ERROR","userPresentableMessage":"An attachment with the same URL already exists."},
+                    "message":"something else entirely",
+                    "path":["issueUpdate"]
+                }]}"#,
+            )
+        })
+        .await;
+        let err = client_at(server.url())
+            .link_pull_request("iss-uuid", PR_URL)
+            .await
+            .expect_err("the shape, not the sentence, decides");
+        assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
     }
 
     /// Argument validation is local and refuses before any request is made, matching every other

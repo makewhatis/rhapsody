@@ -136,8 +136,11 @@ impl Client {
     /// headers to the configured endpoint, and maps failures to the matching sentinel:
     /// transport/build/read → [`ApiRequest`](LinearErrorKind::ApiRequest); non-200 →
     /// [`ApiStatus`](LinearErrorKind::ApiStatus) (with a bounded body snippet); a top-level
-    /// `errors` array → [`GraphqlErrors`](LinearErrorKind::GraphqlErrors); an undecodable body or
-    /// empty `data` → [`UnknownPayload`](LinearErrorKind::UnknownPayload).
+    /// `errors` array → [`GraphqlErrors`](LinearErrorKind::GraphqlErrors), or
+    /// [`DuplicateAttachment`](LinearErrorKind::DuplicateAttachment) when the array's shape is
+    /// Linear refusing an already-present pull-request link (see
+    /// [`errors::classify_graphql_errors`](super::errors::classify_graphql_errors)); an
+    /// undecodable body or empty `data` → [`UnknownPayload`](LinearErrorKind::UnknownPayload).
     ///
     /// Visibility: `pub` because it is the adapter's low-level transport, consumed by the read
     /// (T4) and write (T5) operation methods; `rhapsody-tracker` is an internal workspace crate,
@@ -183,7 +186,7 @@ impl Client {
             .map_err(|e| LinearError::new(LinearErrorKind::UnknownPayload, e.to_string()))?;
         if !env.errors.is_empty() {
             return Err(LinearError::new(
-                LinearErrorKind::GraphqlErrors,
+                super::errors::classify_graphql_errors(&env.errors),
                 format!("{:?}", env.errors),
             )
             .into());
