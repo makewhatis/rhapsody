@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rhapsody_agent::{HarnessId, HarnessKnobs, HarnessSpec, Runner, claude};
+use rhapsody_agent::{HarnessId, HarnessKnobs, HarnessSpec, Runner, claude, opencode};
 use rhapsody_config::{Config, EffectiveConfig, effective_for, resolve_projects};
 use rhapsody_core::normalize_state;
 use rhapsody_tracker::{self as tracker, Tracker};
@@ -197,30 +197,32 @@ impl Effective {
 /// [`runner_for_backend`] implements — see that function's doc.
 pub type RunnerFactory<'a> = &'a dyn Fn(HarnessSpec) -> Arc<dyn Runner>;
 
-/// The production seam: build a claude runner. Mirrors Go `defaultRunnerFactory` (`claude.New`).
+/// The production seam: build the runner the spec names. Mirrors Go `defaultRunnerFactory`
+/// (`claude.New`), generalized over [`HarnessKnobs`]'s variants.
 ///
-/// [`HarnessKnobs`] has exactly one variant today, so this destructures it directly rather than
-/// matching — the moment a second variant exists, this line stops compiling instead of silently
-/// falling through a wildcard arm.
+/// Matched exhaustively with no wildcard arm on purpose: a third harness must stop this function
+/// compiling rather than silently resolve to claude. (Until STUDIO-902 there was one variant and
+/// this destructured it directly, for the same reason.)
 fn default_runner_factory(spec: HarnessSpec) -> Arc<dyn Runner> {
-    let HarnessKnobs::Claude(cc) = spec.knobs;
-    Arc::new(claude::Runner::new(cc))
+    match spec.knobs {
+        HarnessKnobs::Claude(cc) => Arc::new(claude::Runner::new(cc)),
+        HarnessKnobs::Opencode(oc) => Arc::new(opencode::Runner::new(oc)),
+    }
 }
 
 /// Maps a (materialized) [`Config`] onto an [`Runner`] via the named backend, returning
 /// [`OrchestratorError::UnsupportedBackend`] for any backend this build does not implement. Both the
-/// top-level legacy runner and every per-project runner route through this single switch. Today
-/// only `"claude"` is implemented — STUDIO-900 generalized the SHAPE the factory is called with
-/// (a [`HarnessSpec`], not a bare [`claude::Config`]) without changing which backend names this
-/// function accepts; see this module's top-of-file doc and `implemented_backend_is_a_known_harness_name`
-/// below for why "recognized by config" and "implemented here" stay two different questions on
-/// purpose. Mirrors Go `runnerForBackend`.
+/// top-level legacy runner and every per-project runner route through this single switch.
+/// `"claude"` and — since STUDIO-902 — `"opencode"` are implemented; `"codex"` is recognized by
+/// config validation and still has no runner, which is the split this module's top-of-file doc and
+/// `implemented_backends_are_known_harness_names` below keep deliberate rather than accidental.
+/// Mirrors Go `runnerForBackend`.
 fn runner_for_backend(
     cfg: &Config,
     new_runner: RunnerFactory<'_>,
 ) -> Result<Arc<dyn Runner>, OrchestratorError> {
     match cfg.agent.backend.as_str() {
-        "claude" => Ok(new_runner(harness_spec_from_cfg(cfg))),
+        "claude" | "opencode" => Ok(new_runner(harness_spec_from_cfg(cfg))),
         other => Err(OrchestratorError::UnsupportedBackend(other.to_string())),
     }
 }
@@ -233,11 +235,47 @@ fn runner_for_backend(
 /// [`claude::Config`] the pre-STUDIO-900 code passed straight to [`claude::Runner::new`], the argv
 /// [`claude::args::build_args`] produces from it is unchanged.
 fn harness_spec_from_cfg(cfg: &Config) -> HarnessSpec {
+    if cfg.agent.backend == "opencode" {
+        return HarnessSpec {
+            harness: HarnessId::Opencode,
+            model: None,
+            provider: None,
+            knobs: HarnessKnobs::Opencode(opencode_config_from_cfg(cfg)),
+        };
+    }
     HarnessSpec {
         harness: HarnessId::Claude,
         model: None,
         provider: None,
         knobs: HarnessKnobs::Claude(claude_config_from_cfg(cfg)),
+    }
+}
+
+/// Maps a [`Config`]'s `opencode`/tracker/workspace knobs onto an [`opencode::Config`] (STUDIO-902),
+/// the counterpart of [`claude_config_from_cfg`] and built from the same single mapping for both
+/// the top-level and per-project runners.
+///
+/// ⚠️ Note what is NOT carried across from the claude mapping: there is no `billing_guard` (Claude's
+/// guard forces subscription billing off an `apiKeySource` signal opencode does not emit, and this
+/// backend exists to bill a different provider on purpose) and no `permission_mode`/`allowed_tools`
+/// (opencode has one `--auto` approval boolean instead). `tracker_api_key` IS carried: withholding
+/// the Linear credential from the agent is not a billing decision.
+fn opencode_config_from_cfg(cfg: &Config) -> opencode::Config {
+    opencode::Config {
+        command: cfg.opencode.command.clone(),
+        model: cfg.opencode.model.clone(),
+        variant: cfg.opencode.variant.clone(),
+        agent: cfg.opencode.agent.clone(),
+        auto_approve: cfg.opencode.auto_approve,
+        workspace_root: cfg.workspace.root.clone(),
+        turn_timeout: Duration::from_millis(cfg.opencode.turn_timeout_ms.max(0) as u64),
+        extra_args: cfg.opencode.extra_args.clone(),
+        tracker_api_key: cfg.tracker.api_key.clone(),
+        inject_mcp: cfg.mcp.enabled,
+        daemon_bin: daemon_bin_path(),
+        workflow_path: cfg.workflow_path.clone(),
+        state_root: cfg.opencode.state_root.clone(),
+        auth_source: cfg.opencode.auth_source.clone(),
     }
 }
 
@@ -740,7 +778,12 @@ claude:
         let got_configs: RefCell<Vec<claude::Config>> = RefCell::new(Vec::new());
         let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
             assert_eq!(spec.harness, HarnessId::Claude);
-            let HarnessKnobs::Claude(cc) = spec.knobs;
+            // `let ... else` rather than an irrefutable binding since STUDIO-902 added a second
+            // knobs variant. These fixtures configure `backend: claude`, so the other arm is
+            // genuinely unreachable and asserting that is the point.
+            let HarnessKnobs::Claude(cc) = spec.knobs else {
+                panic!("a claude-configured fixture produced non-claude knobs")
+            };
             got_configs.borrow_mut().push(cc.clone());
             Arc::new(claude::Runner::new(cc))
         };
@@ -783,7 +826,12 @@ claude:
         let got_configs: RefCell<Vec<claude::Config>> = RefCell::new(Vec::new());
         let factory = |spec: HarnessSpec| -> Arc<dyn Runner> {
             assert_eq!(spec.harness, HarnessId::Claude);
-            let HarnessKnobs::Claude(cc) = spec.knobs;
+            // `let ... else` rather than an irrefutable binding since STUDIO-902 added a second
+            // knobs variant. These fixtures configure `backend: claude`, so the other arm is
+            // genuinely unreachable and asserting that is the point.
+            let HarnessKnobs::Claude(cc) = spec.knobs else {
+                panic!("a claude-configured fixture produced non-claude knobs")
+            };
             got_configs.borrow_mut().push(cc.clone());
             Arc::new(claude::Runner::new(cc))
         };
@@ -825,11 +873,13 @@ claude:
     /// renamed arm silently stopped matching it — the behavioural tests above (`build_effective`
     /// selecting a claude runner) are what would actually catch that.
     #[test]
-    fn implemented_backend_is_a_known_harness_name() {
-        assert!(
-            rhapsody_config::HARNESS_NAMES.contains(&"claude"),
-            "runner_for_backend's one implemented backend must remain in the shared registry"
-        );
+    fn implemented_backends_are_known_harness_names() {
+        for name in ["claude", "opencode"] {
+            assert!(
+                rhapsody_config::HARNESS_NAMES.contains(&name),
+                "runner_for_backend implements {name:?}, so it must remain in the shared registry"
+            );
+        }
     }
 
     /// `validate`'s `UnsupportedAgentBackend` check used to hardcode its own notion of "which

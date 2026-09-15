@@ -16,11 +16,13 @@
 //! Deliberately **names only** (no capability metadata): a richer per-name contract is slice 2's
 //! `HarnessCapabilities`, reviewed on its own terms, not this slice's job to anticipate.
 
-/// The `agent.backend` values [`validate`](crate::validate::validate) accepts. Mirrors Go
-/// `ValidateDispatch`'s `claude`/`codex` pair. Adding a name here makes config validation accept
-/// it; it does NOT give the orchestrator a `Runner` for it — that remains a separate, per-build
-/// decision (today: only `claude` is implemented).
-pub const HARNESS_NAMES: &[&str] = &["claude", "codex"];
+/// The `agent.backend` values [`validate`](crate::validate::validate) accepts. Go
+/// `ValidateDispatch` accepts the `claude`/`codex` pair; `opencode` is an ADDITIVE Rhapsody
+/// divergence (STUDIO-902 — the frozen reference has no opencode). Adding a name here makes config
+/// validation accept it; it does NOT give the orchestrator a `Runner` for it — that remains a
+/// separate, per-build decision. Today `claude` and `opencode` are implemented and `codex` is not,
+/// which is the split this module's doc says is genuine rather than accidental.
+pub const HARNESS_NAMES: &[&str] = &["claude", "codex", "opencode"];
 
 #[cfg(test)]
 mod tests {
@@ -30,6 +32,7 @@ mod tests {
     fn known_names_are_known() {
         assert!(HARNESS_NAMES.contains(&"claude"));
         assert!(HARNESS_NAMES.contains(&"codex"));
+        assert!(HARNESS_NAMES.contains(&"opencode"));
     }
 
     #[test]

@@ -134,6 +134,20 @@ fn raw_from_config(c: &Config) -> Raw {
     r.claude.stall_timeout_ms = Some(c.claude.stall_timeout_ms);
     r.claude.extra_args = c.claude.extra_args.clone();
     r.claude.billing_guard = c.claude.billing_guard;
+    // opencode (STUDIO-902). Encoded unconditionally like every other block; a zero-value
+    // `Opencode` round-trips to an `opencode:` section of defaults, exactly as an untouched
+    // `codex:` does.
+    r.opencode.command = c.opencode.command.clone();
+    r.opencode.model = c.opencode.model.clone();
+    r.opencode.variant = c.opencode.variant.clone();
+    r.opencode.agent = c.opencode.agent.clone();
+    r.opencode.auto_approve = c.opencode.auto_approve;
+    r.opencode.turn_timeout_ms = Some(c.opencode.turn_timeout_ms);
+    r.opencode.read_timeout_ms = Some(c.opencode.read_timeout_ms);
+    r.opencode.stall_timeout_ms = Some(c.opencode.stall_timeout_ms);
+    r.opencode.extra_args = c.opencode.extra_args.clone();
+    r.opencode.state_root = c.opencode.state_root.clone();
+    r.opencode.auth_source = c.opencode.auth_source.clone();
     // ultracode defaults to false; emit only when true so an unset/false knob is pruned.
     if c.claude.ultracode {
         r.claude.ultracode = Some(true);

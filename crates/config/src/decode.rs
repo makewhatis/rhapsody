@@ -17,8 +17,9 @@ use rhapsody_core::normalize_state;
 use serde_yaml_ng::Value;
 
 use crate::model::{
-    Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT, Hooks, Logging, Mcp, Otel,
-    Polling, Project, Raw, RawClaudeOverride, RawProject, Server, Storage, Tracker, Workspace,
+    Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT, Hooks, Logging, Mcp,
+    Opencode, Otel, Polling, Project, Raw, RawClaudeOverride, RawProject, Server, Storage, Tracker,
+    Workspace,
 };
 use crate::workflow::Definition;
 
@@ -156,6 +157,30 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         ultracode: or_bool(r.claude.ultracode, false),
     };
 
+    // opencode (STUDIO-902). Rhapsody-only and purely additive: with no `opencode:` key in the
+    // workflow every field below is its zero value or its default, nothing constructs an opencode
+    // runner, and the decode is byte-identical to a daemon built before this block existed.
+    //
+    // `command` defaults to the bare name rather than an absolute path, matching how `claude` and
+    // `codex` default — but ⚠️ see `Opencode::command`: a broken shim ahead of the real binary on
+    // PATH is a measured hazard for this CLI specifically, so an operator should set it.
+    let opencode = Opencode {
+        command: or_str(r.opencode.command, "opencode"),
+        model: r.opencode.model,
+        variant: r.opencode.variant,
+        agent: r.opencode.agent,
+        // absent/nil ⇒ enabled (true), because a dispatched agent has no operator to answer a
+        // permission prompt; kept as a pointer so Encode round-trips an explicit false. The same
+        // shape `claude.billing_guard` uses.
+        auto_approve: Some(or_bool(r.opencode.auto_approve, true)),
+        turn_timeout_ms: or_int(r.opencode.turn_timeout_ms, 3600000),
+        read_timeout_ms: or_int(r.opencode.read_timeout_ms, 5000),
+        stall_timeout_ms: or_int(r.opencode.stall_timeout_ms, 300000),
+        extra_args: r.opencode.extra_args,
+        state_root: r.opencode.state_root,
+        auth_source: r.opencode.auth_source,
+    };
+
     let server = Server {
         port: r.server.port,
     };
@@ -207,6 +232,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         agent,
         codex,
         claude,
+        opencode,
         server,
         logging,
         otel,
