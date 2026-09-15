@@ -1606,3 +1606,67 @@ The trust argument is the reverse of the one against widening `isGithubPR`. A wa
 owner/repo/number were written by this daemon from its own resolved repository binding and are never
 taken from room text (the review design's F-SEC rule); a tracker attachment can be written by anyone
 with tracker access. The daemon's own record is the stricter source, not the looser one.
+
+### A second agent backend — `opencode` (STUDIO-902)
+
+The frozen reference runs exactly one coding-agent backend. Rhapsody now ships two: `claude` and
+**`opencode`**, the first adapter of the pluggable-harnesses design
+(`~/.rhapsody/docs/pluggable-harnesses-design.md`, §9's slice 8). The reason is cost, not
+capability — it moves implementation runs onto a different billing pool and keeps the Claude quota
+for planning and review.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `agent.backend` values with a runner | `claude` | `claude`, **`opencode`** |
+| `agent.backend` values config-validation accepts | `claude`, `codex` | `claude`, `codex`, **`opencode`** (`codex` still has no runner, in both) |
+| Backend knob blocks | `claude:`, `codex:` | those, plus **`opencode:`** |
+| Which backend a teammate runs on | — (no Teams) | a profile's **`harness:`**, empty ⇒ the configured `agent.backend` |
+
+**Additive, and that is testable rather than asserted.** A workflow with no `opencode:` key and no
+profile naming a `harness:` decodes, resolves and dispatches byte-identically to a daemon built
+before this existed: every new field's default is its zero value, every shipped built-in profile
+ships `harness: ""`, and `Effective::agent` — what a dispatch naming no harness uses — is still the
+configured backend's runner. Claude's argv, its normalized events and its goldens are untouched.
+
+**The parity surfaces were deliberately NOT widened.** `GET /api/v1/config` emits `claude` and does
+not emit `codex`, so it does not emit `opencode` either — adding it would have changed a shape
+`harness/fixtures/api/config.json` pins byte-for-byte. The console therefore cannot yet read
+opencode's configuration; surfacing it belongs with the design's slice 5 console work. Likewise the
+`runs` table gains no `harness` column: design §6.2 wants `harness` / `model` / `provider` /
+`session_uuid` added together, and that is slice 3.
+
+**What the adapter owes the CLI that claude's does not.** Each of these is measured, from the
+STUDIO-869 spike's committed captures in `harness/harness-spike/opencode/`:
+
+- **A private `XDG_DATA_HOME` per run, which is not optional.** Two turns sharing one opencode state
+  directory lose turns to `database is locked` — 8/10 completed against a warm directory, **0/10
+  against a fresh one**, 10/10 isolated. A lost turn exits 1 in under a second with an **empty event
+  stream**, so "the stream ended with no terminal event" is a first-class failure here rather than an
+  impossible state.
+- **The credential is copied into that directory.** opencode keeps `auth.json` inside the very
+  directory being redirected, so a bare redirect leaves the turn unauthenticated and it fails as a
+  401 that reads like a provider misconfiguration. Auth still defers entirely to the operator's own
+  `opencode auth login` — the daemon writes no provider config, it copies an existing credential —
+  and a missing one is refused at `start_session`, before anything is spawned. The operator's
+  `~/.config/opencode/` config is under `XDG_CONFIG_HOME` and is not redirected at all.
+- **Prompt tool names are rewritten.** opencode spells an injected MCP tool `<server>_<tool>` where
+  claude spells it `mcp__<server>__<tool>`, and Rhapsody's prompt template names tools literally —
+  including `mcp__symphony__symphony_handoff`, the tool that ENDS a run. The adapter rewrites the
+  prompt into opencode's spelling; unrewritten, an agent is told to call a tool that does not exist
+  and the run simply never hands off.
+- **The MCP config goes in the run's state directory, not the worktree.** `OPENCODE_CONFIG` was
+  measured to MERGE with the project and global configs rather than replace them, so the daemon's
+  server can be injected without writing into the git worktree the agent is about to commit from.
+- **stdin is closed at start**, where claude requires it held open as the INF-250 operator mailbox.
+  So this backend cannot steer a live turn: a message that arrives mid-turn is drained, counted and
+  logged as undelivered rather than silently dropped.
+- **No billing guard.** Claude's guard forces subscription billing off an `apiKeySource` signal
+  opencode does not emit, and billing a different provider is the point. The TRACKER credential
+  scrub still applies, by name and by value — withholding the Linear key is not a billing decision.
+
+**The session-id question §6.2 leaves open does not bind this adapter.** Per-run isolation costs
+goose its session-id uniqueness (two isolated goose runs both report `20260912_1`), which is why the
+design asks whether an isolated id can still be an identity key. opencode mints a random `ses_…` per
+session instead of numbering per state directory: `concurrency-trials-isolated-xdg.txt` records ten
+isolated turns with ten distinct ids. So isolation costs opencode nothing here, and slice 9 still
+owns the goose case where the trade is real.
