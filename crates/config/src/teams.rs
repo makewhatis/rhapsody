@@ -336,6 +336,28 @@ pub struct Review {
     /// [`Teams::review_auto_merge`] gates it on the same predicate.
     #[serde(default)]
     pub auto_merge: bool,
+    /// The model a REVIEW run uses, regardless of what the routed teammate's own profile asks for
+    /// (STUDIO-901). Empty — the default — means a review run inherits whatever model it would
+    /// have used anyway (the routed teammate's profile, else the installation-wide `claude.model`),
+    /// exactly the "absent means whatever would have happened" rule [`Review::done_state`] and
+    /// STUDIO-868's profile `model` both already follow — an installation that never sets this key
+    /// is byte-identical to one built before it existed.
+    ///
+    /// Review-scoped rather than a teammate field on purpose: STUDIO-868's profile `model` answers
+    /// "what model does THIS PERSON use", and cannot express "what model does REVIEW use" — every
+    /// teammate both implements and reviews, so a role-based intent has no person to attach to.
+    /// When a routed reviewer's own profile ALSO names a model, this one wins for a review run: the
+    /// operator who wrote `review: { model: … }` is stating role-based intent explicitly, and it is
+    /// the PR under review being priced, not that teammate's own work.
+    #[serde(default)]
+    pub model: String,
+    /// The effort a REVIEW run uses, paired with [`Review::model`] for the same reason `Config` and
+    /// a teammate's profile pair the two everywhere else in this codebase: setting `model` alone
+    /// would leave whatever effort was already in play — profile or installation-wide — applying to
+    /// a cheap review model, which can cost more than the swap saves. Empty means inherit, exactly
+    /// as `model` does.
+    #[serde(default)]
+    pub effort: String,
 }
 
 impl Default for Review {
@@ -346,6 +368,8 @@ impl Default for Review {
             done_state: String::new(),
             changes_state: String::new(),
             auto_merge: false,
+            model: String::new(),
+            effort: String::new(),
         }
     }
 }
@@ -1791,6 +1815,37 @@ mod tests {
         .expect("quorum.reviewers has no ceiling; an upgrade must not turn this install off");
     }
 
+    // ── review.model / review.effort (STUDIO-901) ───────────────────────────
+
+    /// Absent means inherit, never reset — the same rule STUDIO-868's profile
+    /// `model`/`effort` and [`Review::done_state`] already follow. An installation
+    /// that never writes `review.model`/`review.effort` parses to the same empty
+    /// pair a daemon built before this ticket would have (byte-identical).
+    #[test]
+    fn review_model_and_effort_default_to_empty_inherit() {
+        assert_eq!(Review::default().model, "");
+        assert_eq!(Review::default().effort, "");
+        for text in [
+            "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: ticketless\n  model: \"\"\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert_eq!(t.review.model, "", "({text:?})");
+            assert_eq!(t.review.effort, "", "({text:?})");
+        }
+    }
+
+    /// The pair parses off the wire exactly like every other `review:` scalar.
+    #[test]
+    fn review_model_and_effort_parse_from_yaml() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+        assert_eq!(t.review.model, "claude-opus-5");
+        assert_eq!(t.review.effort, "high");
+    }
+
     /// STUDIO-712: the auto-Done transition is OFF unless somebody named the
     /// terminal state, and naming it is not enough on an installation whose
     /// review path cannot produce a merge edge to act on.
@@ -1921,6 +1976,8 @@ mod tests {
                 done_state: "Done".to_string(),
                 changes_state: "In Progress".to_string(),
                 auto_merge: true,
+                model: "claude-opus-5".to_string(),
+                effort: "high".to_string(),
             },
             // Four, because `reviewers: 3` must be a config the ceiling accepts
             // (STUDIO-891: a roster of N satisfies at most N−1). The property
@@ -1948,6 +2005,8 @@ mod tests {
             Teams::load(&path).review_changes_state(),
             Some("In Progress")
         );
+        assert_eq!(Teams::load(&path).review.model, "claude-opus-5");
+        assert_eq!(Teams::load(&path).review.effort, "high");
     }
 
     /// Unknown keys are ignored rather than fatal, matching `CapabilityDef`'s
