@@ -33,6 +33,7 @@ use rhapsody_tracker::Tracker;
 use rhapsody_workspace::Manager;
 
 use crate::backoff::failure_backoff_ms;
+use crate::effective::stall_timeout_for_harness;
 use crate::liveness::Sampler;
 use crate::orchestrator::{Orchestrator, RunningEntry, zero_time};
 use crate::reconcile::{ActionKind, reconcile_actions};
@@ -267,6 +268,13 @@ impl Orchestrator {
 
     /// Returns the stall timeout for a running entry: its owning project's timeout when stamped and
     /// still resolvable, else the top-level stall timeout. Mirrors Go `stallTimeoutFor`.
+    ///
+    /// Plus the harness the run was DISPATCHED on, which Go has no notion of: when `re.harness`
+    /// names a backend the resolved config's own `agent.backend` is not (STUDIO-902's headline
+    /// arrangement — `agent.backend: claude` with one teammate's profile naming `harness:
+    /// opencode`), that backend's own `stall_timeout_ms` wins over the config's precomputed one.
+    /// Every run that names no harness, or names the configured one, is unchanged — see
+    /// [`crate::effective::stall_timeout_for_harness`].
     pub(crate) fn stall_timeout_for(&self, re: &RunningEntry) -> std::time::Duration {
         if !re.project_slug.is_empty()
             && let Some(p) = self
@@ -274,11 +282,11 @@ impl Orchestrator {
                 .as_ref()
                 .and_then(|e| e.project_by_slug(&re.project_slug))
         {
-            return p.stall_timeout;
+            return stall_timeout_for_harness(&p.mcfg, &re.harness).unwrap_or(p.stall_timeout);
         }
-        self.eff
-            .as_ref()
-            .map_or(std::time::Duration::ZERO, |e| e.stall_timeout)
+        self.eff.as_ref().map_or(std::time::Duration::ZERO, |e| {
+            stall_timeout_for_harness(&e.cfg, &re.harness).unwrap_or(e.stall_timeout)
+        })
     }
 
     /// Returns the active / canceled / terminal / review state sets for a running entry: its owning
@@ -598,6 +606,54 @@ mod tests {
     fn advance(clock: &std::sync::Arc<std::sync::Mutex<DateTime<Utc>>>, by: chrono::Duration) {
         let mut g = clock.lock().expect("clock lock");
         *g += by;
+    }
+
+    /// ⚠️ The stall timeout follows the harness a run was DISPATCHED on, not only the backend its
+    /// config names. STUDIO-902's headline arrangement is `agent.backend: claude` with ONE
+    /// teammate's profile naming `harness: opencode`; resolving per config alone governed that run
+    /// by `claude.stall_timeout_ms` and left `opencode.stall_timeout_ms` consulted by nothing.
+    ///
+    /// Every number here is DIFFERENT so no arm can pass by coincidence, and the per-project arm is
+    /// asserted beside the top-level one because the two resolve through different branches.
+    #[test]
+    fn stall_timeout_follows_the_dispatched_harness_not_only_the_config() {
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_millis(111_000));
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.cfg.agent.backend = "claude".to_string();
+            eff.cfg.claude.stall_timeout_ms = 111_000;
+            eff.cfg.opencode.stall_timeout_ms = 222_000;
+
+            let mut p = empty_resolved_project("proj", Arc::new(Fake::new()));
+            p.mcfg.agent.backend = "claude".to_string();
+            p.mcfg.claude.stall_timeout_ms = 333_000;
+            p.mcfg.opencode.stall_timeout_ms = 444_000;
+            p.stall_timeout = std::time::Duration::from_millis(333_000);
+            eff.projects.push(p);
+        }
+
+        let resolved = |o: &Orchestrator, slug: &str, harness: &str| {
+            let mut re = running_entry(issue("1", "MT-1", "In Progress"), slug, slug);
+            re.harness = harness.to_string();
+            o.stall_timeout_for(&re).as_millis()
+        };
+
+        // Top level: no harness, and the configured one, both keep the config's own number.
+        assert_eq!(resolved(&o, "", ""), 111_000);
+        assert_eq!(resolved(&o, "", "claude"), 111_000);
+        // The routed teammate: opencode's own knob, which nothing consulted before.
+        assert_eq!(
+            resolved(&o, "", "opencode"),
+            222_000,
+            "an opencode-dispatched run must be governed by opencode's stall timeout"
+        );
+        // A harness this build has no runner for runs on the default, so it keeps the default's
+        // liveness window rather than losing stall detection to a typo.
+        assert_eq!(resolved(&o, "", "goose"), 111_000);
+
+        // And the per-project branch, which reads the project's own resolved config.
+        assert_eq!(resolved(&o, "proj", ""), 333_000);
+        assert_eq!(resolved(&o, "proj", "opencode"), 444_000);
     }
 
     fn liveness_orch(stall: std::time::Duration) -> (Orchestrator, TempDir) {

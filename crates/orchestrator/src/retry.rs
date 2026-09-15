@@ -396,6 +396,9 @@ impl Orchestrator {
             // whose profile names neither — which is every built-in — so the worker's session keeps
             // the installation-wide pair and the argv is byte-identical to today.
             re.model_override = td.model_override.clone();
+            // The routed teammate's harness (STUDIO-902). Empty for every profile that names none,
+            // so the worker keeps the configured backend's runner and the dispatch is unchanged.
+            re.harness = td.harness.clone();
         }
         // A review run's model/effort come from `review.model`/`review.effort` when the operator
         // set them, regardless of what the routed teammate's own profile asked for (STUDIO-901).
@@ -498,6 +501,7 @@ impl Orchestrator {
         let capabilities_section = re.capabilities_section.clone();
         let teammate_section = re.teammate_section.clone();
         let model_override = re.model_override.clone();
+        let harness = re.harness.clone();
         let review_checkout = review.as_ref().map(crate::review::ReviewRun::checkout);
         // Stamped by `persist_start_run` above; 0 when the store is off or the insert failed, which
         // the runner treats as "unknown" and emits no env for (STUDIO-675).
@@ -522,6 +526,7 @@ impl Orchestrator {
                 capabilities_section,
                 teammate_section,
                 model_override,
+                harness,
                 run_id,
                 started_at,
                 review_checkout,

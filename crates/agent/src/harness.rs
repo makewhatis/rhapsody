@@ -73,9 +73,12 @@
 //!
 //! ## What this slice deliberately does NOT do
 //!
-//! - **No second harness.** [`HarnessId`] has exactly one variant. Every later variant is a real,
-//!   reviewed change to every `match` on it — that is a feature of a closed enum, not a
-//!   gap to paper over with a wildcard arm.
+//! - **No second harness.** [`HarnessId`] had exactly one variant when this slice landed. Every
+//!   later variant is a real, reviewed change to every `match` on it — that is a feature of a
+//!   closed enum, not a gap to paper over with a wildcard arm. ⚠️ **STUDIO-902 has since added
+//!   [`HarnessId::Opencode`]** (`crate::opencode`), ahead of the slice order, to move
+//!   implementation onto a different billing pool; it went in as the real, reviewed change this
+//!   paragraph describes rather than through a wildcard, and it left claude's behaviour untouched.
 //! - **The runner is still built at effective-build time**, not at dispatch (design §4.1's "largest
 //!   structural edit"). [`crate::Session::set_model_override`]'s doc comment already states why:
 //!   Teams picks the identity at dispatch, but *swapping a whole harness* is slice 4's job, not
@@ -90,13 +93,15 @@ use std::fmt;
 
 use crate::Runner;
 
-/// Which harness a resolved [`HarnessSpec`] names. Exactly one variant today (design D4 lists four:
-/// claude, codex, goose, opencode; `pi` was dropped for having no MCP client) — adding the next one
-/// is a real, reviewed change to every `match` on this type, not a default arm silently absorbing
-/// it.
+/// Which harness a resolved [`HarnessSpec`] names. Two variants today, of design D4's four
+/// (claude, codex, goose, opencode; `pi` was dropped for having no MCP client) — adding the next
+/// one is a real, reviewed change to every `match` on this type, not a default arm silently
+/// absorbing it. STUDIO-902 added [`HarnessId::Opencode`] exactly that way: this slice's module doc
+/// said a second variant would be a real, reviewed change, and it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarnessId {
     Claude,
+    Opencode,
 }
 
 /// A non-default model provider/endpoint (design §3's "the multi-provider axis": base URL + auth
@@ -138,9 +143,16 @@ impl fmt::Debug for ProviderAuth {
 /// knob block," because the knobs do not line up across CLIs). One variant per [`HarnessId`] — the
 /// claude arm carries the existing, untouched [`crate::claude::Config`], so wrapping a `Config` in
 /// this enum changes nothing about what reaches [`crate::claude::runner::Runner`].
+///
+/// The two knob blocks demonstrate why §4.2 asked for an opaque block rather than one shared
+/// struct: they overlap on `command`/`model`/`extra_args` and agree on nothing else. opencode has
+/// no permission MODE (it has one `--auto` approval boolean), no tool allowlist, and no
+/// `mcp_config` path — but it does have a `--variant` reasoning knob and a per-run state directory,
+/// neither of which claude has any use for.
 #[derive(Debug, Clone)]
 pub enum HarnessKnobs {
     Claude(crate::claude::Config),
+    Opencode(crate::opencode::Config),
 }
 
 /// What was asked for, fully resolved (design §3): the harness, its model, an optional non-default

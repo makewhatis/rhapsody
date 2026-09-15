@@ -1435,9 +1435,9 @@ impl Orchestrator {
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
     // STUDIO-643 threads `teammate_section` identically, STUDIO-675 threads `run_id` — which Go
-    // carries on `WorkerDeps` proper — and STUDIO-868 threads `model_override` beside the section it
-    // was resolved with. Bundling these into a struct would diverge from the Go parity shape for no
-    // behavioral gain.
+    // carries on `WorkerDeps` proper — STUDIO-868 threads `model_override` beside the section it was
+    // resolved with, and STUDIO-902 threads `harness` beside that, resolved from the same profile.
+    // Bundling these into a struct would diverge from the Go parity shape for no behavioral gain.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_worker(
         &self,
@@ -1449,6 +1449,7 @@ impl Orchestrator {
         capabilities_section: String,
         teammate_section: String,
         model_override: rhapsody_agent::ModelOverride,
+        harness: String,
         run_id: i64,
         started_at: DateTime<Utc>,
         review: Option<crate::review::ReviewCheckout>,
@@ -1467,6 +1468,29 @@ impl Orchestrator {
         // its first turn (STUDIO-868). Empty leaves the runner's own `claude.model`/`effort` in
         // place, so a dispatch that routed to nobody is byte-identical to today.
         deps.model_override = model_override;
+        // ⚠️ The routed teammate's HARNESS (STUDIO-902): swap in that backend's already-built
+        // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
+        // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.
+        //
+        // An unrecognized name FALLS BACK to the configured backend with a warning rather than
+        // refusing the run: one mistyped profile field would otherwise strand every ticket routed
+        // to that teammate, and the run itself is still perfectly runnable on the default harness.
+        // Validating the name at config-load time is slice 4's resolution chain, which is where a
+        // typo can be reported once instead of per dispatch.
+        if !harness.is_empty() {
+            let pool = eff
+                .project_by_slug(&project_slug)
+                .map_or(&eff.agents, |rp| &rp.agents);
+            match pool.get(&harness) {
+                Some(runner) => deps.agent = Arc::clone(runner),
+                None => tracing::warn!(
+                    issue = %iss.identifier,
+                    harness = %harness,
+                    "teammate profile names a harness this build has no runner for; \
+                     dispatching on the configured backend instead"
+                ),
+            }
+        }
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
         // its `teams_post` / `teams_retain` can resolve WHICH run is speaking (STUDIO-675).
         deps.run_id = run_id;

@@ -153,6 +153,48 @@ pub struct Codex {
     pub stall_timeout_ms: i64,
 }
 
+/// opencode backend knobs (STUDIO-902). ⚠️ **Rhapsody-only — the frozen Go reference has no
+/// opencode**, so this whole block is an ADDITIVE divergence (README "Divergences"). An
+/// installation that never writes an `opencode:` key decodes byte-identically to one built before
+/// this existed, which is what keeps it additive.
+///
+/// Deliberately not shaped like [`Claude`]: the two CLIs agree on `command`/`model`/`extra_args`
+/// and on nothing else. opencode has no permission MODE (one `--auto` approval boolean), no tool
+/// allowlist and no `mcp_config` path, but it does have `variant` (its reasoning-effort knob) and a
+/// state directory — see `rhapsody_agent::opencode`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Opencode {
+    /// ⚠️ Should be an ABSOLUTE path. The STUDIO-869 spike found a broken npm-global
+    /// `opencode` ahead of the working Homebrew build on `PATH`, exiting 1 without running
+    /// anything (findings §4.1) — a daemon resolving the bare name there would get the dead one.
+    pub command: String,
+    /// `-m`, in opencode's `provider/model` form.
+    pub model: String,
+    /// `--variant` — the provider-specific reasoning-effort knob, opencode's `claude --effort`.
+    pub variant: String,
+    /// `--agent`.
+    pub agent: String,
+    /// `--auto`. Pointer in Go's style: absent (`None`) means enabled; Decode always fills it, so
+    /// Encode round-trips an explicit `false`.
+    pub auto_approve: Option<bool>,
+    pub turn_timeout_ms: i64,
+    /// Feeds the daemon's own stall detection — `Effective::stall_timeout` when `agent.backend` is
+    /// `opencode`, and per run (over the configured backend's value) for a teammate whose profile
+    /// names `harness: opencode` under a different backend. ⚠️ There is
+    /// deliberately no `read_timeout_ms` beside it, unlike the `claude:` block: claude's is a Go
+    /// parity field that nothing in this port reads for behaviour, and adding a second
+    /// never-consulted knob to a NEW block would just be a setting that silently does nothing.
+    pub stall_timeout_ms: i64,
+    pub extra_args: Vec<String>,
+    /// Where per-run `XDG_DATA_HOME` directories are created; empty ⇒ the system temp dir. ⚠️ The
+    /// isolation itself is NOT optional — see `rhapsody_agent::opencode::state`; only its location
+    /// is configurable.
+    pub state_root: String,
+    /// Absolute path to the operator's own `auth.json`; empty ⇒ resolved from the daemon's
+    /// environment (`$XDG_DATA_HOME/opencode/auth.json`, else `~/.local/share/opencode/auth.json`).
+    pub auth_source: String,
+}
+
 /// Claude backend knobs (Go `Claude`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Claude {
@@ -292,6 +334,8 @@ pub struct Config {
     pub agent: Agent,
     pub codex: Codex,
     pub claude: Claude,
+    /// STUDIO-902; Rhapsody-only (see [`Opencode`]).
+    pub opencode: Opencode,
     pub server: Server,
     pub logging: Logging,
     pub otel: Otel,
@@ -344,6 +388,7 @@ pub(crate) struct Raw {
     pub agent: RawAgent,
     pub codex: RawCodex,
     pub claude: RawClaude,
+    pub opencode: RawOpencode,
     pub server: RawServer,
     pub logging: RawLogging,
     pub storage: RawStorage,
@@ -427,6 +472,21 @@ pub(crate) struct RawCodex {
     pub turn_timeout_ms: Option<i64>,
     pub read_timeout_ms: Option<i64>,
     pub stall_timeout_ms: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct RawOpencode {
+    pub command: String,
+    pub model: String,
+    pub variant: String,
+    pub agent: String,
+    pub auto_approve: Option<bool>,
+    pub turn_timeout_ms: Option<i64>,
+    pub stall_timeout_ms: Option<i64>,
+    pub extra_args: Vec<String>,
+    pub state_root: String,
+    pub auth_source: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

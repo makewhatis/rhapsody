@@ -22,6 +22,7 @@ pub mod claude;
 pub mod fake;
 pub mod harness;
 pub mod humanize;
+pub mod opencode;
 pub mod proctree;
 
 pub use harness::{
@@ -291,6 +292,23 @@ pub enum AgentError {
     #[error("{0}")]
     Other(String),
 }
+
+/// Serializes every test that spawns an agent child against the two that MUTATE the process
+/// environment.
+///
+/// `run_turn` builds its child's environment from `std::env::vars_os()`, and Rust's `std::env` is
+/// not internally synchronized the way Go's `os` package is — so a test calling `set_var` while
+/// another is reading the whole environment is a real race. Every `run_turn`-invoking test takes
+/// the READ lock; the two that `set_var`/`remove_var` take the WRITE lock, which excludes all
+/// readers.
+///
+/// ⚠️ It lives at the CRATE root rather than inside one backend's test module (where it was until
+/// STUDIO-902) because there are now two backends whose runners read the environment. A per-module
+/// guard would serialize each backend's tests against itself and against nothing else, which is
+/// exactly the race it exists to prevent. A tokio `RwLock` (not std) so the guard may be held
+/// across an `await` without tripping `clippy::await_holding_lock`.
+#[cfg(test)]
+pub(crate) static ENV_GUARD: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 #[cfg(test)]
 mod tests {

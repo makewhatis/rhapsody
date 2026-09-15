@@ -33,8 +33,9 @@ pub use harness::HARNESS_NAMES;
 pub use model::{
     Agent, CLAIM_MODE_ASSIGNEE, CLAIM_MODE_POOL, Claude, ClaudeOverride, Codex, Config,
     DEFAULT_DEP_MODE_PROMPT_FILE, DEFAULT_OTEL_ENDPOINT, DEPENDENCY_MODE_DAG,
-    DEPENDENCY_MODE_DISABLED, DEPENDENCY_MODE_GRAPHITE, Hooks, Logging, Mcp, Otel, Polling,
-    Project, Server, Storage, Tracker, WORKSPACE_MODE_CLONE, WORKSPACE_MODE_WORKTREE, Workspace,
+    DEPENDENCY_MODE_DISABLED, DEPENDENCY_MODE_GRAPHITE, Hooks, Logging, Mcp, Opencode, Otel,
+    Polling, Project, Server, Storage, Tracker, WORKSPACE_MODE_CLONE, WORKSPACE_MODE_WORKTREE,
+    Workspace,
 };
 pub use projects::{EffectiveConfig, ResolvedProject, effective_for, resolve_projects};
 pub use resolve::{Resolved, resolve};

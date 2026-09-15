@@ -46,9 +46,23 @@
 //! were consumed by nothing. **They are live now** — STUDIO-868 made a routed
 //! teammate's resolved `model`/`effort` the `--model`/`--effort` its runs get,
 //! so a Staff Engineer and a SWE I stop sharing one installation-wide pair.
-//! Empty still means inherit, which is what every built-in ships. Selecting a
-//! different HARNESS (rather than a different model within Claude) remains the
-//! pluggable-harnesses design's, not this module's.
+//! Empty still means inherit, which is what every built-in ships.
+//!
+//! **`harness` is live too, as of STUDIO-902.** T2 and STUDIO-868 left harness
+//! selection to the pluggable-harnesses design rather than this module, and this
+//! IS that design's work — its slice 8 adapter, taken early. A profile naming
+//! `harness: opencode` gets an opencode runner for its runs while every other
+//! teammate stays on Claude, which is the whole point: one installation, one
+//! Claude quota kept for planning and review, implementation billed elsewhere.
+//! Empty means inherit `agent.backend`, and every built-in ships empty, so this
+//! changes nothing until a profile sets it.
+//!
+//! ⚠️ This is a deliberately SMALLER thing than the design's slice 4 resolution
+//! chain, and it defers the rest to it: there is no `manager.harness`, no
+//! per-project harness override, no provider/model resolution independent of a
+//! harness's own knob block, and the runner is still CONSTRUCTED at
+//! effective-build time — dispatch only SELECTS among runners already built.
+//! Slice 4 replaces the selection with real resolution.
 //!
 //! `tools` is parsed and explicitly unused: per-profile tool allowlists are
 //! deferred (they need permission-flag plumbing), not implied.
@@ -133,6 +147,9 @@ pub struct BuiltinProfile {
     pub model: &'static str,
     /// Empty ⇒ inherit, exactly as [`BuiltinProfile::model`].
     pub effort: &'static str,
+    /// The `agent.backend` name this teammate's runs use; empty ⇒ inherit the daemon's configured
+    /// backend (STUDIO-902). Every built-in ships empty.
+    pub harness: &'static str,
     /// Names from the BO-11 registry ([`crate::capabilities`]) — referenced
     /// here, resolved by whoever renders them.
     pub capabilities: &'static [&'static str],
@@ -153,6 +170,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         version: 1,
         model: "",
         effort: "",
+        harness: "",
         capabilities: &[
             "design-first",
             "test-coverage",
@@ -167,6 +185,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         version: 1,
         model: "",
         effort: "",
+        harness: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v1.md"),
@@ -176,6 +195,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         version: 1,
         model: "",
         effort: "",
+        harness: "",
         capabilities: &["systematic-debugging", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/sre.v1.md"),
@@ -190,6 +210,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         version: 2,
         model: "",
         effort: "",
+        harness: "",
         capabilities: &[
             "design-first",
             "test-coverage",
@@ -204,6 +225,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         version: 2,
         model: "",
         effort: "",
+        harness: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v2.md"),
@@ -213,6 +235,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         version: 2,
         model: "",
         effort: "",
+        harness: "",
         capabilities: &["systematic-debugging", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/sre.v2.md"),
@@ -253,6 +276,8 @@ struct RawProfile {
     #[serde(default)]
     effort: Option<String>,
     #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
     capabilities: Option<Vec<String>>,
     #[serde(default)]
     tools: Option<Vec<String>>,
@@ -264,6 +289,7 @@ pub struct ProfileFile {
     pub extends: Extends,
     pub model: String,
     pub effort: String,
+    pub harness: String,
     pub capabilities: Vec<String>,
     /// Parsed, explicitly unused (§0.11.7).
     pub tools: Vec<String>,
@@ -323,6 +349,7 @@ pub struct Provenance {
     pub drift: Option<Drift>,
     pub model: Origin,
     pub effort: Origin,
+    pub harness: Origin,
     pub capabilities: Origin,
     pub tools: Origin,
     pub body: BodyOrigin,
@@ -341,6 +368,16 @@ pub struct ResolvedProfile {
     /// `claude --effort`, resolved and consumed exactly as [`ResolvedProfile::model`] is; empty ⇒
     /// inherit.
     pub effort: String,
+    /// The `agent.backend` this teammate's runs use — `claude` or `opencode` (STUDIO-902). Empty ⇒
+    /// inherit the daemon's configured backend, which is what every built-in ships and what keeps
+    /// an installation with no `harness:` anywhere byte-identical. Resolved exactly as
+    /// [`ResolvedProfile::model`] is, and read by `Orchestrator::teammate_profile_for`, which
+    /// carries it to the dispatch so the worker picks that harness's already-built runner.
+    ///
+    /// ⚠️ Not validated here. An unrecognized name falls back to the configured backend at
+    /// dispatch, with a warning naming the teammate — refusing the run instead would let one
+    /// mistyped profile field strand every ticket routed to that teammate.
+    pub harness: String,
     pub capabilities: Vec<String>,
     /// Parsed, explicitly unused (§0.11.7).
     pub tools: Vec<String>,
@@ -369,6 +406,7 @@ fn parse_definition(def: Definition) -> Result<ProfileFile, ProfileError> {
         extends: Extends::parse(raw.extends.unwrap_or_default().as_str())?,
         model: raw.model.unwrap_or_default(),
         effort: raw.effort.unwrap_or_default(),
+        harness: raw.harness.unwrap_or_default(),
         capabilities: raw.capabilities.unwrap_or_default(),
         tools: raw.tools.unwrap_or_default(),
         body: def.prompt_template,
@@ -528,6 +566,7 @@ fn resolve_with(
     };
     let (model, model_origin) = pick_str(&file.model, base_profile.map_or("", |b| b.model));
     let (effort, effort_origin) = pick_str(&file.effort, base_profile.map_or("", |b| b.effort));
+    let (harness, harness_origin) = pick_str(&file.harness, base_profile.map_or("", |b| b.harness));
     let (capabilities, capabilities_origin) = pick_list(
         &file.capabilities,
         base_profile.map_or(&[][..], |b| b.capabilities),
@@ -538,6 +577,7 @@ fn resolve_with(
         name: name.to_string(),
         model,
         effort,
+        harness,
         capabilities,
         tools,
         prompt,
@@ -551,6 +591,7 @@ fn resolve_with(
             drift,
             model: model_origin,
             effort: effort_origin,
+            harness: harness_origin,
             capabilities: capabilities_origin,
             tools: tools_origin,
             body,
@@ -578,6 +619,7 @@ fn from_builtin(name: &str, base: &'static BuiltinProfile) -> ResolvedProfile {
         name: name.to_string(),
         model: base.model.to_string(),
         effort: base.effort.to_string(),
+        harness: base.harness.to_string(),
         capabilities: base.capabilities.iter().map(|s| (*s).to_string()).collect(),
         tools: base.tools.iter().map(|s| (*s).to_string()).collect(),
         prompt: base.body.trim().to_string(),
@@ -591,6 +633,7 @@ fn from_builtin(name: &str, base: &'static BuiltinProfile) -> ResolvedProfile {
             drift: None,
             model: str_origin(base.model),
             effort: str_origin(base.effort),
+            harness: str_origin(base.harness),
             capabilities: list_origin(base.capabilities),
             tools: list_origin(base.tools),
             body: BodyOrigin::Base,
@@ -730,6 +773,7 @@ mod tests {
             version: 1,
             model: "sonnet",
             effort: "medium",
+            harness: "claude",
             capabilities: &["code-review"],
             tools: &["read"],
             body: "v1 body",
@@ -739,6 +783,7 @@ mod tests {
             version: 2,
             model: "opus",
             effort: "high",
+            harness: "opencode",
             capabilities: &["code-review", "test-coverage"],
             tools: &["read", "write"],
             body: "v2 body",
@@ -1042,6 +1087,72 @@ mod tests {
         assert_eq!(r.provenance.base, None);
         assert_eq!(r.provenance.drift, None);
         assert_eq!(r.provenance.model, Origin::Unset);
+    }
+
+    // ── harness (STUDIO-902) ────────────────────────────────────────────────
+
+    /// ⚠️ The property that keeps this additive: every SHIPPED built-in names no harness, so no
+    /// existing installation changes behaviour until someone writes `harness:` in a profile. The
+    /// same rule STUDIO-868's `model`/`effort` follow.
+    #[test]
+    fn every_shipped_builtin_inherits_the_configured_harness() {
+        for b in BUILTINS {
+            assert_eq!(
+                b.harness, "",
+                "built-in {}@{} ships a harness, which would change what an existing \
+                 installation dispatches",
+                b.name, b.version
+            );
+        }
+    }
+
+    /// An overlay naming a harness wins over its base's, and reports itself as the overlay's —
+    /// resolved by the same `pick_str` as `model`/`effort`, so it inherits their semantics rather
+    /// than inventing new ones.
+    #[test]
+    fn an_overlay_harness_overrides_the_base_and_records_its_origin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(
+            p,
+            "swe",
+            "---\nextends: swe@1\nharness: opencode\n---\nBody.\n",
+        );
+        let r = resolve_with(p, "swe", TWO_VERSIONS).expect("resolves");
+        assert_eq!(
+            r.harness, "opencode",
+            "the overlay's harness wins over swe@1's `claude`"
+        );
+        assert_eq!(r.provenance.harness, Origin::Overlay);
+        // The other fields still inherit from the base — setting a harness must not reset them.
+        assert_eq!(r.model, "sonnet");
+        assert_eq!(r.provenance.model, Origin::Base);
+    }
+
+    /// An overlay that is silent about the harness inherits its base's, and says so.
+    #[test]
+    fn an_unset_harness_inherits_the_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(p, "swe", "---\nextends: swe@2\n---\nBody.\n");
+        let r = resolve_with(p, "swe", TWO_VERSIONS).expect("resolves");
+        assert_eq!(r.harness, "opencode", "swe@2's harness");
+        assert_eq!(r.provenance.harness, Origin::Base);
+    }
+
+    /// A fork (no `extends:`) that names no harness resolves to empty — "inherit the daemon's
+    /// configured backend" — rather than to some default this module picks.
+    #[test]
+    fn a_fork_naming_no_harness_inherits_the_daemon_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(p, "solo", "---\nmodel: haiku\n---\nJust this.\n");
+        let r = resolve_with(p, "solo", TWO_VERSIONS).expect("resolves");
+        assert_eq!(
+            r.harness, "",
+            "empty means inherit, never a hardcoded default"
+        );
+        assert_eq!(r.provenance.harness, Origin::Unset);
     }
 
     /// An ABSENT `extends:` is a fork, not an implicit overlay of the same-named
