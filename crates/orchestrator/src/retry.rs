@@ -410,14 +410,33 @@ impl Orchestrator {
         // the operator's own words on the ticket) while a profile's `model` is person-based
         // (STUDIO-868) — the two answer different questions, and when both are set it is the PR
         // under review being priced, not that teammate's own work.
+        //
+        // Read through `Teams::review_model`/`review_effort`, not the raw field: this branch is
+        // unreachable except through `dispatch_review`'s ticketless gate today (jimmy/alice round 1
+        // on PR #168), but the accessor is the convention this crate already uses for every other
+        // `review:` scalar and keeps this call site from disagreeing with `teams show` about when
+        // the override is live.
         if review.is_some()
             && let Some(teams) = self.teams.as_ref()
         {
-            if !teams.review.model.is_empty() {
-                re.model_override.model = teams.review.model.clone();
+            let mut review_overrode = false;
+            if let Some(model) = teams.review_model() {
+                re.model_override.model = model.to_string();
+                review_overrode = true;
             }
-            if !teams.review.effort.is_empty() {
-                re.model_override.effort = teams.review.effort.clone();
+            if let Some(effort) = teams.review_effort() {
+                re.model_override.effort = effort.to_string();
+                review_overrode = true;
+            }
+            // A rejected `review.model`/`review.effort` must not blame the routed reviewer's own
+            // profile (alice round 1 finding 2 on PR #168): `ModelOverride.identity` exists so a
+            // CLI rejection names "jimmy's profile asked for `<model>`" rather than nobody, and
+            // that attribution is simply wrong once the value came from the operator's `review:`
+            // block instead. Clearing it degrades the message to `model_attribution`'s existing
+            // "a profile asked for …" branch (`runner.rs:213`) — anonymous, but no longer naming a
+            // teammate for a value they did not write.
+            if review_overrode {
+                re.model_override.identity = String::new();
             }
         }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed

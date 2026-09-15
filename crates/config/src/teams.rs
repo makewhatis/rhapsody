@@ -349,6 +349,11 @@ pub struct Review {
     /// When a routed reviewer's own profile ALSO names a model, this one wins for a review run: the
     /// operator who wrote `review: { model: … }` is stating role-based intent explicitly, and it is
     /// the PR under review being priced, not that teammate's own work.
+    ///
+    /// Only ever consulted on the ticketless path — read this field through
+    /// [`Teams::review_model`], never raw, exactly as [`Review::done_state`] is read through
+    /// [`Teams::review_done_state`] and for the same reason: `dispatch_issue` applies it only to a
+    /// run `dispatch_review` staged, and only `mode: ticketless` ever stages one.
     #[serde(default)]
     pub model: String,
     /// The effort a REVIEW run uses, paired with [`Review::model`] for the same reason `Config` and
@@ -356,6 +361,9 @@ pub struct Review {
     /// would leave whatever effort was already in play — profile or installation-wide — applying to
     /// a cheap review model, which can cost more than the swap saves. Empty means inherit, exactly
     /// as `model` does.
+    ///
+    /// Ticketless-only in the same sense as [`Review::model`] — read it through
+    /// [`Teams::review_effort`].
     #[serde(default)]
     pub effort: String,
 }
@@ -596,6 +604,32 @@ impl Teams {
     /// no reviewer verdict to read at all.
     pub fn review_auto_merge(&self) -> bool {
         self.review_ticketless() && self.review.auto_merge
+    }
+
+    /// The model a REVIEW run uses in place of the routed teammate's own profile, or `None` when
+    /// the override cannot fire (STUDIO-901) — either it is unset, or `review.mode` structurally
+    /// cannot produce the review dispatch `dispatch_issue` applies it to.
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason: `dispatch_issue`'s
+    /// `review.model`/`review.effort` block only ever runs for a run `dispatch_review` staged, and
+    /// only `mode: ticketless` ever stages one — on any other installation, including the default
+    /// `mode: off`, a set value is dead config. `rhapsodyd teams show` reads this (not the raw
+    /// field) so it never claims an override is live on an install where it cannot be.
+    pub fn review_model(&self) -> Option<&str> {
+        if !self.review_ticketless() || self.review.model.is_empty() {
+            return None;
+        }
+        Some(&self.review.model)
+    }
+
+    /// The effort a REVIEW run uses; the pair to [`review_model`](Self::review_model), gated the
+    /// same way and for the same reason.
+    pub fn review_effort(&self) -> Option<&str> {
+        if !self.review_ticketless() || self.review.effort.is_empty() {
+            return None;
+        }
+        Some(&self.review.effort)
     }
 
     /// The configured `manager.timeout_ms` when it is too small for the model
@@ -1844,6 +1878,60 @@ mod tests {
         .expect("parses");
         assert_eq!(t.review.model, "claude-opus-5");
         assert_eq!(t.review.effort, "high");
+    }
+
+    /// **jimmy/alice round-1 finding 2 on PR #168.** `review_model`/`review_effort` must not
+    /// claim an override that cannot fire — scoped to the ticketless path exactly as
+    /// `review_done_state`/`review_changes_state`/`review_auto_merge` already are, on the SAME
+    /// installations those tests exercise (`mode: off`/`tickets`, and Teams disabled entirely).
+    #[test]
+    fn review_model_and_effort_are_off_until_the_review_path_is_ticketless() {
+        assert_eq!(Teams::disabled().review_model(), None);
+        assert_eq!(Teams::disabled().review_effort(), None);
+
+        let with = |enabled: bool, mode: ReviewMode| Teams {
+            enabled,
+            review: Review {
+                mode,
+                model: "claude-opus-5".to_string(),
+                effort: "high".to_string(),
+                ..Review::default()
+            },
+            ..Teams::disabled()
+        };
+        for (enabled, mode) in [
+            (true, ReviewMode::Off),
+            (true, ReviewMode::Tickets),
+            (false, ReviewMode::Ticketless),
+        ] {
+            let t = with(enabled, mode);
+            assert_eq!(
+                t.review_model(),
+                None,
+                "enabled={enabled} mode={mode:?}: a set-but-inert value must read as unset"
+            );
+            assert_eq!(t.review_effort(), None, "enabled={enabled} mode={mode:?}");
+        }
+
+        let live = with(true, ReviewMode::Ticketless);
+        assert_eq!(live.review_model(), Some("claude-opus-5"));
+        assert_eq!(live.review_effort(), Some("high"));
+    }
+
+    /// An unset value stays unset even on the one installation where it could take effect —
+    /// `review_ticketless()` alone must not manufacture an override nobody configured.
+    #[test]
+    fn review_model_and_effort_stay_absent_on_a_ticketless_team_that_never_set_them() {
+        let t = Teams {
+            enabled: true,
+            review: Review {
+                mode: ReviewMode::Ticketless,
+                ..Review::default()
+            },
+            ..Teams::disabled()
+        };
+        assert_eq!(t.review_model(), None);
+        assert_eq!(t.review_effort(), None);
     }
 
     /// STUDIO-712: the auto-Done transition is OFF unless somebody named the

@@ -570,7 +570,9 @@ pub(crate) struct TeamsDispatch {
     pub model_override: rhapsody_agent::ModelOverride,
     /// [`EVENT_ROUTE`] or [`EVENT_UNROUTED`].
     pub kind: &'static str,
-    /// The event text: the reason, and the identity when there is one.
+    /// The event text: the reason, and the identity when there is one. Deliberately carries no
+    /// model/effort — `record_route_event` appends that from the run's FINAL `model_override`,
+    /// which a review dispatch may still overwrite after this struct is built (STUDIO-901).
     pub text: String,
 }
 
@@ -631,18 +633,13 @@ impl Orchestrator {
             });
         };
         let resolved = self.teammate_profile_for(teams, &identity, iss);
-        // Observability (§4): the routing decision's own events row is where an operator sees which
-        // model a run ACTUALLY got, now that it varies per teammate. Appended, never prefixed, so
-        // `triage::route_event_identity` (which reads the first whitespace token) still parses — and
-        // omitted entirely when the profile names nothing, which keeps the row byte-identical for an
-        // installation with no profiles.
-        let mut text = format!("identity={identity} reason={}", routed.reason.as_str());
-        if !resolved.model_override.model.is_empty() {
-            text.push_str(&format!(" model={}", resolved.model_override.model));
-        }
-        if !resolved.model_override.effort.is_empty() {
-            text.push_str(&format!(" effort={}", resolved.model_override.effort));
-        }
+        // The model=/effort= suffix is NOT appended here (STUDIO-901 finding 1): a review run
+        // overrides `model_override` on `re` AFTER this dispatch is built (`retry.rs`'s
+        // `review.model`/`review.effort` block), so baking it into this text from `resolved` would
+        // permanently name the reviewer's own profile instead of what the run actually used.
+        // `record_route_event` composes the suffix from the run's FINAL `model_override` instead —
+        // see its doc comment.
+        let text = format!("identity={identity} reason={}", routed.reason.as_str());
         Some(TeamsDispatch {
             kind: EVENT_ROUTE,
             text,
@@ -1063,8 +1060,23 @@ impl Orchestrator {
     /// `enqueue_event` no-ops on the zero `run_id` a disabled store leaves
     /// behind. The DURABLE work history lives in the room log (§0.11.7); these
     /// rows are pruned with their runs and are the per-run timeline copy.
+    ///
+    /// The model=/effort= suffix is composed HERE, from `re.model_override` — the run's FINAL
+    /// override — rather than from `td.model_override` (STUDIO-901 finding 1). By the time
+    /// `retry.rs` calls this, a review dispatch has already applied `review.model`/`review.effort`
+    /// on top of the routed teammate's own profile, so this is the only value that can never
+    /// disagree with what the agent was actually spawned with. For an ordinary ticket dispatch
+    /// `re.model_override` still equals `td.model_override` (nothing overwrites it), so this stays
+    /// byte-identical to the STUDIO-868 behaviour.
     pub(crate) fn record_route_event(&self, re: &mut RunningEntry, td: &TeamsDispatch) {
         re.event_seq += 1;
+        let mut text = td.text.clone();
+        if !re.model_override.model.is_empty() {
+            text.push_str(&format!(" model={}", re.model_override.model));
+        }
+        if !re.model_override.effort.is_empty() {
+            text.push_str(&format!(" effort={}", re.model_override.effort));
+        }
         self.enqueue_event(
             re.run_id,
             store::EventRow {
@@ -1072,7 +1084,7 @@ impl Orchestrator {
                 at: crate::persist::rfc3339(re.started_at),
                 kind: td.kind.to_string(),
                 tool: String::new(),
-                text: td.text.clone(),
+                text,
             },
         );
     }

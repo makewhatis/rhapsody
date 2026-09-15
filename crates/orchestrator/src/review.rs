@@ -572,7 +572,8 @@ mod tests {
 
     use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
     use rhapsody_store::{
-        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, StorePath,
+        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, Store,
+        StorePath,
     };
     use rhapsody_tracker::fake::Fake;
     use rhapsody_workspace::sanitize_key;
@@ -928,6 +929,21 @@ mod tests {
         std::fs::write(p.join(format!("{name}.md")), text).expect("write profile");
     }
 
+    /// Drains the batched event writer so the rows it queued are readable — the same helper
+    /// `teams.rs`'s STUDIO-868 tests use, duplicated for [`write_profile`]'s reason.
+    fn flush_events(o: &mut Orchestrator) {
+        o.stop_event_writer();
+    }
+
+    fn events_of(store: &dyn Store, run_id: i64) -> Vec<(String, String)> {
+        store
+            .run_events(run_id)
+            .expect("run events")
+            .into_iter()
+            .map(|e| (e.kind, e.text))
+            .collect()
+    }
+
     // ── review.model / review.effort (STUDIO-901) ───────────────────────────
 
     /// **The whole ticket's acceptance criterion.** A review run whose reviewer's OWN profile
@@ -959,11 +975,56 @@ mod tests {
         assert_eq!(
             o.running[&id].model_override,
             rhapsody_agent::ModelOverride {
-                identity: "alice".to_string(),
+                // Cleared, not "alice" (alice round 1 finding 2 on PR #168): the model/effort
+                // came from `review.model`/`review.effort`, not alice's own profile, so a CLI
+                // rejection must not attribute it to her.
+                identity: String::new(),
                 model: "premium-model".to_string(),
                 effort: "xhigh".to_string(),
             },
             "review.model/effort must win over the reviewer's own profile for a review run"
+        );
+    }
+
+    /// **jimmy round-1 finding 1 on PR #168, mutation-checked.** The `teams.route` events row is
+    /// the durable per-run record of the model an operator reads back to see what a run cost
+    /// (`RunningEntry::model_override`'s own doc, `route_teams`'s own doc). It must name what
+    /// `review.model`/`review.effort` overrode to, not the reviewer's own profile — the exact
+    /// mismatch a cost-allocation feature cannot afford. Reverting `record_route_event` to compose
+    /// the suffix from `td.model_override` (the pre-override profile value) instead of
+    /// `re.model_override` (the post-override final value) turns this red.
+    #[test]
+    fn the_route_event_names_the_review_override_not_the_reviewers_profile() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = "premium-model".to_string();
+            teams.review.effort = "xhigh".to_string();
+        }
+        o.start_event_writer();
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        let id = review_run("alice", HEAD_A).key();
+        let run_id = o.running[&id].run_id;
+        flush_events(&mut o);
+        assert_eq!(
+            events_of(o.store.as_ref(), run_id),
+            vec![(
+                "teams.route".to_string(),
+                "identity=alice reason=label model=premium-model effort=xhigh".to_string()
+            )],
+            "the durable row must name review.model/effort, not the reviewer's cheap-model profile"
         );
     }
 
@@ -1075,10 +1136,70 @@ mod tests {
         assert_eq!(
             o.running[&id].model_override,
             rhapsody_agent::ModelOverride {
-                identity: "alice".to_string(),
+                // Cleared for the same reason as the full-override case: `model` came from
+                // `review.model`, not alice's profile, even though `effort` still did.
+                identity: String::new(),
                 model: "premium-model".to_string(),
                 effort: "low".to_string(),
             }
+        );
+    }
+
+    /// **alice round-1 finding 2 on PR #168, mutation-checked.** `ModelOverride.identity` exists
+    /// so a CLI-rejected model fails as "teammate `<name>`'s profile asked for `<model>`" rather
+    /// than nobody (`crates/agent/src/lib.rs`). A `review.model` that overrides the reviewer's
+    /// profile must not leave that identity in place — the value came from the operator's
+    /// `review:` block, not from the routed reviewer's profile, and blaming her for the operator's
+    /// typo names the wrong file in the diagnostic. Reverting the `identity = String::new()` line
+    /// in `retry.rs`'s review-override block turns this red.
+    #[test]
+    fn review_model_override_clears_the_reviewers_identity_from_the_diagnostic() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = "premium-model".to_string();
+            teams.review.effort = "xhigh".to_string();
+        }
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.identity, "",
+            "a rejected review.model must not be blamed on the routed reviewer's own profile"
+        );
+    }
+
+    /// The sibling of the above: with `review.model`/`review.effort` both unset, the override is
+    /// entirely the reviewer's own profile, so the diagnostic naming her is exactly right and
+    /// must NOT be cleared.
+    #[test]
+    fn absent_review_model_leaves_the_reviewers_identity_on_the_diagnostic() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+        }
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.identity, "alice",
+            "with no review override at all, a rejected model IS the reviewer's own profile"
         );
     }
 
