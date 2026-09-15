@@ -91,11 +91,17 @@ where
 /// Resolves the paths the verbs work against, then dispatches. Factored out of
 /// [`run_teams`] so the verbs are unit-testable without hijacking stdout.
 fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<String, String> {
-    let (teams_path, profiles_dir, room_dir) = resolve_paths(getenv)?;
+    // Loaded once and shared: the paths and, for `show`, the configured backend an inheriting
+    // profile falls back to (STUDIO-903). `resolve_paths` errors when there is no runtime home,
+    // which is also the only case where the backend is unavailable — so a successful resolve
+    // always carries one.
+    let cfg = load_config(getenv);
+    let (teams_path, profiles_dir, room_dir) = resolve_paths(cfg.as_ref())?;
+    let backend = cfg.as_ref().map_or("", |c| c.agent.backend.as_str());
     let verb = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or(&[]);
     match verb {
-        "show" => show(rest, &teams_path, &profiles_dir, &room_dir),
+        "show" => show(rest, &teams_path, &profiles_dir, &room_dir, backend),
         "fork" => fork(rest, &profiles_dir),
         "" => Err("usage: rhapsodyd teams <show|fork> <name>".to_string()),
         other => Err(format!(
@@ -114,13 +120,12 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
 /// `teams fork` quietly creating directories in whatever directory the operator
 /// happened to be standing in, which is exactly the kind of surprise write §4's
 /// read-only posture exists to avoid.
-fn resolve_paths(getenv: &dyn Fn(&str) -> String) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    let cfg = load_config(getenv);
+fn resolve_paths(cfg: Option<&Config>) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     // All three anchor to the same runtime home, so they resolve or fail together.
     match (
-        resolve_teams_path(cfg.as_ref(), "", false),
-        resolve_profiles_dir(cfg.as_ref(), "", false),
-        resolve_room_dir(cfg.as_ref(), "", false),
+        resolve_teams_path(cfg, "", false),
+        resolve_profiles_dir(cfg, "", false),
+        resolve_room_dir(cfg, "", false),
     ) {
         (Some(teams), Some(profiles), Some(room)) => Ok((teams, profiles, room)),
         _ => Err(
@@ -158,6 +163,7 @@ fn show(
     teams_path: &Path,
     profiles_dir: &Path,
     room_dir: &Path,
+    backend: &str,
 ) -> Result<String, String> {
     let (name, room_tail) = parse_show_args(args)?;
     // Best-effort: a broken teams.yaml must not stop an operator inspecting a
@@ -209,6 +215,7 @@ fn show(
         &resolved,
         review,
         &room,
+        backend,
         &render_rejection_for(teams_path, &rejected),
     ))
 }
@@ -356,6 +363,7 @@ fn render_show(
     r: &ResolvedProfile,
     review: Option<&Review>,
     room: &str,
+    backend: &str,
     rejection: &str,
 ) -> String {
     let mut out = String::new();
@@ -390,6 +398,13 @@ fn render_show(
             d.name, d.pinned, d.name, d.latest
         ));
     }
+    // ABOVE `model`, decided by the ticket: this is the line that selects the binary, so it is the
+    // most load-bearing of the resolved fields — an operator reads it before the model question,
+    // which is scoped inside whichever CLI wins (STUDIO-903).
+    out.push_str(&format!(
+        "harness:       {}\n",
+        harness_field(&r.harness, r.provenance.harness, backend)
+    ));
     out.push_str(&format!(
         "model:         {}\n",
         field(&r.model, r.provenance.model)
@@ -462,6 +477,47 @@ fn field(value: &str, o: Origin) -> String {
         origin_tag(o).to_string()
     } else {
         format!("{value} {}", origin_tag(o))
+    }
+}
+
+/// The `harness:` line (STUDIO-903): the CLI this teammate's runs actually use, rendered like
+/// every sibling field with its origin.
+///
+/// ⚠️ The RESOLVED value, never the raw front-matter field. An empty `harness` is the common case
+/// and means "inherit `agent.backend`", so the useful fact is that backend's own value — `backend`
+/// is the resolved `agent.backend` from the same workflow the daemon would boot, and naming it is
+/// what turns the line from a restatement into an answer.
+///
+/// A harness this build cannot run is MARKED, because the dispatcher silently falls back to
+/// `agent.backend` for it (`spawn_worker`, STUDIO-902): plain `harness: codex [overlay]` would
+/// claim a CLI that never runs, which is the misleading report decision 2 of this ticket exists to
+/// avoid. The mark is only ever appended — `<value> [origin]` stays byte-identical for the
+/// implemented harnesses that are the overwhelmingly common case, so a mark means something.
+fn harness_field(profile_value: &str, origin: Origin, backend: &str) -> String {
+    if profile_value.is_empty() {
+        return format!("{backend} [unset — inherits agent.backend]");
+    }
+    match harness_note(profile_value, backend) {
+        Some(note) => format!("{profile_value} {} ({note})", origin_tag(origin)),
+        None => format!("{profile_value} {}", origin_tag(origin)),
+    }
+}
+
+/// The parenthetical [`harness_field`] appends when the resolved harness is not one this build can
+/// run, or `None` when it is. `backend` is what dispatch falls back to.
+///
+/// Recognized-but-unimplemented (`codex`) and a name no registry knows are told apart: the first
+/// is a build limitation, the second a typo, and the operator's next move differs.
+fn harness_note(harness: &str, backend: &str) -> Option<String> {
+    if rhapsody_orchestrator::effective::harness_is_implemented(harness) {
+        return None;
+    }
+    if rhapsody_config::HARNESS_NAMES.contains(&harness) {
+        Some(format!(
+            "recognized harness, but this build has no runner for it; runs on {backend}"
+        ))
+    } else {
+        Some(format!("not a recognized harness; runs on {backend}"))
     }
 }
 
@@ -565,11 +621,22 @@ mod tests {
     /// Points the verbs at a hermetic store home by writing a WORKFLOW.md whose
     /// `storage.path` sits under `dir`, and returns the resolved profiles dir.
     fn hermetic(dir: &TempDir) -> (Vec<String>, PathBuf) {
+        hermetic_backend(dir, "")
+    }
+
+    /// [`hermetic`] with an explicit `agent.backend`, so the harness line's inherit branch can be
+    /// exercised against a resolved backend that is not the shipped default (STUDIO-903).
+    fn hermetic_backend(dir: &TempDir, backend: &str) -> (Vec<String>, PathBuf) {
+        let agent = if backend.is_empty() {
+            String::new()
+        } else {
+            format!("agent:\n  backend: {backend}\n")
+        };
         let wf = dir.child("WORKFLOW.md");
         std::fs::write(
             &wf,
             format!(
-                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nstorage:\n  path: {}/rhapsody.db\n---\nDo {{{{ issue.identifier }}}}.\n",
+                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\n{agent}storage:\n  path: {}/rhapsody.db\n---\nDo {{{{ issue.identifier }}}}.\n",
                 dir.path.display()
             ),
         )
@@ -719,6 +786,117 @@ mod tests {
         let out = run(&["show", "swe"], &env2[0]).expect("show swe");
         assert!(!out.contains("review model:"), "out = {out}");
         assert!(!out.contains("review effort:"), "out = {out}");
+    }
+
+    // ── the resolved harness (STUDIO-903) ───────────────────────────────────
+
+    /// The ticket's headline: a profile that sets `harness:` reports the CLI this teammate's runs
+    /// actually use, with its origin — rendered exactly like every sibling field. Before this the
+    /// one field that selects the binary was the only one absent, so the operator had to read the
+    /// nested `config.opencode` block to guess (which proves the block parsed, never that this
+    /// teammate resolved to it).
+    #[test]
+    fn show_reports_the_resolved_harness_with_its_origin() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: opencode\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("harness:       opencode [overlay]"),
+            "out = {out}"
+        );
+    }
+
+    /// ⚠️ The trap the ticket names: printing the raw front matter would leave an inheriting
+    /// teammate with `[unset]` and no answer — the empty string IS the common case. The resolved
+    /// value is `agent.backend`'s, and the marker says so.
+    #[test]
+    fn show_reports_the_configured_backend_for_an_inheriting_teammate() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_backend(&dir, "opencode");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("harness:       opencode [unset — inherits agent.backend]"),
+            "out = {out}"
+        );
+    }
+
+    /// The shipped default, with no `agent.backend` written anywhere: the inherit marker names
+    /// `claude`, the value the daemon actually resolves.
+    #[test]
+    fn show_reports_the_default_backend_for_an_inheriting_teammate() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("harness:       claude [unset — inherits agent.backend]"),
+            "out = {out}"
+        );
+    }
+
+    /// **Decision 2, mutation-checked by the assertion below.** The registry recognizes names this
+    /// build cannot run (`codex`), and `spawn_worker` silently falls back to `agent.backend` for
+    /// them — so plain `harness: codex [overlay]` would claim a CLI that never runs. It is marked,
+    /// and the mark names what dispatch falls back to.
+    #[test]
+    fn show_marks_a_recognized_harness_this_build_cannot_run() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: codex\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("harness:       codex [overlay] ("),
+            "out = {out}"
+        );
+        assert!(out.contains("runs on claude"), "out = {out}");
+    }
+
+    /// A name no registry knows — the mistyped `harness:` the ticket opens with — is marked
+    /// differently from a recognized-but-unimplemented one, because the operator's fix differs,
+    /// and it too names the backend it silently falls back to.
+    #[test]
+    fn show_marks_a_harness_no_registry_knows() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: openai\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(out.contains("not a recognized harness"), "out = {out}");
+        assert!(out.contains("runs on claude"), "out = {out}");
+    }
+
+    /// A harness the build CAN run carries no mark — the common case stays a clean
+    /// `<value> [origin]` line, so the mark means something when it appears.
+    #[test]
+    fn show_prints_an_implemented_harness_with_no_mark() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: opencode\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("harness:"))
+            .unwrap_or_else(|| panic!("no harness line in {out}"));
+        assert_eq!(line, "harness:       opencode [overlay]", "out = {out}");
     }
 
     /// STUDIO-891: a REJECTED `teams.yaml` is reported by the command, not only
