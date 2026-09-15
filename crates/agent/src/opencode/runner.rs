@@ -35,6 +35,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -74,10 +75,23 @@ pub struct Runner {
 }
 
 impl Runner {
-    /// Materializes the zero-value defaults the config layer does not supply.
+    /// Materializes the zero-value defaults the config layer does not supply: an empty command
+    /// becomes `"opencode"`, and a zero turn timeout becomes one hour.
+    ///
+    /// ⚠️ The turn-timeout default is deliberately the SAME materialization
+    /// [`crate::claude::Runner::new`] does, because the value is reachable from config and the two
+    /// backends must not read one operator input two different ways. `decode` defaults an ABSENT
+    /// `opencode.turn_timeout_ms` to 3600000, but an EXPLICIT `0` (the natural way to write "no
+    /// limit", and where a negative value also lands via `.max(0)` in the orchestrator's config
+    /// mapping) arrives here as [`Duration::ZERO`] — which would make the turn deadline already
+    /// expired when the `select!` is entered, killing every turn of every run and reporting it as
+    /// `turn_timeout`.
     pub fn new(mut cfg: Config) -> Runner {
         if cfg.command.is_empty() {
             cfg.command = "opencode".to_string();
+        }
+        if cfg.turn_timeout.is_zero() {
+            cfg.turn_timeout = Duration::from_secs(3600);
         }
         Runner { cfg }
     }
@@ -453,6 +467,8 @@ impl Session for OpencodeSession {
         let mut result_text = String::new();
         let mut terminal_seen = false;
         let mut failure: Option<Failure> = None;
+        // Whether the line that set `failure` was itself emitted as an event (see below).
+        let mut failure_surfaced = false;
         let mut scan_err: Option<String> = None;
         let mut timed_out = false;
         let mut stderr_open = true;
@@ -550,7 +566,24 @@ impl Session for OpencodeSession {
                                 }
                                 if let Some(f) = c.failure.clone() {
                                     // First error wins: later ones are consequences of it.
-                                    failure.get_or_insert(f);
+                                    if failure.is_none() {
+                                        failure = Some(f);
+                                        // ⚠️ Whether the post-loop failure path emits an
+                                        // EVENT_TURN_FAILED depends on whether THIS line was
+                                        // already surfaced as one just below (`if c.ok`), which for
+                                        // an `error` line it is. Claude emits its failure exactly
+                                        // ONCE, in loop (`claude/runner.rs`: the terminal `result`
+                                        // line is classified `EVENT_TURN_FAILED`, emitted here, and
+                                        // the post-loop path returns the error without a second
+                                        // event) — recording it here keeps that true for opencode
+                                        // without the post-loop path having to assume how the
+                                        // classifier flags an error line. A duplicate is not
+                                        // cosmetic: `agentupdate.rs` appends every event to
+                                        // `re.recent_events` and `persist` writes it, so the
+                                        // console and the history would show each provider failure
+                                        // twice.
+                                        failure_surfaced = c.ok;
+                                    }
                                 }
                                 if c.ok {
                                     on_event(ev);
@@ -651,13 +684,15 @@ impl Session for OpencodeSession {
         // and an `isRetryable` boolean directly, so both are carried into the message rather than
         // re-derived from its text (design §7.1).
         if let Some(f) = failure {
-            on_event(Event {
-                event_type: EVENT_TURN_FAILED.to_string(),
-                timestamp: Some(Utc::now()),
-                pid: pid as i64,
-                message: f.summary(),
-                ..Default::default()
-            });
+            if !failure_surfaced {
+                on_event(Event {
+                    event_type: EVENT_TURN_FAILED.to_string(),
+                    timestamp: Some(Utc::now()),
+                    pid: pid as i64,
+                    message: f.summary(),
+                    ..Default::default()
+                });
+            }
             return (
                 failed_with_text(usage, &result_text),
                 Some(AgentError::Other(format!("turn_failed: {}", f.summary()))),
@@ -1163,6 +1198,112 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         // And the session/turn pair the orchestrator reads is the second turn's.
         assert_eq!(sess.thread_id(), "ses_stable");
         assert_eq!(sess.id(), "ses_stable-2");
+    }
+
+    // ⚠️ An in-band `error` line is reported ONCE, the way claude reports its own failure once.
+    //
+    // The line is already surfaced as an `EVENT_TURN_FAILED` inside the read loop (its classifier
+    // sets `ok`), so a post-loop emit of the same failure would double it — and duplicates are not
+    // cosmetic: `agentupdate.rs` appends every event to `re.recent_events` and `persist` writes it,
+    // so the console and the run history would show each provider failure twice. Driven by the REAL
+    // 401 capture (the whole measured stream is that one line, and the run it came from exited 1),
+    // so this pins the shape the CLI actually produces rather than one this file invented.
+    #[tokio::test]
+    async fn an_in_band_error_is_reported_exactly_once() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/harness-spike/opencode/failure-401.jsonl");
+        let script = write_script(
+            &scripts,
+            "error401.sh",
+            &format!("cat '{}'\nexit 1\n", capture.display()),
+        );
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        let evs = events_of(&seen);
+        let failed: Vec<&Event> = evs
+            .iter()
+            .filter(|e| e.event_type == EVENT_TURN_FAILED)
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "one provider failure must produce ONE turn_failed event: {evs:#?}"
+        );
+        assert!(
+            failed[0].message.contains("status 401"),
+            "the surviving event must carry the reason: {:?}",
+            failed[0].message
+        );
+        assert!(
+            !evs.iter().any(|e| e.event_type == EVENT_TURN_COMPLETED),
+            "a failed turn must not also report completion: {evs:#?}"
+        );
+        assert_eq!(tr.status, TURN_FAILED);
+        let msg = err.expect("an error line must be an error").to_string();
+        assert!(msg.contains("turn_failed: APIError"), "{msg}");
+    }
+
+    // ⚠️ An EXPLICIT `opencode.turn_timeout_ms: 0` must mean one hour, not "every turn times out".
+    //
+    // `decode` defaults an ABSENT value to 3600000, but an explicit `0` — the natural way to write
+    // "no limit", and where a negative value also lands via the orchestrator's `.max(0)` — reaches
+    // the runner as `Duration::ZERO`, which would make the deadline already expired when the read
+    // loop is entered. `claude::Runner::new` materializes the same input to one hour, and the two
+    // backends must not read one operator input two different ways. The fake emits a clean terminal
+    // turn, so a red assertion here means the deadline fired, not that the CLI failed.
+    #[tokio::test]
+    async fn an_explicit_zero_turn_timeout_means_one_hour_not_instant_expiry() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(
+            &scripts,
+            "clean.sh",
+            "printf '{\"type\":\"text\",\"sessionID\":\"ses_x\",\"part\":{\"text\":\"done\"}}\n'\n\
+             printf '{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{\"reason\":\"stop\"}}\n'\n",
+        );
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let runner = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root_path(&root),
+            // The defect's exact input, straight from config.
+            turn_timeout: Duration::ZERO,
+            auth_source: auth.clone(),
+            state_root: state_root.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        let evs = events_of(&seen);
+        assert!(
+            !evs.iter()
+                .any(|e| e.event_type == EVENT_TURN_FAILED && e.message == "turn timeout"),
+            "a zero turn timeout must not expire the turn: {evs:#?}"
+        );
+        assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+        assert_eq!(tr.result_text, "done");
+        assert!(err.is_none(), "{err:?}");
     }
 
     // ⚠️ The empty-stream case as the RUNNER sees it: "stream ended with no terminal event" must be
