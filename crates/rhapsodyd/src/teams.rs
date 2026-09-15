@@ -493,6 +493,12 @@ fn field(value: &str, o: Origin) -> String {
 /// claim a CLI that never runs, which is the misleading report decision 2 of this ticket exists to
 /// avoid. The mark is only ever appended — `<value> [origin]` stays byte-identical for the
 /// implemented harnesses that are the overwhelmingly common case, so a mark means something.
+///
+/// The inherit branch above is deliberately UNMARKED, including when `agent.backend` itself names
+/// a harness this build cannot run: the mark's justification is `spawn_worker`'s silent fallback,
+/// and there is none here — `runner_for_backend` rejecting the backend makes `build_effective`
+/// fail and the daemon refuses to boot, and `validate` rejects an unknown name outright, so both
+/// are loud and a second report would only be noisier.
 fn harness_field(profile_value: &str, origin: Origin, backend: &str) -> String {
     if profile_value.is_empty() {
         return format!("{backend} [unset — inherits agent.backend]");
@@ -854,11 +860,15 @@ mod tests {
         )
         .expect("write overlay");
         let out = run(&["show", "swe"], &env[0]).expect("show swe");
-        assert!(
-            out.contains("harness:       codex [overlay] ("),
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("harness:"))
+            .unwrap_or_else(|| panic!("no harness line in {out}"));
+        assert_eq!(
+            line,
+            "harness:       codex [overlay] (recognized harness, but this build has no runner for it; runs on claude)",
             "out = {out}"
         );
-        assert!(out.contains("runs on claude"), "out = {out}");
     }
 
     /// A name no registry knows — the mistyped `harness:` the ticket opens with — is marked
@@ -875,8 +885,14 @@ mod tests {
         )
         .expect("write overlay");
         let out = run(&["show", "swe"], &env[0]).expect("show swe");
-        assert!(out.contains("not a recognized harness"), "out = {out}");
-        assert!(out.contains("runs on claude"), "out = {out}");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("harness:"))
+            .unwrap_or_else(|| panic!("no harness line in {out}"));
+        assert_eq!(
+            line, "harness:       openai [overlay] (not a recognized harness; runs on claude)",
+            "out = {out}"
+        );
     }
 
     /// A harness the build CAN run carries no mark — the common case stays a clean

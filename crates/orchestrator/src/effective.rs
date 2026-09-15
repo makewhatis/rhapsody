@@ -244,7 +244,7 @@ fn runner_for_backend(
 /// documents, and `implemented_backends_are_known_harness_names` pins.
 pub(crate) const IMPLEMENTED_BACKENDS: &[&str] = &["claude", "opencode"];
 
-/// Whether THIS build can actually run `name` — the membership test [`spawn_worker`] makes against
+/// Whether THIS build can actually run `name` — the membership test `spawn_worker` makes against
 /// a resolved project's runner pool (built from [`IMPLEMENTED_BACKENDS`]) when a teammate profile
 /// names a harness (STUDIO-902). Exposed so `rhapsodyd teams show` can report a harness the
 /// dispatcher would silently fall back from, rather than printing it as though it would run
