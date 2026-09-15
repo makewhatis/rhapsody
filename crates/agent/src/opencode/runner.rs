@@ -467,7 +467,14 @@ impl Session for OpencodeSession {
         let mut result_text = String::new();
         let mut terminal_seen = false;
         let mut failure: Option<Failure> = None;
-        // Whether the line that set `failure` was itself emitted as an event (see below).
+        // Whether the line that set `failure` was ALREADY emitted as an `EVENT_TURN_FAILED` in the
+        // loop below, which for an `error` line it is (its classifier sets `ok`). Claude reports a
+        // failed turn exactly ONCE — `claude/parse.rs` classifies the terminal `result` line as
+        // `EVENT_TURN_FAILED`, the loop emits it, and the post-loop path returns the error without a
+        // second event — and this keeps that true here without the post-loop path having to assume
+        // how the classifier flags an error line. A duplicate is not cosmetic: `agentupdate.rs`
+        // appends every event to `re.recent_events` and `persist` writes it, so the console and the
+        // run history would show each provider failure twice.
         let mut failure_surfaced = false;
         let mut scan_err: Option<String> = None;
         let mut timed_out = false;
@@ -565,23 +572,10 @@ impl Session for OpencodeSession {
                                     result_text = c.text.clone();
                                 }
                                 if let Some(f) = c.failure.clone() {
-                                    // First error wins: later ones are consequences of it.
+                                    // First error wins: later ones are consequences of it, so the
+                                    // `surfaced` flag tracks THAT line's emit (just below).
                                     if failure.is_none() {
                                         failure = Some(f);
-                                        // ⚠️ Whether the post-loop failure path emits an
-                                        // EVENT_TURN_FAILED depends on whether THIS line was
-                                        // already surfaced as one just below (`if c.ok`), which for
-                                        // an `error` line it is. Claude emits its failure exactly
-                                        // ONCE, in loop (`claude/runner.rs`: the terminal `result`
-                                        // line is classified `EVENT_TURN_FAILED`, emitted here, and
-                                        // the post-loop path returns the error without a second
-                                        // event) — recording it here keeps that true for opencode
-                                        // without the post-loop path having to assume how the
-                                        // classifier flags an error line. A duplicate is not
-                                        // cosmetic: `agentupdate.rs` appends every event to
-                                        // `re.recent_events` and `persist` writes it, so the
-                                        // console and the history would show each provider failure
-                                        // twice.
                                         failure_surfaced = c.ok;
                                     }
                                 }
