@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use chrono::SecondsFormat;
 use rhapsody_config::profiles::{self, BodyOrigin, Origin, ResolvedProfile};
 use rhapsody_config::room::{Cursor, LocalRoom, Message};
-use rhapsody_config::teams::Teams;
+use rhapsody_config::teams::{Review, Teams};
 use rhapsody_config::{Config, workflow};
 
 use crate::bootcfg::{resolve_profiles_dir, resolve_room_dir, resolve_teams_path};
@@ -199,6 +199,7 @@ fn show(
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
         &resolved,
+        &teams.review,
         &room,
         &render_rejection_for(teams_path, &rejected),
     ))
@@ -342,7 +343,13 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// resolved prompt is unbounded prose, and a glance an operator has to scroll a
 /// screenful of it to reach is not a glance. It is empty whenever Teams is off
 /// or `--room 0` was passed, and then this renders exactly what it always did.
-fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str, rejection: &str) -> String {
+fn render_show(
+    identity: Option<&str>,
+    r: &ResolvedProfile,
+    review: &Review,
+    room: &str,
+    rejection: &str,
+) -> String {
     let mut out = String::new();
     // First, so it is the line an operator reads before anything else. Empty on
     // every accepted config, which keeps an ordinary `show` byte-identical to
@@ -382,6 +389,19 @@ fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str, rejectio
     out.push_str(&format!(
         "effort:       {}\n",
         field(&r.effort, r.provenance.effort)
+    ));
+    // What an operator actually needs answered (STUDIO-901, ticket §4): "what model REVIEWS this
+    // identity's pull requests" is a different question from "what model does this identity run
+    // with", because `review.model`/`review.effort` (when set) win over the profile above for a
+    // REVIEW run specifically — and are otherwise invisible, since they are not part of this
+    // identity's own profile at all.
+    out.push_str(&format!(
+        "review model:  {}\n",
+        review_field("model", &review.model, &r.model, r.provenance.model)
+    ));
+    out.push_str(&format!(
+        "review effort: {}\n",
+        review_field("effort", &review.effort, &r.effort, r.provenance.effort)
     ));
     out.push_str(&format!(
         "capabilities: {}\n",
@@ -425,6 +445,27 @@ fn field(value: &str, o: Origin) -> String {
         origin_tag(o).to_string()
     } else {
         format!("{value} {}", origin_tag(o))
+    }
+}
+
+/// The `review model:`/`review effort:` line (STUDIO-901): `teams.review.<name>` when the
+/// operator set it — which WINS over this identity's own profile for a review run and says so —
+/// else the profile's own value (rendered with its normal [`field`] provenance), since an unset
+/// `review.<name>` means a review run inherits exactly what this identity's profile already gives
+/// an ordinary dispatch.
+fn review_field(
+    name: &str,
+    review_value: &str,
+    profile_value: &str,
+    profile_origin: Origin,
+) -> String {
+    if review_value.is_empty() {
+        format!(
+            "(unset — a review run uses this profile's {name}, {})",
+            field(profile_value, profile_origin)
+        )
+    } else {
+        format!("{review_value} [review.{name} — overrides this profile's {name} for a review run]")
     }
 }
 
@@ -578,6 +619,55 @@ mod tests {
             "out = {out}"
         );
         assert!(!profiles_dir.exists(), "show must not create the dir");
+    }
+
+    // ── review model/effort visibility (STUDIO-901, ticket §4) ──────────────
+
+    /// The whole §4 bar for this ticket: an operator asking "what model will actually review
+    /// this?" gets a direct answer, in the same one command that already answers "what model does
+    /// this identity run with?" — and when `review.model`/`review.effort` are set, the line says
+    /// they WIN over the profile above, so the two lines are never mistaken for each other.
+    #[test]
+    fn show_reports_the_review_scoped_model_when_set() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  claude-opus-5 [review.model — overrides this profile's model for a review run]"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("review effort: high [review.effort — overrides this profile's effort for a review run]"),
+            "out = {out}"
+        );
+    }
+
+    /// Absent `review.model`/`review.effort` — the default — says plainly that a review run
+    /// inherits this identity's own profile, rather than printing nothing and leaving the question
+    /// unanswered.
+    #[test]
+    fn show_reports_review_scoped_model_as_inherited_when_unset() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  (unset — a review run uses this profile's model, [unset — inherits the daemon's config])"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("review effort: (unset — a review run uses this profile's effort, [unset — inherits the daemon's config])"),
+            "out = {out}"
+        );
     }
 
     /// STUDIO-891: a REJECTED `teams.yaml` is reported by the command, not only
