@@ -33,8 +33,8 @@ use rhapsody_orchestrator::{
     RefreshResult, ReloadError, ResumeResult, RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ReviewWatchRow, RunFilter, RunMessage,
-    RunSummary, Store, StoreError,
+    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens, ReviewWatchRow,
+    RunFilter, RunMessage, RunProvenance, RunSummary, Store, StoreError,
 };
 
 /// Narrows the orchestrator's full [`Store`] handle to the httpapi read-only [`HistoryStore`]. The
@@ -79,6 +79,18 @@ impl HistoryStore for HistoryView {
     }
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
         self.0.load_review_watch()
+    }
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
+        self.0.run_provenance(run_id)
+    }
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
+        self.0.load_run_provenances(run_ids)
+    }
+    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError> {
+        self.0.tokens_by_provider()
     }
 }
 

@@ -1287,6 +1287,65 @@ mod tests {
         );
     }
 
+    /// **STUDIO-909 acceptance: the review override's ORIGIN is recorded, not just its value.** This
+    /// is the exact shape that was undiagnosable tonight — a reviewer whose PROFILE names one model
+    /// while `review.model.opencode` substitutes another, so the run failed on a model the operator
+    /// could not see in the job. The durable provenance must name `review.model.opencode` as the
+    /// model's origin (and the opencode harness as `[profile]`), so the console renders the override
+    /// rather than blaming the teammate's own profile value.
+    ///
+    /// Mutation check (acceptance: "make a review run report its profile's model instead of the
+    /// override"): recording the provenance from `td.model_override`/the profile instead of the
+    /// FINAL `re.model_override` reports `profile` and `cheap-model` here, turning this red — and the
+    /// derived provider would read as unknown instead of `fireworks-ai`.
+    #[test]
+    fn a_review_runs_provenance_names_the_review_model_origin_not_the_profile() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nmodel: cheap-model\nharness: opencode\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+            teams.review.model.insert(
+                "opencode",
+                "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+            );
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_origin, "review.model.opencode",
+            "the model came from the operator's review block, not alice's profile"
+        );
+        assert_eq!(
+            o.running[&id].harness_origin, "profile",
+            "the opencode harness came from alice's profile"
+        );
+
+        let run_id = o.running[&id].run_id;
+        let p = o
+            .store()
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(
+            p.model,
+            "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        assert_eq!(p.model_origin, "review.model.opencode");
+        assert_eq!(p.harness, "opencode");
+        assert_eq!(p.harness_origin, "profile");
+        assert_eq!(p.provider, "fireworks-ai");
+    }
+
     /// **Acceptance #5: the mixed roster — today's live configuration and the shape that broke.**
     /// One Claude reviewer and one opencode reviewer of the SAME pull request, each configured a
     /// model for their own harness, both dispatch and each run on its own. Mutation check

@@ -703,7 +703,7 @@ never enabled Teams, and on a Go-written database opened by Rhapsody. It is iner
 subsystem is gated on `teams.enabled` (design §16), nothing outside that path writes a row, and an
 empty table changes no query, no endpoint and no payload. A database that Rhapsody has opened is no
 longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
-runs steps at or above its own `user_version`, so a database ahead of it (v8 at this step, v9 today)
+runs steps at or above its own `user_version`, so a database ahead of it (v8 at this step, v10 today)
 is left alone rather than corrupted, and running both daemons against one file was never supported in
 either direction.
 
@@ -723,7 +723,7 @@ silently unreachable for twelve hours with the comment still sitting on the pull
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **9** |
+| `PRAGMA user_version` | 6 | **10** (9 at this step; see STUDIO-909 below) |
 | tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch` and `rhapsody_summon_watermark` |
 
 One row per ticket identifier: the newest summons ever OBSERVED for it and that same comment's body.
@@ -744,6 +744,55 @@ names. The table is pruned on the same retention cutoff as the runs it is compar
 watermark never outlives the history it is measured against. **Off is still off:** with
 `storage.path: off` there is nowhere to remember an observation, so the daemon keeps the pre-885
 behaviour of seeing only what the lookback window covers right now.
+
+### A run records what actually ran it — `rhapsody_run_provenance` (STUDIO-909)
+
+The `runs` row recorded how many tokens a run spent and **nothing about what spent them**. On an
+installation now running two harnesses and two providers at once, that made two questions
+unanswerable from the product: *which provider/model did this failed run use* (the failure that
+motivated the ticket was a `review.model.opencode` override nothing named, and attributing it cost
+the daemon log plus `rhapsodyd teams show`), and *what did Fireworks save us this week* — a token
+cannot be attributed to a provider it was never recorded against.
+
+| Runs provenance | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **10** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark` and `rhapsody_run_provenance` |
+| per-run harness/model/provider | — | recorded once at dispatch, on `rhapsody_run_provenance` |
+| `GET /api/v1/runs/{id}/provenance` | — | harness, model, provider and each value's origin |
+
+**The design record's §6.2 asks for `harness`/`model`/`provider` columns on `runs`; this takes the
+table route instead, and that is a deliberate, forced divergence.** `harness/fixtures/schema.sql` is
+recapturable ONLY from the real Go daemon, and that daemon can never emit columns it does not know
+about — so adding them to `runs` would turn `schema_matches_committed_golden` permanently red with no
+honest fix (hand-editing the golden is the drift laundering the parity discipline exists to prevent,
+and widening `divergent_objects_are_gated_by_name_only` to excuse a Go table would weaken the gate
+for every future change). The documented Rhapsody-only mechanism — a `rhapsody_`-prefixed table the
+golden excludes by name — records the same facts without touching `runs`, and a run with no such row
+is exactly the honest "unknown" the ticket asks for. `session_uuid`, the fourth field §6.2 names,
+already exists on `runs` in Go's own schema.
+
+**Recorded, never re-derived.** The values are read once from the config the run was actually
+dispatched with and persisted, so a later `WORKFLOW.md` hot-reload cannot rewrite what a finished run
+says it ran on. A run started before this change has no provenance row and renders as `unknown`
+rather than an inference from whatever config is live now. The **origin** of each configurable value
+rides beside it (`profile`, `review.model.opencode`, `agent.backend`, `claude.model`) because an
+unexplained override is what cost the operator hours, not an unknown model — the job detail header
+renders each value with it. `provider` is DERIVED once, at the same dispatch, from the recorded
+harness and model string (`fireworks-ai/…` names its own provider; a Claude model with no `/` is
+Anthropic; anything else is unknown), so it can never later disagree with the model it describes.
+
+**The cost question is answerable in one query.** `tokens_by_provider` groups the whole store's
+tokens by recorded provider, and `GET /api/v1/history/summary` carries the same split for its window
+(`providers`), both computed in SQL over the `runs` ⋈ provenance join rather than folded over a page.
+The compact provider also rides each row of the additive `GET /api/v1/history/issues`, so "which of
+these four runs is on Fireworks" is a scan. `/api/v1/runs/{id}` and `/api/v1/history` are byte-pinned
+to the Go capture and grew nothing.
+
+**D5 holds.** With Teams off and one harness, the values record `agent.backend` and `claude.model`
+and every Go-pinned golden is untouched: the new table is prefix-gated, the new endpoint is
+additive, and the new fields appear only on the Rhapsody-only issue listing. `divergent_objects_are_gated_by_name_only`
+now pins the third name.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 

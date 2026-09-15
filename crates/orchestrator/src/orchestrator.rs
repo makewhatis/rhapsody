@@ -108,21 +108,33 @@ pub struct RunningEntry {
     /// when the profile names neither, in which case the run inherits the installation-wide
     /// `claude.model` / `claude.effort` and its argv is byte-identical to today.
     ///
-    /// **In memory only**, exactly as `identity` is: the `runs` table is frozen here, and a durable
-    /// `runs.model` column arrives with the pluggable-harnesses design's §6.2
-    /// (`~/.rhapsody/docs/pluggable-harnesses-design.md`), which wants `harness` / `model` /
-    /// `provider` / `session_uuid` together. The per-run record meanwhile is the `teams.route`
-    /// events row, which names the model it resolved.
+    /// **In memory only as a field**, and SNAPSHOTTED at dispatch into the durable per-run
+    /// provenance (STUDIO-909: `rhapsody_run_provenance`, model + `model_origin` + provider), so the
+    /// model a finished run actually used survives the config hot-reloads that motivated the
+    /// record. The `teams.route` events row remains the routing record that names it too.
     pub model_override: rhapsody_agent::ModelOverride,
 
     /// The `agent.backend` the routed teammate's profile asked for (STUDIO-902). Empty ⇒ the
     /// configured backend, which is every dispatch that routed to nobody or to a teammate whose
     /// profile is silent about it.
     ///
-    /// **In memory only**, for the same reason [`Self::model_override`] is: a durable `runs.harness`
-    /// column is the pluggable-harnesses design's §6.2, which wants `harness` / `model` /
-    /// `provider` / `session_uuid` added together rather than one at a time.
+    /// **Persisted** at dispatch as part of the run's provenance (STUDIO-909): the harness actually
+    /// run (this value when the build implements it, else the configured backend) is written to
+    /// `rhapsody_run_provenance` beside `harness_origin` and the model.
     pub harness: String,
+
+    /// The config key that named the harness (STUDIO-909), so an operator can tell a profile's
+    /// choice from the installation default. `profile` when the routed teammate's profile named an
+    /// implemented harness, `agent.backend` otherwise. Persisted with the run.
+    pub harness_origin: String,
+
+    /// The config key that supplied the run's model (STUDIO-909): `review.model.<harness>` for a
+    /// review run the override rewrote, `review.model` for the legacy bare-scalar spelling,
+    /// `profile` for the routed teammate's own profile, else the harness's own key
+    /// (`claude.model` / `opencode.model`). Persisted beside `harness_origin`; the model VALUE is
+    /// resolved in [`persist_start_run`](Orchestrator::persist_start_run) from the same facts, so a
+    /// hot-reload later cannot change what this run says it ran on.
+    pub model_origin: String,
 
     /// The `latest_summon_at` of the most recent mid-run summons already delivered to this run's
     /// mailbox (INF-448). The poll-side router delivers a summons only when it is strictly after BOTH
@@ -207,6 +219,8 @@ impl RunningEntry {
             teammate_section: String::new(),
             model_override: rhapsody_agent::ModelOverride::default(),
             harness: String::new(),
+            harness_origin: String::new(),
+            model_origin: String::new(),
             last_delivered_summon_at: zero_time(),
             review: None,
             thread_id: String::new(),

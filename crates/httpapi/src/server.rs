@@ -32,7 +32,7 @@ use crate::handlers_drain::handle_drain;
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_history_summary, handle_issue_counts,
     handle_issue_history, handle_issue_runs, handle_metrics, handle_run_detail, handle_run_events,
-    handle_run_transcript,
+    handle_run_provenance, handle_run_transcript,
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
@@ -592,6 +592,9 @@ where
         .route("/api/v1/metrics", any(handle_metrics))
         .route("/api/v1/runs/{id}/events", any(handle_run_events))
         .route("/api/v1/runs/{id}/transcript", any(handle_run_transcript))
+        // What the run actually ran on (STUDIO-909). Rhapsody-only, and a route of its own rather
+        // than fields on runs/{id}: that body is byte-pinned to the Go capture by api/run_detail.json.
+        .route("/api/v1/runs/{id}/provenance", any(handle_run_provenance))
         .route("/api/v1/issues/{id}/history", any(handle_issue_history))
         // Run actions (H3): kill a running agent (+ move its ticket to Backlog) and resume a stopped
         // run (+ move it back to Todo). More-specific multi-segment POST patterns; axum's matchit

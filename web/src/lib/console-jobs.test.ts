@@ -16,6 +16,7 @@ import {
   lifecycleByIssue,
   mateStates,
   needsOperator,
+  providerByIssue,
   relativeSince,
   reviewOfTickets,
   reviewRunIssues,
@@ -603,6 +604,36 @@ describe("buildConsoleJobs", () => {
       NOW,
     );
     expect(rows[0].updated).toBe("6m ago");
+  });
+});
+
+describe("providerByIssue / the provider badge (STUDIO-909)", () => {
+  it("reads the daemon's provider off each row and skips the rows without one", () => {
+    const by = providerByIssue([
+      issueRow({ issue_identifier: "A", provider: "fireworks-ai" }),
+      issueRow({ issue_identifier: "B" }),
+      issueRow({ issue_identifier: "", provider: "ghost" }),
+      issueRow({ issue_identifier: "A", provider: "anthropic" }),
+    ]);
+    expect(by.get("A")).toBe("fireworks-ai");
+    // A legacy row with no recorded provider is SKIPPED, not mapped to "".
+    expect(by.has("B")).toBe(false);
+    expect(by.has("")).toBe(false);
+  });
+
+  it("carries the provider onto the worklist row, and leaves it empty for a legacy row", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "A", status: "completed" }), job({ issue: "B", status: "completed" })],
+      [
+        issueRow({ issue_identifier: "A", provider: "fireworks-ai" }),
+        issueRow({ issue_identifier: "B" }),
+      ],
+      undefined,
+      NOW,
+    );
+    const byIssue = new Map(rows.map((r) => [r.issue, r.provider]));
+    expect(byIssue.get("A")).toBe("fireworks-ai");
+    expect(byIssue.get("B")).toBe("");
   });
 });
 

@@ -190,6 +190,63 @@ pub struct RunSummary {
     pub team_id: String,
 }
 
+/// RunProvenance is what a run ACTUALLY ran on — the harness, the model and the provider — plus the
+/// origin of each configurable value, recorded at dispatch (STUDIO-909). Rhapsody-only: the frozen
+/// Go reference records none of it.
+///
+/// It lives in its own [`rhapsody_run_provenance`](crate::Store) table keyed by `run_id` rather than
+/// as columns on `runs`, because the `runs` DDL is byte-pinned to Go by the schema golden and that
+/// golden is recapturable ONLY from the real Go daemon — which can never emit these columns. Adding
+/// them to `runs` would turn `schema_matches_committed_golden` permanently red with no honest fix,
+/// so the store uses the documented Rhapsody-only mechanism (a `rhapsody_`-prefixed table) instead.
+/// See the README "Divergences" entry.
+///
+/// The values are a PROVENANCE RECORD, not a config echo: they are read once from the run that
+/// actually executed and persisted, so a later WORKFLOW.md hot-reload cannot rewrite history. A run
+/// started before this existed has no row and renders as unknown.
+///
+/// `harness_origin`/`model_origin` name the config key the value came from — `profile`,
+/// `review.model.opencode`, `agent.backend`, `claude.model` — so an invisible override becomes
+/// visible. `provider` is DERIVED once, at the same moment, from the recorded harness and model
+/// string, and never re-derived at render time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunProvenance {
+    pub harness: String,
+    /// The config key `harness` resolved from (e.g. `profile`, `agent.backend`).
+    pub harness_origin: String,
+    pub model: String,
+    /// The config key `model` resolved from (e.g. `profile`, `review.model.opencode`, `claude.model`).
+    pub model_origin: String,
+    /// Derived from the recorded harness + model, not from live config.
+    pub provider: String,
+}
+
+impl RunProvenance {
+    /// Whether every field is empty — a row with nothing to say, which consumers render as unknown.
+    pub fn is_empty(&self) -> bool {
+        self.harness.is_empty()
+            && self.harness_origin.is_empty()
+            && self.model.is_empty()
+            && self.model_origin.is_empty()
+            && self.provider.is_empty()
+    }
+}
+
+/// The whole-store token tally for ONE provider — the cost question STUDIO-909 exists to answer
+/// ("what did Fireworks save us?"), which is unanswerable while a run's tokens cannot be attributed
+/// to a provider. Aggregated in SQL over the `runs` ⋈ `rhapsody_run_provenance` join so the figure
+/// never depends on which page a client happened to fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTokens {
+    /// The recorded provider; empty for a run that recorded none (a legacy row, or a harness whose
+    /// provider could not be determined). Empty is reported as its own bucket rather than dropped.
+    pub provider: String,
+    pub runs: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+}
+
 /// EventQuery is a cross-run text search over events (Phase 5 /api/v1/events).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventQuery {

@@ -1,4 +1,4 @@
-import type { RunDetail, RunSummary } from "@/lib/api";
+import type { RunDetail, RunProvenance, RunSummary } from "@/lib/api";
 import { formatTokens, runDuration } from "@/lib/format";
 import { fenceSpans, inlineText } from "@/lib/markdown";
 import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "@/lib/trace-model";
@@ -48,6 +48,43 @@ export function runVitals(run: RunSummary, phases: readonly TracePhase[]): RunVi
     branch: branch === "" ? DASH : branch,
     tools: phases.reduce((n, phase) => n + phase.did.length, 0),
   };
+}
+
+/** The word the provenance surface uses for a value the run never recorded. */
+export const PROVENANCE_UNKNOWN = "unknown";
+
+/** One rendered provenance value with the config key it came from (§3A, STUDIO-909). */
+export interface ProvenanceField {
+  label: "harness" | "model" | "provider";
+  value: string;
+  /** The config key the value came from, or "" when there is none to name. */
+  origin: string;
+}
+
+/**
+ * The run's provenance as the three labelled fields the header renders (STUDIO-909): what the run
+ * ACTUALLY ran on, each configurable value carrying the origin it came from. A run that recorded
+ * nothing — one started before the feature, or an absent fetch — renders every value as `unknown`,
+ * which is the whole point: an inferred provenance record is worse than an empty one.
+ *
+ * The MODEL's origin is read from `model_origin`, never from the profile or the harness: the failure
+ * this exists to make visible was a `review.model.opencode` override that no other field on the run
+ * named. That is a deliberate one-source rule — reading anything else here is the bug, and the test
+ * pins it.
+ */
+export function provenanceFields(p: RunProvenance | undefined): ProvenanceField[] {
+  const value = (v: string | undefined) => (v === undefined || v === "" ? PROVENANCE_UNKNOWN : v);
+  // An origin is only meaningful beside a VALUE; for an unknown value it would name a key that
+  // supplied nothing.
+  const origin = (v: string | undefined, o: string | undefined) =>
+    v === undefined || v === "" ? "" : (o ?? "");
+  return [
+    { label: "harness", value: value(p?.harness), origin: origin(p?.harness, p?.harness_origin) },
+    { label: "model", value: value(p?.model), origin: origin(p?.model, p?.model_origin) },
+    // The provider is derived from the harness and the model at dispatch, so it has no config key
+    // of its own to name.
+    { label: "provider", value: value(p?.provider), origin: "" },
+  ];
 }
 
 /**

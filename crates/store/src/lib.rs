@@ -6,6 +6,7 @@
 //! implementations: [`Sqlite`] (pure-in-process SQLite via `rusqlite`, WAL mode) and [`Noop`]
 //! (the guard-free disabled store used when `storage.path: off`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod noop;
@@ -183,6 +184,30 @@ pub trait Store {
     /// the question. It reads the existing `runs` table and adds no column, index or migration.
     fn earliest_run_start(&self) -> Result<Option<String>, StoreError>;
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
+
+    // --- per-run provenance (STUDIO-909) ---
+    // Additive Rhapsody-only surface with no Go counterpart: the frozen reference records nothing
+    // about what ran a run. Written once at dispatch and never rewritten, so a later config
+    // hot-reload cannot change what a past run says it ran on. Backed by the
+    // `rhapsody_run_provenance` table (see the README "Divergences" entry); a run with no row is
+    // "unknown", which is why [`Store::run_provenance`] returns `None` rather than a zero value.
+    //
+    // [`Store::set_run_provenance`] is a no-op when there is no such run row only in the sense that
+    // it inserts regardless; callers pass the id [`Store::start_run`] returned.
+    fn set_run_provenance(&self, run_id: i64, p: &RunProvenance) -> Result<(), StoreError>;
+    /// One run's provenance, or `Ok(None)` when the run predates this feature (or recorded nothing).
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError>;
+    /// Provenance for a PAGE of run ids in one query, keyed by run id. Missing ids are absent from
+    /// the map — the same "no answer" [`Store::run_provenance`] returns, batched so a listing never
+    /// pays a query per row.
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<HashMap<i64, RunProvenance>, StoreError>;
+    /// Whole-store token totals grouped by recorded provider — the cost-attribution question this
+    /// feature exists to answer. One row per distinct provider, empty provider included, run
+    /// count descending then provider ascending so the order is stable.
+    fn tokens_by_provider(&self) -> Result<Vec<ProviderTokens>, StoreError>;
 
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`

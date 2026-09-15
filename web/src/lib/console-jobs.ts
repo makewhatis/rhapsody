@@ -290,6 +290,11 @@ export interface ConsoleJobRow {
   /** PR reference, or "" when none is known. */
   pr: string;
   /**
+   * The provider this row's run actually billed (STUDIO-909), or "" when the run recorded none
+   * (a legacy row) — the compact scanning badge, never a per-row drill-down.
+   */
+  provider: string;
+  /**
    * For a review row, the TICKET it is reviewing (STUDIO-834) — what the table leads with in place
    * of the `pr:owner/repo#n@reviewer` key, which names no work. "" for every other row, and for a
    * review row whose origin the daemon could not resolve to a ticket; the table then leads with
@@ -457,6 +462,22 @@ export function durableAssignees(rows: readonly IssueRun[]): Map<string, string>
 }
 
 /**
+ * Ticket key → the provider its newest run actually billed, from the issue-level listing's own
+ * `provider` field (STUDIO-909). The compact badge the worklist scans by: "which of these four runs
+ * is on Fireworks" is a scanning question. A row with no recorded provider is SKIPPED rather than
+ * mapped to "", so an absent key is what leaves the badge off a legacy row — exactly the omission
+ * the daemon's field uses to mean "unknown".
+ */
+export function providerByIssue(rows: readonly IssueRun[]): Map<string, string> {
+  const byIssue = new Map<string, string>();
+  for (const r of rows) {
+    if (r.issue_identifier === "" || !r.provider || byIssue.has(r.issue_identifier)) continue;
+    byIssue.set(r.issue_identifier, r.provider);
+  }
+  return byIssue;
+}
+
+/**
  * Newest activity per ticket, from the issue-level history rows: a run's end when it has one,
  * else its start. `mergeJobs` surfaces only the start, and the column says "Updated".
  */
@@ -522,6 +543,7 @@ export function buildConsoleJobs(
   const reviewTickets = reviewTicketIssues(issueRows);
   const reviewRuns = reviewRunIssues(issueRows);
   const reviewOf = reviewOfTickets(issueRows);
+  const providers = providerByIssue(issueRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
@@ -545,6 +567,7 @@ export function buildConsoleJobs(
       // daemon has not yet decorated.
       assignee: durable.get(job.issue) ?? live.get(job.issue) ?? "",
       pr: "",
+      provider: providers.get(job.issue) ?? "",
       reviewOf: reviewOf.get(job.issue) ?? "",
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
