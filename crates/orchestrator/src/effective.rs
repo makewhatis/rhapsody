@@ -410,6 +410,32 @@ fn materialize_config(top: &Config, eff: &EffectiveConfig) -> Config {
     c
 }
 
+/// The stall timeout of the backend a config NAMES, not of claude unconditionally.
+///
+/// ⚠️ This function exists because the pluggable-harnesses design predicted the exact bug it fixes.
+/// §1.4 ("The stall-timeout gate is latent, not live") records that the old code read
+/// `cfg.claude.stall_timeout_ms` behind an `if backend == "claude"` with a `Duration::ZERO` else —
+/// unreachable while claude was the only implemented backend, and, in the record's own words, "it
+/// becomes one the instant a second backend is admitted: stall detection would silently be off for
+/// it." STUDIO-902 is the ticket that admits one. The per-project path had the mirror-image defect
+/// (§1.4's second paragraph): it read `rp.eff.claude.stall_timeout_ms` unconditionally, so an
+/// opencode project would have been governed by claude's number rather than its own.
+///
+/// Claude's value is unchanged: `materialize_config` assigns `c.claude = eff.claude`, so the
+/// per-project arm below reads the same field the old line did.
+///
+/// An unimplemented backend keeps `Duration::ZERO`, which `runner_for_backend` rejects before this
+/// is ever reached. A harness-agnostic liveness signal is design §7.3 / slice 6; this only stops
+/// the existing subprocess-shaped one from silently not applying.
+fn stall_timeout_for(cfg: &Config) -> Duration {
+    let ms = match cfg.agent.backend.as_str() {
+        "claude" => cfg.claude.stall_timeout_ms,
+        "opencode" => cfg.opencode.stall_timeout_ms,
+        _ => 0,
+    };
+    Duration::from_millis(ms.max(0) as u64)
+}
+
 /// Normalizes a state slice into a set, lowercasing/trimming each entry. Mirrors Go `normalizeSet`
 /// (whose `map[string]bool` is a set — the Rust port uses [`HashSet`]).
 fn normalize_set(states: &[String]) -> HashSet<String> {
@@ -468,14 +494,9 @@ pub fn build_effective_with_runner(
     let runner = runner_for_backend(cfg, new_runner)?;
     let top_agents = runners_by_harness(cfg, new_runner);
 
-    // The top-level (legacy/nil-rp) stall timeout; per-project stall timeouts are computed from each
-    // project's materialized claude config below. Only the claude backend carries a stall timeout
-    // this phase; `runner_for_backend` already rejected any other backend above.
-    let stall = if cfg.agent.backend == "claude" {
-        Duration::from_millis(cfg.claude.stall_timeout_ms.max(0) as u64)
-    } else {
-        Duration::ZERO
-    };
+    // The top-level (legacy/nil-rp) stall timeout; per-project ones are computed the same way from
+    // each project's materialized config below.
+    let stall = stall_timeout_for(cfg);
 
     let log_dir = cfg.logging.dir.clone();
 
@@ -565,7 +586,7 @@ pub fn build_effective_with_runner(
             dep_mode_prompt_file: rp.eff.dep_mode_prompt_file.clone(),
             claim_mode: rp.eff.claim_mode.clone(),
             model: rp.eff.claude.model.clone(),
-            stall_timeout: Duration::from_millis(rp.eff.claude.stall_timeout_ms.max(0) as u64),
+            stall_timeout: stall_timeout_for(&mcfg),
             mcfg,
             agent: project_runner,
             agents: project_agents,
@@ -943,6 +964,54 @@ claude:
             "codex is recognized by config but has no runner; it must not appear here"
         );
         assert_eq!(eff.agents.len(), IMPLEMENTED_BACKENDS.len());
+    }
+
+    /// ⚠️ Design §1.4, made live by STUDIO-902. The stall timeout must come from the backend the
+    /// config NAMES. Before this, an opencode installation got `Duration::ZERO` at the top level —
+    /// stall detection silently off — and its projects got CLAUDE's number, which is a different
+    /// wrong answer from the same cause.
+    ///
+    /// Both arms are asserted with DIFFERENT values so neither can pass by coincidence.
+    #[test]
+    fn stall_timeout_follows_the_configured_backend() {
+        const WF: &str = "\
+tracker:
+  kind: linear
+  api_key: tok
+  project_slug: proj
+  active_states: [Todo]
+agent:
+  backend: opencode
+claude:
+  stall_timeout_ms: 111000
+opencode:
+  command: /abs/opencode
+  stall_timeout_ms: 222000
+";
+        let cfg = decode_cfg(WF, "body");
+        let eff = build_effective(&cfg).expect("build_effective");
+        assert_eq!(
+            eff.stall_timeout,
+            Duration::from_millis(222_000),
+            "an opencode installation must use opencode's stall timeout, not ZERO and not claude's"
+        );
+        for p in &eff.projects {
+            assert_eq!(
+                p.stall_timeout,
+                Duration::from_millis(222_000),
+                "project {} read the wrong backend's stall timeout",
+                p.slug
+            );
+        }
+
+        // And claude's own value is untouched by the change.
+        let mut claude_cfg = cfg.clone();
+        claude_cfg.agent.backend = "claude".to_string();
+        let eff = build_effective(&claude_cfg).expect("build_effective");
+        assert_eq!(eff.stall_timeout, Duration::from_millis(111_000));
+        for p in &eff.projects {
+            assert_eq!(p.stall_timeout, Duration::from_millis(111_000));
+        }
     }
 
     // Mirrors Go `TestBuildEffectiveCodexUnsupported`.

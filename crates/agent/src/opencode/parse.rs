@@ -163,6 +163,17 @@ pub fn classify(line: &[u8]) -> Classified {
     match r.r#type.as_str() {
         "text" => {
             let text = truncate(part.text.trim(), MAX_MESSAGE_LEN);
+            // ⚠️ A whitespace-only part contributes NOTHING, including to `text`. The runner keeps
+            // the last non-empty `text` as the turn's `result_text`, so letting a blank trailing
+            // part through here would clobber the agent's real final answer — and with it the
+            // `HANDOFF:` marker the orchestrator scans for, which is the last line of that answer.
+            // Keeping `text` and `ok` consistent is what makes "empty means ignore me" one rule
+            // rather than two that can disagree.
+            let carried = if text.is_empty() {
+                String::new()
+            } else {
+                part.text
+            };
             Classified {
                 event: Event {
                     event_type: EVENT_NOTIFICATION.to_string(),
@@ -172,7 +183,7 @@ pub fn classify(line: &[u8]) -> Classified {
                 },
                 session_id: r.session_id,
                 ok: !text.is_empty(),
-                text: part.text,
+                text: carried,
                 ..Default::default()
             }
         }
@@ -443,6 +454,33 @@ mod tests {
             "the final text is the substantive answer, got {:?}",
             texts[1].text
         );
+    }
+
+    // ⚠️ A whitespace-only `text` part must contribute nothing at all. The runner keeps the LAST
+    // non-empty text as the turn's `result_text`, so a blank trailing part that still carried its
+    // raw value would wipe the agent's real answer — and the `HANDOFF:` marker is the last line of
+    // that answer, so the orchestrator would stop seeing a declared hand-off.
+    #[test]
+    fn a_blank_text_part_carries_nothing_and_cannot_clobber_a_real_answer() {
+        for blank in [
+            &br#"{"type":"text","sessionID":"ses_x","part":{"type":"text","text":""}}"#[..],
+            br#"{"type":"text","sessionID":"ses_x","part":{"type":"text","text":"   \n\t "}}"#,
+        ] {
+            let c = classify(blank);
+            assert!(!c.ok, "a blank text part must not be surfaced");
+            assert!(
+                c.text.is_empty(),
+                "`text` must agree with `ok`, got {:?}",
+                c.text
+            );
+        }
+        // A real answer keeps its raw value, newlines and all: the marker is on the LAST line, so
+        // the carried text must not be collapsed on the way through.
+        let real = br#"{"type":"text","sessionID":"ses_x","part":{"type":"text","text":"Did it.\n\nHANDOFF: in-review"}}"#;
+        let c = classify(real);
+        assert!(c.ok, "a real answer must be surfaced");
+        assert!(c.text.ends_with("HANDOFF: in-review"), "{:?}", c.text);
+        assert!(c.text.contains('\n'), "newlines must survive: {:?}", c.text);
     }
 
     // The 401 capture: ONE line, the whole stream, carrying the status code and the retryability

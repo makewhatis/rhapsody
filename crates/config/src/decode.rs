@@ -174,7 +174,6 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // shape `claude.billing_guard` uses.
         auto_approve: Some(or_bool(r.opencode.auto_approve, true)),
         turn_timeout_ms: or_int(r.opencode.turn_timeout_ms, 3600000),
-        read_timeout_ms: or_int(r.opencode.read_timeout_ms, 5000),
         stall_timeout_ms: or_int(r.opencode.stall_timeout_ms, 300000),
         extra_args: r.opencode.extra_args,
         state_root: r.opencode.state_root,

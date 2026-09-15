@@ -1435,9 +1435,9 @@ impl Orchestrator {
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
     // STUDIO-643 threads `teammate_section` identically, STUDIO-675 threads `run_id` — which Go
-    // carries on `WorkerDeps` proper — and STUDIO-868 threads `model_override` beside the section it
-    // was resolved with. Bundling these into a struct would diverge from the Go parity shape for no
-    // behavioral gain.
+    // carries on `WorkerDeps` proper — STUDIO-868 threads `model_override` beside the section it was
+    // resolved with, and STUDIO-902 threads `harness` beside that, resolved from the same profile.
+    // Bundling these into a struct would diverge from the Go parity shape for no behavioral gain.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_worker(
         &self,

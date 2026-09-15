@@ -456,7 +456,15 @@ impl Session for OpencodeSession {
         let mut scan_err: Option<String> = None;
         let mut timed_out = false;
         let mut stderr_open = true;
-        let mut session_announced = !self.thread_id().is_empty();
+        // ⚠️ Per TURN, not per session — always starting `false`. The consumer counts turns off this
+        // event: `agentupdate.rs` does `re.turn_count += 1` and rebuilds `re.session_id` on every
+        // `EVENT_SESSION_STARTED` (design §1.5's "session_id is derived from the turn counter").
+        // Claude satisfies that because each of its turns is a fresh process emitting its own
+        // `system/init`, and opencode likewise spawns one `opencode run` per turn — so one event per
+        // turn is the matching behaviour. Seeding this from `thread_id` instead (announce only when
+        // the session is new) would emit it once per RUN, and every multi-turn opencode run would
+        // report as a single turn for its whole life.
+        let mut session_announced = false;
         let mut mailbox_open = messages.is_some();
         let mut dropped_messages = 0usize;
         let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
@@ -1091,6 +1099,70 @@ exit 0
         // The invariant stated plainly: a last-wins consumer reading only the final notification
         // must land on the same number the turn commits.
         assert_eq!(live.last().copied(), Some(tr.usage.total_tokens));
+    }
+
+    // ⚠️ EVERY turn announces its session, and a continuation turn resumes with `-s <id>`.
+    //
+    // The consumer counts turns off `EVENT_SESSION_STARTED` (`agentupdate.rs` increments
+    // `turn_count` and rebuilds `session_id` on each one), so emitting it only when the session id
+    // is NEW would report every multi-turn run as a single turn forever. Claude emits one per turn
+    // because each turn is a fresh process with its own `system/init`; this asserts opencode does
+    // the same, and that turn 2 really did carry the resume flag.
+    #[tokio::test]
+    async fn every_turn_announces_its_session_and_turn_two_resumes() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let argv_log = scripts.path().join("argv.log");
+        // Appends its whole argv per invocation, then emits a one-step turn with a fixed session
+        // id. A raw string keeps the shell and JSON quoting readable; LOG is substituted rather
+        // than formatted so no brace or dollar needs escaping.
+        const TMPL: &str = r#"printf '%s\n' "$*" >> "LOG"
+printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}\n'
+"#;
+        let body = TMPL.replace("LOG", &argv_log.display().to_string());
+        let script = write_script(&scripts, "twoturn.sh", &body);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-902"), None)
+            .await
+            .expect("session");
+
+        let (seen, on_event) = collector();
+        for turn in 1..=2 {
+            let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+            assert_eq!(tr.status, TURN_SUCCEEDED, "turn {turn}: {err:?}");
+        }
+
+        let starts = events_of(&seen)
+            .iter()
+            .filter(|e| e.event_type == EVENT_SESSION_STARTED)
+            .count();
+        assert_eq!(
+            starts, 2,
+            "one session event PER TURN — the consumer counts turns with them"
+        );
+
+        let log = std::fs::read_to_string(&argv_log).expect("argv log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "two invocations: {lines:?}");
+        assert!(
+            !lines[0].contains("-s "),
+            "turn 1 must not resume: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("-s ses_stable"),
+            "turn 2 must resume the captured session: {}",
+            lines[1]
+        );
+        // And the session/turn pair the orchestrator reads is the second turn's.
+        assert_eq!(sess.thread_id(), "ses_stable");
+        assert_eq!(sess.id(), "ses_stable-2");
     }
 
     // ⚠️ The empty-stream case as the RUNNER sees it: "stream ended with no terminal event" must be

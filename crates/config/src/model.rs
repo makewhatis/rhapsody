@@ -178,7 +178,10 @@ pub struct Opencode {
     /// Encode round-trips an explicit `false`.
     pub auto_approve: Option<bool>,
     pub turn_timeout_ms: i64,
-    pub read_timeout_ms: i64,
+    /// Feeds the daemon's own stall detection (`Effective::stall_timeout`). ⚠️ There is
+    /// deliberately no `read_timeout_ms` beside it, unlike the `claude:` block: claude's is a Go
+    /// parity field that nothing in this port reads for behaviour, and adding a second
+    /// never-consulted knob to a NEW block would just be a setting that silently does nothing.
     pub stall_timeout_ms: i64,
     pub extra_args: Vec<String>,
     /// Where per-run `XDG_DATA_HOME` directories are created; empty ⇒ the system temp dir. ⚠️ The
@@ -478,7 +481,6 @@ pub(crate) struct RawOpencode {
     pub agent: String,
     pub auto_approve: Option<bool>,
     pub turn_timeout_ms: Option<i64>,
-    pub read_timeout_ms: Option<i64>,
     pub stall_timeout_ms: Option<i64>,
     pub extra_args: Vec<String>,
     pub state_root: String,
