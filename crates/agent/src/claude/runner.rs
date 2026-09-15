@@ -242,7 +242,10 @@ impl ClaudeSession {
     /// The `[teammate …]` clause a failure message carries when this session's model/effort came
     /// from a dispatched teammate's profile; EMPTY when it did not, so an unrouted run's error text
     /// is unchanged (STUDIO-868). Only the fields the profile actually named are listed — reporting
-    /// an inherited global as though the profile had chosen it would misdirect the reader.
+    /// an inherited global as though the profile had chosen it would misdirect the reader. The
+    /// anonymous `"a profile"` branch also fires when `review.model`/`review.effort` (STUDIO-901)
+    /// overrode the routed teammate's own profile — `ModelOverride.identity` is cleared in that
+    /// case precisely so this message does not name a teammate for a value they didn't write.
     fn model_attribution(&self) -> String {
         let over = self.locked_model_override();
         if over.is_empty() {

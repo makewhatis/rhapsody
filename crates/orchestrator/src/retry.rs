@@ -397,6 +397,48 @@ impl Orchestrator {
             // the installation-wide pair and the argv is byte-identical to today.
             re.model_override = td.model_override.clone();
         }
+        // A review run's model/effort come from `review.model`/`review.effort` when the operator
+        // set them, regardless of what the routed teammate's own profile asked for (STUDIO-901).
+        // `review` is `Some` only for a run `dispatch_review` staged in `pending_review`, so an
+        // ordinary ticket dispatch — where this would otherwise silently apply to every run — never
+        // reaches the branch. Per-field non-empty-wins, the same shape `turn_cfg` already applies to
+        // a profile override: naming only `model` leaves `effort` at whatever the reviewer's profile
+        // (or the installation) already had.
+        //
+        // Review-scoped rather than a teammate field, and deliberately outranking the reviewer's own
+        // profile: the operator's intent here is role-based (keep review on the premium model, per
+        // the operator's own words on the ticket) while a profile's `model` is person-based
+        // (STUDIO-868) — the two answer different questions, and when both are set it is the PR
+        // under review being priced, not that teammate's own work.
+        //
+        // Read through `Teams::review_model`/`review_effort`, not the raw field: this branch is
+        // unreachable except through `dispatch_review`'s ticketless gate today (jimmy/alice round 1
+        // on PR #168), but the accessor is the convention this crate already uses for every other
+        // `review:` scalar and keeps this call site from disagreeing with `teams show` about when
+        // the override is live.
+        if review.is_some()
+            && let Some(teams) = self.teams.as_ref()
+        {
+            let mut review_overrode = false;
+            if let Some(model) = teams.review_model() {
+                re.model_override.model = model.to_string();
+                review_overrode = true;
+            }
+            if let Some(effort) = teams.review_effort() {
+                re.model_override.effort = effort.to_string();
+                review_overrode = true;
+            }
+            // A rejected `review.model`/`review.effort` must not blame the routed reviewer's own
+            // profile (alice round 1 finding 2 on PR #168): `ModelOverride.identity` exists so a
+            // CLI rejection names "jimmy's profile asked for `<model>`" rather than nobody, and
+            // that attribution is simply wrong once the value came from the operator's `review:`
+            // block instead. Clearing it degrades the message to `model_attribution`'s existing
+            // "a profile asked for …" branch (`runner.rs:213`) — anonymous, but no longer naming a
+            // teammate for a value they did not write.
+            if review_overrode {
+                re.model_override.identity = String::new();
+            }
+        }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
         re.model = match &route {

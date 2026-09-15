@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use chrono::SecondsFormat;
 use rhapsody_config::profiles::{self, BodyOrigin, Origin, ResolvedProfile};
 use rhapsody_config::room::{Cursor, LocalRoom, Message};
-use rhapsody_config::teams::Teams;
+use rhapsody_config::teams::{Review, Teams};
 use rhapsody_config::{Config, workflow};
 
 use crate::bootcfg::{resolve_profiles_dir, resolve_room_dir, resolve_teams_path};
@@ -196,9 +196,18 @@ fn show(
     } else {
         String::new()
     };
+    // `review.model`/`review.effort` are only ever consulted on the ticketless path
+    // (STUDIO-901; `Teams::review_ticketless`) — on any other install (including the default,
+    // `mode: off`) `dispatch_issue` never reaches the block that reads them, so a set value is
+    // dead config. `None` here is what makes `render_show` suppress the two lines entirely rather
+    // than asserting an override that install cannot honour, so a Teams-off `show` (no
+    // `teams.yaml` at all) prints no line this addition did not exist to add (the alignment fix
+    // widened every label's gutter by one, so it is not byte-identical to pre-STUDIO-901 output).
+    let review = teams.review_ticketless().then_some(&teams.review);
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
         &resolved,
+        review,
         &room,
         &render_rejection_for(teams_path, &rejected),
     ))
@@ -342,19 +351,25 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// resolved prompt is unbounded prose, and a glance an operator has to scroll a
 /// screenful of it to reach is not a glance. It is empty whenever Teams is off
 /// or `--room 0` was passed, and then this renders exactly what it always did.
-fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str, rejection: &str) -> String {
+fn render_show(
+    identity: Option<&str>,
+    r: &ResolvedProfile,
+    review: Option<&Review>,
+    room: &str,
+    rejection: &str,
+) -> String {
     let mut out = String::new();
     // First, so it is the line an operator reads before anything else. Empty on
     // every accepted config, which keeps an ordinary `show` byte-identical to
     // what it printed before this existed (STUDIO-670's property).
     out.push_str(rejection);
     if let Some(i) = identity {
-        out.push_str(&format!("identity:     {i}\n"));
+        out.push_str(&format!("identity:      {i}\n"));
     }
-    out.push_str(&format!("profile:      {}\n", r.name));
+    out.push_str(&format!("profile:       {}\n", r.name));
     match &r.provenance.base {
         Some(b) => out.push_str(&format!(
-            "base:         {}@{} ({})\n",
+            "base:          {}@{} ({})\n",
             b.name,
             b.version,
             if b.pinned {
@@ -363,39 +378,61 @@ fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str, rejectio
                 "tracking latest"
             }
         )),
-        None => out.push_str("base:         none (fork — this file is the whole profile)\n"),
+        None => out.push_str("base:          none (fork — this file is the whole profile)\n"),
     }
     match &r.provenance.overlay {
-        Some(p) => out.push_str(&format!("overlay:      {}\n", p.display())),
-        None => out.push_str("overlay:      none (the built-in, unmodified)\n"),
+        Some(p) => out.push_str(&format!("overlay:       {}\n", p.display())),
+        None => out.push_str("overlay:       none (the built-in, unmodified)\n"),
     }
     if let Some(d) = &r.provenance.drift {
         out.push_str(&format!(
-            "drift:        pinned to {}@{}; the built-in is now {}@{} (reported, never merged)\n",
+            "drift:         pinned to {}@{}; the built-in is now {}@{} (reported, never merged)\n",
             d.name, d.pinned, d.name, d.latest
         ));
     }
     out.push_str(&format!(
-        "model:        {}\n",
+        "model:         {}\n",
         field(&r.model, r.provenance.model)
     ));
     out.push_str(&format!(
-        "effort:       {}\n",
+        "effort:        {}\n",
         field(&r.effort, r.provenance.effort)
     ));
+    // What an operator actually needs answered (STUDIO-901, ticket §4): "what model REVIEWS this
+    // identity's pull requests" is a different question from "what model does this identity run
+    // with", because `review.model`/`review.effort` (when set) win over the profile above for a
+    // REVIEW run specifically — and are otherwise invisible, since they are not part of this
+    // identity's own profile at all.
+    //
+    // `None` (Teams off, or `review.mode` anything but `ticketless`) suppresses BOTH lines rather
+    // than printing them with a claim that cannot come true (jimmy/alice round 1 on PR #168):
+    // `dispatch_issue` only ever applies `review.model`/`review.effort` to a run
+    // `dispatch_review` staged, and only the ticketless path stages one. `show` on any other
+    // install prints exactly the lines it printed before this ticket — not a column-for-column
+    // match, since the round-1 alignment fix widened every label's gutter by one (jimmy round 2).
+    if let Some(review) = review {
+        out.push_str(&format!(
+            "review model:  {}\n",
+            review_field("model", &review.model, &r.model, r.provenance.model)
+        ));
+        out.push_str(&format!(
+            "review effort: {}\n",
+            review_field("effort", &review.effort, &r.effort, r.provenance.effort)
+        ));
+    }
     out.push_str(&format!(
-        "capabilities: {}\n",
+        "capabilities:  {}\n",
         list_field(&r.capabilities, r.provenance.capabilities)
     ));
     out.push_str(&format!(
-        "tools:        {} (parsed, unused in this slice)\n",
+        "tools:         {} (parsed, unused in this slice)\n",
         list_field(&r.tools, r.provenance.tools)
     ));
     // A fork has no base, so a `{{ base }}` token in one splices nothing. Say
     // that, rather than claiming a splice the `base: none` line contradicts.
     let has_base = r.provenance.base.is_some();
     out.push_str(&format!(
-        "body:         {}\n",
+        "body:          {}\n",
         match r.provenance.body {
             BodyOrigin::Base => "from the base (the overlay body is empty)",
             BodyOrigin::Overlay => "from the overlay (replaces the base wholesale)",
@@ -425,6 +462,31 @@ fn field(value: &str, o: Origin) -> String {
         origin_tag(o).to_string()
     } else {
         format!("{value} {}", origin_tag(o))
+    }
+}
+
+/// The `review model:`/`review effort:` line (STUDIO-901): `teams.review.<name>` when the
+/// operator set it — which WINS over this identity's own profile for a review run and says so —
+/// else the profile's own value (rendered with its normal [`field`] provenance), since an unset
+/// `review.<name>` means a review run inherits exactly what this identity's profile already gives
+/// an ordinary dispatch.
+///
+/// Only called when `render_show`'s `review` argument is `Some` — the caller (`show`) gates that
+/// on [`Teams::review_ticketless`](rhapsody_config::teams::Teams::review_ticketless), so this
+/// function itself never has to ask "can this override even fire": by the time it runs, it can.
+fn review_field(
+    name: &str,
+    review_value: &str,
+    profile_value: &str,
+    profile_origin: Origin,
+) -> String {
+    if review_value.is_empty() {
+        format!(
+            "(unset — a review run uses this profile's {name}, {})",
+            field(profile_value, profile_origin)
+        )
+    } else {
+        format!("{review_value} [review.{name} — overrides this profile's {name} for a review run]")
     }
 }
 
@@ -538,15 +600,15 @@ mod tests {
         let dir = TempDir::new();
         let (env, profiles_dir) = hermetic(&dir);
         let out = run(&["show", "swe"], &env[0]).expect("show swe");
-        assert!(out.contains("profile:      swe"), "out = {out}");
+        assert!(out.contains("profile:       swe"), "out = {out}");
         assert!(
             out.contains(&format!(
-                "base:         swe@{} (tracking latest)",
+                "base:          swe@{} (tracking latest)",
                 newest_builtin("swe")
             )),
             "out = {out}"
         );
-        assert!(out.contains("overlay:      none"), "out = {out}");
+        assert!(out.contains("overlay:       none"), "out = {out}");
         assert!(out.contains("--- resolved prompt ---"), "out = {out}");
         assert!(
             out.contains("You are a software engineer on this codebase."),
@@ -571,13 +633,92 @@ mod tests {
         )
         .expect("write teams.yaml");
         let out = run(&["show", "alice"], &env[0]).expect("show alice");
-        assert!(out.contains("identity:     alice"), "out = {out}");
-        assert!(out.contains("profile:      reviewer"), "out = {out}");
+        assert!(out.contains("identity:      alice"), "out = {out}");
+        assert!(out.contains("profile:       reviewer"), "out = {out}");
         assert!(
             out.contains("You are a code reviewer on this codebase."),
             "out = {out}"
         );
         assert!(!profiles_dir.exists(), "show must not create the dir");
+    }
+
+    // ── review model/effort visibility (STUDIO-901, ticket §4) ──────────────
+
+    /// The whole §4 bar for this ticket: an operator asking "what model will actually review
+    /// this?" gets a direct answer, in the same one command that already answers "what model does
+    /// this identity run with?" — and when `review.model`/`review.effort` are set, the line says
+    /// they WIN over the profile above, so the two lines are never mistaken for each other.
+    #[test]
+    fn show_reports_the_review_scoped_model_when_set() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  claude-opus-5 [review.model — overrides this profile's model for a review run]"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("review effort: high [review.effort — overrides this profile's effort for a review run]"),
+            "out = {out}"
+        );
+    }
+
+    /// Absent `review.model`/`review.effort` on the ticketless path — the default that path
+    /// itself would ship with — says plainly that a review run inherits this identity's own
+    /// profile, rather than printing nothing and leaving the question unanswered.
+    #[test]
+    fn show_reports_review_scoped_model_as_inherited_when_unset() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  (unset — a review run uses this profile's model, [unset — inherits the daemon's config])"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("review effort: (unset — a review run uses this profile's effort, [unset — inherits the daemon's config])"),
+            "out = {out}"
+        );
+    }
+
+    /// **jimmy/alice round-1 finding 2 on PR #168, mutation-checked.** `review.model`/
+    /// `review.effort` are dead config on any installation whose `review.mode` is not
+    /// `ticketless` — including the SHIPPED default, `mode: off`, and Teams disabled entirely (no
+    /// `teams.yaml` at all). `show` must not claim an override that install can never honour, so a
+    /// Teams-off install's report suppresses both review-scoped lines and otherwise prints exactly
+    /// the lines it printed before this ticket. Gating `render_show`'s `review` argument on
+    /// anything other than `teams.review_ticketless()` turns this red.
+    #[test]
+    fn show_suppresses_the_review_scoped_lines_off_the_ticketless_path() {
+        // Teams enabled, but on `mode: tickets` — the review override is set and inert.
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: tickets\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(!out.contains("review model:"), "out = {out}");
+        assert!(!out.contains("review effort:"), "out = {out}");
+
+        // No teams.yaml at all: the review-scoped lines stay suppressed, exactly as before this
+        // ticket added them.
+        let dir2 = TempDir::new();
+        let (env2, _) = hermetic(&dir2);
+        let out = run(&["show", "swe"], &env2[0]).expect("show swe");
+        assert!(!out.contains("review model:"), "out = {out}");
+        assert!(!out.contains("review effort:"), "out = {out}");
     }
 
     /// STUDIO-891: a REJECTED `teams.yaml` is reported by the command, not only
@@ -646,7 +787,7 @@ mod tests {
         )
         .expect("write overlay");
         let out = run(&["show", "swe"], &env[0]).expect("show swe");
-        assert!(out.contains("model:        opus [overlay]"), "out = {out}");
+        assert!(out.contains("model:         opus [overlay]"), "out = {out}");
         assert!(
             out.contains("the overlay, with the base spliced in at {{ base }}"),
             "out = {out}"
@@ -699,7 +840,7 @@ mod tests {
         // The fork now resolves with no base at all.
         let shown = run(&["show", "sre"], &env[0]).expect("show sre");
         assert!(
-            shown.contains("base:         none (fork"),
+            shown.contains("base:          none (fork"),
             "shown = {shown}"
         );
     }

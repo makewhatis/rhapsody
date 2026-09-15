@@ -145,7 +145,10 @@ pub struct Transcript {
 /// bare non-zero exit that names nobody.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelOverride {
-    /// The routed teammate. Diagnostics only; empty when Teams is off or nobody was routed.
+    /// The routed teammate. Diagnostics only; empty when Teams is off, nobody was routed, or
+    /// (STUDIO-901) `model`/`effort` came from `review.model`/`review.effort` rather than the
+    /// routed teammate's own profile — so an empty `identity` no longer implies nobody was routed;
+    /// `re.identity` on the dispatch is the real routing record.
     pub identity: String,
     /// `claude --model`; empty ⇒ inherit [`crate::claude::Config::model`].
     pub model: String,
