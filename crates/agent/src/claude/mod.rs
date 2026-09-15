@@ -30,3 +30,7 @@ pub use billing::{
 pub use mcpinject::{MERGED_MCP_CONFIG_NAME, append_me_env, append_review_env, inject_daemon_mcp};
 pub use parse::{Classified, classify};
 pub use runner::Runner;
+
+// `Harness` is implemented for `runner::Runner` in `runner.rs` (STUDIO-900) so its capabilities
+// stay next to the behavior they describe; re-exported here for callers that only import `claude`.
+pub use crate::harness::Harness;

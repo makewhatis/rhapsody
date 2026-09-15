@@ -13,12 +13,13 @@ no `Cargo.toml` of its own and is just the crate's second backend, not a separat
 | `src/humanize.rs` | `humanize.go` | stream-json line → `LogEntry` for the `/log` API/dashboard |
 | `src/fake.rs` | `internal/agent/fake` | scriptable in-process backend, the orchestrator's test double |
 | `src/proctree.rs` | — | harness-agnostic process-TREE kill (`kill_tree`, `KillTreeOnDrop`); no Go counterpart |
+| `src/harness.rs` | — | the pluggable-harnesses contract (`HarnessSpec`/`HarnessCapabilities`/`Harness`, STUDIO-900); no Go counterpart — the frozen reference runs one backend. `Harness: Runner`, so `Runner`/`Session` stay the only traits the orchestrator schedules against |
 | `src/claude/mod.rs` | `internal/agent/claude` | re-exports; module doc lists the five submodules' Go files 1:1 |
 | `src/claude/args.rs` | `args.go` | `Config` + `build_args`/`split_command` |
 | `src/claude/billing.rs` | `billing.go` | env-scrub name sets + billing-guard decisions |
 | `src/claude/mcpinject.rs` | `mcpinject.go` | per-workspace `.symphony-mcp.json` merge + "me" identity env |
 | `src/claude/parse.rs` | `parse.go` | one stream-json line → normalized `Event`/`TurnResult` |
-| `src/claude/runner.rs` | `runner.go` | the subprocess `Runner`/`Session` impl; wires the four modules above |
+| `src/claude/runner.rs` | `runner.go` | the subprocess `Runner`/`Session` impl; wires the four modules above; also implements `harness::Harness` for `Runner` (STUDIO-900) — its declared `HarnessCapabilities` live next to the behavior they describe |
 | `tests/fake_claude_gate.rs` | — | P4 phase gate: runs the real Claude `Runner` against the committed `harness/stubs/fake-claude*` and diffs the humanized output against `harness/fixtures/runs/*.jsonl` |
 
 ## Architecture — reading order
