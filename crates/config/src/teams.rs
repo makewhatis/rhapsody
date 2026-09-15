@@ -614,8 +614,9 @@ impl Teams {
     /// [`review_done_state`](Self::review_done_state)'s reason: `dispatch_issue`'s
     /// `review.model`/`review.effort` block only ever runs for a run `dispatch_review` staged, and
     /// only `mode: ticketless` ever stages one — on any other installation, including the default
-    /// `mode: off`, a set value is dead config. `rhapsodyd teams show` reads this (not the raw
-    /// field) so it never claims an override is live on an install where it cannot be.
+    /// `mode: off`, a set value is dead config. `dispatch_issue` is this accessor's only caller;
+    /// `rhapsodyd teams show` applies the same `review_ticketless()` gate itself rather than
+    /// calling this, because it also needs the set/unset distinction this collapses to `None`.
     pub fn review_model(&self) -> Option<&str> {
         if !self.review_ticketless() || self.review.model.is_empty() {
             return None;

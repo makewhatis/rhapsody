@@ -408,8 +408,8 @@ fn render_show(
     // than printing them with a claim that cannot come true (jimmy/alice round 1 on PR #168):
     // `dispatch_issue` only ever applies `review.model`/`review.effort` to a run
     // `dispatch_review` staged, and only the ticketless path stages one. `show` on any other
-    // install is exactly as byte-identical to its pre-STUDIO-901 output as `--room 0` already
-    // makes the room section (STUDIO-670's property, extended to this addition).
+    // install prints exactly the lines it printed before this ticket — not a column-for-column
+    // match, since the round-1 alignment fix widened every label's gutter by one (jimmy round 2).
     if let Some(review) = review {
         out.push_str(&format!(
             "review model:  {}\n",
@@ -694,10 +694,10 @@ mod tests {
     /// **jimmy/alice round-1 finding 2 on PR #168, mutation-checked.** `review.model`/
     /// `review.effort` are dead config on any installation whose `review.mode` is not
     /// `ticketless` — including the SHIPPED default, `mode: off`, and Teams disabled entirely (no
-    /// `teams.yaml` at all). `show` must not claim an override that install can never honour, and
-    /// a Teams-off install's report must stay byte-identical to what it printed before this ticket
-    /// (the same property STUDIO-670 already gives the room section). Gating `render_show`'s
-    /// `review` argument on anything other than `teams.review_ticketless()` turns this red.
+    /// `teams.yaml` at all). `show` must not claim an override that install can never honour, so a
+    /// Teams-off install's report suppresses both review-scoped lines and otherwise prints exactly
+    /// what it printed before this ticket. Gating `render_show`'s `review` argument on anything
+    /// other than `teams.review_ticketless()` turns this red.
     #[test]
     fn show_suppresses_the_review_scoped_lines_off_the_ticketless_path() {
         // Teams enabled, but on `mode: tickets` — the review override is set and inert.
@@ -712,7 +712,8 @@ mod tests {
         assert!(!out.contains("review model:"), "out = {out}");
         assert!(!out.contains("review effort:"), "out = {out}");
 
-        // No teams.yaml at all: the report must be exactly what it was before STUDIO-901.
+        // No teams.yaml at all: the review-scoped lines stay suppressed, exactly as before this
+        // ticket added them.
         let dir2 = TempDir::new();
         let (env2, _) = hermetic(&dir2);
         let out = run(&["show", "swe"], &env2[0]).expect("show swe");
