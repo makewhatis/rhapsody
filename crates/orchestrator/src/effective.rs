@@ -244,6 +244,16 @@ fn runner_for_backend(
 /// documents, and `implemented_backends_are_known_harness_names` pins.
 pub(crate) const IMPLEMENTED_BACKENDS: &[&str] = &["claude", "opencode"];
 
+/// Whether THIS build can actually run `name` — the membership test `spawn_worker` makes against
+/// a resolved project's runner pool (built from [`IMPLEMENTED_BACKENDS`]) when a teammate profile
+/// names a harness (STUDIO-902). Exposed so `rhapsodyd teams show` can report a harness the
+/// dispatcher would silently fall back from, rather than printing it as though it would run
+/// (STUDIO-903). `""` is not implemented on purpose: an empty harness means "inherit
+/// `agent.backend`", which dispatch resolves before it ever asks this question.
+pub fn harness_is_implemented(name: &str) -> bool {
+    IMPLEMENTED_BACKENDS.contains(&name)
+}
+
 /// Builds one runner per [`IMPLEMENTED_BACKENDS`] entry, so a dispatch can SELECT a harness without
 /// constructing anything (STUDIO-902).
 ///
@@ -1083,6 +1093,23 @@ opencode:
                 "runner_for_backend implements {name:?}, so it must remain in the shared registry"
             );
         }
+    }
+
+    /// [`harness_is_implemented`] is the arbiter `teams show` consults to decide whether to mark a
+    /// profile's harness (STUDIO-903), so it must agree with what the dispatch pool actually
+    /// builds — otherwise the report could mark a runnable harness unavailable, or pass `codex`
+    /// off as one that will run. `""` is deliberately not implemented: it is the inherit sentinel,
+    /// resolved to `agent.backend` before dispatch ever consults the pool.
+    #[test]
+    fn harness_is_implemented_matches_the_dispatch_pool() {
+        for name in IMPLEMENTED_BACKENDS {
+            assert!(harness_is_implemented(name), "{name:?} has a runner");
+        }
+        assert!(!harness_is_implemented("codex"), "codex has no runner");
+        assert!(
+            !harness_is_implemented(""),
+            "the empty name is the inherit sentinel"
+        );
     }
 
     /// `validate`'s `UnsupportedAgentBackend` check used to hardcode its own notion of "which
