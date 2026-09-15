@@ -722,8 +722,9 @@ impl Orchestrator {
             .unwrap_or_default()
     }
 
-    /// The configured `agent.backend` — what a run with no harness of its own actually uses.
-    fn configured_backend(&self) -> String {
+    /// The configured `agent.backend` — what a run with no harness of its own actually uses, and
+    /// the harness the legacy bare-scalar `review.model`/`review.effort` belongs to (STUDIO-908).
+    pub(crate) fn configured_backend(&self) -> String {
         self.eff
             .as_ref()
             .map_or_else(String::new, |e| e.cfg.agent.backend.clone())

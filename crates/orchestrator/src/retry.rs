@@ -432,14 +432,34 @@ impl Orchestrator {
         {
             let harness = self
                 .harness_actually_run(teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()));
+            // The harness the legacy bare-scalar `review.model`/`review.effort` spelling belongs
+            // to (STUDIO-908): the installation's configured `agent.backend`, not a hardcoded
+            // `claude`. `dispatch_review` derives it the same way, so the refusal and the override
+            // are the same fact.
+            let fallback = self.configured_backend();
             let mut review_overrode = false;
-            if let rhapsody_config::teams::ReviewModelChoice::Use(model) =
-                teams.review_model_for(&harness)
-            {
-                re.model_override.model = model.to_string();
-                review_overrode = true;
+            match teams.review_model_for(&harness, &fallback) {
+                rhapsody_config::teams::ReviewModelChoice::Use(model) => {
+                    re.model_override.model = model.to_string();
+                    review_overrode = true;
+                }
+                // `dispatch_review` already refused a review whose harness has no `review.model`
+                // entry, so a `Refuse` here means the two derivations of the reviewer's harness
+                // disagreed. Falling through to inherit is exactly the silent cheap review this
+                // ticket exists to prevent, so it is logged at `error!` and never left unspoken
+                // (alice's non-blocking finding 2 on PR #172). Staging the decided model on the
+                // pending-review entry would make the two one computation; that is the follow-up.
+                rhapsody_config::teams::ReviewModelChoice::Refuse(why) => {
+                    tracing::error!(
+                        review = %iss.id,
+                        reason = %why,
+                        "review.model refused at dispatch_issue; the review run inherits the \
+                         reviewer's own profile model"
+                    );
+                }
+                rhapsody_config::teams::ReviewModelChoice::Inherit => {}
             }
-            if let Some(effort) = teams.review_effort(&harness) {
+            if let Some(effort) = teams.review_effort(&harness, &fallback) {
                 re.model_override.effort = effort.to_string();
                 review_overrode = true;
             }

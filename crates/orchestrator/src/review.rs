@@ -345,16 +345,20 @@ impl Orchestrator {
         // them. Placed after the overwrite guard so a duplicate of an already-live review still
         // answers `AlreadyInFlight` rather than blaming a model.
         let iss = run.synthetic_issue();
+        // `fallback` is the configured `agent.backend` — the harness the legacy bare-scalar
+        // `review.model` spelling belongs to, so an all-opencode installation that wrote a bare
+        // scalar is not refused on its own harness (alice's blocking finding on PR #172).
+        let fallback = self.configured_backend();
         let refused = self
             .teams
             .as_ref()
             .filter(|t| t.review_ticketless())
-            .and_then(
-                |teams| match teams.review_model_for(&self.review_harness_for(&iss)) {
+            .and_then(|teams| {
+                match teams.review_model_for(&self.review_harness_for(&iss), &fallback) {
                     rhapsody_config::teams::ReviewModelChoice::Refuse(why) => Some(why),
                     _ => None,
-                },
-            );
+                }
+            });
         if let Some(why) = refused {
             tracing::warn!(review = %id, reason = %why, "ticketless review: refused");
             return ReviewDispatchOutcome::Refused(why);
@@ -1438,6 +1442,71 @@ mod tests {
         let id = review_run("alice", HEAD_A).key();
         assert_eq!(o.running[&id].model_override.model, "cheap-model");
         assert_eq!(o.running[&id].model_override.identity, "alice");
+    }
+
+    /// **alice's blocking finding on PR #172.** The legacy bare `review.model` spelling belongs to
+    /// the installation's configured `agent.backend`, not a hardcoded `claude`. On an all-opencode
+    /// installation — `agent.backend: opencode`, every profile naming no harness, exactly alice's
+    /// probe — a bare `review.model` works today and must keep working; scoping it to `claude`
+    /// refused every ticketless review on that install. Mutation check: resolving `bare()` under a
+    /// hardcoded `claude` turns this refusal red.
+    #[test]
+    fn a_legacy_bare_review_model_applies_on_an_all_opencode_installation() {
+        let dir = TempDir::new();
+        // No `harness:` line: this profile inherits the installation's backend, as an all-opencode
+        // install's profiles do.
+        write_profile(&dir, "oc", "---\nextends: swe\n---\nStaff.\n");
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        o.eff.as_mut().expect("eff").cfg.agent.backend = "opencode".to_string();
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+            teams.review.model = HarnessScoped::bare("some-opencode-model");
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.model, "some-opencode-model",
+            "the bare scalar belongs to the configured backend, which is opencode here"
+        );
+    }
+
+    /// The other direction of the same finding: the bare scalar is still refused for a reviewer on
+    /// a harness OTHER than the configured backend — it is never silently re-scoped to make a
+    /// mismatch go away. And the refusal names the backend as the value's own harness, not a
+    /// `claude` the operator never wrote.
+    #[test]
+    fn a_legacy_bare_review_model_is_refused_for_a_reviewer_on_a_different_harness() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "cl",
+            "---\nextends: swe\nharness: claude\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        o.eff.as_mut().expect("eff").cfg.agent.backend = "opencode".to_string();
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "cl".to_string();
+            teams.review.model = HarnessScoped::bare("some-opencode-model");
+        }
+
+        let ReviewDispatchOutcome::Refused(why) = o.dispatch_review(review_run("alice", HEAD_A))
+        else {
+            panic!("a claude reviewer must not be handed the opencode backend's model");
+        };
+        assert!(
+            why.contains("opencode (model some-opencode-model)"),
+            "the value's harness must be named as opencode, not claude: {why}"
+        );
+        assert!(
+            why.contains("claude"),
+            "must name the reviewer's harness: {why}"
+        );
     }
 
     /// A ticket dispatch is untouched by any of this: no review coordinates, so the worker takes the

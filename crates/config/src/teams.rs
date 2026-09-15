@@ -275,7 +275,7 @@ pub enum ReviewMode {
 /// states "premium review on every harness" rather than "premium review on Claude, broken
 /// elsewhere", which is the seam STUDIO-901 and STUDIO-902 landed on top of each other.
 ///
-/// Two YAML spellings parse — the legacy scalar (equivalent to a one-entry `claude` map):
+/// Two YAML spellings parse — the legacy scalar:
 ///
 /// ```yaml
 /// review:
@@ -292,47 +292,79 @@ pub enum ReviewMode {
 /// ```
 ///
 /// The bare scalar is the spelling STUDIO-901 shipped, written when every teammate was Claude and
-/// a model name was unambiguous; it is read as a value for `claude`, the harness it was
-/// unambiguous for. An empty scalar and a null both mean "nothing configured" — the same
-/// absent-means-inherit rule every other field in this file follows. Empty values are dropped, so
-/// `{ claude: "" }` is unset rather than an override to the empty string.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
-#[serde(transparent)]
+/// a model name was unambiguous; it is stored UNRESOLVED because which harness it belongs to is
+/// not knowable at parse time (alice's blocking finding on PR #172). Its harness is the
+/// installation's configured `agent.backend` — the harness a bare name was unambiguous for on a
+/// single-harness install — so an all-opencode installation that wrote a bare `review.model`
+/// keeps working, while a reviewer on a *different* harness is still refused rather than handed
+/// the wrong model. [`HarnessScoped::for_harness`] takes that fallback.
+///
+/// An empty scalar and a null both mean "nothing configured" — the same absent-means-inherit rule
+/// every other field in this file follows. Empty values are dropped, so `{ claude: "" }` is unset
+/// rather than an override to the empty string.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HarnessScoped {
+    /// The legacy bare-scalar spelling, unresolved until [`HarnessScoped::for_harness`] is handed
+    /// the fallback harness. `values` is empty whenever this is `Some`; the two spellings never
+    /// mix, because each is produced by its own [`Deserialize`] branch.
+    bare: Option<String>,
     values: BTreeMap<String, String>,
 }
 
 impl HarnessScoped {
-    /// The value configured for `harness`, or `None` — including when values exist for OTHER
+    /// The value that applies to `harness`, resolving the legacy bare spelling against `fallback`
+    /// (the installation's `agent.backend`), or `None` — including when values exist for OTHER
     /// harnesses. A caller that must tell "unset everywhere" from "set, but not for this harness"
     /// asks [`HarnessScoped::is_empty`] first; [`Teams::review_model_for`] is that caller.
-    pub fn get(&self, harness: &str) -> Option<&str> {
-        self.values.get(harness).map(String::as_str)
-    }
-
-    /// Whether any harness has a value. An empty map and an all-empty map both read as unset.
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    /// Every configured `(harness, value)` pair, in harness order — `teams show` and the refusal
-    /// message both render the set back to the operator, so nothing here is silently dropped.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.values.iter().map(|(h, v)| (h.as_str(), v.as_str()))
-    }
-
-    /// The legacy bare-scalar spelling: `value` is a value for `claude`, the harness a bare model
-    /// name was unambiguous for when STUDIO-901 shipped. Empty is unset.
-    pub fn bare(value: &str) -> Self {
-        let mut values = BTreeMap::new();
-        if !value.is_empty() {
-            values.insert("claude".to_string(), value.to_string());
+    pub fn for_harness(&self, harness: &str, fallback: &str) -> Option<&str> {
+        match &self.bare {
+            Some(value) => (harness == fallback).then_some(value.as_str()),
+            None => self.values.get(harness).map(String::as_str),
         }
-        Self { values }
+    }
+
+    /// Whether any value is configured at all. An absent scalar, an empty scalar and an empty map
+    /// all read as unset.
+    pub fn is_empty(&self) -> bool {
+        self.bare.is_none() && self.values.is_empty()
+    }
+
+    /// Every configured `(harness, value)` pair, in harness order, with the legacy bare spelling
+    /// resolved to `fallback` — `teams show` and the refusal message both render the set back to
+    /// the operator, so nothing here is silently dropped.
+    pub fn resolved<'a>(&'a self, fallback: &'a str) -> Vec<(&'a str, &'a str)> {
+        match &self.bare {
+            Some(value) => vec![(fallback, value.as_str())],
+            None => self
+                .values
+                .iter()
+                .map(|(h, v)| (h.as_str(), v.as_str()))
+                .collect(),
+        }
+    }
+
+    /// The value the legacy bare scalar spelled, or `None` for the per-harness map spelling. Only
+    /// `teams show` needs it: the origin label differs between the two spellings (`review.model`
+    /// vs `review.model.<harness>`), and naming a harness the operator never wrote is the sort of
+    /// misattribution this ticket exists to remove.
+    pub fn legacy(&self) -> Option<&str> {
+        self.bare.as_deref()
+    }
+
+    /// The legacy bare-scalar spelling: `value` is resolved against the installation's
+    /// `agent.backend` at dispatch, the harness a bare model name was unambiguous for when
+    /// STUDIO-901 shipped. Empty is unset.
+    pub fn bare(value: &str) -> Self {
+        Self {
+            bare: (!value.is_empty()).then(|| value.to_string()),
+            values: BTreeMap::new(),
+        }
     }
 
     /// Sets `harness`'s value, or removes it when `value` is empty — so a builder can never leave
-    /// an entry that [`HarnessScoped::is_empty`]/[`HarnessScoped::get`] would treat as unset.
+    /// an entry that [`HarnessScoped::is_empty`]/[`HarnessScoped::for_harness`] would treat as
+    /// unset. This is the per-harness map spelling; [`HarnessScoped::bare`] is the other, and a
+    /// value built with one is never mixed with the other.
     pub fn insert(&mut self, harness: &str, value: &str) -> &mut Self {
         if value.is_empty() {
             self.values.remove(harness);
@@ -340,6 +372,21 @@ impl HarnessScoped {
             self.values.insert(harness.to_string(), value.to_string());
         }
         self
+    }
+}
+
+impl Serialize for HarnessScoped {
+    /// Serialized in the spelling it was parsed from, so a legacy bare scalar round-trips to the
+    /// same YAML `Teams::save` read. Writing it as a `{claude: …}` map would silently RE-SCOPE it:
+    /// the bare value belongs to `agent.backend`, which may not be `claude` (STUDIO-908).
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.bare {
+            Some(value) => serializer.serialize_str(value),
+            None => self.values.serialize(serializer),
+        }
     }
 }
 
@@ -362,6 +409,7 @@ impl<'de> Deserialize<'de> for HarnessScoped {
             None => Self::default(),
             Some(Raw::Bare(value)) => Self::bare(&value),
             Some(Raw::PerHarness(values)) => Self {
+                bare: None,
                 values: values.into_iter().filter(|(_, v)| !v.is_empty()).collect(),
             },
         })
@@ -731,7 +779,8 @@ impl Teams {
     /// What a REVIEW run dispatched to a reviewer on `harness` should do about `review.model`
     /// (STUDIO-901, scoped by harness in STUDIO-908). `harness` is the harness the run will
     /// ACTUALLY use — the routed reviewer's resolved profile harness, else the configured
-    /// `agent.backend` — never the reviewer's raw profile field.
+    /// `agent.backend` — never the reviewer's raw profile field. `fallback` is that configured
+    /// `agent.backend` itself, the harness the legacy bare-scalar spelling belongs to.
     ///
     /// Gated on [`review_ticketless`](Self::review_ticketless) for
     /// [`review_done_state`](Self::review_done_state)'s reason: `dispatch_review`'s and
@@ -747,16 +796,17 @@ impl Teams {
     ///   this harness fails loudly at dispatch naming the harness, the configured model and the
     ///   `review.model` origin, rather than being handed to a provider that will reject it or
     ///   silently downgrading to the reviewer's own profile model.
-    pub fn review_model_for(&self, harness: &str) -> ReviewModelChoice<'_> {
+    pub fn review_model_for(&self, harness: &str, fallback: &str) -> ReviewModelChoice<'_> {
         if !self.review_ticketless() || self.review.model.is_empty() {
             return ReviewModelChoice::Inherit;
         }
-        if let Some(value) = self.review.model.get(harness) {
+        if let Some(value) = self.review.model.for_harness(harness, fallback) {
             return ReviewModelChoice::Use(value);
         }
         let listed = self
             .review
             .model
+            .resolved(fallback)
             .iter()
             .map(|(h, v)| format!("{h} (model {v})"))
             .collect::<Vec<_>>()
@@ -771,15 +821,17 @@ impl Teams {
 
     /// The effort a REVIEW run on `harness` uses; the pair to
     /// [`review_model_for`](Self::review_model_for), gated the same way and for the same reason.
+    /// `fallback` is read for [`review_model_for`](Self::review_model_for)'s reason: the legacy
+    /// bare effort belongs to the configured `agent.backend`.
     ///
     /// Deliberately one answer where [`review_model_for`](Self::review_model_for) has three: an
     /// effort value cannot be rejected by a provider, so a harness the operator did not write an
     /// entry for simply inherits its profile's effort instead of refusing the run.
-    pub fn review_effort(&self, harness: &str) -> Option<&str> {
+    pub fn review_effort(&self, harness: &str, fallback: &str) -> Option<&str> {
         if !self.review_ticketless() {
             return None;
         }
-        self.review.effort.get(harness)
+        self.review.effort.for_harness(harness, fallback)
     }
 
     /// The configured `manager.timeout_ms` when it is too small for the model
@@ -2018,26 +2070,28 @@ mod tests {
             assert!(t.review.model.is_empty(), "({text:?})");
             assert!(t.review.effort.is_empty(), "({text:?})");
             assert_eq!(
-                t.review_model_for("claude"),
+                t.review_model_for("claude", "claude"),
                 ReviewModelChoice::Inherit,
                 "{text:?}"
             );
         }
     }
 
-    /// Both wire spellings parse. The bare scalar is the legacy STUDIO-901 spelling and belongs to
-    /// `claude`, the harness a bare model name was unambiguous for when it shipped; the map is the
-    /// STUDIO-908 spelling and scopes a value per harness.
+    /// Both wire spellings parse. The bare scalar is the legacy STUDIO-901 spelling: it is stored
+    /// unresolved and resolved against the caller's fallback harness at dispatch, which is the
+    /// installation's `agent.backend` (`a_legacy_bare_review_model_belongs_to_the_configured_backend…`
+    /// covers the non-claude case). The map is the STUDIO-908 spelling and scopes a value per
+    /// harness by name.
     #[test]
     fn review_model_parses_both_the_legacy_scalar_and_the_per_harness_map() {
         let bare = Teams::parse(
             "enabled: true\nreview:\n  mode: ticketless\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n",
         )
         .expect("parses");
-        assert_eq!(bare.review.model.get("claude"), Some("claude-opus-5"));
-        assert_eq!(bare.review.effort.get("claude"), Some("high"));
+        assert_eq!(bare.review.model.legacy(), Some("claude-opus-5"));
+        assert_eq!(bare.review.effort.legacy(), Some("high"));
         assert_eq!(
-            bare.review_model_for("claude"),
+            bare.review_model_for("claude", "claude"),
             ReviewModelChoice::Use("claude-opus-5")
         );
 
@@ -2045,14 +2099,55 @@ mod tests {
             "enabled: true\nreview:\n  mode: ticketless\n  model:\n    claude: claude-opus-5\n    opencode: fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash\nroster:\n  - name: alice\n",
         )
         .expect("parses");
-        assert_eq!(scoped.review.model.get("claude"), Some("claude-opus-5"));
+        assert_eq!(scoped.review.model.legacy(), None);
         assert_eq!(
-            scoped.review.model.get("opencode"),
+            scoped.review.model.for_harness("claude", "claude"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            scoped.review.model.for_harness("opencode", "claude"),
             Some("fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash")
         );
         assert_eq!(
-            scoped.review_model_for("opencode"),
+            scoped.review_model_for("opencode", "claude"),
             ReviewModelChoice::Use("fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash")
+        );
+    }
+
+    /// **alice's blocking finding on PR #172.** The legacy bare scalar is NOT pinned to the literal
+    /// `claude`: it belongs to the installation's configured `agent.backend`, so an all-opencode
+    /// installation whose bare `review.model` works today keeps working. Resolving it against a
+    /// hardcoded `claude` refused every ticketless review on that install and blamed the operator's
+    /// opencode model on a `claude` key they never wrote.
+    ///
+    /// The other direction is the acceptance that must not regress: the same bare value is still
+    /// refused for a reviewer on a DIFFERENT harness, never silently re-scoped.
+    #[test]
+    fn a_legacy_bare_review_model_belongs_to_the_configured_backend_not_a_hardcoded_claude() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model: some-opencode-model\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+
+        // All-opencode installation: the bare scalar is an opencode model, and it applies.
+        assert_eq!(
+            t.review_model_for("opencode", "opencode"),
+            ReviewModelChoice::Use("some-opencode-model")
+        );
+        // Same install, a reviewer on another harness: refused, naming the value's own harness.
+        let ReviewModelChoice::Refuse(msg) = t.review_model_for("claude", "opencode") else {
+            panic!("a claude reviewer must not be handed the opencode model");
+        };
+        assert!(
+            msg.contains("opencode (model some-opencode-model)"),
+            "the value's harness must be named as opencode, not claude: {msg}"
+        );
+
+        // All-claude installation: the same bare scalar applies to claude, exactly as STUDIO-901
+        // shipped it.
+        assert_eq!(
+            t.review_model_for("claude", "claude"),
+            ReviewModelChoice::Use("some-opencode-model")
         );
     }
 
@@ -2067,7 +2162,7 @@ mod tests {
             "enabled: true\nreview:\n  mode: ticketless\n  model:\n    claude: claude-opus-5\nroster:\n  - name: alice\n",
         )
         .expect("parses");
-        let ReviewModelChoice::Refuse(msg) = t.review_model_for("opencode") else {
+        let ReviewModelChoice::Refuse(msg) = t.review_model_for("opencode", "claude") else {
             panic!("an opencode reviewer must not be handed the claude model");
         };
         assert!(
@@ -2090,11 +2185,11 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(
-            t.review_model_for("opencode"),
+            t.review_model_for("opencode", "claude"),
             ReviewModelChoice::Use("cheap")
         );
-        assert_eq!(t.review_effort("opencode"), None);
-        assert_eq!(t.review_effort("claude"), Some("high"));
+        assert_eq!(t.review_effort("opencode", "claude"), None);
+        assert_eq!(t.review_effort("claude", "claude"), Some("high"));
     }
 
     /// A harness with no entry does not refuse when NOTHING is configured anywhere — the
@@ -2110,8 +2205,12 @@ mod tests {
             ..Teams::disabled()
         };
         for h in ["claude", "opencode"] {
-            assert_eq!(t.review_model_for(h), ReviewModelChoice::Inherit, "{h}");
-            assert_eq!(t.review_effort(h), None, "{h}");
+            assert_eq!(
+                t.review_model_for(h, "claude"),
+                ReviewModelChoice::Inherit,
+                "{h}"
+            );
+            assert_eq!(t.review_effort(h, "claude"), None, "{h}");
         }
     }
 
@@ -2122,10 +2221,10 @@ mod tests {
     #[test]
     fn review_model_and_effort_are_off_until_the_review_path_is_ticketless() {
         assert_eq!(
-            Teams::disabled().review_model_for("claude"),
+            Teams::disabled().review_model_for("claude", "claude"),
             ReviewModelChoice::Inherit
         );
-        assert_eq!(Teams::disabled().review_effort("claude"), None);
+        assert_eq!(Teams::disabled().review_effort("claude", "claude"), None);
 
         let with = |enabled: bool, mode: ReviewMode| Teams {
             enabled,
@@ -2144,12 +2243,12 @@ mod tests {
         ] {
             let t = with(enabled, mode);
             assert_eq!(
-                t.review_model_for("claude"),
+                t.review_model_for("claude", "claude"),
                 ReviewModelChoice::Inherit,
                 "enabled={enabled} mode={mode:?}: a set-but-inert value must read as unset"
             );
             assert_eq!(
-                t.review_effort("claude"),
+                t.review_effort("claude", "claude"),
                 None,
                 "enabled={enabled} mode={mode:?}"
             );
@@ -2157,10 +2256,10 @@ mod tests {
 
         let live = with(true, ReviewMode::Ticketless);
         assert_eq!(
-            live.review_model_for("claude"),
+            live.review_model_for("claude", "claude"),
             ReviewModelChoice::Use("claude-opus-5")
         );
-        assert_eq!(live.review_effort("claude"), Some("high"));
+        assert_eq!(live.review_effort("claude", "claude"), Some("high"));
     }
 
     /// An unset value stays unset even on the one installation where it could take effect —
@@ -2175,8 +2274,11 @@ mod tests {
             },
             ..Teams::disabled()
         };
-        assert_eq!(t.review_model_for("claude"), ReviewModelChoice::Inherit);
-        assert_eq!(t.review_effort("claude"), None);
+        assert_eq!(
+            t.review_model_for("claude", "claude"),
+            ReviewModelChoice::Inherit
+        );
+        assert_eq!(t.review_effort("claude", "claude"), None);
     }
 
     /// STUDIO-712: the auto-Done transition is OFF unless somebody named the
@@ -2339,10 +2441,19 @@ mod tests {
             Some("In Progress")
         );
         assert_eq!(
-            Teams::load(&path).review.model.get("claude"),
+            Teams::load(&path)
+                .review
+                .model
+                .for_harness("claude", "claude"),
             Some("claude-opus-5")
         );
-        assert_eq!(Teams::load(&path).review.effort.get("claude"), Some("high"));
+        assert_eq!(
+            Teams::load(&path)
+                .review
+                .effort
+                .for_harness("claude", "claude"),
+            Some("high")
+        );
     }
 
     /// Unknown keys are ignored rather than fatal, matching `CapabilityDef`'s

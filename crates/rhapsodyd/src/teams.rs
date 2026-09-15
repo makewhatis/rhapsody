@@ -428,6 +428,7 @@ fn render_show(
     if let Some(review) = review {
         // The harness a review of THIS identity actually runs on (STUDIO-908): `review.model` is
         // scoped by harness, so the useful answer is this identity's own entry, not the raw map.
+        // `backend` is also the fallback the legacy bare-scalar spelling resolves against.
         let review_harness = resolved_harness(&r.harness, backend);
         out.push_str(&format!(
             "review model:  {}\n",
@@ -435,6 +436,7 @@ fn render_show(
                 "model",
                 &review.model,
                 &review_harness,
+                backend,
                 &r.model,
                 r.provenance.model
             )
@@ -445,6 +447,7 @@ fn render_show(
                 "effort",
                 &review.effort,
                 &review_harness,
+                backend,
                 &r.effort,
                 r.provenance.effort
             )
@@ -564,6 +567,12 @@ fn resolved_harness(profile_value: &str, backend: &str) -> String {
 /// entry means a review run inherits exactly what this identity's profile already gives an
 /// ordinary dispatch.
 ///
+/// `fallback` is the configured `agent.backend`: the harness the legacy bare-scalar spelling
+/// belongs to (STUDIO-908), so a bare `review.model` reads as applying here exactly when this
+/// identity's harness IS the backend. The origin label keeps the spelling the operator wrote — a
+/// bare scalar renders as `review.model`, not `review.model.<harness>`, because naming a harness
+/// they never wrote is the misattribution this ticket removes.
+///
 /// A value set for a DIFFERENT harness is called out rather than hidden: for `model` it is a
 /// refusal (the review will not run at all), and for `effort` it simply means this harness
 /// inherits. Either way the operator sees which harnesses are named, since the raw map is the one
@@ -576,6 +585,7 @@ fn review_field(
     name: &str,
     scoped: &rhapsody_config::teams::HarnessScoped,
     harness: &str,
+    fallback: &str,
     profile_value: &str,
     profile_origin: Origin,
 ) -> String {
@@ -585,12 +595,16 @@ fn review_field(
             field(profile_value, profile_origin)
         );
     }
-    if let Some(value) = scoped.get(harness) {
-        return format!(
-            "{value} [review.{name}.{harness} — overrides this profile's {name} for a review run]"
-        );
+    if let Some(value) = scoped.for_harness(harness, fallback) {
+        let key = if scoped.legacy().is_some() {
+            format!("review.{name}")
+        } else {
+            format!("review.{name}.{harness}")
+        };
+        return format!("{value} [{key} — overrides this profile's {name} for a review run]");
     }
     let listed = scoped
+        .resolved(fallback)
         .iter()
         .map(|(h, v)| format!("{h}: {v}"))
         .collect::<Vec<_>>()
@@ -777,6 +791,10 @@ mod tests {
     /// this?" gets a direct answer, in the same one command that already answers "what model does
     /// this identity run with?" — and when `review.model`/`review.effort` are set, the line says
     /// they WIN over the profile above, so the two lines are never mistaken for each other.
+    ///
+    /// This file's spelling is the legacy bare scalar, so the label is `review.model`, not
+    /// `review.model.claude`: the operator never wrote a harness, and STUDIO-908 resolves the bare
+    /// value against `agent.backend` (claude here).
     #[test]
     fn show_reports_the_review_scoped_model_when_set() {
         let dir = TempDir::new();
@@ -788,11 +806,30 @@ mod tests {
         .expect("write teams.yaml");
         let out = run(&["show", "alice"], &env[0]).expect("show alice");
         assert!(
-            out.contains("review model:  claude-opus-5 [review.model.claude — overrides this profile's model for a review run]"),
+            out.contains("review model:  claude-opus-5 [review.model — overrides this profile's model for a review run]"),
             "out = {out}"
         );
         assert!(
-            out.contains("review effort: high [review.effort.claude — overrides this profile's effort for a review run]"),
+            out.contains("review effort: high [review.effort — overrides this profile's effort for a review run]"),
+            "out = {out}"
+        );
+    }
+
+    /// **alice's blocking finding on PR #172, seen from `show`.** A legacy bare `review.model` is
+    /// not pinned to `claude`: on an installation whose `agent.backend` is `opencode` it applies
+    /// to that harness, and the line says so rather than claiming a refusal that will not happen.
+    #[test]
+    fn show_resolves_a_legacy_bare_review_model_against_the_configured_backend() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_backend(&dir, "opencode");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model: some-opencode-model\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  some-opencode-model [review.model — overrides this profile's model for a review run]"),
             "out = {out}"
         );
     }
