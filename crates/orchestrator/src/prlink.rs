@@ -68,6 +68,14 @@
 //! What it is NOT is silent: the two outcomes worth a line get one each, because "the daemon linked
 //! it" and "the daemon tried and Linear refused" are the two facts an operator staring at an idle
 //! board needs to tell apart.
+//!
+//! A third outcome used to masquerade as the second, and no longer does (STUDIO-904). Linear
+//! refuses a second write of a pull request already attached with `INPUT_ERROR` on the
+//! `attachmentLinkGitHubPR` path; `rhapsody_tracker` classifies that refusal as the SUCCESS it is
+//! (the link exists — which is the whole post-condition), so it takes the "the daemon linked it"
+//! line and never the warning. The warning is therefore only ever the genuine failure — the half
+//! worth keeping loud — and it no longer claims the author cannot be re-engaged, because routing
+//! does not read this attachment (see the module doc above).
 
 use std::sync::Arc;
 
@@ -157,9 +165,10 @@ pub(crate) fn pr_link_target(
 /// or a tracker the quorum has already resolved for the parent's own project.
 #[async_trait]
 pub trait PrLinker: Send + Sync {
-    /// Attaches `url` to `issue_id`. Callers do not depend on the tracker de-duplicating: the
-    /// [`pr_link_target`] gate is what keeps a working installation from writing at all, and see
-    /// [`Tracker::link_pull_request`] for what a duplicate would and would not cost.
+    /// Attaches `url` to `issue_id`. The [`pr_link_target`] gate is what keeps a working
+    /// installation from writing at all; a write that still happens and is refused because the
+    /// link is already there comes back `Ok`, since the refusal proves the post-condition. See
+    /// [`Tracker::link_pull_request`] for what a duplicate costs.
     async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError>;
 }
 
@@ -238,12 +247,18 @@ pub(crate) async fn link_pr_best_effort(
             issue_identifier = %target.identifier, pr = %url,
             "pr-link: attached the pull request to its ticket, so a summons on it can reach the author"
         ),
-        // The consequence, not just the error: whoever reads this line is reading it because
-        // nothing re-engaged an author, and the link is why.
+        // The consequence, and it is deliberately NOT "the author cannot be re-engaged": since
+        // STUDIO-882 summons routing reads the daemon's own watch set
+        // (`ghenrich::DaemonPrLinks`), not this attachment, so a failed write costs a link in the
+        // tracker's UI and nothing more. The line says what is true and actionable — the ticket
+        // shows no link for a person to click — and reassures what used to be feared, so a
+        // genuine failure is not misread as a stall. A duplicate never reaches here: the tracker's
+        // refusal for an already-attached pull request is classified as success upstream
+        // (STUDIO-904).
         Err(e) => tracing::warn!(
             issue_identifier = %target.identifier, pr = %url, err = %e,
-            "pr-link: could not attach the pull request to its ticket; a review that files findings \
-             on it cannot re-engage the author until this succeeds"
+            "pr-link: could not attach the pull request to its ticket, so the ticket will show no \
+             link to it; the daemon's own summons routing does not depend on this attachment"
         ),
     }
 }
@@ -466,6 +481,87 @@ mod tests {
         .await;
         link_pr_best_effort(Some(l.as_ref()), target.as_ref(), "not-a-pull-request-url").await;
         assert_eq!(l.calls().len(), 2, "neither is provably already linked");
+    }
+
+    // ── the two lines an operator reads (STUDIO-904) ────────────────────────────────────────────
+    //
+    // The adapter classifies a duplicate as success, so these two branches are all prlink can see:
+    // "linked" and "genuinely failed". Their lines must differ, and the failure must not carry the
+    // false re-engagement claim that made the old duplicate warning unreadable.
+
+    use crate::testsupport::{CapturedEvent, TRACING_TEST_LOCK, recording_subscriber};
+
+    async fn captured<F, Fut>(f: F) -> Vec<CapturedEvent>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _serial = TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        f().await; // warm-up: force every callsite to register (TRA-243)
+        tracing::callsite::rebuild_interest_cache();
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        f().await;
+        drop(guard);
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A write that landed is an INFO and never a WARN — the shape the duplicate now takes, since
+    /// the tracker's refusal for an already-attached pull request is absorbed upstream.
+    #[tokio::test]
+    async fn a_linked_pull_request_says_so_at_info_and_never_warns() {
+        let events = captured(|| async {
+            let l = Recording::new(None);
+            link_pr_best_effort(Some(l.as_ref()), Some(&target()), PR).await;
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == "INFO" && e.message.contains("attached the pull request")),
+            "expected the success line, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.level == "WARN"),
+            "a landed link must not warn: {events:?}"
+        );
+    }
+
+    /// A genuine failure still warns — and the wording no longer claims the author is stranded.
+    /// Routing does not read this attachment (STUDIO-882), so that claim was false; restoring it,
+    /// or making a failure read as success, reds here.
+    #[tokio::test]
+    async fn a_genuine_failure_warns_without_claiming_the_author_is_unreachable() {
+        let events = captured(|| async {
+            let l = Recording::new(Some(TrackerError::Other("linear said no".into())));
+            link_pr_best_effort(Some(l.as_ref()), Some(&target()), PR).await;
+        })
+        .await;
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("a genuine failure must warn, got {events:?}"));
+        assert!(
+            warn.message.contains("could not attach the pull request"),
+            "got {warn:?}"
+        );
+        assert!(
+            !warn.message.contains("cannot re-engage")
+                && !warn.message.contains("re-engage the author"),
+            "the warning must not claim the author is unreachable: {}",
+            warn.message
+        );
+        assert!(
+            !events.iter().any(|e| e.level == "INFO"),
+            "a failed link must not also claim success: {events:?}"
+        );
     }
 
     /// And the other side of the same gate, which is what keeps a healthy installation's Linear

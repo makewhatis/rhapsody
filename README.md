@@ -1533,9 +1533,20 @@ On the quorum path the URL written is `resolve_open_pr`'s result, which falls ba
 own attachment when the `gh` lookup fails; that fallback URL came off a link the ticket already has,
 so the worst it produces is a duplicate write, never a link to the wrong pull request.
 
-Nothing depends on Linear de-duplicating the write. The gate above is what keeps a working
-installation silent; a duplicate that got through would be two identical links in Linear's UI.
-Untidy, and nothing reads them.
+Nothing depends on Linear de-duplicating the write — it does not de-duplicate it. A second
+`attachmentLinkGitHubPR` for a pull request the issue already links is answered with a REFUSAL, not
+a no-op (measured, STUDIO-904: `INPUT_ERROR` on the `attachmentLinkGitHubPR` path, top-level message
+`"Duplicate attachment for duplicate url"`; whether the uniqueness is scoped per-issue or per-URL was
+not measured, and cannot matter here, because this write only ever links a pull request to the ticket
+that resolved it). The refusal proves the link is there, so the adapter absorbs it as the success it
+is: `linear_duplicate_attachment`, a Rhapsody-only `LinearErrorKind` that mirrors no `errors.go`
+sentinel. The gate above is what keeps a working installation from writing at all; where it cannot
+see the link — its input is the run-start
+snapshot's `linked_prs`, and a daemon-written attachment on an unconnected repository never enters
+`linked_prs` (STUDIO-882) — the retry is now answered by that classification rather than by a WARN
+claiming the author cannot be re-engaged. The WARN that remains is for a GENUINE failure only, and
+it says what is true: the ticket will show no link for a person to click, and the daemon's own
+summons routing does not depend on this attachment.
 
 **The warning exists because the information already did.** The STUDIO-574 counters had been
 reporting `linked_prs_total=0 … matched=0 advanced=0` every ~35 seconds for eleven hours while three

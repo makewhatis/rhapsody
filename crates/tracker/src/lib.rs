@@ -309,13 +309,14 @@ pub trait Tracker: Any + Send + Sync {
     /// Linear's GitHub integration, nothing else ever writes that link — so the daemon writes it
     /// itself, at the moment it resolves a pull request for a ticket.
     ///
-    /// **Callers must not assume the tracker de-duplicates.** Linear's link mutations are keyed on
-    /// (issue, url) and a repeat is expected to be a no-op, but that is the tracker's behaviour and
-    /// not this contract's: the once-per-ticket guard belongs to the caller, exactly as
-    /// [`Tracker::create_issue`]'s once-per-parent guard does. A duplicate is cheap rather than
-    /// harmful — two attachments of the same pull request give `linked_prs` two equal entries, and
-    /// the summons walk attributes the same comment twice and advances once — so the guard is about
-    /// tidiness in the tracker's UI, not correctness.
+    /// **A repeat is a success, and the adapter absorbs it.** Linear answers a second write of the
+    /// same pull request with a REFUSAL rather than a no-op (measured, STUDIO-904: `INPUT_ERROR` on
+    /// the `attachmentLinkGitHubPR` path, with the duplicate's top-level `message`). That refusal
+    /// proves the link the caller wanted is already there, so `link_pull_request` returns
+    /// `Ok` for it; every other refusal is still an error, so a caller can never mistake a real
+    /// failure for a healthily-linked ticket. The once-per-ticket guard still belongs to the
+    /// caller, exactly as [`Tracker::create_issue`]'s once-per-parent guard does — but it saves a
+    /// redundant round trip, not a failure, and a ticket whose guard is stale still links cleanly.
     ///
     /// An adapter with no attachment surface returns an error rather than a silent success — the
     /// caller treats the link as best-effort, but "best-effort" must never mean "told it worked".
