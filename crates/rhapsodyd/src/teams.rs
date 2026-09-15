@@ -426,13 +426,31 @@ fn render_show(
     // install prints exactly the lines it printed before this ticket — not a column-for-column
     // match, since the round-1 alignment fix widened every label's gutter by one (jimmy round 2).
     if let Some(review) = review {
+        // The harness a review of THIS identity actually runs on (STUDIO-908): `review.model` is
+        // scoped by harness, so the useful answer is this identity's own entry, not the raw map.
+        // `backend` is also the fallback the legacy bare-scalar spelling resolves against.
+        let review_harness = resolved_harness(&r.harness, backend);
         out.push_str(&format!(
             "review model:  {}\n",
-            review_field("model", &review.model, &r.model, r.provenance.model)
+            review_field(
+                "model",
+                &review.model,
+                &review_harness,
+                backend,
+                &r.model,
+                r.provenance.model
+            )
         ));
         out.push_str(&format!(
             "review effort: {}\n",
-            review_field("effort", &review.effort, &r.effort, r.provenance.effort)
+            review_field(
+                "effort",
+                &review.effort,
+                &review_harness,
+                backend,
+                &r.effort,
+                r.provenance.effort
+            )
         ));
     }
     out.push_str(&format!(
@@ -528,28 +546,79 @@ fn harness_note(harness: &str, backend: &str) -> Option<String> {
     }
 }
 
-/// The `review model:`/`review effort:` line (STUDIO-901): `teams.review.<name>` when the
-/// operator set it — which WINS over this identity's own profile for a review run and says so —
+/// The harness an identity's runs actually use, for [`harness_field`]'s reason and by the same
+/// rule: the profile's resolved `harness` when this build implements it, else the configured
+/// `agent.backend` (the value dispatch falls back to). Shared with the review-scoped lines so
+/// `show` explains the review model against the harness the run really is on (STUDIO-908).
+fn resolved_harness(profile_value: &str, backend: &str) -> String {
+    if !profile_value.is_empty()
+        && rhapsody_orchestrator::effective::harness_is_implemented(profile_value)
+    {
+        profile_value.to_string()
+    } else {
+        backend.to_string()
+    }
+}
+
+/// The `review model:`/`review effort:` line (STUDIO-901, scoped by harness in STUDIO-908):
+/// `teams.review.<name>.<harness>` when the operator set an entry for the harness this identity's
+/// runs actually use — which WINS over this identity's own profile for a review run and says so —
 /// else the profile's own value (rendered with its normal [`field`] provenance), since an unset
-/// `review.<name>` means a review run inherits exactly what this identity's profile already gives
-/// an ordinary dispatch.
+/// entry means a review run inherits exactly what this identity's profile already gives an
+/// ordinary dispatch.
+///
+/// `fallback` is the configured `agent.backend`: the harness the legacy bare-scalar spelling
+/// belongs to (STUDIO-908), so a bare `review.model` reads as applying here exactly when this
+/// identity's harness IS the backend. The origin label keeps the spelling the operator wrote — a
+/// bare scalar renders as `review.model`, not `review.model.<harness>`, because naming a harness
+/// they never wrote is the misattribution this ticket removes.
+///
+/// A value set for a DIFFERENT harness is called out rather than hidden: for `model` it is a
+/// refusal (the review will not run at all), and for `effort` it simply means this harness
+/// inherits. Either way the operator sees which harnesses are named, since the raw map is the one
+/// thing this line exists to make legible.
 ///
 /// Only called when `render_show`'s `review` argument is `Some` — the caller (`show`) gates that
 /// on [`Teams::review_ticketless`](rhapsody_config::teams::Teams::review_ticketless), so this
 /// function itself never has to ask "can this override even fire": by the time it runs, it can.
 fn review_field(
     name: &str,
-    review_value: &str,
+    scoped: &rhapsody_config::teams::HarnessScoped,
+    harness: &str,
+    fallback: &str,
     profile_value: &str,
     profile_origin: Origin,
 ) -> String {
-    if review_value.is_empty() {
-        format!(
+    if scoped.is_empty() {
+        return format!(
             "(unset — a review run uses this profile's {name}, {})",
             field(profile_value, profile_origin)
+        );
+    }
+    if let Some(value) = scoped.for_harness(harness, fallback) {
+        let key = if scoped.legacy().is_some() {
+            format!("review.{name}")
+        } else {
+            format!("review.{name}.{harness}")
+        };
+        return format!("{value} [{key} — overrides this profile's {name} for a review run]");
+    }
+    let listed = scoped
+        .resolved(fallback)
+        .iter()
+        .map(|(h, v)| format!("{h}: {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if name == "model" {
+        format!(
+            "(unset for harness {harness} — review.model names {listed}, so a review on {harness} \
+             is refused rather than run on the wrong model)"
         )
     } else {
-        format!("{review_value} [review.{name} — overrides this profile's {name} for a review run]")
+        format!(
+            "(unset for harness {harness} — review.effort names {listed}; a review on {harness} \
+             inherits this profile's effort)"
+        )
     }
 }
 
@@ -722,6 +791,10 @@ mod tests {
     /// this?" gets a direct answer, in the same one command that already answers "what model does
     /// this identity run with?" — and when `review.model`/`review.effort` are set, the line says
     /// they WIN over the profile above, so the two lines are never mistaken for each other.
+    ///
+    /// This file's spelling is the legacy bare scalar, so the label is `review.model`, not
+    /// `review.model.claude`: the operator never wrote a harness, and STUDIO-908 resolves the bare
+    /// value against `agent.backend` (claude here).
     #[test]
     fn show_reports_the_review_scoped_model_when_set() {
         let dir = TempDir::new();
@@ -738,6 +811,47 @@ mod tests {
         );
         assert!(
             out.contains("review effort: high [review.effort — overrides this profile's effort for a review run]"),
+            "out = {out}"
+        );
+    }
+
+    /// **alice's blocking finding on PR #172, seen from `show`.** A legacy bare `review.model` is
+    /// not pinned to `claude`: on an installation whose `agent.backend` is `opencode` it applies
+    /// to that harness, and the line says so rather than claiming a refusal that will not happen.
+    #[test]
+    fn show_resolves_a_legacy_bare_review_model_against_the_configured_backend() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_backend(&dir, "opencode");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model: some-opencode-model\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  some-opencode-model [review.model — overrides this profile's model for a review run]"),
+            "out = {out}"
+        );
+    }
+
+    /// **STUDIO-908, the diagnostic the live breakage lacked.** A `review.model` scoped to a
+    /// harness the identity does NOT run on is reported as such — named back to the operator,
+    /// rather than printed as though it applied (which is how the original bug read) or hidden
+    /// (which would leave them wondering). The line names the harness, the configured model and
+    /// its harness, and the consequence: a review is refused, not run on the wrong model.
+    #[test]
+    fn show_reports_a_review_model_scoped_to_another_harness_as_refused() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        // A per-harness map with an entry for `opencode` only; the reviewer below runs claude.
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model:\n    opencode: fireworks-ai/x\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  (unset for harness claude — review.model names opencode: fireworks-ai/x, so a review on claude is refused rather than run on the wrong model)"),
             "out = {out}"
         );
     }

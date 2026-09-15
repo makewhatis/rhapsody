@@ -619,15 +619,7 @@ impl Orchestrator {
     /// the behavioural delta that promise rules out.
     pub(crate) fn route_teams(&self, iss: &Issue) -> Option<TeamsDispatch> {
         let teams = self.teams.as_ref().filter(|t| t.enabled)?;
-        let routed = self.apply_pending_assignment(
-            teams,
-            iss,
-            route(
-                teams,
-                iss,
-                &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
-            ),
-        );
+        let routed = self.route_identity(teams, iss);
         let Some(identity) = routed.identity else {
             if routed.reason == RouteReason::Off {
                 return None;
@@ -687,6 +679,83 @@ impl Orchestrator {
             Some(i) => Routed::to(i.name.clone(), RouteReason::Pending),
             None => routed,
         }
+    }
+
+    /// The router's own answer for `iss` — [`route`] plus the pending-assignment substitution,
+    /// with no profile rendering and no event row. Factored out of
+    /// [`route_teams`](Self::route_teams) (STUDIO-908) so a caller that needs only the routed
+    /// IDENTITY (the review harness check) does not pay for the turn-1 section compose — which
+    /// advances the room catch-up watermark as a side effect, so calling it twice for one dispatch
+    /// would eat a window.
+    fn route_identity(&self, teams: &Teams, iss: &Issue) -> Routed {
+        self.apply_pending_assignment(
+            teams,
+            iss,
+            route(
+                teams,
+                iss,
+                &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
+            ),
+        )
+    }
+
+    /// The harness a routed identity's profile asks for, WITHOUT composing the turn-1 section
+    /// (STUDIO-908). `teammate_profile_for` resolves the same profile for the section; this is the
+    /// harness-only half, so a dispatch-time check can ask before the section is worth building.
+    /// Empty for an identity with no profile and for an installation with no runtime home — both
+    /// meaning "inherit `agent.backend`", exactly as `teammate_profile_for` answers.
+    fn identity_harness(&self, teams: &Teams, identity: &str) -> String {
+        let profile = teams
+            .roster
+            .iter()
+            .find(|i| i.name == identity)
+            .map(|i| i.profile.clone())
+            .unwrap_or_default();
+        if profile.is_empty() {
+            return String::new();
+        }
+        let Some(dir) = self.teams_profiles_dir.as_ref() else {
+            return String::new();
+        };
+        rhapsody_config::profiles::resolve(dir, &profile)
+            .map(|p| p.harness)
+            .unwrap_or_default()
+    }
+
+    /// The configured `agent.backend` — what a run with no harness of its own actually uses, and
+    /// the harness the legacy bare-scalar `review.model`/`review.effort` belongs to (STUDIO-908).
+    pub(crate) fn configured_backend(&self) -> String {
+        self.eff
+            .as_ref()
+            .map_or_else(String::new, |e| e.cfg.agent.backend.clone())
+    }
+
+    /// The harness a run actually runs on, given the harness its profile named (STUDIO-908): the
+    /// named one when this build implements it, else the configured backend. Mirrors the fallback
+    /// `spawn_worker` makes (STUDIO-902) — an unrecognized or unimplemented name runs on the
+    /// backend with a warning rather than refusing — so the review model this resolves to is the
+    /// model the run really uses.
+    pub(crate) fn harness_actually_run(&self, named: &str) -> String {
+        if !named.is_empty() && crate::effective::harness_is_implemented(named) {
+            named.to_string()
+        } else {
+            self.configured_backend()
+        }
+    }
+
+    /// The harness a review dispatched to `iss` will ACTUALLY run on (STUDIO-908), resolved the
+    /// same way [`spawn_worker`](Orchestrator::spawn_worker) will resolve the runner. Used by
+    /// `dispatch_review` to refuse a review whose reviewer's harness cannot serve the operator's
+    /// `review.model` BEFORE any watch-set write, rather than after the row says in-flight.
+    pub(crate) fn review_harness_for(&self, iss: &Issue) -> String {
+        let Some(teams) = self.teams.as_ref().filter(|t| t.enabled) else {
+            return self.configured_backend();
+        };
+        let named = self
+            .route_identity(teams, iss)
+            .identity
+            .map_or_else(String::new, |id| self.identity_harness(teams, &id));
+        self.harness_actually_run(&named)
     }
 
     /// Whether this candidate must be **held this tick** for want of a team assignment

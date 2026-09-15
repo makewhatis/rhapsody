@@ -401,12 +401,20 @@ impl Orchestrator {
             re.harness = td.harness.clone();
         }
         // A review run's model/effort come from `review.model`/`review.effort` when the operator
-        // set them, regardless of what the routed teammate's own profile asked for (STUDIO-901).
-        // `review` is `Some` only for a run `dispatch_review` staged in `pending_review`, so an
-        // ordinary ticket dispatch — where this would otherwise silently apply to every run — never
-        // reaches the branch. Per-field non-empty-wins, the same shape `turn_cfg` already applies to
-        // a profile override: naming only `model` leaves `effort` at whatever the reviewer's profile
-        // (or the installation) already had.
+        // set them, regardless of what the routed teammate's own profile asked for (STUDIO-901) —
+        // but scoped by the HARNESS the review will actually run on (STUDIO-908). A model name is
+        // meaningless without its harness: applying `review.model` to a reviewer running opencode
+        // handed that CLI a Claude model name, and the provider answered with a generic
+        // `UnknownError` one second into the run. `review` is `Some` only for a run
+        // `dispatch_review` staged in `pending_review`, so an ordinary ticket dispatch — where this
+        // would otherwise silently apply to every run — never reaches the branch.
+        //
+        // The harness is the routed reviewer's ACTUAL harness (their profile's, when this build
+        // implements it, else `agent.backend`), the same value `spawn_worker` will select the
+        // runner with. `dispatch_review` has already refused a review whose harness has no entry
+        // for the operator's `review.model`, so by the time this runs the three-way lookup cannot
+        // answer `Refuse`; `Inherit` (nothing configured) leaves the reviewer's own profile in
+        // place, and `Use` overrides it.
         //
         // Review-scoped rather than a teammate field, and deliberately outranking the reviewer's own
         // profile: the operator's intent here is role-based (keep review on the premium model, per
@@ -414,7 +422,7 @@ impl Orchestrator {
         // (STUDIO-868) — the two answer different questions, and when both are set it is the PR
         // under review being priced, not that teammate's own work.
         //
-        // Read through `Teams::review_model`/`review_effort`, not the raw field: this branch is
+        // Read through `Teams::review_model_for`/`review_effort`, not the raw field: this branch is
         // unreachable except through `dispatch_review`'s ticketless gate today (jimmy/alice round 1
         // on PR #168), but the accessor is the convention this crate already uses for every other
         // `review:` scalar and keeps this call site from disagreeing with `teams show` about when
@@ -422,12 +430,36 @@ impl Orchestrator {
         if review.is_some()
             && let Some(teams) = self.teams.as_ref()
         {
+            let harness = self
+                .harness_actually_run(teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()));
+            // The harness the legacy bare-scalar `review.model`/`review.effort` spelling belongs
+            // to (STUDIO-908): the installation's configured `agent.backend`, not a hardcoded
+            // `claude`. `dispatch_review` derives it the same way, so the refusal and the override
+            // are the same fact.
+            let fallback = self.configured_backend();
             let mut review_overrode = false;
-            if let Some(model) = teams.review_model() {
-                re.model_override.model = model.to_string();
-                review_overrode = true;
+            match teams.review_model_for(&harness, &fallback) {
+                rhapsody_config::teams::ReviewModelChoice::Use(model) => {
+                    re.model_override.model = model.to_string();
+                    review_overrode = true;
+                }
+                // `dispatch_review` already refused a review whose harness has no `review.model`
+                // entry, so a `Refuse` here means the two derivations of the reviewer's harness
+                // disagreed. Falling through to inherit is exactly the silent cheap review this
+                // ticket exists to prevent, so it is logged at `error!` and never left unspoken
+                // (alice's non-blocking finding 2 on PR #172). Staging the decided model on the
+                // pending-review entry would make the two one computation; that is the follow-up.
+                rhapsody_config::teams::ReviewModelChoice::Refuse(why) => {
+                    tracing::error!(
+                        review = %iss.id,
+                        reason = %why,
+                        "review.model refused at dispatch_issue; the review run inherits the \
+                         reviewer's own profile model"
+                    );
+                }
+                rhapsody_config::teams::ReviewModelChoice::Inherit => {}
             }
-            if let Some(effort) = teams.review_effort() {
+            if let Some(effort) = teams.review_effort(&harness, &fallback) {
                 re.model_override.effort = effort.to_string();
                 review_overrode = true;
             }
