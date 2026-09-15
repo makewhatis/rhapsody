@@ -66,9 +66,10 @@
 //!   exercises a resume that narrows scope.
 //! - **[`ToolNaming`]'s three variants have no case for goose.** goose's real tool name lives in a
 //!   vendor `_meta.goose.toolCall.toolName` field; ACP's own standard `title` field is lossy human
-//!   prose ("goose: goose state"), not a name a prompt template can address. **Deferred to slice
-//!   9** for the same reason as `Resume` above — a fourth variant added now, with no adapter to
-//!   exercise it, would be a guess about ACP's shape rather than a measured one.
+//!   prose — for the daemon's own `symphony_state` tool it renders as `"symphony: symphony state"`,
+//!   not `symphony__symphony_state`, so a prompt template keyed on the standard field cannot address
+//!   it. **Deferred to slice 9** for the same reason as `Resume` above — a fourth variant added now,
+//!   with no adapter to exercise it, would be a guess about ACP's shape rather than a measured one.
 //!
 //! ## What this slice deliberately does NOT do
 //!
@@ -109,10 +110,12 @@ pub struct Provider {
 
 /// How a [`Provider`] authenticates. `ApiKey` carries the credential itself (design §4.5: the
 /// daemon does not write provider configs, so this is passed through, never stored). `Debug` is
-/// hand-written to redact the key — the repo's convention for a secret-bearing type
-/// (`crates/orchestrator/src/reads.rs`'s `ReadsTarget` masks the same way) — because `HarnessSpec`
-/// derives `Debug` transitively and a future `tracing::debug!(?spec)` must never write a raw
-/// credential to the rotating file logs.
+/// hand-written to redact the key, because `HarnessSpec` derives `Debug` transitively and a future
+/// `tracing::debug!(?spec)` must never write a raw credential to the rotating file logs. This is a
+/// new redacting-`Debug` pattern in the crate, not a repeat of an existing one: the repo's other
+/// secret-bearing type, `crates/orchestrator/src/reads.rs`'s `ReadsTarget`, has no `Debug` impl at
+/// all and masks only at its reporting boundary (`mask_token`) — the convention both share is that a
+/// secret-bearing type never lets the raw value reach a log line, not the specific mechanism.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProviderAuth {
     ApiKey(String),

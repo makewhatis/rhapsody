@@ -152,7 +152,7 @@ impl crate::Runner for Runner {
 /// (`STUDIO-869-harness-spike-findings.md` §2, `[RAN]`), even though the `Usage` struct this crate
 /// currently populates (`lib.rs`) has no cost field yet — extracting `total_cost_usd` into `Usage`
 /// is unstarted, adapter-owned work (design §3's "usage extraction is the adapter's job") that
-/// belongs to slice 5/§7.4's spend-budget routing, not this slice; `budgets: false` (the turn
+/// belongs to slice 7/§7.4's spend-budget routing, not this slice; `budgets: false` (the turn
 /// deadline above is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per
 /// the mailbox.
 const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
