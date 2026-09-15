@@ -696,8 +696,8 @@ mod tests {
     /// `ticketless` — including the SHIPPED default, `mode: off`, and Teams disabled entirely (no
     /// `teams.yaml` at all). `show` must not claim an override that install can never honour, so a
     /// Teams-off install's report suppresses both review-scoped lines and otherwise prints exactly
-    /// what it printed before this ticket. Gating `render_show`'s `review` argument on anything
-    /// other than `teams.review_ticketless()` turns this red.
+    /// the lines it printed before this ticket. Gating `render_show`'s `review` argument on
+    /// anything other than `teams.review_ticketless()` turns this red.
     #[test]
     fn show_suppresses_the_review_scoped_lines_off_the_ticketless_path() {
         // Teams enabled, but on `mode: tickets` — the review override is set and inert.
