@@ -51,9 +51,8 @@
 //!
 //! # Repeats
 //!
-//! Linear keys a link attachment on (issue, url) and answers a second write of the same pull
-//! request with a REFUSAL rather than a no-op. Measured against the live API (STUDIO-904), the
-//! refusal is:
+//! Linear answers a second write of the same pull request with a REFUSAL rather than a no-op.
+//! Measured against the live API (STUDIO-904), the refusal is:
 //!
 //! ```text
 //! code INPUT_ERROR      path ["attachmentLinkGitHubPR"]
@@ -62,9 +61,21 @@
 //!
 //! **That refusal is not a failure here.** The post-condition this write exists for is "the ticket
 //! links this pull request", and a duplicate error proves it — so [`link_pull_request`] returns
-//! `Ok` for it, classified on the error's machine-readable SHAPE (`INPUT_ERROR` on the
-//! `attachmentLinkGitHubPR` path) and never on `userPresentableMessage`, which is presentation
-//! text. Every other refusal is still an error.
+//! `Ok` for it, classified on the refusal's machine-readable SHAPE: `INPUT_ERROR` on the
+//! `attachmentLinkGitHubPR` path **and** the top-level `message`
+//! `"Duplicate attachment for duplicate url"`. All three coordinates are required, because
+//! `INPUT_ERROR` is Linear's general user-error bucket for this mutation and the same bucket
+//! carries refusals that never linked anything — a URL Linear rejects as not a pull request. The
+//! `message` is the developer-facing error identity; `userPresentableMessage`, the English
+//! sentence Linear shows a person, is still never consulted. Every other refusal is an error.
+//!
+//! What was measured is that a repeat of the SAME (issue, url) is refused — every observed refusal
+//! is one ticket retrying its own pull request. Whether Linear's uniqueness is scoped per-issue or
+//! globally per-URL is an inference the message (`"An attachment with the same URL already
+//! exists."`) does not settle, and it does not matter here: this write only ever links a pull
+//! request to the one ticket that resolved it (`prlink` passes the parent's own target, never the
+//! review sub-issues), so two tickets never race for one URL. Stated because mistaking an inference
+//! for an observation is how this module's original claim survived review.
 //!
 //! The caller's own gate (`prlink::link_pr_best_effort` — "this ticket already links the pull
 //! request that was just resolved") still keeps a healthy installation from writing at all. This
@@ -113,9 +124,10 @@ struct AttachmentIdNode {
 /// LATER reads the attachment back.
 ///
 /// The one refusal that is NOT an error is a duplicate: Linear answering
-/// [`INPUT_ERROR` + `attachmentLinkGitHubPR`](LinearErrorKind::DuplicateAttachment) means the same
-/// (issue, url) is already attached, so the link landed — just not from this call. See the module
-/// doc's "Repeats".
+/// [`INPUT_ERROR` + `attachmentLinkGitHubPR` + the duplicate message](LinearErrorKind::DuplicateAttachment)
+/// means the same (issue, url) is already attached, so the link landed — just not from this call.
+/// The message coordinate is what keeps this from absorbing the rest of `INPUT_ERROR`, which is
+/// Linear's general user-error bucket for the mutation. See the module doc's "Repeats".
 pub(super) async fn link_pull_request(
     c: &Client,
     issue_id: &str,
@@ -303,6 +315,35 @@ mod tests {
             .link_pull_request("iss-uuid", PR_URL)
             .await
             .expect_err("a non-duplicate refusal must error");
+        assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
+    }
+
+    /// The STUDIO-904 review's pin, at the boundary: a different user error on the SAME mutation —
+    /// same code, same path, only the identity differs — must still be an error. `INPUT_ERROR` is
+    /// Linear's general user-error bucket, not a synonym for "duplicate", and a URL Linear rejects
+    /// as not a pull request is reachable here (`resolve_open_pr`'s attachment fallback can hand the
+    /// link a malformed URL; see `a_pull_request_the_link_set_cannot_speak_for_is_written` in
+    /// `prlink`). Absorbing it would log a link for a write that never landed.
+    #[tokio::test]
+    async fn a_non_duplicate_user_error_on_the_attachment_path_is_still_an_error() {
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{
+                        "code":"INPUT_ERROR","statusCode":400,"type":"invalid input",
+                        "userError":true,
+                        "userPresentableMessage":"That is not a valid GitHub pull request URL."
+                    },
+                    "message":"Invalid pull request url",
+                    "path":["attachmentLinkGitHubPR"]
+                }]}"#,
+            )
+        })
+        .await;
+        let err = client_at(server.url())
+            .link_pull_request("iss-uuid", "not-a-pull-request-url")
+            .await
+            .expect_err("a non-duplicate user error must error");
         assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
     }
 

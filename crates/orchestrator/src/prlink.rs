@@ -165,9 +165,10 @@ pub(crate) fn pr_link_target(
 /// or a tracker the quorum has already resolved for the parent's own project.
 #[async_trait]
 pub trait PrLinker: Send + Sync {
-    /// Attaches `url` to `issue_id`. Callers do not depend on the tracker de-duplicating: the
-    /// [`pr_link_target`] gate is what keeps a working installation from writing at all, and see
-    /// [`Tracker::link_pull_request`] for what a duplicate would and would not cost.
+    /// Attaches `url` to `issue_id`. The [`pr_link_target`] gate is what keeps a working
+    /// installation from writing at all; a write that still happens and is refused because the
+    /// link is already there comes back `Ok`, since the refusal proves the post-condition. See
+    /// [`Tracker::link_pull_request`] for what a duplicate costs.
     async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError>;
 }
 

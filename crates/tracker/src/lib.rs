@@ -309,10 +309,10 @@ pub trait Tracker: Any + Send + Sync {
     /// Linear's GitHub integration, nothing else ever writes that link — so the daemon writes it
     /// itself, at the moment it resolves a pull request for a ticket.
     ///
-    /// **A repeat is a success, and the adapter absorbs it.** Linear keys a link attachment on
-    /// (issue, url) and answers a second write of the same pull request with a REFUSAL (measured,
-    /// STUDIO-904: `INPUT_ERROR` on the `attachmentLinkGitHubPR` path) rather than a no-op. That
-    /// refusal proves the link the caller wanted is already there, so `link_pull_request` returns
+    /// **A repeat is a success, and the adapter absorbs it.** Linear answers a second write of the
+    /// same pull request with a REFUSAL rather than a no-op (measured, STUDIO-904: `INPUT_ERROR` on
+    /// the `attachmentLinkGitHubPR` path, with the duplicate's top-level `message`). That refusal
+    /// proves the link the caller wanted is already there, so `link_pull_request` returns
     /// `Ok` for it; every other refusal is still an error, so a caller can never mistake a real
     /// failure for a healthily-linked ticket. The once-per-ticket guard still belongs to the
     /// caller, exactly as [`Tracker::create_issue`]'s once-per-parent guard does — but it saves a
