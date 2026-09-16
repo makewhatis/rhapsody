@@ -153,8 +153,10 @@ in the same situation just inherits, since an effort value can't make a provider
 **A cleared review can merge itself.** `review.auto_merge` (default `false`) lets the daemon merge
 a pull request once every reviewer has recorded a non-blocking verdict at its current head and CI
 is green. It never arms GitHub's own auto-merge — it checks green once and merges immediately or
-not at all — and it refuses a draft pull request or one whose branch has fallen behind (see
-`operating.md` for the two GitHub repository settings this depends on).
+not at all — and it refuses a draft pull request outright. A branch that has fallen behind is never
+merged on its existing approval either: if the repository allows it, the daemon updates the branch
+itself, which moves the head and arms a fresh review round rather than merging (see `operating.md`
+for the two GitHub repository settings this depends on).
 
 ## Planning work for an installation (the operational rules)
 

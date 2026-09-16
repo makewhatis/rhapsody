@@ -45,10 +45,12 @@ the 200.
 
 ## Two GitHub repository settings that are not in any config file
 
-- **Allow update branch.** `review.auto_merge` refuses a `BEHIND` branch rather than overriding
-  repository policy unless this setting says GitHub will bring it up to date itself — with it off,
-  a human must update each pull request by hand after every merge before the daemon will touch it
-  again.
+- **Allow update branch.** A `BEHIND` pull request is never merged on its existing approval. With
+  this setting on, the daemon updates the branch itself (GitHub does not do it on its own) — which
+  moves the head and arms a fresh review round, capped at 8 rounds per pull request, before the
+  merge can happen again. With it off, the daemon refuses instead, and a human must update each
+  pull request by hand. Reading the setting itself needs an admin token; if that read fails, the
+  daemon declines the same as if the setting were off, even when it is actually on.
 - **Automatically delete head branches.** The daemon's own `gh pr merge` calls never pass
   `--delete-branch`; cleaning up a merged branch is left entirely to this setting.
 
