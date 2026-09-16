@@ -143,10 +143,9 @@ the author's run. An approved one posts a deliberately **tokenless** note, so no
 **A review run can use its own model, scoped per harness.** `review.model` / `review.effort`
 override the routed reviewer's own profile for a review run specifically — unset, the default,
 means the review inherits whatever model that reviewer's profile would have used anyway. Both are
-maps from harness name to value
-(`review.model: { claude: ..., opencode: ... }`); a legacy bare scalar (`review.model:
-claude-opus-5`) still parses and resolves against the installation's own configured
-`agent.backend`. ⚠️ If a model is configured for some harness but not the one the routed
+maps from harness name to value (`review.model: { claude: ..., opencode: ... }`); a legacy bare
+scalar (`review.model: claude-opus-5`) still parses and resolves against the installation's own
+configured `agent.backend`. ⚠️ If a model is configured for some harness but not the one the routed
 reviewer's runs actually use, the review is **refused** rather than sent to the wrong provider or
 silently downgraded to a cheaper model — this is the trap above, closed by config. `review.effort`
 in the same situation just inherits, since an effort value can't make a provider reject a model.
