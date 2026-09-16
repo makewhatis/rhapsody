@@ -43,6 +43,30 @@ group. On builds before the fix for that path it moved the ticket and killed not
 reporting success, so on an older daemon verify the agent actually stopped rather than trusting
 the 200.
 
+## Two GitHub repository settings that are not in any config file
+
+- **Allow update branch.** `review.auto_merge` refuses a `BEHIND` branch rather than overriding
+  repository policy unless this setting says GitHub will bring it up to date itself — with it off,
+  a human must update each pull request by hand after every merge before the daemon will touch it
+  again.
+- **Automatically delete head branches.** The daemon's own `gh pr merge` calls never pass
+  `--delete-branch`; cleaning up a merged branch is left entirely to this setting.
+
+Neither is visible in `WORKFLOW.md`, `teams.yaml` or any daemon endpoint — an operator whose loop
+half-works will not find either by reading config.
+
+## Restarting or upgrading without losing in-flight work
+
+**A drain lets a run in flight finish its current turn before a restart, instead of it being
+killed and redone from scratch.** `POST /api/v1/drain` arms one; `/api/v1/state` carries a `drain`
+key only while one is armed (a healthy daemon has no such key at all), the console shows a banner,
+and the tray gets a drain action. While armed: a run in flight finishes its current turn and is not
+re-dispatched, a due retry is parked rather than fired, and no new run starts. What is lost is the
+agent's conversation thread only — the worktree, branch, commits, claim and retry state all
+survive, and the next dispatch resumes as a fresh turn rather than from scratch. End one early with
+`POST /api/v1/drain {"active": false}` or the console banner's Cancel drain. Default is **off**: a
+daemon nobody drains behaves exactly as before.
+
 ## Config traps
 
 - **`teams.yaml` is boot-only.** `WORKFLOW.md` hot-reloads; `teams.yaml` does not. Every
@@ -62,14 +86,19 @@ the 200.
 
 Check, in order:
 
-1. **A request-changes verdict parked in the review state.** With `review.changes_state` unset
+1. **A pull request the daemon has already flagged as stuck.** `GET /api/v1/state`'s
+   `review_divergence` key (and the per-project advisory on `/api/v1/projects`) names a watched
+   pull request where nobody has made the move it's waiting on for 90+ minutes. This is a report,
+   never an action — it never re-dispatches, arms or merges anything — so treat it as the first
+   thing to check rather than something that will resolve itself.
+2. **A request-changes verdict parked in the review state.** With `review.changes_state` unset
    this is the commonest cause — the agents are done and waiting on a human.
-2. **Triage failing.** A `teams triage cycle outcome="tracker_failure"` line with
+3. **Triage failing.** A `teams triage cycle outcome="tracker_failure"` line with
    `candidates_seen=0` means no candidate set was fetched, so nothing can dispatch. Usually the
    tracker.
-3. **The daemon's own quota.** A failing lookup that retries without backoff can exhaust the
+4. **The daemon's own quota.** A failing lookup that retries without backoff can exhaust the
    tracker's hourly limit and starve dispatch — the failure then looks like idleness.
-4. **The claim lock.** Under `claim_mode: assignee` a ticket that is not assigned to the account
+5. **The claim lock.** Under `claim_mode: assignee` a ticket that is not assigned to the account
    the daemon authenticates as is never a candidate, however it is labelled.
 
 ## Releasing Rhapsody itself
