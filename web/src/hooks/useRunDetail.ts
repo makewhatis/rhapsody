@@ -5,11 +5,13 @@ import {
   fetchRunDetail,
   fetchRunIdentityEvents,
   fetchRunMessages,
+  fetchRunProvenance,
   fetchRunTranscript,
   type EventHit,
   type IssueHistoryResponse,
   type RunDetail,
   type RunMessage,
+  type RunProvenance,
   type RunTranscriptResponse,
 } from "@/lib/api";
 
@@ -31,6 +33,19 @@ export function useRunDetail(runId: number, enabled = true) {
     queryFn: () => fetchRunDetail(runId),
     enabled: enabled && runId > 0,
     refetchInterval: (query) => runDetailPollInterval(query.state.data),
+    refetchOnWindowFocus: false,
+  });
+}
+
+// useRunProvenance fetches what a run actually ran on (GET /api/v1/runs/{id}/provenance,
+// STUDIO-909). Provenance is written once at dispatch and never changes, so this never polls and
+// never goes stale — one fetch per run id, unlike the run detail it sits beside.
+export function useRunProvenance(runId: number, enabled = true) {
+  return useQuery<RunProvenance>({
+    queryKey: ["run-provenance", runId],
+    queryFn: () => fetchRunProvenance(runId),
+    enabled: enabled && runId > 0,
+    staleTime: Infinity,
     refetchOnWindowFocus: false,
   });
 }

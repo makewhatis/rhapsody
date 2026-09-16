@@ -427,6 +427,10 @@ impl Orchestrator {
         // on PR #168), but the accessor is the convention this crate already uses for every other
         // `review:` scalar and keeps this call site from disagreeing with `teams show` about when
         // the override is live.
+        // Whether the MODEL specifically came from `review.model` (STUDIO-909): distinct from the
+        // combined `review_overrode` below, which an effort-only override also sets — the recorded
+        // model origin must name the key that supplied the MODEL, not one that only supplied effort.
+        let mut review_model_overrode = false;
         if review.is_some()
             && let Some(teams) = self.teams.as_ref()
         {
@@ -442,6 +446,7 @@ impl Orchestrator {
                 rhapsody_config::teams::ReviewModelChoice::Use(model) => {
                     re.model_override.model = model.to_string();
                     review_overrode = true;
+                    review_model_overrode = true;
                 }
                 // `dispatch_review` already refused a review whose harness has no `review.model`
                 // entry, so a `Refuse` here means the two derivations of the reviewer's harness
@@ -489,6 +494,43 @@ impl Orchestrator {
         if !re.model_override.model.is_empty() {
             re.model = re.model_override.model.clone();
         }
+        // Provenance ORIGINS (STUDIO-909), stamped beside the values they explain. The VALUES are
+        // resolved and persisted by `persist_start_run` from these origins plus the run's own
+        // harness/profile override; recording the origin here means an invisible override — tonight's
+        // unreproducible `Model not found` — becomes a fact on the run row rather than something an
+        // operator has to reconstruct from the config that happens to be live now.
+        //
+        // The harness origin names the key that ACTUALLY took effect: a profile that names a harness
+        // this build has no runner for falls back to the configured backend (spawn_worker logs the
+        // fallback), so the origin is `agent.backend` there rather than a `profile` claim the run did
+        // not honour.
+        let actual_harness = self.harness_actually_run(&re.harness);
+        re.harness_origin =
+            if !re.harness.is_empty() && crate::effective::harness_is_implemented(&re.harness) {
+                "profile".to_string()
+            } else {
+                "agent.backend".to_string()
+            };
+        re.model_origin = if review_model_overrode {
+            // The legacy bare-scalar spelling is `review.model`; the per-harness map spelling names
+            // the harness. `HarnessScoped::legacy` is the one reader that tells them apart, so the
+            // label cannot disagree with `teams show`.
+            match self.teams.as_ref().and_then(|t| t.review.model.legacy()) {
+                Some(_) => "review.model".to_string(),
+                None => format!("review.model.{actual_harness}"),
+            }
+        } else if !re.model_override.model.is_empty() {
+            "profile".to_string()
+        } else {
+            // The value is `configured_model_for`'s answer at persist time. KNOWN IMPRECISION
+            // (alice round 1 on PR #173): on a multi-project install whose project block overrides
+            // `claude.model`, that value comes from `projects.<slug>.claude.model` while this label
+            // names the flat `claude.model` key. `mcfg` cannot tell an explicit project override from
+            // an inherited one, so a project-scoped spelling here could name a key that supplied
+            // nothing — worse than the flat one. The value is still the run's true model; only the
+            // pointer is coarser. `opencode` is not per-project overlaid, so its arm is exact.
+            format!("{actual_harness}.model")
+        };
         if let Some(r) = &route {
             re.project_slug = r.slug.clone();
             // The per-project cap is counted across the whole project group; fall back to the slug when
@@ -1402,6 +1444,67 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, store::OUTCOME_COMPLETED);
         assert_eq!(runs[0].error, "", "no 'ticket moved externally' diagnosis");
+    }
+
+    /// STUDIO-909: a plain, unrouted dispatch records what it ACTUALLY ran on — the configured
+    /// harness and its model, the ORIGIN of each, and the provider derived from the two. This is
+    /// the run-row provenance the console reads; before it, the row knew only how many tokens the
+    /// run had spent and nothing about what spent them.
+    #[test]
+    fn dispatch_records_the_harness_model_and_provider_it_actually_used() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "claude".to_string();
+            eff.cfg.claude.model = "claude-sonnet-4".to_string();
+        }
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store is on, so the run has a row");
+        let p = store
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(p.harness, "claude");
+        assert_eq!(p.harness_origin, "agent.backend");
+        assert_eq!(p.model, "claude-sonnet-4");
+        assert_eq!(p.model_origin, "claude.model");
+        assert_eq!(p.provider, "anthropic");
+    }
+
+    /// STUDIO-909 round 1: a harness with no model knob records NO model and therefore NO
+    /// `model_origin`. `agent.backend: codex` is a recognized `HARNESS_NAMES` value this build has no
+    /// runner for, so `configured_model_for` answers empty — the origin must not then name a
+    /// `codex.model` key that supplied nothing.
+    #[test]
+    fn dispatch_records_no_model_origin_when_no_model_resolved() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "codex".to_string();
+        }
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store is on, so the run has a row");
+        let p = store
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(p.harness, "codex");
+        assert_eq!(p.model, "", "codex has no model knob in this build");
+        assert_eq!(
+            p.model_origin, "",
+            "an origin for a model that was never resolved asserts something untrue"
+        );
+        assert_eq!(p.provider, "");
     }
 
     // BO-12: dispatch computes the ADDITIVE capability set (project defaults ∪ the ticket's

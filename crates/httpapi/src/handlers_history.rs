@@ -19,7 +19,8 @@ use crate::responses::{write_error, write_json};
 use crate::responses_history::{
     IssueStatusKey, event_search_response, history_response, history_summary_response,
     issue_counts_response, issue_history_response, issue_runs_response, metrics_response,
-    run_detail_from_running, run_detail_from_summary, run_events_response, run_transcript_json,
+    run_detail_from_running, run_detail_from_summary, run_events_response, run_provenance_response,
+    run_transcript_json,
 };
 use crate::server::StateProvider;
 
@@ -130,6 +131,14 @@ pub(crate) async fn handle_issue_runs(
     // is reviewing (STUDIO-834). It is the store's own answer, so it is resolved before the three
     // awaits rather than joined with them.
     let review_origins = review_origins(provider.history().as_ref(), &runs);
+    // The provider badge (STUDIO-909): one store read for the whole page, keyed by run id. Like
+    // every other decoration here it is best-effort — a store error yields an empty map and each row
+    // renders exactly as it did before the field existed.
+    let run_ids: Vec<i64> = runs.iter().map(|r| r.id).collect();
+    let provenances = provider
+        .history()
+        .load_run_provenances(&run_ids)
+        .unwrap_or_default();
     let (lifecycles, assignees, reviews) = tokio::join!(
         provider.issue_lifecycles(&ids),
         provider.issue_assignees(&keys),
@@ -144,7 +153,52 @@ pub(crate) async fn handle_issue_runs(
             &assignees,
             &reviews,
             &review_origins,
+            &provenances,
         ),
+    )
+}
+
+/// `GET /api/v1/runs/{id}/provenance`: what the run ACTUALLY ran on — harness, model, provider and
+/// the origin of each configurable value (STUDIO-909). The forensic surface the job detail page
+/// renders with each value's origin, so an override (`review.model.opencode`) is visible instead of
+/// mistaken for the teammate's own profile value.
+///
+/// `{id}` must be a positive integer (else 404); an unknown run is 404 `run_not_found` — the same
+/// contract `GET /api/v1/runs/{id}` uses, because a provenance answer for a run that does not exist
+/// would be a fabricated one. A known run with no recorded provenance answers `{run_id}` alone,
+/// which is the honest "unknown" for a row that predates this feature. Rhapsody-only — no Go
+/// counterpart.
+pub(crate) async fn handle_run_provenance(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let run_id = match parse_run_id(&id) {
+        Ok(n) => n,
+        Err(resp) => return *resp,
+    };
+    match provider.history().get_run(run_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return write_error(
+                StatusCode::NOT_FOUND,
+                "run_not_found",
+                format!("no run with id: {id}"),
+                None,
+            );
+        }
+        Err(_) => return store_error("run lookup failed"),
+    }
+    let provenance = match provider.history().run_provenance(run_id) {
+        Ok(p) => p,
+        Err(_) => return store_error("run provenance lookup failed"),
+    };
+    write_json(
+        StatusCode::OK,
+        &run_provenance_response(run_id, provenance.as_ref()),
     )
 }
 
@@ -424,9 +478,14 @@ pub(crate) async fn handle_history_summary(
         Err(_) => return store_error("history summary query failed"),
     };
     let rhythm: Vec<i64> = recent.iter().rev().map(|r| r.total_tokens).collect();
+    // Per-provider token attribution (STUDIO-909), scoped to the SAME `since`-bounded window as
+    // `day_totals` and the rhythm series so the split can be read beside the totals it decomposes.
+    // Best-effort like the history decorations: a store that cannot answer yields no buckets rather
+    // than failing the whole summary.
+    let providers = history.tokens_by_provider(&since).unwrap_or_default();
     write_json(
         StatusCode::OK,
-        &history_summary_response(&since, &totals, &rhythm),
+        &history_summary_response(&since, &totals, &rhythm, &providers),
     )
 }
 
@@ -1017,6 +1076,25 @@ mod tests {
             self.watch_reads
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Store::load_review_watch(&self.inner)
+        }
+        fn run_provenance(
+            &self,
+            run_id: i64,
+        ) -> Result<Option<rhapsody_store::RunProvenance>, StoreError> {
+            Store::run_provenance(&self.inner, run_id)
+        }
+        fn load_run_provenances(
+            &self,
+            run_ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, rhapsody_store::RunProvenance>, StoreError>
+        {
+            Store::load_run_provenances(&self.inner, run_ids)
+        }
+        fn tokens_by_provider(
+            &self,
+            since: &str,
+        ) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
+            Store::tokens_by_provider(&self.inner, since)
         }
     }
 
@@ -2336,6 +2414,210 @@ mod tests {
     async fn run_detail_method_not_allowed() {
         let base = spawn(FakeProvider::ok(sample_snapshot())).await;
         assert_eq!(post_status(&format!("{base}/api/v1/runs/101")).await, 405);
+    }
+
+    // ---- run provenance (STUDIO-909; Rhapsody-only, no Go counterpart) ----
+
+    /// The forensic endpoint: all three values plus the origin of each configurable one, so an
+    /// override (`review.model.opencode`) is visible on the run rather than invisible.
+    #[tokio::test]
+    async fn run_provenance_serves_the_recorded_values_with_their_origins() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store);
+        store
+            .set_run_provenance(
+                run_id,
+                &rhapsody_store::RunProvenance {
+                    harness: "opencode".into(),
+                    harness_origin: "profile".into(),
+                    model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash".into(),
+                    model_origin: "review.model.opencode".into(),
+                    provider: "fireworks-ai".into(),
+                },
+            )
+            .expect("set provenance");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/{run_id}/provenance")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["run_id"], run_id);
+        assert_eq!(body["harness"], "opencode");
+        assert_eq!(body["harness_origin"], "profile");
+        assert_eq!(
+            body["model"],
+            "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        assert_eq!(body["model_origin"], "review.model.opencode");
+        assert_eq!(body["provider"], "fireworks-ai");
+    }
+
+    /// A run that predates the feature records nothing, so the endpoint answers its id and omits
+    /// every value — the honest unknown the console renders rather than a guessed config echo.
+    #[tokio::test]
+    async fn run_provenance_of_a_legacy_run_is_unknown_not_guessed() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store);
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/{run_id}/provenance")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["run_id"], run_id);
+        assert!(body.get("harness").is_none(), "no harness: {body}");
+        assert!(body.get("model").is_none(), "no model: {body}");
+        assert!(body.get("provider").is_none(), "no provider: {body}");
+    }
+
+    /// An unknown run is 404 (never a fabricated provenance), an unparseable id is 404, and POST is
+    /// 405 — the same contract `GET /api/v1/runs/{id}` already keeps.
+    #[tokio::test]
+    async fn run_provenance_not_found_invalid_id_and_method_not_allowed() {
+        let base = spawn(FakeProvider::ok(empty_snapshot())).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/99999/provenance")).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"]["code"], "run_not_found");
+
+        let (status, _) = get_json(&format!("{base}/api/v1/runs/not-a-number/provenance")).await;
+        assert_eq!(status, 404);
+
+        assert_eq!(
+            post_status(&format!("{base}/api/v1/runs/101/provenance")).await,
+            405
+        );
+    }
+
+    /// The Jobs list's scanning badge: `/history/issues` carries each row's provider (and only when
+    /// one was recorded), so "which of these runs is on Fireworks" needs no drill-down.
+    #[tokio::test]
+    async fn issue_listing_carries_the_provider_badge() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store);
+        store
+            .set_run_provenance(
+                run_id,
+                &rhapsody_store::RunProvenance {
+                    harness: "opencode".into(),
+                    harness_origin: "profile".into(),
+                    model: "fireworks-ai/x".into(),
+                    model_origin: "profile".into(),
+                    provider: "fireworks-ai".into(),
+                },
+            )
+            .expect("set provenance");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let issues = body["issues"].as_array().expect("issues");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["provider"], "fireworks-ai");
+        // The Go-pinned run-paged listing is untouched by the Rhapsody-only field.
+        let (_, runs) = get_json(&format!("{base}/api/v1/history")).await;
+        assert!(
+            runs["runs"][0].get("provider").is_none(),
+            "the parity-pinned listing must not grow the field: {runs}"
+        );
+    }
+
+    /// The cost question the whole feature exists to answer: the summary splits the window's tokens
+    /// by the provider each run actually billed.
+    #[tokio::test]
+    async fn history_summary_splits_tokens_by_provider() {
+        let store = mem_store();
+        let run_id = seed_completed_run(&store); // 100 in / 50 out / 150 total
+        store
+            .set_run_provenance(
+                run_id,
+                &rhapsody_store::RunProvenance {
+                    harness: "claude".into(),
+                    harness_origin: "agent.backend".into(),
+                    model: "claude-sonnet-4".into(),
+                    model_origin: "claude.model".into(),
+                    provider: "anthropic".into(),
+                },
+            )
+            .expect("set provenance");
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        // An explicit window containing the seeded run (now - 1h) rather than the local-midnight
+        // default, which between 00:00 and 01:00 local would put the run BEFORE `since` and make
+        // this test fail for the clock rather than the code (STUDIO-909 round 1).
+        let since = rfc3339(Utc::now() - ChronoDuration::hours(2));
+        let (status, body) =
+            get_json(&format!("{base}/api/v1/history/summary?since={since}")).await;
+        assert_eq!(status, 200);
+        let providers = body["providers"].as_array().expect("providers");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["provider"], "anthropic");
+        assert_eq!(providers[0]["runs"], 1);
+        assert_eq!(providers[0]["total_tokens"], 150);
+    }
+
+    /// Round 1 (PR #173) caught `providers` summing the whole store while every sibling figure on the
+    /// response was `since`-bounded: a run outside the window could ship a bucket beside
+    /// `total_tokens: 0`. This pins the boundary — an out-of-window run with its own provider must
+    /// not be bucketed, so `providers` decomposes `total_tokens`.
+    #[tokio::test]
+    async fn history_summary_providers_ignore_runs_before_the_window() {
+        let store = mem_store();
+        let recent = seed_completed_run(&store); // now - 1h, inside the default (local-midnight) window
+        store
+            .set_run_provenance(
+                recent,
+                &rhapsody_store::RunProvenance {
+                    harness: "claude".into(),
+                    harness_origin: "agent.backend".into(),
+                    model: "claude-sonnet-4".into(),
+                    model_origin: "claude.model".into(),
+                    provider: "anthropic".into(),
+                },
+            )
+            .expect("set provenance");
+        let old = store
+            .start_run(RunStart {
+                issue_id: "old".into(),
+                issue_identifier: "MT-OLD".into(),
+                title: "before the window".into(),
+                attempt: 1,
+                started_at: "2025-01-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start old");
+        store
+            .set_run_provenance(
+                old,
+                &rhapsody_store::RunProvenance {
+                    harness: "opencode".into(),
+                    harness_origin: "profile".into(),
+                    model: "fireworks-ai/dsv4".into(),
+                    model_origin: "opencode.model".into(),
+                    provider: "fireworks-ai".into(),
+                },
+            )
+            .expect("set old provenance");
+        store
+            .end_run(
+                old,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 900_000,
+                    ..Default::default()
+                },
+            )
+            .expect("end old");
+
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+        // A window that contains the recent run (now - 1h) but not the 2025 one.
+        let since = rfc3339(Utc::now() - ChronoDuration::hours(2));
+        let (status, body) =
+            get_json(&format!("{base}/api/v1/history/summary?since={since}")).await;
+        assert_eq!(status, 200, "body: {body}");
+        let providers = body["providers"].as_array().expect("providers");
+        assert_eq!(
+            providers.len(),
+            1,
+            "the pre-window run must not be bucketed: {body}"
+        );
+        assert_eq!(providers[0]["provider"], "anthropic");
     }
 
     // Mirrors Go `TestRunDetailLiveThenFinished`: the SAME run_id resolves live first, then from the

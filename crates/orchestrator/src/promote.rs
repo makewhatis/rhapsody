@@ -636,6 +636,32 @@ mod tests {
         fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError> {
             self.0.metrics(since_days, project)
         }
+        fn set_run_provenance(
+            &self,
+            id: i64,
+            p: &rhapsody_store::RunProvenance,
+        ) -> Result<(), StoreError> {
+            self.0.set_run_provenance(id, p)
+        }
+        fn run_provenance(
+            &self,
+            id: i64,
+        ) -> Result<Option<rhapsody_store::RunProvenance>, StoreError> {
+            self.0.run_provenance(id)
+        }
+        fn load_run_provenances(
+            &self,
+            ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, rhapsody_store::RunProvenance>, StoreError>
+        {
+            self.0.load_run_provenances(ids)
+        }
+        fn tokens_by_provider(
+            &self,
+            since: &str,
+        ) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
+            self.0.tokens_by_provider(since)
+        }
         fn insert_run_message(&self, id: i64, b: &str, ms: i64) -> Result<i64, StoreError> {
             self.0.insert_run_message(id, b, ms)
         }

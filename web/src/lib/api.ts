@@ -141,6 +141,32 @@ export interface RunDetail {
   generated_at: string;
 }
 
+// RunProvenance is the GET /api/v1/runs/{id}/provenance payload (STUDIO-909): what a run ACTUALLY
+// ran on — its harness, model and provider — plus the origin of each configurable value. A run
+// started before the feature (or one the daemon could not attribute) records nothing, so EVERY
+// field is optional: absent means unknown, and the UI must say "unknown" rather than guess.
+//
+// `harness_origin`/`model_origin` name the config key the value came from (`profile`,
+// `review.model.opencode`, `agent.backend`, `claude.model`). The origin is the load-bearing half:
+// tonight's undiagnosable failure was an override nobody could see, not an unknown model.
+export interface RunProvenance {
+  run_id: number;
+  harness?: string;
+  harness_origin?: string;
+  model?: string;
+  model_origin?: string;
+  provider?: string;
+}
+
+// ProviderTokens is one bucket of the DaySummary's per-provider token split (STUDIO-909).
+export interface ProviderTokens {
+  provider: string;
+  runs: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+}
+
 // LogEntry is one humanized line of an agent session transcript (oldest -> newest), as served
 // by GET /api/v1/runs/<id>/transcript. kind ∈ {"thinking","text","tool_use","tool_result","event"};
 // tool is set only on tool_use entries.
@@ -218,6 +244,10 @@ export interface IssueRun extends RunSummary {
   // this one is not shaped like `lifecycle`/`assignee` above, where absence is a distinguishable
   // third answer — here there is nothing a client could do differently.
   review_ticket?: boolean;
+  // The provider this row's run ACTUALLY billed (STUDIO-909) — a scanning badge for "which of
+  // these runs is on Fireworks", never a per-row drill-down. Absent for a run that recorded none
+  // (a legacy row), which the UI renders as no badge rather than a guess.
+  provider?: string;
   // True when this row's own RUN is a review run (STUDIO-826) — a run the daemon dispatched against
   // a synthetic `pr:owner/repo#n@reviewer` issue rather than a tracker ticket, which is what
   // `review.mode: ticketless` produces.
@@ -310,6 +340,10 @@ export interface DaySummary {
   total_tokens: number;
   seconds: number;
   rhythm: number[];
+  // The same window's tokens split by the provider each run actually billed (STUDIO-909) — the
+  // cost question that motivated recording provenance at all. Absent from a daemon older than the
+  // field, which reads as "no per-provider breakdown available".
+  providers?: ProviderTokens[];
 }
 
 // IssueHistoryResponse is the GET /api/v1/issues/<id>/history payload.
@@ -429,6 +463,14 @@ export async function fetchRunDetail(runID: number): Promise<RunDetail> {
   // Defensive: tolerate a server that omits/nulls recent_events so the timeline can .map().
   d.recent_events ??= [];
   return d;
+}
+
+// fetchRunProvenance reads what one run actually ran on (GET /api/v1/runs/{id}/provenance,
+// STUDIO-909). Kept a separate request from the run detail on purpose: that body is byte-pinned to
+// the Go capture, and a run that predates the feature answers 200 with no values rather than 404
+// (only an unknown RUN is 404).
+export async function fetchRunProvenance(runID: number): Promise<RunProvenance> {
+  return getJSON<RunProvenance>(`/api/v1/runs/${runID}/provenance`);
 }
 
 // setDrain arms or cancels the daemon's drain (STUDIO-880), resolving to the drain's state

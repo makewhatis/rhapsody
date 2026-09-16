@@ -48,6 +48,31 @@ pub(crate) const EVENT_BUF_CAP: usize = 4096;
 /// The event-count flush threshold for the async writer (~200). Mirrors Go `flushBatch`.
 const FLUSH_BATCH: usize = 200;
 
+/// Derive the PROVIDER a run actually billed, from the harness it ran on and the model string it
+/// used (STUDIO-909). The model string is the authority: opencode names models as
+/// `provider/model` (`fireworks-ai/accounts/fireworks/models/…`), so the segment before the first
+/// `/` IS the provider and is kept verbatim — never case-folded or normalized into a name the CLI
+/// did not use. Claude model names carry no `/`, and Claude's provider is unambiguously Anthropic,
+/// so that one case is named explicitly. Anything else — an empty model, a bare model name on a
+/// harness whose provider is not knowable — answers the empty string, which the console renders as
+/// unknown rather than guessing. Being DERIVED here, once, at dispatch, and then PERSISTED means a
+/// later config change cannot make the recorded provider disagree with the recorded model.
+pub(crate) fn derive_provider(harness: &str, model: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        return String::new();
+    }
+    if let Some((prefix, _rest)) = model.split_once('/')
+        && !prefix.trim().is_empty()
+    {
+        return prefix.trim().to_string();
+    }
+    match harness {
+        "claude" => "anthropic".to_string(),
+        _ => String::new(),
+    }
+}
+
 /// The time-based flush cadence for the async writer (~1s). Mirrors Go `flushInterval`.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -189,7 +214,75 @@ impl Orchestrator {
                 tracing::error!(issue_identifier = %re.issue.identifier, error = %e, "persist start run failed");
             }
         }
+        // What this run ACTUALLY runs on (STUDIO-909), recorded once at dispatch beside the run row
+        // so a later WORKFLOW.md hot-reload cannot rewrite what a finished run says it ran on. This
+        // is a provenance RECORD, not a config echo: the harness/model are the values the worker was
+        // dispatched with, and the origin names the key each came from. Best-effort like every other
+        // persist call — a run without a row (store disabled / insert failed) records nothing and
+        // renders as unknown rather than failing the dispatch.
+        if re.run_id != 0 {
+            let prov = self.run_provenance_for(re);
+            if let Err(e) = self.store.set_run_provenance(re.run_id, &prov) {
+                tracing::error!(issue_identifier = %re.issue.identifier, error = %e, "persist run provenance failed");
+            }
+        }
         self.save_claim(&re.issue.identifier, store::CLAIM_RUNNING, &re.project_slug);
+    }
+
+    /// The per-run provenance record (STUDIO-909): the harness the run actually uses, the model it
+    /// actually uses, and the origin of each, with the provider DERIVED once from the two.
+    ///
+    /// The model is the override the dispatch resolved (the routed teammate's profile, or the
+    /// `review.model` override) when there is one, else the actual harness's own configured model —
+    /// never `re.model`, which is a Go-parity telemetry label deliberately stamped from
+    /// `claude.model` regardless of harness. Reading the live config HERE, at dispatch, and
+    /// persisting the answer is the whole point: the config hot-reloads, the run is history.
+    fn run_provenance_for(&self, re: &RunningEntry) -> store::RunProvenance {
+        let harness = self.harness_actually_run(&re.harness);
+        let model = if re.model_override.model.is_empty() {
+            self.configured_model_for(&re.project_slug, &harness)
+        } else {
+            re.model_override.model.clone()
+        };
+        // An origin is only meaningful beside a value (STUDIO-909 round 1). `re.model_origin` can
+        // name a key that resolved nothing — `agent.backend: codex` is a recognized harness this
+        // build has no runner for, so `configured_model_for` answers empty while the origin fallback
+        // would still spell `codex.model`. Recording an origin for a model that was never resolved
+        // asserts something untrue about the row; drop it instead.
+        let model_origin = if model.is_empty() {
+            String::new()
+        } else {
+            re.model_origin.clone()
+        };
+        store::RunProvenance {
+            provider: derive_provider(&harness, &model),
+            harness,
+            harness_origin: re.harness_origin.clone(),
+            model,
+            model_origin,
+        }
+    }
+
+    /// The model the ACTUAL harness would run with when nothing overrides it: the owning project's
+    /// materialized value when the slug resolves, else the top-level one. `codex` has no model knob
+    /// in this build, and an unknown harness has none either, so both answer empty rather than a
+    /// guess.
+    fn configured_model_for(&self, project_slug: &str, harness: &str) -> String {
+        let Some(eff) = self.eff.as_ref() else {
+            return String::new();
+        };
+        let project = eff.project_by_slug(project_slug);
+        match harness {
+            "claude" => project.map_or_else(
+                || eff.cfg.claude.model.clone(),
+                |p| p.mcfg.claude.model.clone(),
+            ),
+            "opencode" => project.map_or_else(
+                || eff.cfg.opencode.model.clone(),
+                |p| p.mcfg.opencode.model.clone(),
+            ),
+            _ => String::new(),
+        }
     }
 
     /// Records the terminal outcome + end time + final tallies for a run. A zero `run_id` (store
@@ -433,6 +526,31 @@ mod tests {
 
     fn re_for(id: &str, ident: &str, state: &str) -> RunningEntry {
         running_entry(issue(id, ident, state), "", "")
+    }
+
+    /// The provider is derived from the model string the CLI was handed, not from the harness alone:
+    /// opencode names models `provider/model`, so that prefix is the authority. Claude models carry
+    /// no slash, so that one harness is named explicitly. Anything genuinely unknowable answers
+    /// empty — the console renders "unknown" rather than inventing a provider.
+    #[test]
+    fn derive_provider_reads_the_model_string_then_the_one_known_harness() {
+        assert_eq!(
+            derive_provider("opencode", "fireworks-ai/accounts/fireworks/models/x"),
+            "fireworks-ai"
+        );
+        assert_eq!(
+            derive_provider("opencode", "openrouter/anthropic/claude"),
+            "openrouter"
+        );
+        assert_eq!(derive_provider("claude", "claude-sonnet-4"), "anthropic");
+        assert_eq!(
+            derive_provider("claude", "anthropic/claude-sonnet-4"),
+            "anthropic",
+            "a slash-bearing model names its provider even on claude"
+        );
+        assert_eq!(derive_provider("opencode", "bare-model"), "", "no guessing");
+        assert_eq!(derive_provider("claude", ""), "");
+        assert_eq!(derive_provider("opencode", "  "), "");
     }
 
     // Mirrors Go `TestPersistStartRunOnDispatch` at the persist seam (dispatch itself is O5): the run

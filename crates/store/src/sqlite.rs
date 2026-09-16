@@ -8,9 +8,10 @@
 //!
 //! # The divergent schema objects, and how the golden still gates the rest (STUDIO-711)
 //!
-//! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column) and step 9
-//! (`rhapsody_summon_watermark`, STUDIO-885) have no Go counterpart: they are the ticketless
-//! PR-review watch set and the per-ticket summons watermark, neither of which the frozen v0.4.0
+//! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column), step 9
+//! (`rhapsody_summon_watermark`, STUDIO-885) and step 10 (`rhapsody_run_provenance`, STUDIO-909)
+//! have no Go counterpart: they are the ticketless PR-review watch set, the per-ticket summons
+//! watermark and the per-run harness/model/provider record, none of which the frozen v0.4.0
 //! reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
@@ -38,10 +39,10 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7, 8 and 9 are Rhapsody-only (the ticketless review watch set, then
-/// its `author` column, then the summons watermark) and are the one documented reason this number
-/// is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 9;
+/// Go v0.4.0 froze at 6. Steps 7, 8, 9 and 10 are Rhapsody-only (the ticketless review watch set,
+/// then its `author` column, then the summons watermark, then per-run provenance) and are the one
+/// documented reason this number is ahead of the reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 10;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -180,6 +181,25 @@ CREATE TABLE IF NOT EXISTS rhapsody_summon_watermark (
   identifier  TEXT    NOT NULL PRIMARY KEY,
   summon_at   TEXT    NOT NULL,
   summon_body TEXT    NOT NULL DEFAULT ''
+);
+"#,
+    // v9 -> v10: what a run actually ran on — harness/model/provider + the origin of each
+    // configurable value (STUDIO-909). Rhapsody-only, and on a Rhapsody-only table rather than as
+    // `runs` columns: the `runs` DDL is byte-pinned to Go by `harness/fixtures/schema.sql`, which
+    // is recapturable only from the real Go daemon and can never contain these columns. The
+    // `rhapsody_` prefix is what the schema golden excludes by name (see the module doc), so this
+    // lands without touching `runs` or the golden.
+    //
+    // `run_id INTEGER PRIMARY KEY` is the one row per run (`runs.id`); the FK is the run's own id
+    // and nothing else, so a pruned run simply orphans a row that no query joins from.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_run_provenance (
+  run_id         INTEGER NOT NULL PRIMARY KEY,
+  harness        TEXT    NOT NULL DEFAULT '',
+  harness_origin TEXT    NOT NULL DEFAULT '',
+  model          TEXT    NOT NULL DEFAULT '',
+  model_origin   TEXT    NOT NULL DEFAULT '',
+  provider       TEXT    NOT NULL DEFAULT ''
 );
 "#,
 ];
@@ -391,6 +411,32 @@ fn map_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
         usage_estimated: row.get(18)?,
         team_id: row.get(19)?,
     })
+}
+
+/// The `rhapsody_run_provenance` value columns, in DDL order — the single shared list for every
+/// provenance read, read positionally by [`map_run_provenance`].
+const PROVENANCE_COLS: &str = "harness, harness_origin, model, model_origin, provider";
+
+/// How many run ids [`Sqlite::load_run_provenances`] binds per statement. Well under SQLite's
+/// 32766-variable ceiling, and small enough that a very large page is a few queries rather than one
+/// that fails closed (STUDIO-909 round 1).
+const PROVENANCE_BIND_CHUNK: usize = 500;
+
+/// Map a provenance row starting at column `off` (0 for a bare [`PROVENANCE_COLS`] select; 1 when
+/// the query leads with `run_id`).
+fn map_run_provenance_at(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<RunProvenance> {
+    Ok(RunProvenance {
+        harness: row.get(off)?,
+        harness_origin: row.get(off + 1)?,
+        model: row.get(off + 2)?,
+        model_origin: row.get(off + 3)?,
+        provider: row.get(off + 4)?,
+    })
+}
+
+/// Map one `rhapsody_run_provenance` row selected as [`PROVENANCE_COLS`].
+fn map_run_provenance(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunProvenance> {
+    map_run_provenance_at(row, 0)
 }
 
 /// Build the ` WHERE …` clause (empty string when unfiltered) and its bound arguments for a
@@ -843,6 +889,108 @@ impl Store for Sqlite {
         } else {
             Ok(Some(runs.remove(0)))
         }
+    }
+
+    fn set_run_provenance(&self, run_id: i64, p: &RunProvenance) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // UPSERT on the run id: provenance is written once at dispatch, but a re-dispatch of the
+        // same run id (impossible today) must overwrite rather than fail a PRIMARY KEY constraint.
+        conn.execute(
+            "INSERT INTO rhapsody_run_provenance
+               (run_id, harness, harness_origin, model, model_origin, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id) DO UPDATE SET
+               harness = excluded.harness, harness_origin = excluded.harness_origin,
+               model = excluded.model, model_origin = excluded.model_origin,
+               provider = excluded.provider",
+            params![
+                run_id,
+                p.harness,
+                p.harness_origin,
+                p.model,
+                p.model_origin,
+                p.provider,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROVENANCE_COLS} FROM rhapsody_run_provenance WHERE run_id = ?1"
+        ))?;
+        let mut rows = stmt.query_map([run_id], map_run_provenance)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
+        if run_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.lock();
+        let mut out = std::collections::HashMap::new();
+        // Chunked because `/api/v1/history/issues?limit=` is caller-controlled and `effective_run_limit`
+        // caps nothing, so one page can carry more ids than SQLite allows bind variables in a single
+        // statement (32766). Un-chunked, that fails closed — `unwrap_or_default()` on the caller side
+        // silently drops EVERY badge on the page, not just the overflowing ones (STUDIO-909 round 1).
+        for chunk in run_ids.chunks(PROVENANCE_BIND_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let q = format!(
+                "SELECT run_id, {PROVENANCE_COLS} FROM rhapsody_run_provenance \
+                  WHERE run_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&q)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |row| {
+                Ok((row.get::<_, i64>(0)?, map_run_provenance_at(row, 1)?))
+            })?;
+            for r in rows {
+                let (id, p) = r?;
+                out.insert(id, p);
+            }
+        }
+        Ok(out)
+    }
+
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
+        let conn = self.lock();
+        // Time-filtered on `started_at` exactly like `day_totals`, so `providers` and `runs` /
+        // `total_tokens` on the same `/history/summary` response describe one window (STUDIO-909
+        // round 1). A pre-window run with provenance must NOT appear in a bucket: the whole point of
+        // the field is the per-window cost split, and an unbounded lifetime total cannot be
+        // reconciled with the totals beside it.
+        let mut stmt = conn.prepare(
+            "SELECT p.provider,
+                    COUNT(*),
+                    COALESCE(SUM(r.input_tokens), 0),
+                    COALESCE(SUM(r.output_tokens), 0),
+                    COALESCE(SUM(r.total_tokens), 0)
+               FROM runs r
+               JOIN rhapsody_run_provenance p ON p.run_id = r.id
+              WHERE r.started_at >= ?1
+              GROUP BY p.provider
+              ORDER BY COUNT(*) DESC, p.provider ASC",
+        )?;
+        let rows = stmt.query_map([since], |row| {
+            Ok(ProviderTokens {
+                provider: row.get(0)?,
+                runs: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                total_tokens: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError> {
@@ -3389,6 +3537,202 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Per-run provenance (STUDIO-909)
+    // ---------------------------------------------------------------------------------------------
+
+    fn provenance_fixture(harness: &str, model: &str, provider: &str) -> RunProvenance {
+        RunProvenance {
+            harness: harness.into(),
+            harness_origin: "profile".into(),
+            model: model.into(),
+            model_origin: format!("review.model.{harness}"),
+            provider: provider.into(),
+        }
+    }
+
+    fn start_provenance_run(store: &Sqlite, key: &str) -> i64 {
+        store
+            .start_run(RunStart {
+                issue_id: format!("iss_{key}"),
+                issue_identifier: key.into(),
+                title: format!("run {key}"),
+                started_at: "2026-09-15T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start_run")
+    }
+
+    // Provenance round-trips through its own table, and a run that never recorded any reads back as
+    // `None` — the "unknown" the console renders for a pre-STUDIO-909 row rather than a guess.
+    #[test]
+    fn run_provenance_round_trips_and_is_absent_for_a_legacy_run() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let with = start_provenance_run(&store, "with");
+        let legacy = start_provenance_run(&store, "legacy");
+        let p = provenance_fixture(
+            "opencode",
+            "fireworks-ai/deepseek-v4p1-flash",
+            "fireworks-ai",
+        );
+        store.set_run_provenance(with, &p).expect("set");
+
+        assert_eq!(store.run_provenance(with).expect("get"), Some(p.clone()));
+        assert_eq!(store.run_provenance(legacy).expect("get"), None);
+
+        // The page read returns only the runs that HAVE a row; a legacy id is absent, not zeroed.
+        let batch = store.load_run_provenances(&[with, legacy]).expect("batch");
+        assert_eq!(batch.get(&with), Some(&p));
+        assert!(!batch.contains_key(&legacy));
+        assert!(store.load_run_provenances(&[]).expect("empty").is_empty());
+
+        // A rewrite replaces the row rather than failing on the primary key.
+        let rewritten = provenance_fixture("claude", "claude-sonnet-4", "anthropic");
+        store.set_run_provenance(with, &rewritten).expect("rewrite");
+        assert_eq!(store.run_provenance(with).expect("get"), Some(rewritten));
+    }
+
+    // The cost question this exists to answer: every token in the WINDOW attributed to the provider
+    // that spent it, summed over that window's rows rather than one page. A run with no provenance
+    // row is a different bucket — it is absent entirely, never folded into the empty-string provider
+    // — and a run BEFORE the window is excluded, so `providers` decomposes `day_totals`'s totals
+    // rather than an unbounded lifetime figure sitting beside a windowed one (STUDIO-909 round 1).
+    #[test]
+    fn tokens_by_provider_sums_every_matching_run_in_the_window() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let fireworks_a = start_provenance_run(&store, "fw-a");
+        let fireworks_b = start_provenance_run(&store, "fw-b");
+        let anthropic = start_provenance_run(&store, "an");
+        let unattributed = start_provenance_run(&store, "none");
+        for (id, p) in [
+            (
+                fireworks_a,
+                provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            ),
+            (
+                fireworks_b,
+                provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            ),
+            (
+                anthropic,
+                provenance_fixture("claude", "claude-sonnet-4", "anthropic"),
+            ),
+        ] {
+            store.set_run_provenance(id, &p).expect("set");
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: OUTCOME_COMPLETED.into(),
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 120,
+                        ..Default::default()
+                    },
+                )
+                .expect("end");
+        }
+        // No provenance row: its tokens must not appear under any provider.
+        store
+            .end_run(
+                unattributed,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 9999,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        // BEFORE the window, with provenance: it must not be bucketed, or `providers` would answer a
+        // different question than the `day_totals` it ships beside.
+        let before = store
+            .start_run(RunStart {
+                issue_id: "iss_old".into(),
+                issue_identifier: "old".into(),
+                title: "pre-window".into(),
+                started_at: "2026-09-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start pre-window");
+        store
+            .set_run_provenance(
+                before,
+                &provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            )
+            .expect("set pre-window");
+        store
+            .end_run(
+                before,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 5000,
+                    ..Default::default()
+                },
+            )
+            .expect("end pre-window");
+
+        let tallies = store
+            .tokens_by_provider("2026-09-15T00:00:00Z")
+            .expect("tokens_by_provider");
+        assert_eq!(
+            tallies.len(),
+            2,
+            "only the two attributed providers: {tallies:?}"
+        );
+        let fw = &tallies[0];
+        assert_eq!(fw.provider, "fireworks-ai");
+        assert_eq!(fw.runs, 2);
+        assert_eq!(fw.input_tokens, 200);
+        assert_eq!(fw.output_tokens, 20);
+        assert_eq!(fw.total_tokens, 240);
+        let an = &tallies[1];
+        assert_eq!(an.provider, "anthropic");
+        assert_eq!(an.runs, 1);
+        assert_eq!(an.total_tokens, 120);
+        assert!(
+            tallies.iter().all(|t| t.total_tokens != 9999),
+            "an unattributed run has no provider to be summed under"
+        );
+        assert!(
+            tallies.iter().all(|t| t.total_tokens != 5000),
+            "a run before the window must not be bucketed: {tallies:?}"
+        );
+    }
+
+    // A database already at the shipped step-9 schema gains the provenance table rather than
+    // re-running an earlier step or failing; it starts empty, so every pre-existing run stays
+    // "unknown".
+    #[test]
+    fn a_v9_database_gains_the_provenance_table_empty() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v9.db");
+        {
+            let mut conn = Connection::open(&db).expect("open raw");
+            let tx = conn.transaction().expect("tx");
+            for m in &MIGRATIONS[0..9] {
+                tx.execute_batch(m).expect("apply step");
+            }
+            tx.execute_batch("PRAGMA user_version = 9")
+                .expect("stamp v9");
+            tx.commit().expect("commit");
+        }
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("migrate forward");
+        let version: i64 = store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let runs = store.list_runs(RunFilter::default()).expect("list");
+        assert!(runs.is_empty());
+        assert!(
+            store
+                .tokens_by_provider("1970-01-01T00:00:00Z")
+                .expect("tally")
+                .is_empty()
+        );
+    }
+
     // A database already at the shipped step-7 schema migrates forward to step 8 rather than
     // re-running step 7 (which would not add the column) or failing: the ALTER backfills every
     // existing row with the empty author the selection path fails closed on.
@@ -3803,6 +4147,7 @@ mod tests {
             vec![
                 "rhapsody_review_watch".to_string(),
                 "rhapsody_summon_watermark".to_string(),
+                "rhapsody_run_provenance".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

@@ -12,9 +12,11 @@
 //! INF-250) — consumed only by the run-messages handler in this write lane, so it lands with that
 //! handler rather than earlier.
 
+use std::collections::HashMap;
+
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ReviewWatchRow, RunFilter, RunMessage,
-    RunSummary, StoreError,
+    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens, ReviewWatchRow,
+    RunFilter, RunMessage, RunProvenance, RunSummary, StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -60,6 +62,21 @@ pub trait HistoryStore: Send + Sync {
     /// retirement is a soft delete, so a merged pull request's row survives, and the run it
     /// produced stays in this listing long after the watcher has stopped caring about it.
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
+    /// One run's recorded provenance — harness, model, provider and the origin of the configurable
+    /// values (`GET /api/v1/runs/{id}/provenance`, STUDIO-909). `Ok(None)` for a run that predates
+    /// the feature, which is the honest "unknown" rather than a zero value. Rhapsody-only; Go
+    /// records no such thing.
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError>;
+    /// The provenance of a PAGE of runs in one query, keyed by run id, decorating
+    /// `GET /api/v1/history/issues` with each row's provider (STUDIO-909). Missing ids are absent.
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<HashMap<i64, RunProvenance>, StoreError>;
+    /// Token totals grouped by recorded provider over the same window as `day_totals` — the
+    /// cost-attribution tally the dashboard's summary carries (STUDIO-909). Rhapsody-only; Go cannot
+    /// attribute a token at all.
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
 }
 
 /// Every thread-safe [`rhapsody_store::Store`] is a [`HistoryStore`] — the Rust analog of Go's
@@ -103,5 +120,17 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     }
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
         rhapsody_store::Store::load_review_watch(self)
+    }
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
+        rhapsody_store::Store::run_provenance(self, run_id)
+    }
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<HashMap<i64, RunProvenance>, StoreError> {
+        rhapsody_store::Store::load_run_provenances(self, run_ids)
+    }
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
+        rhapsody_store::Store::tokens_by_provider(self, since)
     }
 }

@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow, review};
-use rhapsody_store::{DayRollup, DayTotals, EventHit, EventRow, RunSummary};
+use rhapsody_store::{
+    DayRollup, DayTotals, EventHit, EventRow, ProviderTokens, RunProvenance, RunSummary,
+};
 use serde_json::{Value, json};
 
 /// Bounds the activity timeline a finished run's detail carries, matching the live snapshot's
@@ -237,6 +239,7 @@ pub(crate) fn issue_runs_response(
     assignees: &HashMap<String, String>,
     reviews: &HashSet<String>,
     review_origins: &HashMap<String, String>,
+    provenances: &HashMap<i64, RunProvenance>,
 ) -> Value {
     let issues: Vec<Value> = runs
         .iter()
@@ -245,6 +248,14 @@ pub(crate) fn issue_runs_response(
             let Some(obj) = row.as_object_mut() else {
                 return row;
             };
+            // The compact PROVIDER badge this row scans by (STUDIO-909): "which of these four runs
+            // is on Fireworks" is a scanning question, so the listing carries just the provider
+            // (the full harness/model/origins live on the run detail's own endpoint). Absent — never
+            // empty — for a run that recorded none, so a legacy row renders as it did before the
+            // field existed.
+            if let Some(p) = provenances.get(&r.id).filter(|p| !p.provider.is_empty()) {
+                obj.insert("provider".to_string(), json!(p.provider));
+            }
             if let Some(life) = lifecycles.get(&r.issue_id) {
                 obj.insert("tracker_state".to_string(), json!(life.state));
                 obj.insert("lifecycle".to_string(), json!(life.lifecycle.as_str()));
@@ -343,7 +354,20 @@ pub(crate) fn issue_counts_response(buckets: &BTreeMap<IssueStatusKey, i64>) -> 
 /// `total_tokens` is the cache-INCLUSIVE billed total (`cached = total − in − out`), unchanged in
 /// meaning from the per-run column. `rhythm` is the most recent runs' `total_tokens`, oldest→newest.
 /// Rhapsody-only — Go has no day-summary endpoint.
-pub(crate) fn history_summary_response(since: &str, t: &DayTotals, rhythm: &[i64]) -> Value {
+///
+/// `providers` (STUDIO-909) is the same window's tokens split by the provider each run actually
+/// billed — the whole point of running two providers, and unanswerable while a run's tokens could
+/// not be attributed to one. Aggregated in SQL, like every other figure here, so it is never a fold
+/// over one fetched page; and time-filtered on `started_at` like `day_totals`, so `providers`
+/// decomposes the `total_tokens` beside it rather than reporting a lifetime total under the same
+/// heading. A legacy run with no recorded provider is absent from every bucket, not folded into a
+/// nameless one.
+pub(crate) fn history_summary_response(
+    since: &str,
+    t: &DayTotals,
+    rhythm: &[i64],
+    providers: &[ProviderTokens],
+) -> Value {
     json!({
         "since": since,
         "runs": t.runs,
@@ -353,7 +377,46 @@ pub(crate) fn history_summary_response(since: &str, t: &DayTotals, rhythm: &[i64
         "total_tokens": t.total_tokens,
         "seconds": t.seconds,
         "rhythm": Value::Array(rhythm.iter().map(|v| json!(v)).collect()),
+        "providers": Value::Array(
+            providers
+                .iter()
+                .map(|p| json!({
+                    "provider": p.provider,
+                    "runs": p.runs,
+                    "input_tokens": p.input_tokens,
+                    "output_tokens": p.output_tokens,
+                    "total_tokens": p.total_tokens,
+                }))
+                .collect(),
+        ),
     })
+}
+
+/// `{run_id, harness?, harness_origin?, model?, model_origin?, provider?}` — the
+/// `GET /api/v1/runs/{id}/provenance` payload (STUDIO-909). Each field is OMITTED when the run
+/// recorded nothing for it, so a run started before this feature renders as unknown rather than a
+/// guessed value; `harness_origin`/`model_origin` name the config key the value came from, which is
+/// what makes an invisible override (`review.model.opencode`) visible.
+///
+/// Rhapsody-only — Go records none of it. Kept a separate additive endpoint rather than fields on
+/// `GET /api/v1/runs/{id}`, whose body is byte-pinned to the Go capture by `api/run_detail.json`.
+pub(crate) fn run_provenance_response(run_id: i64, p: Option<&RunProvenance>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("run_id".to_string(), json!(run_id));
+    if let Some(p) = p {
+        for (key, value) in [
+            ("harness", &p.harness),
+            ("harness_origin", &p.harness_origin),
+            ("model", &p.model),
+            ("model_origin", &p.model_origin),
+            ("provider", &p.provider),
+        ] {
+            if !value.is_empty() {
+                obj.insert(key.to_string(), json!(value));
+            }
+        }
+    }
+    Value::Object(obj)
 }
 
 /// `{issue_identifier, runs:[…]}` — the `GET /api/v1/issues/{id}/history` payload. Mirrors Go

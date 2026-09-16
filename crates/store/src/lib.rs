@@ -6,6 +6,7 @@
 //! implementations: [`Sqlite`] (pure-in-process SQLite via `rusqlite`, WAL mode) and [`Noop`]
 //! (the guard-free disabled store used when `storage.path: off`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod noop;
@@ -183,6 +184,36 @@ pub trait Store {
     /// the question. It reads the existing `runs` table and adds no column, index or migration.
     fn earliest_run_start(&self) -> Result<Option<String>, StoreError>;
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
+
+    // --- per-run provenance (STUDIO-909) ---
+    // Additive Rhapsody-only surface with no Go counterpart: the frozen reference records nothing
+    // about what ran a run. Written once at dispatch and never rewritten, so a later config
+    // hot-reload cannot change what a past run says it ran on. Backed by the
+    // `rhapsody_run_provenance` table (see the README "Divergences" entry); a run with no row is
+    // "unknown", which is why [`Store::run_provenance`] returns `None` rather than a zero value.
+    //
+    // [`Store::set_run_provenance`] inserts (upserting on `run_id`) unconditionally and does not
+    // check that `run_id` names a live `runs` row; callers pass the id [`Store::start_run`]
+    // returned.
+    fn set_run_provenance(&self, run_id: i64, p: &RunProvenance) -> Result<(), StoreError>;
+    /// One run's provenance, or `Ok(None)` when the run predates this feature (or recorded nothing).
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError>;
+    /// Provenance for a PAGE of run ids in one query, keyed by run id. Missing ids are absent from
+    /// the map — the same "no answer" [`Store::run_provenance`] returns, batched so a listing never
+    /// pays a query per row.
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<HashMap<i64, RunProvenance>, StoreError>;
+    /// Token totals grouped by recorded provider over the runs that started at or after `since` —
+    /// the cost-attribution question this feature exists to answer, scoped to the same window as
+    /// [`Store::day_totals`] so the two figures can be read beside each other. One row per distinct
+    /// provider, empty provider included, run count descending then provider ascending so the order
+    /// is stable.
+    ///
+    /// The window is the point (STUDIO-909 round 1): a lifetime total rendered under a "today"
+    /// heading answers a question nobody asked and cannot be reconciled with `day_totals`.
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
 
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`

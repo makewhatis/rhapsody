@@ -326,7 +326,17 @@ function JobsRow({
           {jobLead(row)}
           {row.title === "" ? "" : ` · ${row.title}`}
         </div>
-        <div className="pj">{row.project}</div>
+        {/* The compact provider badge (STUDIO-909): "which of these runs is on Fireworks" is a
+            scanning question, so the provider sits beside the project with no drill-down. Absent for
+            a run that recorded none, so a legacy row reads exactly as it did before the field. */}
+        <div className="pj">
+          {row.project}
+          {row.provider === "" ? null : (
+            <span className="provbadge" title={`ran on ${row.provider}`}>
+              {row.provider}
+            </span>
+          )}
+        </div>
       </td>
       <td>
         {row.assignee === "" ? (
