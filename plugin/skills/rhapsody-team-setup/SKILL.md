@@ -91,8 +91,22 @@ extends: swe
   just text, and there is no interpolation surface.
 
 Optional front matter, all inherited from the built-in when omitted: `model`, `effort`,
-`capabilities`, `tools`. (`tools` is parsed and reported by `teams show`, but does not yet
-gate anything — do not rely on it to restrict a teammate.)
+`harness`, `capabilities`, `tools`. (`tools` is parsed and reported by `teams show`, but does not
+yet gate anything — do not rely on it to restrict a teammate.)
+
+- **`harness`** — which coding-agent backend this teammate's runs use: `claude` or `opencode`
+  today (`codex` is a recognized name with no runner yet, and falls back to the configured backend
+  with a warning rather than failing the run). Empty is the shipped default for every built-in and
+  means **inherit the daemon's configured `agent.backend`** — the same absent-means-inherit rule
+  `model`/`effort` already follow, *not* a fork the way an absent `extends:` is. `rhapsodyd teams
+  show <name>` renders the resolved value with its origin, and marks it when this build can't
+  actually run it.
+
+⚠️ **A model name means nothing without its harness.** Setting `model: claude-opus-5` on a profile
+that also sets `harness: opencode` hands that CLI a Claude model name — the provider rejects it
+outright, and every run wearing that profile fails. If a profile sets `harness`, its `model` (and
+any `review.model` entry aimed at it — see `rhapsody-teams`'s Review section) must be a model that
+harness actually recognizes.
 
 ⚠️ **Rhapsody only ever *reads* profile files.** The one exception in the whole feature is
 `rhapsodyd teams fork <profile>`, which materialises a resolved copy on an explicit command.
@@ -172,8 +186,8 @@ repo has genuinely separate areas, not by giving one a thinner profile.
 
 ## What not to do
 
-- Don't invent front-matter fields. The set is `extends`, `model`, `effort`, `capabilities`,
-  `tools` — everything else belongs in the body.
+- Don't invent front-matter fields. The set is `extends`, `model`, `effort`, `harness`,
+  `capabilities`, `tools` — everything else belongs in the body.
 - Don't put a person's name, a bank id, or history in a profile. It is a role.
 - Don't restate the built-in's engineering discipline; `{{ base }}` already includes it.
 - Don't set the Linear **assignee** to route work — that field is the daemon's claim lock.
