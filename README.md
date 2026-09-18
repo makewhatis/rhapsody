@@ -1227,8 +1227,8 @@ projects:
 
 A project with no matching entry — and an entry that sets no `auto_merge` — inherits the top-level
 value in both directions, so a project that has never been configured behaves exactly as it did
-before the block existed. A malformed entry is a rejected `teams.yaml`, which degrades to Teams-off
-(and `rhapsodyd teams show` reports the reason), never a silently-ignored override.
+before the block existed. An entry with the wrong *type* where a list or a boolean belongs is a
+rejected `teams.yaml`, which degrades to Teams-off (and `rhapsodyd teams show` reports the reason).
 
 **The verdict is data, never prose.** `gh pr review --approve` errors on this install (GitHub
 refuses a self-review from the account that authored the pull request), so `reviewDecision` is empty
