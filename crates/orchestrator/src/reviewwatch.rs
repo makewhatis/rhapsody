@@ -59,9 +59,11 @@
 //!
 //! Asking GitHub where a pull request stands is a `gh` call, and [`crate::ghsummons::GH`] shells out
 //! through a synchronous `std::process::Command` — off-task and bounded since STUDIO-829, but still
-//! a round trip per watched pull request. [`run_review_watch_task`] owns every one of them,
-//! holds no `Orchestrator` and takes no lock the control task takes — the same structural
-//! containment [`crate::prstate`] was built for and documents. What comes back crosses to the
+//! a round trip per watched pull request. [`run_review_watch_task`] owns every one of them, holds
+//! no `Orchestrator`, and the only lock it shares with the control task is
+//! [`crate::runautomerge::AutoMergeLedger`]'s — taken read-only by the control task through
+//! [`crate::runautomerge::AutoMergeLedger::peek`] (STUDIO-923) — the same structural containment
+//! [`crate::prstate`] was built for and documents. What comes back crosses to the
 //! control task as ONE [`Event::ReviewSweep`], where the watch set stays single-writer beside
 //! `dispatch_review` and `handle_review_introduce`, and where `running`/`claimed` can be read
 //! without a race.

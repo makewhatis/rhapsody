@@ -318,6 +318,7 @@ mod tests {
             ticket: "STUDIO-893".to_string(),
             reviewer: "jimmy".to_string(),
             stale_secs: 21_600,
+            auto_merge_reason: None,
         }];
 
         let rendered = render(&o.build_snapshot());

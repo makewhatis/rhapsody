@@ -185,6 +185,16 @@ pub struct Divergence {
     /// Seconds since the party owing the next move started owing it. Always greater than
     /// [`RECONCILE_STALE_AFTER`] — it IS the staleness the threshold was crossed by.
     pub stale_secs: i64,
+    /// What [`crate::runautomerge::AutoMergeLedger`] has most recently SAID about this pull request,
+    /// `None` unless [`DivergenceKind::ApprovedStillOpen`] and the ledger holds an entry for it
+    /// (STUDIO-923). Not a cause the sweep worked out — [`reconcile_pr`] never sets this, it is
+    /// filled in afterward by [`Orchestrator::reconcile_review_divergence`] from a sibling module's
+    /// own already-decided report — so it does not weaken the doc above: the sweep still invents
+    /// nothing, it just repeats a fact this process already has. Read by
+    /// [`Orchestrator::set_review_divergences`] to enrich the WARN line; deliberately NOT rendered
+    /// onto `/api/v1/state` (`snapshot_json::render` enumerates fields explicitly and this is not
+    /// among them) — the ticket's ask is the human-facing log report, not a wire-shape change.
+    pub auto_merge_reason: Option<&'static str>,
 }
 
 /// When one run started, and whether it has finished. The only two facts about a `runs` row the
@@ -296,6 +306,9 @@ pub(crate) fn reconcile_pr(
                     .unwrap_or_default(),
                 reviewer: String::new(),
                 stale_secs,
+                // Filled in by the caller ([`Orchestrator::reconcile_review_divergence`]), which
+                // has the ledger this pure function deliberately does not.
+                auto_merge_reason: None,
             });
         }
         return None;
@@ -339,6 +352,7 @@ fn row_divergence(
                 ticket: row.ticket.clone(),
                 reviewer: row.reviewer.clone(),
                 stale_secs: stale_secs(now, anchor, stale_after)?,
+                auto_merge_reason: None,
             })
         }
         // A round ENDED without the agent ever declaring it had finished, so the round is owed
@@ -357,6 +371,7 @@ fn row_divergence(
                 ticket: row.ticket.clone(),
                 reviewer: row.reviewer.clone(),
                 stale_secs: stale_secs(now, attempt.last_at(), stale_after)?,
+                auto_merge_reason: None,
             })
         }
         // A round is owed and the REVIEWER owes it, and no run for this head has been recorded yet.
@@ -392,6 +407,7 @@ fn row_divergence(
                 ticket: row.ticket.clone(),
                 reviewer: row.reviewer.clone(),
                 stale_secs: stale_secs(now, anchor, stale_after)?,
+                auto_merge_reason: None,
             })
         }
         // `approved` is decided above (and, with auto-merge off, is a healthy wait for a human);
@@ -486,8 +502,20 @@ impl Orchestrator {
         let now = (self.now)();
         let found: Vec<Divergence> = order
             .iter()
-            .filter_map(|pr| by_pr.get(pr))
-            .filter_map(|facts| reconcile_pr(facts, now, RECONCILE_STALE_AFTER))
+            .filter_map(|pr| by_pr.get(pr).map(|facts| (pr, facts)))
+            .filter_map(|(pr, facts)| {
+                let mut d = reconcile_pr(facts, now, RECONCILE_STALE_AFTER)?;
+                // The one place this sweep reads the auto-merge ledger (STUDIO-923): only for
+                // `ApprovedStillOpen`, the one divergence auto-merge would itself be attempting a
+                // merge against — the ledger has nothing meaningful to say about a pull request
+                // still owed a review round. A `None` here is silent either way: no ledger handle
+                // (the review watcher never spawned) and no entry for this coordinate (auto-merge
+                // off, or this head never reached a gate) both fall back to the plain wording.
+                if d.kind == DivergenceKind::ApprovedStillOpen {
+                    d.auto_merge_reason = self.automerge_ledger.as_ref().and_then(|l| l.peek(pr));
+                }
+                Some(d)
+            })
             .collect();
         self.set_review_divergences(found);
     }
@@ -530,18 +558,46 @@ impl Orchestrator {
             // The crossing sweep and the rate-limited repeats in ONE condition: at the crossing the
             // count is 1, and `1 - 1` is a multiple of everything.
             if (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
-                tracing::warn!(
-                    pr = %d.pr,
-                    kind = d.kind.as_str(),
-                    ticket = %d.ticket,
-                    reviewer = %d.reviewer,
-                    stale_secs = d.stale_secs,
-                    sweeps,
-                    "review reconciliation: {} — {}. Nothing is progressing it and nothing has \
-                     reported it blocked; this sweep only reports, so it needs a human.",
-                    d.pr,
-                    d.kind.detail()
-                );
+                // STUDIO-923: when auto-merge has already said something about this exact pull
+                // request, name it instead of claiming nothing has. The sentence states no count:
+                // auto-merge's own attempts run on the review watcher's separate
+                // `PR_STATE_POLL_INTERVAL` cadence (120s), not this sweep's `polling.interval_ms`
+                // (default 30s), so this sweep's own `sweeps` field would misstate auto-merge's
+                // tally as its own — trading the ticket's false negative for a false positive. No
+                // ledger entry (auto-merge off, or this head never reached a gate) falls back to the
+                // original wording unchanged.
+                match d.auto_merge_reason {
+                    Some(reason) => {
+                        tracing::warn!(
+                            pr = %d.pr,
+                            kind = d.kind.as_str(),
+                            ticket = %d.ticket,
+                            reviewer = %d.reviewer,
+                            stale_secs = d.stale_secs,
+                            sweeps,
+                            auto_merge_reason = reason,
+                            "review reconciliation: {} — {}. Auto-merge has been declining it: {}. \
+                             This sweep only reports, so it needs a human.",
+                            d.pr,
+                            d.kind.detail(),
+                            reason
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            pr = %d.pr,
+                            kind = d.kind.as_str(),
+                            ticket = %d.ticket,
+                            reviewer = %d.reviewer,
+                            stale_secs = d.stale_secs,
+                            sweeps,
+                            "review reconciliation: {} — {}. Nothing is progressing it and nothing \
+                             has reported it blocked; this sweep only reports, so it needs a human.",
+                            d.pr,
+                            d.kind.detail()
+                        );
+                    }
+                }
             }
         }
         // Recovery is news exactly once, and only for a pull request that was actually REPORTED.
@@ -1246,6 +1302,34 @@ mod store_tests {
             .expect("completed");
     }
 
+    /// Seeds one watch row that has been APPROVED at `HEAD` — divergence (b)'s shape, the one
+    /// auto-merge itself would be attempting to merge.
+    fn approved_row(o: &Orchestrator, reviewer: &str, ticket: &str) {
+        let key = ReviewWatchKey {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 164,
+            reviewer: reviewer.to_string(),
+        };
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                author: "jimmy".to_string(),
+                introduced_by: format!("handoff:{ticket}"),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: String::new(),
+                open: true,
+            })
+            .expect("seed the row");
+        o.store()
+            .mark_review_requested(&key, HEAD)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key, HEAD, REVIEW_STATUS_APPROVED)
+            .expect("completed");
+    }
+
     /// Records one finished run of `identifier`.
     fn run(o: &Orchestrator, identifier: &str, started: &str, ended: &str) {
         let id = o
@@ -1424,6 +1508,120 @@ mod store_tests {
                 .len(),
             runs_before.len(),
             "no run was started"
+        );
+    }
+
+    /// STUDIO-923: when auto-merge has already declined the SAME pull request this sweep is
+    /// independently reporting `ApprovedStillOpen`, the WARN names the reason instead of claiming
+    /// nothing has reported it blocked. It states no count: this sweep's own `sweeps` field runs on
+    /// a different cadence than auto-merge's attempts (`PR_STATE_POLL_INTERVAL` vs
+    /// `polling.interval_ms`), so asserting it as auto-merge's tally would trade one false claim
+    /// for another.
+    ///
+    /// Mutation check: revert the enriched arm's message back to the hardcoded "nothing has
+    /// reported it blocked" wording and this test reds — it asserts on WHAT was said, not merely
+    /// that a WARN fired.
+    #[test]
+    fn approved_and_open_names_the_auto_merge_reason() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+
+        let ledger = Arc::new(crate::runautomerge::AutoMergeLedger::default());
+        ledger.test_seed(
+            &PrCoord::new("makewhatis", "rhapsody", 164),
+            HEAD,
+            "the pull request is still a draft",
+        );
+        o.automerge_ledger = Some(ledger);
+
+        // `tracing`'s per-callsite Interest cache only gets REBUILT for a callsite that has
+        // already executed at least once (`testsupport::TRACING_TEST_LOCK`'s own doc: a brand new
+        // callsite's FIRST hit can race a concurrently-running test on another thread). This
+        // enriched-message callsite is exercised by no other test in the suite, so one uncaptured
+        // warm-up call registers it before the real, captured call depends on it; resetting the
+        // sweep counter after keeps the assertion below about the FIRST crossing, not the second.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message
+                .contains("Auto-merge has been declining it: the pull request is still a draft."),
+            "got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("nothing has reported it blocked"),
+            "the enriched line must replace the fallback wording, not sit beside it: {}",
+            warn.message
+        );
+    }
+
+    /// The other half of the acceptance: approved, open, auto-merge ON, but the ledger holds
+    /// nothing for this pull request — it never reached a gate, or this daemon's off-loop half was
+    /// never built. The report keeps its original wording, unenriched.
+    #[test]
+    fn approved_and_open_with_no_ledger_entry_keeps_the_plain_wording() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        approved_row(o, "jimmy", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "jimmy"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:45:00Z",
+        );
+        // No `o.automerge_ledger` at all — the review watcher never spawned.
+        assert!(o.automerge_ledger.is_none());
+
+        // See the sibling test above for why this warm-up call exists: this fallback-message
+        // callsite is likewise exercised by no other test, so it needs the same registration
+        // before the real, captured call.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains(
+                "Nothing is progressing it and nothing has reported it blocked; this sweep only \
+                 reports, so it needs a human."
+            ),
+            "got: {}",
+            warn.message
+        );
+        assert!(
+            !warn.message.contains("Auto-merge has declined"),
+            "no ledger entry must never invent a decline count: {}",
+            warn.message
         );
     }
 }

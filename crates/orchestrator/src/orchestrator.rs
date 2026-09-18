@@ -600,6 +600,20 @@ pub struct Orchestrator {
     /// Separate from [`Orchestrator::review_divergence`] because it must SURVIVE a sweep that
     /// reports the same pull request again; the vector above is replaced wholesale.
     pub(crate) review_divergent: HashMap<String, usize>,
+    /// Read-only handle onto the off-loop auto-merge half's own report of what it has already SAID
+    /// about a pull request ([`crate::runautomerge::AutoMergeLedger`], STUDIO-874) — the control
+    /// task never writes it. Shared for one reason (STUDIO-923):
+    /// [`Orchestrator::reconcile_review_divergence`] independently reports an approved-and-open
+    /// pull request as diverged, and when auto-merge has been declining that SAME pull request the
+    /// whole time, its report should name the reason instead of claiming nothing has said anything.
+    /// `None` whenever the off-loop half was never built — the review watcher did not spawn — and
+    /// the sweep then falls back to its unenriched wording; see `runautomerge`'s module doc for why
+    /// a refusal is otherwise never surfaced outside the log.
+    ///
+    /// `pub`, like [`Orchestrator::merge_deps`]/[`Orchestrator::diff_deps`] beside it: the daemon's
+    /// composition root (`rhapsodyd::run`) sets it before `o.run()` moves the orchestrator into the
+    /// control task, the same inject-before-`run()` pattern that crate's `CLAUDE.md` documents.
+    pub automerge_ledger: Option<Arc<crate::runautomerge::AutoMergeLedger>>,
     /// Pull-request coordinates a console merge is currently attempting, and since when
     /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
     /// id, because two runs of one ticket share a branch and therefore share the pull request a
@@ -849,6 +863,7 @@ impl Orchestrator {
             review_unassignable: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
+            automerge_ledger: None,
             merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),

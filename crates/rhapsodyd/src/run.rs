@@ -761,6 +761,19 @@ where
         })
     });
 
+    // The auto-merge ledger (STUDIO-874), built HERE — beside `triage_seam` above and for the same
+    // reason — so the SAME `Arc` can go to two consumers: the off-loop `AutoMergeDeps` below, which
+    // writes it, and `o.automerge_ledger`, which the control task's reconciliation sweep reads
+    // (STUDIO-923) to name what auto-merge has already said about a pull request it independently
+    // reports diverged.
+    //
+    // Built on exactly `spawn_watcher`'s condition, matching `automerge` below: a ledger nothing
+    // ever writes has nothing to read either, and the sweep's fallback wording covers a `None`
+    // handle without needing one.
+    let automerge_ledger = spawn_watcher
+        .then(|| Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeLedger::default()));
+    o.automerge_ledger = automerge_ledger.clone();
+
     // The watcher task. Its `PrStateSource` is the same `gh` seam the introduction task uses, and
     // like it, the task holds no `Orchestrator`: a hung `gh` parks THIS task and the daemon keeps
     // ticking.
@@ -792,7 +805,12 @@ where
             checks: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
             merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
             allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
-            ledger: Default::default(),
+            // `spawn_watcher` gates both this closure and the ledger above, so this is always
+            // `Some` in practice; the fallback is a fresh, equally-empty ledger rather than a
+            // boot-time panic on a daemon that could otherwise run fine.
+            ledger: automerge_ledger.clone().unwrap_or_else(|| {
+                Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeLedger::default())
+            }),
         });
         let sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone())
             .with_auto_merge(automerge);

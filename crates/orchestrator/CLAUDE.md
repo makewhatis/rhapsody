@@ -19,7 +19,7 @@ the `Orchestrator` struct itself. Concretely:
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
   they never lock anything and must never be called from another task.
-- Six exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+- Seven exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -77,8 +77,22 @@ the `Orchestrator` struct itself. Concretely:
     its own door and give it the same test: forgetting the second one is the failure this feature
     already had once, and the warn is what will tell you if a fifth slips through.
 
+  - `runautomerge.rs`'s `AutoMergeLedger` (`Orchestrator::automerge_ledger:
+    Option<Arc<AutoMergeLedger>>`, STUDIO-923) — a `Mutex`-guarded map the off-loop auto-merge half
+    (`runautomerge.rs`, itself outside this list: it holds no `Orchestrator` and sends no control
+    event) is the ONLY writer of. The control task holds a read-only `Arc` clone, used from exactly
+    one call site — `reviewreconcile.rs`'s reconciliation sweep, through `AutoMergeLedger::peek` —
+    to name what auto-merge has already said about a pull request the sweep is independently
+    reporting diverged (`ApprovedStillOpen`), rather than claiming nothing has said anything about
+    it; this ledger lock is the one lock the control task shares with the off-loop half, and the
+    control task only ever takes it read-only. `None`
+    whenever the review watcher never spawned, which the sweep's fallback wording already covers.
+    `peek` is the only method this crate exposes outside `runautomerge.rs`'s own module, so a
+    second write path here would need its own deliberate exception to "a refusal is not surfaced
+    outside the log", which that module's doc still states and this read does not weaken.
+
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  six seams; if none fits, that's a real design decision — don't reach for a seventh ad hoc
+  seven seams; if none fits, that's a real design decision — don't reach for an eighth ad hoc
   `Arc<Mutex<..>>` without updating this list.
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
