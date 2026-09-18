@@ -1009,11 +1009,20 @@ impl Orchestrator {
     /// behaves exactly as it did before the per-project block existed.
     ///
     /// When several resolved projects share the repo, their answers are ANDed:
-    /// **any** owning project that resolves `false` holds the merge, whichever of
-    /// its slugs the operator named. That is the fail-safe direction — the choice
-    /// this accessor exists to make — because the alternative (first match wins)
-    /// fails OPEN, letting a repo an operator explicitly set aside self-merge
-    /// simply because its override named the second of two slugs.
+    /// **any** owning project that resolves `false` holds the merge. That is the
+    /// fail-safe direction — the choice this accessor exists to make — because the
+    /// alternative (first match wins) fails OPEN, letting a repo an operator
+    /// explicitly set aside self-merge simply because its override named the second
+    /// of two slugs.
+    ///
+    /// The AND cuts both ways, though. Holding a merge back takes naming any ONE
+    /// slug (its sibling inherits the global `true`, and the AND still yields
+    /// `false`); opting a repo back IN under a global `false` takes naming EVERY
+    /// slug of the project, because an unnamed sibling inherits the global `false`
+    /// and holds the merge. That asymmetry is deliberate: the alternative — any
+    /// explicit `false` wins, else any explicit `true`, else global — would let a
+    /// single `true` on a sibling slug override another slug's explicit `false` and
+    /// fail OPEN, which is the direction this accessor exists to prevent.
     pub(crate) fn review_auto_merge_for_repo(&self, owner: &str, repo: &str) -> bool {
         let Some(teams) = self.teams.as_ref() else {
             return false;

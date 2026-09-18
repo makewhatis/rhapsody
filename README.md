@@ -1226,11 +1226,20 @@ projects:
 ```
 
 `slugs:` here are the same values as `WORKFLOW.md`'s own `projects:` list — Linear's opaque
-**`slugId` hex** (`4f4a2350682f`), never the project's display name. A project that fans out to
-several slugs (one Linear project, several repos) may be named by **any** of them: when more than
-one resolved project shares a repo, their answers are ANDed, so any one that resolves `false` holds
-the merge. An entry whose slug matches nothing can never fire, so the daemon warns at boot naming
-every unmatched slug rather than letting a name-where-an-id-belongs look like success.
+**`slugId` hex** (`4f4a2350682f`), never the project's display name. When several resolved projects
+share one repo (a project that fans out to several slugs, or two projects pointing at the same
+repo), their answers are ANDed, so the two directions differ:
+
+- **To hold a merge back** (the overriding direction, `auto_merge: false` under a global `true`),
+  name **any one** of the project's slugs. An unnamed sibling inherits the global `true`, and the
+  AND already yields `false`.
+- **To opt in under a global `false`**, name **every** slug of the project. An unnamed sibling
+  inherits the global `false`, and the AND then yields `false` — so naming only one slug leaves the
+  repo human-merged. This fails closed, but silently: nothing warns that the unnamed sibling is
+  holding it.
+
+An entry whose slug matches nothing can never fire, so the daemon warns at boot naming every
+unmatched slug rather than letting a name-where-an-id-belongs look like success.
 
 A project with no matching entry — and an entry that sets no `auto_merge` — inherits the top-level
 value in both directions, so a project that has never been configured behaves exactly as it did
