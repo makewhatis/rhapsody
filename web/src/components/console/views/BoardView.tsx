@@ -94,7 +94,6 @@ export function BoardView({
         .filter((col) => col.cards.length > 0),
     [columns, filter, project],
   );
-  const total = visible.reduce((n, col) => n + col.cards.length, 0);
 
   const running = counts?.running;
   const capped = maxConcurrent > 0 && (running ?? 0) >= maxConcurrent;
@@ -103,7 +102,7 @@ export function BoardView({
   return (
     <div className="boardwrap">
       {visible.length === 0 ? (
-        <div className="empty">{emptyMessage(columns.length, total)}</div>
+        <div className="empty">{emptyMessage(columns.length)}</div>
       ) : (
         <div className="board">
           {visible.map((col) => (
@@ -155,8 +154,10 @@ export function BoardView({
   );
 }
 
-function emptyMessage(columnCount: number, total: number): string {
-  return columnCount === 0 ? "No jobs yet." : total === 0 ? "No jobs match this filter." : "";
+// Reached only with nothing on screen: no columns at all is an empty store, and columns that were
+// all filtered away is a filter that matched nothing. Same two sentences as the table.
+function emptyMessage(columnCount: number): string {
+  return columnCount === 0 ? "No jobs yet." : "No jobs match this filter.";
 }
 
 // One card. A real activation target like a table row: the whole card opens the ticket's job, so it

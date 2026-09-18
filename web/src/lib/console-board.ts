@@ -43,7 +43,7 @@ export interface PullRequestRef {
 
 // `pr:` then owner then repo then `#n`, optionally `@reviewer`. A plain ticket key — "STUDIO-925" —
 // never matches, which is the whole guard: the parser is only ever answering "is this a review key".
-const PR_IDENTIFIER = /^pr:([^/#\s]+)\/([^#\s]+)#(\d+)(?:@(\S+))?$/;
+const PR_IDENTIFIER = /^pr:([^/#\s]+)\/([^/#\s]+)#(\d+)(?:@(\S+))?$/;
 
 /** Parse a review run's issue key, or `undefined` when it is not one. */
 export function parsePullRequest(identifier: string): PullRequestRef | undefined {
