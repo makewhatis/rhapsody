@@ -662,6 +662,9 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
             self.0.tokens_by_provider(since)
         }
+        fn run_costs(&self) -> Result<Vec<rhapsody_store::RunCostBucket>, StoreError> {
+            self.0.run_costs()
+        }
         fn insert_run_message(&self, id: i64, b: &str, ms: i64) -> Result<i64, StoreError> {
             self.0.insert_run_message(id, b, ms)
         }

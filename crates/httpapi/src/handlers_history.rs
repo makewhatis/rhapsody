@@ -17,10 +17,10 @@ use rhapsody_store::{EventQuery, OUTCOME_RUNNING, RunFilter, effective_run_limit
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
 use crate::responses::{write_error, write_json};
 use crate::responses_history::{
-    IssueStatusKey, event_search_response, history_response, history_summary_response,
-    issue_counts_response, issue_history_response, issue_runs_response, metrics_response,
-    run_detail_from_running, run_detail_from_summary, run_events_response, run_provenance_response,
-    run_transcript_json,
+    IssueStatusKey, event_search_response, history_costs_response, history_response,
+    history_summary_response, issue_counts_response, issue_history_response, issue_runs_response,
+    metrics_response, run_detail_from_running, run_detail_from_summary, run_events_response,
+    run_provenance_response, run_transcript_json,
 };
 use crate::server::StateProvider;
 
@@ -236,6 +236,15 @@ fn review_origins(
         .map(|r| r.issue_id.as_str())
         .filter(|id| review::is_review_key(id))
         .collect();
+    review_origins_for_keys(history, &wanted)
+}
+
+/// [`review_origins`] over an already-collected set of review-run keys, so a caller that holds keys
+/// rather than run rows (the cost ledger, STUDIO-926) reads the watch set through the same join.
+fn review_origins_for_keys(
+    history: &dyn crate::HistoryStore,
+    wanted: &HashSet<&str>,
+) -> HashMap<String, String> {
     if wanted.is_empty() {
         return HashMap::new();
     }
@@ -258,6 +267,41 @@ fn review_origins(
             Some((key, ticket.to_string()))
         })
         .collect()
+}
+
+/// `GET /api/v1/history/costs`: every ticket's token cost over the WHOLE store, split by provider
+/// (STUDIO-926).
+///
+/// WHY THIS IS A ROUTE AND NOT A FOLD OVER `/history/issues`. That listing keeps ONE row per key —
+/// each key's newest run — so summing it counts the latest implementation run and the latest review
+/// per reviewer and silently drops every earlier round; a ticket that is running right now shows
+/// only its in-flight run, which has spent nothing yet. It is also a PAGE, so a review row that
+/// fell off the page vanished from its ticket's total with no signal. A cost is every run that
+/// spent on the ticket, which only a whole-store sum can say — the same rule
+/// [`handle_history_summary`] states for its totals.
+///
+/// A review run is credited to the ticket it reviewed, through the same watch-set join the listing's
+/// `review_of` uses; one whose origin names no ticket keeps its own `pr:` key, exactly as the
+/// listing falls back. Rhapsody-only and additive; Go has no cost surface at all.
+pub(crate) async fn handle_history_costs(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let history = provider.history();
+    let buckets = match history.run_costs() {
+        Ok(b) => b,
+        Err(_) => return store_error("cost query failed"),
+    };
+    let wanted: HashSet<&str> = buckets
+        .iter()
+        .map(|b| b.issue_identifier.as_str())
+        .filter(|id| review::is_review_key(id))
+        .collect();
+    let origins = review_origins_for_keys(history.as_ref(), &wanted);
+    write_json(StatusCode::OK, &history_costs_response(&buckets, &origins))
 }
 
 /// `GET /api/v1/history/issues/counts`: how many ISSUES in the whole store carry each distinct
@@ -1096,6 +1140,9 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
             Store::tokens_by_provider(&self.inner, since)
         }
+        fn run_costs(&self) -> Result<Vec<rhapsody_store::RunCostBucket>, StoreError> {
+            Store::run_costs(&self.inner)
+        }
     }
 
     async fn post_status(url: &str) -> reqwest::StatusCode {
@@ -1584,6 +1631,89 @@ mod tests {
         let rows = by_identifier(&body);
         assert_eq!(rows[handoff]["review_of"], "STUDIO-839");
         assert_eq!(rows[adopt]["review_of"], "STUDIO-838");
+    }
+
+    // STUDIO-926 — the cost endpoint sums EVERY run, not each key's newest, and credits a review
+    // run to the ticket it reviewed. Two impl runs and two review rounds by one reviewer: a fold
+    // over `/history/issues` would keep one of each.
+    #[tokio::test]
+    async fn history_costs_sums_all_runs_and_folds_reviews_into_their_ticket() {
+        let store = mem_store();
+        let tokens = |id: i64, total: i64| {
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: OUTCOME_COMPLETED.into(),
+                        total_tokens: total,
+                        ..Default::default()
+                    },
+                )
+                .expect("end run");
+        };
+        let review = "pr:makewhatis/rhapsody#147@alice";
+        let orphan = "pr:makewhatis/rhapsody#12@alice";
+        let mut ids = Vec::new();
+        for (key, at) in [
+            ("STUDIO-9", "2026-08-01T00:00:00Z"),
+            ("STUDIO-9", "2026-08-01T01:00:00Z"),
+            (review, "2026-08-01T02:00:00Z"),
+            (review, "2026-08-01T03:00:00Z"),
+            (orphan, "2026-08-01T04:00:00Z"),
+        ] {
+            ids.push(seed_run_for(key, key, at, &store));
+        }
+        for (id, total) in ids.iter().zip([1000, 500, 40, 2, 3]) {
+            tokens(*id, total);
+        }
+        store
+            .set_run_provenance(
+                ids[0],
+                &rhapsody_store::RunProvenance {
+                    provider: "fireworks-ai".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+        store
+            .set_run_provenance(
+                ids[2],
+                &rhapsody_store::RunProvenance {
+                    provider: "anthropic".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+        seed_watch(&store, 147, "alice", "handoff:STUDIO-9");
+        seed_watch(&store, 12, "alice", "console:someone");
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/costs")).await;
+        assert_eq!(status, 200);
+        let got: Vec<(String, String, i64)> = body["costs"]
+            .as_array()
+            .expect("costs array")
+            .iter()
+            .map(|c| {
+                (
+                    c["ticket"].as_str().unwrap_or_default().to_string(),
+                    c["provider"].as_str().unwrap_or_default().to_string(),
+                    c["total_tokens"].as_i64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                // STUDIO-9's second run recorded no provider, so it is the "" bucket.
+                ("STUDIO-9".into(), "".into(), 502),
+                ("STUDIO-9".into(), "anthropic".into(), 40),
+                ("STUDIO-9".into(), "fireworks-ai".into(), 1000),
+                // No ticket-bearing origin: the row keeps its own key rather than vanishing.
+                (orphan.into(), "".into(), 3),
+            ]
+        );
     }
 
     // STUDIO-834 decision 2 — a review row whose origin names no ticket carries NO field, and the

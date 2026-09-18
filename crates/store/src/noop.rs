@@ -107,6 +107,9 @@ impl Store for Noop {
     fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         Ok(Vec::new())
     }
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError> {
+        Ok(Vec::new())
+    }
 
     fn insert_run_message(
         &self,

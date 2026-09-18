@@ -993,6 +993,36 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError> {
+        let conn = self.lock();
+        // LEFT JOIN, unlike `tokens_by_provider`: a run with no provenance row still spent tokens,
+        // and a cost cannot skip it — it lands in the empty-provider bucket.
+        let mut stmt = conn.prepare(
+            "SELECT r.issue_identifier,
+                    COALESCE(p.provider, ''),
+                    COALESCE(SUM(r.total_tokens), 0),
+                    MAX(r.usage_estimated)
+               FROM runs r
+               LEFT JOIN rhapsody_run_provenance p ON p.run_id = r.id
+              WHERE r.issue_identifier != ''
+              GROUP BY r.issue_identifier, COALESCE(p.provider, '')
+              ORDER BY r.issue_identifier ASC, COALESCE(p.provider, '') ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunCostBucket {
+                issue_identifier: row.get(0)?,
+                provider: row.get(1)?,
+                total_tokens: row.get(2)?,
+                usage_estimated: row.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -3561,6 +3591,65 @@ mod tests {
                 ..Default::default()
             })
             .expect("start_run")
+    }
+
+    // STUDIO-926 — a ticket's cost is EVERY run that spent on it. `list_issue_runs` keeps one row
+    // per key, so a sum over it drops earlier rounds; the ledger must not. Three runs under one
+    // key across two providers, one estimated, plus a legacy run with no provenance and an
+    // unattributed run (empty identifier) that must not appear at all.
+    #[test]
+    fn run_costs_sums_every_run_per_key_and_provider() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let end = |id: i64, total: i64, estimated: bool| {
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: OUTCOME_COMPLETED.into(),
+                        total_tokens: total,
+                        usage_estimated: estimated,
+                        ..Default::default()
+                    },
+                )
+                .expect("end");
+        };
+        let fw = provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai");
+        let an = provenance_fixture("claude", "claude-sonnet-4", "anthropic");
+        let a = start_provenance_run(&store, "T-1");
+        let b = start_provenance_run(&store, "T-1");
+        let c = start_provenance_run(&store, "T-1");
+        let legacy = start_provenance_run(&store, "T-2");
+        store.set_run_provenance(a, &fw).expect("set");
+        store.set_run_provenance(b, &fw).expect("set");
+        store.set_run_provenance(c, &an).expect("set");
+        end(a, 100, false);
+        end(b, 50, true);
+        end(c, 7, false);
+        end(legacy, 9, false);
+        let orphan = store
+            .start_run(RunStart {
+                issue_id: "x".into(),
+                started_at: "2026-09-15T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start");
+        end(orphan, 999, false);
+
+        let got = store.run_costs().expect("run_costs");
+        let row = |k: &str, p: &str, t: i64, e: bool| RunCostBucket {
+            issue_identifier: k.into(),
+            provider: p.into(),
+            total_tokens: t,
+            usage_estimated: e,
+        };
+        assert_eq!(
+            got,
+            vec![
+                row("T-1", "anthropic", 7, false),
+                row("T-1", "fireworks-ai", 150, true),
+                row("T-2", "", 9, false),
+            ]
+        );
     }
 
     // Provenance round-trips through its own table, and a run that never recorded any reads back as

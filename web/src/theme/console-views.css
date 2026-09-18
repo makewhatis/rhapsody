@@ -50,6 +50,13 @@
 /* The provider badge on a Jobs row (STUDIO-909) — a mono chip beside the project, muted so it
    scans without competing with the ticket key. */
 .rh-console .jtbl .provbadge { margin-left: 6px; padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+/* The ticket's token cost, split by provider (STUDIO-926) — quiet tabular text, never a Pill and
+   never `--rust`: cost is secondary metadata, and must read as such beside the status column. */
+.rh-console .jtbl .cost { margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--ink-4); font-variant-numeric: tabular-nums; }
+/* The running-row activity line (STUDIO-926): the current transcript step plus elapsed time, the
+   honest "is it moving?" signal in place of a fabricated progress bar. Same quiet treatment as
+   `.cost` — no color, no glyph, just text a reader can skim past or read. */
+.rh-console .jtbl .activity { margin-top: 3px; font-size: 11px; color: var(--ink-3); }
 .rh-console .who2 { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
 /* The assignee slot of a run nothing can name: kept, and dimmed, rather than omitted. */
 .rh-console .who2.none { color: var(--ink-4); }
