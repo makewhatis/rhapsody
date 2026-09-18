@@ -74,6 +74,16 @@
 //! ([`crate::reviewwatch`]) and this half announces its refusal once per head and reason, where the
 //! two of them together logged 383 lines for two stuck pull requests in three hours.
 //!
+//! **One narrow, reviewed exception** (STUDIO-923): [`AutoMergeLedger::peek`] lets
+//! [`crate::reviewreconcile`]'s sweep — itself a human-facing report of an approved pull request
+//! stuck open — READ the reason already on record, so its own warning can name it instead of
+//! claiming nobody has said anything. That is not the control event this doc argues against: the
+//! sweep already runs on the control task and already reports this exact pull request on its own
+//! terms; `peek` hands it a fact this process already has rather than teaching this module to push
+//! anywhere. Nothing here writes the ledger from outside, arms a merge, or reaches the run, the
+//! tracker, the pull request or the store — see `reviewreconcile::set_review_divergences`, `peek`'s
+//! one caller.
+//!
 //! # BEHIND updates and re-gates; it never merges on a stale approval
 //!
 //! STUDIO-784 is this bug already shipped once: the console armed an auto-merge on a BEHIND branch
@@ -150,7 +160,12 @@ pub struct AutoMergeDeps {
     /// The head repositories a watched pull request may come from besides the base's own owner.
     pub allow: HeadAllowlist,
     /// What this half has already SAID, and the only state it keeps. See [`AutoMergeLedger`].
-    pub ledger: AutoMergeLedger,
+    ///
+    /// `Arc`-held, not owned outright, so the SAME ledger can be shared with
+    /// `Orchestrator::automerge_ledger` (STUDIO-923) — a read-only handle the control task's
+    /// reconciliation sweep uses through [`AutoMergeLedger::peek`]. This half remains the only
+    /// writer; the `Arc` exists to let a second reader in, not a second writer.
+    pub ledger: Arc<AutoMergeLedger>,
 }
 
 /// What one auto-merge attempt did.
@@ -452,6 +467,34 @@ impl AutoMergeLedger {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(pr);
+    }
+
+    /// The reason this half most recently declined `pr`, or `None` when it holds nothing for that
+    /// coordinate — auto-merge off, this pull request never reached a gate, or its last outcome was
+    /// [`AutoMergeOutcome::Merged`]/[`AutoMergeOutcome::Updated`] and [`forget`](Self::forget)
+    /// cleared it.
+    ///
+    /// The one reviewed exception to "not surfaced outside the log" (module doc, STUDIO-923): a
+    /// READ, never a write, and it answers with what this half has already SAID rather than
+    /// deciding anything fresh — the caller gets no more freshness guarantee than the log line
+    /// itself had.
+    pub fn peek(&self, pr: &PrCoord) -> Option<&'static str> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(pr)
+            .map(|(_, why)| *why)
+    }
+
+    /// Test-only seam for [`crate::reviewreconcile`]'s STUDIO-923 tests: writes an entry directly,
+    /// bypassing [`refuse`](Self::refuse)'s Declined/Held bookkeeping, which this half's own tests
+    /// already cover above. `#[cfg(test)]`, so a non-test build has exactly one writer, unqualified.
+    #[cfg(test)]
+    pub(crate) fn test_seed(&self, pr: &PrCoord, head: &str, why: &'static str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(pr.clone(), (head.to_string(), why));
     }
 }
 
@@ -772,7 +815,7 @@ mod tests {
             checks,
             merger,
             allow: HeadAllowlist::none(),
-            ledger: AutoMergeLedger::default(),
+            ledger: Arc::new(AutoMergeLedger::default()),
         }
     }
 
@@ -1560,6 +1603,34 @@ mod tests {
         assert_eq!(
             ledger.refuse(&pr(1), HEAD, DECLINE_DRAFT),
             AutoMergeOutcome::Held(DECLINE_DRAFT)
+        );
+    }
+
+    /// `peek` is the STUDIO-923 read seam: it answers with what the ledger holds, does not decide
+    /// anything, and reflects `forget` immediately — the same three properties the reconciliation
+    /// sweep's enrichment depends on.
+    #[test]
+    fn peek_reads_the_ledger_without_deciding_anything() {
+        let ledger = AutoMergeLedger::default();
+        let pr = PrCoord::new("makewhatis", "tally", 1);
+
+        assert_eq!(ledger.peek(&pr), None, "nothing refused yet");
+
+        ledger.refuse(&pr, HEAD, DECLINE_DRAFT);
+        assert_eq!(ledger.peek(&pr), Some(DECLINE_DRAFT));
+        // A second peek changes nothing: `refuse`'s own Declined→Held transition is untouched.
+        assert_eq!(ledger.peek(&pr), Some(DECLINE_DRAFT));
+        assert_eq!(
+            ledger.refuse(&pr, HEAD, DECLINE_DRAFT),
+            AutoMergeOutcome::Held(DECLINE_DRAFT),
+            "peek must not itself count as the caller having reported this refusal before"
+        );
+
+        ledger.forget(&pr);
+        assert_eq!(
+            ledger.peek(&pr),
+            None,
+            "a forgotten pull request is news again"
         );
     }
 
