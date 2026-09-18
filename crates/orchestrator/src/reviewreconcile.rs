@@ -559,11 +559,15 @@ impl Orchestrator {
             // count is 1, and `1 - 1` is a multiple of everything.
             if (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
                 // STUDIO-923: when auto-merge has already said something about this exact pull
-                // request, name it instead of claiming nothing has — `sweeps` doubles as the decline
-                // count because both sweeps run the same cadence and a diverged `ApprovedStillOpen`
-                // row is exactly the shape auto-merge re-declines every tick. No ledger entry
-                // (auto-merge off, or this head never reached a gate) falls back to the original
-                // wording unchanged.
+                // request, name it instead of claiming nothing has. `sweeps` doubles as the decline
+                // count — the ticket's own worked example is this sweep's `sweeps=361` field read
+                // straight off the motivating log line — rather than a new counter of auto-merge's
+                // own attempts, which run on the review watcher's separate `PR_STATE_POLL_INTERVAL`
+                // cadence (120s) and not this sweep's `polling.interval_ms` (default 30s): the two
+                // are proportional for as long as the divergence persists, not literally equal, and
+                // a precise attempt count would be the new state the ticket says is not needed. No
+                // ledger entry (auto-merge off, or this head never reached a gate) falls back to the
+                // original wording unchanged.
                 match d.auto_merge_reason {
                     Some(reason) => {
                         tracing::warn!(
