@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { IssueCountsResponse, IssueRun, TeamsOverview } from "@/lib/api";
+import type { IssueCountsResponse, IssueRun, TeamsOverview, TicketCostRow } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 import {
   CONSOLE_JOB_FILTERS,
@@ -619,8 +619,18 @@ describe("buildConsoleJobs", () => {
       undefined,
       NOW,
     );
-    expect(rows.find((r) => r.issue === "A")?.elapsed).toBe("2m 4s");
+    expect(rows.find((r) => r.issue === "A")?.elapsed).toBe("2m");
     expect(rows.find((r) => r.issue === "B")?.elapsed).toBe("");
+  });
+
+  // The clock ticks every 30s, so a seconds figure past one minute would freeze and then jump.
+  it("keeps seconds only under a minute", () => {
+    const at = (s: number) =>
+      buildConsoleJobs([job({ issue: "A", status: "running", startedAtMs: NOW - s * 1000 })], [], undefined, NOW)[0]
+        .elapsed;
+    expect(at(41)).toBe("41s");
+    expect(at(60)).toBe("1m");
+    expect(at(3600 + 5 * 60 + 59)).toBe("1h 5m");
   });
 });
 
@@ -655,43 +665,29 @@ describe("providerByIssue / the provider badge (STUDIO-909)", () => {
 });
 
 describe("ticketCostsByIssue — the ticket card's cost (STUDIO-926)", () => {
-  it("sums the implementation run plus every review_of row onto the ticket it reviewed", () => {
-    const by = ticketCostsByIssue([
-      issueRow({ issue_identifier: "STUDIO-924", total_tokens: 3_956_114, provider: "anthropic" }),
-      issueRow({
-        issue_identifier: "pr:makewhatis/booch#540@jimmy",
-        review_run: true,
-        review_of: "STUDIO-924",
-        total_tokens: 4_602_965,
-        provider: "anthropic",
-      }),
-      issueRow({
-        issue_identifier: "pr:makewhatis/booch#540@jerry",
-        review_run: true,
-        review_of: "STUDIO-924",
-        total_tokens: 4_819_381,
-        provider: "anthropic",
-      }),
-    ]);
+  const cost = (
+    ticket: string,
+    provider: string,
+    total_tokens: number,
+    usage_estimated = false,
+  ): TicketCostRow => ({ ticket, provider, total_tokens, usage_estimated });
+
+  // The ledger arrives already summed over EVERY run (the daemon credits reviews to the ticket they
+  // reviewed), so a ticket with earlier rounds carries their tokens too. This is the shape the old
+  // fold over `/history/issues` could never produce: that listing holds one run per key.
+  it("groups a ticket's ledger rows and keeps the total the daemon summed", () => {
+    const by = ticketCostsByIssue([cost("STUDIO-924", "anthropic", 93_600_000)]);
     expect(by.get("STUDIO-924")).toEqual([
-      { provider: "anthropic", totalTokens: 3_956_114 + 4_602_965 + 4_819_381, estimated: false },
+      { provider: "anthropic", totalTokens: 93_600_000, estimated: false },
     ]);
-    // The review rows fold into the ticket they reviewed rather than keeping their own entry.
-    expect(by.has("pr:makewhatis/booch#540@jimmy")).toBe(false);
   });
 
   // "A ticket whose impl ran on Fireworks and whose reviews ran on Anthropic must read as two
   // different numbers, not one blended total" — the ticket's own wording.
-  it("keeps two harnesses as two buckets rather than blending them into one total", () => {
+  it("keeps two harnesses as two buckets, largest first, rather than one blended total", () => {
     const by = ticketCostsByIssue([
-      issueRow({ issue_identifier: "STUDIO-1", total_tokens: 607_780, provider: "fireworks-ai" }),
-      issueRow({
-        issue_identifier: "pr:acme/x#1@alice",
-        review_run: true,
-        review_of: "STUDIO-1",
-        total_tokens: 200_000,
-        provider: "anthropic",
-      }),
+      cost("STUDIO-1", "anthropic", 200_000),
+      cost("STUDIO-1", "fireworks-ai", 607_780),
     ]);
     expect(by.get("STUDIO-1")).toEqual([
       { provider: "fireworks-ai", totalTokens: 607_780, estimated: false },
@@ -699,56 +695,29 @@ describe("ticketCostsByIssue — the ticket card's cost (STUDIO-926)", () => {
     ]);
   });
 
-  it("marks a bucket estimated when any run folded into it was a floored estimate", () => {
-    const by = ticketCostsByIssue([
-      issueRow({ issue_identifier: "STUDIO-2", total_tokens: 100, provider: "anthropic" }),
-      issueRow({
-        issue_identifier: "pr:acme/x#2@alice",
-        review_run: true,
-        review_of: "STUDIO-2",
-        total_tokens: 50,
-        provider: "anthropic",
-        usage_estimated: true,
-      }),
-    ]);
+  it("carries a bucket's estimated flag through", () => {
+    const by = ticketCostsByIssue([cost("STUDIO-2", "anthropic", 150, true)]);
     expect(by.get("STUDIO-2")).toEqual([{ provider: "anthropic", totalTokens: 150, estimated: true }]);
   });
 
-  it("folds tokens with no recorded provider under the empty-string bucket rather than dropping them", () => {
-    const by = ticketCostsByIssue([issueRow({ issue_identifier: "STUDIO-3", total_tokens: 42 })]);
+  it("keeps tokens with no recorded provider under the empty-string bucket rather than dropping them", () => {
+    const by = ticketCostsByIssue([cost("STUDIO-3", "", 42)]);
     expect(by.get("STUDIO-3")).toEqual([{ provider: "", totalTokens: 42, estimated: false }]);
   });
 
-  it("falls back to a review row's own key when its origin names no ticket", () => {
-    const by = ticketCostsByIssue([
-      issueRow({
-        issue_identifier: "pr:acme/x#3@alice",
-        review_run: true,
-        total_tokens: 10,
-        provider: "anthropic",
-      }),
-    ]);
-    expect(by.get("pr:acme/x#3@alice")).toEqual([
-      { provider: "anthropic", totalTokens: 10, estimated: false },
-    ]);
+  it("gives a ticket that has spent nothing no entry, so a queued row shows no cost line", () => {
+    expect(ticketCostsByIssue([cost("STUDIO-4", "anthropic", 0)]).has("STUDIO-4")).toBe(false);
   });
 
-  it("carries the summed cost onto the worklist row", () => {
+  it("carries the ledger's cost onto the worklist row", () => {
     const rows = buildConsoleJobs(
-      [job({ issue: "STUDIO-924", status: "completed" })],
-      [
-        issueRow({ issue_identifier: "STUDIO-924", total_tokens: 100, provider: "anthropic" }),
-        issueRow({
-          issue_identifier: "pr:makewhatis/booch#540@jimmy",
-          review_run: true,
-          review_of: "STUDIO-924",
-          total_tokens: 200,
-          provider: "anthropic",
-        }),
-      ],
+      [job({ issue: "STUDIO-924", status: "running" })],
+      [],
       undefined,
       NOW,
+      [cost("STUDIO-924", "anthropic", 300)],
     );
+    // Even a row whose only run is in flight (no listing row carrying tokens) reads its true cost.
     expect(rows[0].costs).toEqual([{ provider: "anthropic", totalTokens: 300, estimated: false }]);
   });
 });

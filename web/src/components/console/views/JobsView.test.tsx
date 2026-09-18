@@ -5,7 +5,14 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { HistoryFilter, IssueCountsResponse, IssueRun, IssueStatusBucket, StateResponse } from "@/lib/api";
+import type {
+  HistoryFilter,
+  IssueCountsResponse,
+  IssueRun,
+  IssueStatusBucket,
+  StateResponse,
+  TicketCostRow,
+} from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
 import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
 import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
@@ -18,6 +25,7 @@ const h = vi.hoisted(() => ({
   fetchState: vi.fn(),
   fetchIssueRuns: vi.fn(),
   fetchIssueCounts: vi.fn(),
+  fetchHistoryCosts: vi.fn(async (): Promise<{ costs: TicketCostRow[] }> => ({ costs: [] })),
   fetchTeamsOverview: vi.fn(),
   fetchRunTranscript: vi.fn(),
 }));
@@ -29,6 +37,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchState: h.fetchState,
     fetchIssueRuns: h.fetchIssueRuns,
     fetchIssueCounts: h.fetchIssueCounts,
+    fetchHistoryCosts: h.fetchHistoryCosts,
     fetchTeamsOverview: h.fetchTeamsOverview,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchVersion: vi.fn(async () => ({
@@ -1015,7 +1024,9 @@ describe("the ticket's cost and live activity (STUDIO-926)", () => {
     ) as HTMLElement;
   }
 
-  it("sums the implementation run and its review onto the ticket's row", async () => {
+  // The row shows the DAEMON's ledger, not a fold over the listing: `/history/issues` keeps one run
+  // per key, so this ticket's earlier rounds are absent from `issues` and only present in `costs`.
+  it("shows the whole-store cost the ledger reports on the ticket's row", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
     h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
     h.fetchIssueRuns.mockResolvedValue({
@@ -1033,6 +1044,11 @@ describe("the ticket's cost and live activity (STUDIO-926)", () => {
       ],
       next_offset: null,
     });
+    h.fetchHistoryCosts.mockResolvedValue({
+      costs: [
+        { ticket: "A-1", provider: "anthropic", total_tokens: 900, usage_estimated: false },
+      ],
+    });
     h.fetchTeamsOverview.mockResolvedValue({
       enabled: true,
       manager_mode: "labels",
@@ -1042,7 +1058,9 @@ describe("the ticket's cost and live activity (STUDIO-926)", () => {
     });
     mount();
     await waitFor(() => expect(row("A-1")).toBeTruthy());
-    expect(row("A-1").querySelector(".cost")?.textContent).toBe("300 anthropic");
+    await waitFor(() =>
+      expect(row("A-1").querySelector(".cost")?.textContent).toBe("900 anthropic"),
+    );
   });
 
   it("shows a running row's current step and elapsed time, with no dwell and no step count", async () => {

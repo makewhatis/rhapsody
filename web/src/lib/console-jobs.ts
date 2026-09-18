@@ -29,6 +29,7 @@ import type {
   IssueStatusBucket,
   RunSummary,
   TeamsOverview,
+  TicketCostRow,
 } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 // The run detail's own vocabulary, imported rather than restated: `statusNote` exists to make the
@@ -302,7 +303,7 @@ export interface ConsoleJobRow {
    */
   costs: TicketCost[];
   /**
-   * How long the ticket's live run has been going, formatted ("6m 4s"), or "" when [`live`] is
+   * How long the ticket's live run has been going, formatted ("6m"; seconds only under a minute), or "" when [`live`] is
    * false. This plus the current transcript step is the honest "is it moving?" signal the design
    * record's progress-bar ban asks for in its place (STUDIO-926) — a card that has shown the same
    * step for a long while is the real stall tell, and neither half needs a denominator the daemon
@@ -506,45 +507,43 @@ export interface TicketCost {
 }
 
 /**
- * Ticket key → its token cost, split by provider, summed across the ticket's own newest run AND
- * every review run whose `review_of` names it (STUDIO-926).
+ * Elapsed time for a live row's activity line. Whole minutes once past one, because the clock that
+ * drives this ticks every 30s: a seconds figure would sit frozen on screen and then jump, claiming
+ * a precision it does not have.
+ */
+function liveElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return formatDuration(s < 60 ? s : Math.floor(s / 60) * 60).replace(/ 0s$/, "");
+}
+
+/**
+ * Ticket key → its token cost, split by provider, from the daemon's whole-store ledger
+ * (`GET /api/v1/history/costs`, STUDIO-926).
  *
  * This is the number the ticket's card exists to answer: "one ticket's two reviews cost 9.4M
- * tokens" is the implementation run's total plus every review's, not the implementation's alone.
- * A review row (`pr:owner/repo#n@reviewer`) is folded into the TICKET it reviewed rather than kept
- * under its own key — `reviewOfTickets` above resolves the same link — so the aggregate lands on
- * the row an operator actually opens. A review row whose origin names no ticket (an
- * operator-introduced pull request, or a watch row that did not survive) falls back to its own
- * key, exactly as the rest of the listing falls back when `review_of` is absent.
+ * tokens" is EVERY implementation run plus every review round, not the newest of each. The ledger
+ * arrives already summed per (ticket, provider) with review runs credited to the ticket they
+ * reviewed, so this only groups and orders — it deliberately does NOT sum `/history/issues` rows,
+ * which keep one run per key and would drop every earlier round (and show a running ticket as 0).
  *
  * Split BY PROVIDER rather than blended, because that is the one thing this figure must not do:
  * a ticket whose implementation ran on Fireworks and whose review ran on Anthropic spent two
  * different currencies, and a single blended number would hide exactly the split the ticket exists
  * to show. Buckets are ordered largest first (ties broken by provider name) so the biggest cost is
- * always what a reader sees first.
+ * always what a reader sees first. A ticket that has spent nothing has no entry, so a queued row
+ * carries no cost line at all rather than "0".
  */
-export function ticketCostsByIssue(rows: readonly IssueRun[]): Map<string, TicketCost[]> {
-  const byTicket = new Map<string, Map<string, { totalTokens: number; estimated: boolean }>>();
-  for (const r of rows) {
-    const owner = r.review_of || r.issue_identifier;
-    if (!owner) continue;
-    let byProvider = byTicket.get(owner);
-    if (!byProvider) {
-      byProvider = new Map();
-      byTicket.set(owner, byProvider);
-    }
-    const key = r.provider ?? "";
-    const bucket = byProvider.get(key) ?? { totalTokens: 0, estimated: false };
-    bucket.totalTokens += r.total_tokens;
-    bucket.estimated = bucket.estimated || r.usage_estimated;
-    byProvider.set(key, bucket);
-  }
+export function ticketCostsByIssue(rows: readonly TicketCostRow[]): Map<string, TicketCost[]> {
   const out = new Map<string, TicketCost[]>();
-  for (const [owner, byProvider] of byTicket) {
-    const costs = [...byProvider.entries()]
-      .map(([provider, v]) => ({ provider, totalTokens: v.totalTokens, estimated: v.estimated }))
-      .sort((a, b) => b.totalTokens - a.totalTokens || a.provider.localeCompare(b.provider));
-    out.set(owner, costs);
+  for (const r of rows) {
+    if (!r.ticket || r.total_tokens <= 0) continue;
+    const bucket = { provider: r.provider ?? "", totalTokens: r.total_tokens, estimated: r.usage_estimated };
+    const list = out.get(r.ticket);
+    if (list) list.push(bucket);
+    else out.set(r.ticket, [bucket]);
+  }
+  for (const list of out.values()) {
+    list.sort((a, b) => b.totalTokens - a.totalTokens || a.provider.localeCompare(b.provider));
   }
   return out;
 }
@@ -607,6 +606,7 @@ export function buildConsoleJobs(
   issueRows: readonly IssueRun[],
   overview: TeamsOverview | undefined,
   nowMs: number,
+  costRows: readonly TicketCostRow[] = [],
 ): ConsoleJobRow[] {
   const durable = durableAssignees(issueRows);
   const live = ticketAssignees(overview);
@@ -616,7 +616,7 @@ export function buildConsoleJobs(
   const reviewRuns = reviewRunIssues(issueRows);
   const reviewOf = reviewOfTickets(issueRows);
   const providers = providerByIssue(issueRows);
-  const costs = ticketCostsByIssue(issueRows);
+  const costs = ticketCostsByIssue(costRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
@@ -644,7 +644,7 @@ export function buildConsoleJobs(
       costs: costs.get(job.issue) ?? [],
       // `updatedAtMs` IS this run's start while it is live (no `ended_at` has landed yet to
       // outrank it), so it doubles as the elapsed clock's zero without a second lookup.
-      elapsed: job.live ? formatDuration(Math.max(0, Math.floor((nowMs - updatedAtMs) / 1000))) : "",
+      elapsed: job.live ? liveElapsed(nowMs - updatedAtMs) : "",
       reviewOf: reviewOf.get(job.issue) ?? "",
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,

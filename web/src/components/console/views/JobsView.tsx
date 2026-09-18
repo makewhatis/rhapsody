@@ -77,7 +77,7 @@ export function JobsView({
   // caller sent (handlers_history.rs), so an unsent limit still answers "is there more?".
   // `useJobsFeed` polls the default window and refreshes a widened one off the live snapshot
   // instead — its own doc comment carries the measurements behind that split.
-  const { state, issueRuns, issueCounts } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
+  const { state, issueRuns, issueCounts, costs } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
@@ -94,8 +94,9 @@ export function JobsView({
         issueRows,
         overview.data,
         nowMs,
+        costs.data?.costs,
       ),
-    [state.data, issueRows, projects, overview.data, nowMs],
+    [state.data, issueRows, projects, overview.data, nowMs, costs.data],
   );
 
   // The strip's numbers come from the DAEMON's tally over every issue in the store, not from `rows`
@@ -274,8 +275,13 @@ function TicketCostLine({ costs }: { costs: readonly TicketCost[] }) {
 // `TraceSpark` below this is not gated on the dwell — the set of rows it ever renders for is
 // exactly the daemon's live runs, which `max_concurrent` already bounds, so eagerly reading their
 // transcripts costs nothing like a sweep down 50 finished rows would.
+// The activity line reads the whole transcript to find its LAST step, and a long run's transcript
+// is large, so it polls at the Jobs feed's own cadence rather than the detail page's 1.5s: a stall
+// is a minutes-scale signal and needs no faster answer.
+const LIVE_ACTIVITY_POLL_MS = 10_000;
+
 function LiveActivity({ runId, elapsed }: { runId: number; elapsed: string }) {
-  const transcript = useTranscript(runId, true, runId > 0);
+  const transcript = useTranscript(runId, true, runId > 0, LIVE_ACTIVITY_POLL_MS);
   const step = useMemo(
     () => currentStepLabel(buildTrace(transcript.data?.entries ?? []).phases),
     [transcript.data],
