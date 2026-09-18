@@ -2,7 +2,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { useState } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { HistoryFilter, IssueCountsResponse, IssueRun, IssueStatusBucket, StateResponse } from "@/lib/api";
@@ -193,6 +193,17 @@ function rowKeys(): string[] {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+// The List/Board choice is PERSISTED (STUDIO-925), so a board test that toggles would otherwise leave
+// the next test's mount in board mode and its table assertions empty. Storage is absent in some test
+// environments (a Node with no localStorage global behind jsdom), hence the guards.
+beforeEach(() => {
+  try {
+    window.localStorage?.clear();
+  } catch {
+    // No storage to reset.
+  }
 });
 
 describe("the Now strip (§3)", () => {
