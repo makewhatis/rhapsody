@@ -326,6 +326,24 @@ export interface IssueCountsResponse {
   buckets: IssueStatusBucket[];
 }
 
+// TicketCostRow is one entry of GET /api/v1/history/costs (STUDIO-926): the tokens EVERY run spent
+// on one ticket on one provider, over the whole store. A review run is already credited to the
+// ticket it reviewed. `provider` is "" for tokens whose run recorded none. `usage_estimated` is true
+// when any run in the bucket ended without a clean `result` event (a floored figure).
+//
+// This is not a fold over IssueRun: /history/issues keeps ONE row per key (its newest run), so a sum
+// over it drops every earlier round and shows a running ticket as 0.
+export interface TicketCostRow {
+  ticket: string;
+  provider: string;
+  total_tokens: number;
+  usage_estimated: boolean;
+}
+
+export interface HistoryCostsResponse {
+  costs: TicketCostRow[];
+}
+
 // DaySummary is the GET /api/v1/history/summary payload (TRA-320): whole-store totals over the runs
 // that STARTED at or after `since`, computed in the daemon's SQL rather than folded over whatever
 // page the client happens to hold. `total_tokens` is the cache-INCLUSIVE billed total, so the
@@ -784,6 +802,13 @@ export async function fetchIssueRuns(f: HistoryFilter): Promise<IssueRunsRespons
   // Defensive: tolerate a server that omits/nulls issues so the table can .map() safely.
   r.issues ??= [];
   r.next_offset ??= null;
+  return r;
+}
+
+// fetchHistoryCosts reads the whole-store per-ticket token ledger (STUDIO-926); see TicketCostRow.
+export async function fetchHistoryCosts(): Promise<HistoryCostsResponse> {
+  const r = await getJSON<HistoryCostsResponse>("/api/v1/history/costs");
+  r.costs ??= [];
   return r;
 }
 

@@ -245,6 +245,7 @@ and the `api/history.json` golden is untouched:
 | --- | --- |
 | `GET /api/v1/history/issues` | one row per issue (its latest matching run), paged by **issue** |
 | `GET /api/v1/history/summary?since=` | whole-store run/token/runtime totals for a window |
+| `GET /api/v1/history/costs` | every ticket's tokens over the whole store, by provider (STUDIO-926) |
 
 Both exist because the dashboard's two headline surfaces cannot be derived correctly from a
 run-paged fetch at any page size. An issue-grouped Jobs list built by grouping runs lets one ticket
@@ -788,6 +789,11 @@ recorded provider, and `GET /api/v1/history/summary` carries that split (`provid
 join rather than folded over a page. Scoping the split to the window (STUDIO-909 round 1) is what lets
 it be read *beside* the totals it decomposes instead of answering a lifetime question under a "today"
 heading.
+**A ticket's cost is its own endpoint.** `GET /api/v1/history/costs` (STUDIO-926, additive,
+Rhapsody-only) returns `{costs: [{ticket, provider, total_tokens, usage_estimated}]}` summed over
+EVERY run in the store and split by provider, with each review run credited to the ticket it reviewed
+through the same watch-set join as `review_of`. It is not a fold over `/history/issues`, which keeps
+one row per key — its newest run — and so drops every earlier round and shows a running ticket as 0.
 The compact provider also rides each row of the additive `GET /api/v1/history/issues`, so "which of
 these four runs is on Fireworks" is a scan. `/api/v1/runs/{id}` and `/api/v1/history` are byte-pinned
 to the Go capture and grew nothing.

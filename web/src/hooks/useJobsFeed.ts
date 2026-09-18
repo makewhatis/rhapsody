@@ -2,9 +2,11 @@ import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { HistoryFilter, StateResponse } from "@/lib/api";
 import {
+  HISTORY_COSTS_QUERY_KEY,
   HISTORY_ISSUES_QUERY_KEY,
   HISTORY_ISSUE_COUNTS_QUERY_KEY,
   TRACKER_POLL_MS,
+  useHistoryCosts,
   useIssueCounts,
   useIssueRuns,
 } from "@/hooks/useHistory";
@@ -111,6 +113,10 @@ export function useJobsFeed(filter: HistoryFilter = {}) {
   // slower strip than table is the disagreement this hook exists to prevent, only spelled the other
   // way round.
   const issueCounts = useIssueCounts({ refetchInterval: LIVE_POLL_MS });
+  // The cost ledger (STUDIO-926) is a whole-store GROUP BY, unfiltered like the tally, so it too is
+  // one entry however wide the window is. It rides the slow cadence: a running ticket's tokens only
+  // climb, and the pull-forward below refreshes it the moment a run starts or ends.
+  const costs = useHistoryCosts({ refetchInterval: TRACKER_POLL_MS });
 
   // `null` until the first snapshot lands, so seeding the comparison is not mistaken for a change:
   // the listing has already fetched on mount and does not need a second identical request.
@@ -121,11 +127,12 @@ export function useJobsFeed(filter: HistoryFilter = {}) {
     if (seen.current !== null && seen.current !== signature) {
       void qc.invalidateQueries({ queryKey: HISTORY_ISSUES_QUERY_KEY });
       void qc.invalidateQueries({ queryKey: HISTORY_ISSUE_COUNTS_QUERY_KEY });
+      void qc.invalidateQueries({ queryKey: HISTORY_COSTS_QUERY_KEY });
     }
     seen.current = signature;
   }, [signature, qc]);
 
-  return { state, issueRuns, issueCounts };
+  return { state, issueRuns, issueCounts, costs };
 }
 
 /**

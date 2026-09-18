@@ -5,7 +5,14 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { HistoryFilter, IssueCountsResponse, IssueRun, IssueStatusBucket, StateResponse } from "@/lib/api";
+import type {
+  HistoryFilter,
+  IssueCountsResponse,
+  IssueRun,
+  IssueStatusBucket,
+  StateResponse,
+  TicketCostRow,
+} from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
 import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
 import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
@@ -18,6 +25,7 @@ const h = vi.hoisted(() => ({
   fetchState: vi.fn(),
   fetchIssueRuns: vi.fn(),
   fetchIssueCounts: vi.fn(),
+  fetchHistoryCosts: vi.fn(async (): Promise<{ costs: TicketCostRow[] }> => ({ costs: [] })),
   fetchTeamsOverview: vi.fn(),
   fetchRunTranscript: vi.fn(),
 }));
@@ -29,6 +37,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchState: h.fetchState,
     fetchIssueRuns: h.fetchIssueRuns,
     fetchIssueCounts: h.fetchIssueCounts,
+    fetchHistoryCosts: h.fetchHistoryCosts,
     fetchTeamsOverview: h.fetchTeamsOverview,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchVersion: vi.fn(async () => ({
@@ -1002,6 +1011,106 @@ describe("the row trace-sparkline (§6)", () => {
         expect(themeCss).not.toMatch(new RegExp(`\\.rh-console \\.${cls}\\b`));
       }
     }
+  });
+});
+
+// The ticket's cost, and a running row's activity, in place of the progress bar the ticket bans
+// (STUDIO-926) — driven through the real view rather than only the pure `console-jobs` functions,
+// so a wiring mistake between `buildConsoleJobs` and the row's JSX fails here too.
+describe("the ticket's cost and live activity (STUDIO-926)", () => {
+  function row(issue: string): HTMLElement {
+    return [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.textContent?.includes(issue),
+    ) as HTMLElement;
+  }
+
+  // The row shows the DAEMON's ledger, not a fold over the listing: `/history/issues` keeps one run
+  // per key, so this ticket's earlier rounds are absent from `issues` and only present in `costs`.
+  it("shows the whole-store cost the ledger reports on the ticket's row", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ id: 20, issue_identifier: "A-1", outcome: "completed", total_tokens: 100, provider: "anthropic" }),
+        run({
+          id: 21,
+          issue_identifier: "pr:acme/x#1@alice",
+          outcome: "completed",
+          review_run: true,
+          review_of: "A-1",
+          total_tokens: 200,
+          provider: "anthropic",
+        }),
+      ],
+      next_offset: null,
+    });
+    h.fetchHistoryCosts.mockResolvedValue({
+      costs: [
+        { ticket: "A-1", provider: "anthropic", total_tokens: 900, usage_estimated: false },
+      ],
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+    await waitFor(() => expect(row("A-1")).toBeTruthy());
+    await waitFor(() =>
+      expect(row("A-1").querySelector(".cost")?.textContent).toBe("900 anthropic"),
+    );
+  });
+
+  it("shows a running row's current step and elapsed time, with no dwell and no step count", async () => {
+    h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-LIVE-2",
+          issue_identifier: "LIVE-2",
+          title: "LIVE-2 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 30,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 30,
+      entries: [
+        { seq: 1, kind: "tool_use", tool: "Read", text: "file_path=/repo/src/lib/api.ts" },
+        { seq: 2, kind: "tool_result", tool: "", text: "export interface RunSummary" },
+      ],
+      generated_at: "2026-09-01T12:00:00Z",
+    });
+    mount();
+    await waitFor(() => expect(row("LIVE-2")).toBeTruthy());
+    // No dwell needed — a live row's activity reads immediately, unlike the sparkline preview.
+    await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(30));
+    await waitFor(() =>
+      expect(row("LIVE-2").querySelector(".activity")?.textContent).toContain("Oriented"),
+    );
+    // The ticket's whole reason for existing: never an invented "n/m" denominator.
+    expect(row("LIVE-2").querySelector(".activity")?.textContent).not.toMatch(/\d+\s*\/\s*\d+/);
   });
 });
 
