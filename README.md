@@ -1218,17 +1218,25 @@ repo still merges itself:
 
 ```yaml
 review:
-  auto_merge: true          # the default, unchanged
+  auto_merge: true            # the default, unchanged
 projects:
-  - slugs: [booch]
+  - slugs: [4f4a2350682f]     # the Linear project's slugId, NOT its name
     review:
-      auto_merge: false     # this project is merged by a human
+      auto_merge: false       # this project is merged by a human
 ```
+
+`slugs:` here are the same values as `WORKFLOW.md`'s own `projects:` list — Linear's opaque
+**`slugId` hex** (`4f4a2350682f`), never the project's display name. A project that fans out to
+several slugs (one Linear project, several repos) may be named by **any** of them: when more than
+one resolved project shares a repo, their answers are ANDed, so any one that resolves `false` holds
+the merge. An entry whose slug matches nothing can never fire, so the daemon warns at boot naming
+every unmatched slug rather than letting a name-where-an-id-belongs look like success.
 
 A project with no matching entry — and an entry that sets no `auto_merge` — inherits the top-level
 value in both directions, so a project that has never been configured behaves exactly as it did
-before the block existed. An entry with the wrong *type* where a list or a boolean belongs is a
-rejected `teams.yaml`, which degrades to Teams-off (and `rhapsodyd teams show` reports the reason).
+before the block existed. An unknown key (a misspelling, or `auto_merge` placed beside `slugs`
+instead of under `review:`) or a wrong type is a rejected `teams.yaml`, which degrades to Teams-off
+(and `rhapsodyd teams show` reports the reason); Teams-off means no auto-merge, the safe side.
 
 **The verdict is data, never prose.** `gh pr review --approve` errors on this install (GitHub
 refuses a self-review from the account that authored the pull request), so `reviewDecision` is empty

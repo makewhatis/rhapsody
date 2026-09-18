@@ -179,6 +179,7 @@ where
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
         report_starved_manager(o.teams.as_ref());
+        report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
         //
@@ -1389,6 +1390,40 @@ fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
          time out and every ticket will be assigned by the deterministic fallback. The value is \
          honoured as written — raise manager.timeout_ms in teams.yaml to use the model at all."
     );
+}
+
+/// Warns about every `teams.yaml` `projects:` slug that matches no resolved project
+/// slug (STUDIO-927). The near-certain cause is a Linear project NAME where its
+/// `slugId` hex belongs (`slugs: [booch]` instead of `[4f4a2350682f]`), and the
+/// consequence is silent and in the unsafe direction: the override never fires, so
+/// the project keeps the top-level `review.auto_merge` and self-merges anyway. A
+/// safety brake whose misspelling is invisible is the defect this ticket removes, so
+/// every unmatched slug is named here at boot.
+///
+/// Gated on `review_ticketless`: only the ticketless path reads the override at all,
+/// and staying silent otherwise keeps a Teams-off or `mode: tickets` boot byte-identical
+/// (the D5 invariant).
+fn report_unmatched_project_slugs(
+    teams: Option<&rhapsody_config::teams::Teams>,
+    resolved: Option<&Config>,
+) {
+    let Some(teams) = teams.filter(|t| t.review_ticketless() && !t.projects.is_empty()) else {
+        return;
+    };
+    let Some(resolved) = resolved else { return };
+    let known: Vec<String> = rhapsody_config::projects::resolve_projects(resolved)
+        .into_iter()
+        .map(|p| p.slug)
+        .collect();
+    let unmatched = teams.unmatched_project_slugs(&known);
+    if !unmatched.is_empty() {
+        tracing::warn!(
+            slugs = %unmatched.join(", "),
+            "teams.yaml projects: entries name slugs that match no WORKFLOW.md project, so their \
+             review overrides can never fire. Use the Linear project slugId (e.g. 4f4a2350682f), \
+             not the project name — see README.md's per-project auto_merge section."
+        );
+    }
 }
 
 fn load_resolved(path: &Path) -> Option<Config> {

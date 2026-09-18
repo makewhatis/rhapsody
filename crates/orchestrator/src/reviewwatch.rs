@@ -969,37 +969,60 @@ impl Orchestrator {
             .map(|p| p.repo.clone())
     }
 
-    /// The slug of the resolved project that owns `owner/repo`, or `None`.
-    /// [`Self::review_repo_url`]'s lookup, without its `!disabled` filter and
-    /// returning the slug rather than the repo string.
+    /// Every slug of a resolved project that owns `owner/repo`, in resolution
+    /// order; empty when no resolved project owns it. [`Self::review_repo_url`]'s
+    /// lookup, without its `!disabled` filter and returning the slugs rather than
+    /// the repo string.
     ///
     /// The missing `!disabled` is deliberate for the one caller,
     /// [`Self::review_auto_merge_for_repo`]: a project paused after a pull
     /// request entered the watch set must still have its override read, because
     /// the override is the fail-safe half — dropping it would fall back to a
     /// GLOBAL value the operator may have set this very repo aside from.
-    fn review_project_for_repo(&self, owner: &str, repo: &str) -> Option<&str> {
-        self.eff.as_ref()?.projects.iter().find_map(|p| {
-            crate::ghsummons::parse_repo(&p.repo)
-                .is_some_and(|(o, r)| o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo))
-                .then_some(p.slug.as_str())
-        })
+    ///
+    /// It returns EVERY owning slug, not the first match, because a WORKFLOW
+    /// project fans out to one resolved project per slug and they share one repo
+    /// (STUDIO-927). A first-match scan would let an override naming any slug but
+    /// the first be invisible — exactly the booch case, whose two hex slugs share
+    /// `git@github.com:makewhatis/booch.git`.
+    fn review_project_slugs_for_repo(&self, owner: &str, repo: &str) -> Vec<&str> {
+        let Some(eff) = self.eff.as_ref() else {
+            return Vec::new();
+        };
+        eff.projects
+            .iter()
+            .filter_map(|p| {
+                crate::ghsummons::parse_repo(&p.repo)
+                    .is_some_and(|(o, r)| {
+                        o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo)
+                    })
+                    .then_some(p.slug.as_str())
+            })
+            .collect()
     }
 
-    /// The effective `teams.review.auto_merge` for the project that owns
-    /// `owner/repo` (STUDIO-927): the project's own per-project override when it
-    /// has one, else the installation-wide default. A repo that no resolved
-    /// project owns — and an orchestrator carrying no resolved project set at
-    /// all — falls back to the top-level value, so every existing installation
+    /// The effective `teams.review.auto_merge` for the project set that owns
+    /// `owner/repo` (STUDIO-927): the owning projects' own per-project overrides
+    /// when they have any, else the installation-wide default. A repo that no
+    /// resolved project owns — and an orchestrator carrying no resolved project set
+    /// at all — falls back to the top-level value, so every existing installation
     /// behaves exactly as it did before the per-project block existed.
+    ///
+    /// When several resolved projects share the repo, their answers are ANDed:
+    /// **any** owning project that resolves `false` holds the merge, whichever of
+    /// its slugs the operator named. That is the fail-safe direction — the choice
+    /// this accessor exists to make — because the alternative (first match wins)
+    /// fails OPEN, letting a repo an operator explicitly set aside self-merge
+    /// simply because its override named the second of two slugs.
     pub(crate) fn review_auto_merge_for_repo(&self, owner: &str, repo: &str) -> bool {
         let Some(teams) = self.teams.as_ref() else {
             return false;
         };
-        match self.review_project_for_repo(owner, repo) {
-            Some(slug) => teams.review_auto_merge_for(slug),
-            None => teams.review_auto_merge(),
+        let slugs = self.review_project_slugs_for_repo(owner, repo);
+        if slugs.is_empty() {
+            return teams.review_auto_merge();
         }
+        slugs.iter().all(|slug| teams.review_auto_merge_for(slug))
     }
 }
 
@@ -1676,6 +1699,46 @@ mod tests {
         assert!(
             report.merge.is_empty(),
             "the project this repo belongs to asked not to self-merge"
+        );
+    }
+
+    /// ⚠️ STUDIO-927, the case that must not be missed: a WORKFLOW project fans
+    /// out to one resolved project per slug, ALL sharing one repo, so an operator
+    /// may name ANY of its slugs. Here the override names the SECOND slug of a
+    /// two-slug project; the first has no entry. A first-match scan resolves the
+    /// first slug, finds no entry and falls back to the global `true`, so the repo
+    /// self-merges anyway — the bug alice found on the live install, where booch's
+    /// two hex slugs share one repo. The AND over every owning slug is what holds
+    /// it back. Mutation: return `review_auto_merge_for_repo` to a first-match
+    /// `find_map` and the plan is handed out again, so this goes red.
+    #[test]
+    fn an_override_naming_a_fanned_projects_second_slug_still_holds_the_merge() {
+        let mut teams = ticketless_automerge(&["alice", "bob"]);
+        teams.projects = vec![rhapsody_config::teams::TeamsProject {
+            slugs: vec!["161ac721c8bc".to_string()],
+            review: rhapsody_config::teams::ProjectReview {
+                auto_merge: Some(false),
+            },
+        }];
+        let (mut o, _d) = orch(teams);
+        // Fan the one repo out over two slugs, as `resolve_projects` does for
+        // `slugs: [4f4a2350682f, 161ac721c8bc]`. The override names the second.
+        let tracker = Arc::clone(&o.eff.as_ref().expect("eff").projects[0].tracker);
+        let mut second = empty_resolved_project("161ac721c8bc", tracker);
+        second.repo = REPO_URL.to_string();
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.projects[0].slug = "4f4a2350682f".to_string();
+            eff.projects[0].group = "4f4a2350682f".to_string();
+            eff.projects.push(second);
+        }
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "naming the second slug of a fanned project must still hold the merge"
         );
     }
 

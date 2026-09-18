@@ -582,12 +582,26 @@ impl Review {
 ///
 /// Per-PROJECT rather than per-repo on purpose: the thing the operator writes is
 /// the Linear project, and its repo belongs to it — a repo shared by two projects
-/// is two overrides to state, not one.
+/// is two overrides to state, not one. When two resolved projects do share a repo,
+/// the orchestrator ANDs every owning project's answer, so naming EITHER project
+/// holds the merge: an override that resolves `false` must never be lost to a
+/// first-match scan.
+///
+/// Unknown keys are rejected ([`serde`] `deny_unknown_fields`), deliberately unlike
+/// the lenient top-level blocks. These are brand-new types with no legacy spellings,
+/// and a misspelled key (`auto-merge:`) or a mis-indent (the key beside `slugs`
+/// instead of under `review:`) would otherwise parse cleanly, leave `auto_merge`
+/// unset, and silently inherit the global — the exact unsafe direction this knob
+/// exists to prevent. A rejected `teams.yaml` degrades to Teams-off (no auto-merge),
+/// the safe side.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamsProject {
-    /// The Linear project slugs this entry applies to. A project with no matching
-    /// slug is untouched by this entry; an entry with no slugs can never fire, and
-    /// is silently inert exactly as any unmatched slug is.
+    /// The Linear project SLUG IDs this entry applies to — the same `slugs:` values
+    /// `WORKFLOW.md`'s `projects:` list carries (Linear `slugId` hex, e.g.
+    /// `4f4a2350682f`), never the project NAME. A slug no resolved project carries
+    /// leaves its entry inert, and the boot reports every such slug with a warning,
+    /// so a name written where an id belongs is visible rather than silently ignored.
     #[serde(default)]
     pub slugs: Vec<String>,
     /// The per-project review overrides.
@@ -603,6 +617,7 @@ pub struct TeamsProject {
 /// self-merge had no way to say so inside `teams.yaml` — the only brake was an
 /// adjective in a prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectReview {
     /// `Some(false)` keeps THIS project human-merged even when the top-level
     /// `review.auto_merge` is on; `Some(true)` turns it on for a project whose
@@ -859,9 +874,41 @@ impl Teams {
         }
         self.projects
             .iter()
-            .find(|p| p.slugs.iter().any(|s| s == project_slug))
+            .find(|p| p.slugs.iter().any(|s| s.trim() == project_slug.trim()))
             .and_then(|p| p.review.auto_merge)
             .unwrap_or(self.review.auto_merge)
+    }
+
+    /// The `slugs:` values in [`Teams::projects`] that match no resolved project
+    /// slug in `known` (STUDIO-927), in declaration order.
+    ///
+    /// An unmatched slug is inert by construction — no resolved project can route
+    /// to it, so its `review` override can never fire and the project silently keeps
+    /// the top-level `auto_merge`. For a safety brake that is the wrong failure mode:
+    /// an operator who writes the project NAME (`slugs: [booch]`) where the Linear
+    /// `slugId` belongs (`4f4a2350682f`) gets a valid `teams.yaml` that does nothing.
+    /// This exists so the boot can name every such slug and turn a typo into
+    /// something the operator can see, rather than leaving booch self-merging.
+    ///
+    /// `known` are the resolved project slugs — `projects::resolve_projects`'s
+    /// output, the same set the orchestrator routes against. Empty only when there
+    /// are no entries at all.
+    ///
+    /// Both sides are trimmed: `validate` trims `projects[].slugs[]` in place before
+    /// the orchestrator resolves them, but the boot calls this on the unvalidated
+    /// config, so a slug padded with whitespace must not read as a typo here when
+    /// routing would have matched it.
+    pub fn unmatched_project_slugs<'a>(&'a self, known: &[String]) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        for project in &self.projects {
+            for slug in &project.slugs {
+                let slug = slug.trim();
+                if !known.iter().any(|k| k.trim() == slug) {
+                    out.push(slug);
+                }
+            }
+        }
+        out
     }
 
     /// What a REVIEW run dispatched to a reviewer on `harness` should do about `review.model`
@@ -2028,11 +2075,63 @@ mod tests {
         assert!(!Teams::disabled().review_auto_merge_for("booch"));
     }
 
+    /// The visibility half of the ticket's trap: an override that names a slug no
+    /// resolved project carries is inert, and [`Teams::unmatched_project_slugs`]
+    /// names it so the boot can warn. A project NAME where the Linear `slugId`
+    /// belongs is the exact case — the documented example `slugs: [booch]` can
+    /// never match a resolved project.
+    #[test]
+    fn an_override_naming_no_resolved_project_slug_is_reported() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [booch]\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            t.unmatched_project_slugs(&["4f4a2350682f".to_string()]),
+            vec!["booch"],
+            "a name where a slugId belongs must be reported"
+        );
+
+        // A matching slug is not reported, and a partially-matching entry reports
+        // only the half that matches nothing.
+        let mixed = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n\
+             projects:\n  - slugs: [4f4a2350682f, typo]\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            mixed.unmatched_project_slugs(&["4f4a2350682f".to_string()]),
+            vec!["typo"]
+        );
+        assert!(Teams::disabled().unmatched_project_slugs(&[]).is_empty());
+
+        // Whitespace around a slug is trimmed on both sides, matching `validate`'s
+        // in-place trim before the orchestrator resolves: padded, it is neither a
+        // false-positive report nor a miss in the override lookup.
+        let padded = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [' 4f4a2350682f ']\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(
+            padded
+                .unmatched_project_slugs(&["4f4a2350682f".to_string()])
+                .is_empty()
+        );
+        assert!(!padded.review_auto_merge_for("4f4a2350682f"));
+    }
+
     /// A `projects:` entry may be written with an empty or null `review:` block —
     /// it then inherits, exactly as the null-block tolerance elsewhere in this
-    /// file does. A malformed block (a scalar where the list belongs) is a loud
-    /// parse error, so a typo cannot silently leave `auto_merge` unset and a
-    /// repo the operator meant to hold back merging itself.
+    /// file does. Everything the types cannot accept is a loud parse error rather
+    /// than a silently-inherited override: a wrong type AND an unknown key (a
+    /// misspelling, or the easy mis-indent placing `auto_merge` beside `slugs`
+    /// instead of under `review:`) both fail, so a typo cannot leave `auto_merge`
+    /// unset and a repo the operator meant to hold back merging itself.
     #[test]
     fn a_project_entry_with_no_review_block_inherits_and_a_malformed_one_is_rejected() {
         let t = Teams::parse(
@@ -2055,6 +2154,13 @@ mod tests {
             "enabled: true\nprojects:\n  - slugs: booch\n",
             // `auto_merge` must be a boolean.
             "enabled: true\nprojects:\n  - slugs: [booch]\n    review:\n      auto_merge: nope\n",
+            // MIS-INDENT: `auto_merge` beside `slugs` rather than under `review:`
+            // — with a lenient decode this would parse, leave the override unset
+            // and inherit the global ON.
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    auto_merge: false\n",
+            // MISSPELLED keys, at the entry and inside the review block.
+            "enabled: true\nprojects:\n  - slug: [booch]\n    review:\n      auto_merge: false\n",
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    review:\n      auto-merge: false\n",
         ] {
             let err = Teams::parse(bad).expect_err("must not parse");
             assert!(matches!(err, TeamsError::Parse(_)), "{bad:?}: got {err}");
