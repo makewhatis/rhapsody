@@ -1211,6 +1211,25 @@ thing that merges on this install is somebody happening to look.
 | how it merges | — | `gh pr merge --squash --match-head-commit <head>` |
 | default | — | **off**: `teams.review.auto_merge` is `false` unless an operator sets it |
 
+**`auto_merge` is per project, and unset inherits.** The top-level `teams.review.auto_merge` is the
+installation-wide default; a `projects:` entry in `teams.yaml` overrides it for the Linear project
+slugs it names (STUDIO-927), so a repo that must be merged by a human can say so while a sibling
+repo still merges itself:
+
+```yaml
+review:
+  auto_merge: true          # the default, unchanged
+projects:
+  - slugs: [booch]
+    review:
+      auto_merge: false     # this project is merged by a human
+```
+
+A project with no matching entry — and an entry that sets no `auto_merge` — inherits the top-level
+value in both directions, so a project that has never been configured behaves exactly as it did
+before the block existed. A malformed entry is a rejected `teams.yaml`, which degrades to Teams-off
+(and `rhapsodyd teams show` reports the reason), never a silently-ignored override.
+
 **The verdict is data, never prose.** `gh pr review --approve` errors on this install (GitHub
 refuses a self-review from the account that authored the pull request), so `reviewDecision` is empty
 on every pull request here and reviewer verdicts reach GitHub only as English. None of that is read.

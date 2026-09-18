@@ -826,11 +826,7 @@ impl Orchestrator {
         head: &str,
         report: &mut ReviewSweepReport,
     ) {
-        if !self
-            .teams
-            .as_ref()
-            .is_some_and(rhapsody_config::teams::Teams::review_auto_merge)
-        {
+        if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
             return; // opt-in, and off by default (the D5 invariant)
         }
         match crate::automerge::auto_merge_verdict(mine, head) {
@@ -971,6 +967,39 @@ impl Orchestrator {
                     })
             })
             .map(|p| p.repo.clone())
+    }
+
+    /// The slug of the resolved project that owns `owner/repo`, or `None`.
+    /// [`Self::review_repo_url`]'s lookup, without its `!disabled` filter and
+    /// returning the slug rather than the repo string.
+    ///
+    /// The missing `!disabled` is deliberate for the one caller,
+    /// [`Self::review_auto_merge_for_repo`]: a project paused after a pull
+    /// request entered the watch set must still have its override read, because
+    /// the override is the fail-safe half — dropping it would fall back to a
+    /// GLOBAL value the operator may have set this very repo aside from.
+    fn review_project_for_repo(&self, owner: &str, repo: &str) -> Option<&str> {
+        self.eff.as_ref()?.projects.iter().find_map(|p| {
+            crate::ghsummons::parse_repo(&p.repo)
+                .is_some_and(|(o, r)| o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo))
+                .then_some(p.slug.as_str())
+        })
+    }
+
+    /// The effective `teams.review.auto_merge` for the project that owns
+    /// `owner/repo` (STUDIO-927): the project's own per-project override when it
+    /// has one, else the installation-wide default. A repo that no resolved
+    /// project owns — and an orchestrator carrying no resolved project set at
+    /// all — falls back to the top-level value, so every existing installation
+    /// behaves exactly as it did before the per-project block existed.
+    pub(crate) fn review_auto_merge_for_repo(&self, owner: &str, repo: &str) -> bool {
+        let Some(teams) = self.teams.as_ref() else {
+            return false;
+        };
+        match self.review_project_for_repo(owner, repo) {
+            Some(slug) => teams.review_auto_merge_for(slug),
+            None => teams.review_auto_merge(),
+        }
     }
 }
 
@@ -1624,6 +1653,30 @@ mod tests {
         let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
 
         assert!(report.merge.is_empty(), "off unless the operator asked");
+    }
+
+    /// ⚠️ STUDIO-927: the gate is scoped to the project that owns the pull request's repo. With the
+    /// top-level flag ON, a `projects:` entry for THIS project setting `auto_merge: false` holds the
+    /// merge back. Mutation: make `propose_auto_merge` gate on `Teams::review_auto_merge` again —
+    /// the global wins, the plan is handed out, and this goes red.
+    #[test]
+    fn a_per_project_override_holds_back_this_projects_auto_merge() {
+        let mut teams = ticketless_automerge(&["alice", "bob"]);
+        teams.projects = vec![rhapsody_config::teams::TeamsProject {
+            slugs: vec!["rhapsody".to_string()],
+            review: rhapsody_config::teams::ProjectReview {
+                auto_merge: Some(false),
+            },
+        }];
+        let (mut o, _d) = orch(teams);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "the project this repo belongs to asked not to self-merge"
+        );
     }
 
     /// ⚠️ The stale-approval refusal, end to end through the sweep: the reviewer approved HEAD_A
