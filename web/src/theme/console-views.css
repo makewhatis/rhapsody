@@ -11,9 +11,10 @@
    `.run`, `.checks` and `.kv` are far too generic to publish alongside the
    Podium screens.
 
-   Every color is a token. The one literal hex — `#34343c`, the hover hairline —
-   is the prototype's own one-off shade, already present in console.css on the
-   same treatment. It is not a duplicate of a token.
+   Every color is a token. The literal hexes below — `#34343c`, the hover hairline,
+   and `#453915`, the `.dchip` warn border (the same shade `.note.warn` uses in
+   console.css) — are the prototype's own one-off shades. They are NOT duplicates
+   of a token; every value that has a token uses `var(--…)`.
 
    The room-slice, memory, manage and teams-console views are sub-tickets 3–5;
    `.memprev`/`.mcard` land here because §4's side column uses them.
@@ -71,7 +72,7 @@
 
 /* ===== §3 board (STUDIO-925) =====
    The worklist as work: one card per ticket, one column per tracker state. Reuses the same atoms
-   and tokens as the table beside it (`Pill`, `Chip`, `TicketChip`, the warm-dark console palette) —
+   and tokens as the table beside it (`Pill`, `Chip`, `TicketChip`, the cool console palette) —
    a second view of the worklist, not a second visual language. Cards are a repeated object: the same
    edges, the same inner padding, and each recurring element in the same place on every card. */
 .rh-console .board {
