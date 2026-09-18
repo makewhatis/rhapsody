@@ -79,12 +79,13 @@ the `Orchestrator` struct itself. Concretely:
 
   - `runautomerge.rs`'s `AutoMergeLedger` (`Orchestrator::automerge_ledger:
     Option<Arc<AutoMergeLedger>>`, STUDIO-923) — a `Mutex`-guarded map the off-loop auto-merge half
-    (`runautomerge.rs`, itself outside this list: it holds no `Orchestrator`, sends no control
-    event and takes no lock the control task takes) is the ONLY writer of. The control task holds a
-    read-only `Arc` clone, used from exactly one call site — `reviewreconcile.rs`'s reconciliation
-    sweep, through `AutoMergeLedger::peek` — to name what auto-merge has already said about a pull
-    request the sweep is independently reporting diverged (`ApprovedStillOpen`), rather than
-    claiming nothing has said anything about it. `None`
+    (`runautomerge.rs`, itself outside this list: it holds no `Orchestrator` and sends no control
+    event) is the ONLY writer of. The control task holds a read-only `Arc` clone, used from exactly
+    one call site — `reviewreconcile.rs`'s reconciliation sweep, through `AutoMergeLedger::peek` —
+    to name what auto-merge has already said about a pull request the sweep is independently
+    reporting diverged (`ApprovedStillOpen`), rather than claiming nothing has said anything about
+    it; this ledger lock is the one lock the control task shares with the off-loop half, and the
+    control task only ever takes it read-only. `None`
     whenever the review watcher never spawned, which the sweep's fallback wording already covers.
     `peek` is the only method this crate exposes outside `runautomerge.rs`'s own module, so a
     second write path here would need its own deliberate exception to "a refusal is not surfaced

@@ -559,13 +559,11 @@ impl Orchestrator {
             // count is 1, and `1 - 1` is a multiple of everything.
             if (sweeps - 1).is_multiple_of(RECONCILE_LOG_EVERY) {
                 // STUDIO-923: when auto-merge has already said something about this exact pull
-                // request, name it instead of claiming nothing has. `sweeps` doubles as the decline
-                // count — the ticket's own worked example is this sweep's `sweeps=361` field read
-                // straight off the motivating log line — rather than a new counter of auto-merge's
-                // own attempts, which run on the review watcher's separate `PR_STATE_POLL_INTERVAL`
-                // cadence (120s) and not this sweep's `polling.interval_ms` (default 30s): the two
-                // are proportional for as long as the divergence persists, not literally equal, and
-                // a precise attempt count would be the new state the ticket says is not needed. No
+                // request, name it instead of claiming nothing has. The sentence states no count:
+                // auto-merge's own attempts run on the review watcher's separate
+                // `PR_STATE_POLL_INTERVAL` cadence (120s), not this sweep's `polling.interval_ms`
+                // (default 30s), so this sweep's own `sweeps` field would misstate auto-merge's
+                // tally as its own — trading the ticket's false negative for a false positive. No
                 // ledger entry (auto-merge off, or this head never reached a gate) falls back to the
                 // original wording unchanged.
                 match d.auto_merge_reason {
@@ -578,10 +576,10 @@ impl Orchestrator {
                             stale_secs = d.stale_secs,
                             sweeps,
                             auto_merge_reason = reason,
-                            "review reconciliation: {} — {}. Auto-merge has declined it {} times: {}.",
+                            "review reconciliation: {} — {}. Auto-merge has been declining it: {}. \
+                             This sweep only reports, so it needs a human.",
                             d.pr,
                             d.kind.detail(),
-                            sweeps,
                             reason
                         );
                     }
@@ -1515,14 +1513,16 @@ mod store_tests {
 
     /// STUDIO-923: when auto-merge has already declined the SAME pull request this sweep is
     /// independently reporting `ApprovedStillOpen`, the WARN names the reason instead of claiming
-    /// nothing has reported it blocked — and reuses the sweep's own `sweeps` counter as the decline
-    /// count, so no second counter is introduced (the ticket's "no new state is needed").
+    /// nothing has reported it blocked. It states no count: this sweep's own `sweeps` field runs on
+    /// a different cadence than auto-merge's attempts (`PR_STATE_POLL_INTERVAL` vs
+    /// `polling.interval_ms`), so asserting it as auto-merge's tally would trade one false claim
+    /// for another.
     ///
     /// Mutation check: revert the enriched arm's message back to the hardcoded "nothing has
     /// reported it blocked" wording and this test reds — it asserts on WHAT was said, not merely
     /// that a WARN fired.
     #[test]
-    fn approved_and_open_names_the_auto_merge_reason_and_decline_count() {
+    fn approved_and_open_names_the_auto_merge_reason() {
         let o = &mut orch(true, "2026-09-14T21:20:00Z");
         approved_row(o, "alice", "STUDIO-877");
         approved_row(o, "jimmy", "STUDIO-877");
@@ -1564,7 +1564,7 @@ mod store_tests {
             .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
         assert!(
             warn.message
-                .contains("Auto-merge has declined it 1 times: the pull request is still a draft."),
+                .contains("Auto-merge has been declining it: the pull request is still a draft."),
             "got: {}",
             warn.message
         );

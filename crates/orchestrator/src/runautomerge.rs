@@ -3,10 +3,11 @@
 //!
 //! **No Go v0.4.0 counterpart.** [`crate::runmerge`]'s sibling, and deliberately its shape: every
 //! `gh` call is out here, the module holds no [`Orchestrator`](crate::orchestrator::Orchestrator),
-//! sends no control event and takes no lock the control task takes, so a slow `gh` delays the
-//! watcher's next tick and nothing else. The DECISION that needs loop state — the head-keyed
-//! reviewer verdicts — was made in [`crate::automerge`] and arrives here already made, as an
-//! [`AutoMergePlan`].
+//! sends no control event, and the only lock it shares with the control task is
+//! [`AutoMergeLedger`]'s — taken read-only, through [`AutoMergeLedger::peek`] (see below) — so a
+//! slow `gh` delays the watcher's next tick and nothing else. The DECISION that needs loop state —
+//! the head-keyed reviewer verdicts — was made in [`crate::automerge`] and arrives here already
+//! made, as an [`AutoMergePlan`].
 //!
 //! # Why this does not arm GitHub's own auto-merge
 //!
@@ -67,8 +68,9 @@
 //! A refusal is deliberately NOT surfaced outside the log as well — not on the run, not on the pull
 //! request, not the way [`CREDENTIAL_DEAD_WARNING`](crate::preflight) reaches `/api/v1/projects` per
 //! project. That warning rides loop-owned state; this module holds no `Orchestrator`, sends no
-//! control event and takes no lock the control task takes, which is its whole containment guarantee
-//! (see the opening paragraph). Surfacing from here needs a new control event, which is a design
+//! control event, and shares no lock with the control task beyond the ledger's own — which is its
+//! whole containment guarantee for the `gh` I/O this half performs (see the opening paragraph).
+//! Surfacing from here beyond the one exception below needs a new control event, which is a design
 //! change rather than a bug fix, and the volume problem that prompted the question is answered at
 //! its source, on BOTH sides of the seam: the control task announces a plan once per head
 //! ([`crate::reviewwatch`]) and this half announces its refusal once per head and reason, where the
