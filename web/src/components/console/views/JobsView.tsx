@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   Chip,
+  ExternalLink,
   Mate,
   NowMates,
   NowStats,
@@ -33,12 +34,14 @@ import { currentStepLabel } from "@/lib/console-trace-view";
 import { buildTrace } from "@/lib/trace-model";
 import { formatTokens } from "@/lib/format";
 import { mergeJobs } from "@/lib/runs-model";
-import { useLinearProjects } from "@/hooks/useConfig";
+import { useLinearProjects, useTypedConfigQuery } from "@/hooks/useConfig";
 import { useJobsFeed } from "@/hooks/useJobsFeed";
 import { useNow } from "@/hooks/useNow";
 import { useTranscript } from "@/hooks/useRunDetail";
 import { useRefresh } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview } from "@/hooks/useTeams";
+import { useJobsViewMode, type JobsViewMode } from "@/hooks/useJobsViewMode";
+import { BoardView } from "./BoardView";
 
 const ALL_PROJECTS = "";
 
@@ -82,7 +85,12 @@ export function JobsView({
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
   const refresh = useRefresh();
+  // The concurrency cap the board footer measures against (STUDIO-925). A missing or unparseable
+  // config reads as "no cap known" — the footer then omits the "/ N" rather than inventing one.
+  const maxConcurrent = useTypedConfigQuery().data?.global?.agent.max_concurrent_agents ?? 0;
 
+  // List or board (STUDIO-925): the board is an ADDITIONAL view, remembered across visits.
+  const [view, setView] = useJobsViewMode();
   const [filter, setFilter] = useState<ConsoleJobFilterId>("all");
   const [project, setProject] = useState(ALL_PROJECTS);
 
@@ -128,6 +136,15 @@ export function JobsView({
       <div className="head">
         <h1>Jobs</h1>
         <div className="spacer" />
+        <Seg
+          aria-label="View"
+          options={[
+            { value: "list", label: "List" },
+            { value: "board", label: "Board" },
+          ]}
+          value={view}
+          onChange={(v) => setView(v as JobsViewMode)}
+        />
         <Chip onClick={() => refresh.mutate()} disabled={refresh.isPending}>
           ↻ Refresh
         </Chip>
@@ -184,43 +201,62 @@ export function JobsView({
         />
       </div>
 
-      <Card>
-        <table className="jtbl">
-          <thead>
-            <tr>
-              <th>Ticket</th>
-              <th>Assigned</th>
-              <th>Status</th>
-              <th>Trace</th>
-              <th>PR</th>
-              <th>Updated</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((row) => (
-              <JobsRow key={row.key} row={row} roster={roster} onOpen={onOpenJob} />
-            ))}
-          </tbody>
-        </table>
-        {visible.length === 0 ? <div className="empty">{emptyMessage(rows.length, issueRuns.isPending)}</div> : null}
-        {/* How much of the history this is (STUDIO-792). Rendered whenever there are rows, not
-            only when the list is cut: "Showing all 386 jobs" is what tells the operator the list
-            ended because the history did, and that is the fact the silent 50 used to withhold. */}
-        {pageNote === "" ? null : (
-          <div className="jmore">
-            <span className="note">{pageNote}</span>
-            {hasMore ? (
-              // `isPlaceholderData`, not `isFetching`: it is true exactly while a WIDER page is in
-              // flight and the previous one is still on screen, and false during a background
-              // refetch of the page already held. Disabling on `isFetching` would make the
-              // control dead for a beat on every poll once STUDIO-791 gives this query one.
-              <Chip onClick={onLoadMore} disabled={issueRuns.isPlaceholderData}>
-                Load {JOBS_PAGE_SIZE} more
-              </Chip>
-            ) : null}
-          </div>
-        )}
-      </Card>
+      {view === "board" ? (
+        <BoardView
+          rows={rows}
+          blocked={state.data?.blocked ?? []}
+          filter={filter}
+          project={project}
+          counts={counts}
+          maxConcurrent={maxConcurrent}
+          refreshedAtMs={issueRuns.dataUpdatedAt}
+          nowMs={nowMs}
+          roster={roster}
+          onOpenJob={onOpenJob}
+          pageNote={pageNote}
+          hasMore={hasMore}
+          onLoadMore={onLoadMore}
+          loadingMore={issueRuns.isPlaceholderData}
+        />
+      ) : (
+        <Card>
+          <table className="jtbl">
+            <thead>
+              <tr>
+                <th>Ticket</th>
+                <th>Assigned</th>
+                <th>Status</th>
+                <th>Trace</th>
+                <th>PR</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map((row) => (
+                <JobsRow key={row.key} row={row} roster={roster} onOpen={onOpenJob} />
+              ))}
+            </tbody>
+          </table>
+          {visible.length === 0 ? <div className="empty">{emptyMessage(rows.length, issueRuns.isPending)}</div> : null}
+          {/* How much of the history this is (STUDIO-792). Rendered whenever there are rows, not
+              only when the list is cut: "Showing all 386 jobs" is what tells the operator the list
+              ended because the history did, and that is the fact the silent 50 used to withhold. */}
+          {pageNote === "" ? null : (
+            <div className="jmore">
+              <span className="note">{pageNote}</span>
+              {hasMore ? (
+                // `isPlaceholderData`, not `isFetching`: it is true exactly while a WIDER page is in
+                // flight and the previous one is still on screen, and false during a background
+                // refetch of the page already held. Disabling on `isFetching` would make the
+                // control dead for a beat on every poll once STUDIO-791 gives this query one.
+                <Chip onClick={onLoadMore} disabled={issueRuns.isPlaceholderData}>
+                  Load {JOBS_PAGE_SIZE} more
+                </Chip>
+              ) : null}
+            </div>
+          )}
+        </Card>
+      )}
     </section>
   );
 }
@@ -412,7 +448,23 @@ function JobsRow({
       <td>
         <TraceSpark runId={row.runId} live={row.live} armed={armed} />
       </td>
-      <td>{row.pr === "" ? "—" : <TicketChip variant="pr">{row.pr}</TicketChip>}</td>
+      {/* The PR column used to render "—" on every row, including the review rows whose own issue
+          key is literally `pr:owner/repo#n@reviewer` (STUDIO-925). The number was always there; now
+          it is a link. Only the LINK stops the click from also opening the row's job — the empty
+          cell (most rows) and the rare unlinked chip must stay a way into the row. */}
+      <td>
+        {row.pr === "" ? (
+          "—"
+        ) : row.prUrl === "" ? (
+          <TicketChip variant="pr">{row.pr}</TicketChip>
+        ) : (
+          <span onClick={(e) => e.stopPropagation()}>
+            <ExternalLink href={row.prUrl} aria-label={`Open pull request ${row.pr}`}>
+              <TicketChip variant="pr">{row.pr}</TicketChip>
+            </ExternalLink>
+          </span>
+        )}
+      </td>
       <td className="up">{row.updated}</td>
     </tr>
   );

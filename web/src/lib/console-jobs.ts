@@ -37,6 +37,9 @@ import type { JobRow } from "@/lib/runs-model";
 // disagreement it is fixing. `console-job-detail` imports only TYPES back from here, so this is not
 // a runtime cycle.
 import { runOutcomeLabel } from "@/lib/console-job-detail";
+// `console-board` imports ONLY types back from here (`import type`), so this is not a runtime cycle
+// — the same arrangement `console-job-detail` uses above.
+import { parsePullRequest, pullRequestLabel } from "@/lib/console-board";
 import { formatDuration } from "@/lib/format";
 
 /**
@@ -285,12 +288,33 @@ export interface ConsoleJobRow {
   projectSlug: string;
   status: ConsoleJobStatus;
   statusLabel: string;
+  /**
+   * This row's own RUN status, before any ticket-lifecycle mapping — `JobRow.status` verbatim.
+   *
+   * `status`/`statusLabel` are the TICKET's when the daemon resolved a lifecycle, so they cannot
+   * answer "how did this run end" — a failed review run maps to `blocked`, and the board's reviewer
+   * chip would then read "blocked" where it promises the run's own outcome (STUDIO-925). Carried
+   * raw so [`runOutcomeLabel`] is applied at the one surface that prints a run's word.
+   */
+  runOutcome: string;
   /** The tracker's own workflow-state name behind `status`, or "" when the daemon had no answer. */
   trackerState: string;
   /** Teammate name, or "" when solo/unassigned (the table renders "—"). */
   assignee: string;
-  /** PR reference, or "" when none is known. */
+  /**
+   * True when this row's own RUN is a review run (STUDIO-826), carried through from the listing so
+   * the board can fold it onto the ticket it reviews instead of rendering it as its own card
+   * (STUDIO-925). The row's `reviewOf` is where it attaches.
+   */
+  reviewRun: boolean;
+  /**
+   * PR reference, or "" when none is known. Parsed from a review row's `pr:owner/repo#n@reviewer`
+   * issue key (STUDIO-925) — the number has always been in the identifier while this column
+   * rendered "—". The display form is the prototype's `#n`.
+   */
   pr: string;
+  /** The PR's URL, or "" when none — what makes the chip a link rather than a label. */
+  prUrl: string;
   /**
    * The provider this row's run actually billed (STUDIO-909), or "" when the run recorded none
    * (a legacy row) — the compact scanning badge, never a per-row drill-down.
@@ -624,6 +648,9 @@ export function buildConsoleJobs(
     const reviewRun = reviewRuns.has(job.issue);
     const status = consoleJobStatus(job.status, ticket?.lifecycle, reviewTicket, reviewRun);
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
+    // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row
+    // has one; a plain ticket key never matches the parser.
+    const pr = parsePullRequest(job.issue);
     return {
       key: job.key,
       issue: job.issue,
@@ -634,12 +661,15 @@ export function buildConsoleJobs(
       projectSlug: job.project,
       status,
       statusLabel: CONSOLE_STATUS_LABELS[status],
+      runOutcome: job.status,
       trackerState: ticket?.trackerState ?? "",
       // The durable record first: it is the only one that survives the run. The live roster is the
       // fallback for the gap at the other end — a run dispatched moments ago, whose history row the
       // daemon has not yet decorated.
       assignee: durable.get(job.issue) ?? live.get(job.issue) ?? "",
-      pr: "",
+      reviewRun,
+      pr: pr === undefined ? "" : pullRequestLabel(pr),
+      prUrl: pr?.url ?? "",
       provider: providers.get(job.issue) ?? "",
       costs: costs.get(job.issue) ?? [],
       // `updatedAtMs` IS this run's start while it is live (no `ended_at` has landed yet to
@@ -681,9 +711,18 @@ export function buildConsoleJobs(
  * actively reviewing is the opposite of parked.
  */
 export function matchConsoleFilter(row: ConsoleJobRow, filter: ConsoleJobFilterId): boolean {
+  return consoleStatusMatches(row.status, filter);
+}
+
+/**
+ * The same rule over a bare STATUS rather than a row (STUDIO-925): the board's cards are not
+ * `ConsoleJobRow`s, but the status Seg above them must still filter them, and a second copy of this
+ * predicate is exactly how the Seg and the thing it filters drift apart.
+ */
+export function consoleStatusMatches(status: ConsoleJobStatus, filter: ConsoleJobFilterId): boolean {
   if (filter === "all") return true;
-  if (filter === "run") return isLive(row.status);
-  return row.status === filter;
+  if (filter === "run") return isLive(status);
+  return status === filter;
 }
 
 /** Whether a status means an agent is working the ticket right now — `run` or `reviewing`. */

@@ -2,7 +2,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { useState } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
@@ -202,6 +202,17 @@ function rowKeys(): string[] {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+// The List/Board choice is PERSISTED (STUDIO-925), so a board test that toggles would otherwise leave
+// the next test's mount in board mode and its table assertions empty. Storage is absent in some test
+// environments (a Node with no localStorage global behind jsdom), hence the guards.
+beforeEach(() => {
+  try {
+    window.localStorage?.clear();
+  } catch {
+    // No storage to reset.
+  }
 });
 
 describe("the Now strip (§3)", () => {
@@ -444,6 +455,17 @@ describe("the filter bar and the table (§3)", () => {
       tr.textContent?.includes("B-2"),
     );
     fireEvent.click(row!);
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("B-2");
+  });
+
+  it("still opens the row when its empty PR cell is clicked", async () => {
+    const onOpen = await mountFourJobs();
+    const row = [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.textContent?.includes("B-2"),
+    )!;
+    const prCell = within(row as HTMLElement).getAllByRole("cell")[4];
+    expect(prCell.textContent).toBe("—");
+    fireEvent.click(prCell);
     expect(onOpen).toHaveBeenCalledExactlyOnceWith("B-2");
   });
 
@@ -1704,5 +1726,124 @@ describe("a review row says which ticket it is reviewing", () => {
 
     fireEvent.click(document.querySelector(".jtbl tbody tr")!);
     expect(onOpen).toHaveBeenCalledExactlyOnceWith("pr:makewhatis/tally#230@jimmy");
+  });
+});
+
+// STUDIO-925 — the Jobs home's second view: a card is a ticket, a column is its tracker state. The
+// regroup itself is pinned in `lib/console-board.test.ts`; these are the boxes on the real view.
+describe("the board view (STUDIO-925)", () => {
+  /** A ticket with a live run plus the TWO review rows that used to read as two more jobs. */
+  function boardStore(more = false) {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-STUDIO-924",
+          issue_identifier: "STUDIO-924",
+          title: "STUDIO-924 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 901,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    const rows = [
+      run({
+        id: 901,
+        issue_identifier: "STUDIO-924",
+        outcome: "running",
+        lifecycle: "open",
+        tracker_state: "In Progress",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#539@jimmy",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#540@alice",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+      run({
+        issue_identifier: "STUDIO-925",
+        outcome: "completed",
+        lifecycle: "in_review",
+        tracker_state: "In Review",
+      }),
+    ];
+    h.fetchIssueRuns.mockResolvedValue({ issues: rows, next_offset: more ? rows.length : null });
+    h.fetchIssueCounts.mockImplementation(async () => tallyOf(rows, await h.fetchState()));
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+  }
+
+  const boardButton = () => screen.getByRole("button", { name: "Board" });
+
+  it("folds a ticket's review rows onto its one card, chip each", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4)); // the table still shows every row
+    fireEvent.click(boardButton());
+
+    await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(2));
+    const ticket = [...document.querySelectorAll(".bcard")].find((el) =>
+      el.textContent?.includes("STUDIO-924"),
+    )!;
+    expect(ticket.querySelectorAll(".rchip")).toHaveLength(2);
+    expect(
+      [...ticket.querySelectorAll(".rchip .o")].map((el) => el.textContent),
+    ).toEqual(["done", "done"]);
+  });
+
+  it("drives columns from tracker_state, not the normalized status", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+    fireEvent.click(boardButton());
+
+    await waitFor(() =>
+      expect(
+        [...document.querySelectorAll(".bcolhd .bname")].map((el) => el.textContent),
+      ).toEqual(["In Progress", "In Review"]),
+    );
+  });
+
+  it("links the PR column that used to render a dash", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+    const hrefs = [...document.querySelectorAll(".jtbl a")].map((el) =>
+      (el as HTMLAnchorElement).getAttribute("href"),
+    );
+    expect(hrefs.sort()).toEqual([
+      "https://github.com/makewhatis/booch/pull/539",
+      "https://github.com/makewhatis/booch/pull/540",
+    ]);
+  });
+
+  it("carries the table's truncation sentence and Load more onto the board", async () => {
+    boardStore(true);
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+    fireEvent.click(boardButton());
+    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(2));
+    expect(document.querySelector(".bfoot .bnote")?.textContent).toContain("Older jobs");
+    expect(screen.getByRole("button", { name: /load more/i })).toBeTruthy();
   });
 });
