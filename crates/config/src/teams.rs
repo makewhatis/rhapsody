@@ -583,9 +583,10 @@ impl Review {
 /// Per-PROJECT rather than per-repo on purpose: the thing the operator writes is
 /// the Linear project, and its repo belongs to it — a repo shared by two projects
 /// is two overrides to state, not one. When two resolved projects do share a repo,
-/// the orchestrator ANDs every owning project's answer, so naming EITHER project
-/// holds the merge: an override that resolves `false` must never be lost to a
-/// first-match scan.
+/// the orchestrator ANDs every owning project's answer: naming any ONE owning slug
+/// holds the merge back, while opting in under a global `false` takes naming EVERY
+/// owning slug, since an unnamed sibling inherits the global and holds it. An
+/// override that resolves `false` must never be lost to a first-match scan.
 ///
 /// Unknown keys are rejected ([`serde`] `deny_unknown_fields`), deliberately unlike
 /// the lenient top-level blocks. These are brand-new types with no legacy spellings,
