@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use rhapsody_store::{
     DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens, ReviewWatchRow,
-    RunFilter, RunMessage, RunProvenance, RunSummary, StoreError,
+    RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -77,6 +77,9 @@ pub trait HistoryStore: Send + Sync {
     /// cost-attribution tally the dashboard's summary carries (STUDIO-909). Rhapsody-only; Go cannot
     /// attribute a token at all.
     fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
+    /// Every run's tokens per (issue key, provider) over the whole store — the ledger behind
+    /// `GET /api/v1/history/costs` (STUDIO-926). Rhapsody-only.
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError>;
 }
 
 /// Every thread-safe [`rhapsody_store::Store`] is a [`HistoryStore`] — the Rust analog of Go's
@@ -132,5 +135,8 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
     }
     fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
         rhapsody_store::Store::tokens_by_provider(self, since)
+    }
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError> {
+        rhapsody_store::Store::run_costs(self)
     }
 }

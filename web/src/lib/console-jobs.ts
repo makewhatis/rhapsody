@@ -29,6 +29,7 @@ import type {
   IssueStatusBucket,
   RunSummary,
   TeamsOverview,
+  TicketCostRow,
 } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 // The run detail's own vocabulary, imported rather than restated: `statusNote` exists to make the
@@ -39,6 +40,7 @@ import { runOutcomeLabel } from "@/lib/console-job-detail";
 // `console-board` imports ONLY types back from here (`import type`), so this is not a runtime cycle
 // — the same arrangement `console-job-detail` uses above.
 import { parsePullRequest, pullRequestLabel } from "@/lib/console-board";
+import { formatDuration } from "@/lib/format";
 
 /**
  * The states the console's Pill paints (§1.3), plus `reviewing` (STUDIO-780).
@@ -319,6 +321,20 @@ export interface ConsoleJobRow {
    */
   provider: string;
   /**
+   * The ticket's token cost split by provider (STUDIO-926) — the implementation run plus every
+   * review of it, summed. `[]` when the daemon has no run to cost yet (a queued ticket with no
+   * history row). See [`ticketCostsByIssue`].
+   */
+  costs: TicketCost[];
+  /**
+   * How long the ticket's live run has been going, formatted ("6m"; seconds only under a minute), or "" when [`live`] is
+   * false. This plus the current transcript step is the honest "is it moving?" signal the design
+   * record's progress-bar ban asks for in its place (STUDIO-926) — a card that has shown the same
+   * step for a long while is the real stall tell, and neither half needs a denominator the daemon
+   * does not have.
+   */
+  elapsed: string;
+  /**
    * For a review row, the TICKET it is reviewing (STUDIO-834) — what the table leads with in place
    * of the `pr:owner/repo#n@reviewer` key, which names no work. "" for every other row, and for a
    * review row whose origin the daemon could not resolve to a ticket; the table then leads with
@@ -502,6 +518,61 @@ export function providerByIssue(rows: readonly IssueRun[]): Map<string, string> 
 }
 
 /**
+ * One provider's token total on a ticket's card (STUDIO-926). `provider` is "" for tokens whose
+ * run recorded none (a legacy row) — folded in rather than dropped, because a cost cannot be
+ * skipped the way the single-row badge above can. `estimated` is true when ANY run folded into
+ * this bucket ended without a clean `result` event: a sum with one floored input is itself a
+ * floor, never an authoritative total.
+ */
+export interface TicketCost {
+  provider: string;
+  totalTokens: number;
+  estimated: boolean;
+}
+
+/**
+ * Elapsed time for a live row's activity line. Whole minutes once past one, because the clock that
+ * drives this ticks every 30s: a seconds figure would sit frozen on screen and then jump, claiming
+ * a precision it does not have.
+ */
+function liveElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return formatDuration(s < 60 ? s : Math.floor(s / 60) * 60).replace(/ 0s$/, "");
+}
+
+/**
+ * Ticket key → its token cost, split by provider, from the daemon's whole-store ledger
+ * (`GET /api/v1/history/costs`, STUDIO-926).
+ *
+ * This is the number the ticket's card exists to answer: "one ticket's two reviews cost 9.4M
+ * tokens" is EVERY implementation run plus every review round, not the newest of each. The ledger
+ * arrives already summed per (ticket, provider) with review runs credited to the ticket they
+ * reviewed, so this only groups and orders — it deliberately does NOT sum `/history/issues` rows,
+ * which keep one run per key and would drop every earlier round (and show a running ticket as 0).
+ *
+ * Split BY PROVIDER rather than blended, because that is the one thing this figure must not do:
+ * a ticket whose implementation ran on Fireworks and whose review ran on Anthropic spent two
+ * different currencies, and a single blended number would hide exactly the split the ticket exists
+ * to show. Buckets are ordered largest first (ties broken by provider name) so the biggest cost is
+ * always what a reader sees first. A ticket that has spent nothing has no entry, so a queued row
+ * carries no cost line at all rather than "0".
+ */
+export function ticketCostsByIssue(rows: readonly TicketCostRow[]): Map<string, TicketCost[]> {
+  const out = new Map<string, TicketCost[]>();
+  for (const r of rows) {
+    if (!r.ticket || r.total_tokens <= 0) continue;
+    const bucket = { provider: r.provider ?? "", totalTokens: r.total_tokens, estimated: r.usage_estimated };
+    const list = out.get(r.ticket);
+    if (list) list.push(bucket);
+    else out.set(r.ticket, [bucket]);
+  }
+  for (const list of out.values()) {
+    list.sort((a, b) => b.totalTokens - a.totalTokens || a.provider.localeCompare(b.provider));
+  }
+  return out;
+}
+
+/**
  * Newest activity per ticket, from the issue-level history rows: a run's end when it has one,
  * else its start. `mergeJobs` surfaces only the start, and the column says "Updated".
  */
@@ -559,6 +630,7 @@ export function buildConsoleJobs(
   issueRows: readonly IssueRun[],
   overview: TeamsOverview | undefined,
   nowMs: number,
+  costRows: readonly TicketCostRow[] = [],
 ): ConsoleJobRow[] {
   const durable = durableAssignees(issueRows);
   const live = ticketAssignees(overview);
@@ -568,6 +640,7 @@ export function buildConsoleJobs(
   const reviewRuns = reviewRunIssues(issueRows);
   const reviewOf = reviewOfTickets(issueRows);
   const providers = providerByIssue(issueRows);
+  const costs = ticketCostsByIssue(costRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
@@ -598,6 +671,10 @@ export function buildConsoleJobs(
       pr: pr === undefined ? "" : pullRequestLabel(pr),
       prUrl: pr?.url ?? "",
       provider: providers.get(job.issue) ?? "",
+      costs: costs.get(job.issue) ?? [],
+      // `updatedAtMs` IS this run's start while it is live (no `ended_at` has landed yet to
+      // outrank it), so it doubles as the elapsed clock's zero without a second lookup.
+      elapsed: job.live ? liveElapsed(nowMs - updatedAtMs) : "",
       reviewOf: reviewOf.get(job.issue) ?? "",
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,

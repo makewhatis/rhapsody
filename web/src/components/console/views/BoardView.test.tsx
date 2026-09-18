@@ -31,6 +31,8 @@ function row(over: Partial<ConsoleJobRow> & Pick<ConsoleJobRow, "issue">): Conso
     status: "review",
     statusLabel: "in review",
     runOutcome: "completed",
+    costs: [],
+    elapsed: "",
     trackerState: "In Review",
     assignee: "",
     reviewRun: false,

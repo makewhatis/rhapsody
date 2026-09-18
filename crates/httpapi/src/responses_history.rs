@@ -16,7 +16,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_orchestrator::{EventRecord, IssueLifecycleRow, RunningRow, review};
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventRow, ProviderTokens, RunProvenance, RunSummary,
+    DayRollup, DayTotals, EventHit, EventRow, ProviderTokens, RunCostBucket, RunProvenance,
+    RunSummary,
 };
 use serde_json::{Value, json};
 
@@ -386,6 +387,41 @@ pub(crate) fn history_summary_response(
                     "input_tokens": p.input_tokens,
                     "output_tokens": p.output_tokens,
                     "total_tokens": p.total_tokens,
+                }))
+                .collect(),
+        ),
+    })
+}
+
+/// `{costs: [{ticket, provider, total_tokens, usage_estimated}]}` — the whole-store token ledger
+/// folded per OWNER ticket and provider (STUDIO-926). `origins` maps a review-run key to the ticket
+/// it reviewed; a key with no entry (an operator-introduced pull request) is its own owner. Sorted
+/// by ticket then provider so the body is stable. `provider` is "" for tokens whose run recorded
+/// none — present rather than dropped, since a cost cannot skip a run the way a badge can.
+pub(crate) fn history_costs_response(
+    buckets: &[RunCostBucket],
+    origins: &HashMap<String, String>,
+) -> Value {
+    let mut folded: BTreeMap<(&str, &str), (i64, bool)> = BTreeMap::new();
+    for b in buckets {
+        let owner = origins
+            .get(&b.issue_identifier)
+            .map_or(b.issue_identifier.as_str(), String::as_str);
+        let slot = folded
+            .entry((owner, b.provider.as_str()))
+            .or_insert((0, false));
+        slot.0 += b.total_tokens;
+        slot.1 |= b.usage_estimated;
+    }
+    json!({
+        "costs": Value::Array(
+            folded
+                .into_iter()
+                .map(|((ticket, provider), (total, estimated))| json!({
+                    "ticket": ticket,
+                    "provider": provider,
+                    "total_tokens": total,
+                    "usage_estimated": estimated,
                 }))
                 .collect(),
         ),

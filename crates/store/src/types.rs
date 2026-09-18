@@ -237,6 +237,21 @@ pub struct ProviderTokens {
     pub total_tokens: i64,
 }
 
+/// One (issue key, provider) bucket of the whole-store token ledger — the raw material of the
+/// per-ticket cost split (STUDIO-926). The key is the run's OWN `issue_identifier`, so a review run
+/// (`pr:owner/repo#n@reviewer`) is a bucket of its own; folding it into the ticket it reviewed needs
+/// the review watch set and happens in the HTTP layer, not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunCostBucket {
+    pub issue_identifier: String,
+    /// The recorded provider; empty for a run that recorded none (a legacy row), reported as its
+    /// own bucket rather than dropped, exactly like [`ProviderTokens::provider`].
+    pub provider: String,
+    pub total_tokens: i64,
+    /// True when ANY run in the bucket ended without a clean `result` event (a floored figure).
+    pub usage_estimated: bool,
+}
+
 /// EventQuery is a cross-run text search over events (Phase 5 /api/v1/events).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventQuery {

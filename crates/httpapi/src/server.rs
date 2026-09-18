@@ -30,9 +30,9 @@ use crate::handlers::{handle_healthz, handle_refresh, handle_state, handle_versi
 use crate::handlers_config::{handle_capabilities, handle_config};
 use crate::handlers_drain::handle_drain;
 use crate::handlers_history::{
-    handle_event_search, handle_history, handle_history_summary, handle_issue_counts,
-    handle_issue_history, handle_issue_runs, handle_metrics, handle_run_detail, handle_run_events,
-    handle_run_provenance, handle_run_transcript,
+    handle_event_search, handle_history, handle_history_costs, handle_history_summary,
+    handle_issue_counts, handle_issue_history, handle_issue_runs, handle_metrics,
+    handle_run_detail, handle_run_events, handle_run_provenance, handle_run_transcript,
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
@@ -588,6 +588,9 @@ where
         // neighbour.
         .route("/api/v1/history/issues/counts", any(handle_issue_counts))
         .route("/api/v1/history/summary", any(handle_history_summary))
+        // Whole-store per-ticket token cost by provider (STUDIO-926): a route of its own because
+        // `/history/issues` keeps only each key's newest run and so cannot be summed into a cost.
+        .route("/api/v1/history/costs", any(handle_history_costs))
         .route("/api/v1/events", any(handle_event_search))
         .route("/api/v1/metrics", any(handle_metrics))
         .route("/api/v1/runs/{id}/events", any(handle_run_events))

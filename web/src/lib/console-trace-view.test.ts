@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { LogEntry, RunDetail, RunProvenance, RunSummary } from "@/lib/api";
-import { buildResult, buildTrace } from "@/lib/trace-model";
+import { buildResult, buildTrace, type TracePhase } from "@/lib/trace-model";
 import {
   PROVENANCE_UNKNOWN,
   TRACE_FILTERS,
   attemptBucket,
   attemptOptions,
   cardLead,
+  currentStepLabel,
   failingStep,
   filterPhases,
   githubRepo,
@@ -67,6 +68,42 @@ const TRANSCRIPT: LogEntry[] = [
   entry({ seq: 6, kind: "tool_use", tool: "Bash", text: "command=npm test" }),
   entry({ seq: 7, kind: "tool_result", text: "Error: 1 failed" }),
 ];
+
+function phase(over: Partial<TracePhase> & Pick<TracePhase, "title">): TracePhase {
+  return {
+    id: "1",
+    kind: "other",
+    subtitle: "",
+    turn: 0,
+    did: [],
+    said: [],
+    effects: [],
+    failed: false,
+    orphanResults: [],
+    ...over,
+  };
+}
+
+// The Jobs worklist's live-activity signal (STUDIO-926) — never a step count, only the most
+// recent phase's own title and subtitle, the same pairing the run-detail spine renders per step.
+describe("currentStepLabel", () => {
+  it("reads the most recent phase's title and subtitle", () => {
+    expect(
+      currentStepLabel([
+        phase({ title: "Oriented", subtitle: "read 2 files" }),
+        phase({ title: "Verified", subtitle: "cargo test --workspace" }),
+      ]),
+    ).toBe("Verified · cargo test --workspace");
+  });
+
+  it("drops the separator when the phase has no subtitle", () => {
+    expect(currentStepLabel([phase({ title: "Handed off" })])).toBe("Handed off");
+  });
+
+  it("returns undefined for a run with no phases yet, rather than a fabricated label", () => {
+    expect(currentStepLabel([])).toBeUndefined();
+  });
+});
 
 describe("runVitals — the header's mono strip derives from RunSummary (§3A)", () => {
   it("reads duration from ended−started, and turns/tokens/branch verbatim", () => {

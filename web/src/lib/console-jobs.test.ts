@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { IssueCountsResponse, IssueRun, TeamsOverview } from "@/lib/api";
+import type { IssueCountsResponse, IssueRun, TeamsOverview, TicketCostRow } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 import {
   CONSOLE_JOB_FILTERS,
@@ -23,6 +23,7 @@ import {
   reviewTicketIssues,
   statusNote,
   ticketAssignees,
+  ticketCostsByIssue,
 } from "./console-jobs";
 import { runOutcomeLabel } from "./console-job-detail";
 
@@ -605,6 +606,32 @@ describe("buildConsoleJobs", () => {
     );
     expect(rows[0].updated).toBe("6m ago");
   });
+
+  // The Jobs worklist's live-activity clock (STUDIO-926): only a running row gets one, and it
+  // reads off the same started timestamp `updated` already resolves — no second lookup.
+  it("formats a running row's elapsed time and leaves a finished row's empty", () => {
+    const rows = buildConsoleJobs(
+      [
+        job({ issue: "A", status: "running", startedAtMs: NOW - (2 * 60 + 4) * 1000 }),
+        job({ issue: "B", status: "completed" }),
+      ],
+      [],
+      undefined,
+      NOW,
+    );
+    expect(rows.find((r) => r.issue === "A")?.elapsed).toBe("2m");
+    expect(rows.find((r) => r.issue === "B")?.elapsed).toBe("");
+  });
+
+  // The clock ticks every 30s, so a seconds figure past one minute would freeze and then jump.
+  it("keeps seconds only under a minute", () => {
+    const at = (s: number) =>
+      buildConsoleJobs([job({ issue: "A", status: "running", startedAtMs: NOW - s * 1000 })], [], undefined, NOW)[0]
+        .elapsed;
+    expect(at(41)).toBe("41s");
+    expect(at(60)).toBe("1m");
+    expect(at(3600 + 5 * 60 + 59)).toBe("1h 5m");
+  });
 });
 
 describe("providerByIssue / the provider badge (STUDIO-909)", () => {
@@ -634,6 +661,64 @@ describe("providerByIssue / the provider badge (STUDIO-909)", () => {
     const byIssue = new Map(rows.map((r) => [r.issue, r.provider]));
     expect(byIssue.get("A")).toBe("fireworks-ai");
     expect(byIssue.get("B")).toBe("");
+  });
+});
+
+describe("ticketCostsByIssue — the ticket card's cost (STUDIO-926)", () => {
+  const cost = (
+    ticket: string,
+    provider: string,
+    total_tokens: number,
+    usage_estimated = false,
+  ): TicketCostRow => ({ ticket, provider, total_tokens, usage_estimated });
+
+  // The ledger arrives already summed over EVERY run (the daemon credits reviews to the ticket they
+  // reviewed), so a ticket with earlier rounds carries their tokens too. This is the shape the old
+  // fold over `/history/issues` could never produce: that listing holds one run per key.
+  it("groups a ticket's ledger rows and keeps the total the daemon summed", () => {
+    const by = ticketCostsByIssue([cost("STUDIO-924", "anthropic", 93_600_000)]);
+    expect(by.get("STUDIO-924")).toEqual([
+      { provider: "anthropic", totalTokens: 93_600_000, estimated: false },
+    ]);
+  });
+
+  // "A ticket whose impl ran on Fireworks and whose reviews ran on Anthropic must read as two
+  // different numbers, not one blended total" — the ticket's own wording.
+  it("keeps two harnesses as two buckets, largest first, rather than one blended total", () => {
+    const by = ticketCostsByIssue([
+      cost("STUDIO-1", "anthropic", 200_000),
+      cost("STUDIO-1", "fireworks-ai", 607_780),
+    ]);
+    expect(by.get("STUDIO-1")).toEqual([
+      { provider: "fireworks-ai", totalTokens: 607_780, estimated: false },
+      { provider: "anthropic", totalTokens: 200_000, estimated: false },
+    ]);
+  });
+
+  it("carries a bucket's estimated flag through", () => {
+    const by = ticketCostsByIssue([cost("STUDIO-2", "anthropic", 150, true)]);
+    expect(by.get("STUDIO-2")).toEqual([{ provider: "anthropic", totalTokens: 150, estimated: true }]);
+  });
+
+  it("keeps tokens with no recorded provider under the empty-string bucket rather than dropping them", () => {
+    const by = ticketCostsByIssue([cost("STUDIO-3", "", 42)]);
+    expect(by.get("STUDIO-3")).toEqual([{ provider: "", totalTokens: 42, estimated: false }]);
+  });
+
+  it("gives a ticket that has spent nothing no entry, so a queued row shows no cost line", () => {
+    expect(ticketCostsByIssue([cost("STUDIO-4", "anthropic", 0)]).has("STUDIO-4")).toBe(false);
+  });
+
+  it("carries the ledger's cost onto the worklist row", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "STUDIO-924", status: "running" })],
+      [],
+      undefined,
+      NOW,
+      [cost("STUDIO-924", "anthropic", 300)],
+    );
+    // Even a row whose only run is in flight (no listing row carrying tokens) reads its true cost.
+    expect(rows[0].costs).toEqual([{ provider: "anthropic", totalTokens: 300, estimated: false }]);
   });
 });
 

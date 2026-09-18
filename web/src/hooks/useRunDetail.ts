@@ -53,12 +53,17 @@ export function useRunProvenance(runId: number, enabled = true) {
 // useTranscript fetches a run's humanized transcript. While the run is in flight it streams
 // (polls @1.5s, never stale); once finished it freezes (no interval, infinite staleTime). On the
 // running→finished edge it fires exactly one extra refetch to capture the final lines.
-export function useTranscript(runId: number, inFlight: boolean, enabled = true) {
+export function useTranscript(
+  runId: number,
+  inFlight: boolean,
+  enabled = true,
+  pollMs = 1500,
+) {
   const query = useQuery<RunTranscriptResponse>({
     queryKey: ["run-transcript", runId],
     queryFn: () => fetchRunTranscript(runId),
     enabled: enabled && runId > 0,
-    refetchInterval: inFlight ? 1500 : false,
+    refetchInterval: inFlight ? pollMs : false,
     staleTime: inFlight ? 0 : Infinity,
     refetchOnWindowFocus: false,
   });

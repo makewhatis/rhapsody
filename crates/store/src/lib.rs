@@ -214,6 +214,11 @@ pub trait Store {
     /// The window is the point (STUDIO-909 round 1): a lifetime total rendered under a "today"
     /// heading answers a question nobody asked and cannot be reconciled with `day_totals`.
     fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
+    /// Every run's tokens summed per (`issue_identifier`, provider), over the WHOLE store — the
+    /// ledger behind a ticket's cost on the console (STUDIO-926). Unlike `list_issue_runs` this does
+    /// not keep only each key's newest run: a ticket's cost is every run that spent on it. One row
+    /// per distinct pair, empty provider included; order is stable (identifier, then provider).
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError>;
 
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`
