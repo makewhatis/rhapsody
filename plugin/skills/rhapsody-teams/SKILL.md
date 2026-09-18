@@ -158,6 +158,26 @@ merged on its existing approval either: if the repository allows it, the daemon 
 itself, which moves the head and arms a fresh review round rather than merging (see `operating.md`
 for the two GitHub repository settings this depends on).
 
+**`auto_merge` can be scoped per project.** The top-level `teams.review.auto_merge` is the
+installation-wide default; a top-level `projects:` entry overrides it for the Linear project
+slugs it names, so one repo can be held for a human while a sibling still merges itself:
+
+```yaml
+review:
+  auto_merge: true
+projects:
+  - slugs: [4f4a2350682f]   # the Linear project slugId, NOT its display name
+    review:
+      auto_merge: false      # this repo is merged by a human
+```
+
+`slugs:` takes the same values as `WORKFLOW.md`'s own `projects:` list — Linear's opaque
+**`slugId` hex** — never the project's display name; the daemon warns at boot about any slug that
+matches nothing. An unset override inherits the global value, both directions. When a project fans
+out to several slugs that share one repo, their answers are ANDed: to **hold a merge back**, name
+any one slug; to **opt in under a global `false`**, name **every** slug, or an unnamed sibling
+inherits `false` and keeps the repo human-merged.
+
 ## Planning work for an installation (the operational rules)
 
 - Under the shipped `claim_mode: assignee`, a ticket is claimable only when **all** of these

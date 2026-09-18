@@ -1217,6 +1217,42 @@ thing that merges on this install is somebody happening to look.
 | how it merges | — | `gh pr merge --squash --match-head-commit <head>` |
 | default | — | **off**: `teams.review.auto_merge` is `false` unless an operator sets it |
 
+**`auto_merge` is per project, and unset inherits.** The top-level `teams.review.auto_merge` is the
+installation-wide default; a `projects:` entry in `teams.yaml` overrides it for the Linear project
+slugs it names (STUDIO-927), so a repo that must be merged by a human can say so while a sibling
+repo still merges itself:
+
+```yaml
+review:
+  auto_merge: true            # the default, unchanged
+projects:
+  - slugs: [4f4a2350682f]     # the Linear project's slugId, NOT its name
+    review:
+      auto_merge: false       # this project is merged by a human
+```
+
+`slugs:` here are the same values as `WORKFLOW.md`'s own `projects:` list — Linear's opaque
+**`slugId` hex** (`4f4a2350682f`), never the project's display name. When several resolved projects
+share one repo (a project that fans out to several slugs, or two projects pointing at the same
+repo), their answers are ANDed, so the two directions differ:
+
+- **To hold a merge back** (the overriding direction, `auto_merge: false` under a global `true`),
+  name **any one** of the project's slugs. An unnamed sibling inherits the global `true`, and the
+  AND already yields `false`.
+- **To opt in under a global `false`**, name **every** slug of the project. An unnamed sibling
+  inherits the global `false`, and the AND then yields `false` — so naming only one slug leaves the
+  repo human-merged. This fails closed, but silently: nothing warns that the unnamed sibling is
+  holding it.
+
+An entry whose slug matches nothing can never fire, so the daemon warns at boot naming every
+unmatched slug rather than letting a name-where-an-id-belongs look like success.
+
+A project with no matching entry — and an entry that sets no `auto_merge` — inherits the top-level
+value in both directions, so a project that has never been configured behaves exactly as it did
+before the block existed. An unknown key (a misspelling, or `auto_merge` placed beside `slugs`
+instead of under `review:`) or a wrong type is a rejected `teams.yaml`, which degrades to Teams-off
+(and `rhapsodyd teams show` reports the reason); Teams-off means no auto-merge, the safe side.
+
 **The verdict is data, never prose.** `gh pr review --approve` errors on this install (GitHub
 refuses a self-review from the account that authored the pull request), so `reviewDecision` is empty
 on every pull request here and reviewer verdicts reach GitHub only as English. None of that is read.

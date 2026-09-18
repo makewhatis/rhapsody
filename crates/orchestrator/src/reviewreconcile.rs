@@ -245,7 +245,9 @@ pub(crate) struct PrFacts {
     /// `owner/repo#number`.
     pub pr: String,
     pub rows: Vec<RowFacts>,
-    /// The effective `teams.review.auto_merge`. It gates divergence (b) and nothing else, and the
+    /// The effective `teams.review.auto_merge` FOR THIS PULL REQUEST'S PROJECT (STUDIO-927) — the
+    /// per-project override when the owning project has one, else the installation-wide default.
+    /// It gates divergence (b) and nothing else, and the
     /// gate is not a special case: with auto-merge OFF, an approved-and-open pull request is waiting
     /// for a HUMAN by design, so there is no intent for its activity to diverge from. Reporting it
     /// would light the warning on every healthy review on such a board — the exact crying-wolf
@@ -458,16 +460,16 @@ impl Orchestrator {
                 return;
             }
         };
-        let auto_merge = self
-            .teams
-            .as_ref()
-            .is_some_and(rhapsody_config::teams::Teams::review_auto_merge);
         // Grouped by pull request, preserving `load_live_review_watch`'s stable order so the
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
         let mut by_pr: HashMap<PrCoord, PrFacts> = HashMap::new();
         for row in &rows {
             let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+            // Per project (STUDIO-927): each pull request reads the override for the project
+            // that owns its repo, so one repo can be held back while a sibling still merges.
+            // A repo no resolved project owns falls back to the top-level value.
+            let auto_merge = self.review_auto_merge_for_repo(&row.key.owner, &row.key.repo);
             let ticket = origin_ticket(&row.introduced_by)
                 .unwrap_or_default()
                 .to_string();

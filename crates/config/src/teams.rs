@@ -501,6 +501,11 @@ pub struct Review {
     /// verdict the ticketless path records — so it is dead without
     /// `mode: ticketless` exactly as [`Review::done_state`] is, and
     /// [`Teams::review_auto_merge`] gates it on the same predicate.
+    ///
+    /// This is the installation-wide DEFAULT (STUDIO-927): a per-project entry
+    /// under [`Teams::projects`] may override it, and every caller that knows
+    /// which project a pull request belongs to reads
+    /// [`Teams::review_auto_merge_for`] rather than this field directly.
     #[serde(default)]
     pub auto_merge: bool,
     /// The model a REVIEW run uses, per HARNESS, regardless of what the routed teammate's own
@@ -563,6 +568,65 @@ impl Review {
         usize::try_from(self.reviewers.max(MIN_QUORUM_REVIEWERS))
             .unwrap_or(DEFAULT_REVIEW_REVIEWERS as usize)
     }
+}
+
+/// One `projects:` entry in `teams.yaml` (STUDIO-927): a per-project overlay of
+/// the review knobs, keyed by the Linear project slugs it applies to.
+///
+/// Shaped like `WORKFLOW.md`'s own `projects:` list (a `slugs:` list plus a
+/// nested override block) and resolved the same presence-based way: an unset
+/// override inherits the top-level `review.auto_merge`; a set one wins for this
+/// project. The slugs are matched against a resolved project's slug exactly as
+/// the orchestrator routes a run, so a project that no entry names is
+/// byte-identical to one built before this block existed.
+///
+/// Per-PROJECT rather than per-repo on purpose: the thing the operator writes is
+/// the Linear project, and its repo belongs to it — a repo shared by two projects
+/// is two overrides to state, not one. When two resolved projects do share a repo,
+/// the orchestrator ANDs every owning project's answer: naming any ONE owning slug
+/// holds the merge back, while opting in under a global `false` takes naming EVERY
+/// owning slug, since an unnamed sibling inherits the global and holds it. An
+/// override that resolves `false` must never be lost to a first-match scan.
+///
+/// Unknown keys are rejected ([`serde`] `deny_unknown_fields`), deliberately unlike
+/// the lenient top-level blocks. These are brand-new types with no legacy spellings,
+/// and a misspelled key (`auto-merge:`) or a mis-indent (the key beside `slugs`
+/// instead of under `review:`) would otherwise parse cleanly, leave `auto_merge`
+/// unset, and silently inherit the global — the exact unsafe direction this knob
+/// exists to prevent. A rejected `teams.yaml` degrades to Teams-off (no auto-merge),
+/// the safe side.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamsProject {
+    /// The Linear project SLUG IDs this entry applies to — the same `slugs:` values
+    /// `WORKFLOW.md`'s `projects:` list carries (Linear `slugId` hex, e.g.
+    /// `4f4a2350682f`), never the project NAME. A slug no resolved project carries
+    /// leaves its entry inert, and the boot reports every such slug with a warning,
+    /// so a name written where an id belongs is visible rather than silently ignored.
+    #[serde(default)]
+    pub slugs: Vec<String>,
+    /// The per-project review overrides.
+    #[serde(default)]
+    pub review: ProjectReview,
+}
+
+/// The per-project half of [`Review`] (STUDIO-927), scoped to the project whose
+/// slugs name the enclosing [`TeamsProject`].
+///
+/// Only the knobs that make sense per project and are read per project live
+/// here. `auto_merge` is the first: with one global flag, a repo that must not
+/// self-merge had no way to say so inside `teams.yaml` — the only brake was an
+/// adjective in a prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectReview {
+    /// `Some(false)` keeps THIS project human-merged even when the top-level
+    /// `review.auto_merge` is on; `Some(true)` turns it on for a project whose
+    /// default would be off. `None` — the default — inherits the top-level
+    /// value, which is the asymmetric safety property: a project never named
+    /// here behaves exactly as it did before this key existed.
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
 }
 
 /// The `memory:` block (§2.2). Carried as config in T1 — no backend is
@@ -664,6 +728,13 @@ pub struct Teams {
     /// every existing `teams.yaml` is already in.
     #[serde(default)]
     pub review: Review,
+    /// The per-project review overrides (STUDIO-927). An ABSENT block leaves
+    /// every project on the top-level `review.auto_merge`, so an existing
+    /// `teams.yaml` — including one that spells only the bare top-level key —
+    /// parses to exactly the behaviour it had. Read through
+    /// [`Teams::review_auto_merge_for`], never raw.
+    #[serde(default)]
+    pub projects: Vec<TeamsProject>,
     #[serde(default)]
     pub roster: Vec<Identity>,
     /// **The one total byte budget** for the whole Teams turn-1 prepend
@@ -700,6 +771,7 @@ impl Default for Teams {
             memory: Memory::default(),
             quorum: Quorum::default(),
             review: Review::default(),
+            projects: Vec::new(),
             roster: Vec::new(),
             prompt_budget_bytes: DEFAULT_PROMPT_BUDGET_BYTES,
         }
@@ -772,8 +844,72 @@ impl Teams {
     /// by the ticketless path. On a `tickets` install the watch set is empty, so
     /// an auto-merge there would not be conservative, it would be a merge with
     /// no reviewer verdict to read at all.
+    ///
+    /// This is the installation-wide default. A caller that knows which project
+    /// a pull request belongs to reads [`review_auto_merge_for`](Self::review_auto_merge_for)
+    /// instead; this accessor remains the fallback for a pull request whose
+    /// project cannot be resolved.
     pub fn review_auto_merge(&self) -> bool {
         self.review_ticketless() && self.review.auto_merge
+    }
+
+    /// Whether the project named `project_slug` may be auto-merged (STUDIO-927):
+    /// the per-project overlay of [`review_auto_merge`](Self::review_auto_merge).
+    ///
+    /// The first `projects:` entry whose `slugs` contains `project_slug` wins, and
+    /// its `review.auto_merge` — when set — overrides the top-level value. A slug
+    /// no entry names answers exactly as [`review_auto_merge`](Self::review_auto_merge)
+    /// does, so a project that has never been configured behaves exactly as it
+    /// did before this key existed. An unset per-project override inherits in
+    /// BOTH directions: a project with no entry under a global `true` still
+    /// merges, and one named with no `auto_merge` under a global `false` still
+    /// does not.
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_auto_merge`](Self::review_auto_merge)'s reason: a per-project
+    /// `true` on a Teams-off or `mode: tickets` install is dead config and reads
+    /// as `false`, never as an override that cannot fire.
+    pub fn review_auto_merge_for(&self, project_slug: &str) -> bool {
+        if !self.review_ticketless() {
+            return false;
+        }
+        self.projects
+            .iter()
+            .find(|p| p.slugs.iter().any(|s| s.trim() == project_slug.trim()))
+            .and_then(|p| p.review.auto_merge)
+            .unwrap_or(self.review.auto_merge)
+    }
+
+    /// The `slugs:` values in [`Teams::projects`] that match no resolved project
+    /// slug in `known` (STUDIO-927), in declaration order.
+    ///
+    /// An unmatched slug is inert by construction — no resolved project can route
+    /// to it, so its `review` override can never fire and the project silently keeps
+    /// the top-level `auto_merge`. For a safety brake that is the wrong failure mode:
+    /// an operator who writes the project NAME (`slugs: [booch]`) where the Linear
+    /// `slugId` belongs (`4f4a2350682f`) gets a valid `teams.yaml` that does nothing.
+    /// This exists so the boot can name every such slug and turn a typo into
+    /// something the operator can see, rather than leaving booch self-merging.
+    ///
+    /// `known` are the resolved project slugs — `projects::resolve_projects`'s
+    /// output, the same set the orchestrator routes against. Empty only when there
+    /// are no entries at all.
+    ///
+    /// Both sides are trimmed: `validate` trims `projects[].slugs[]` in place before
+    /// the orchestrator resolves them, but the boot calls this on the unvalidated
+    /// config, so a slug padded with whitespace must not read as a typo here when
+    /// routing would have matched it.
+    pub fn unmatched_project_slugs<'a>(&'a self, known: &[String]) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        for project in &self.projects {
+            for slug in &project.slugs {
+                let slug = slug.trim();
+                if !known.iter().any(|k| k.trim() == slug) {
+                    out.push(slug);
+                }
+            }
+        }
+        out
     }
 
     /// What a REVIEW run dispatched to a reviewer on `harness` should do about `review.model`
@@ -1800,6 +1936,238 @@ mod tests {
         }
     }
 
+    // ── per-project review.auto_merge (STUDIO-927) ──────────────────────────
+
+    /// The ticket's headline: one project may opt OUT of a global auto-merge
+    /// while its sibling keeps it. Mutation: drop the `projects` lookup in
+    /// [`Teams::review_auto_merge_for`] so the top-level value always wins —
+    /// `booch` then reads `true` and this goes red.
+    #[test]
+    fn a_per_project_false_beats_a_global_true() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [booch]\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(
+            !t.review_auto_merge_for("booch"),
+            "the named project must not auto-merge"
+        );
+        assert!(
+            t.review_auto_merge_for("rhapsody"),
+            "a sibling project with no entry still inherits the global true"
+        );
+        assert!(
+            t.review_auto_merge_for("never-configured"),
+            "a project that has never been configured behaves exactly as it did before the block"
+        );
+    }
+
+    /// A per-project `true` under a global `false` turns auto-merge ON for that
+    /// project alone, and an entry that sets no `auto_merge` inherits — in both
+    /// directions, which is the asymmetry the ticket calls safety-critical.
+    #[test]
+    fn an_unset_per_project_auto_merge_inherits_the_global_in_both_directions() {
+        // Global OFF: naming a project with no `auto_merge` must not turn it on.
+        let off = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n\
+             projects:\n  - slugs: [quiet]\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(!off.review_auto_merge_for("quiet"), "unset inherits false");
+        assert!(!off.review_auto_merge_for("other"), "and so does unlisted");
+
+        // Global OFF, an explicit per-project true is the override.
+        let on = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n\
+             projects:\n  - slugs: [loud]\n    review:\n      auto_merge: true\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(
+            on.review_auto_merge_for("loud"),
+            "set wins for that project"
+        );
+        assert!(!on.review_auto_merge_for("other"), "and only that project");
+    }
+
+    /// The multi-slug spelling: a fanned project's override applies to every slug
+    /// it names, and an absent `projects:` block leaves no project changed.
+    #[test]
+    fn a_multi_slug_entry_applies_to_every_slug_it_names() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [alpha, alpha-2]\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        for slug in ["alpha", "alpha-2"] {
+            assert!(!t.review_auto_merge_for(slug), "{slug}");
+        }
+        assert!(
+            t.review_auto_merge_for("beta"),
+            "beta is a different project"
+        );
+    }
+
+    /// The legacy decode the ticket names: a `teams.yaml` with only the bare
+    /// top-level `review.auto_merge` parses to an EMPTY `projects` block and
+    /// answers identically to the pre-STUDIO-927 accessor for every slug.
+    #[test]
+    fn a_legacy_bare_auto_merge_decodes_to_no_projects_and_unchanged_behaviour() {
+        for (yaml, want) in [
+            (
+                "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\nroster:\n  - name: alice\n",
+                true,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: false\nroster:\n  - name: alice\n",
+                false,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n",
+                false,
+            ),
+        ] {
+            let t = Teams::parse(yaml).unwrap_or_else(|e| panic!("parse {yaml:?}: {e}"));
+            assert!(t.projects.is_empty(), "legacy config carries no projects");
+            for slug in ["booch", "rhapsody", "anything"] {
+                assert_eq!(t.review_auto_merge_for(slug), want, "{slug} under {yaml:?}");
+                assert_eq!(
+                    t.review_auto_merge_for(slug),
+                    t.review_auto_merge(),
+                    "the per-project accessor must agree with the global one when nothing is scoped"
+                );
+            }
+        }
+    }
+
+    /// The D5 invariant, per project: a per-project `true` is dead config unless
+    /// Teams is on AND review is ticketless. Mutation: drop the
+    /// `review_ticketless` gate from [`Teams::review_auto_merge_for`] and the
+    /// Teams-off row below reads `true`.
+    #[test]
+    fn a_per_project_override_cannot_escape_the_ticketless_gate() {
+        for (yaml, want) in [
+            (
+                "enabled: false\nreview:\n  mode: ticketless\n\
+                 projects:\n  - slugs: [booch]\n    review:\n      auto_merge: true\n\
+                 roster:\n  - name: alice\n",
+                false,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: tickets\n\
+                 projects:\n  - slugs: [booch]\n    review:\n      auto_merge: true\n\
+                 roster:\n  - name: alice\n",
+                false,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: ticketless\n\
+                 projects:\n  - slugs: [booch]\n    review:\n      auto_merge: true\n\
+                 roster:\n  - name: alice\n",
+                true,
+            ),
+        ] {
+            let t = Teams::parse(yaml).unwrap_or_else(|e| panic!("parse {yaml:?}: {e}"));
+            assert_eq!(t.review_auto_merge_for("booch"), want, "{yaml:?}");
+        }
+        assert!(!Teams::disabled().review_auto_merge_for("booch"));
+    }
+
+    /// The visibility half of the ticket's trap: an override that names a slug no
+    /// resolved project carries is inert, and [`Teams::unmatched_project_slugs`]
+    /// names it so the boot can warn. A project NAME where the Linear `slugId`
+    /// belongs is the exact case — the documented example `slugs: [booch]` can
+    /// never match a resolved project.
+    #[test]
+    fn an_override_naming_no_resolved_project_slug_is_reported() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [booch]\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            t.unmatched_project_slugs(&["4f4a2350682f".to_string()]),
+            vec!["booch"],
+            "a name where a slugId belongs must be reported"
+        );
+
+        // A matching slug is not reported, and a partially-matching entry reports
+        // only the half that matches nothing.
+        let mixed = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n\
+             projects:\n  - slugs: [4f4a2350682f, typo]\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            mixed.unmatched_project_slugs(&["4f4a2350682f".to_string()]),
+            vec!["typo"]
+        );
+        assert!(Teams::disabled().unmatched_project_slugs(&[]).is_empty());
+
+        // Whitespace around a slug is trimmed on both sides, matching `validate`'s
+        // in-place trim before the orchestrator resolves: padded, it is neither a
+        // false-positive report nor a miss in the override lookup.
+        let padded = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [' 4f4a2350682f ']\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(
+            padded
+                .unmatched_project_slugs(&["4f4a2350682f".to_string()])
+                .is_empty()
+        );
+        assert!(!padded.review_auto_merge_for("4f4a2350682f"));
+    }
+
+    /// A `projects:` entry may be written with an empty or null `review:` block —
+    /// it then inherits, exactly as the null-block tolerance elsewhere in this
+    /// file does. Everything the types cannot accept is a loud parse error rather
+    /// than a silently-inherited override: a wrong type AND an unknown key (a
+    /// misspelling, or the easy mis-indent placing `auto_merge` beside `slugs`
+    /// instead of under `review:`) both fail, so a typo cannot leave `auto_merge`
+    /// unset and a repo the operator meant to hold back merging itself.
+    #[test]
+    fn a_project_entry_with_no_review_block_inherits_and_a_malformed_one_is_rejected() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [booch]\n  - slugs: [b]\n    review:\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(t.review_auto_merge_for("booch"), "no review block inherits");
+        assert!(
+            t.review_auto_merge_for("b"),
+            "an empty review block inherits"
+        );
+
+        for bad in [
+            // `projects` must be a list, not a map or a scalar.
+            "enabled: true\nprojects:\n  booch: false\n",
+            "enabled: true\nprojects: booch\n",
+            // `slugs` must be a list.
+            "enabled: true\nprojects:\n  - slugs: booch\n",
+            // `auto_merge` must be a boolean.
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    review:\n      auto_merge: nope\n",
+            // MIS-INDENT: `auto_merge` beside `slugs` rather than under `review:`
+            // — with a lenient decode this would parse, leave the override unset
+            // and inherit the global ON.
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    auto_merge: false\n",
+            // MISSPELLED keys, at the entry and inside the review block.
+            "enabled: true\nprojects:\n  - slug: [booch]\n    review:\n      auto_merge: false\n",
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    review:\n      auto-merge: false\n",
+        ] {
+            let err = Teams::parse(bad).expect_err("must not parse");
+            assert!(matches!(err, TeamsError::Parse(_)), "{bad:?}: got {err}");
+        }
+    }
+
     /// All three spellings decode, and nothing else does: a typo must be a loud
     /// parse error rather than a silent fall back to `off`, which would leave an
     /// operator who asked for review with none and no complaint.
@@ -2523,6 +2891,13 @@ mod tests {
                 mode: ReviewMode::Tickets,
                 ..Review::default()
             },
+            // STUDIO-927: the one new block, round-tripped like the rest.
+            projects: vec![TeamsProject {
+                slugs: vec!["booch".to_string()],
+                review: ProjectReview {
+                    auto_merge: Some(false),
+                },
+            }],
             roster: vec![Identity {
                 name: "alice".to_string(),
                 profile: "swe".to_string(),
