@@ -404,16 +404,19 @@ function JobsRow({
       </td>
       {/* The PR column used to render "—" on every row, including the review rows whose own issue
           key is literally `pr:owner/repo#n@reviewer` (STUDIO-925). The number was always there; now
-          it is a link, and the wrapper stops the click from also opening the row's job. */}
-      <td onClick={(e) => e.stopPropagation()}>
+          it is a link. Only the LINK stops the click from also opening the row's job — the empty
+          cell (most rows) and the rare unlinked chip must stay a way into the row. */}
+      <td>
         {row.pr === "" ? (
           "—"
         ) : row.prUrl === "" ? (
           <TicketChip variant="pr">{row.pr}</TicketChip>
         ) : (
-          <ExternalLink href={row.prUrl} aria-label={`Open pull request ${row.pr}`}>
-            <TicketChip variant="pr">{row.pr}</TicketChip>
-          </ExternalLink>
+          <span onClick={(e) => e.stopPropagation()}>
+            <ExternalLink href={row.prUrl} aria-label={`Open pull request ${row.pr}`}>
+              <TicketChip variant="pr">{row.pr}</TicketChip>
+            </ExternalLink>
+          </span>
         )}
       </td>
       <td className="up">{row.updated}</td>

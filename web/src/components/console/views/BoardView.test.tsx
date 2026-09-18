@@ -30,6 +30,7 @@ function row(over: Partial<ConsoleJobRow> & Pick<ConsoleJobRow, "issue">): Conso
     projectSlug: "rhapsody",
     status: "review",
     statusLabel: "in review",
+    runOutcome: "completed",
     trackerState: "In Review",
     assignee: "",
     reviewRun: false,
@@ -110,6 +111,21 @@ describe("the board (STUDIO-925)", () => {
     expect(chips[1].textContent).toContain("alice");
     // A completed review is green — the board's "two gates passed" signal.
     expect(chips[0].classList.contains("ok")).toBe(true);
+  });
+
+  it("shows a failed review as 'failed' in the bad tone, not the status' 'blocked'", () => {
+    mount([
+      row({ issue: "STUDIO-924", status: "run", statusLabel: "running" }),
+      review("pr:makewhatis/booch#540@alice", "STUDIO-924", {
+        status: "blocked",
+        statusLabel: "blocked",
+        runOutcome: "failed",
+      }),
+    ]);
+
+    const chip = document.querySelector(".bcard .rchip");
+    expect(chip?.querySelector(".o")?.textContent).toBe("failed");
+    expect(chip?.classList.contains("bad")).toBe(true);
   });
 
   it("never renders a review row as its own card, even with a null tracker_state", () => {

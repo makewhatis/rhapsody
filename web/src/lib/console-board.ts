@@ -20,6 +20,7 @@
 // could not resolve still has to appear SOMEWHERE, so it lands in an explicit "state unknown" column
 // rather than being renamed after a Linear state the daemon never read.
 import type { BlockedEntry } from "@/lib/api";
+import { runOutcomeLabel } from "@/lib/console-job-detail";
 import type { ConsoleJobRow, ConsoleJobStatus } from "@/lib/console-jobs";
 
 /**
@@ -220,7 +221,9 @@ export function buildConsoleBoard(
       key: row.key,
       reviewer: pr?.reviewer || row.assignee || "unknown",
       status: row.status,
-      outcome: row.statusLabel,
+      // The row's OWN run outcome, not the ticket status' label: a failed review maps to `blocked`,
+      // and the chip's word must say how the run ended, not that a person is now needed (STUDIO-925).
+      outcome: runOutcomeLabel(row.runOutcome),
       pr,
     });
     // Newest review row first (the rows arrive newest-first), so the card's PR link is the most

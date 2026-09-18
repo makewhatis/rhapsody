@@ -286,6 +286,15 @@ export interface ConsoleJobRow {
   projectSlug: string;
   status: ConsoleJobStatus;
   statusLabel: string;
+  /**
+   * This row's own RUN status, before any ticket-lifecycle mapping — `JobRow.status` verbatim.
+   *
+   * `status`/`statusLabel` are the TICKET's when the daemon resolved a lifecycle, so they cannot
+   * answer "how did this run end" — a failed review run maps to `blocked`, and the board's reviewer
+   * chip would then read "blocked" where it promises the run's own outcome (STUDIO-925). Carried
+   * raw so [`runOutcomeLabel`] is applied at the one surface that prints a run's word.
+   */
+  runOutcome: string;
   /** The tracker's own workflow-state name behind `status`, or "" when the daemon had no answer. */
   trackerState: string;
   /** Teammate name, or "" when solo/unassigned (the table renders "—"). */
@@ -579,6 +588,7 @@ export function buildConsoleJobs(
       projectSlug: job.project,
       status,
       statusLabel: CONSOLE_STATUS_LABELS[status],
+      runOutcome: job.status,
       trackerState: ticket?.trackerState ?? "",
       // The durable record first: it is the only one that survives the run. The live roster is the
       // fallback for the gap at the other end — a run dispatched moments ago, whose history row the

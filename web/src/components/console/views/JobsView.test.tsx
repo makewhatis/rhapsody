@@ -449,6 +449,17 @@ describe("the filter bar and the table (§3)", () => {
     expect(onOpen).toHaveBeenCalledExactlyOnceWith("B-2");
   });
 
+  it("still opens the row when its empty PR cell is clicked", async () => {
+    const onOpen = await mountFourJobs();
+    const row = [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.textContent?.includes("B-2"),
+    )!;
+    const prCell = within(row as HTMLElement).getAllByRole("cell")[4];
+    expect(prCell.textContent).toBe("—");
+    fireEvent.click(prCell);
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("B-2");
+  });
+
   it("opens a row from the keyboard too", async () => {
     const onOpen = await mountFourJobs();
     const row = [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>

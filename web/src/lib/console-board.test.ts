@@ -27,6 +27,7 @@ function row(over: Partial<ConsoleJobRow> & Pick<ConsoleJobRow, "issue">): Conso
     projectSlug: "rhapsody",
     status: "review",
     statusLabel: "in review",
+    runOutcome: "completed",
     trackerState: "In Review",
     assignee: "",
     reviewRun: false,
@@ -103,6 +104,24 @@ describe("the board regroup (STUDIO-925)", () => {
     // ...and the card carries the PR its reviews are on.
     expect(card.pr?.number).toBe(539);
     expect(card.pr?.url).toBe("https://github.com/makewhatis/booch/pull/539");
+  });
+
+  it("gives a failed review the run's own word, not the ticket status' 'blocked'", () => {
+    // A failed review run maps to the `blocked` status (consoleJobStatus), so its statusLabel is
+    // "blocked" while its run outcome is "failed". The chip must say "failed" — that is the fact the
+    // board exists to show — while `status` still colours it red.
+    const board = buildConsoleBoard([
+      row({ issue: "STUDIO-924", status: "run", statusLabel: "running" }),
+      review("pr:makewhatis/booch#540@alice", "STUDIO-924", {
+        status: "blocked",
+        statusLabel: "blocked",
+        runOutcome: "failed",
+      }),
+    ]);
+
+    const chip = board[0].cards[0].reviewers[0];
+    expect(chip.outcome).toBe("failed");
+    expect(chip.status).toBe("blocked");
   });
 
   it("never makes a review row its own card, even when its tracker_state is null", () => {
