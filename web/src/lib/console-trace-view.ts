@@ -50,6 +50,24 @@ export function runVitals(run: RunSummary, phases: readonly TracePhase[]): RunVi
   };
 }
 
+/**
+ * The Jobs worklist's live-activity signal (STUDIO-926): the most recent phase's title, plus its
+ * subtitle when the phase has one — the same pairing the run-detail spine renders per step
+ * (`JobDetailView`'s `.trstep`), so a row and its own detail page never describe "what it is doing
+ * right now" two different ways.
+ *
+ * `undefined` for a run with no phases yet (freshly dispatched, or a transcript that has not
+ * arrived) — never a fabricated "starting" label the model has no fact behind. This is
+ * deliberately NOT a step count: the design record's whole reason for existing is that Rhapsody
+ * has no plan object to count against, so this reads only the shape of what already happened, the
+ * same restraint `traceSpark`'s checklist observes.
+ */
+export function currentStepLabel(phases: readonly TracePhase[]): string | undefined {
+  if (phases.length === 0) return undefined;
+  const phase = phases[phases.length - 1];
+  return phase.subtitle === "" ? phase.title : `${phase.title} · ${phase.subtitle}`;
+}
+
 /** The word the provenance surface uses for a value the run never recorded. */
 export const PROVENANCE_UNKNOWN = "unknown";
 

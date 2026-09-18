@@ -26,9 +26,12 @@ import {
   mateStates,
   type ConsoleJobFilterId,
   type ConsoleJobRow,
+  type TicketCost,
 } from "@/lib/console-jobs";
 import { sparkSummary, traceSpark } from "@/lib/console-trace-spark";
+import { currentStepLabel } from "@/lib/console-trace-view";
 import { buildTrace } from "@/lib/trace-model";
+import { formatTokens } from "@/lib/format";
 import { mergeJobs } from "@/lib/runs-model";
 import { useLinearProjects } from "@/hooks/useConfig";
 import { useJobsFeed } from "@/hooks/useJobsFeed";
@@ -250,6 +253,41 @@ function jobLead(row: ConsoleJobRow): string {
   return row.reviewOf === "" ? row.issue : row.reviewOf;
 }
 
+// The ticket's token cost, split by provider (STUDIO-926) — quiet tabular text under the project
+// line, never a `Pill` or `--rust`: cost is secondary metadata, not a status, so it must not
+// compete with the status Pill for attention. "+" joins two providers deliberately, spelling out
+// that a two-harness ticket is two numbers rather than one blended total. "~" marks an estimated
+// bucket, the same prefix `runVitals.tokens` uses for a single run's own floored total.
+function TicketCostLine({ costs }: { costs: readonly TicketCost[] }) {
+  const text = costs
+    .map((c) => `${c.estimated ? "~" : ""}${formatTokens(c.totalTokens)}${c.provider === "" ? "" : ` ${c.provider}`}`)
+    .join(" + ");
+  return (
+    <div className="cost" title={`tokens: ${text}`}>
+      {text}
+    </div>
+  );
+}
+
+// The Jobs worklist's live-activity signal (STUDIO-926; see the ticket's "no progress bar" rule):
+// the run's current transcript step plus how long it has been going, for a LIVE row only. Unlike
+// `TraceSpark` below this is not gated on the dwell — the set of rows it ever renders for is
+// exactly the daemon's live runs, which `max_concurrent` already bounds, so eagerly reading their
+// transcripts costs nothing like a sweep down 50 finished rows would.
+function LiveActivity({ runId, elapsed }: { runId: number; elapsed: string }) {
+  const transcript = useTranscript(runId, true, runId > 0);
+  const step = useMemo(
+    () => currentStepLabel(buildTrace(transcript.data?.entries ?? []).phases),
+    [transcript.data],
+  );
+  const label = step ?? "Starting…";
+  return (
+    <div className="activity" title={`${label} · ${elapsed} elapsed`}>
+      {label} · {elapsed}
+    </div>
+  );
+}
+
 // One worklist row. It is a real activation target, not a div with a click handler: the whole
 // row navigates, so it owes Enter/Space and a focus ring as well as the pointer (§10 box 2.8).
 function JobsRow({
@@ -337,6 +375,8 @@ function JobsRow({
             </span>
           )}
         </div>
+        {row.costs.length === 0 ? null : <TicketCostLine costs={row.costs} />}
+        {row.live ? <LiveActivity runId={row.runId} elapsed={row.elapsed} /> : null}
       </td>
       <td>
         {row.assignee === "" ? (

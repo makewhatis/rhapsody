@@ -23,6 +23,7 @@ import {
   reviewTicketIssues,
   statusNote,
   ticketAssignees,
+  ticketCostsByIssue,
 } from "./console-jobs";
 import { runOutcomeLabel } from "./console-job-detail";
 
@@ -605,6 +606,22 @@ describe("buildConsoleJobs", () => {
     );
     expect(rows[0].updated).toBe("6m ago");
   });
+
+  // The Jobs worklist's live-activity clock (STUDIO-926): only a running row gets one, and it
+  // reads off the same started timestamp `updated` already resolves — no second lookup.
+  it("formats a running row's elapsed time and leaves a finished row's empty", () => {
+    const rows = buildConsoleJobs(
+      [
+        job({ issue: "A", status: "running", startedAtMs: NOW - (2 * 60 + 4) * 1000 }),
+        job({ issue: "B", status: "completed" }),
+      ],
+      [],
+      undefined,
+      NOW,
+    );
+    expect(rows.find((r) => r.issue === "A")?.elapsed).toBe("2m 4s");
+    expect(rows.find((r) => r.issue === "B")?.elapsed).toBe("");
+  });
 });
 
 describe("providerByIssue / the provider badge (STUDIO-909)", () => {
@@ -634,6 +651,105 @@ describe("providerByIssue / the provider badge (STUDIO-909)", () => {
     const byIssue = new Map(rows.map((r) => [r.issue, r.provider]));
     expect(byIssue.get("A")).toBe("fireworks-ai");
     expect(byIssue.get("B")).toBe("");
+  });
+});
+
+describe("ticketCostsByIssue — the ticket card's cost (STUDIO-926)", () => {
+  it("sums the implementation run plus every review_of row onto the ticket it reviewed", () => {
+    const by = ticketCostsByIssue([
+      issueRow({ issue_identifier: "STUDIO-924", total_tokens: 3_956_114, provider: "anthropic" }),
+      issueRow({
+        issue_identifier: "pr:makewhatis/booch#540@jimmy",
+        review_run: true,
+        review_of: "STUDIO-924",
+        total_tokens: 4_602_965,
+        provider: "anthropic",
+      }),
+      issueRow({
+        issue_identifier: "pr:makewhatis/booch#540@jerry",
+        review_run: true,
+        review_of: "STUDIO-924",
+        total_tokens: 4_819_381,
+        provider: "anthropic",
+      }),
+    ]);
+    expect(by.get("STUDIO-924")).toEqual([
+      { provider: "anthropic", totalTokens: 3_956_114 + 4_602_965 + 4_819_381, estimated: false },
+    ]);
+    // The review rows fold into the ticket they reviewed rather than keeping their own entry.
+    expect(by.has("pr:makewhatis/booch#540@jimmy")).toBe(false);
+  });
+
+  // "A ticket whose impl ran on Fireworks and whose reviews ran on Anthropic must read as two
+  // different numbers, not one blended total" — the ticket's own wording.
+  it("keeps two harnesses as two buckets rather than blending them into one total", () => {
+    const by = ticketCostsByIssue([
+      issueRow({ issue_identifier: "STUDIO-1", total_tokens: 607_780, provider: "fireworks-ai" }),
+      issueRow({
+        issue_identifier: "pr:acme/x#1@alice",
+        review_run: true,
+        review_of: "STUDIO-1",
+        total_tokens: 200_000,
+        provider: "anthropic",
+      }),
+    ]);
+    expect(by.get("STUDIO-1")).toEqual([
+      { provider: "fireworks-ai", totalTokens: 607_780, estimated: false },
+      { provider: "anthropic", totalTokens: 200_000, estimated: false },
+    ]);
+  });
+
+  it("marks a bucket estimated when any run folded into it was a floored estimate", () => {
+    const by = ticketCostsByIssue([
+      issueRow({ issue_identifier: "STUDIO-2", total_tokens: 100, provider: "anthropic" }),
+      issueRow({
+        issue_identifier: "pr:acme/x#2@alice",
+        review_run: true,
+        review_of: "STUDIO-2",
+        total_tokens: 50,
+        provider: "anthropic",
+        usage_estimated: true,
+      }),
+    ]);
+    expect(by.get("STUDIO-2")).toEqual([{ provider: "anthropic", totalTokens: 150, estimated: true }]);
+  });
+
+  it("folds tokens with no recorded provider under the empty-string bucket rather than dropping them", () => {
+    const by = ticketCostsByIssue([issueRow({ issue_identifier: "STUDIO-3", total_tokens: 42 })]);
+    expect(by.get("STUDIO-3")).toEqual([{ provider: "", totalTokens: 42, estimated: false }]);
+  });
+
+  it("falls back to a review row's own key when its origin names no ticket", () => {
+    const by = ticketCostsByIssue([
+      issueRow({
+        issue_identifier: "pr:acme/x#3@alice",
+        review_run: true,
+        total_tokens: 10,
+        provider: "anthropic",
+      }),
+    ]);
+    expect(by.get("pr:acme/x#3@alice")).toEqual([
+      { provider: "anthropic", totalTokens: 10, estimated: false },
+    ]);
+  });
+
+  it("carries the summed cost onto the worklist row", () => {
+    const rows = buildConsoleJobs(
+      [job({ issue: "STUDIO-924", status: "completed" })],
+      [
+        issueRow({ issue_identifier: "STUDIO-924", total_tokens: 100, provider: "anthropic" }),
+        issueRow({
+          issue_identifier: "pr:makewhatis/booch#540@jimmy",
+          review_run: true,
+          review_of: "STUDIO-924",
+          total_tokens: 200,
+          provider: "anthropic",
+        }),
+      ],
+      undefined,
+      NOW,
+    );
+    expect(rows[0].costs).toEqual([{ provider: "anthropic", totalTokens: 300, estimated: false }]);
   });
 });
 

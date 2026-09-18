@@ -36,6 +36,7 @@ import type { JobRow } from "@/lib/runs-model";
 // disagreement it is fixing. `console-job-detail` imports only TYPES back from here, so this is not
 // a runtime cycle.
 import { runOutcomeLabel } from "@/lib/console-job-detail";
+import { formatDuration } from "@/lib/format";
 
 /**
  * The states the console's Pill paints (§1.3), plus `reviewing` (STUDIO-780).
@@ -295,6 +296,20 @@ export interface ConsoleJobRow {
    */
   provider: string;
   /**
+   * The ticket's token cost split by provider (STUDIO-926) — the implementation run plus every
+   * review of it, summed. `[]` when the daemon has no run to cost yet (a queued ticket with no
+   * history row). See [`ticketCostsByIssue`].
+   */
+  costs: TicketCost[];
+  /**
+   * How long the ticket's live run has been going, formatted ("6m 4s"), or "" when [`live`] is
+   * false. This plus the current transcript step is the honest "is it moving?" signal the design
+   * record's progress-bar ban asks for in its place (STUDIO-926) — a card that has shown the same
+   * step for a long while is the real stall tell, and neither half needs a denominator the daemon
+   * does not have.
+   */
+  elapsed: string;
+  /**
    * For a review row, the TICKET it is reviewing (STUDIO-834) — what the table leads with in place
    * of the `pr:owner/repo#n@reviewer` key, which names no work. "" for every other row, and for a
    * review row whose origin the daemon could not resolve to a ticket; the table then leads with
@@ -478,6 +493,63 @@ export function providerByIssue(rows: readonly IssueRun[]): Map<string, string> 
 }
 
 /**
+ * One provider's token total on a ticket's card (STUDIO-926). `provider` is "" for tokens whose
+ * run recorded none (a legacy row) — folded in rather than dropped, because a cost cannot be
+ * skipped the way the single-row badge above can. `estimated` is true when ANY run folded into
+ * this bucket ended without a clean `result` event: a sum with one floored input is itself a
+ * floor, never an authoritative total.
+ */
+export interface TicketCost {
+  provider: string;
+  totalTokens: number;
+  estimated: boolean;
+}
+
+/**
+ * Ticket key → its token cost, split by provider, summed across the ticket's own newest run AND
+ * every review run whose `review_of` names it (STUDIO-926).
+ *
+ * This is the number the ticket's card exists to answer: "one ticket's two reviews cost 9.4M
+ * tokens" is the implementation run's total plus every review's, not the implementation's alone.
+ * A review row (`pr:owner/repo#n@reviewer`) is folded into the TICKET it reviewed rather than kept
+ * under its own key — `reviewOfTickets` above resolves the same link — so the aggregate lands on
+ * the row an operator actually opens. A review row whose origin names no ticket (an
+ * operator-introduced pull request, or a watch row that did not survive) falls back to its own
+ * key, exactly as the rest of the listing falls back when `review_of` is absent.
+ *
+ * Split BY PROVIDER rather than blended, because that is the one thing this figure must not do:
+ * a ticket whose implementation ran on Fireworks and whose review ran on Anthropic spent two
+ * different currencies, and a single blended number would hide exactly the split the ticket exists
+ * to show. Buckets are ordered largest first (ties broken by provider name) so the biggest cost is
+ * always what a reader sees first.
+ */
+export function ticketCostsByIssue(rows: readonly IssueRun[]): Map<string, TicketCost[]> {
+  const byTicket = new Map<string, Map<string, { totalTokens: number; estimated: boolean }>>();
+  for (const r of rows) {
+    const owner = r.review_of || r.issue_identifier;
+    if (!owner) continue;
+    let byProvider = byTicket.get(owner);
+    if (!byProvider) {
+      byProvider = new Map();
+      byTicket.set(owner, byProvider);
+    }
+    const key = r.provider ?? "";
+    const bucket = byProvider.get(key) ?? { totalTokens: 0, estimated: false };
+    bucket.totalTokens += r.total_tokens;
+    bucket.estimated = bucket.estimated || r.usage_estimated;
+    byProvider.set(key, bucket);
+  }
+  const out = new Map<string, TicketCost[]>();
+  for (const [owner, byProvider] of byTicket) {
+    const costs = [...byProvider.entries()]
+      .map(([provider, v]) => ({ provider, totalTokens: v.totalTokens, estimated: v.estimated }))
+      .sort((a, b) => b.totalTokens - a.totalTokens || a.provider.localeCompare(b.provider));
+    out.set(owner, costs);
+  }
+  return out;
+}
+
+/**
  * Newest activity per ticket, from the issue-level history rows: a run's end when it has one,
  * else its start. `mergeJobs` surfaces only the start, and the column says "Updated".
  */
@@ -544,6 +616,7 @@ export function buildConsoleJobs(
   const reviewRuns = reviewRunIssues(issueRows);
   const reviewOf = reviewOfTickets(issueRows);
   const providers = providerByIssue(issueRows);
+  const costs = ticketCostsByIssue(issueRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
@@ -568,6 +641,10 @@ export function buildConsoleJobs(
       assignee: durable.get(job.issue) ?? live.get(job.issue) ?? "",
       pr: "",
       provider: providers.get(job.issue) ?? "",
+      costs: costs.get(job.issue) ?? [],
+      // `updatedAtMs` IS this run's start while it is live (no `ended_at` has landed yet to
+      // outrank it), so it doubles as the elapsed clock's zero without a second lookup.
+      elapsed: job.live ? formatDuration(Math.max(0, Math.floor((nowMs - updatedAtMs) / 1000))) : "",
       reviewOf: reviewOf.get(job.issue) ?? "",
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
