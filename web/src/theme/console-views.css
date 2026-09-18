@@ -11,9 +11,10 @@
    `.run`, `.checks` and `.kv` are far too generic to publish alongside the
    Podium screens.
 
-   Every color is a token. The one literal hex — `#34343c`, the hover hairline —
-   is the prototype's own one-off shade, already present in console.css on the
-   same treatment. It is not a duplicate of a token.
+   Every color is a token. The literal hexes below — `#34343c`, the hover hairline,
+   and `#453915`, the `.dchip` warn border (the same shade `.note.warn` uses in
+   console.css) — are the prototype's own one-off shades. They are NOT duplicates
+   of a token; every value that has a token uses `var(--…)`.
 
    The room-slice, memory, manage and teams-console views are sub-tickets 3–5;
    `.memprev`/`.mcard` land here because §4's side column uses them.
@@ -68,6 +69,94 @@
 .rh-console .jmore { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 11px 14px; border-top: 1px solid var(--line-soft); }
 .rh-console .jmore .note { color: var(--ink-4); font-size: 11.5px; }
 .rh-console .jmore .chip { margin-left: auto; }
+
+/* ===== §3 board (STUDIO-925) =====
+   The worklist as work: one card per ticket, one column per tracker state. Reuses the same atoms
+   and tokens as the table beside it (`Pill`, `Chip`, `TicketChip`, the cool console palette) —
+   a second view of the worklist, not a second visual language. Cards are a repeated object: the same
+   edges, the same inner padding, and each recurring element in the same place on every card. */
+.rh-console .board {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(252px, 1fr);
+  gap: 12px;
+  align-items: start;
+  /* The board scrolls sideways itself; the page body never does. */
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+.rh-console .bcol {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel);
+  overflow: hidden;
+}
+.rh-console .bcolhd {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--panel-2);
+}
+.rh-console .bcolhd .bname { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rh-console .bcolhd .bcount { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); background: var(--panel); border: 1px solid var(--line-soft); border-radius: 99px; padding: 1px 7px; }
+.rh-console .bcolhd .bsub { flex-basis: 100%; font-size: 11px; color: var(--ink-3); }
+/* Each column scrolls its own cards, so a long Done column does not push the live ones out of view. */
+.rh-console .bcards { display: flex; flex-direction: column; gap: 8px; padding: 9px; max-height: calc(100vh - 290px); overflow-y: auto; }
+
+.rh-console .bcard {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+  cursor: pointer;
+}
+.rh-console .bcard:hover { border-color: #34343c; background: var(--raise); }
+.rh-console .bcard:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* The live edge is the table's running-pin, carried across: an agent is on this ticket right now. */
+.rh-console .bcard.live { border-left: 2px solid var(--accent); }
+.rh-console .btop { display: flex; align-items: center; gap: 8px; }
+.rh-console .btop .bkey { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--ticket); }
+.rh-console .btop .pill { margin-left: auto; }
+.rh-console .btitle { font-size: 12.5px; color: var(--ink-2); line-height: 1.35; }
+.rh-console .bmeta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-4); }
+.rh-console .bmeta .provbadge { padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.rh-console .bchips { display: flex; flex-wrap: wrap; gap: 5px; }
+/* A reviewer chip: who, and how their review ended. `done` is GREEN here — the board's whole claim
+   is "two green chips = two gates passed" — so it deliberately does not reuse the status Pill's
+   blue `done`. */
+.rh-console .rchip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; border-radius: 99px; padding: 2px 8px; background: var(--panel); border: 1px solid var(--line-soft); color: var(--ink-3); }
+.rh-console .rchip .d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.rh-console .rchip .o { font-family: var(--mono); font-size: 10px; opacity: .8; }
+.rh-console .rchip.ok { color: var(--ok); }
+.rh-console .rchip.live { color: var(--operator); }
+.rh-console .rchip.bad { color: var(--bad); }
+.rh-console .rchip.queued { color: var(--ink-4); }
+.rh-console .dchip { font-size: 11px; border-radius: 99px; padding: 2px 8px; background: var(--warn-soft); border: 1px solid #453915; color: var(--warn); }
+.rh-console .bpr { display: flex; }
+.rh-console .bpr .tk.pr { cursor: pointer; }
+.rh-console .bpr .tk.pr:hover { border-color: var(--ok); }
+
+/* The board footer: utilization against the cap, the three counts that need a person or a seat, and
+   when the view was last answered. Replaces a bare running counter with the question the operator
+   actually asks — capped or starved? */
+.rh-console .bfoot { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); font-size: 12px; color: var(--ink-3); }
+.rh-console .bfoot .bfrun { font-family: var(--mono); color: var(--ink); }
+.rh-console .bfoot .bfrun b { color: var(--ok); }
+.rh-console .bfoot .bfrun.capped b { color: var(--warn); }
+.rh-console .bfoot .bfstat { font-family: var(--mono); }
+.rh-console .bfoot .bfstat b { color: var(--ink-2); }
+.rh-console .bfoot .bspacer { flex: 1; }
+.rh-console .bfoot .bnote { color: var(--ink-4); font-size: 11.5px; }
+.rh-console .bfoot .bref { color: var(--ink-4); font-family: var(--mono); font-size: 11px; }
 
 /* ===== §4 job detail ===== */
 .rh-console .jobhd { display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
