@@ -226,8 +226,8 @@ export function boardLaneTally(
 }
 
 /**
- * The board's issue rows: the paged listing plus the unbounded non-terminal fetch, one row per
- * issue. The PAGE wins a collision because it is the fresher read — it polls on the live cadence
+ * The board's issue rows: the paged listing plus the wide, latest-run-outcome active fetch, one row
+ * per issue. The PAGE wins a collision because it is the fresher read — it polls on the live cadence
  * while the active fetch rides the tracker's own, slower one.
  */
 export function mergeIssueRows<T extends { issue_identifier: string; id: number }>(
