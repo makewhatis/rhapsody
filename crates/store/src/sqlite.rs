@@ -796,6 +796,19 @@ impl Store for Sqlite {
         // identifier — so those rows stay individual instead of collapsing into one synthetic row.
         // Because the kept row IS each partition's newest, ordering the survivors by started_at is
         // already "most recent activity first".
+        //
+        // `latest_outcome` is applied AFTER the partition, on the kept `rn = 1` row (STUDIO-931).
+        // It is deliberately NOT part of `run_filter_where`: filtering `outcome` there would make
+        // ROW_NUMBER() rank the surviving rows, so the query would return each issue's newest run
+        // *with that outcome* rather than the issues whose newest run has it — the stale-run bug
+        // that made the board bucket a finished ticket from an old `stopped` run. A caller that
+        // sets both still gets the `outcome`-narrowed partition (the existing semantics), then
+        // `latest_outcome` selects among it.
+        let mut outer = String::from("rn = 1");
+        if !f.latest_outcome.is_empty() {
+            outer.push_str(" AND outcome = ?");
+            args.push(Value::Text(f.latest_outcome.clone()));
+        }
         let q = format!(
             "SELECT {RUN_COLS} FROM (
                SELECT {RUN_COLS}, ROW_NUMBER() OVER (
@@ -805,7 +818,7 @@ impl Store for Sqlite {
                       ) AS rn
                  FROM runs{where_sql}
              )
-              WHERE rn = 1
+              WHERE {outer}
               ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
         );
         args.push(Value::Integer(limit));
@@ -2239,6 +2252,86 @@ mod tests {
             scoped[0].started_at, "2026-01-01T00:02:00Z",
             "its newest run"
         );
+    }
+
+    // STUDIO-931 — `latest_outcome` selects among PARTITION-NEWEST rows, unlike `outcome`, which
+    // narrows the partition first. The difference is the whole point: a finished ticket whose old
+    // run was stopped must not come back from a "currently stopped" query.
+    #[test]
+    fn list_issue_runs_latest_outcome_filters_after_the_partition() {
+        let st = open_mem();
+        let seed = |ident: &str, started: &str| {
+            st.start_run(RunStart {
+                issue_identifier: ident.into(),
+                started_at: started.into(),
+                ..Default::default()
+            })
+            .expect("start")
+        };
+        let end = |id: i64, outcome: &str| {
+            st.end_run(
+                id,
+                RunEnd {
+                    outcome: outcome.into(),
+                    ended_at: "2026-01-01T04:00:00Z".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end")
+        };
+        // MT-1 finished: an OLD stopped run, then a newer completed one (its actual latest run).
+        // Its stopped run is the oldest thing in the store — far off any recency page.
+        let stale = seed("MT-1", "2026-01-01T00:00:00Z");
+        end(stale, OUTCOME_STOPPED);
+        end(seed("MT-1", "2026-01-01T01:00:00Z"), OUTCOME_COMPLETED);
+        // MT-2 genuinely stopped: its newest run is the stopped one.
+        end(seed("MT-2", "2026-01-01T03:00:00Z"), OUTCOME_STOPPED);
+
+        // The pre-existing `outcome` filter returns MT-1's STALE row too — the bug this parameter
+        // exists to avoid. Pin it so a future refactor cannot quietly redefine `outcome`.
+        let by_outcome = st
+            .list_issue_runs(RunFilter {
+                outcome: OUTCOME_STOPPED.into(),
+                ..Default::default()
+            })
+            .expect("by outcome");
+        let mut seen: Vec<&str> = by_outcome
+            .iter()
+            .map(|r| r.issue_identifier.as_str())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, ["MT-1", "MT-2"], "outcome filters before grouping");
+
+        // `latest_outcome` keeps only the issue whose NEWEST run carries it.
+        let stopped = st
+            .list_issue_runs(RunFilter {
+                latest_outcome: OUTCOME_STOPPED.into(),
+                ..Default::default()
+            })
+            .expect("latest stopped");
+        assert_eq!(stopped.len(), 1, "MT-1's newest run is completed");
+        assert_eq!(stopped[0].issue_identifier, "MT-2");
+        assert_eq!(stopped[0].outcome, OUTCOME_STOPPED);
+
+        let completed = st
+            .list_issue_runs(RunFilter {
+                latest_outcome: OUTCOME_COMPLETED.into(),
+                ..Default::default()
+            })
+            .expect("latest completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].issue_identifier, "MT-1");
+        assert_eq!(completed[0].started_at, "2026-01-01T01:00:00Z");
+
+        // `latest_outcome` composes with the other pre-partition filters.
+        let scoped = st
+            .list_issue_runs(RunFilter {
+                issue: "MT-1".into(),
+                latest_outcome: OUTCOME_STOPPED.into(),
+                ..Default::default()
+            })
+            .expect("scoped");
+        assert!(scoped.is_empty(), "MT-1's latest run is not stopped");
     }
 
     // TRA-320 Defect 2: the day totals are a whole-store SUM, not a fold over a page — with more

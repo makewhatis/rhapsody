@@ -12,6 +12,7 @@ import type { BoardCardFields } from "@/hooks/useBoardCardFields";
 import { teammateColor } from "@/theme/teammates";
 import type { BlockedEntry } from "@/lib/api";
 import {
+  boardLaneTally,
   buildConsoleBoard,
   FILTERED_LANE_EMPTY,
   TRUNCATED_LANE_EMPTY,
@@ -31,10 +32,17 @@ import {
 //
 // The Jobs table's unit of display is the RUN, so one ticket with two finished reviews reads as
 // three unrelated rows. Here the unit is the TICKET: a card per work item, its reviews folded in as
-// chips, and a lane per run status. It is built entirely from what the table already holds —
-// `console-board.buildConsoleBoard` does the regroup, the same `useJobsFeed` feeds it, and the
-// project Select above it narrows the cards the same way it narrows rows. No new endpoint, no
-// daemon change.
+// chips, and a lane per run status. `console-board.buildConsoleBoard` does the regroup, and the
+// project Select above it narrows the cards the same way it narrows rows.
+//
+// THE ROWS ARE NOT ONLY THE PAGE (STUDIO-931). A lane is a run status, and non-terminal work is the
+// oldest and quietest, so bucketing the same recency page the table holds made the board least
+// informative about exactly the ticket that had waited longest — STUDIO-877 sat at row 153 and its
+// Queued lane read `0` beside a header that read `1`. `JobsView` therefore feeds the board the page
+// PLUS a wide fetch filtered to each issue's LATEST run outcome (`latest_outcome`), and each lane's
+// count comes from the same whole-store tally the header uses (see `boardLaneTally`). The table still
+// pages; the board's non-terminal lanes do not. No new endpoint — `/api/v1/history/issues` takes
+// `latest_outcome`.
 //
 // The STATUS filter does NOT narrow the board (STUDIO-932): the four lanes already ARE the status
 // axis, so a status Seg here was a control that undid the board rather than a filter over it. The
@@ -120,6 +128,10 @@ export function BoardView({
             key={lane.id}
             lane={lane}
             filtered={filtered}
+            // The lane's whole-store total, not the cards this page happens to hold (STUDIO-931).
+            // Gated off under a filter: the tally is project-blind and unfiltered, so beside a
+            // filter it would be a number about a different question — the card count is right there.
+            tally={filtered || counts === undefined ? undefined : boardLaneTally(lane.id, counts)}
             occupied={occupied}
             truncated={hasMore}
             maxConcurrent={maxConcurrent}
@@ -162,6 +174,7 @@ export function BoardView({
 function LaneView({
   lane,
   filtered,
+  tally,
   occupied,
   truncated,
   maxConcurrent,
@@ -171,6 +184,8 @@ function LaneView({
 }: {
   lane: BoardLane;
   filtered: boolean;
+  /** The lane's whole-store total from the daemon's tally, or `undefined` when it is not known. */
+  tally: number | undefined;
   occupied: number;
   /** The listing is one page of a longer one, so an empty lane says nothing about the pipeline. */
   truncated: boolean;
@@ -181,21 +196,27 @@ function LaneView({
 }) {
   const isRunning = lane.id === "running";
   const freeSlots = isRunning && maxConcurrent > 0 ? Math.max(0, maxConcurrent - occupied) : 0;
+  // The tally knows cards the board has not rendered — an In-Review lane counted from the store
+  // while its rows are only on the loaded page, say. The Running lane is exempt: its occupancy
+  // header and idle slots already say everything a shortfall would (STUDIO-931).
+  const gap = !isRunning && tally !== undefined ? Math.max(0, tally - lane.cards.length) : 0;
   // A held seat with no card in this lane is a live review (folded onto its ticket in In Review) or
   // an unattributed run; "No agent is running." would contradict the `n / max` beside it.
   const emptyLine = filtered
     ? FILTERED_LANE_EMPTY
     : isRunning && occupied > 0
       ? "Agents are busy on reviews and other runs, shown on their tickets in other lanes."
-      : truncated && !(isRunning && occupied === 0)
-        ? TRUNCATED_LANE_EMPTY
-        : lane.empty;
+      : gap > 0
+        ? `${tally} in this lane, but not among the jobs loaded.`
+        : truncated && !(isRunning && occupied === 0)
+          ? TRUNCATED_LANE_EMPTY
+          : lane.empty;
   return (
     <section className="bcol" aria-label={lane.name} data-lane={lane.id}>
       <header className="bcolhd">
         <span className="bname">{lane.name}</span>
         <span className="bcount" title={isRunning && maxConcurrent > 0 ? "Whole pool, all projects" : undefined}>
-          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : lane.cards.length}
+          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : (tally ?? lane.cards.length)}
         </span>
         <span className="bsub">{lane.caption}</span>
       </header>
@@ -203,8 +224,9 @@ function LaneView({
         {lane.cards.map((card) => (
           <BoardCardView key={card.key} card={card} roster={roster} fields={fields} onOpen={onOpen} />
         ))}
-        {lane.cards.length === 0 ? (
-          <div className="bempty">{emptyLine}</div>
+        {lane.cards.length === 0 ? <div className="bempty">{emptyLine}</div> : null}
+        {gap > 0 && lane.cards.length > 0 ? (
+          <div className="bempty">{`${gap} more in this lane not among the jobs loaded.`}</div>
         ) : null}
         {Array.from({ length: freeSlots }, (_, i) => (
           <div className="bslot" key={`slot-${i}`}>

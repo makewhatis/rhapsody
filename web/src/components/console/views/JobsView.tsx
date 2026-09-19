@@ -30,6 +30,7 @@ import {
   type ConsoleJobRow,
   type TicketCost,
 } from "@/lib/console-jobs";
+import { mergeIssueRows } from "@/lib/console-board";
 import { sparkSummary, traceSpark } from "@/lib/console-trace-spark";
 import { currentStepLabel } from "@/lib/console-trace-view";
 import { buildTrace } from "@/lib/trace-model";
@@ -37,6 +38,7 @@ import { formatTokens } from "@/lib/format";
 import { mergeJobs } from "@/lib/runs-model";
 import { useLinearProjects, useTypedConfigQuery } from "@/hooks/useConfig";
 import { useJobsFeed } from "@/hooks/useJobsFeed";
+import { useBoardActive } from "@/hooks/useBoardActive";
 import { useNow } from "@/hooks/useNow";
 import { useTranscript } from "@/hooks/useRunDetail";
 import { useRefresh } from "@/hooks/useStateQuery";
@@ -102,16 +104,26 @@ export function JobsView({
   const [project, setProject] = useState(ALL_PROJECTS);
 
   const issueRows = useMemo(() => issueRuns.data?.issues ?? [], [issueRuns.data]);
+  // The board's non-terminal lanes must be complete, not a sample of the recency page (STUDIO-931):
+  // the page is ordered newest-first, so the longer a ticket sits the more certainly it has fallen
+  // off. The active feed fetches each issue's LATEST run outcome by filter and wider than a page; the
+  // table keeps the page alone, so a list-only visit neither pays for the extra requests nor grows
+  // the window.
+  const activeRows = useBoardActive(view === "board");
+  const boardIssueRows = useMemo(
+    () => (view === "board" ? mergeIssueRows(issueRows, activeRows) : issueRows),
+    [view, issueRows, activeRows],
+  );
   const rows = useMemo(
     () =>
       buildConsoleJobs(
-        mergeJobs(state.data, issueRows, projects, nowMs),
-        issueRows,
+        mergeJobs(state.data, boardIssueRows, projects, nowMs),
+        boardIssueRows,
         overview.data,
         nowMs,
         costs.data?.costs,
       ),
-    [state.data, issueRows, projects, overview.data, nowMs, costs.data],
+    [state.data, boardIssueRows, projects, overview.data, nowMs, costs.data],
   );
 
   // The strip's numbers come from the DAEMON's tally over every issue in the store, not from `rows`

@@ -262,7 +262,7 @@ describe("the board (STUDIO-925)", () => {
   });
 
   it("renders all four lanes with zero cards, each saying what its emptiness means", () => {
-    mount([], vi.fn(), { ...COUNTS, running: 0 });
+    mount([], vi.fn(), { ...COUNTS, running: 0, queued: 0, review: 0, blocked: 0 });
     expect(document.querySelectorAll(".bcol")).toHaveLength(4);
     expect(document.querySelectorAll(".bcard")).toHaveLength(0);
     expect(screen.getByText("Nothing is waiting for an agent.")).toBeTruthy();
@@ -286,11 +286,42 @@ describe("the board (STUDIO-925)", () => {
     mount([row({ issue: "D-1", status: "done", trackerState: "Done" })], vi.fn(), { ...COUNTS, queued: 5, running: 0 }, 4, {
       hasMore: true,
     });
+    // The lane is NOT empty — the whole-store tally says five are waiting — so it reports the
+    // number it cannot render rather than the "not loaded yet" hedge (STUDIO-931).
     const queued = document.querySelector('[data-lane="queued"] .bempty');
-    expect(queued?.textContent).toMatch(/not loaded yet/);
+    expect(queued?.textContent).toMatch(/5 in this lane/);
     expect(screen.queryByText("Nothing is waiting for an agent.")).toBeNull();
     // The whole-store running tally is 0, so that lane may still say so.
     expect(screen.getByText("No agent is running.")).toBeTruthy();
+  });
+
+  // THE BOARD CONTRADICTING ITSELF (STUDIO-931). The header's counts come from a whole-store tally;
+  // the lane must not report its cards instead, or a ticket the longer it waits the more certainly
+  // falls off the 50-row page reads as `0` beside a header that says `1`.
+  it("shows a lane's whole-store total even when the page holds none of its cards", () => {
+    mount([row({ issue: "D-1", status: "done", trackerState: "Done" })], vi.fn(), {
+      ...COUNTS,
+      running: 0,
+      review: 0,
+      queued: 0,
+      blocked: 1,
+    });
+    const queued = document.querySelector('[data-lane="queued"]')!;
+    expect(queued.querySelector(".bcount")?.textContent).toBe("1");
+    expect(queued.querySelector(".bempty")?.textContent).toMatch(/1 in this lane/);
+    expect(screen.queryByText("Nothing is waiting for an agent.")).toBeNull();
+  });
+
+  // A lane holding SOME of its cards says so rather than implying the page is the lane.
+  it("notes the cards a counted lane has not rendered", () => {
+    mount([row({ issue: "R-1", trackerState: "In Review", status: "review" })], vi.fn(), {
+      ...COUNTS,
+      review: 3,
+    });
+    const review = document.querySelector('[data-lane="review"]')!;
+    expect(review.querySelector(".bcount")?.textContent).toBe("3");
+    expect(review.querySelectorAll(".bcard")).toHaveLength(1);
+    expect(review.textContent).toMatch(/2 more in this lane/);
   });
 
   it("says the project filter emptied a lane, not the pipeline", () => {

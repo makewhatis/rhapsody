@@ -300,6 +300,26 @@ midnight. This preserves the local-day semantics the client-side fold had; a UTC
 silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
 meaning, so the header's `cached = total − in − out` reconciliation still adds up.
 
+### A latest-run outcome filter on the issue listing — `/history/issues?latest_outcome=` (STUDIO-931)
+
+`GET /api/v1/history/issues` keeps one row per issue — its **newest run matching the filters**. The
+`outcome` filter runs in the inner `WHERE`, *before* the per-issue `ROW_NUMBER()`, so it means "each
+issue's newest run **with that outcome**", which is frequently an old run of a ticket that has since
+finished. Measured on the operator's daemon, `?outcome=stopped` returned 7 issues of which 6 were
+done or canceled, each showing its stale stopped run.
+
+`latest_outcome` is an **additive** parameter that filters *after* the partition — `WHERE rn = 1 AND
+outcome = ?` — so it means "the issues whose newest run has this outcome right now". `outcome` is
+unchanged (the golden and every existing caller are untouched); the two are alternatives, and a
+caller that sets both narrows the partition with `outcome` and then selects among it with
+`latest_outcome`. `/history` pages RUNS, where "the issue's newest run" is not a concept, so it
+parses the parameter but ignores it. Rhapsody-only: Go has neither the issue listing nor this filter.
+
+The console's board uses it for its non-terminal lanes: fetching `latest_outcome=running|continued|
+stopped|failed|interrupted` unbounded returns the genuinely-active pipeline, rather than every ticket
+that ever passed through those outcomes, so a lane's cards can no longer be stale runs of finished
+tickets and `BOARD_ACTIVE_LIMIT` is bounded by the pipeline rather than by history.
+
 ### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828)
 
 A third **additive**, Rhapsody-only history endpoint, for the same reason the two above exist and

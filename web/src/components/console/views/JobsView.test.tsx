@@ -1852,6 +1852,102 @@ describe("the board view (STUDIO-925)", () => {
     expect(document.querySelector(".bfoot .bnote")?.textContent).toContain("Older jobs");
     expect(screen.getByRole("button", { name: /load more/i })).toBeTruthy();
   });
+
+  // STUDIO-931, end to end: the board must not bucket a 50-row recency page. Sixty done tickets
+  // dominate recency, so STUDIO-877 — open, Backlog, last run stopped, exactly the shape of the
+  // ticket that filed this — sits at row 61 and cannot be on the page. A page-only board reads its
+  // lane as `0`; the active fetch (filtered to each issue's LATEST run outcome) puts the card in
+  // Queued where it belongs.
+  //
+  // STUDIO-880 is the regression the reviewer demanded: a FINISHED ticket whose OLD run was stopped
+  // and whose newer run completed, both well outside the page. `?outcome=stopped` would hand back
+  // that stale stopped row and card it in Done; `?latest_outcome=stopped` must not.
+  it("cards a stuck non-terminal ticket but not a finished ticket's stale run", async () => {
+    const done = Array.from({ length: 60 }, (_, i) =>
+      run({
+        issue_identifier: `DONE-${i}`,
+        outcome: "completed",
+        lifecycle: "done",
+        tracker_state: "Done",
+      }),
+    );
+    const stuck = run({
+      issue_identifier: "STUDIO-877",
+      outcome: "stopped",
+      lifecycle: "open",
+      tracker_state: "Backlog",
+      started_at: "2026-08-15T10:00:00Z",
+    });
+    // A finished ticket: an OLD stopped run, a NEWER completed run. Newest-first order puts the
+    // completed run ahead of the stopped one, and both behind the sixty DONE rows.
+    const staleStopped = run({
+      issue_identifier: "STUDIO-880",
+      outcome: "stopped",
+      lifecycle: "done",
+      tracker_state: "Done",
+      started_at: "2026-07-01T10:00:00Z",
+    });
+    const staleCompleted = run({
+      issue_identifier: "STUDIO-880",
+      outcome: "completed",
+      lifecycle: "done",
+      tracker_state: "Done",
+      started_at: "2026-07-02T10:00:00Z",
+    });
+    const store = [...done, stuck, staleCompleted, staleStopped];
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    // Emulate the STORE's two filters, which differ on whether they run before the per-issue
+    // partition. A mock that ignored either would pass whether or not the fix was there.
+    h.fetchIssueRuns.mockImplementation(async (f: HistoryFilter = {}) => {
+      // `outcome` narrows the runs first — so it may return several rows for one issue, an old one
+      // among them; the listing then keeps each issue's newest MATCHING row.
+      const narrowed = f.outcome ? store.filter((r) => r.outcome === f.outcome) : store;
+      const byIssue = new Map<string, IssueRun[]>();
+      for (const r of narrowed) {
+        const list = byIssue.get(r.issue_identifier) ?? [];
+        list.push(r);
+        byIssue.set(r.issue_identifier, list);
+      }
+      const newest = (rows: IssueRun[]) =>
+        rows.reduce((a, b) =>
+          b.started_at > a.started_at || (b.started_at === a.started_at && b.id > a.id) ? b : a,
+        );
+      let rows = [...byIssue.values()].map(newest);
+      // `latest_outcome` narrows AFTER the partition: only issues whose NEWEST run has it.
+      if (f.latestOutcome) rows = rows.filter((r) => r.outcome === f.latestOutcome);
+      rows = [...rows].sort((a, b) => (a.started_at < b.started_at ? 1 : -1));
+      const limit = f.limit ?? JOBS_PAGE_SIZE;
+      const page = rows.slice(0, limit);
+      return { issues: page, next_offset: page.length === limit ? limit : null };
+    });
+    h.fetchIssueCounts.mockImplementation(async () => tallyOf(store, await h.fetchState()));
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+
+    mount();
+    // The page holds the newest 50 and neither of the interesting tickets is one of them.
+    await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
+    expect(rowKeys()).not.toContain("STUDIO-877");
+    expect(rowKeys()).not.toContain("STUDIO-880");
+
+    switchToBoard();
+    // The header's tally — the source the board now reports — already knows the ticket is queued,
+    // and the active fetch then puts its CARD in the lane rather than merely counting it.
+    await waitFor(() =>
+      expect(document.querySelector('[data-lane="queued"] .bcount')?.textContent).toBe("1"),
+    );
+    await waitFor(() =>
+      expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-877"),
+    );
+    // STUDIO-880's stale stopped run must NOT be resurrected into Done by the active feed.
+    expect(document.querySelector('[data-lane="done"]')?.textContent).not.toContain("STUDIO-880");
+    expect(document.querySelector('[data-lane="queued"]')?.textContent).not.toContain("STUDIO-880");
+  });
 });
 
 // STUDIO-932 — the display options leave the filter row for a popover behind a header icon, and the

@@ -158,6 +158,12 @@ pub struct RunFilter {
     pub since: String,
     /// exact match on runs.project_slug; "" => no project filter
     pub project: String,
+    /// Only meaningful for the ISSUE-paged listing ([`Store::list_issue_runs`]): keep an issue only
+    /// when its NEWEST run carries this outcome. Distinct from [`RunFilter::outcome`], which filters
+    /// BEFORE the per-issue partition and so returns each issue's newest run *with that outcome* —
+    /// often an old run of a finished ticket (STUDIO-931). "the issue's newest run" is not a
+    /// run-paged concept, so [`Store::list_runs`] ignores this. "" => no filter.
+    pub latest_outcome: String,
     /// <=0 => default page
     pub limit: i64,
     pub offset: i64,
