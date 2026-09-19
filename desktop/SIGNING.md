@@ -24,7 +24,7 @@ off independent environment variables:
 | Variable | When set… | When unset… |
 | --- | --- | --- |
 | `APPLE_SIGNING_IDENTITY` | `_sign` code-signs the **`rhapsodyd` sidecar first, then the app bundle** under the hardened runtime (`--options runtime`), with a secure `--timestamp` and `build/darwin/entitlements.plist`; then, after `_dmg` packages the installer, `make-dmg.sh` **also Developer-ID-signs the dmg itself** (`codesign --force --timestamp`, no `--options runtime` — a disk image isn't executable code). | `_sign` is a no-op; the dmg contains the Tauri ad-hoc-signed (i.e. unsigned) app and the dmg itself is unsigned. |
-| `NOTARY_PROFILE` (or an `ASC_*` API key) | `_notarize_app` notarizes + staples the **`.app`** (zip → `notarytool submit --wait` → `stapler staple` the bundle) so the installed app validates **offline**; `_notarize` then does the same for the finished **dmg**. | both notarize steps are a no-op. |
+| `NOTARY_PROFILE` (or an `ASC_*` API key) | `_notarize_app` notarizes + staples the **`.app`** (zip → `notarytool submit` → poll `notarytool info` until Apple answers → `stapler staple` the bundle) so the installed app validates **offline**; `_notarize` then does the same for the finished **dmg**. | both notarize steps are a no-op. |
 
 The gates key **independently**: set only `APPLE_SIGNING_IDENTITY` to get a *signed-but-unnotarized*
 app + dmg (useful for local testing), or add the notary creds for a fully distributable installer.
@@ -106,8 +106,16 @@ make dmg
 
 This builds the app, signs the sidecar + app, notarizes + staples the **`.app`**, packages
 `desktop/build/bin/Rhapsody.dmg`, signs the dmg, and finally notarizes + staples the **dmg** (each
-`notarytool submit --wait` waits for Apple's result). Both the app and the dmg end up
+submission is polled with `notarytool info` until Apple answers). Both the app and the dmg end up
 signed + notarized + offline-stapled.
+
+> **Why not `notarytool submit --wait`?** `--wait` is not used, deliberately (STUDIO-877):
+> notarytool 1.1.2 (Xcode 26.6) stack-overflows — `SIGBUS`, *"Could not determine thread index for
+> stack guard region"* — inside CoreFoundation while formatting the progress line it prints while
+> polling. It crashed ~14s **after** Apple had already accepted the submission, so the release threw
+> away work Apple had done and left an orphaned `In Progress` submission behind. `notarize.sh`
+> submits with `--output-format json`, keeps the submission id, and polls `notarytool info` itself;
+> a crashed or disconnected poll no longer discards an accepted submission.
 
 > **`create-dmg` needs a GUI session.** The polished installer (`brew install create-dmg`) drives
 > Finder via AppleScript, so run it from a logged-in desktop (not a headless SSH session). Without
@@ -230,7 +238,13 @@ which a no-op notarize never reaches).
   silent skip. Rhapsody's release CI never sets these — it signs + notarizes from the dedicated
   keychain via `NOTARY_PROFILE` + `NOTARY_KEYCHAIN` on the self-hosted runner instead (see
   [CI signing from a dedicated keychain](#ci-signing-from-a-dedicated-keychain-self-hosted-runner)).
-- **Troubleshooting notarization.** If `notarytool submit` reports `Invalid`, fetch the detailed log
-  with `xcrun notarytool log <submission-id> --keychain-profile rhapsody-notary`; the usual causes
-  are a missing hardened runtime (`--options runtime`) or an unsigned nested binary — both of which
-  `_sign` already handles for the app + sidecar.
+- **Troubleshooting notarization.** On `Invalid`, `notarize.sh` already fetches and prints the
+  detailed log itself; to re-read it, run `xcrun notarytool log <submission-id> --keychain-profile
+  rhapsody-notary`. The usual causes are a missing hardened runtime (`--options runtime`) or an
+  unsigned nested binary — both of which `_sign` already handles for the app + sidecar.
+- **A notarization run that dies before stapling is resumable.** The submission id is recorded beside
+  the target as `<target>.notary-id` (e.g. `desktop/build/bin/Rhapsody.dmg.notary-id`), keyed by the
+  sha256 of the exact bytes submitted. Re-running `make _notarize` on the **same** artifact resumes
+  that submission instead of paying Apple for a second one; rebuilding the artifact submits afresh,
+  because the digest no longer matches. Tune the wait with `NOTARY_POLL_INTERVAL` (default 30s) and
+  `NOTARY_POLL_TIMEOUT` (default 1800s); a timeout leaves the submission intact and re-pollable.

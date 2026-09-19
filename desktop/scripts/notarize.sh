@@ -115,14 +115,162 @@ kind="$(notarize_target_kind "$TARGET")" || exit 1
 auth_args=()
 while IFS= read -r arg; do auth_args+=("$arg"); done <<< "$auth_out"
 
-# submit_to_apple <file>: submit an already-signed file (a dmg/pkg, or a zipped .app) to notarytool.
-submit_to_apple() {
-  if [ -n "${ASC_KEY_ID:-}" ]; then
-    echo "notarize: submitting $1 to Apple (notarytool, App Store Connect API key '$ASC_KEY_ID')"
-  else
-    echo "notarize: submitting $1 to Apple (notarytool, profile '$NOTARY_PROFILE')"
+# --- submit + poll (STUDIO-877) ----------------------------------------------------------------
+# We do NOT use `notarytool submit --wait`. notarytool 1.1.2 (Xcode 26.6) stack-overflows (SIGBUS,
+# "Could not determine thread index for stack guard region") inside CoreFoundation while formatting
+# the progress line `--wait` prints, ~14s after the submission id has been printed and Apple has
+# already ACCEPTED the submission. Every release failed there, discarding work Apple had done and
+# leaving an orphaned In Progress submission behind.
+#
+# So: submit once, keep the id, and poll `notarytool info` ourselves. That removes the crashing code
+# path and is strictly more robust — the id is ours, so a crashed or disconnected poll no longer
+# throws the submission away; it is re-pollable, including by a later run (see STATE_FILE).
+#
+# Cadence knobs (seconds), overridable for a slow notary queue or a fast test:
+NOTARY_POLL_INTERVAL="${NOTARY_POLL_INTERVAL:-30}"
+NOTARY_POLL_TIMEOUT="${NOTARY_POLL_TIMEOUT:-1800}"
+case "$NOTARY_POLL_INTERVAL" in *[!0-9]* | "") echo "notarize: NOTARY_POLL_INTERVAL must be a whole number of seconds, got '$NOTARY_POLL_INTERVAL'" >&2; exit 1 ;; esac
+case "$NOTARY_POLL_TIMEOUT" in *[!0-9]* | "") echo "notarize: NOTARY_POLL_TIMEOUT must be a whole number of seconds, got '$NOTARY_POLL_TIMEOUT'" >&2; exit 1 ;; esac
+
+# Resumability: the submission id is recorded beside the TARGET (under NOTARY_STATE_DIR if set) as
+# "<sha256-of-submitted-file> <id>", so a re-run polls the existing submission instead of paying
+# Apple for a second one. The digest is the guard: it is the fingerprint of the exact bytes that were
+# submitted, so a REBUILT artifact never resumes an id that belongs to different bytes (which would
+# staple a ticket that does not match). `desktop/build/bin/` is gitignored, so this leaves no
+# tracked file behind.
+STATE_FILE="${NOTARY_STATE_DIR:-$(dirname "$TARGET")}/$(basename "$TARGET").notary-id"
+
+# artifact_digest <file>: sha256 of the bytes actually handed to notarytool.
+artifact_digest() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+# submit_or_resume <file>: obtain a notarytool submission id for an already-signed file (a dmg/pkg,
+# or a zipped .app) — by resuming the one recorded for these exact bytes, or by submitting. Sets
+# SUBMISSION_ID. Returns non-zero (loudly) if notarytool fails or hands back no id; we never poll on
+# a guessed or empty id.
+SUBMISSION_ID=""
+submit_or_resume() {
+  local file="$1" digest saved_digest saved_id out rc
+  digest="$(artifact_digest "$file")"
+
+  if [ -f "$STATE_FILE" ]; then
+    saved_digest=""
+    saved_id=""
+    read -r saved_digest saved_id < "$STATE_FILE" || true
+    if [ -n "$saved_id" ] && [ "$saved_digest" = "$digest" ]; then
+      echo "notarize: resuming submission $saved_id from $STATE_FILE (same artifact — not re-submitting)"
+      SUBMISSION_ID="$saved_id"
+      return 0
+    fi
+    if [ -n "$saved_id" ]; then
+      echo "notarize: $STATE_FILE holds submission $saved_id for different bytes; submitting the rebuilt artifact instead"
+    fi
   fi
-  xcrun notarytool submit "$1" "${auth_args[@]}" --wait
+
+  if [ -n "${ASC_KEY_ID:-}" ]; then
+    echo "notarize: submitting $file to Apple (notarytool, App Store Connect API key '$ASC_KEY_ID')"
+  else
+    echo "notarize: submitting $file to Apple (notarytool, profile '$NOTARY_PROFILE')"
+  fi
+
+  rc=0
+  # --output-format json: the id is read from machine-readable output, never scraped off the human
+  # progress line (which is exactly the kind of thing a notarytool update breaks).
+  out="$(xcrun notarytool submit "$file" "${auth_args[@]}" --output-format json 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "notarize: submission failed — notarytool submit exited $rc" >&2
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  SUBMISSION_ID="$(printf '%s' "$out" | jq -re '.id // empty' 2>/dev/null)" || SUBMISSION_ID=""
+  if [ -z "$SUBMISSION_ID" ]; then
+    echo "notarize: notarytool reported success but returned no submission id — refusing to poll blindly" >&2
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  echo "notarize: submission id $SUBMISSION_ID"
+
+  if ! printf '%s %s\n' "$digest" "$SUBMISSION_ID" > "$STATE_FILE" 2>/dev/null; then
+    # Not fatal: the run continues and polls normally, it just cannot be resumed cheaply.
+    echo "notarize: warning: could not record the submission id at $STATE_FILE — a re-run will submit again" >&2
+  fi
+}
+
+# poll_until_done <id>: poll notarytool until the submission leaves "In Progress". Distinct exit
+# codes, because these are distinct outcomes that must not collapse into one error:
+#   0  Accepted
+#   1  Invalid   — Apple examined it and refused; the notary log is fetched and printed
+#   2  Rejected  — Apple refused the submission itself
+#   3  timed out while still In Progress
+#   4  timed out without ever reading a status (every poll failed)
+poll_until_done() {
+  local id="$1" start now elapsed=0 rc out status attempts=0 reads=0 last="unknown"
+  start="$(date +%s)"
+  echo "notarize: waiting for Apple — polling every ${NOTARY_POLL_INTERVAL}s, up to ${NOTARY_POLL_TIMEOUT}s (submission $id)"
+  while :; do
+    attempts=$((attempts + 1))
+    rc=0
+    out="$(xcrun notarytool info "$id" "${auth_args[@]}" --output-format json 2>&1)" || rc=$?
+    status=""
+    if [ "$rc" -eq 0 ]; then
+      status="$(printf '%s' "$out" | jq -re '.status // empty' 2>/dev/null)" || status=""
+    fi
+    now="$(date +%s)"
+    elapsed=$((now - start))
+
+    if [ -z "$status" ]; then
+      # A failed or unreadable poll is NOT a verdict. Apple's copy of the submission is unaffected
+      # by our crash (that is the whole STUDIO-877 lesson), so retry until the deadline.
+      echo "notarize: poll failed (attempt $attempts, notarytool info exited $rc) — the submission is unaffected, retrying" >&2
+      printf '%s\n' "$out" >&2
+    else
+      reads=$((reads + 1))
+      last="$status"
+      case "$status" in
+        Accepted)
+          echo "notarize: Apple Accepted submission $id after ${elapsed}s"
+          return 0
+          ;;
+        Invalid)
+          echo "notarize: Apple returned Invalid for submission $id — fetching the notary log" >&2
+          # A rejection with no reason in the CI log is a dead end for whoever reads it next.
+          xcrun notarytool log "$id" "${auth_args[@]}" >&2 \
+            || echo "notarize: could not fetch the notary log; run: xcrun notarytool log $id" >&2
+          return 1
+          ;;
+        Rejected)
+          # Distinct from Invalid: Apple refused the submission itself rather than examining and
+          # failing its contents, and produces no notary log for it — so we print the command
+          # instead of an empty fetch.
+          echo "notarize: Apple Rejected submission $id after ${elapsed}s — inspect it with: xcrun notarytool info $id" >&2
+          return 2
+          ;;
+        "In Progress")
+          echo "notarize: status In Progress (attempt $attempts, ${elapsed}s elapsed)"
+          ;;
+        *)
+          echo "notarize: unrecognized status '$status' for submission $id (attempt $attempts) — continuing to poll" >&2
+          ;;
+      esac
+    fi
+
+    if [ "$elapsed" -ge "$NOTARY_POLL_TIMEOUT" ]; then
+      if [ "$reads" -eq 0 ]; then
+        echo "notarize: gave up after ${elapsed}s — notarytool never returned a readable status for submission $id. The submission is NOT lost: re-run to resume polling it, or check 'xcrun notarytool info $id'." >&2
+        return 4
+      fi
+      echo "notarize: timed out after ${elapsed}s waiting for submission $id (last status: $last). The submission is NOT lost: re-run to resume polling it." >&2
+      return 3
+    fi
+    sleep "$NOTARY_POLL_INTERVAL"
+  done
+}
+
+# submit_to_apple <file>: submit (or resume) and wait for Apple's verdict, without `--wait`.
+submit_to_apple() {
+  submit_or_resume "$1"
+  poll_until_done "$SUBMISSION_ID"
 }
 
 if [ "$kind" = bundle ]; then

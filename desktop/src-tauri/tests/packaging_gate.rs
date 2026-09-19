@@ -252,3 +252,27 @@ fn render_latest_json_lib_contract() {
         String::from_utf8_lossy(&out.stderr),
     );
 }
+
+// notarize.sh's submit + poll loop (`notarize_poll_test.sh`, STUDIO-877), driven by a fake `xcrun`
+// on PATH — no Apple, no network, no real notarytool. `notarytool submit --wait` stack-overflows
+// (SIGBUS) formatting its progress line AFTER Apple has accepted the submission, so notarize.sh
+// captures the submission id and polls `notarytool info` itself. This pins each branch of that loop
+// — Accepted, Invalid (+ the notary-log fetch), Rejected, a never-finishing In Progress, a poll that
+// exits non-zero mid-loop, and the recorded-id resume — because a release script exercises them once
+// per release and always under time pressure.
+#[test]
+fn notarize_poll_loop_contract() {
+    let script = desktop_dir().join("scripts/notarize_poll_test.sh");
+    let out = Command::new("bash")
+        .arg(&script)
+        .env_clear()
+        .envs(scrubbed_env())
+        .output()
+        .expect("run notarize_poll_test.sh");
+    assert!(
+        out.status.success(),
+        "notarize_poll_test.sh failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
