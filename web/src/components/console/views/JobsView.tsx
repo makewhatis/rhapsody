@@ -41,6 +41,7 @@ import { useTranscript } from "@/hooks/useRunDetail";
 import { useRefresh } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview } from "@/hooks/useTeams";
 import { useJobsViewMode, type JobsViewMode } from "@/hooks/useJobsViewMode";
+import { BOARD_LANE_WIDTHS, useBoardLaneWidth, type BoardLaneWidth } from "@/hooks/useBoardLaneWidth";
 import { BoardView } from "./BoardView";
 
 const ALL_PROJECTS = "";
@@ -91,6 +92,7 @@ export function JobsView({
 
   // List or board (STUDIO-925): the board is an ADDITIONAL view, remembered across visits.
   const [view, setView] = useJobsViewMode();
+  const [laneWidth, setLaneWidth] = useBoardLaneWidth();
   const [filter, setFilter] = useState<ConsoleJobFilterId>("all");
   const [project, setProject] = useState(ALL_PROJECTS);
 
@@ -193,6 +195,14 @@ export function JobsView({
           value={filter}
           onChange={(v) => setFilter(v as ConsoleJobFilterId)}
         />
+        {view === "board" ? (
+          <Seg
+            aria-label="Lane width"
+            options={BOARD_LANE_WIDTHS}
+            value={laneWidth}
+            onChange={(v) => setLaneWidth(v as BoardLaneWidth)}
+          />
+        ) : null}
         <Select
           aria-label="Filter by project"
           options={projectOptions}
@@ -209,6 +219,7 @@ export function JobsView({
           project={project}
           counts={counts}
           maxConcurrent={maxConcurrent}
+          laneWidth={laneWidth}
           refreshedAtMs={issueRuns.dataUpdatedAt}
           nowMs={nowMs}
           roster={roster}

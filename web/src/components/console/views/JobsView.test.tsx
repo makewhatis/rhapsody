@@ -1811,7 +1811,7 @@ describe("the board view (STUDIO-925)", () => {
     ).toEqual(["done", "done"]);
   });
 
-  it("drives columns from tracker_state, not the normalized status", async () => {
+  it("always shows the four run-status lanes, whatever cards exist", async () => {
     boardStore();
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(4));
@@ -1820,7 +1820,7 @@ describe("the board view (STUDIO-925)", () => {
     await waitFor(() =>
       expect(
         [...document.querySelectorAll(".bcolhd .bname")].map((el) => el.textContent),
-      ).toEqual(["In Progress", "In Review"]),
+      ).toEqual(["Queued", "Running", "In Review", "Done"]),
     );
   });
 
@@ -1842,7 +1842,7 @@ describe("the board view (STUDIO-925)", () => {
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(4));
     fireEvent.click(boardButton());
-    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(2));
+    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(4));
     expect(document.querySelector(".bfoot .bnote")?.textContent).toContain("Older jobs");
     expect(screen.getByRole("button", { name: /load more/i })).toBeTruthy();
   });

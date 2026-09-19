@@ -86,6 +86,7 @@ function mount(
       hasMore={false}
       onLoadMore={vi.fn()}
       loadingMore={false}
+      laneWidth="default"
       {...over}
     />,
   );
@@ -142,8 +143,9 @@ describe("the board (STUDIO-925)", () => {
     ]);
 
     expect(document.querySelectorAll(".bcard")).toHaveLength(1);
-    expect(document.querySelectorAll(".bcol")).toHaveLength(1);
-    expect(document.querySelector(".bcolhd .bname")?.textContent).toBe("In Progress");
+    // The review row invents no lane: the four are fixed, and the one card is under Running.
+    expect(document.querySelectorAll(".bcol")).toHaveLength(4);
+    expect(document.querySelector('[data-lane="running"] .bkey')?.textContent).toBe("STUDIO-924");
     expect(document.querySelector(".btop .bkey")?.textContent).toBe("STUDIO-924");
   });
 
@@ -204,23 +206,70 @@ describe("the board (STUDIO-925)", () => {
     expect(document.querySelector(".btop .bkey")?.textContent).toBe("B-1");
   });
 
-  it("says so rather than rendering an empty board", () => {
-    mount([]);
-    expect(screen.getByText("No jobs yet.")).toBeTruthy();
-    expect(document.querySelectorAll(".bcol")).toHaveLength(0);
+  it("renders all four lanes with zero cards, each saying what its emptiness means", () => {
+    mount([], vi.fn(), { ...COUNTS, running: 0 });
+    expect(document.querySelectorAll(".bcol")).toHaveLength(4);
+    expect(document.querySelectorAll(".bcard")).toHaveLength(0);
+    expect(screen.getByText("Nothing is waiting for an agent.")).toBeTruthy();
+    expect(screen.getByText("No agent is running.")).toBeTruthy();
   });
 
-  it("describes each column's meaning under its name", () => {
-    mount([
-      row({
-        issue: "STUDIO-924",
-        status: "run",
-        statusLabel: "running",
-        trackerState: "In Progress",
-      }),
-    ]);
-    expect(document.querySelector(".bsub")?.textContent).toBe(
-      "an agent is working this in a worktree",
-    );
+  it("does not claim the pool is idle while a live review holds a seat with no Running card", () => {
+    const rows = [
+      row({ issue: "R-1", status: "review", trackerState: "In Review" }),
+      review("R-1#5@jimmy", "R-1", { status: "reviewing", statusLabel: "reviewing", live: true }),
+    ];
+    mount(rows, vi.fn(), { ...COUNTS, running: 1 });
+    const lane = document.querySelector('[data-lane="running"]');
+    expect(lane?.querySelector(".bcount")?.textContent).toBe("1 / 4");
+    expect(lane?.querySelectorAll(".bslot")).toHaveLength(3);
+    expect(screen.queryByText("No agent is running.")).toBeNull();
+    expect(lane?.querySelector(".bempty")?.textContent).toMatch(/reviews/);
+  });
+
+  it("does not claim an empty lane is empty when the listing is a truncated page", () => {
+    mount([row({ issue: "D-1", status: "done", trackerState: "Done" })], vi.fn(), { ...COUNTS, queued: 5, running: 0 }, 4, {
+      hasMore: true,
+    });
+    const queued = document.querySelector('[data-lane="queued"] .bempty');
+    expect(queued?.textContent).toMatch(/not loaded yet/);
+    expect(screen.queryByText("Nothing is waiting for an agent.")).toBeNull();
+    // The whole-store running tally is 0, so that lane may still say so.
+    expect(screen.getByText("No agent is running.")).toBeTruthy();
+  });
+
+  it("says the filter emptied a lane, not the pipeline", () => {
+    mount([row({ issue: "R-1", status: "run", statusLabel: "running", trackerState: "Todo" })], vi.fn(), COUNTS, 4, {
+      filter: "done",
+    });
+    expect(screen.queryByText("Nothing is waiting for an agent.")).toBeNull();
+    expect(screen.getAllByText("No tickets here match the filter.")).toHaveLength(4);
+  });
+
+  it("captions each lane with a fixed line, and a running Todo ticket is under Running", () => {
+    mount([row({ issue: "STUDIO-930", status: "run", statusLabel: "running", live: true, trackerState: "Todo" })]);
+    const running = document.querySelector('[data-lane="running"]')!;
+    expect(running.querySelector(".bkey")?.textContent).toBe("STUDIO-930");
+    expect(running.querySelector(".bsub")?.textContent).toBe("an agent has the ticket right now");
+    expect(document.querySelector('[data-lane="queued"] .bcard')).toBeNull();
+  });
+
+  it("draws the unused Running slots and the occupancy against the cap", () => {
+    mount([row({ issue: "R-1", status: "run", statusLabel: "running", live: true, trackerState: "Todo" })]);
+    const running = document.querySelector('[data-lane="running"]')!;
+    expect(running.querySelector(".bcount")?.textContent).toBe("3 / 4");
+    expect(running.querySelectorAll(".bslot")).toHaveLength(1);
+    cleanup();
+    mount([], vi.fn(), { ...COUNTS, running: 0 }, 4);
+    expect(document.querySelectorAll('[data-lane="running"] .bslot')).toHaveLength(4);
+    cleanup();
+    // No known cap: no slots invented.
+    mount([], vi.fn(), COUNTS, 0);
+    expect(document.querySelectorAll(".bslot")).toHaveLength(0);
+  });
+
+  it("carries the lane width to the track", () => {
+    mount([], vi.fn(), COUNTS, 4, { laneWidth: "wide" });
+    expect(document.querySelector(".board")?.getAttribute("data-lane-width")).toBe("wide");
   });
 });

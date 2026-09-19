@@ -7,12 +7,16 @@ import {
   TicketChip,
 } from "@/components/console";
 import { cn } from "@/lib/utils";
+import type { BoardLaneWidth } from "@/hooks/useBoardLaneWidth";
 import { teammateColor } from "@/theme/teammates";
 import type { BlockedEntry } from "@/lib/api";
 import {
   buildConsoleBoard,
+  FILTERED_LANE_EMPTY,
+  TRUNCATED_LANE_EMPTY,
   pullRequestLabel,
   type BoardCard,
+  type BoardLane,
   type ReviewerChip,
 } from "@/lib/console-board";
 import {
@@ -28,26 +32,32 @@ import {
 //
 // The Jobs table's unit of display is the RUN, so one ticket with two finished reviews reads as
 // three unrelated rows. Here the unit is the TICKET: a card per work item, its reviews folded in as
-// chips, and a column per tracker state. It is built entirely from what the table already holds —
+// chips, and a lane per run status. It is built entirely from what the table already holds —
 // `console-board.buildConsoleBoard` does the regroup, the same `useJobsFeed` feeds it, and the
 // status Seg and project Select above it narrow the cards the same way they narrow rows. No new
 // endpoint, no daemon change.
 //
-// READ-ONLY by design: a column IS a Linear state, so dragging a card would be a tracker write —
+// The four lanes ALWAYS render, empty ones included: the board is quietest exactly when the
+// pipeline is idle or starved, and that is the state it must not hide. Running draws its unused
+// `max_concurrent_agents` slots, so an idle slot beside a full Queued lane reads as starvation.
+//
+// READ-ONLY by design: a lane is a run status (Done is a tracker state), so dragging a card would imply a tracker write —
 // the console has no write path for it, and the rate limit hit on 2026-09-17 is why it stays out.
 export interface BoardViewProps {
   /** Every worklist row, review rows included — the board folds them onto their tickets. */
   rows: readonly ConsoleJobRow[];
   /** The live snapshot's held dependents — the board's only dependency edge. */
   blocked: readonly BlockedEntry[];
-  /** The status Seg's current value; applied to cards, so a column of filtered-out cards hides. */
+  /** The status Seg's current value; applied to cards, so a lane of filtered-out cards is empty. */
   filter: ConsoleJobFilterId;
   /** The project Select's value ("" = all projects). */
   project: string;
   /** The daemon's whole-store tally, so the footer agrees with the Now strip above it. */
   counts: ConsoleJobCounts | undefined;
-  /** `max_concurrent_agents` — the cap the footer measures running work against. */
+  /** `max_concurrent_agents` — the cap the footer and the Running lane measure against. */
   maxConcurrent: number;
+  /** The lane track width, from the Seg beside the filters. */
+  laneWidth: BoardLaneWidth;
   /** When the listing was last answered, for the footer's refreshed stamp. */
   refreshedAtMs: number;
   nowMs: number;
@@ -67,6 +77,7 @@ export function BoardView({
   project,
   counts,
   maxConcurrent,
+  laneWidth,
   refreshedAtMs,
   nowMs,
   roster,
@@ -79,53 +90,44 @@ export function BoardView({
   // The regroup is over EVERY row, then the Seg and project Select narrow the cards — never the
   // input to `buildConsoleBoard`. A review row filtered away before the regroup would silently strip
   // a surviving card of its chips, which is the one thing the board exists to show.
-  const columns = useMemo(() => buildConsoleBoard(rows, blocked), [rows, blocked]);
+  const lanes = useMemo(() => buildConsoleBoard(rows, blocked), [rows, blocked]);
+  const filtered = filter !== "all" || project !== "";
   const visible = useMemo(
     () =>
-      columns
-        .map((col) => ({
-          ...col,
-          cards: col.cards.filter(
-            (card) =>
-              consoleStatusMatches(card.status, filter) &&
-              (project === "" || card.projectSlug === project),
-          ),
-        }))
-        .filter((col) => col.cards.length > 0),
-    [columns, filter, project],
+      lanes.map((lane) => ({
+        ...lane,
+        cards: lane.cards.filter(
+          (card) =>
+            consoleStatusMatches(card.status, filter) &&
+            (project === "" || card.projectSlug === project),
+        ),
+      })),
+    [lanes, filter, project],
   );
 
   const running = counts?.running;
   const capped = maxConcurrent > 0 && (running ?? 0) >= maxConcurrent;
   const refreshed = relativeSince(refreshedAtMs, nowMs);
+  // Occupancy is the daemon's whole-store tally, not the filtered lane: a project filter must not
+  // make a full pool look idle. Before the tally lands, fall back to the unfiltered Running lane.
+  const occupied = running ?? lanes.find((l) => l.id === "running")?.cards.length ?? 0;
 
   return (
     <div className="boardwrap">
-      {visible.length === 0 ? (
-        <div className="empty">{emptyMessage(columns.length)}</div>
-      ) : (
-        <div className="board">
-          {visible.map((col) => (
-            <section className="bcol" key={col.key} aria-label={col.name}>
-              <header className="bcolhd">
-                <span className="bname">{col.name}</span>
-                <span className="bcount">{col.cards.length}</span>
-                {col.subtitle === "" ? null : <span className="bsub">{col.subtitle}</span>}
-              </header>
-              <div className="bcards">
-                {col.cards.map((card) => (
-                  <BoardCardView
-                    key={card.key}
-                    card={card}
-                    roster={roster}
-                    onOpen={onOpenJob}
-                  />
-                ))}
-              </div>
-            </section>
-          ))}
-        </div>
-      )}
+      <div className="board" data-lane-width={laneWidth}>
+        {visible.map((lane) => (
+          <LaneView
+            key={lane.id}
+            lane={lane}
+            filtered={filtered}
+            occupied={occupied}
+            truncated={hasMore}
+            maxConcurrent={maxConcurrent}
+            roster={roster}
+            onOpen={onOpenJob}
+          />
+        ))}
+      </div>
 
       <div className="bfoot">
         <span className={cn("bfrun", capped && "capped")}>
@@ -154,10 +156,61 @@ export function BoardView({
   );
 }
 
-// Reached only with nothing on screen: no columns at all is an empty store, and columns that were
-// all filtered away is a filter that matched nothing. Same two sentences as the table.
-function emptyMessage(columnCount: number): string {
-  return columnCount === 0 ? "No jobs yet." : "No jobs match this filter.";
+// One lane. The Running lane also draws the pool: `occupied / max` in its header and one dashed slot
+// per unused seat, so free capacity is visible as absence made concrete.
+function LaneView({
+  lane,
+  filtered,
+  occupied,
+  truncated,
+  maxConcurrent,
+  roster,
+  onOpen,
+}: {
+  lane: BoardLane;
+  filtered: boolean;
+  occupied: number;
+  /** The listing is one page of a longer one, so an empty lane says nothing about the pipeline. */
+  truncated: boolean;
+  maxConcurrent: number;
+  roster: readonly string[];
+  onOpen: (issue: string) => void;
+}) {
+  const isRunning = lane.id === "running";
+  const freeSlots = isRunning && maxConcurrent > 0 ? Math.max(0, maxConcurrent - occupied) : 0;
+  // A held seat with no card in this lane is a live review (folded onto its ticket in In Review) or
+  // an unattributed run; "No agent is running." would contradict the `n / max` beside it.
+  const emptyLine = filtered
+    ? FILTERED_LANE_EMPTY
+    : isRunning && occupied > 0
+      ? "Agents are busy on reviews and other runs, shown on their tickets in other lanes."
+      : truncated && !(isRunning && occupied === 0)
+        ? TRUNCATED_LANE_EMPTY
+        : lane.empty;
+  return (
+    <section className="bcol" aria-label={lane.name} data-lane={lane.id}>
+      <header className="bcolhd">
+        <span className="bname">{lane.name}</span>
+        <span className="bcount" title={isRunning && maxConcurrent > 0 ? "Whole pool, all projects" : undefined}>
+          {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : lane.cards.length}
+        </span>
+        <span className="bsub">{lane.caption}</span>
+      </header>
+      <div className="bcards">
+        {lane.cards.map((card) => (
+          <BoardCardView key={card.key} card={card} roster={roster} onOpen={onOpen} />
+        ))}
+        {lane.cards.length === 0 ? (
+          <div className="bempty">{emptyLine}</div>
+        ) : null}
+        {Array.from({ length: freeSlots }, (_, i) => (
+          <div className="bslot" key={`slot-${i}`}>
+            idle slot
+          </div>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 // One card. A real activation target like a table row: the whole card opens the ticket's job, so it
