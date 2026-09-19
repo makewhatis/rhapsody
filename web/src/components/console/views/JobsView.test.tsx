@@ -1793,13 +1793,19 @@ describe("the board view (STUDIO-925)", () => {
     });
   }
 
-  const boardButton = () => screen.getByRole("button", { name: "Board" });
+  // The View Seg moved into the display-options popover (STUDIO-932): open the trigger, then pick
+  // Board. The popover is a dialog, so the two clicks are what an operator does.
+  const openDisplayOptions = () => screen.getByRole("button", { name: "Display options" });
+  const switchToBoard = () => {
+    fireEvent.click(openDisplayOptions());
+    fireEvent.click(screen.getByRole("button", { name: "Board" }));
+  };
 
   it("folds a ticket's review rows onto its one card, chip each", async () => {
     boardStore();
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(4)); // the table still shows every row
-    fireEvent.click(boardButton());
+    switchToBoard();
 
     await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(2));
     const ticket = [...document.querySelectorAll(".bcard")].find((el) =>
@@ -1815,7 +1821,7 @@ describe("the board view (STUDIO-925)", () => {
     boardStore();
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(4));
-    fireEvent.click(boardButton());
+    switchToBoard();
 
     await waitFor(() =>
       expect(
@@ -1841,7 +1847,7 @@ describe("the board view (STUDIO-925)", () => {
     boardStore(true);
     mount();
     await waitFor(() => expect(rowKeys()).toHaveLength(4));
-    fireEvent.click(boardButton());
+    switchToBoard();
     await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(4));
     expect(document.querySelector(".bfoot .bnote")?.textContent).toContain("Older jobs");
     expect(screen.getByRole("button", { name: /load more/i })).toBeTruthy();
@@ -1929,7 +1935,7 @@ describe("the board view (STUDIO-925)", () => {
     expect(rowKeys()).not.toContain("STUDIO-877");
     expect(rowKeys()).not.toContain("STUDIO-880");
 
-    fireEvent.click(boardButton());
+    switchToBoard();
     // The header's tally — the source the board now reports — already knows the ticket is queued,
     // and the active fetch then puts its CARD in the lane rather than merely counting it.
     await waitFor(() =>
@@ -1941,5 +1947,150 @@ describe("the board view (STUDIO-925)", () => {
     // STUDIO-880's stale stopped run must NOT be resurrected into Done by the active feed.
     expect(document.querySelector('[data-lane="done"]')?.textContent).not.toContain("STUDIO-880");
     expect(document.querySelector('[data-lane="queued"]')?.textContent).not.toContain("STUDIO-880");
+  });
+});
+
+// STUDIO-932 — the display options leave the filter row for a popover behind a header icon, and the
+// status filter stops being offered on the board. Driven through the real view: the persistence and
+// the aria state have their own unit tests (`useBoardCardFields.test.ts`) and component tests
+// (`DisplayOptions.test.tsx`); these are the wiring boxes the ticket names.
+describe("the display options popover (STUDIO-932)", () => {
+  function boardStore() {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-STUDIO-924",
+          issue_identifier: "STUDIO-924",
+          title: "STUDIO-924 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 901,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    const rows = [
+      run({
+        id: 901,
+        issue_identifier: "STUDIO-924",
+        outcome: "running",
+        lifecycle: "open",
+        tracker_state: "In Progress",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#539@jimmy",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#540@alice",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+    ];
+    h.fetchIssueRuns.mockResolvedValue({ issues: rows, next_offset: null });
+    h.fetchIssueCounts.mockImplementation(async () => tallyOf(rows, await h.fetchState()));
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+  }
+
+  const displayTrigger = () => screen.getByRole("button", { name: "Display options" });
+  const switchToBoard = () => {
+    fireEvent.click(displayTrigger());
+    fireEvent.click(screen.getByRole("button", { name: "Board" }));
+  };
+  const statusFilter = () => screen.queryByRole("button", { name: "In review" });
+
+  it("renders no status filter in Board mode, and keeps it in List mode", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    expect(statusFilter()).not.toBeNull();
+
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(4));
+    expect(statusFilter()).toBeNull();
+    // The project Select stays in both (STUDIO-932).
+    expect(screen.getByLabelText("Filter by project")).toBeTruthy();
+
+    // The popover is still open, so List is one click away — and the filter comes back with it.
+    fireEvent.click(screen.getByRole("button", { name: "List" }));
+    await waitFor(() => expect(statusFilter()).not.toBeNull());
+  });
+
+  it("shows the lane-width row only in Board mode", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+
+    fireEvent.click(displayTrigger());
+    expect(screen.queryByText("Lane width")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Board" }));
+    expect(screen.getByText("Lane width")).toBeTruthy();
+  });
+
+  // The ticket's acceptance on the chips: aria-pressed is the same fact a screen reader reads, and
+  // the element really goes. The persistence round-trip (including the throwing-storage path) is
+  // pinned in `useBoardCardFields.test.ts` — this jsdom build has no `localStorage` at all, which is
+  // the environment the storage guards exist for.
+  it("hides a card element with a chip, and reports it through aria-pressed", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(1));
+    expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(2);
+
+    const reviews = screen.getByRole("button", { name: "Reviews" });
+    expect(reviews.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(reviews);
+    await waitFor(() => expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(0));
+    expect(screen.getByRole("button", { name: "Reviews" }).getAttribute("aria-pressed")).toBe("false");
+    // The card keeps the elements that are its identity.
+    expect(document.querySelector(".bcard .bkey")?.textContent).toBe("STUDIO-924");
+    expect(document.querySelector(".bcard .pill")).not.toBeNull();
+  });
+
+  it("draws the non-default dot only once a display option differs", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    expect(document.querySelector(".dpdot")).toBeNull();
+
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(4));
+    expect(document.querySelector(".dpdot")).not.toBeNull();
+  });
+
+  it("Reset returns every display option to its default", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reviews" }));
+    await waitFor(() => expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(0));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    // The view returns to the table, the dot clears, and the chips all read as on again.
+    await waitFor(() => expect(statusFilter()).not.toBeNull());
+    expect(document.querySelector(".dpdot")).toBeNull();
+    expect(screen.getByRole("button", { name: "Reviews" }).getAttribute("aria-pressed")).toBe("true");
   });
 });

@@ -172,6 +172,54 @@
 .rh-console .bfoot .bnote { color: var(--ink-4); font-size: 11.5px; }
 .rh-console .bfoot .bref { color: var(--ink-4); font-family: var(--mono); font-size: 11px; }
 
+/* ===== display options popover (STUDIO-932) =====
+   List/Board, lane width and the five card-field chips leave the filter row for one header popover.
+   It is built from the PODIUM tokens in `src/index.css` — --surface / --hair-card / --r-card /
+   --shadow-pop for the surface, --tint-rust / --rust-text / --hair-control / --btn-label for the
+   chips and the reset, --rust-text for the non-default dot — deliberately NOT the `.rh-console`
+   palette the rest of this file uses. The ticket names those tokens exactly: the popover hangs above
+   the board as a real overlay, and this is one of the few places a shadow is earned. */
+.rh-console .dpwrap { position: relative; display: inline-flex; }
+.rh-console .dptrig { position: relative; display: inline-flex; align-items: center; justify-content: center; padding: 7px 9px; }
+.rh-console .dptrig .dpicon { position: relative; display: inline-flex; }
+/* The non-default marker: rust, 5px, on the icon's top-right — never Linear's blue. */
+.rh-console .dpdot { position: absolute; top: -2px; right: -2px; width: 5px; height: 5px; border-radius: 50%; background: var(--rust-text); }
+.rh-console .dpop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 13px;
+  background: var(--surface);
+  border: 1px solid var(--hair-card);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-pop);
+  /* Fades in because the operator just clicked; nothing here animates on page load. */
+  animation: dp-in .14s ease-out;
+}
+.rh-console .dprow { display: flex; align-items: baseline; gap: 12px; }
+.rh-console .dplabel { flex: none; width: 72px; color: var(--text-muted); font-size: 12px; }
+.rh-console .dprow .seg { margin-left: auto; }
+.rh-console .dprule { height: 1px; background: var(--hair-section); }
+/* Card fields are five chips, not one control, so they wrap as a group to the right of the label. */
+.rh-console .dphfields { align-items: flex-start; }
+.rh-console .dphfields .dplabel { padding-top: 5px; }
+.rh-console .dpchips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+/* Toggle chips: ON is a tint-rust fill with a rust-text label and no border; OFF is transparent with
+   the control hairline. Selection stays `aria-pressed`, so a test and a screen reader read the same. */
+.rh-console .dpop .chip { border-radius: var(--r-chip); border: 1px solid var(--hair-control); background: transparent; color: var(--btn-label); font-size: 12px; padding: 4px 9px; }
+.rh-console .dpop .chip:hover { border-color: var(--hair-strong); color: var(--ink); }
+.rh-console .dpop .chip[aria-pressed="true"] { background: var(--tint-rust); color: var(--rust-text); border-color: transparent; font-weight: 600; }
+/* Reset is an escape hatch, not a call to action: a subtle --btn-label text button. */
+.rh-console .dpreset { justify-content: flex-end; }
+.rh-console .dpreset .btn.link { color: var(--btn-label); font-size: 12px; padding: 0; }
+.rh-console .dpreset .btn.link:hover { color: var(--rust-text); background: none; }
+@keyframes dp-in { from { opacity: 0; transform: translateY(-4px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
 /* ===== §4 job detail ===== */
 .rh-console .jobhd { display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
 .rh-console .jobhd .tt { min-width: 0; }

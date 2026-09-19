@@ -8,6 +8,7 @@ import {
 } from "@/components/console";
 import { cn } from "@/lib/utils";
 import type { BoardLaneWidth } from "@/hooks/useBoardLaneWidth";
+import type { BoardCardFields } from "@/hooks/useBoardCardFields";
 import { teammateColor } from "@/theme/teammates";
 import type { BlockedEntry } from "@/lib/api";
 import {
@@ -21,10 +22,8 @@ import {
   type ReviewerChip,
 } from "@/lib/console-board";
 import {
-  consoleStatusMatches,
   relativeSince,
   type ConsoleJobCounts,
-  type ConsoleJobFilterId,
   type ConsoleJobRow,
   type ConsoleJobStatus,
 } from "@/lib/console-jobs";
@@ -34,7 +33,7 @@ import {
 // The Jobs table's unit of display is the RUN, so one ticket with two finished reviews reads as
 // three unrelated rows. Here the unit is the TICKET: a card per work item, its reviews folded in as
 // chips, and a lane per run status. `console-board.buildConsoleBoard` does the regroup, and the
-// status Seg and project Select above it narrow the cards the same way they narrow rows.
+// project Select above it narrows the cards the same way it narrows rows.
 //
 // THE ROWS ARE NOT ONLY THE PAGE (STUDIO-931). A lane is a run status, and non-terminal work is the
 // oldest and quietest, so bucketing the same recency page the table holds made the board least
@@ -44,6 +43,10 @@ import {
 // count comes from the same whole-store tally the header uses (see `boardLaneTally`). The table still
 // pages; the board's non-terminal lanes do not. No new endpoint — `/api/v1/history/issues` takes
 // `latest_outcome`.
+//
+// The STATUS filter does NOT narrow the board (STUDIO-932): the four lanes already ARE the status
+// axis, so a status Seg here was a control that undid the board rather than a filter over it. The
+// Seg is not rendered in Board mode at all (see `JobsView`), and no status filter reaches this view.
 //
 // The four lanes ALWAYS render, empty ones included: the board is quietest exactly when the
 // pipeline is idle or starved, and that is the state it must not hide. Running draws its unused
@@ -56,16 +59,16 @@ export interface BoardViewProps {
   rows: readonly ConsoleJobRow[];
   /** The live snapshot's held dependents — the board's only dependency edge. */
   blocked: readonly BlockedEntry[];
-  /** The status Seg's current value; applied to cards, so a lane of filtered-out cards is empty. */
-  filter: ConsoleJobFilterId;
   /** The project Select's value ("" = all projects). */
   project: string;
   /** The daemon's whole-store tally, so the footer agrees with the Now strip above it. */
   counts: ConsoleJobCounts | undefined;
   /** `max_concurrent_agents` — the cap the footer and the Running lane measure against. */
   maxConcurrent: number;
-  /** The lane track width, from the Seg beside the filters. */
+  /** The lane track width, from the display-options popover. */
   laneWidth: BoardLaneWidth;
+  /** Which card elements the display-options chips currently show (STUDIO-932). */
+  fields: BoardCardFields;
   /** When the listing was last answered, for the footer's refreshed stamp. */
   refreshedAtMs: number;
   nowMs: number;
@@ -81,11 +84,11 @@ export interface BoardViewProps {
 export function BoardView({
   rows,
   blocked,
-  filter,
   project,
   counts,
   maxConcurrent,
   laneWidth,
+  fields,
   refreshedAtMs,
   nowMs,
   roster,
@@ -95,22 +98,19 @@ export function BoardView({
   onLoadMore,
   loadingMore,
 }: BoardViewProps) {
-  // The regroup is over EVERY row, then the Seg and project Select narrow the cards — never the
-  // input to `buildConsoleBoard`. A review row filtered away before the regroup would silently strip
-  // a surviving card of its chips, which is the one thing the board exists to show.
+  // The regroup is over EVERY row, then the project Select narrows the cards — never the input to
+  // `buildConsoleBoard`. A review row filtered away before the regroup would silently strip a
+  // surviving card of its chips, which is the one thing the board exists to show. Status is NOT
+  // applied: the lanes are that axis (STUDIO-932).
   const lanes = useMemo(() => buildConsoleBoard(rows, blocked), [rows, blocked]);
-  const filtered = filter !== "all" || project !== "";
+  const filtered = project !== "";
   const visible = useMemo(
     () =>
       lanes.map((lane) => ({
         ...lane,
-        cards: lane.cards.filter(
-          (card) =>
-            consoleStatusMatches(card.status, filter) &&
-            (project === "" || card.projectSlug === project),
-        ),
+        cards: lane.cards.filter((card) => project === "" || card.projectSlug === project),
       })),
-    [lanes, filter, project],
+    [lanes, project],
   );
 
   const running = counts?.running;
@@ -136,6 +136,7 @@ export function BoardView({
             truncated={hasMore}
             maxConcurrent={maxConcurrent}
             roster={roster}
+            fields={fields}
             onOpen={onOpenJob}
           />
         ))}
@@ -178,6 +179,7 @@ function LaneView({
   truncated,
   maxConcurrent,
   roster,
+  fields,
   onOpen,
 }: {
   lane: BoardLane;
@@ -189,6 +191,7 @@ function LaneView({
   truncated: boolean;
   maxConcurrent: number;
   roster: readonly string[];
+  fields: BoardCardFields;
   onOpen: (issue: string) => void;
 }) {
   const isRunning = lane.id === "running";
@@ -219,7 +222,7 @@ function LaneView({
       </header>
       <div className="bcards">
         {lane.cards.map((card) => (
-          <BoardCardView key={card.key} card={card} roster={roster} onOpen={onOpen} />
+          <BoardCardView key={card.key} card={card} roster={roster} fields={fields} onOpen={onOpen} />
         ))}
         {lane.cards.length === 0 ? <div className="bempty">{emptyLine}</div> : null}
         {gap > 0 && lane.cards.length > 0 ? (
@@ -237,16 +240,27 @@ function LaneView({
 
 // One card. A real activation target like a table row: the whole card opens the ticket's job, so it
 // owes Enter/Space and a focus ring as well as the pointer (§10 box 2.8).
+//
+// The five display-option chips (STUDIO-932) gate the card's OPTIONAL elements only. The ticket key,
+// title and status pill are the card's identity and always draw; the assignee, project, harness,
+// review chips and pull request come and go with `fields`.
 function BoardCardView({
   card,
   roster,
+  fields,
   onOpen,
 }: {
   card: BoardCard;
   roster: readonly string[];
+  fields: BoardCardFields;
   onOpen: (issue: string) => void;
 }) {
   const open = () => onOpen(card.issue);
+  // Hiding every meta element drops the row rather than leaving an empty flex line with a gap.
+  const showMeta =
+    (fields.assignee && card.assignee !== "") ||
+    (fields.project && card.project !== "") ||
+    (fields.harness && card.provider !== "");
   return (
     <article
       className={cn("bcard", card.live && "live")}
@@ -266,21 +280,23 @@ function BoardCardView({
         <Pill variant={card.status}>{card.statusLabel}</Pill>
       </div>
       {card.title === "" ? null : <div className="btitle">{card.title}</div>}
-      <div className="bmeta">
-        {card.assignee === "" ? null : (
-          <span className="who2">
-            <TeammateAvatar color={teammateColor(roster, card.assignee)} size={7} />
-            {card.assignee}
-          </span>
-        )}
-        {card.project === "" ? null : <span className="bproj">{card.project}</span>}
-        {card.provider === "" ? null : (
-          <span className="provbadge" title={`ran on ${card.provider}`}>
-            {card.provider}
-          </span>
-        )}
-      </div>
-      {card.reviewers.length === 0 ? null : (
+      {showMeta ? (
+        <div className="bmeta">
+          {!fields.assignee || card.assignee === "" ? null : (
+            <span className="who2">
+              <TeammateAvatar color={teammateColor(roster, card.assignee)} size={7} />
+              {card.assignee}
+            </span>
+          )}
+          {!fields.project || card.project === "" ? null : <span className="bproj">{card.project}</span>}
+          {!fields.harness || card.provider === "" ? null : (
+            <span className="provbadge" title={`ran on ${card.provider}`}>
+              {card.provider}
+            </span>
+          )}
+        </div>
+      ) : null}
+      {!fields.reviews || card.reviewers.length === 0 ? null : (
         <div className="bchips" aria-label="Reviews">
           {card.reviewers.map((r) => (
             <ReviewerChipView key={r.key} chip={r} />
@@ -296,7 +312,7 @@ function BoardCardView({
           ))}
         </div>
       )}
-      {card.pr === undefined ? null : (
+      {!fields.pullRequest || card.pr === undefined ? null : (
         // The anchor is wrapped rather than given its own `onClick`: `ExternalLink` deliberately
         // does not accept one (so its open-seam cannot be replaced), and the card underneath must not
         // navigate when the operator clicked the link.

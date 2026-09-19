@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ConsoleJobRow, ConsoleJobCounts } from "@/lib/console-jobs";
+import { DEFAULT_BOARD_CARD_FIELDS } from "@/hooks/useBoardCardFields";
 import { BoardView, type BoardViewProps } from "./BoardView";
 
 // The PR link is an ExternalLink, whose click seam calls `openExternal`; with no Tauri bridge that
@@ -74,7 +75,6 @@ function mount(
     <BoardView
       rows={rows}
       blocked={[]}
-      filter="all"
       project=""
       counts={counts}
       maxConcurrent={maxConcurrent}
@@ -87,6 +87,7 @@ function mount(
       onLoadMore={vi.fn()}
       loadingMore={false}
       laneWidth="default"
+      fields={DEFAULT_BOARD_CARD_FIELDS}
       {...over}
     />,
   );
@@ -191,19 +192,73 @@ describe("the board (STUDIO-925)", () => {
     expect(document.querySelector(".bfrun")?.classList.contains("capped")).toBe(true);
   });
 
-  it("narrows the cards by the status Seg and the project Select", () => {
+  // STUDIO-932 — the board is NOT status-filtered. The lanes ARE that axis; only the project Select
+  // narrows what is drawn. A status filter no longer has a prop to reach this view with.
+  it("narrows the cards by the project Select only", () => {
     const rows = [
       row({ issue: "R-1", status: "run", statusLabel: "running" }),
       row({ issue: "B-1", status: "review", projectSlug: "booch" }),
     ];
-    mount(rows, vi.fn(), COUNTS, 4, { filter: "run" });
-    expect(document.querySelectorAll(".bcard")).toHaveLength(1);
-    expect(document.querySelector(".btop .bkey")?.textContent).toBe("R-1");
+    mount(rows);
+    expect(document.querySelectorAll(".bcard")).toHaveLength(2);
     cleanup();
 
     mount(rows, vi.fn(), COUNTS, 4, { project: "booch" });
     expect(document.querySelectorAll(".bcard")).toHaveLength(1);
     expect(document.querySelector(".btop .bkey")?.textContent).toBe("B-1");
+  });
+
+  // The five card-field chips (STUDIO-932). Key, title and status pill are the card's identity and
+  // must survive every combination; only the named element goes.
+  it("hides and shows each optional card element", () => {
+    mount([
+      row({ issue: "R-1", assignee: "alice", trackerState: "In Progress" }),
+      review("pr:makewhatis/booch#540@jimmy", "R-1"),
+    ]);
+    expect(document.querySelector(".bcard .who2")).not.toBeNull();
+    expect(document.querySelector(".bcard .bproj")).not.toBeNull();
+    expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(1);
+    expect(document.querySelector(".bcard .bpr")).not.toBeNull();
+    cleanup();
+
+    mount([row({ issue: "R-1", assignee: "alice" })], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, assignee: false },
+    });
+    expect(document.querySelector(".bcard .who2")).toBeNull();
+    // The card's identity is not a toggle.
+    expect(document.querySelector(".bcard .bkey")?.textContent).toBe("R-1");
+    expect(document.querySelector(".bcard .pill")).not.toBeNull();
+    cleanup();
+
+    mount([row({ issue: "R-1" })], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, project: false },
+    });
+    expect(document.querySelector(".bcard .bproj")).toBeNull();
+    cleanup();
+
+    mount([row({ issue: "R-1", provider: "fireworks" })], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, harness: false },
+    });
+    expect(document.querySelector(".bcard .provbadge")).toBeNull();
+    cleanup();
+
+    mount([row({ issue: "R-1" }), review("pr:makewhatis/booch#540@jimmy", "R-1")], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, reviews: false },
+    });
+    expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(0);
+    cleanup();
+
+    mount([row({ issue: "R-1" }), review("pr:makewhatis/booch#540@jimmy", "R-1")], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, pullRequest: false },
+    });
+    expect(document.querySelector(".bcard .bpr")).toBeNull();
+  });
+
+  it("drops the meta row entirely, rather than leaving a gap, when all three meta fields are off", () => {
+    mount([row({ issue: "R-1", assignee: "alice", provider: "fireworks" })], vi.fn(), COUNTS, 4, {
+      fields: { ...DEFAULT_BOARD_CARD_FIELDS, assignee: false, project: false, harness: false },
+    });
+    expect(document.querySelector(".bcard .bmeta")).toBeNull();
   });
 
   it("renders all four lanes with zero cards, each saying what its emptiness means", () => {
@@ -269,9 +324,9 @@ describe("the board (STUDIO-925)", () => {
     expect(review.textContent).toMatch(/2 more in this lane/);
   });
 
-  it("says the filter emptied a lane, not the pipeline", () => {
+  it("says the project filter emptied a lane, not the pipeline", () => {
     mount([row({ issue: "R-1", status: "run", statusLabel: "running", trackerState: "Todo" })], vi.fn(), COUNTS, 4, {
-      filter: "done",
+      project: "other",
     });
     expect(screen.queryByText("Nothing is waiting for an agent.")).toBeNull();
     expect(screen.getAllByText("No tickets here match the filter.")).toHaveLength(4);
