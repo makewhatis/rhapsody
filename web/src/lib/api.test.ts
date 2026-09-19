@@ -185,6 +185,20 @@ describe("issue listing + day summary (TRA-320)", () => {
     expect(r.next_offset).toBe(50);
   });
 
+  // STUDIO-931 — the board's active feed asks for the issue's LATEST run outcome, not any run with
+  // that outcome. The parameter name is the contract with the daemon's issue listing.
+  it("fetchIssueRuns passes latestOutcome through as latest_outcome", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ issues: [], next_offset: null }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchIssueRuns({ latestOutcome: "stopped", limit: 1000 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/history/issues?latest_outcome=stopped&limit=1000",
+      expect.anything(),
+    );
+  });
+
   it("fetchIssueRuns tolerates a null/omitted issues array so the table can map safely", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);

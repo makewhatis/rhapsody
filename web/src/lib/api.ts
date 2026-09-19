@@ -413,6 +413,10 @@ export interface MetricsResponse {
 export interface HistoryFilter {
   issue?: string;
   outcome?: string;
+  // latestOutcome keeps an ISSUE only when its NEWEST run has this outcome — it filters after the
+  // per-issue partition, unlike `outcome`, which returns each issue's newest run *with* that outcome
+  // (an old run of a finished ticket). Only the issue listing honours it (STUDIO-931).
+  latestOutcome?: string;
   project?: string; // Linear project slug; omitted from the query when empty
   since?: string; // RFC3339 lower bound on started_at
   limit?: number;
@@ -778,6 +782,7 @@ export function historyQuery(f: HistoryFilter): string {
   const p = new URLSearchParams();
   if (f.issue) p.set("issue", f.issue);
   if (f.outcome) p.set("outcome", f.outcome);
+  if (f.latestOutcome) p.set("latest_outcome", f.latestOutcome);
   if (f.project) p.set("project", f.project);
   if (f.since) p.set("since", f.since);
   if (f.limit != null) p.set("limit", String(f.limit));

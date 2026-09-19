@@ -41,8 +41,8 @@ function run(over: Partial<IssueRun> & Pick<IssueRun, "issue_identifier" | "outc
   } as IssueRun;
 }
 
-// STUDIO-931 — the board's non-terminal lanes fetch by OUTCOME, unbounded, instead of bucketing the
-// 50-row recency page. The fetch SHAPE is the fix, so it is what the hook test pins.
+// STUDIO-931 — the board's non-terminal lanes fetch by LATEST run outcome, wide, instead of
+// bucketing the 50-row recency page. The fetch SHAPE is the fix, so it is what the hook test pins.
 describe("useBoardActive", () => {
   function mount(enabled = true) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -62,28 +62,33 @@ describe("useBoardActive", () => {
     h.fetchIssueRuns.mockReset();
   });
 
-  it("fetches every non-terminal outcome by filter, never the recency page", async () => {
+  it("fetches each issue's latest-run outcome by filter, never the recency page", async () => {
     mount();
     await waitFor(() =>
       expect(h.fetchIssueRuns).toHaveBeenCalledTimes(BOARD_ACTIVE_OUTCOMES.length),
     );
     for (const outcome of BOARD_ACTIVE_OUTCOMES) {
-      expect(h.fetchIssueRuns).toHaveBeenCalledWith({ outcome, limit: BOARD_ACTIVE_LIMIT });
+      expect(h.fetchIssueRuns).toHaveBeenCalledWith({
+        latestOutcome: outcome,
+        limit: BOARD_ACTIVE_LIMIT,
+      });
     }
-    // Every request carries an outcome AND a limit: an omitted outcome would be the recency page
-    // again, and an omitted limit would be the 50-row window this ticket exists to escape.
+    // Every request carries a latestOutcome AND a limit: an omitted outcome would be the recency
+    // page again, an omitted limit would be the 50-row window this ticket exists to escape, and
+    // `outcome` (which filters BEFORE the partition) would return stale runs of finished tickets.
     for (const [filter] of h.fetchIssueRuns.mock.calls) {
-      expect(filter.outcome).toBeTruthy();
+      expect(filter.latestOutcome).toBeTruthy();
+      expect(filter.outcome).toBeUndefined();
       expect(filter.limit).toBe(BOARD_ACTIVE_LIMIT);
     }
   });
 
   it("merges the outcomes' issues into one list", async () => {
-    h.fetchIssueRuns.mockImplementation(async ({ outcome }: { outcome: string }) => ({
+    h.fetchIssueRuns.mockImplementation(async ({ latestOutcome }: { latestOutcome: string }) => ({
       issues:
-        outcome === "stopped"
+        latestOutcome === "stopped"
           ? [run({ issue_identifier: "STUDIO-877", outcome: "stopped" })]
-          : outcome === "running"
+          : latestOutcome === "running"
             ? [run({ issue_identifier: "LIVE-1", outcome: "running" })]
             : [],
       next_offset: null,

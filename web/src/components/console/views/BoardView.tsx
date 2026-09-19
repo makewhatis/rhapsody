@@ -40,9 +40,10 @@ import {
 // oldest and quietest, so bucketing the same recency page the table holds made the board least
 // informative about exactly the ticket that had waited longest — STUDIO-877 sat at row 153 and its
 // Queued lane read `0` beside a header that read `1`. `JobsView` therefore feeds the board the page
-// PLUS an unbounded, per-outcome non-terminal fetch, and each lane's count comes from the same
-// whole-store tally the header uses (see `boardLaneTally`). The table still pages; the board's
-// non-terminal lanes do not. No new endpoint — `/api/v1/history/issues` already takes `outcome`.
+// PLUS a wide fetch filtered to each issue's LATEST run outcome (`latest_outcome`), and each lane's
+// count comes from the same whole-store tally the header uses (see `boardLaneTally`). The table still
+// pages; the board's non-terminal lanes do not. No new endpoint — `/api/v1/history/issues` takes
+// `latest_outcome`.
 //
 // The four lanes ALWAYS render, empty ones included: the board is quietest exactly when the
 // pipeline is idle or starved, and that is the state it must not hide. Running draws its unused

@@ -101,8 +101,9 @@ export function JobsView({
   const issueRows = useMemo(() => issueRuns.data?.issues ?? [], [issueRuns.data]);
   // The board's non-terminal lanes must be complete, not a sample of the recency page (STUDIO-931):
   // the page is ordered newest-first, so the longer a ticket sits the more certainly it has fallen
-  // off. The active feed fetches those outcomes by filter and wider than a page; the table keeps the
-  // page alone, so a list-only visit neither pays for the extra requests nor grows the window.
+  // off. The active feed fetches each issue's LATEST run outcome by filter and wider than a page; the
+  // table keeps the page alone, so a list-only visit neither pays for the extra requests nor grows
+  // the window.
   const activeRows = useBoardActive(view === "board");
   const boardIssueRows = useMemo(
     () => (view === "board" ? mergeIssueRows(issueRows, activeRows) : issueRows),

@@ -60,10 +60,16 @@ pub(crate) async fn handle_history(
     )
 }
 
-/// `GET /api/v1/history/issues?issue=&outcome=&project=&since=&limit=&offset=`: the same filters as
-/// `/history`, but ONE row per issue — each issue's latest matching run — paged by issue, so an
-/// issue in a retry loop occupies one row instead of crowding every other issue off the page
-/// (TRA-320). `next_offset` follows the same effective-limit rule as `/history`, counting issues.
+/// `GET /api/v1/history/issues?issue=&outcome=&latest_outcome=&project=&since=&limit=&offset=`: the
+/// same filters as `/history`, but ONE row per issue — each issue's latest matching run — paged by
+/// issue, so an issue in a retry loop occupies one row instead of crowding every other issue off the
+/// page (TRA-320). `next_offset` follows the same effective-limit rule as `/history`, counting issues.
+///
+/// `latest_outcome` (STUDIO-931) keeps an issue only when its NEWEST run carries that outcome. It is
+/// applied AFTER the per-issue partition, whereas `outcome` filters each run before the partition
+/// runs — so `?outcome=stopped` returns "every issue that ever had a stopped run, as that old run",
+/// while `?latest_outcome=stopped` returns "the issues that are stopped right now". The board's
+/// non-terminal lanes use the latter; see README "Divergences".
 ///
 /// Rhapsody-only: Go has no issue-level listing, and the dashboard's issue-grouped Jobs list used to
 /// group a run-paged fetch client-side — which is what made one noisy ticket hide 73 others.
@@ -546,12 +552,17 @@ fn next_offset(returned: usize, offset: i64, effective_limit: i64) -> Option<i64
 /// [`RunFilter`]. `limit`/`offset` must be non-negative integers when present (else a 400 envelope).
 /// Shared by `/history` and `/history/issues`, which take identical filters and differ only in what
 /// a page counts.
+///
+/// `latest_outcome` (STUDIO-931) is parsed here too but is meaningful only to `/history/issues`,
+/// which partitions by issue: it keeps an issue only when its NEWEST run has that outcome.
+/// `/history` pages RUNS, where "the issue's newest run" is not a concept, so `list_runs` ignores it.
 fn run_filter_from_query(q: &HashMap<String, String>) -> Result<RunFilter, Box<Response>> {
     Ok(RunFilter {
         issue: qget(q, "issue").to_string(),
         outcome: qget(q, "outcome").to_string(),
         since: qget(q, "since").to_string(),
         project: qget(q, "project").to_string(),
+        latest_outcome: qget(q, "latest_outcome").to_string(),
         limit: parse_non_neg_int(qget(q, "limit"), "limit")?,
         offset: parse_non_neg_int(qget(q, "offset"), "offset")?,
     })
@@ -854,8 +865,9 @@ mod tests {
         EventRecord, IssueKey, IssueLifecycle, IssueLifecycleRow, Snapshot, TokenCounts, Totals,
     };
     use rhapsody_store::{
-        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, ReviewWatchKey, ReviewWatchRow, RunEnd,
-        RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError, StorePath,
+        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, OUTCOME_STOPPED, ReviewWatchKey,
+        ReviewWatchRow, RunEnd, RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError,
+        StorePath,
     };
     use serde_json::{Value, json};
 
@@ -879,6 +891,12 @@ mod tests {
     /// The lightweight seeder the TRA-320 paging/aggregate tests use to build stores larger than one
     /// page, where only the identity + timestamp of each row matters.
     fn seed_run_at(store: &Sqlite, issue: &str, started: &str) -> i64 {
+        seed_run_outcome(store, issue, started, OUTCOME_COMPLETED)
+    }
+
+    /// [`seed_run_at`] with a chosen outcome — for tests that need a finished ticket to carry an
+    /// OLD non-terminal run (STUDIO-931).
+    fn seed_run_outcome(store: &Sqlite, issue: &str, started: &str, outcome: &str) -> i64 {
         let id = store
             .start_run(RunStart {
                 issue_identifier: issue.into(),
@@ -890,7 +908,7 @@ mod tests {
             .end_run(
                 id,
                 RunEnd {
-                    outcome: OUTCOME_COMPLETED.into(),
+                    outcome: outcome.into(),
                     ended_at: started.into(),
                     ..Default::default()
                 },
@@ -1352,6 +1370,63 @@ mod tests {
             0,
             "4 issues total"
         );
+    }
+
+    // STUDIO-931 — `latest_outcome` keeps an issue only when its NEWEST run has that outcome, while
+    // `outcome` returns an issue's newest run WITH that outcome even when a newer run exists. This is
+    // the difference between "the board can see a stuck ticket" and "the board buckets an old run of
+    // a finished ticket".
+    #[tokio::test]
+    async fn issue_runs_latest_outcome_excludes_a_finished_ticket_stale_run() {
+        let store = mem_store();
+        // A ticket that was stopped once and later finished. Its stopped run is the oldest row in the
+        // store, so it is far past any recency page; its newest run is completed.
+        seed_run_outcome(
+            &store,
+            "STUDIO-880",
+            "2026-08-01T00:00:00Z",
+            OUTCOME_STOPPED,
+        );
+        seed_run_outcome(
+            &store,
+            "STUDIO-880",
+            "2026-08-02T00:00:00Z",
+            OUTCOME_COMPLETED,
+        );
+        // A ticket that is genuinely stopped right now.
+        seed_run_outcome(
+            &store,
+            "STUDIO-877",
+            "2026-08-03T00:00:00Z",
+            OUTCOME_STOPPED,
+        );
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+
+        // Precondition: the plain `outcome` filter is the bug — it returns the finished ticket too.
+        let (_s, body) = get_json(&format!("{base}/api/v1/history/issues?outcome=stopped")).await;
+        let mut idents: Vec<String> = body["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .map(|r| {
+                r["issue_identifier"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        idents.sort();
+        assert_eq!(idents, ["STUDIO-877", "STUDIO-880"]);
+
+        let (status, body) = get_json(&format!(
+            "{base}/api/v1/history/issues?latest_outcome=stopped&limit=1000"
+        ))
+        .await;
+        assert_eq!(status, 200);
+        let issues = body["issues"].as_array().expect("issues");
+        assert_eq!(issues.len(), 1, "only the issue that is stopped now");
+        assert_eq!(issues[0]["issue_identifier"], "STUDIO-877");
+        assert_eq!(issues[0]["outcome"], "stopped");
     }
 
     // STUDIO-702 — the issue listing carries the TICKET's current lifecycle, so a completed run on
