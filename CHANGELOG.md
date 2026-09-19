@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.6](https://github.com/makewhatis/rhapsody/compare/v0.3.5...v0.3.6) (2026-09-19)
+
+
+### Features
+
+* **config,orchestrator:** scope review.auto_merge per project (STUDIO-927) ([#179](https://github.com/makewhatis/rhapsody/issues/179)) ([81f4732](https://github.com/makewhatis/rhapsody/commit/81f4732ea89ef67b507865b4fd8233d2f7c2f234))
+* **web:** add a board view where a card is a ticket (STUDIO-925) ([#178](https://github.com/makewhatis/rhapsody/issues/178)) ([2fc26f7](https://github.com/makewhatis/rhapsody/commit/2fc26f7de003ec8f286056f3afa90fb3319e4797))
+* **web:** fix the board's lane axis, pin four fixed-width lanes, add a lane-width control (STUDIO-930) ([#180](https://github.com/makewhatis/rhapsody/issues/180)) ([19ed6e8](https://github.com/makewhatis/rhapsody/commit/19ed6e89e47cec99cbc47e7245c8cd9565b1464f))
+* **web:** move display options into a header popover and drop the status filter on the board (STUDIO-932) ([#181](https://github.com/makewhatis/rhapsody/issues/181)) ([080b610](https://github.com/makewhatis/rhapsody/commit/080b610dbad1f44a6b066777b63befd6d7bc8207))
+* **web:** show a ticket's token cost by provider and live-run activity (STUDIO-926) ([#177](https://github.com/makewhatis/rhapsody/issues/177)) ([71087e9](https://github.com/makewhatis/rhapsody/commit/71087e95bef614a95a7a6a6c9d03ad7c942e5053))
+
+
+### Bug Fixes
+
+* **desktop:** poll notarytool instead of --wait so a crash stops discarding an accepted submission (STUDIO-877) ([#184](https://github.com/makewhatis/rhapsody/issues/184)) ([b46b048](https://github.com/makewhatis/rhapsody/commit/b46b048df894e3868a368f6c2bb05fc78edb164d))
+* **orchestrator:** name auto-merge's decline reason in the reconciliation sweep ([#175](https://github.com/makewhatis/rhapsody/issues/175)) ([9c530d2](https://github.com/makewhatis/rhapsody/commit/9c530d286105331af2ac5595406845a4aa0d08f7))
+* **store,httpapi,web:** filter the board's active feed to each issue's latest run outcome (STUDIO-931) ([#182](https://github.com/makewhatis/rhapsody/issues/182)) ([8598156](https://github.com/makewhatis/rhapsody/commit/85981564d98bf439d7022de9408a15a43d82d869))
+
 ## [0.3.5](https://github.com/makewhatis/rhapsody/compare/v0.3.4...v0.3.5) (2026-09-16)
 
 
