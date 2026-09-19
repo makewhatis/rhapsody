@@ -2,18 +2,21 @@ import { describe, expect, it } from "vitest";
 import type { BlockedEntry } from "@/lib/api";
 import type { ConsoleJobRow } from "@/lib/console-jobs";
 import {
+  type BoardLane,
   buildConsoleBoard,
-  boardColumnSubtitle,
-  boardStateRank,
+  boardLaneOf,
   parsePullRequest,
-  UNKNOWN_STATE,
 } from "@/lib/console-board";
 
 // STUDIO-925 — the board is a client-side regroup of rows the console already holds: a CARD is a
-// ticket (`review_run` falsy, keyed by `issue_identifier`), a COLUMN is its `tracker_state`, and a
+// ticket (`review_run` falsy, keyed by `issue_identifier`), a LANE is its run status (STUDIO-930), and a
 // review row (`review_run` true, `review_of` naming its ticket) is folded onto the card as a chip.
 
 let nextKey = 0;
+
+const cards = (board: BoardLane[]) => board.flatMap((l) => l.cards);
+const laneIssues = (board: BoardLane[], id: BoardLane["id"]) =>
+  board.find((l) => l.id === id)?.cards.map((c) => c.issue);
 
 /** One ConsoleJobRow, with only the fields a test cares about spelled out. */
 function row(over: Partial<ConsoleJobRow> & Pick<ConsoleJobRow, "issue">): ConsoleJobRow {
@@ -97,9 +100,8 @@ describe("the board regroup (STUDIO-925)", () => {
       }),
     ]);
 
-    expect(board).toHaveLength(1);
-    expect(board[0].cards).toHaveLength(1);
-    const card = board[0].cards[0];
+    expect(cards(board)).toHaveLength(1);
+    const card = cards(board)[0];
     expect(card.issue).toBe("STUDIO-924");
     expect(card.reviewers.map((r) => r.reviewer)).toEqual(["jimmy", "alice"]);
     expect(card.reviewers.map((r) => r.outcome)).toEqual(["done", "done"]);
@@ -121,64 +123,64 @@ describe("the board regroup (STUDIO-925)", () => {
       }),
     ]);
 
-    const chip = board[0].cards[0].reviewers[0];
+    const chip = cards(board)[0].reviewers[0];
     expect(chip.outcome).toBe("failed");
     expect(chip.status).toBe("blocked");
   });
 
   it("never makes a review row its own card, even when its tracker_state is null", () => {
     const board = buildConsoleBoard([
-      row({
-        issue: "STUDIO-924",
-        status: "run",
-        statusLabel: "running",
-        trackerState: "In Progress",
-      }),
+      row({ issue: "STUDIO-924", status: "run", statusLabel: "running", trackerState: "Todo" }),
       review("pr:makewhatis/booch#540@jimmy", "STUDIO-924"),
     ]);
-
-    // One card, in the ticket's own column — the review's absent tracker_state invents no column.
-    expect(board.map((c) => c.name)).toEqual(["In Progress"]);
-    expect(board.flatMap((c) => c.cards).map((c) => c.issue)).toEqual(["STUDIO-924"]);
+    expect(cards(board).map((c) => c.issue)).toEqual(["STUDIO-924"]);
   });
 
   it("drops a review row whose origin never resolved to a ticket", () => {
-    const board = buildConsoleBoard([review("pr:makewhatis/booch#540@jimmy", "")]);
-    expect(board).toEqual([]);
+    expect(cards(buildConsoleBoard([review("pr:makewhatis/booch#540@jimmy", "")]))).toEqual([]);
   });
 
-  it("keeps a ticket the daemon could not resolve in an explicit unknown column", () => {
+  it("always yields the four lanes in order, even with no cards at all", () => {
+    const withOne = buildConsoleBoard([row({ issue: "D", trackerState: "Done", status: "done" })]);
+    for (const board of [buildConsoleBoard([]), withOne]) {
+      expect(board.map((l) => l.id)).toEqual(["queued", "running", "review", "done"]);
+      expect(board.map((l) => l.name)).toEqual(["Queued", "Running", "In Review", "Done"]);
+    }
+    const empty = buildConsoleBoard([]);
+    expect(empty.every((l) => l.cards.length === 0)).toBe(true);
+    // Every lane says what its emptiness means, and every caption is fixed and non-empty.
+    expect(empty.every((l) => l.empty !== "" && l.caption !== "")).toBe(true);
+  });
+
+  it("puts a Todo ticket with a live run in Running, not a Todo lane", () => {
+    const board = buildConsoleBoard([
+      row({ issue: "STUDIO-930", trackerState: "Todo", status: "run", statusLabel: "running", live: true }),
+    ]);
+    expect(laneIssues(board, "running")).toEqual(["STUDIO-930"]);
+    expect(laneIssues(board, "queued")).toEqual([]);
+  });
+
+  it("sorts each ticket into the lane its run status names, and lets the tracker decide Done", () => {
+    const board = buildConsoleBoard([
+      row({ issue: "Q", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
+      row({ issue: "B", trackerState: "Todo", status: "blocked", statusLabel: "blocked" }),
+      row({ issue: "RV", trackerState: "Todo", status: "reviewing", statusLabel: "reviewing", live: true }),
+      row({ issue: "R", trackerState: "In Review", status: "review" }),
+      row({ issue: "D", trackerState: "Done", status: "done", statusLabel: "done" }),
+      // A terminal tracker state wins over whatever the last run's status says.
+      row({ issue: "C", trackerState: "Canceled", status: "blocked", statusLabel: "blocked" }),
+    ]);
+    expect(laneIssues(board, "queued")).toEqual(["Q", "B"]);
+    expect(laneIssues(board, "running")).toEqual(["RV"]);
+    expect(laneIssues(board, "review")).toEqual(["R"]);
+    expect(laneIssues(board, "done")).toEqual(["D", "C"]);
+  });
+
+  it("keeps a ticket with no resolved tracker state on the board", () => {
     const board = buildConsoleBoard([
       row({ issue: "LEGACY", trackerState: "", status: "queued", statusLabel: "queued" }),
     ]);
-    expect(board).toHaveLength(1);
-    expect(board[0].key).toBe(UNKNOWN_STATE);
-    expect(board[0].name).toBe("State unknown");
-  });
-
-  it("orders columns by workflow state, unknown last", () => {
-    const board = buildConsoleBoard([
-      row({ issue: "D", trackerState: "Done", status: "done", statusLabel: "done" }),
-      row({ issue: "T", trackerState: "Todo", status: "queued", statusLabel: "queued" }),
-      row({ issue: "R", trackerState: "In Review" }),
-      row({ issue: "P", trackerState: "In Progress", status: "run", statusLabel: "running" }),
-      row({ issue: "U", trackerState: "" }),
-    ]);
-    expect(board.map((c) => c.name)).toEqual([
-      "Todo",
-      "In Progress",
-      "In Review",
-      "Done",
-      "State unknown",
-    ]);
-  });
-
-  it("describes a column by its most active card, not its first", () => {
-    const board = buildConsoleBoard([
-      row({ issue: "A", trackerState: "In Progress", status: "review" }),
-      row({ issue: "B", trackerState: "In Progress", status: "run", statusLabel: "running" }),
-    ]);
-    expect(board[0].subtitle).toBe("an agent is working this in a worktree");
+    expect(laneIssues(board, "queued")).toEqual(["LEGACY"]);
   });
 
   it("attaches a blocker chip from the live snapshot's held set", () => {
@@ -196,7 +198,7 @@ describe("the board regroup (STUDIO-925)", () => {
       [row({ issue: "STUDIO-924", trackerState: "Todo", status: "blocked", statusLabel: "blocked" })],
       blocked,
     );
-    expect(board[0].cards[0].dependencies).toEqual(["STUDIO-900 · In Progress"]);
+    expect(cards(board)[0].dependencies).toEqual(["STUDIO-900 · In Progress"]);
   });
 
   it("carries assignee and provider onto the card", () => {
@@ -210,20 +212,14 @@ describe("the board regroup (STUDIO-925)", () => {
         provider: "fireworks-ai",
       }),
     ]);
-    expect(board[0].cards[0].assignee).toBe("jerry");
-    expect(board[0].cards[0].provider).toBe("fireworks-ai");
+    expect(cards(board)[0].assignee).toBe("jerry");
+    expect(cards(board)[0].provider).toBe("fireworks-ai");
   });
 });
 
-describe("board column helpers", () => {
-  it("ranks known states ahead of unknown ones", () => {
-    expect(boardStateRank("Todo")).toBeLessThan(boardStateRank("Done"));
-    expect(boardStateRank("Done")).toBeLessThan(boardStateRank("Something Else"));
-  });
-
-  it("describes each status in one line", () => {
-    expect(boardColumnSubtitle(["done", "run"])).toBe("an agent is working this in a worktree");
-    expect(boardColumnSubtitle(["done"])).toBe("merged or closed");
-    expect(boardColumnSubtitle([])).toBe("");
+describe("boardLaneOf", () => {
+  it("treats a live run as running even when the status word is stale", () => {
+    expect(boardLaneOf({ status: "queued", live: true, trackerState: "Todo" })).toBe("running");
+    expect(boardLaneOf({ status: "queued", live: false, trackerState: "Todo" })).toBe("queued");
   });
 });

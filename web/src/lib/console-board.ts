@@ -1,7 +1,7 @@
 // The board model — STUDIO-925.
 //
 // The Jobs worklist's unit of display is the RUN; the board's is the WORK ITEM. One ticket is one
-// card, its reviews are folded onto it as chips, and a column is the ticket's TRACKER STATE. The
+// card, its reviews are folded onto it as chips, and a lane is the ticket's RUN STATUS. The
 // regroup needs nothing the console does not already hold: `GET /api/v1/history/issues` serves
 // `tracker_state`, `review_run`, `review_of`, `provider` and `assignee` per row (verified against a
 // live daemon on 2026-09-18), and `mergeJobs` has already collapsed the live snapshot into one row
@@ -15,10 +15,15 @@
 // attached to the ticket they name in `review_of`. A review row whose origin did not resolve to a
 // ticket is dropped rather than carded: it is not work, and there is no card for it to belong to.
 //
-// `tracker_state` is ABSENT — not blank — when the daemon could not ask the tracker (STUDIO-702),
-// and only a review row is expected to be absent in a healthy payload. A non-review row the daemon
-// could not resolve still has to appear SOMEWHERE, so it lands in an explicit "state unknown" column
-// rather than being renamed after a Linear state the daemon never read.
+// WHY THE LANE IS RUN STATUS, NOT TRACKER STATE (STUDIO-930). STUDIO-925 columned on `tracker_state`
+// and designed a capacity rack for an "In Progress" column — but the daemon never sets In Progress.
+// It dispatches straight out of `Todo` and moves to `In Review` at the end, so a running ticket sat
+// in the Todo lane. The lifecycle the board can actually see is Queued → Running → In Review → Done:
+// the tracker decides only DONE (terminal states), and the run status decides the rest.
+//
+// THE LANE SET IS FIXED. Lanes are never built from the cards present: the board is quietest exactly
+// when the pipeline is idle or starved, and an absent lane would hide the very condition the console
+// most needs to shout about. All four always exist, empty ones included.
 import type { BlockedEntry } from "@/lib/api";
 import { runOutcomeLabel } from "@/lib/console-job-detail";
 import type { ConsoleJobRow, ConsoleJobStatus } from "@/lib/console-jobs";
@@ -93,7 +98,7 @@ export interface BoardCard {
   projectSlug: string;
   status: ConsoleJobStatus;
   statusLabel: string;
-  /** The tracker's own workflow-state name — the column this card belongs to. "" when unresolved. */
+  /** The tracker's own workflow-state name — it decides only the Done lane. "" when unresolved. */
   trackerState: string;
   assignee: string;
   provider: string;
@@ -107,76 +112,76 @@ export interface BoardCard {
   dependencies: string[];
 }
 
-/** A column is a tracker state, its cards newest-first within the incoming order. */
-export interface BoardColumn {
-  /** The tracker state's own name, or `UNKNOWN_STATE`. */
-  key: string;
+/** The four lanes, left to right — the order a ticket travels them. */
+export type BoardLaneId = "queued" | "running" | "review" | "done";
+
+/** One lane: a fixed slot in the board, its cards newest-first within the incoming order. */
+export interface BoardLane {
+  id: BoardLaneId;
   name: string;
-  /** One line saying what the column MEANS, from the status of the cards in it. */
-  subtitle: string;
+  /** One line saying what the lane MEANS. Fixed per lane, so it is true of every card in it. */
+  caption: string;
+  /** What an empty lane says about the pipeline (an empty lane is information, not absence). */
+  empty: string;
   cards: BoardCard[];
 }
 
-/**
- * The column key for a ticket the daemon could not resolve a tracker state for. A sentinel, not "",
- * so it cannot collide with a real (if bizarre) empty workflow-state name, and rendered as an
- * explicit "state unknown" column rather than being renamed after a Linear state nobody read.
- */
-export const UNKNOWN_STATE = "\u0000unknown";
-
-/** The order the console knows workflow states in; anything else sorts after, alphabetically. */
-const KNOWN_STATE_ORDER: readonly string[] = [
-  "backlog",
-  "todo",
-  "in progress",
-  "in review",
-  "done",
-  "canceled",
-  "cancelled",
+const LANES: readonly Omit<BoardLane, "cards">[] = [
+  {
+    id: "queued",
+    name: "Queued",
+    caption: "waiting for an agent, or held by a blocker",
+    empty: "Nothing is waiting for an agent.",
+  },
+  {
+    id: "running",
+    name: "Running",
+    caption: "an agent has the ticket right now",
+    empty: "No agent is running.",
+  },
+  {
+    id: "review",
+    name: "In Review",
+    caption: "finished work waiting on a reviewer",
+    empty: "Nothing is parked for review.",
+  },
+  {
+    id: "done",
+    name: "Done",
+    caption: "merged or closed",
+    empty: "Nothing has finished yet.",
+  },
 ];
 
+/** What a lane says when the filter above the board, not the pipeline, emptied it. */
+export const FILTERED_LANE_EMPTY = "No tickets here match the filter.";
+
+// Tracker states the daemon never moves a ticket out of again.
+const TERMINAL_STATES: readonly string[] = ["done", "canceled", "cancelled"];
+
 /**
- * What each status means, in one line — the column's subtitle.
- *
- * The ticket's own example is the standard: "an agent is working this in a worktree" says more than
- * "In Progress" does. A column of mixed statuses takes the most active one, so the subtitle always
- * describes the reason to look at that column rather than the average of what is in it.
+ * The lane a card belongs in. The tracker decides DONE; otherwise the run status does, so a `Todo`
+ * ticket with a live run lands in Running. A `blocked` card (a failed run, or a held dependent) is
+ * not moving and not finished: it waits in Queued, still wearing its blocked pill and blocker chip.
  */
-const SUBTITLE_BY_STATUS: Record<ConsoleJobStatus, string> = {
-  run: "an agent is working this in a worktree",
-  reviewing: "an agent is reviewing a pull request here",
-  blocked: "waiting on a blocker or a person",
-  review: "finished work waiting on a reviewer",
-  queued: "dispatched next — no agent on it yet",
-  done: "merged or closed",
-};
-
-// Most-active first: a column holding both a live run and finished work is described by the live run.
-const STATUS_PRIORITY: readonly ConsoleJobStatus[] = [
-  "run",
-  "reviewing",
-  "blocked",
-  "review",
-  "queued",
-  "done",
-];
-
-/** The column's subtitle: the meaning of the most active status among its cards. */
-export function boardColumnSubtitle(statuses: readonly ConsoleJobStatus[]): string {
-  for (const status of STATUS_PRIORITY) {
-    if (statuses.includes(status)) return SUBTITLE_BY_STATUS[status];
+export function boardLaneOf(card: Pick<BoardCard, "status" | "live" | "trackerState">): BoardLaneId {
+  if (TERMINAL_STATES.includes(card.trackerState.trim().toLowerCase())) return "done";
+  switch (card.status) {
+    case "run":
+    case "reviewing":
+      return "running";
+    case "review":
+      return "review";
+    case "done":
+      return "done";
+    default:
+      // A live run outranks a stale status word: an agent on the ticket IS running.
+      return card.live ? "running" : "queued";
   }
-  return "";
-}
-
-/** Where a column sorts: known states in workflow order, unknown states alphabetically after. */
-export function boardStateRank(state: string): number {
-  const known = KNOWN_STATE_ORDER.indexOf(state.trim().toLowerCase());
-  return known === -1 ? KNOWN_STATE_ORDER.length : known;
 }
 
 /**
- * Regroup the worklist rows into board columns.
+ * Regroup the worklist rows into the board's four lanes — always all four, in order.
  *
  * `rows` is exactly what the table renders (one per issue key, review rows included); `blocked` is
  * the live snapshot's held-dependent set, which is the only dependency edge the state payload
@@ -185,7 +190,7 @@ export function boardStateRank(state: string): number {
 export function buildConsoleBoard(
   rows: readonly ConsoleJobRow[],
   blocked: readonly BlockedEntry[] = [],
-): BoardColumn[] {
+): BoardLane[] {
   const cards: BoardCard[] = [];
   const byIssue = new Map<string, BoardCard>();
   for (const row of rows) {
@@ -240,32 +245,10 @@ export function buildConsoleBoard(
   }
   for (const card of cards) card.dependencies = heldBy.get(card.issue) ?? [];
 
-  const columns = new Map<string, BoardColumn>();
+  const lanes: BoardLane[] = LANES.map((lane) => ({ ...lane, cards: [] }));
   for (const card of cards) {
-    const state = card.trackerState;
-    const key = state === "" ? UNKNOWN_STATE : state;
-    let col = columns.get(key);
-    if (col === undefined) {
-      col = {
-        key,
-        name: state === "" ? "State unknown" : state,
-        subtitle: "",
-        cards: [],
-      };
-      columns.set(key, col);
-    }
-    col.cards.push(card);
+    const id = boardLaneOf(card);
+    lanes.find((lane) => lane.id === id)?.cards.push(card);
   }
-
-  const out = [...columns.values()];
-  for (const col of out) {
-    col.subtitle = boardColumnSubtitle(col.cards.map((c) => c.status));
-  }
-  out.sort((a, b) => {
-    const ar = a.key === UNKNOWN_STATE ? Number.MAX_SAFE_INTEGER : boardStateRank(a.name);
-    const br = b.key === UNKNOWN_STATE ? Number.MAX_SAFE_INTEGER : boardStateRank(b.name);
-    if (ar !== br) return ar - br;
-    return a.name.localeCompare(b.name);
-  });
-  return out;
+  return lanes;
 }
