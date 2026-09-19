@@ -13,6 +13,7 @@ import type { BlockedEntry } from "@/lib/api";
 import {
   buildConsoleBoard,
   FILTERED_LANE_EMPTY,
+  TRUNCATED_LANE_EMPTY,
   pullRequestLabel,
   type BoardCard,
   type BoardLane,
@@ -31,7 +32,7 @@ import {
 //
 // The Jobs table's unit of display is the RUN, so one ticket with two finished reviews reads as
 // three unrelated rows. Here the unit is the TICKET: a card per work item, its reviews folded in as
-// chips, and a column per tracker state. It is built entirely from what the table already holds —
+// chips, and a lane per run status. It is built entirely from what the table already holds —
 // `console-board.buildConsoleBoard` does the regroup, the same `useJobsFeed` feeds it, and the
 // status Seg and project Select above it narrow the cards the same way they narrow rows. No new
 // endpoint, no daemon change.
@@ -40,14 +41,14 @@ import {
 // pipeline is idle or starved, and that is the state it must not hide. Running draws its unused
 // `max_concurrent_agents` slots, so an idle slot beside a full Queued lane reads as starvation.
 //
-// READ-ONLY by design: the Done lane IS a Linear state, so dragging a card would be a tracker write —
+// READ-ONLY by design: a lane is a run status (Done is a tracker state), so dragging a card would imply a tracker write —
 // the console has no write path for it, and the rate limit hit on 2026-09-17 is why it stays out.
 export interface BoardViewProps {
   /** Every worklist row, review rows included — the board folds them onto their tickets. */
   rows: readonly ConsoleJobRow[];
   /** The live snapshot's held dependents — the board's only dependency edge. */
   blocked: readonly BlockedEntry[];
-  /** The status Seg's current value; applied to cards, so a column of filtered-out cards hides. */
+  /** The status Seg's current value; applied to cards, so a lane of filtered-out cards is empty. */
   filter: ConsoleJobFilterId;
   /** The project Select's value ("" = all projects). */
   project: string;
@@ -120,6 +121,7 @@ export function BoardView({
             lane={lane}
             filtered={filtered}
             occupied={occupied}
+            truncated={hasMore}
             maxConcurrent={maxConcurrent}
             roster={roster}
             onOpen={onOpenJob}
@@ -160,6 +162,7 @@ function LaneView({
   lane,
   filtered,
   occupied,
+  truncated,
   maxConcurrent,
   roster,
   onOpen,
@@ -167,6 +170,8 @@ function LaneView({
   lane: BoardLane;
   filtered: boolean;
   occupied: number;
+  /** The listing is one page of a longer one, so an empty lane says nothing about the pipeline. */
+  truncated: boolean;
   maxConcurrent: number;
   roster: readonly string[];
   onOpen: (issue: string) => void;
@@ -179,7 +184,9 @@ function LaneView({
     ? FILTERED_LANE_EMPTY
     : isRunning && occupied > 0
       ? "Agents are busy on reviews and other runs, shown on their tickets in other lanes."
-      : lane.empty;
+      : truncated && !(isRunning && occupied === 0)
+        ? TRUNCATED_LANE_EMPTY
+        : lane.empty;
   return (
     <section className="bcol" aria-label={lane.name} data-lane={lane.id}>
       <header className="bcolhd">

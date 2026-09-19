@@ -156,6 +156,9 @@ const LANES: readonly Omit<BoardLane, "cards">[] = [
 /** What a lane says when the filter above the board, not the pipeline, emptied it. */
 export const FILTERED_LANE_EMPTY = "No tickets here match the filter.";
 
+/** An empty lane on a truncated page: older jobs are not loaded, so it cannot claim the lane is empty. */
+export const TRUNCATED_LANE_EMPTY = "Nothing in the jobs loaded so far; older jobs are not loaded yet.";
+
 // Tracker states the daemon never moves a ticket out of again.
 const TERMINAL_STATES: readonly string[] = ["done", "canceled", "cancelled"];
 

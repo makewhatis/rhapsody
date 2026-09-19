@@ -227,6 +227,17 @@ describe("the board (STUDIO-925)", () => {
     expect(lane?.querySelector(".bempty")?.textContent).toMatch(/reviews/);
   });
 
+  it("does not claim an empty lane is empty when the listing is a truncated page", () => {
+    mount([row({ issue: "D-1", status: "done", trackerState: "Done" })], vi.fn(), { ...COUNTS, queued: 5, running: 0 }, 4, {
+      hasMore: true,
+    });
+    const queued = document.querySelector('[data-lane="queued"] .bempty');
+    expect(queued?.textContent).toMatch(/not loaded yet/);
+    expect(screen.queryByText("Nothing is waiting for an agent.")).toBeNull();
+    // The whole-store running tally is 0, so that lane may still say so.
+    expect(screen.getByText("No agent is running.")).toBeTruthy();
+  });
+
   it("says the filter emptied a lane, not the pipeline", () => {
     mount([row({ issue: "R-1", status: "run", statusLabel: "running", trackerState: "Todo" })], vi.fn(), COUNTS, 4, {
       filter: "done",
