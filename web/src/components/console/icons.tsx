@@ -50,6 +50,18 @@ export function SettingsIcon(props: Glyph) {
   );
 }
 
+/** The display-options trigger (STUDIO-932): a sliders glyph, the top-right control that opens the
+ *  popover holding View, Lane width, the card-field chips and Reset. */
+export function SlidersIcon(props: Glyph) {
+  return (
+    <Stroke {...props}>
+      <path d="M2 5h12M2 11h12" />
+      <circle cx="5.5" cy="5" r="1.7" />
+      <circle cx="10.5" cy="11" r="1.7" />
+    </Stroke>
+  );
+}
+
 /** The warn triangle a `<Note variant="warn">` leads with. */
 export function WarnIcon(props: Glyph) {
   return (

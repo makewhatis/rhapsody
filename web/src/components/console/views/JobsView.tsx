@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   Chip,
+  DisplayOptions,
   ExternalLink,
   Mate,
   NowMates,
@@ -40,8 +41,9 @@ import { useNow } from "@/hooks/useNow";
 import { useTranscript } from "@/hooks/useRunDetail";
 import { useRefresh } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview } from "@/hooks/useTeams";
-import { useJobsViewMode, type JobsViewMode } from "@/hooks/useJobsViewMode";
-import { BOARD_LANE_WIDTHS, useBoardLaneWidth, type BoardLaneWidth } from "@/hooks/useBoardLaneWidth";
+import { useJobsViewMode } from "@/hooks/useJobsViewMode";
+import { useBoardLaneWidth } from "@/hooks/useBoardLaneWidth";
+import { useBoardCardFields } from "@/hooks/useBoardCardFields";
 import { BoardView } from "./BoardView";
 
 const ALL_PROJECTS = "";
@@ -90,9 +92,12 @@ export function JobsView({
   // config reads as "no cap known" — the footer then omits the "/ N" rather than inventing one.
   const maxConcurrent = useTypedConfigQuery().data?.global?.agent.max_concurrent_agents ?? 0;
 
-  // List or board (STUDIO-925): the board is an ADDITIONAL view, remembered across visits.
+  // List or board (STUDIO-925): the board is an ADDITIONAL view, remembered across visits. The
+  // lane width and the card-field chips (STUDIO-932) live in the same display-options popover, so
+  // all three are persisted the same guarded way.
   const [view, setView] = useJobsViewMode();
   const [laneWidth, setLaneWidth] = useBoardLaneWidth();
+  const [cardFields, setCardField, resetCardFields] = useBoardCardFields();
   const [filter, setFilter] = useState<ConsoleJobFilterId>("all");
   const [project, setProject] = useState(ALL_PROJECTS);
 
@@ -120,7 +125,11 @@ export function JobsView({
   const counts = consoleStoreCounts(issueCounts.data, state.data?.blocked);
   const mates = mateStates(overview.data);
   const roster = mates.map((m) => m.name);
-  const visible = filterConsoleJobs(rows, filter, project);
+  // In Board mode the lanes ARE the status axis (STUDIO-932), so the status filter does not apply:
+  // the Seg is not rendered there, and carrying a List-mode choice into the board would silently
+  // hide cards behind a control the operator cannot see. The operator's List choice is kept.
+  const effectiveFilter: ConsoleJobFilterId = view === "board" ? "all" : filter;
+  const visible = filterConsoleJobs(rows, effectiveFilter, project);
   const projectOptions = [{ value: ALL_PROJECTS, label: "All projects" }, ...consoleJobProjects(rows)];
   // The daemon's own claim, restated verbatim: `next_offset` is non-null exactly when the store
   // filled the page it was asked for, and it is derived from the size the store ACTUALLY applied,
@@ -130,7 +139,7 @@ export function JobsView({
     loaded: rows.length,
     visible: visible.length,
     hasMore,
-    filtered: filter !== "all" || project !== ALL_PROJECTS,
+    filtered: effectiveFilter !== "all" || project !== ALL_PROJECTS,
   });
 
   return (
@@ -138,18 +147,22 @@ export function JobsView({
       <div className="head">
         <h1>Jobs</h1>
         <div className="spacer" />
-        <Seg
-          aria-label="View"
-          options={[
-            { value: "list", label: "List" },
-            { value: "board", label: "Board" },
-          ]}
-          value={view}
-          onChange={(v) => setView(v as JobsViewMode)}
-        />
         <Chip onClick={() => refresh.mutate()} disabled={refresh.isPending}>
           ↻ Refresh
         </Chip>
+        <DisplayOptions
+          view={view}
+          onView={setView}
+          laneWidth={laneWidth}
+          onLaneWidth={setLaneWidth}
+          fields={cardFields}
+          onToggleField={setCardField}
+          onReset={() => {
+            setView("list");
+            setLaneWidth("default");
+            resetCardFields();
+          }}
+        />
       </div>
 
       <NowStrip>
@@ -188,19 +201,15 @@ export function JobsView({
       </NowStrip>
 
       <div className="jfilters">
-        <Seg
-          accent
-          aria-label="Filter by status"
-          options={CONSOLE_JOB_FILTERS.map((f) => ({ value: f.id, label: f.label }))}
-          value={filter}
-          onChange={(v) => setFilter(v as ConsoleJobFilterId)}
-        />
-        {view === "board" ? (
+        {/* List mode only (STUDIO-932): in Board mode the four lanes ARE the status axis, so a
+            status Seg would be a control that undoes the board rather than narrows it. */}
+        {view === "list" ? (
           <Seg
-            aria-label="Lane width"
-            options={BOARD_LANE_WIDTHS}
-            value={laneWidth}
-            onChange={(v) => setLaneWidth(v as BoardLaneWidth)}
+            accent
+            aria-label="Filter by status"
+            options={CONSOLE_JOB_FILTERS.map((f) => ({ value: f.id, label: f.label }))}
+            value={filter}
+            onChange={(v) => setFilter(v as ConsoleJobFilterId)}
           />
         ) : null}
         <Select
@@ -215,11 +224,11 @@ export function JobsView({
         <BoardView
           rows={rows}
           blocked={state.data?.blocked ?? []}
-          filter={filter}
           project={project}
           counts={counts}
           maxConcurrent={maxConcurrent}
           laneWidth={laneWidth}
+          fields={cardFields}
           refreshedAtMs={issueRuns.dataUpdatedAt}
           nowMs={nowMs}
           roster={roster}
