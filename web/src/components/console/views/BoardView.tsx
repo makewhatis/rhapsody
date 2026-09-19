@@ -173,11 +173,18 @@ function LaneView({
 }) {
   const isRunning = lane.id === "running";
   const freeSlots = isRunning && maxConcurrent > 0 ? Math.max(0, maxConcurrent - occupied) : 0;
+  // A held seat with no card in this lane is a live review (folded onto its ticket in In Review) or
+  // an unattributed run; "No agent is running." would contradict the `n / max` beside it.
+  const emptyLine = filtered
+    ? FILTERED_LANE_EMPTY
+    : isRunning && occupied > 0
+      ? "Agents are busy on reviews and other runs, shown on their tickets in other lanes."
+      : lane.empty;
   return (
     <section className="bcol" aria-label={lane.name} data-lane={lane.id}>
       <header className="bcolhd">
         <span className="bname">{lane.name}</span>
-        <span className="bcount">
+        <span className="bcount" title={isRunning && maxConcurrent > 0 ? "Whole pool, all projects" : undefined}>
           {isRunning && maxConcurrent > 0 ? `${occupied} / ${maxConcurrent}` : lane.cards.length}
         </span>
         <span className="bsub">{lane.caption}</span>
@@ -187,7 +194,7 @@ function LaneView({
           <BoardCardView key={card.key} card={card} roster={roster} onOpen={onOpen} />
         ))}
         {lane.cards.length === 0 ? (
-          <div className="bempty">{filtered ? FILTERED_LANE_EMPTY : lane.empty}</div>
+          <div className="bempty">{emptyLine}</div>
         ) : null}
         {Array.from({ length: freeSlots }, (_, i) => (
           <div className="bslot" key={`slot-${i}`}>

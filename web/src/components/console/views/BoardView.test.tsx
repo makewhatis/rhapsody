@@ -207,11 +207,24 @@ describe("the board (STUDIO-925)", () => {
   });
 
   it("renders all four lanes with zero cards, each saying what its emptiness means", () => {
-    mount([]);
+    mount([], vi.fn(), { ...COUNTS, running: 0 });
     expect(document.querySelectorAll(".bcol")).toHaveLength(4);
     expect(document.querySelectorAll(".bcard")).toHaveLength(0);
     expect(screen.getByText("Nothing is waiting for an agent.")).toBeTruthy();
     expect(screen.getByText("No agent is running.")).toBeTruthy();
+  });
+
+  it("does not claim the pool is idle while a live review holds a seat with no Running card", () => {
+    const rows = [
+      row({ issue: "R-1", status: "review", trackerState: "In Review" }),
+      review("R-1#5@jimmy", "R-1", { status: "reviewing", statusLabel: "reviewing", live: true }),
+    ];
+    mount(rows, vi.fn(), { ...COUNTS, running: 1 });
+    const lane = document.querySelector('[data-lane="running"]');
+    expect(lane?.querySelector(".bcount")?.textContent).toBe("1 / 4");
+    expect(lane?.querySelectorAll(".bslot")).toHaveLength(3);
+    expect(screen.queryByText("No agent is running.")).toBeNull();
+    expect(lane?.querySelector(".bempty")?.textContent).toMatch(/reviews/);
   });
 
   it("says the filter emptied a lane, not the pipeline", () => {
