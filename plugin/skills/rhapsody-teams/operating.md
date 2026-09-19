@@ -110,15 +110,63 @@ Only relevant if you are cutting Rhapsody releases; skip it if you are just runn
 **A tag push triggers nothing.** `release.yml` fires on `push: branches: [main]` and on
 `workflow_dispatch` — there is no `push: tags:` trigger.
 
-**Release candidates** are manual, two steps:
+**Release candidates** are manual, two steps. The **version** comes from release-please's open
+release pull request title — `chore(main): release 0.3.6` names the base `0.3.6` — and the **RC
+ordinal** from the tags already cut for that base:
 
 ```
-gh release create v0.3.5-rc.1 --prerelease --target <FULL 40-char sha> --title … --notes …
-gh workflow run release.yml -f tag=v0.3.5-rc.1
+git fetch --tags && git tag -l --sort=v:refname "v0.3.6*"
+```
+
+Empty output means `-rc.1`; a list whose last line is `v0.3.6-rc.1` means the next is `-rc.2`.
+`gh release create` cuts the tag on the **remote**, so a local list is stale until you fetch — read
+it straight from the remote instead with `git ls-remote --tags origin "v0.3.6*"` if you prefer — and
+`--sort=v:refname` is what makes "the last line is the highest" true past `-rc.9`. Thirty seconds
+that stops you colliding with or skipping an ordinal.
+
+```
+gh release create v0.3.6-rc.2 --prerelease --target <FULL 40-char sha> --title … --notes …
+gh workflow run release.yml -f tag=v0.3.6-rc.2
 ```
 
 `--target` needs the **full** sha; a short one is rejected as an invalid `target_commitish`.
 Verify CI is green on that commit *before* tagging.
+
+⚠️ **A notarize failure after Apple accepts is a retry, not a signing problem.** Apple's
+`notarytool 1.1.2` intermittently stack-overflows — a SIGBUS inside CoreFoundation string
+formatting — in `submit --wait`, hitting roughly 2 of 8 builds on 2026-09-19. The submission itself
+has already succeeded: Apple has accepted the upload by the time the wait crashes. So a red build
+job does **not** mean notarization failed, and the remedy is to re-run, never to hunt through
+certificates and entitlements for a signing chain that is not broken.
+
+Retry the **same way the run started**, or you can silently skip a cask bump:
+
+- **An RC (dispatched)** — re-dispatch: `gh workflow run release.yml -f tag=v0.3.6-rc.2`. That is
+  how the build ran in the first place, and `homebrew-bump-rc` fires on `workflow_dispatch`.
+- **A stable promotion (the release-please merge on `main`)** — re-run the failed jobs of the
+  original run: `gh run rerun <run-id> --failed`. Do **not** dispatch: `homebrew-bump` is gated on
+  `release_created`, which is `false` on `workflow_dispatch`, so a dispatched run goes green and
+  leaves the stable cask on the old version — the `brew upgrade` "no updates" failure, reached a
+  new way.
+
+**`releases/latest` is the in-app updater's channel, and it is stable-only.** The updater polls
+`releases/latest/download/latest.json`, and GitHub never points `latest` at a release flagged
+`prerelease` — so `gh release create --prerelease` is what keeps every installed stable app from
+being offered an RC. Check it after cutting one:
+
+```
+gh release view --repo makewhatis/rhapsody --json tagName,isPrerelease
+```
+
+It must still name the last **stable** tag. On 2026-09-19, immediately after `v0.3.6-rc.1` was
+published, it read `v0.3.5` — the correct outcome.
+
+**There are two Homebrew casks.** `rhapsody` tracks stable releases and `rhapsody@rc` tracks
+prereleases, so a tester installs an RC through `rhapsody@rc`. The release workflow bumps them
+independently — `homebrew-bump` on a real release, `homebrew-bump-rc` on a dispatch of a prerelease
+tag — so a run that skips the `@rc` bump is *not* a failure when the build was a stable release, and
+a run that skips the stable bump is not a failure for an RC. Both install the same
+`/Applications/Rhapsody.app`, so at most one is installed at a time.
 
 **Promotion** is merging release-please's pull request: one run then cuts the tag, the GitHub
 Release, the CHANGELOG, the signed + notarized dmg and the Homebrew cask bump.
