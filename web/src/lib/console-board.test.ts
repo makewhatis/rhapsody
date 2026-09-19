@@ -3,8 +3,10 @@ import type { BlockedEntry } from "@/lib/api";
 import type { ConsoleJobRow } from "@/lib/console-jobs";
 import {
   type BoardLane,
+  boardLaneTally,
   buildConsoleBoard,
   boardLaneOf,
+  mergeIssueRows,
   parsePullRequest,
 } from "@/lib/console-board";
 
@@ -221,5 +223,55 @@ describe("boardLaneOf", () => {
   it("treats a live run as running even when the status word is stale", () => {
     expect(boardLaneOf({ status: "queued", live: true, trackerState: "Todo" })).toBe("running");
     expect(boardLaneOf({ status: "queued", live: false, trackerState: "Todo" })).toBe("queued");
+  });
+});
+
+// STUDIO-931 — the board must not bucket a 50-row recency page. These are the two model pieces that
+// make the fix: the tally that a lane reports, and the merge that lets the non-terminal fetch reach
+// the board without widening the table.
+describe("the board's whole-store lane counts (STUDIO-931)", () => {
+  const counts = { running: 2, review: 3, queued: 1, blocked: 4 };
+
+  it("reads each non-terminal lane's total from the tally, blocked folded into Queued", () => {
+    expect(boardLaneTally("running", counts)).toBe(2);
+    expect(boardLaneTally("review", counts)).toBe(3);
+    // A blocked card waits in Queued, so the lane's total is both buckets together.
+    expect(boardLaneTally("queued", counts)).toBe(5);
+  });
+
+  it("leaves Done uncounted, because its terminal set stays paged", () => {
+    expect(boardLaneTally("done", counts)).toBeUndefined();
+  });
+});
+
+describe("mergeIssueRows (STUDIO-931)", () => {
+  const at = (id: number, issue: string) => ({ id, issue_identifier: issue });
+
+  it("adds a fetched non-terminal row the page did not hold", () => {
+    const merged = mergeIssueRows([at(1, "DONE-1")], [at(9, "STUDIO-877")]);
+    expect(merged.map((r) => r.issue_identifier)).toEqual(["DONE-1", "STUDIO-877"]);
+  });
+
+  it("keeps the page's row when both hold the same issue — it is the fresher read", () => {
+    const merged = mergeIssueRows([at(1, "STUDIO-877")], [at(9, "STUDIO-877")]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe(1);
+  });
+
+  it("keeps unattributed runs individual rather than collapsing them", () => {
+    const merged = mergeIssueRows([at(1, "")], [at(2, "")]);
+    expect(merged).toHaveLength(2);
+  });
+
+  // The acceptance fixture at the model layer: the page is 50/50 completed — the shape of the
+  // operator's own daemon — so a stuck non-terminal ticket the active fetch hands over is one row
+  // the page could never have carried. `JobsView.test.tsx` drives the same fixture through the view.
+  it("carries a non-terminal issue well outside the most recent 50 rows", () => {
+    const page = Array.from({ length: 50 }, (_, i) => at(100 + i, `DONE-${i}`));
+    const stuck = at(9, "STUDIO-877");
+    const merged = mergeIssueRows(page, [stuck]);
+    expect(merged).toHaveLength(51);
+    expect(merged[merged.length - 1].issue_identifier).toBe("STUDIO-877");
+    expect(boardLaneOf({ status: "queued", live: false, trackerState: "Backlog" })).toBe("queued");
   });
 });

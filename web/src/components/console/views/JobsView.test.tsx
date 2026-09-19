@@ -1846,4 +1846,59 @@ describe("the board view (STUDIO-925)", () => {
     expect(document.querySelector(".bfoot .bnote")?.textContent).toContain("Older jobs");
     expect(screen.getByRole("button", { name: /load more/i })).toBeTruthy();
   });
+
+  // STUDIO-931, end to end: the board must not bucket a 50-row recency page. Sixty done tickets
+  // dominate recency, so STUDIO-877 — open, Backlog, last run stopped, exactly the shape of the
+  // ticket that filed this — sits at row 61 and cannot be on the page. A page-only board reads its
+  // lane as `0`; the per-outcome active fetch puts the card in Queued where it belongs.
+  it("cards a stuck non-terminal ticket that sits well outside the recency page", async () => {
+    const done = Array.from({ length: 60 }, (_, i) =>
+      run({
+        issue_identifier: `DONE-${i}`,
+        outcome: "completed",
+        lifecycle: "done",
+        tracker_state: "Done",
+      }),
+    );
+    const stuck = run({
+      issue_identifier: "STUDIO-877",
+      outcome: "stopped",
+      lifecycle: "open",
+      tracker_state: "Backlog",
+    });
+    const store = [...done, stuck];
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    // Honor the filter, unlike `serveStore`: this test exists to prove the board asks for the
+    // non-terminal OUTCOMES rather than widening the page. A mock that ignored the filter would
+    // pass whether or not the fix was there.
+    h.fetchIssueRuns.mockImplementation(async (f: HistoryFilter = {}) => {
+      const matched = f.outcome ? store.filter((r) => r.outcome === f.outcome) : store;
+      const limit = f.limit ?? JOBS_PAGE_SIZE;
+      const page = matched.slice(0, limit);
+      return { issues: page, next_offset: page.length === limit ? limit : null };
+    });
+    h.fetchIssueCounts.mockImplementation(async () => tallyOf(store, await h.fetchState()));
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+
+    mount();
+    // The page holds the newest 50 and STUDIO-877 is not one of them.
+    await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
+    expect(rowKeys()).not.toContain("STUDIO-877");
+
+    fireEvent.click(boardButton());
+    // The header's tally — the source the board now reports — already knows the ticket is queued,
+    // and the active fetch then puts its CARD in the lane rather than merely counting it.
+    await waitFor(() =>
+      expect(document.querySelector('[data-lane="queued"] .bcount')?.textContent).toBe("1"),
+    );
+    await waitFor(() =>
+      expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-877"),
+    );
+  });
 });

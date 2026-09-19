@@ -159,6 +159,88 @@ export const FILTERED_LANE_EMPTY = "No tickets here match the filter.";
 /** An empty lane on a truncated page: older jobs are not loaded, so it cannot claim the lane is empty. */
 export const TRUNCATED_LANE_EMPTY = "Nothing in the jobs loaded so far; older jobs are not loaded yet.";
 
+/**
+ * The run outcomes the board's non-terminal lanes fetch — the ones that can only ever be
+ * non-terminal, so an unbounded query over them is bounded by the pipeline rather than by history
+ * (STUDIO-931).
+ *
+ * WHY THE BOARD CANNOT BUCKET A PAGE. The board used to regroup the same 50-row recency listing the
+ * table holds, and completed work dominates recent activity, so a non-terminal ticket aged off the
+ * page the longer it sat: on the operator's own daemon STUDIO-877 (open, `stopped`) sat at row 153
+ * and its Queued lane read `0` while the header, counting the whole store, read `1`. The lane was
+ * least informative about exactly the ticket that had waited longest.
+ *
+ * WHY `completed` IS ABSENT, though it is the outcome an In-Review ticket's last run carries. It is
+ * ALSO the outcome a Done ticket's last run carries (`completed` is the terminal hand-off), and the
+ * only server-side fact that tells the two apart is the ticket's lifecycle — which is a post-query
+ * decoration, not a filter (trap 1 on the ticket). Fetching every `completed` row unbounded would
+ * pull the whole 371-ticket Done set to find the handful in review, which is the opposite of this
+ * fix. So In Review takes its COUNT from the whole-store tally (see `boardLaneTally`) and its cards
+ * from the loaded page, and the lane reports a number it can stand behind either way.
+ */
+export const BOARD_ACTIVE_OUTCOMES = [
+  "running",
+  "continued",
+  "stopped",
+  "failed",
+  "interrupted",
+] as const;
+
+/**
+ * The page the board's active fetch asks for. Not a recency window: non-terminal work is bounded by
+ * the pipeline, not by history, so a page this wide is complete in practice. It is a ceiling rather
+ * than a promise of unboundedness, and the lane reports its TALLY rather than its card count, so a
+ * store that ever exceeded it would read as a lane count with fewer cards — never as a lie.
+ */
+export const BOARD_ACTIVE_LIMIT = 1000;
+
+/**
+ * A lane's whole-store total, from the daemon's per-status tally. `undefined` for the Done lane,
+ * whose terminal set is deliberately paged rather than counted, and for a board with no tally yet —
+ * the callers render the card count in its place.
+ *
+ * The tally is the SAME source the Now strip paints, which is what stops the board contradicting
+ * the header on one screen. A `blocked` card waits in Queued (see [`boardLaneOf`]), so that lane's
+ * total is both buckets together.
+ */
+export function boardLaneTally(
+  laneId: BoardLaneId,
+  counts: { running: number; review: number; queued: number; blocked: number },
+): number | undefined {
+  switch (laneId) {
+    case "running":
+      return counts.running;
+    case "review":
+      return counts.review;
+    case "queued":
+      return counts.queued + counts.blocked;
+    case "done":
+      return undefined;
+  }
+}
+
+/**
+ * The board's issue rows: the paged listing plus the unbounded non-terminal fetch, one row per
+ * issue. The PAGE wins a collision because it is the fresher read — it polls on the live cadence
+ * while the active fetch rides the tracker's own, slower one.
+ */
+export function mergeIssueRows<T extends { issue_identifier: string; id: number }>(
+  page: readonly T[],
+  active: readonly T[],
+): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const r of [...page, ...active]) {
+    // The same partition key `Store::list_issue_runs` uses: an unattributed run has no ticket to
+    // group under, so it stays individual rather than collapsing into one row.
+    const key = r.issue_identifier === "" ? `run:${r.id}` : r.issue_identifier;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
 // Tracker states the daemon never moves a ticket out of again.
 const TERMINAL_STATES: readonly string[] = ["done", "canceled", "cancelled"];
 
