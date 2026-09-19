@@ -177,18 +177,27 @@ submit_or_resume() {
   rc=0
   # --output-format json: the id is read from machine-readable output, never scraped off the human
   # progress line (which is exactly the kind of thing a notarytool update breaks).
-  out="$(xcrun notarytool submit "$file" "${auth_args[@]}" --output-format json 2>&1)" || rc=$?
+  # stdout only feeds jq: notarytool writes warnings and progress to stderr, and one such line on a
+  # successful submit would make the JSON unparseable and lose the id. stderr goes to a side file
+  # that is shown only when something fails.
+  errf="$(mktemp "${TMPDIR:-/tmp}/notarize-submit.XXXXXX")" || { echo "notarize: cannot create a scratch file" >&2; return 1; }
+  out="$(xcrun notarytool submit "$file" "${auth_args[@]}" --output-format json 2>"$errf")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "notarize: submission failed — notarytool submit exited $rc" >&2
     printf '%s\n' "$out" >&2
+    cat "$errf" >&2
+    rm -f "$errf"
     return 1
   fi
   SUBMISSION_ID="$(printf '%s' "$out" | jq -re '.id // empty' 2>/dev/null)" || SUBMISSION_ID=""
   if [ -z "$SUBMISSION_ID" ]; then
     echo "notarize: notarytool reported success but returned no submission id — refusing to poll blindly" >&2
     printf '%s\n' "$out" >&2
+    cat "$errf" >&2
+    rm -f "$errf"
     return 1
   fi
+  rm -f "$errf"
   echo "notarize: submission id $SUBMISSION_ID"
 
   if ! printf '%s %s\n' "$digest" "$SUBMISSION_ID" > "$STATE_FILE" 2>/dev/null; then
@@ -205,13 +214,15 @@ submit_or_resume() {
 #   3  timed out while still In Progress
 #   4  timed out without ever reading a status (every poll failed)
 poll_until_done() {
-  local id="$1" start now elapsed=0 rc out status attempts=0 reads=0 last="unknown"
+  local id="$1" start now elapsed=0 rc out status attempts=0 reads=0 last="unknown" errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/notarize-info.XXXXXX")" || { echo "notarize: cannot create a scratch file" >&2; return 1; }
+  trap 'rm -f "${errf:-}"' RETURN
   start="$(date +%s)"
   echo "notarize: waiting for Apple — polling every ${NOTARY_POLL_INTERVAL}s, up to ${NOTARY_POLL_TIMEOUT}s (submission $id)"
   while :; do
     attempts=$((attempts + 1))
     rc=0
-    out="$(xcrun notarytool info "$id" "${auth_args[@]}" --output-format json 2>&1)" || rc=$?
+    out="$(xcrun notarytool info "$id" "${auth_args[@]}" --output-format json 2>"$errf")" || rc=$?
     status=""
     if [ "$rc" -eq 0 ]; then
       status="$(printf '%s' "$out" | jq -re '.status // empty' 2>/dev/null)" || status=""
@@ -224,6 +235,7 @@ poll_until_done() {
       # by our crash (that is the whole STUDIO-877 lesson), so retry until the deadline.
       echo "notarize: poll failed (attempt $attempts, notarytool info exited $rc) — the submission is unaffected, retrying" >&2
       printf '%s\n' "$out" >&2
+      cat "$errf" >&2
     else
       reads=$((reads + 1))
       last="$status"

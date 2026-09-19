@@ -78,6 +78,7 @@ case "$tool" in
     sub="${1:-}"; shift || true
     case "$sub" in
       submit)
+        cat "$dir/stderr_noise" >&2 2>/dev/null || true
         cat "$dir/submit_out" 2>/dev/null || true
         exit "$(cat "$dir/submit_rc" 2>/dev/null || echo 0)"
         ;;
@@ -93,6 +94,7 @@ case "$tool" in
           echo "fake notarytool: Bus error: 10" >&2
           exit 138
         fi
+        cat "$dir/stderr_noise" >&2 2>/dev/null || true
         printf '{"id":"%s","status":"%s"}\n' "$FAKE_ID" "$line"
         ;;
       log)
@@ -299,6 +301,15 @@ else
   echo "FAIL app bundle: expected a state file at $app.notary-id" >&2
   FAILS=$((FAILS + 1))
 fi
+
+# --- 12b. stderr noise on a SUCCESSFUL submit/info must not corrupt the JSON ------------------------
+fake_reset stderrnoise Accepted
+printf 'notarytool: warning: something on stderr\n' > "$FAKE_XCRUN_DIR/stderr_noise"
+dmg=$(new_dmg noise.dmg "dmg-noise")
+run_notarize "$dmg"; out="$OUT"
+check_eq "stderr noise: rc" "0" "$RC"
+check_contains "stderr noise: id still read" "$out" "submission id $FAKE_ID"
+check_contains "stderr noise: id recorded" "$(cat "$dmg.notary-id" 2>/dev/null)" "$FAKE_ID"
 
 # --- 13. Unconfigured credentials still short-circuit before any xcrun call --------------------
 fake_reset unconfigured Accepted
