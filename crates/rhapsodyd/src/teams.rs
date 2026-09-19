@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use chrono::SecondsFormat;
 use rhapsody_config::profiles::{self, BodyOrigin, Origin, ResolvedProfile};
 use rhapsody_config::room::{Cursor, LocalRoom, Message};
-use rhapsody_config::teams::Teams;
+use rhapsody_config::teams::{Review, Teams};
 use rhapsody_config::{Config, workflow};
 
 use crate::bootcfg::{resolve_profiles_dir, resolve_room_dir, resolve_teams_path};
@@ -91,11 +91,17 @@ where
 /// Resolves the paths the verbs work against, then dispatches. Factored out of
 /// [`run_teams`] so the verbs are unit-testable without hijacking stdout.
 fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<String, String> {
-    let (teams_path, profiles_dir, room_dir) = resolve_paths(getenv)?;
+    // Loaded once and shared: the paths and, for `show`, the configured backend an inheriting
+    // profile falls back to (STUDIO-903). `resolve_paths` errors when there is no runtime home,
+    // which is also the only case where the backend is unavailable — so a successful resolve
+    // always carries one.
+    let cfg = load_config(getenv);
+    let (teams_path, profiles_dir, room_dir) = resolve_paths(cfg.as_ref())?;
+    let backend = cfg.as_ref().map_or("", |c| c.agent.backend.as_str());
     let verb = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or(&[]);
     match verb {
-        "show" => show(rest, &teams_path, &profiles_dir, &room_dir),
+        "show" => show(rest, &teams_path, &profiles_dir, &room_dir, backend),
         "fork" => fork(rest, &profiles_dir),
         "" => Err("usage: rhapsodyd teams <show|fork> <name>".to_string()),
         other => Err(format!(
@@ -114,13 +120,12 @@ fn teams_command(args: &[String], getenv: &dyn Fn(&str) -> String) -> Result<Str
 /// `teams fork` quietly creating directories in whatever directory the operator
 /// happened to be standing in, which is exactly the kind of surprise write §4's
 /// read-only posture exists to avoid.
-fn resolve_paths(getenv: &dyn Fn(&str) -> String) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    let cfg = load_config(getenv);
+fn resolve_paths(cfg: Option<&Config>) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     // All three anchor to the same runtime home, so they resolve or fail together.
     match (
-        resolve_teams_path(cfg.as_ref(), "", false),
-        resolve_profiles_dir(cfg.as_ref(), "", false),
-        resolve_room_dir(cfg.as_ref(), "", false),
+        resolve_teams_path(cfg, "", false),
+        resolve_profiles_dir(cfg, "", false),
+        resolve_room_dir(cfg, "", false),
     ) {
         (Some(teams), Some(profiles), Some(room)) => Ok((teams, profiles, room)),
         _ => Err(
@@ -158,11 +163,22 @@ fn show(
     teams_path: &Path,
     profiles_dir: &Path,
     room_dir: &Path,
+    backend: &str,
 ) -> Result<String, String> {
     let (name, room_tail) = parse_show_args(args)?;
     // Best-effort: a broken teams.yaml must not stop an operator inspecting a
     // profile, so `show` falls back to treating the arg as a profile name.
-    let teams = Teams::load(teams_path);
+    //
+    // `try_load` rather than `load` since STUDIO-891, for the REASON and not for
+    // the value: a rejected config degrades to the off state and the daemon
+    // still exits 0, so the only evidence an operator gets is an absence — a
+    // roster that silently does not resolve. This command needs no daemon and no
+    // log access, which makes it the right place to say what was refused. The
+    // `Err` arm still yields the off state, so the fallback above is unchanged.
+    let (teams, rejected) = match Teams::try_load(teams_path) {
+        Ok(t) => (t, String::new()),
+        Err(e) => (Teams::disabled(), e.to_string()),
+    };
     let identity = teams.roster.iter().find(|i| i.name == name);
     let profile_name = match identity {
         Some(i) if i.profile.is_empty() => {
@@ -186,11 +202,41 @@ fn show(
     } else {
         String::new()
     };
+    // `review.model`/`review.effort` are only ever consulted on the ticketless path
+    // (STUDIO-901; `Teams::review_ticketless`) — on any other install (including the default,
+    // `mode: off`) `dispatch_issue` never reaches the block that reads them, so a set value is
+    // dead config. `None` here is what makes `render_show` suppress the two lines entirely rather
+    // than asserting an override that install cannot honour, so a Teams-off `show` (no
+    // `teams.yaml` at all) prints no line this addition did not exist to add (the alignment fix
+    // widened every label's gutter by one, so it is not byte-identical to pre-STUDIO-901 output).
+    let review = teams.review_ticketless().then_some(&teams.review);
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
         &resolved,
+        review,
         &room,
+        backend,
+        &render_rejection_for(teams_path, &rejected),
     ))
+}
+
+/// The banner a rejected `teams.yaml` gets, above everything else `show` prints
+/// so it cannot scroll off the top of a long prompt.
+///
+/// It states three things in the order an operator needs them: that the file was
+/// refused, what the daemon is therefore doing (Teams OFF — the consequence, and
+/// the half that explains an idle board), and the daemon's own reason quoted
+/// VERBATIM. Verbatim matters: a second wording here would be a second place for
+/// the rule to be explained, free to drift from the one that actually decides
+/// whether the file loads.
+fn render_rejection_for(path: &Path, reason: &str) -> String {
+    if reason.is_empty() {
+        return String::new();
+    }
+    format!(
+        "!!! {} was REJECTED; Teams is OFF for this daemon !!!\n    {reason}\n\n",
+        path.display()
+    )
 }
 
 /// `show`'s arguments: one positional name plus the optional `--room N`.
@@ -312,15 +358,26 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// resolved prompt is unbounded prose, and a glance an operator has to scroll a
 /// screenful of it to reach is not a glance. It is empty whenever Teams is off
 /// or `--room 0` was passed, and then this renders exactly what it always did.
-fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str) -> String {
+fn render_show(
+    identity: Option<&str>,
+    r: &ResolvedProfile,
+    review: Option<&Review>,
+    room: &str,
+    backend: &str,
+    rejection: &str,
+) -> String {
     let mut out = String::new();
+    // First, so it is the line an operator reads before anything else. Empty on
+    // every accepted config, which keeps an ordinary `show` byte-identical to
+    // what it printed before this existed (STUDIO-670's property).
+    out.push_str(rejection);
     if let Some(i) = identity {
-        out.push_str(&format!("identity:     {i}\n"));
+        out.push_str(&format!("identity:      {i}\n"));
     }
-    out.push_str(&format!("profile:      {}\n", r.name));
+    out.push_str(&format!("profile:       {}\n", r.name));
     match &r.provenance.base {
         Some(b) => out.push_str(&format!(
-            "base:         {}@{} ({})\n",
+            "base:          {}@{} ({})\n",
             b.name,
             b.version,
             if b.pinned {
@@ -329,39 +386,86 @@ fn render_show(identity: Option<&str>, r: &ResolvedProfile, room: &str) -> Strin
                 "tracking latest"
             }
         )),
-        None => out.push_str("base:         none (fork — this file is the whole profile)\n"),
+        None => out.push_str("base:          none (fork — this file is the whole profile)\n"),
     }
     match &r.provenance.overlay {
-        Some(p) => out.push_str(&format!("overlay:      {}\n", p.display())),
-        None => out.push_str("overlay:      none (the built-in, unmodified)\n"),
+        Some(p) => out.push_str(&format!("overlay:       {}\n", p.display())),
+        None => out.push_str("overlay:       none (the built-in, unmodified)\n"),
     }
     if let Some(d) = &r.provenance.drift {
         out.push_str(&format!(
-            "drift:        pinned to {}@{}; the built-in is now {}@{} (reported, never merged)\n",
+            "drift:         pinned to {}@{}; the built-in is now {}@{} (reported, never merged)\n",
             d.name, d.pinned, d.name, d.latest
         ));
     }
+    // ABOVE `model`, decided by the ticket: this is the line that selects the binary, so it is the
+    // most load-bearing of the resolved fields — an operator reads it before the model question,
+    // which is scoped inside whichever CLI wins (STUDIO-903).
     out.push_str(&format!(
-        "model:        {}\n",
+        "harness:       {}\n",
+        harness_field(&r.harness, r.provenance.harness, backend)
+    ));
+    out.push_str(&format!(
+        "model:         {}\n",
         field(&r.model, r.provenance.model)
     ));
     out.push_str(&format!(
-        "effort:       {}\n",
+        "effort:        {}\n",
         field(&r.effort, r.provenance.effort)
     ));
+    // What an operator actually needs answered (STUDIO-901, ticket §4): "what model REVIEWS this
+    // identity's pull requests" is a different question from "what model does this identity run
+    // with", because `review.model`/`review.effort` (when set) win over the profile above for a
+    // REVIEW run specifically — and are otherwise invisible, since they are not part of this
+    // identity's own profile at all.
+    //
+    // `None` (Teams off, or `review.mode` anything but `ticketless`) suppresses BOTH lines rather
+    // than printing them with a claim that cannot come true (jimmy/alice round 1 on PR #168):
+    // `dispatch_issue` only ever applies `review.model`/`review.effort` to a run
+    // `dispatch_review` staged, and only the ticketless path stages one. `show` on any other
+    // install prints exactly the lines it printed before this ticket — not a column-for-column
+    // match, since the round-1 alignment fix widened every label's gutter by one (jimmy round 2).
+    if let Some(review) = review {
+        // The harness a review of THIS identity actually runs on (STUDIO-908): `review.model` is
+        // scoped by harness, so the useful answer is this identity's own entry, not the raw map.
+        // `backend` is also the fallback the legacy bare-scalar spelling resolves against.
+        let review_harness = resolved_harness(&r.harness, backend);
+        out.push_str(&format!(
+            "review model:  {}\n",
+            review_field(
+                "model",
+                &review.model,
+                &review_harness,
+                backend,
+                &r.model,
+                r.provenance.model
+            )
+        ));
+        out.push_str(&format!(
+            "review effort: {}\n",
+            review_field(
+                "effort",
+                &review.effort,
+                &review_harness,
+                backend,
+                &r.effort,
+                r.provenance.effort
+            )
+        ));
+    }
     out.push_str(&format!(
-        "capabilities: {}\n",
+        "capabilities:  {}\n",
         list_field(&r.capabilities, r.provenance.capabilities)
     ));
     out.push_str(&format!(
-        "tools:        {} (parsed, unused in this slice)\n",
+        "tools:         {} (parsed, unused in this slice)\n",
         list_field(&r.tools, r.provenance.tools)
     ));
     // A fork has no base, so a `{{ base }}` token in one splices nothing. Say
     // that, rather than claiming a splice the `base: none` line contradicts.
     let has_base = r.provenance.base.is_some();
     out.push_str(&format!(
-        "body:         {}\n",
+        "body:          {}\n",
         match r.provenance.body {
             BodyOrigin::Base => "from the base (the overlay body is empty)",
             BodyOrigin::Overlay => "from the overlay (replaces the base wholesale)",
@@ -391,6 +495,130 @@ fn field(value: &str, o: Origin) -> String {
         origin_tag(o).to_string()
     } else {
         format!("{value} {}", origin_tag(o))
+    }
+}
+
+/// The `harness:` line (STUDIO-903): the CLI this teammate's runs actually use, rendered like
+/// every sibling field with its origin.
+///
+/// ⚠️ The RESOLVED value, never the raw front-matter field. An empty `harness` is the common case
+/// and means "inherit `agent.backend`", so the useful fact is that backend's own value — `backend`
+/// is the resolved `agent.backend` from the same workflow the daemon would boot, and naming it is
+/// what turns the line from a restatement into an answer.
+///
+/// A harness this build cannot run is MARKED, because the dispatcher silently falls back to
+/// `agent.backend` for it (`spawn_worker`, STUDIO-902): plain `harness: codex [overlay]` would
+/// claim a CLI that never runs, which is the misleading report decision 2 of this ticket exists to
+/// avoid. The mark is only ever appended — `<value> [origin]` stays byte-identical for the
+/// implemented harnesses that are the overwhelmingly common case, so a mark means something.
+///
+/// The empty-`harness` branch is deliberately UNMARKED, including when `agent.backend` itself
+/// names a harness this build cannot run: the mark's justification is `spawn_worker`'s silent
+/// fallback,
+/// and there is none here — `runner_for_backend` rejecting the backend makes `build_effective`
+/// fail and the daemon refuses to boot, and `validate` rejects an unknown name outright, so both
+/// are loud and a second report would only be noisier.
+fn harness_field(profile_value: &str, origin: Origin, backend: &str) -> String {
+    if profile_value.is_empty() {
+        return format!("{backend} [unset — inherits agent.backend]");
+    }
+    match harness_note(profile_value, backend) {
+        Some(note) => format!("{profile_value} {} ({note})", origin_tag(origin)),
+        None => format!("{profile_value} {}", origin_tag(origin)),
+    }
+}
+
+/// The parenthetical [`harness_field`] appends when the resolved harness is not one this build can
+/// run, or `None` when it is. `backend` is what dispatch falls back to.
+///
+/// Recognized-but-unimplemented (`codex`) and a name no registry knows are told apart: the first
+/// is a build limitation, the second a typo, and the operator's next move differs.
+fn harness_note(harness: &str, backend: &str) -> Option<String> {
+    if rhapsody_orchestrator::effective::harness_is_implemented(harness) {
+        return None;
+    }
+    if rhapsody_config::HARNESS_NAMES.contains(&harness) {
+        Some(format!(
+            "recognized harness, but this build has no runner for it; runs on {backend}"
+        ))
+    } else {
+        Some(format!("not a recognized harness; runs on {backend}"))
+    }
+}
+
+/// The harness an identity's runs actually use, for [`harness_field`]'s reason and by the same
+/// rule: the profile's resolved `harness` when this build implements it, else the configured
+/// `agent.backend` (the value dispatch falls back to). Shared with the review-scoped lines so
+/// `show` explains the review model against the harness the run really is on (STUDIO-908).
+fn resolved_harness(profile_value: &str, backend: &str) -> String {
+    if !profile_value.is_empty()
+        && rhapsody_orchestrator::effective::harness_is_implemented(profile_value)
+    {
+        profile_value.to_string()
+    } else {
+        backend.to_string()
+    }
+}
+
+/// The `review model:`/`review effort:` line (STUDIO-901, scoped by harness in STUDIO-908):
+/// `teams.review.<name>.<harness>` when the operator set an entry for the harness this identity's
+/// runs actually use — which WINS over this identity's own profile for a review run and says so —
+/// else the profile's own value (rendered with its normal [`field`] provenance), since an unset
+/// entry means a review run inherits exactly what this identity's profile already gives an
+/// ordinary dispatch.
+///
+/// `fallback` is the configured `agent.backend`: the harness the legacy bare-scalar spelling
+/// belongs to (STUDIO-908), so a bare `review.model` reads as applying here exactly when this
+/// identity's harness IS the backend. The origin label keeps the spelling the operator wrote — a
+/// bare scalar renders as `review.model`, not `review.model.<harness>`, because naming a harness
+/// they never wrote is the misattribution this ticket removes.
+///
+/// A value set for a DIFFERENT harness is called out rather than hidden: for `model` it is a
+/// refusal (the review will not run at all), and for `effort` it simply means this harness
+/// inherits. Either way the operator sees which harnesses are named, since the raw map is the one
+/// thing this line exists to make legible.
+///
+/// Only called when `render_show`'s `review` argument is `Some` — the caller (`show`) gates that
+/// on [`Teams::review_ticketless`](rhapsody_config::teams::Teams::review_ticketless), so this
+/// function itself never has to ask "can this override even fire": by the time it runs, it can.
+fn review_field(
+    name: &str,
+    scoped: &rhapsody_config::teams::HarnessScoped,
+    harness: &str,
+    fallback: &str,
+    profile_value: &str,
+    profile_origin: Origin,
+) -> String {
+    if scoped.is_empty() {
+        return format!(
+            "(unset — a review run uses this profile's {name}, {})",
+            field(profile_value, profile_origin)
+        );
+    }
+    if let Some(value) = scoped.for_harness(harness, fallback) {
+        let key = if scoped.legacy().is_some() {
+            format!("review.{name}")
+        } else {
+            format!("review.{name}.{harness}")
+        };
+        return format!("{value} [{key} — overrides this profile's {name} for a review run]");
+    }
+    let listed = scoped
+        .resolved(fallback)
+        .iter()
+        .map(|(h, v)| format!("{h}: {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if name == "model" {
+        format!(
+            "(unset for harness {harness} — review.model names {listed}, so a review on {harness} \
+             is refused rather than run on the wrong model)"
+        )
+    } else {
+        format!(
+            "(unset for harness {harness} — review.effort names {listed}; a review on {harness} \
+             inherits this profile's effort)"
+        )
     }
 }
 
@@ -469,11 +697,22 @@ mod tests {
     /// Points the verbs at a hermetic store home by writing a WORKFLOW.md whose
     /// `storage.path` sits under `dir`, and returns the resolved profiles dir.
     fn hermetic(dir: &TempDir) -> (Vec<String>, PathBuf) {
+        hermetic_backend(dir, "")
+    }
+
+    /// [`hermetic`] with an explicit `agent.backend`, so the harness line's inherit branch can be
+    /// exercised against a resolved backend that is not the shipped default (STUDIO-903).
+    fn hermetic_backend(dir: &TempDir, backend: &str) -> (Vec<String>, PathBuf) {
+        let agent = if backend.is_empty() {
+            String::new()
+        } else {
+            format!("agent:\n  backend: {backend}\n")
+        };
         let wf = dir.child("WORKFLOW.md");
         std::fs::write(
             &wf,
             format!(
-                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\nstorage:\n  path: {}/rhapsody.db\n---\nDo {{{{ issue.identifier }}}}.\n",
+                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\n{agent}storage:\n  path: {}/rhapsody.db\n---\nDo {{{{ issue.identifier }}}}.\n",
                 dir.path.display()
             ),
         )
@@ -504,15 +743,15 @@ mod tests {
         let dir = TempDir::new();
         let (env, profiles_dir) = hermetic(&dir);
         let out = run(&["show", "swe"], &env[0]).expect("show swe");
-        assert!(out.contains("profile:      swe"), "out = {out}");
+        assert!(out.contains("profile:       swe"), "out = {out}");
         assert!(
             out.contains(&format!(
-                "base:         swe@{} (tracking latest)",
+                "base:          swe@{} (tracking latest)",
                 newest_builtin("swe")
             )),
             "out = {out}"
         );
-        assert!(out.contains("overlay:      none"), "out = {out}");
+        assert!(out.contains("overlay:       none"), "out = {out}");
         assert!(out.contains("--- resolved prompt ---"), "out = {out}");
         assert!(
             out.contains("You are a software engineer on this codebase."),
@@ -537,13 +776,311 @@ mod tests {
         )
         .expect("write teams.yaml");
         let out = run(&["show", "alice"], &env[0]).expect("show alice");
-        assert!(out.contains("identity:     alice"), "out = {out}");
-        assert!(out.contains("profile:      reviewer"), "out = {out}");
+        assert!(out.contains("identity:      alice"), "out = {out}");
+        assert!(out.contains("profile:       reviewer"), "out = {out}");
         assert!(
             out.contains("You are a code reviewer on this codebase."),
             "out = {out}"
         );
         assert!(!profiles_dir.exists(), "show must not create the dir");
+    }
+
+    // ── review model/effort visibility (STUDIO-901, ticket §4) ──────────────
+
+    /// The whole §4 bar for this ticket: an operator asking "what model will actually review
+    /// this?" gets a direct answer, in the same one command that already answers "what model does
+    /// this identity run with?" — and when `review.model`/`review.effort` are set, the line says
+    /// they WIN over the profile above, so the two lines are never mistaken for each other.
+    ///
+    /// This file's spelling is the legacy bare scalar, so the label is `review.model`, not
+    /// `review.model.claude`: the operator never wrote a harness, and STUDIO-908 resolves the bare
+    /// value against `agent.backend` (claude here).
+    #[test]
+    fn show_reports_the_review_scoped_model_when_set() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  claude-opus-5 [review.model — overrides this profile's model for a review run]"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("review effort: high [review.effort — overrides this profile's effort for a review run]"),
+            "out = {out}"
+        );
+    }
+
+    /// **alice's blocking finding on PR #172, seen from `show`.** A legacy bare `review.model` is
+    /// not pinned to `claude`: on an installation whose `agent.backend` is `opencode` it applies
+    /// to that harness, and the line says so rather than claiming a refusal that will not happen.
+    #[test]
+    fn show_resolves_a_legacy_bare_review_model_against_the_configured_backend() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_backend(&dir, "opencode");
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model: some-opencode-model\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  some-opencode-model [review.model — overrides this profile's model for a review run]"),
+            "out = {out}"
+        );
+    }
+
+    /// **STUDIO-908, the diagnostic the live breakage lacked.** A `review.model` scoped to a
+    /// harness the identity does NOT run on is reported as such — named back to the operator,
+    /// rather than printed as though it applied (which is how the original bug read) or hidden
+    /// (which would leave them wondering). The line names the harness, the configured model and
+    /// its harness, and the consequence: a review is refused, not run on the wrong model.
+    #[test]
+    fn show_reports_a_review_model_scoped_to_another_harness_as_refused() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        // A per-harness map with an entry for `opencode` only; the reviewer below runs claude.
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  model:\n    opencode: fireworks-ai/x\nroster:\n  - name: alice\n    profile: reviewer\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  (unset for harness claude — review.model names opencode: fireworks-ai/x, so a review on claude is refused rather than run on the wrong model)"),
+            "out = {out}"
+        );
+    }
+
+    /// Absent `review.model`/`review.effort` on the ticketless path — the default that path
+    /// itself would ship with — says plainly that a review run inherits this identity's own
+    /// profile, rather than printing nothing and leaving the question unanswered.
+    #[test]
+    fn show_reports_review_scoped_model_as_inherited_when_unset() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(
+            out.contains("review model:  (unset — a review run uses this profile's model, [unset — inherits the daemon's config])"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("review effort: (unset — a review run uses this profile's effort, [unset — inherits the daemon's config])"),
+            "out = {out}"
+        );
+    }
+
+    /// **jimmy/alice round-1 finding 2 on PR #168, mutation-checked.** `review.model`/
+    /// `review.effort` are dead config on any installation whose `review.mode` is not
+    /// `ticketless` — including the SHIPPED default, `mode: off`, and Teams disabled entirely (no
+    /// `teams.yaml` at all). `show` must not claim an override that install can never honour, so a
+    /// Teams-off install's report suppresses both review-scoped lines and otherwise prints exactly
+    /// the lines it printed before this ticket. Gating `render_show`'s `review` argument on
+    /// anything other than `teams.review_ticketless()` turns this red.
+    #[test]
+    fn show_suppresses_the_review_scoped_lines_off_the_ticketless_path() {
+        // Teams enabled, but on `mode: tickets` — the review override is set and inert.
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: tickets\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "alice"], &env[0]).expect("show alice");
+        assert!(!out.contains("review model:"), "out = {out}");
+        assert!(!out.contains("review effort:"), "out = {out}");
+
+        // No teams.yaml at all: the review-scoped lines stay suppressed, exactly as before this
+        // ticket added them.
+        let dir2 = TempDir::new();
+        let (env2, _) = hermetic(&dir2);
+        let out = run(&["show", "swe"], &env2[0]).expect("show swe");
+        assert!(!out.contains("review model:"), "out = {out}");
+        assert!(!out.contains("review effort:"), "out = {out}");
+    }
+
+    // ── the resolved harness (STUDIO-903) ───────────────────────────────────
+
+    /// The ticket's headline: a profile that sets `harness:` reports the CLI this teammate's runs
+    /// actually use, with its origin — rendered exactly like every sibling field. Before this the
+    /// one field that selects the binary was the only one absent, so the operator had to read the
+    /// nested `config.opencode` block to guess (which proves the block parsed, never that this
+    /// teammate resolved to it).
+    #[test]
+    fn show_reports_the_resolved_harness_with_its_origin() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: opencode\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("harness:       opencode [overlay]"),
+            "out = {out}"
+        );
+    }
+
+    /// ⚠️ The trap the ticket names: printing the raw front matter would leave an inheriting
+    /// teammate with `[unset]` and no answer — the empty string IS the common case. The resolved
+    /// value is `agent.backend`'s, and the marker says so.
+    #[test]
+    fn show_reports_the_configured_backend_for_an_inheriting_teammate() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic_backend(&dir, "opencode");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("harness:       opencode [unset — inherits agent.backend]"),
+            "out = {out}"
+        );
+    }
+
+    /// The shipped default, with no `agent.backend` written anywhere: the inherit marker names
+    /// `claude`, the value the daemon actually resolves.
+    #[test]
+    fn show_reports_the_default_backend_for_an_inheriting_teammate() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("harness:       claude [unset — inherits agent.backend]"),
+            "out = {out}"
+        );
+    }
+
+    /// **Decision 2, mutation-checked by the assertion below.** The registry recognizes names this
+    /// build cannot run (`codex`), and `spawn_worker` silently falls back to `agent.backend` for
+    /// them — so plain `harness: codex [overlay]` would claim a CLI that never runs. It is marked,
+    /// and the mark names what dispatch falls back to.
+    #[test]
+    fn show_marks_a_recognized_harness_this_build_cannot_run() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: codex\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("harness:"))
+            .unwrap_or_else(|| panic!("no harness line in {out}"));
+        assert_eq!(
+            line,
+            "harness:       codex [overlay] (recognized harness, but this build has no runner for it; runs on claude)",
+            "out = {out}"
+        );
+    }
+
+    /// A name no registry knows — the mistyped `harness:` the ticket opens with — is marked
+    /// differently from a recognized-but-unimplemented one, because the operator's fix differs,
+    /// and it too names the backend it silently falls back to.
+    #[test]
+    fn show_marks_a_harness_no_registry_knows() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: openai\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("harness:"))
+            .unwrap_or_else(|| panic!("no harness line in {out}"));
+        assert_eq!(
+            line, "harness:       openai [overlay] (not a recognized harness; runs on claude)",
+            "out = {out}"
+        );
+    }
+
+    /// A harness the build CAN run carries no mark — the common case stays a clean
+    /// `<value> [origin]` line, so the mark means something when it appears.
+    #[test]
+    fn show_prints_an_implemented_harness_with_no_mark() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+        std::fs::write(
+            profiles_dir.join("swe.md"),
+            "---\nextends: swe\nharness: opencode\n---\n{{ base }}\n",
+        )
+        .expect("write overlay");
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("harness:"))
+            .unwrap_or_else(|| panic!("no harness line in {out}"));
+        assert_eq!(line, "harness:       opencode [overlay]", "out = {out}");
+    }
+
+    /// STUDIO-891: a REJECTED `teams.yaml` is reported by the command, not only
+    /// by a log line the operator has to go looking for.
+    ///
+    /// The rejection path degrades to `Teams::disabled()` and still exits 0, so
+    /// without this the evidence that a config was refused is an absence — the
+    /// roster silently not resolving, and a board that quietly stops being
+    /// reviewed. `teams show` is the surface that needs no daemon and no log
+    /// access, so it is where the reason belongs.
+    ///
+    /// The command still SUCCEEDS: §4's "best-effort" contract is that a broken
+    /// `teams.yaml` must not stop an operator inspecting a profile.
+    #[test]
+    fn show_reports_a_rejected_teams_config_without_refusing_to_run() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        // Unsatisfiable: two teammates cannot supply two non-author reviewers.
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\n  reviewers: 2\nroster:\n  - name: alice\n  - name: jimmy\n",
+        )
+        .expect("write teams.yaml");
+        let out = run(&["show", "swe"], &env[0]).expect("a rejected config must not fail `show`");
+        assert!(
+            out.contains("teams.yaml was REJECTED"),
+            "the rejection must be stated, not implied: {out}"
+        );
+        assert!(
+            out.contains("review.reviewers is 2") && out.contains("at most 1"),
+            "the daemon's own reason must be quoted verbatim: {out}"
+        );
+        assert!(
+            out.contains("Teams is OFF"),
+            "the consequence is the half an operator acts on: {out}"
+        );
+        assert!(
+            out.contains("--- resolved prompt ---"),
+            "the profile is still shown: {out}"
+        );
+
+        // A config the daemon accepts prints no such banner — the report is the
+        // exception, so an ordinary `show` is byte-identical to what it was.
+        std::fs::write(
+            dir.child("teams.yaml"),
+            "enabled: true\nroster:\n  - name: alice\n",
+        )
+        .expect("rewrite teams.yaml");
+        let ok = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            !ok.contains("REJECTED"),
+            "no banner on a valid config: {ok}"
+        );
     }
 
     /// An overlay's provenance — including the pin's drift line — is what the
@@ -559,7 +1096,7 @@ mod tests {
         )
         .expect("write overlay");
         let out = run(&["show", "swe"], &env[0]).expect("show swe");
-        assert!(out.contains("model:        opus [overlay]"), "out = {out}");
+        assert!(out.contains("model:         opus [overlay]"), "out = {out}");
         assert!(
             out.contains("the overlay, with the base spliced in at {{ base }}"),
             "out = {out}"
@@ -612,7 +1149,7 @@ mod tests {
         // The fork now resolves with no base at all.
         let shown = run(&["show", "sre"], &env[0]).expect("show sre");
         assert!(
-            shown.contains("base:         none (fork"),
+            shown.contains("base:          none (fork"),
             "shown = {shown}"
         );
     }

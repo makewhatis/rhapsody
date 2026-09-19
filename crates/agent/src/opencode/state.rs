@@ -1,0 +1,315 @@
+//! Per-run `XDG_DATA_HOME` isolation for the opencode backend (STUDIO-902). Rhapsody-only.
+//!
+//! ⚠️ **This module exists because sharing one opencode state directory LOSES TURNS.** It is not
+//! hygiene. The STUDIO-869 spike measured it (`harness/harness-spike/opencode/`, and
+//! `STUDIO-869-harness-spike-findings.md` §A.3):
+//!
+//! | Two concurrent turns | Turns completed |
+//! |---|---|
+//! | one shared state dir, database already created | **8/10** (`concurrency-trials-shared.txt`) |
+//! | one shared state dir, **no database yet** | **0/10 — both turns of every pair** (`concurrency-trials-fresh-shared-xdg.txt`) |
+//! | a private `XDG_DATA_HOME` per turn | **10/10** (`concurrency-trials-isolated-xdg.txt`) |
+//!
+//! `$XDG_DATA_HOME/opencode/opencode.db` is SQLite; the turn that loses the race is refused
+//! outright — it dies in 0–1s, exits 1, writes `database is locked` to stderr and emits a
+//! **completely empty event stream**. The worst case is exactly the one a daemon meets first: a
+//! newly provisioned state directory, where the loss is not intermittent but total.
+//!
+//! ## Two things that make a naive redirect silently wrong
+//!
+//! 1. ⚠️ **Redirect `XDG_DATA_HOME`, never `HOME`.** Redirecting `HOME` severs the macOS keychain
+//!    and the turn fails looking like a misconfigured provider (measured for goose, STUDIO-872;
+//!    design §4.5 states the rule for the family).
+//! 2. ⚠️ **opencode keeps its CREDENTIALS in the very directory being redirected** —
+//!    `$XDG_DATA_HOME/opencode/auth.json`. A bare redirect therefore leaves the turn
+//!    unauthenticated, and it fails as a 401 that is indistinguishable from a real credential
+//!    problem: `harness/harness-spike/opencode/failure-401.jsonl` is literally that shape. So the
+//!    state directory is SEEDED with a copy of the operator's own `auth.json`, and a missing source
+//!    is refused loudly BEFORE any process is spawned ([`RunState::provision`]) rather than
+//!    discovered as a 401 mid-turn. The spike's own driver refuses the same way and for the same
+//!    stated reason (`sandbox/conctrials.sh` exits 3).
+//!
+//! Copying an existing credential is not the daemon writing a provider config: auth still defers
+//! entirely to the operator's own `opencode auth login` (design §4.5). Nothing here creates,
+//! refreshes or edits a credential — it is moved, unread, into the directory the CLI will look in.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::AgentError;
+
+/// Distinguishes two state directories created in the same nanosecond by the same pid. Pid alone is
+/// not enough and neither is a timestamp: pids are recycled, and a recycled pid adopting a stale
+/// directory is precisely how a run inherits another run's database.
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The directory name prefix, so an operator can recognize (and an admin can sweep) what these are.
+const PREFIX: &str = "rhapsody-opencode";
+
+/// A provisioned, private opencode state directory for ONE session.
+///
+/// Removed by [`RunState::cleanup`] (called from `Session::stop`) and again by `Drop`, because an
+/// operator Stop cancels a run by DROPPING the session's future rather than returning through it —
+/// the same cancellation path `crate::proctree::KillTreeOnDrop` exists for. Cleanup is idempotent.
+#[derive(Debug)]
+pub struct RunState {
+    dir: PathBuf,
+}
+
+impl RunState {
+    /// Creates a private state directory and seeds it with the operator's `auth.json`.
+    ///
+    /// `state_root` empty ⇒ the system temp dir. `auth_source` empty ⇒ [`default_auth_source`].
+    /// Returns an error — before anything is spawned — when the credential is missing or empty.
+    pub fn provision(
+        state_root: &str,
+        auth_source: &str,
+        issue_identifier: &str,
+    ) -> Result<RunState, AgentError> {
+        let src = if auth_source.is_empty() {
+            default_auth_source()
+        } else {
+            PathBuf::from(auth_source)
+        };
+        // Checked first, so the refusal names the real problem rather than leaving a provisioned
+        // directory behind on the way to reporting it.
+        let meta = std::fs::metadata(&src).map_err(|e| {
+            AgentError::Other(format!(
+                "opencode_auth_missing: {}: {e}. opencode keeps its credentials inside the state \
+                 directory this backend redirects, so a run cannot authenticate without a copy. \
+                 Run `opencode auth login` as the daemon's user, or set `opencode.auth_source`",
+                src.display()
+            ))
+        })?;
+        if meta.len() == 0 {
+            return Err(AgentError::Other(format!(
+                "opencode_auth_missing: {} is empty; a run would be unauthenticated and fail as a \
+                 401. Run `opencode auth login` as the daemon's user",
+                src.display()
+            )));
+        }
+
+        let root = if state_root.is_empty() {
+            std::env::temp_dir()
+        } else {
+            PathBuf::from(state_root)
+        };
+        std::fs::create_dir_all(&root).map_err(|e| {
+            AgentError::Other(format!("opencode state root {}: {e}", root.display()))
+        })?;
+
+        let dir = root.join(unique_name(issue_identifier));
+        // `create_dir`, NOT `create_dir_all`: if this name somehow already exists, that is a
+        // collision with another run's live database and must fail rather than be adopted.
+        std::fs::create_dir(&dir)
+            .map_err(|e| AgentError::Other(format!("opencode state dir {}: {e}", dir.display())))?;
+        let state = RunState { dir };
+
+        let dst_dir = state.dir.join("opencode");
+        let seed = || -> std::io::Result<()> {
+            std::fs::create_dir_all(&dst_dir)?;
+            std::fs::copy(&src, dst_dir.join("auth.json"))?;
+            Ok(())
+        };
+        if let Err(e) = seed() {
+            // The half-built directory is removed here rather than left for `Drop`, so the error
+            // path leaves nothing behind either.
+            state.cleanup();
+            return Err(AgentError::Other(format!(
+                "opencode_auth_missing: could not seed {} from {}: {e}",
+                dst_dir.display(),
+                src.display()
+            )));
+        }
+        Ok(state)
+    }
+
+    /// The value to set `XDG_DATA_HOME` to for this session's children.
+    pub fn xdg_data_home(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Removes the state directory. Idempotent, best-effort, and never fails a run: by the time
+    /// this is reached the turn's outcome is already decided, and a leaked directory is a disk
+    /// problem rather than a correctness one.
+    pub fn cleanup(&self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                dir = %self.dir.display(), err = %e,
+                "opencode: could not remove the per-run state directory"
+            );
+        }
+    }
+}
+
+impl Drop for RunState {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Where the operator's own opencode credential lives, from the DAEMON's environment:
+/// `$XDG_DATA_HOME/opencode/auth.json` when that variable is set, else the XDG default
+/// `$HOME/.local/share/opencode/auth.json`.
+///
+/// Read from the daemon's environment on purpose — it is the operator's login that is being
+/// located, and the child's `XDG_DATA_HOME` is about to be overwritten with the private directory.
+pub fn default_auth_source() -> PathBuf {
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+    base.join("opencode").join("auth.json")
+}
+
+/// A directory name no other run can produce: prefix, a sanitized issue identifier for legibility,
+/// the pid, a nanosecond stamp, and a process-wide counter.
+fn unique_name(issue_identifier: &str) -> String {
+    let slug: String = issue_identifier
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(40)
+        .collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{PREFIX}-{slug}-{}-{nanos}-{seq}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opencode::testdir::TempDir;
+
+    fn seeded_auth(dir: &Path) -> String {
+        let p = dir.join("auth.json");
+        std::fs::write(&p, b"{\"fireworks-ai\":{\"type\":\"api\"}}").expect("write auth");
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn provision_creates_a_private_dir_and_copies_the_credential() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let root = tmp.path().join("root");
+
+        let st =
+            RunState::provision(&root.to_string_lossy(), &auth, "STUDIO-902").expect("provision");
+        let seeded = st.xdg_data_home().join("opencode").join("auth.json");
+        assert!(seeded.is_file(), "auth.json seeded at {}", seeded.display());
+        assert_eq!(
+            std::fs::read(&seeded).expect("read"),
+            std::fs::read(&auth).expect("read src"),
+            "the credential is copied byte-for-byte, never rewritten"
+        );
+        assert!(
+            st.xdg_data_home().to_string_lossy().contains("STUDIO-902"),
+            "the directory names its issue so an operator can tell what leaked"
+        );
+    }
+
+    // ⚠️ The headline property. Two sessions must never be handed the same state directory: that
+    // is the `database is locked` failure, and it drops turns silently with an EMPTY event stream.
+    #[test]
+    fn two_provisions_never_share_a_directory() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let root = tmp.path().join("root").to_string_lossy().into_owned();
+
+        let states: Vec<RunState> = (0..16)
+            .map(|_| RunState::provision(&root, &auth, "STUDIO-902").expect("provision"))
+            .collect();
+        let dirs: std::collections::BTreeSet<PathBuf> = states
+            .iter()
+            .map(|s| s.xdg_data_home().to_path_buf())
+            .collect();
+        assert_eq!(dirs.len(), states.len(), "every state dir is distinct");
+        // And each really is its own tree on disk, not a shared one reached by different names.
+        for s in &states {
+            assert!(
+                s.xdg_data_home()
+                    .join("opencode")
+                    .join("auth.json")
+                    .is_file()
+            );
+        }
+    }
+
+    // The refusal is the whole point of the credential check: a missing auth.json must stop the run
+    // BEFORE a process is spawned, because the alternative is a 401 that reads like a provider
+    // misconfiguration and costs a real dispatch to diagnose.
+    #[test]
+    fn a_missing_credential_is_refused_before_anything_is_created() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("root");
+        let missing = tmp.path().join("nope").join("auth.json");
+
+        let err = RunState::provision(
+            &root.to_string_lossy(),
+            &missing.to_string_lossy(),
+            "STUDIO-902",
+        )
+        .expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.starts_with("opencode_auth_missing:"), "{msg}");
+        assert!(msg.contains("opencode auth login"), "names the fix: {msg}");
+        assert!(
+            !root.exists() || std::fs::read_dir(&root).into_iter().flatten().count() == 0,
+            "a refused provision leaves no state directory behind"
+        );
+    }
+
+    #[test]
+    fn an_empty_credential_is_refused_too() {
+        let tmp = TempDir::new();
+        let auth = tmp.path().join("auth.json");
+        std::fs::write(&auth, b"").expect("write");
+        let err = RunState::provision(
+            &tmp.path().join("root").to_string_lossy(),
+            &auth.to_string_lossy(),
+            "X-1",
+        )
+        .expect_err("must refuse an empty credential");
+        assert!(err.to_string().contains("is empty"), "{err}");
+    }
+
+    // Cleanup runs on `stop()` AND on drop, because an operator Stop cancels a run by dropping the
+    // future. Both paths, and cleanup twice, must be safe.
+    #[test]
+    fn cleanup_is_idempotent_and_drop_also_removes() {
+        let tmp = TempDir::new();
+        let auth = seeded_auth(tmp.path());
+        let root = tmp.path().join("root").to_string_lossy().into_owned();
+
+        let path = {
+            let st = RunState::provision(&root, &auth, "X-1").expect("provision");
+            let p = st.xdg_data_home().to_path_buf();
+            assert!(p.is_dir());
+            st.cleanup();
+            assert!(!p.exists(), "cleanup removed it");
+            st.cleanup(); // idempotent — must not panic or warn-fail
+            p
+        };
+        assert!(!path.exists());
+
+        let st = RunState::provision(&root, &auth, "X-2").expect("provision");
+        let p = st.xdg_data_home().to_path_buf();
+        drop(st);
+        assert!(!p.exists(), "Drop removed the directory of a cancelled run");
+    }
+
+    // The default source follows XDG, and must not be `$HOME` itself — redirecting HOME is the
+    // documented way to break the macOS keychain (design §4.5).
+    #[test]
+    fn default_auth_source_follows_xdg() {
+        let p = default_auth_source();
+        assert!(p.ends_with("opencode/auth.json"), "{}", p.display());
+    }
+}

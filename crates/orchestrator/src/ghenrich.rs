@@ -26,6 +26,11 @@
 //!   * STUDIO-574 adds success-path diagnostics Go does not emit: [`fetch_github_summons`] logs the
 //!     repo / `since` watermark / PR numbers found, and [`apply_github_summons`] logs a per-reason
 //!     drop tally. Both are additive `tracing` events — the enrichment's data flow is unchanged.
+//!   * STUDIO-882 gives [`apply_github_summons`] a SECOND source of the PR→ticket mapping Go only
+//!     ever read off tracker attachments — [`DaemonPrLinks`], the daemon's own review watch set —
+//!     because on a repository the tracker's GitHub integration is not connected to there is no
+//!     attachment the daemon can write that `linked_prs` will accept. Additive: an empty index
+//!     leaves the pass byte-identical to Go's.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -106,14 +111,20 @@ pub struct SummonApply {
     pub unlinked: Vec<UnlinkedSummons>,
 }
 
-/// A ticket that the polled repository's summons hits could not be attributed to, because it has no
-/// unmerged linked pull request there.
+/// A ticket that the polled repository's summons hits could not be attributed to, because NEITHER
+/// source has an unmerged pull request of its there.
 ///
 /// This is STUDIO-875's whole signature, and it is the one a reviewer's findings die in: the
 /// comment is posted, the scanner finds it, and the walk over `linked_prs` has nothing to walk. It
 /// fails IDENTICALLY to "the reviewer approved and there is nothing to do" — an idle board with an
 /// open pull request — which is why it cost eleven hours with the information sitting in the log
 /// the whole time.
+///
+/// Since STUDIO-882 the tracker's `linked_prs` is only one of the two sources, and the daemon's own
+/// [`DaemonPrLinks`] is the other — so this report now means "no link ANYWHERE", which is both
+/// rarer and more actionable than what it used to mean. A ticket the daemon parked for review is
+/// reachable through its own watch row whatever the tracker says, so a warning here on such a
+/// ticket points at a genuinely missing record rather than at an unconnected integration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnlinkedSummons {
     /// The ticket, as a human reads it.
@@ -213,12 +224,114 @@ pub fn report_unlinked_summons(
             repo = %slug,
             repo_prs = ?drop.repo_prs,
             state = %drop.state,
-            "github-summons: a summons was found on this repo's pull requests but this ticket has \
-             no linked pull request, so it can never be re-engaged; link the pull request to the \
-             ticket, or connect the repository in the tracker's GitHub integration"
+            "github-summons: a summons was found on this repo's pull requests but neither the \
+             tracker nor this daemon links one to this ticket, so it can never be re-engaged; \
+             link the pull request to the ticket, or connect the repository in the tracker's \
+             GitHub integration"
         );
     }
     warned
+}
+
+// ─── the link the tracker will not classify (STUDIO-882) ───────────────────────────────────────
+
+/// The pull requests THIS DAEMON recorded against each ticket, as a second source of the PR→ticket
+/// mapping `apply_github_summons` needs — one that does not depend on the tracker classifying
+/// anything.
+///
+/// # Why a second source exists at all
+///
+/// STUDIO-875 had the daemon write the missing link into the tracker with `attachmentLinkGitHubPR`,
+/// on the stated ground that the mutation, not the caller, decides the attachment's `sourceType`
+/// and that the GitHub-specific mutation therefore yields `sourceType: "github"`. Read back from
+/// the live API, a daemon-written attachment on a repository whose GitHub integration is NOT
+/// connected answers:
+///
+/// ```text
+/// sourceType: "api"      metadata: {}
+/// ```
+///
+/// against an integration-written one on a connected repository:
+///
+/// ```text
+/// sourceType: "github"   metadata: { url, number, status, mergedAt, … }
+/// ```
+///
+/// So the write lands, Linear shows it, and it fails
+/// [`is_github_pr`](rhapsody_tracker) twice over: the `sourceType` gate rejects it, and even with
+/// that gate widened there is no coordinate left to read, because `linked_prs` is built by matching
+/// a PR url out of `metadata.url` and `metadata` is empty. There is no write the daemon can make on
+/// an unconnected repository that `linked_prs` will accept, which is why the fix is here and not in
+/// the write.
+///
+/// # Why the watch set is the right record, and not merely an available one
+///
+/// A row in `rhapsody_review_watch` exists because THIS DAEMON parked a ticket in review for a pull
+/// request it resolved itself, on the run's own trusted repository binding — the same provenance
+/// [`crate::reviewdone`] already moves tickets on, and a stricter one than an attachment, which any
+/// account with tracker access can write. `introduced_by` names the ticket as `handoff:<id>` /
+/// `adopt:<id>`, and [`crate::reviewdone::origin_ticket`] is the single reader of those spellings,
+/// called here rather than re-implemented.
+///
+/// It also supplies, for free, the field the attachment could not keep honest: liveness. This index
+/// is built from `load_live_review_watch`, whose rows are `open` and not `dropped`, maintained by
+/// the daemon's own [`crate::prstate`] sweep. `LinkedPRRef::merged` on an unconnected repository is
+/// written once and refreshed by nothing — the staleness [`crate::prlink`] documents at length —
+/// whereas a merged pull request leaves this index on the sweep that observes the merge.
+///
+/// A `console:` origin names an operator rather than a ticket and contributes nothing, exactly as it
+/// contributes no auto-done transition.
+#[derive(Debug, Default, Clone)]
+pub struct DaemonPrLinks {
+    /// `(owner, repo, identifier)` — all upper/lower-cased for lookup — to that ticket's pull
+    /// request numbers in that repository, ascending and deduplicated.
+    ///
+    /// Case-folded on BOTH the repository coordinate and the identifier. The repository half
+    /// matches the case-insensitive guard the apply loop already applies; the identifier half is
+    /// defensive — `introduced_by` is written from the issue's own identifier so the two agree
+    /// byte-for-byte today, and a folded key costs nothing to make a future disagreement not be a
+    /// silent drop, which is the failure mode this whole ticket is about.
+    by_ticket: HashMap<(String, String, String), Vec<i64>>,
+}
+
+impl DaemonPrLinks {
+    /// Builds the index from a watch-set snapshot — normally
+    /// [`Store::load_live_review_watch`](rhapsody_store::Store::load_live_review_watch), so every
+    /// row is already open and not dropped.
+    ///
+    /// Rows whose origin names no ticket are skipped. A pull request watched by several reviewers
+    /// has one row each and contributes its number once.
+    pub fn from_watch_rows(rows: &[rhapsody_store::ReviewWatchRow]) -> Self {
+        let mut by_ticket: HashMap<(String, String, String), Vec<i64>> = HashMap::new();
+        for row in rows {
+            let Some(identifier) = crate::reviewdone::origin_ticket(&row.introduced_by) else {
+                continue;
+            };
+            let key = (
+                row.key.owner.to_ascii_lowercase(),
+                row.key.repo.to_ascii_lowercase(),
+                identifier.to_ascii_uppercase(),
+            );
+            by_ticket.entry(key).or_default().push(row.key.number);
+        }
+        for numbers in by_ticket.values_mut() {
+            numbers.sort_unstable();
+            numbers.dedup();
+        }
+        Self { by_ticket }
+    }
+
+    /// This ticket's daemon-recorded pull requests in `owner`/`repo`, ascending; empty when there
+    /// are none.
+    fn numbers_for(&self, owner: &str, repo: &str, identifier: &str) -> &[i64] {
+        self.by_ticket
+            .get(&(
+                owner.to_ascii_lowercase(),
+                repo.to_ascii_lowercase(),
+                identifier.to_ascii_uppercase(),
+            ))
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Advances each issue's `latest_summon_at` (max only) — and, in the same update, `latest_summon_body`
@@ -231,11 +344,17 @@ pub fn report_unlinked_summons(
 /// indistinguishable from "nobody summoned". Each drop reason is now counted and reported on one
 /// debug line, and an issue whose linked PRs ALL sit outside the polled repo — which no summons can
 /// ever reach — is named at info.
+///
+/// STUDIO-882: `links` is the daemon's OWN record of which pull request belongs to which ticket,
+/// consulted in addition to the tracker's `linked_prs` because on a repository the tracker's GitHub
+/// integration is not connected to, `linked_prs` is empty and no write can fill it. Pass
+/// `&DaemonPrLinks::default()` for the tracker-only behaviour. See [`DaemonPrLinks`].
 pub fn apply_github_summons(
     mut issues: Vec<Issue>,
     by_pr: &HashMap<i64, SummonHit>,
     owner: &str,
     repo: &str,
+    links: &DaemonPrLinks,
 ) -> SummonApply {
     if by_pr.is_empty() {
         return SummonApply {
@@ -249,6 +368,11 @@ pub fn apply_github_summons(
     let issue_count = issues.len();
     let (mut linked, mut other_repo, mut merged, mut no_hit, mut matched, mut advanced) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    // STUDIO-882: how many pull requests the DAEMON's own record contributed that the tracker did
+    // not. On an unconnected repository this is the whole of `linked_prs_total`'s missing count, and
+    // reading `linked_prs_total=0 daemon_links=1 matched=1` is how an operator tells "the tracker
+    // still classifies nothing, and it no longer matters" from "the fix is not running".
+    let mut daemon_linked = 0usize;
     // The pull requests the hits are ON, named on every drop report so the warning can point at
     // the comment somebody actually wrote. Sorted for a stable line across polls.
     let mut hit_prs: Vec<i64> = by_pr.keys().copied().collect();
@@ -302,11 +426,55 @@ pub fn apply_github_summons(
                 tracing::info!(issue_identifier = %iss.identifier, pr = pr.number, at = %hit.at, "github-summons: advanced latest_summon_at from PR comment");
             }
         }
+        // STUDIO-882: the same walk over the pull requests the DAEMON recorded for this ticket in
+        // this repository, for the ones the tracker did not already supply. Separate from the loop
+        // above rather than folded into it so the ported walk stays byte-identical to Go's, and
+        // because the two sources answer different questions: that one asks what the tracker
+        // believes, this one asks what this daemon did.
+        //
+        // No repo guard and no merged check are needed here and their absence is not an oversight:
+        // the index is keyed BY repository, and it is built from live watch rows, so a foreign or a
+        // merged pull request is not in it to begin with. See [`DaemonPrLinks`].
+        for number in links.numbers_for(owner, repo, &iss.identifier) {
+            if prs.iter().any(|pr| {
+                pr.number == *number
+                    && pr.owner.eq_ignore_ascii_case(owner)
+                    && pr.repo.eq_ignore_ascii_case(repo)
+            }) {
+                // The tracker already offered this one, so the loop above has ruled on it — and
+                // its ruling stands, including when that ruling was `merged`. Deliberate: where
+                // the tracker knows a pull request at all its `merged` comes from a CONNECTED
+                // integration and is fresher than a watch row that a sweep has not yet retired, and
+                // the conservative error (not advancing a summons on a merged pull request) is the
+                // safe one. On the unconnected repositories this index exists for, the tracker
+                // offers nothing, so the two can never disagree there.
+                continue;
+            }
+            daemon_linked += 1;
+            iss_reachable = true;
+            let Some(hit) = by_pr.get(number) else {
+                no_hit += 1;
+                continue;
+            };
+            matched += 1;
+            if iss.latest_summon_at.is_none_or(|current| hit.at > current) {
+                advanced += 1;
+                iss.latest_summon_at = Some(hit.at);
+                iss.latest_summon_body = hit.body.clone();
+                tracing::info!(issue_identifier = %iss.identifier, pr = number, at = %hit.at, "github-summons: advanced latest_summon_at from PR comment (daemon-recorded link)");
+            }
+        }
         // Every linked PR on this issue lives outside the repo we polled, so no summons on any of
         // them can EVER reach this ticket — a routing fault (the ticket's project points at a
         // different repo than its PRs), not a quiet no-op. INFO because it is the one drop reason an
         // operator must act on, and it cannot fire for a correctly-routed ticket.
-        let all_in_another_repo = iss_other_repo > 0 && iss_other_repo == prs.len();
+        //
+        // `!iss_reachable` (STUDIO-882) so a ticket the daemon's own links DID reach is not also
+        // accused of pointing at the wrong repository. It changes nothing for a tracker-only
+        // ticket: if every tracker link is foreign then nothing set `iss_reachable` in the loop
+        // above, and only a daemon link in the POLLED repo can have set it since.
+        let all_in_another_repo =
+            iss_other_repo > 0 && iss_other_repo == prs.len() && !iss_reachable;
         if all_in_another_repo {
             tracing::info!(
                 issue_identifier = %iss.identifier,
@@ -341,6 +509,7 @@ pub fn apply_github_summons(
         hits = by_pr.len(),
         issues = issue_count,
         linked_prs_total = linked,
+        daemon_links = daemon_linked,
         skipped_other_repo = other_repo,
         skipped_merged = merged,
         skipped_no_hit = no_hit,
@@ -362,9 +531,10 @@ pub async fn enrich_with_github_summons(
     owner: &str,
     repo: &str,
     since: DateTime<Utc>,
+    links: &DaemonPrLinks,
 ) -> SummonApply {
     match fetch_github_summons(src, owner, repo, since).await {
-        Some(by_pr) => apply_github_summons(issues, &by_pr, owner, repo),
+        Some(by_pr) => apply_github_summons(issues, &by_pr, owner, repo, links),
         None => SummonApply {
             issues,
             unlinked: Vec::new(),
@@ -466,6 +636,7 @@ mod tests {
             "o",
             "r",
             summon - chrono::Duration::hours(1),
+            &DaemonPrLinks::default(),
         )
         .await;
         assert_eq!(
@@ -487,7 +658,15 @@ mod tests {
             ..Default::default()
         }];
         let src = FakeSrc::ok(hits(&[(101, older)]));
-        let got = enrich_with_github_summons(issues, Some(&src), "o", "r", older).await;
+        let got = enrich_with_github_summons(
+            issues,
+            Some(&src),
+            "o",
+            "r",
+            older,
+            &DaemonPrLinks::default(),
+        )
+        .await;
         assert_eq!(
             got.issues[0].latest_summon_at,
             Some(existing),
@@ -504,9 +683,15 @@ mod tests {
             ..Default::default()
         }];
         let src = FakeSrc::failing();
-        let got =
-            enrich_with_github_summons(issues, Some(&src), "o", "r", utc(2026, 6, 25, 12, 0, 0))
-                .await;
+        let got = enrich_with_github_summons(
+            issues,
+            Some(&src),
+            "o",
+            "r",
+            utc(2026, 6, 25, 12, 0, 0),
+            &DaemonPrLinks::default(),
+        )
+        .await;
         assert!(
             got.issues[0].latest_summon_at.is_none(),
             "error must leave latest_summon_at nil"
@@ -532,6 +717,7 @@ mod tests {
             "o",
             "r",
             summon - chrono::Duration::hours(1),
+            &DaemonPrLinks::default(),
         )
         .await;
         assert!(
@@ -561,6 +747,7 @@ mod tests {
             "acme-corp",
             "neat-widget",
             summon - chrono::Duration::hours(1),
+            &DaemonPrLinks::default(),
         )
         .await;
         assert_eq!(
@@ -689,7 +876,7 @@ mod tests {
             let by_pr = by_pr.clone();
             let issues = issues.clone();
             async move {
-                let _ = apply_github_summons(issues, &by_pr, "o", "r");
+                let _ = apply_github_summons(issues, &by_pr, "o", "r", &DaemonPrLinks::default());
             }
         })
         .await;
@@ -724,7 +911,13 @@ mod tests {
             let by_pr = by_pr.clone();
             let issues = issues.clone();
             async move {
-                let _ = apply_github_summons(issues, &by_pr, "studio49dev", "other-repo");
+                let _ = apply_github_summons(
+                    issues,
+                    &by_pr,
+                    "studio49dev",
+                    "other-repo",
+                    &DaemonPrLinks::default(),
+                );
             }
         })
         .await;
@@ -764,7 +957,13 @@ mod tests {
             let by_pr = by_pr.clone();
             let issues = issues.clone();
             async move {
-                let got = apply_github_summons(issues, &by_pr, "studio49dev", "studio-infra");
+                let got = apply_github_summons(
+                    issues,
+                    &by_pr,
+                    "studio49dev",
+                    "studio-infra",
+                    &DaemonPrLinks::default(),
+                );
                 assert_eq!(got.issues[0].latest_summon_at, Some(summon));
             }
         })
@@ -790,9 +989,9 @@ mod tests {
     // the pull request. A fix whose failure branch is untested is the same defect again.
 
     const WARNING: &str = "github-summons: a summons was found on this repo's pull requests but \
-                           this ticket has no linked pull request, so it can never be re-engaged; \
-                           link the pull request to the ticket, or connect the repository in the \
-                           tracker's GitHub integration";
+                           neither the tracker nor this daemon links one to this ticket, so it can \
+                           never be re-engaged; link the pull request to the ticket, or connect \
+                           the repository in the tracker's GitHub integration";
 
     fn in_review(identifier: &str, prs: Vec<LinkedPRRef>) -> Issue {
         Issue {
@@ -826,6 +1025,7 @@ mod tests {
             &by_pr,
             "makewhatis",
             "rhapsody",
+            &DaemonPrLinks::default(),
         );
         assert_eq!(
             got.unlinked,
@@ -851,6 +1051,7 @@ mod tests {
             &by_pr,
             "makewhatis",
             "rhapsody",
+            &DaemonPrLinks::default(),
         );
         assert!(got.unlinked.is_empty());
         assert!(got.issues[0].latest_summon_at.is_some(), "it matched");
@@ -869,6 +1070,7 @@ mod tests {
             &by_pr,
             "makewhatis",
             "rhapsody",
+            &DaemonPrLinks::default(),
         );
         assert!(got.unlinked.is_empty());
     }
@@ -886,6 +1088,7 @@ mod tests {
             &by_pr,
             "makewhatis",
             "rhapsody",
+            &DaemonPrLinks::default(),
         );
         assert_eq!(got.unlinked.len(), 1);
     }
@@ -904,6 +1107,7 @@ mod tests {
             &by_pr,
             "makewhatis",
             "rhapsody",
+            &DaemonPrLinks::default(),
         );
         assert!(got.unlinked.is_empty());
     }
@@ -924,6 +1128,7 @@ mod tests {
             &by_pr,
             "makewhatis",
             "rhapsody",
+            &DaemonPrLinks::default(),
         );
         assert_eq!(got.unlinked.len(), 1);
     }
@@ -936,6 +1141,7 @@ mod tests {
             &HashMap::new(),
             "makewhatis",
             "rhapsody",
+            &DaemonPrLinks::default(),
         );
         assert!(got.unlinked.is_empty());
     }
@@ -1126,6 +1332,344 @@ claude:
         assert!(
             p.github_summons,
             "github_summons should mirror cfg.tracker.github_summons=true"
+        );
+    }
+
+    // ─── the unconnected repository (STUDIO-882) ────────────────────────────────────────────────
+
+    /// A watch row for `owner/repo#number`, introduced by a handoff of `identifier`.
+    fn watch_row(
+        owner: &str,
+        repo: &str,
+        number: i64,
+        introduced_by: &str,
+    ) -> rhapsody_store::ReviewWatchRow {
+        rhapsody_store::ReviewWatchRow {
+            key: rhapsody_store::ReviewWatchKey {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number,
+                reviewer: "jimmy".to_string(),
+            },
+            introduced_by: introduced_by.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A ticket exactly as an UNCONNECTED repository's tracker answers it: no attachments at all,
+    /// so no `linked_prs`. This is the population STUDIO-875 targeted and could not reach — its
+    /// `attachmentLinkGitHubPR` write lands with `sourceType: "api"` and `metadata: {}`, so
+    /// `linked_prs` stays empty however many times the daemon writes it.
+    fn unlinked_issue(identifier: &str) -> Issue {
+        Issue {
+            id: "i1".into(),
+            identifier: identifier.into(),
+            state: "In Review".into(),
+            ..Default::default()
+        }
+    }
+
+    /// THE regression: a summons on a pull request the tracker does not link, on a ticket the
+    /// DAEMON linked, advances `latest_summon_at` — and reports no drop.
+    #[test]
+    fn daemon_link_attributes_a_summons_the_tracker_cannot() {
+        let summon = utc(2026, 9, 13, 1, 46, 59);
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let got = apply_github_summons(
+            vec![unlinked_issue("STUDIO-880")],
+            &hits(&[(159, summon)]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        assert_eq!(
+            got.issues[0].latest_summon_at,
+            Some(summon),
+            "a daemon-recorded link must attribute the summons"
+        );
+        assert!(
+            got.unlinked.is_empty(),
+            "the ticket IS reachable now, so it must not be reported as unlinked: {:?}",
+            got.unlinked
+        );
+    }
+
+    /// The same ticket WITHOUT the daemon's link is still dropped and still reported — the
+    /// behaviour STUDIO-875 shipped is unchanged where nothing recorded a link, so this test is
+    /// what tells "the new source applied" from "the old path happened to work".
+    #[test]
+    fn no_daemon_link_still_drops_and_reports() {
+        let got = apply_github_summons(
+            vec![unlinked_issue("STUDIO-880")],
+            &hits(&[(159, utc(2026, 9, 13, 1, 46, 59))]),
+            "makewhatis",
+            "rhapsody",
+            &DaemonPrLinks::default(),
+        );
+        assert!(got.issues[0].latest_summon_at.is_none());
+        assert_eq!(got.unlinked.len(), 1, "the drop must still be reported");
+        assert_eq!(got.unlinked[0].identifier, "STUDIO-880");
+    }
+
+    /// The index is per-repository: a daemon link in ANOTHER repo must not attribute a summons
+    /// whose number collides, exactly as a foreign `linked_prs` entry does not.
+    #[test]
+    fn daemon_link_in_another_repo_is_not_applied() {
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "tally",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let got = apply_github_summons(
+            vec![unlinked_issue("STUDIO-880")],
+            &hits(&[(159, utc(2026, 9, 13, 1, 46, 59))]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        assert!(
+            got.issues[0].latest_summon_at.is_none(),
+            "a link in makewhatis/tally must not attribute a makewhatis/rhapsody summons"
+        );
+    }
+
+    /// A daemon link belonging to a DIFFERENT ticket must not attribute this ticket's summons —
+    /// the index is keyed by ticket, and getting that wrong would re-engage the wrong author.
+    #[test]
+    fn daemon_link_of_another_ticket_is_not_applied() {
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-881",
+        )]);
+        let got = apply_github_summons(
+            vec![unlinked_issue("STUDIO-880")],
+            &hits(&[(159, utc(2026, 9, 13, 1, 46, 59))]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        assert!(got.issues[0].latest_summon_at.is_none());
+    }
+
+    /// An `adopt:` origin names a ticket and counts; a `console:` origin names an OPERATOR and
+    /// contributes nothing, exactly as it moves no ticket in `reviewdone`.
+    #[test]
+    fn adopt_origin_counts_and_console_origin_does_not() {
+        let summon = utc(2026, 9, 13, 1, 46, 59);
+        let adopted = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "adopt:STUDIO-880",
+        )]);
+        let got = apply_github_summons(
+            vec![unlinked_issue("STUDIO-880")],
+            &hits(&[(159, summon)]),
+            "makewhatis",
+            "rhapsody",
+            &adopted,
+        );
+        assert_eq!(
+            got.issues[0].latest_summon_at,
+            Some(summon),
+            "adopt: counts"
+        );
+
+        let console = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "console:david",
+        )]);
+        let got = apply_github_summons(
+            vec![unlinked_issue("STUDIO-880")],
+            &hits(&[(159, summon)]),
+            "makewhatis",
+            "rhapsody",
+            &console,
+        );
+        assert!(
+            got.issues[0].latest_summon_at.is_none(),
+            "console: names no ticket and must contribute no link"
+        );
+    }
+
+    /// A pull request BOTH sources offer is walked once, not twice — a connected repository must
+    /// behave exactly as it did before this ticket.
+    #[test]
+    fn a_pr_both_sources_offer_is_not_double_counted() {
+        let summon = utc(2026, 9, 13, 1, 46, 59);
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let mut iss = unlinked_issue("STUDIO-880");
+        iss.linked_prs = Some(vec![linked("makewhatis", "rhapsody", 159, false)]);
+        let got = apply_github_summons(
+            vec![iss.clone()],
+            &hits(&[(159, summon)]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        let tracker_only = apply_github_summons(
+            vec![iss],
+            &hits(&[(159, summon)]),
+            "makewhatis",
+            "rhapsody",
+            &DaemonPrLinks::default(),
+        );
+        assert_eq!(got.issues[0].latest_summon_at, Some(summon));
+        assert_eq!(
+            got.issues[0].latest_summon_at, tracker_only.issues[0].latest_summon_at,
+            "a connected repository must be unaffected by the daemon's index"
+        );
+        assert!(got.unlinked.is_empty());
+    }
+
+    /// The merged-deference rule, observed rather than merely commented: where BOTH sources offer
+    /// the pull request and the tracker says `merged`, the tracker's ruling stands and no summons
+    /// advances — even though the watch row the index is built from still exists.
+    ///
+    /// This is reachable, not hypothetical: `prstate`'s sweep retires a watch row AFTER the merge,
+    /// and `retire_review_pr` warns and returns on a store error, so a merged pull request with a
+    /// live watch row is an ordinary state rather than a race. Without the deference the daemon
+    /// walk would advance `latest_summon_at` on it and re-engage a finished ticket.
+    #[test]
+    fn a_merged_tracker_link_is_not_re_offered_by_a_live_watch_row() {
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let mut iss = unlinked_issue("STUDIO-880");
+        iss.linked_prs = Some(vec![linked("makewhatis", "rhapsody", 159, true)]);
+        let got = apply_github_summons(
+            vec![iss],
+            &hits(&[(159, utc(2026, 9, 13, 1, 46, 59))]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        assert_eq!(
+            got.issues[0].latest_summon_at, None,
+            "the tracker ruled this pull request merged, so a live watch row must not re-offer it"
+        );
+        // And the ticket is still REPORTED as having nothing a summons could reach, exactly as it
+        // is without the index — the deference must not quietly make the drop invisible either.
+        assert_eq!(got.unlinked.len(), 1, "the drop must still be reported");
+        assert_eq!(got.unlinked[0].identifier, "STUDIO-880");
+    }
+
+    /// A ticket whose ONLY tracker link is foreign, but which the daemon linked in the polled
+    /// repository, is reachable — and must not be accused of pointing at the wrong repository.
+    #[test]
+    fn a_daemon_link_rescues_a_ticket_whose_tracker_links_are_all_foreign() {
+        let summon = utc(2026, 9, 13, 1, 46, 59);
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let mut iss = unlinked_issue("STUDIO-880");
+        iss.linked_prs = Some(vec![linked("makewhatis", "tally", 246, false)]);
+        let got = apply_github_summons(
+            vec![iss],
+            &hits(&[(159, summon)]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        assert_eq!(got.issues[0].latest_summon_at, Some(summon));
+        assert!(got.unlinked.is_empty());
+    }
+
+    /// Repository coordinate and ticket identifier are both matched case-insensitively, the same
+    /// rule the apply loop's own repo guard applies.
+    #[test]
+    fn the_index_folds_case_on_both_coordinates() {
+        let summon = utc(2026, 9, 13, 1, 46, 59);
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "MakeWhatIs",
+            "Rhapsody",
+            159,
+            "handoff:studio-880",
+        )]);
+        let got = apply_github_summons(
+            vec![unlinked_issue("STUDIO-880")],
+            &hits(&[(159, summon)]),
+            "makewhatis",
+            "rhapsody",
+            &links,
+        );
+        assert_eq!(got.issues[0].latest_summon_at, Some(summon));
+    }
+
+    /// Two reviewers watching one pull request are two rows and one link.
+    #[test]
+    fn two_reviewer_rows_of_one_pr_contribute_one_number() {
+        let mut second = watch_row("makewhatis", "rhapsody", 159, "handoff:STUDIO-880");
+        second.key.reviewer = "alice".into();
+        let links = DaemonPrLinks::from_watch_rows(&[
+            watch_row("makewhatis", "rhapsody", 159, "handoff:STUDIO-880"),
+            second,
+        ]);
+        assert_eq!(
+            links.numbers_for("makewhatis", "rhapsody", "STUDIO-880"),
+            &[159]
+        );
+    }
+
+    /// The counters an operator reads. STUDIO-882's acceptance names this line: a rhapsody hit must
+    /// report `matched=1 advanced=1`, and it must do so while `linked_prs_total` is still 0 —
+    /// which is the pair that says "the tracker classifies nothing, and it no longer matters".
+    #[tokio::test]
+    async fn the_applied_line_reports_the_daemon_link_beside_the_empty_tracker_count() {
+        let summon = utc(2026, 9, 13, 1, 46, 59);
+        let links = DaemonPrLinks::from_watch_rows(&[watch_row(
+            "makewhatis",
+            "rhapsody",
+            159,
+            "handoff:STUDIO-880",
+        )]);
+        let events = captured(|| {
+            let links = links.clone();
+            async move {
+                apply_github_summons(
+                    vec![unlinked_issue("STUDIO-880")],
+                    &hits(&[(159, summon)]),
+                    "makewhatis",
+                    "rhapsody",
+                    &links,
+                );
+            }
+        })
+        .await;
+
+        let f = only(&events, "github-summons: applied PR summons");
+        assert_eq!(f.get("matched").map(String::as_str), Some("1"));
+        assert_eq!(f.get("advanced").map(String::as_str), Some("1"));
+        assert_eq!(
+            f.get("daemon_links").map(String::as_str),
+            Some("1"),
+            "the new source must be visible in the line, not only in its effect"
+        );
+        assert_eq!(
+            f.get("linked_prs_total").map(String::as_str),
+            Some("0"),
+            "the tracker still offers nothing — that is the point"
         );
     }
 }

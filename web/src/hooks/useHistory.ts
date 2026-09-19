@@ -2,10 +2,12 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   fetchDaySummary,
   fetchHistory,
+  fetchHistoryCosts,
   fetchIssueCounts,
   fetchIssueRuns,
   localDayStartISO,
   type DaySummary,
+  type HistoryCostsResponse,
   type HistoryFilter,
   type HistoryResponse,
   type IssueCountsResponse,
@@ -115,6 +117,24 @@ export function useIssueCounts(opts?: { enabled?: boolean; refetchInterval?: num
     refetchOnWindowFocus: false,
     // No `placeholderData`: the key is constant, so there is no previous page to keep across a
     // re-key — react-query already serves the last successful answer while the next is in flight.
+  });
+}
+
+// The per-ticket cost ledger's query key (STUDIO-926).
+export const HISTORY_COSTS_QUERY_KEY = ["history-costs"] as const;
+
+// useHistoryCosts fetches every ticket's token cost by provider over the WHOLE store
+// (GET /api/v1/history/costs). Unfiltered and unwidened like the tally above, so one cache entry
+// however wide the worklist's window is — a ticket's cost must not change because the operator
+// clicked "Load more". A cost is every run that spent on the ticket, which the one-row-per-key
+// issue listing cannot say.
+export function useHistoryCosts(opts?: { enabled?: boolean; refetchInterval?: number | false }) {
+  return useQuery<HistoryCostsResponse>({
+    queryKey: HISTORY_COSTS_QUERY_KEY,
+    queryFn: fetchHistoryCosts,
+    enabled: opts?.enabled ?? true,
+    refetchInterval: opts?.refetchInterval ?? false,
+    refetchOnWindowFocus: false,
   });
 }
 

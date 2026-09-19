@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { LogEntry, RunDetail, RunSummary } from "@/lib/api";
-import { buildResult, buildTrace } from "@/lib/trace-model";
+import type { LogEntry, RunDetail, RunProvenance, RunSummary } from "@/lib/api";
+import { buildResult, buildTrace, type TracePhase } from "@/lib/trace-model";
 import {
+  PROVENANCE_UNKNOWN,
   TRACE_FILTERS,
   attemptBucket,
   attemptOptions,
   cardLead,
+  currentStepLabel,
   failingStep,
   filterPhases,
   githubRepo,
@@ -14,6 +16,7 @@ import {
   playheadPhase,
   phaseGlyph,
   prSearchUrl,
+  provenanceFields,
   relayBatons,
   resultBanner,
   resultEyebrow,
@@ -65,6 +68,42 @@ const TRANSCRIPT: LogEntry[] = [
   entry({ seq: 6, kind: "tool_use", tool: "Bash", text: "command=npm test" }),
   entry({ seq: 7, kind: "tool_result", text: "Error: 1 failed" }),
 ];
+
+function phase(over: Partial<TracePhase> & Pick<TracePhase, "title">): TracePhase {
+  return {
+    id: "1",
+    kind: "other",
+    subtitle: "",
+    turn: 0,
+    did: [],
+    said: [],
+    effects: [],
+    failed: false,
+    orphanResults: [],
+    ...over,
+  };
+}
+
+// The Jobs worklist's live-activity signal (STUDIO-926) — never a step count, only the most
+// recent phase's own title and subtitle, the same pairing the run-detail spine renders per step.
+describe("currentStepLabel", () => {
+  it("reads the most recent phase's title and subtitle", () => {
+    expect(
+      currentStepLabel([
+        phase({ title: "Oriented", subtitle: "read 2 files" }),
+        phase({ title: "Verified", subtitle: "cargo test --workspace" }),
+      ]),
+    ).toBe("Verified · cargo test --workspace");
+  });
+
+  it("drops the separator when the phase has no subtitle", () => {
+    expect(currentStepLabel([phase({ title: "Handed off" })])).toBe("Handed off");
+  });
+
+  it("returns undefined for a run with no phases yet, rather than a fabricated label", () => {
+    expect(currentStepLabel([])).toBeUndefined();
+  });
+});
 
 describe("runVitals — the header's mono strip derives from RunSummary (§3A)", () => {
   it("reads duration from ended−started, and turns/tokens/branch verbatim", () => {
@@ -688,6 +727,72 @@ describe("relayBatons — the handoff baton the attempt selector switches betwee
     expect(relayBatons(relay, run({ id: 999 }), NONE, "alice")).toEqual({
       incoming: null,
       outgoing: null,
+    });
+  });
+});
+
+// The run-detail provenance line (STUDIO-909) — what the run actually ran on, each value with the
+// config key it came from. The origin is the load-bearing half: the failure this exists to make
+// visible was an override nothing else on the run named.
+describe("provenanceFields — the header's provenance line (STUDIO-909)", () => {
+  it("renders all three values with the origin of each configurable one", () => {
+    const p: RunProvenance = {
+      run_id: 7,
+      harness: "opencode",
+      harness_origin: "profile",
+      model: "deepseek-v4p1-flash",
+      model_origin: "review.model.opencode",
+      provider: "fireworks-ai",
+    };
+    expect(provenanceFields(p)).toEqual([
+      { label: "harness", value: "opencode", origin: "profile" },
+      { label: "model", value: "deepseek-v4p1-flash", origin: "review.model.opencode" },
+      // Derived from the harness + model at dispatch, so there is no config key to name.
+      { label: "provider", value: "fireworks-ai", origin: "" },
+    ]);
+  });
+
+  it("reads the model's origin from model_origin, never the profile or harness origin", () => {
+    // The exact undiagnosable shape: the teammate's profile named one model, the operator's
+    // review.model.opencode substituted another. Reading harness_origin here (or the profile's
+    // origin) would report "profile" and hide the override — the bug this field exists to expose.
+    const fields = provenanceFields({
+      run_id: 7,
+      harness: "opencode",
+      harness_origin: "profile",
+      model: "fireworks-ai/x",
+      model_origin: "review.model.opencode",
+      provider: "fireworks-ai",
+    });
+    expect(fields.find((f) => f.label === "model")?.origin).toBe("review.model.opencode");
+  });
+
+  it("says unknown for every value of a run that recorded none, and names no origin", () => {
+    expect(provenanceFields(undefined)).toEqual([
+      { label: "harness", value: PROVENANCE_UNKNOWN, origin: "" },
+      { label: "model", value: PROVENANCE_UNKNOWN, origin: "" },
+      { label: "provider", value: PROVENANCE_UNKNOWN, origin: "" },
+    ]);
+  });
+
+  it("treats an empty recorded value as unknown rather than showing a blank", () => {
+    const fields = provenanceFields({
+      run_id: 7,
+      harness: "claude",
+      harness_origin: "agent.backend",
+      model: "",
+      model_origin: "claude.model",
+      provider: "",
+    });
+    expect(fields.find((f) => f.label === "model")).toEqual({
+      label: "model",
+      value: PROVENANCE_UNKNOWN,
+      origin: "",
+    });
+    expect(fields.find((f) => f.label === "harness")).toEqual({
+      label: "harness",
+      value: "claude",
+      origin: "agent.backend",
     });
   });
 });

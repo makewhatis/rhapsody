@@ -568,9 +568,16 @@ pub(crate) struct TeamsDispatch {
     /// every built-in profile and for every installation with no `teams/profiles/` directory — means
     /// inherit the installation-wide `claude.model` / `claude.effort`.
     pub model_override: rhapsody_agent::ModelOverride,
+    /// The `agent.backend` the routed identity's profile asks for (STUDIO-902). Empty — the case
+    /// for every built-in profile and for every installation with no `teams/profiles/` directory —
+    /// means inherit the configured backend, so a dispatch that routed to nobody, or to a teammate
+    /// whose profile is silent, uses exactly the runner it always did.
+    pub harness: String,
     /// [`EVENT_ROUTE`] or [`EVENT_UNROUTED`].
     pub kind: &'static str,
-    /// The event text: the reason, and the identity when there is one.
+    /// The event text: the reason, and the identity when there is one. Deliberately carries no
+    /// model/effort — `record_route_event` appends that from the run's FINAL `model_override`,
+    /// which a review dispatch may still overwrite after this struct is built (STUDIO-901).
     pub text: String,
 }
 
@@ -583,6 +590,8 @@ pub(crate) struct ResolvedTeammate {
     section: String,
     /// Empty ⇒ inherit the installation-wide `claude.model` / `claude.effort`.
     model_override: rhapsody_agent::ModelOverride,
+    /// Empty ⇒ inherit the configured `agent.backend` (STUDIO-902).
+    harness: String,
 }
 
 impl ResolvedTeammate {
@@ -593,6 +602,7 @@ impl ResolvedTeammate {
         ResolvedTeammate {
             section,
             model_override: rhapsody_agent::ModelOverride::default(),
+            harness: String::new(),
         }
     }
 }
@@ -609,15 +619,7 @@ impl Orchestrator {
     /// the behavioural delta that promise rules out.
     pub(crate) fn route_teams(&self, iss: &Issue) -> Option<TeamsDispatch> {
         let teams = self.teams.as_ref().filter(|t| t.enabled)?;
-        let routed = self.apply_pending_assignment(
-            teams,
-            iss,
-            route(
-                teams,
-                iss,
-                &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
-            ),
-        );
+        let routed = self.route_identity(teams, iss);
         let Some(identity) = routed.identity else {
             if routed.reason == RouteReason::Off {
                 return None;
@@ -626,29 +628,26 @@ impl Orchestrator {
                 identity: String::new(),
                 section: String::new(),
                 model_override: rhapsody_agent::ModelOverride::default(),
+                harness: String::new(),
                 kind: EVENT_UNROUTED,
                 text: format!("reason={}", routed.reason.as_str()),
             });
         };
         let resolved = self.teammate_profile_for(teams, &identity, iss);
-        // Observability (§4): the routing decision's own events row is where an operator sees which
-        // model a run ACTUALLY got, now that it varies per teammate. Appended, never prefixed, so
-        // `triage::route_event_identity` (which reads the first whitespace token) still parses — and
-        // omitted entirely when the profile names nothing, which keeps the row byte-identical for an
-        // installation with no profiles.
-        let mut text = format!("identity={identity} reason={}", routed.reason.as_str());
-        if !resolved.model_override.model.is_empty() {
-            text.push_str(&format!(" model={}", resolved.model_override.model));
-        }
-        if !resolved.model_override.effort.is_empty() {
-            text.push_str(&format!(" effort={}", resolved.model_override.effort));
-        }
+        // The model=/effort= suffix is NOT appended here (STUDIO-901 finding 1): a review run
+        // overrides `model_override` on `re` AFTER this dispatch is built (`retry.rs`'s
+        // `review.model`/`review.effort` block), so baking it into this text from `resolved` would
+        // permanently name the reviewer's own profile instead of what the run actually used.
+        // `record_route_event` composes the suffix from the run's FINAL `model_override` instead —
+        // see its doc comment.
+        let text = format!("identity={identity} reason={}", routed.reason.as_str());
         Some(TeamsDispatch {
             kind: EVENT_ROUTE,
             text,
             identity,
             section: resolved.section,
             model_override: resolved.model_override,
+            harness: resolved.harness,
         })
     }
 
@@ -680,6 +679,83 @@ impl Orchestrator {
             Some(i) => Routed::to(i.name.clone(), RouteReason::Pending),
             None => routed,
         }
+    }
+
+    /// The router's own answer for `iss` — [`route`] plus the pending-assignment substitution,
+    /// with no profile rendering and no event row. Factored out of
+    /// [`route_teams`](Self::route_teams) (STUDIO-908) so a caller that needs only the routed
+    /// IDENTITY (the review harness check) does not pay for the turn-1 section compose — which
+    /// advances the room catch-up watermark as a side effect, so calling it twice for one dispatch
+    /// would eat a window.
+    fn route_identity(&self, teams: &Teams, iss: &Issue) -> Routed {
+        self.apply_pending_assignment(
+            teams,
+            iss,
+            route(
+                teams,
+                iss,
+                &LoadSnapshot::from_running_and_retries(&self.running, &self.retry_attempts),
+            ),
+        )
+    }
+
+    /// The harness a routed identity's profile asks for, WITHOUT composing the turn-1 section
+    /// (STUDIO-908). `teammate_profile_for` resolves the same profile for the section; this is the
+    /// harness-only half, so a dispatch-time check can ask before the section is worth building.
+    /// Empty for an identity with no profile and for an installation with no runtime home — both
+    /// meaning "inherit `agent.backend`", exactly as `teammate_profile_for` answers.
+    fn identity_harness(&self, teams: &Teams, identity: &str) -> String {
+        let profile = teams
+            .roster
+            .iter()
+            .find(|i| i.name == identity)
+            .map(|i| i.profile.clone())
+            .unwrap_or_default();
+        if profile.is_empty() {
+            return String::new();
+        }
+        let Some(dir) = self.teams_profiles_dir.as_ref() else {
+            return String::new();
+        };
+        rhapsody_config::profiles::resolve(dir, &profile)
+            .map(|p| p.harness)
+            .unwrap_or_default()
+    }
+
+    /// The configured `agent.backend` — what a run with no harness of its own actually uses, and
+    /// the harness the legacy bare-scalar `review.model`/`review.effort` belongs to (STUDIO-908).
+    pub(crate) fn configured_backend(&self) -> String {
+        self.eff
+            .as_ref()
+            .map_or_else(String::new, |e| e.cfg.agent.backend.clone())
+    }
+
+    /// The harness a run actually runs on, given the harness its profile named (STUDIO-908): the
+    /// named one when this build implements it, else the configured backend. Mirrors the fallback
+    /// `spawn_worker` makes (STUDIO-902) — an unrecognized or unimplemented name runs on the
+    /// backend with a warning rather than refusing — so the review model this resolves to is the
+    /// model the run really uses.
+    pub(crate) fn harness_actually_run(&self, named: &str) -> String {
+        if !named.is_empty() && crate::effective::harness_is_implemented(named) {
+            named.to_string()
+        } else {
+            self.configured_backend()
+        }
+    }
+
+    /// The harness a review dispatched to `iss` will ACTUALLY run on (STUDIO-908), resolved the
+    /// same way [`spawn_worker`](Orchestrator::spawn_worker) will resolve the runner. Used by
+    /// `dispatch_review` to refuse a review whose reviewer's harness cannot serve the operator's
+    /// `review.model` BEFORE any watch-set write, rather than after the row says in-flight.
+    pub(crate) fn review_harness_for(&self, iss: &Issue) -> String {
+        let Some(teams) = self.teams.as_ref().filter(|t| t.enabled) else {
+            return self.configured_backend();
+        };
+        let named = self
+            .route_identity(teams, iss)
+            .identity
+            .map_or_else(String::new, |id| self.identity_harness(teams, &id));
+        self.harness_actually_run(&named)
     }
 
     /// Whether this candidate must be **held this tick** for want of a team assignment
@@ -876,6 +952,10 @@ impl Orchestrator {
                     model: p.model,
                     effort: p.effort,
                 },
+                // Empty means INHERIT the configured `agent.backend` (STUDIO-902), on the same
+                // terms as `model`/`effort` above and for the same reason: every built-in profile
+                // ships it empty, so this changes nothing until an operator writes one.
+                harness: p.harness,
             },
             Err(e) => {
                 tracing::error!(
@@ -1063,8 +1143,23 @@ impl Orchestrator {
     /// `enqueue_event` no-ops on the zero `run_id` a disabled store leaves
     /// behind. The DURABLE work history lives in the room log (§0.11.7); these
     /// rows are pruned with their runs and are the per-run timeline copy.
+    ///
+    /// The model=/effort= suffix is composed HERE, from `re.model_override` — the run's FINAL
+    /// override — rather than from `td.model_override` (STUDIO-901 finding 1). By the time
+    /// `retry.rs` calls this, a review dispatch has already applied `review.model`/`review.effort`
+    /// on top of the routed teammate's own profile, so this is the only value that can never
+    /// disagree with what the agent was actually spawned with. For an ordinary ticket dispatch
+    /// `re.model_override` still equals `td.model_override` (nothing overwrites it), so this stays
+    /// byte-identical to the STUDIO-868 behaviour.
     pub(crate) fn record_route_event(&self, re: &mut RunningEntry, td: &TeamsDispatch) {
         re.event_seq += 1;
+        let mut text = td.text.clone();
+        if !re.model_override.model.is_empty() {
+            text.push_str(&format!(" model={}", re.model_override.model));
+        }
+        if !re.model_override.effort.is_empty() {
+            text.push_str(&format!(" effort={}", re.model_override.effort));
+        }
         self.enqueue_event(
             re.run_id,
             store::EventRow {
@@ -1072,7 +1167,7 @@ impl Orchestrator {
                 at: crate::persist::rfc3339(re.started_at),
                 kind: td.kind.to_string(),
                 tool: String::new(),
-                text: td.text.clone(),
+                text,
             },
         );
     }

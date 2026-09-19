@@ -134,6 +134,19 @@ fn raw_from_config(c: &Config) -> Raw {
     r.claude.stall_timeout_ms = Some(c.claude.stall_timeout_ms);
     r.claude.extra_args = c.claude.extra_args.clone();
     r.claude.billing_guard = c.claude.billing_guard;
+    // opencode (STUDIO-902). Encoded unconditionally like every other block; a zero-value
+    // `Opencode` round-trips to an `opencode:` section of defaults, exactly as an untouched
+    // `codex:` does.
+    r.opencode.command = c.opencode.command.clone();
+    r.opencode.model = c.opencode.model.clone();
+    r.opencode.variant = c.opencode.variant.clone();
+    r.opencode.agent = c.opencode.agent.clone();
+    r.opencode.auto_approve = c.opencode.auto_approve;
+    r.opencode.turn_timeout_ms = Some(c.opencode.turn_timeout_ms);
+    r.opencode.stall_timeout_ms = Some(c.opencode.stall_timeout_ms);
+    r.opencode.extra_args = c.opencode.extra_args.clone();
+    r.opencode.state_root = c.opencode.state_root.clone();
+    r.opencode.auth_source = c.opencode.auth_source.clone();
     // ultracode defaults to false; emit only when true so an unset/false knob is pruned.
     if c.claude.ultracode {
         r.claude.ultracode = Some(true);
@@ -450,6 +463,58 @@ mod tests {
     fn re_encode_decode(c: &Config) -> Config {
         let def = encode(c).expect("encode");
         decode(&def).expect("re-decode")
+    }
+
+    // ⚠️ A DATA-LOSS class, not a formatting one (STUDIO-902). The console's config editor knows
+    // nothing about `opencode:`, and its write path (`httpapi::config_view::apply_typed_config`)
+    // starts from the on-disk `Config` and overwrites only what the request carries. So the block
+    // survives a save ONLY if Encode writes back what Decode read. If it did not, an operator who
+    // pressed Save in Settings would silently lose their whole opencode configuration.
+    #[test]
+    fn an_opencode_block_survives_an_encode_decode_round_trip() {
+        let c1 = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\n\
+             opencode:\n  command: /opt/homebrew/Cellar/opencode/1.18.30/bin/opencode\n  \
+             model: fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash\n  variant: high\n  \
+             agent: build\n  auto_approve: false\n  turn_timeout_ms: 900000\n  \
+             stall_timeout_ms: 60000\n  extra_args: [--log-level, DEBUG]\n  \
+             state_root: /var/opencode\n  auth_source: /home/op/auth.json\n",
+            "body",
+        );
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(
+            c2.opencode, c1.opencode,
+            "the opencode block must round-trip intact"
+        );
+        // Spot-check the fields most easily lost: an explicit `false` pointer, and the two paths.
+        assert_eq!(
+            c2.opencode.auto_approve,
+            Some(false),
+            "an explicit false must survive"
+        );
+        assert_eq!(c2.opencode.variant, "high");
+        assert_eq!(c2.opencode.state_root, "/var/opencode");
+        assert_eq!(c2.opencode.auth_source, "/home/op/auth.json");
+        assert_eq!(c2.opencode.extra_args, vec!["--log-level", "DEBUG"]);
+        assert_eq!(c2.opencode.stall_timeout_ms, 60000);
+    }
+
+    /// A workflow with NO `opencode:` key decodes to defaults and re-encodes to the same defaults —
+    /// so a round trip is stable rather than accumulating. Encode DOES materialize the block (a
+    /// non-empty default `command` survives `prune_empty`), which is exactly what the `codex:` block
+    /// has always done; it is the established shape, not a new one.
+    #[test]
+    fn an_absent_opencode_block_round_trips_to_stable_defaults() {
+        let c1 = decode_map(
+            "tracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n  active_states: [Todo]\n",
+            "body",
+        );
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(c2.opencode, c1.opencode);
+        assert_eq!(c2.opencode.command, "opencode");
+        assert_eq!(c2.opencode.auto_approve, Some(true), "absent ⇒ enabled");
+        // Stable under a second trip: Encode/Decode must be a fixed point here.
+        assert_eq!(re_encode_decode(&c2).opencode, c2.opencode);
     }
 
     /// Look up a nested `config[outer][inner]` value in an encoded front-matter map.

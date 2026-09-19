@@ -19,6 +19,7 @@ use rhapsody_core::Project;
 use rhapsody_httpapi::{
     ConfigValidateError, HistoryStore, RunActionError, SnapshotError, StateProvider,
 };
+use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -32,8 +33,8 @@ use rhapsody_orchestrator::{
     RefreshResult, ReloadError, ResumeResult, RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
-    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ReviewWatchRow, RunFilter, RunMessage,
-    RunSummary, Store, StoreError,
+    DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens, ReviewWatchRow,
+    RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, Store, StoreError,
 };
 
 /// Narrows the orchestrator's full [`Store`] handle to the httpapi read-only [`HistoryStore`]. The
@@ -78,6 +79,21 @@ impl HistoryStore for HistoryView {
     }
     fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
         self.0.load_review_watch()
+    }
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
+        self.0.run_provenance(run_id)
+    }
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
+        self.0.load_run_provenances(run_ids)
+    }
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
+        self.0.tokens_by_provider(since)
+    }
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError> {
+        self.0.run_costs()
     }
 }
 
@@ -212,6 +228,17 @@ impl StateProvider for DaemonState {
 
     fn refresh(&self) -> RefreshResult {
         self.handle.refresh()
+    }
+
+    fn drain_status(&self) -> DrainStatus {
+        self.handle.drain_status()
+    }
+
+    fn set_drain(&self, active: bool, reason: DrainReason) -> DrainStatus {
+        // `Utc::now()` rather than the orchestrator's injectable clock: the handle is off-loop and
+        // the loop-owned `now` is not reachable from here. The timestamp is an operator annotation
+        // (how long has this drain been waiting), never an input to a decision.
+        self.handle.set_drain(active, reason, Utc::now())
     }
 
     fn workflow_path(&self) -> &str {

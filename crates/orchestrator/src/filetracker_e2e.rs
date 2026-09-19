@@ -709,6 +709,164 @@ async fn file_tracker_e2e_stop_leaves_no_tool_child_that_escaped_the_group() {
     teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
 }
 
+/// (6) STUDIO-880, Rhapsody-only: a DRAIN lets an in-flight run finish and leaves no agent process.
+///
+/// This is the acceptance criterion the whole feature exists for, so it is asserted on process state
+/// and on the stored outcome — never on a return value. Four things have to hold together:
+///
+/// 1. The run is **not interrupted**. It reaches its turn boundary and winds down normally, so the
+///    row records `continued` (claim kept, continuation queued) rather than `interrupted`.
+/// 2. `counts.running` falls to **0 on its own** — nothing is cancelled here, and `teardown`'s
+///    cancel comes after every assertion.
+/// 3. **No agent process survives.** The agent exited of its own accord and was reaped, so its
+///    process group is empty. That is the whole difference from today's restart, which SIGTERMs the
+///    daemon's group and SIGKILLs 5s later: a SIGKILL means `Drop` never runs, so `KillTreeOnDrop`
+///    never runs, and the live `claude` and everything under it are orphaned. After a drain there is
+///    nothing left to kill, so there is nothing a kill could orphan.
+/// 4. The gate **holds**: a tick after the drain claims nothing, even with a continuation due.
+///
+/// The fixture spawns a `setpgid`-ing child (`FAKE_CLAUDE_ESCAPE`) deliberately. Scenario (4)'s
+/// stub kept everything inside the agent's own group and so passed on the very day STUDIO-871's
+/// defect was live; a drain test built on that shape would re-certify the same blind spot. Here the
+/// run really does own a process the daemon's group kill cannot reach, so assertion 3 is about a
+/// tree, not a single pid.
+///
+/// What this does NOT claim: that a tool child the agent BACKGROUNDED AND ABANDONED is collected.
+/// A clean turn end reaps the agent and disarms the tree kill — `runner.rs` disarms deliberately,
+/// because the pid is reaped and may be recycled, and killing a recycled pid's tree would be far
+/// worse than the leak. That is unchanged by draining, and is the same on every ordinary clean run
+/// end today. The drain's claim is narrower and is what assertion 3 pins: it removes the SIGKILL
+/// orphan class, where the agent ITSELF survives.
+///
+/// STUDIO-860's flake shape does not reach here, for scenario (5)'s reason: the running entry comes
+/// from a real `on_tick` dispatch, which stamps `started_at` from `(o.now)()` itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tracker_e2e_drain_finishes_the_run_and_leaves_no_agent_process() {
+    let dir = TempDir::new();
+    let src = dir.child("issues.json");
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "i1",
+            identifier: "SMK-1",
+            title: "Smoke",
+            state: "Todo",
+            team_id: "team-1",
+            latest_summon_at: "",
+        }],
+    );
+    // Escape (so the run owns a process outside the daemon's group) and a turn slow enough that the
+    // drain is reliably armed while the FIRST turn is still in flight — which is the case that
+    // matters: the drain must let that turn finish, not cut it short.
+    let escaped_report = dir.child("escaped.pgid");
+    let mut ft = build_file_tracker_orch(
+        &src,
+        &format!("FAKE_CLAUDE_SLEEP_S=2 FAKE_CLAUDE_ESCAPE={escaped_report}"),
+    );
+
+    // A budget far larger than the shared builder's 2, so ONLY the drain can end this loop inside
+    // the pump window below. Without it the run would reach its own `max_turns` in about the time
+    // the fixture allows, and this test would stay green with the turn-boundary check deleted.
+    // The file tracker never moves the ticket, so it stays active for every one of those turns.
+    ft.o.eff
+        .as_mut()
+        .expect("the fixture always loads an effective config")
+        .max_turns = 30;
+
+    ft.o.on_tick().await;
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(10), |o| o
+            .running
+            .get("i1")
+            .is_some_and(|re| re.pgid != 0))
+        .await,
+        "the agent never reported a pid; running={}",
+        ft.o.running.len()
+    );
+    let pgid = {
+        let re =
+            ft.o.running
+                .get("i1")
+                .expect("the worker should be running");
+        re.pgid
+    };
+    let escaped = read_escaped_pgid(&escaped_report, Duration::from_secs(10)).await;
+    // Armed before the first assertion and on whatever was reported, exactly as scenario (5) does:
+    // a red run must not leave a `sleep 3600` on the machine for good.
+    let _reaper = GroupReaper(escaped);
+    assert!(
+        escaped > 1,
+        "the stub never reported an escaped process group at {escaped_report}"
+    );
+    assert_ne!(
+        escaped, pgid,
+        "the stub did not escape the agent's group, so this fixture cannot prove containment"
+    );
+
+    // The drain, asked for while the first turn is in flight.
+    assert!(
+        ft.o.drain
+            .arm((ft.o.now)(), crate::drain::DrainReason::Update),
+        "this is the call that armed the drain"
+    );
+
+    // (2) counts.running falls to 0 on its own — nothing here cancels anything.
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(30), |o| o
+            .running
+            .is_empty()
+            && count_runs(o) >= 1)
+        .await,
+        "the drained run never finished on its own; running={}",
+        ft.o.running.len()
+    );
+
+    // (1) and it finished rather than being interrupted.
+    let runs = ft.store.list_runs(RunFilter::default()).expect("list runs");
+    assert_eq!(runs.len(), 1, "want exactly 1 run, got {runs:?}");
+    assert_eq!(
+        runs[0].outcome, OUTCOME_CONTINUED,
+        "a drained run winds down at its turn boundary and keeps its claim; \
+         an `interrupted` here means the drain cut a live turn, got {runs:?}"
+    );
+
+    // (3) no agent process survives: it exited and was reaped, so its group is empty.
+    assert!(
+        wait_group_quiet(pgid, Duration::from_secs(15)).await,
+        "an agent process survived the drained run: group {pgid} still runs {:?}",
+        group_live_rows(pgid)
+    );
+
+    // (4) the gate holds on BOTH dispatch paths. The run wound down as a continuation, so a retry
+    // is queued and due within ~1s — and a retry dispatches from `on_retry`, not from the tick. Pump
+    // well past that, driving ticks too, and assert nothing was dispatched and nothing new claimed.
+    //
+    // `pump` returning false is the PASS here: the condition it waits for is the failure.
+    let claimed_before = ft.o.claimed.len();
+    ft.o.on_tick().await;
+    let redispatched = pump(&mut ft.o, &mut ft.rx, Duration::from_secs(5), |o| {
+        !o.running.is_empty() || count_runs(o) > 1
+    })
+    .await;
+    assert!(
+        !redispatched,
+        "a draining daemon re-dispatched the continuation; running={} runs={}",
+        ft.o.running.len(),
+        count_runs(&ft.o)
+    );
+    assert_eq!(
+        ft.o.claimed.len(),
+        claimed_before,
+        "a draining daemon claimed something after the drain"
+    );
+    assert!(
+        ft.o.retry_attempts.contains_key("i1"),
+        "the parked continuation must still be queued — a drain defers work, it never drops it"
+    );
+
+    teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+}
+
 /// Polls until the stub has written the process group it escaped into, returning `0` if it never
 /// does. Returns rather than panics so the caller can arm its reaper on whatever came back before
 /// asserting — a report that arrives a moment after the timeout still names a real `sleep 3600`.

@@ -28,7 +28,7 @@ const STATE_POLL_INTERVAL_MS: i64 = 2000;
 /// is intentionally NOT emitted here — the per-project rollup is served by the agents/projects
 /// surfaces, not `/state` (matching Go's `stateJSON`, which omits it).
 pub fn render(s: &Snapshot) -> Value {
-    json!({
+    let mut out = json!({
         "status": STATE_STATUS_OK,
         "poll_interval_ms": STATE_POLL_INTERVAL_MS,
         "generated_at": rfc3339_or_empty(s.generated_at),
@@ -45,7 +45,59 @@ pub fn render(s: &Snapshot) -> Value {
             "seconds_running": s.totals.seconds_running,
         },
         "rate_limits": s.rate_limits.iter().map(rate_limit_json).collect::<Vec<_>>(),
-    })
+    });
+    // STUDIO-880: the drain key is emitted ONLY while a drain is armed.
+    //
+    // That conditional is deliberate and load-bearing. `/api/v1/state` is byte-pinned to the Go
+    // daemon's `harness/fixtures/api/state.json` golden, so an unconditional Rhapsody-only key here
+    // would be parity drift — the reason `teams_enabled` lives on `/api/v1/version` instead. A key
+    // that appears only in a state the Go daemon cannot be in leaves every payload it CAN produce
+    // byte-identical, which is what `state_json_matches_state_fixture` and
+    // `a_daemon_that_is_not_draining_emits_no_drain_key` pin between them. Clients read it as
+    // `state.drain?.active`.
+    if let Some(d) = &s.drain
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "drain".to_string(),
+            json!({
+                "active": d.active,
+                "reason": d.reason.as_str(),
+                "requested_at": d.requested_at.map(rfc3339_or_empty).unwrap_or_default(),
+            }),
+        );
+    }
+    // STUDIO-898: the review_divergence key is emitted ONLY when the reconciliation sweep has
+    // something to report, for the `drain` key's reason above and under the same two guards — the
+    // golden comparison plus `a_healthy_daemon_emits_no_review_divergence_key`, which asserts the
+    // ABSENCE directly so this cannot decay into an unconditional `[]` on a Go-pinned surface.
+    //
+    // The DETAIL and not just a flag, because the advisory on `/api/v1/projects` is a fixed string
+    // and an operator's next question is always "which one". Clients read
+    // `state.review_divergence?.length`.
+    if !s.review_divergence.is_empty()
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "review_divergence".to_string(),
+            Value::Array(
+                s.review_divergence
+                    .iter()
+                    .map(|d| {
+                        json!({
+                            "pr": d.pr,
+                            "kind": d.kind.as_str(),
+                            "detail": d.kind.detail(),
+                            "ticket": d.ticket,
+                            "reviewer": d.reviewer,
+                            "stale_secs": d.stale_secs,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    out
 }
 
 /// The flat `RunningSession` the SPA expects: nested tokens flattened, `last_event` renamed
@@ -214,6 +266,102 @@ mod tests {
         );
         // counts reflect the row.
         assert_eq!(rendered["counts"]["running"], 1);
+    }
+
+    // STUDIO-880, the parity guard: a daemon that is not draining emits NO `drain` key at all.
+    //
+    // `state_json_matches_state_fixture` above already proves the whole non-draining payload is
+    // byte-identical to the Go golden, but it would keep proving that even if this key were
+    // rendered as `null` or `false` and the golden were quietly recaptured. This asserts the
+    // ABSENCE directly, so the conditional cannot decay into an unconditional Rhapsody-only key on
+    // a surface that is pinned to Go's.
+    #[test]
+    fn a_daemon_that_is_not_draining_emits_no_drain_key() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        let rendered = render(&o.build_snapshot());
+        assert!(
+            rendered.get("drain").is_none(),
+            "a non-draining daemon must serve the Go-identical payload, got: {rendered}"
+        );
+    }
+
+    // STUDIO-898, the same parity guard for the same reason: a healthy daemon emits NO
+    // `review_divergence` key. The sweep reports nothing on the overwhelming majority of ticks, so
+    // an unconditional `[]` here would be a Rhapsody-only key on every payload of a Go-pinned
+    // surface — and `state_json_matches_state_fixture` would keep passing if the golden were
+    // recaptured with it. This asserts the ABSENCE directly.
+    #[test]
+    fn a_healthy_daemon_emits_no_review_divergence_key() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        let rendered = render(&o.build_snapshot());
+        assert!(
+            rendered.get("review_divergence").is_none(),
+            "a healthy daemon must serve the Go-identical payload, got: {rendered}"
+        );
+    }
+
+    // And the other half: a reported divergence reaches `/api/v1/state` with enough to act on —
+    // WHICH pull request, which ticket, how it diverged and for how long. The advisory on
+    // `/api/v1/projects` is a fixed string, so this is the only surface that can say which.
+    #[test]
+    fn a_reported_divergence_reaches_state_with_its_detail() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.review_divergence = vec![crate::reviewreconcile::Divergence {
+            pr: "makewhatis/rhapsody#164".to_string(),
+            kind: crate::reviewreconcile::DivergenceKind::ChangesRequestedNoRun,
+            ticket: "STUDIO-893".to_string(),
+            reviewer: "jimmy".to_string(),
+            stale_secs: 21_600,
+            auto_merge_reason: None,
+        }];
+
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["review_divergence"]
+            .as_array()
+            .expect("review_divergence is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["pr"], "makewhatis/rhapsody#164");
+        assert_eq!(rows[0]["kind"], "changes_requested_no_run");
+        assert_eq!(rows[0]["ticket"], "STUDIO-893");
+        assert_eq!(rows[0]["reviewer"], "jimmy");
+        assert_eq!(rows[0]["stale_secs"], 21_600);
+        // The human sentence travels with it: a console must not have to own a copy of the wording,
+        // which is how the two drift apart.
+        assert_eq!(
+            rows[0]["detail"],
+            "a reviewer asked for changes and the ticket has had no run since"
+        );
+    }
+
+    // And the other half: while a drain IS armed the key appears, carrying the two annotations an
+    // operator needs to tell a deliberate pause from a wedged daemon.
+    #[test]
+    fn a_draining_daemon_reports_the_drain_on_state() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        o.drain.arm(now, crate::drain::DrainReason::Update);
+
+        let rendered = render(&o.build_snapshot());
+        let drain = &rendered["drain"];
+        assert_eq!(drain["active"], true);
+        assert_eq!(drain["reason"], "update");
+        assert_eq!(
+            drain["requested_at"], "2026-05-28T12:00:00Z",
+            "the drain reports when it was asked for, so a waiter can say how long it has run"
+        );
+        // Cancelling takes the key away again rather than leaving `active: false` behind.
+        o.drain.disarm();
+        assert!(
+            render(&o.build_snapshot()).get("drain").is_none(),
+            "a cancelled drain returns the payload to its Go-identical shape"
+        );
     }
 
     // rate_limits always serializes as an array (never null), matching the fixture's `[]`.

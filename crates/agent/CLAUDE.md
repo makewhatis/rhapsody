@@ -13,12 +13,14 @@ no `Cargo.toml` of its own and is just the crate's second backend, not a separat
 | `src/humanize.rs` | `humanize.go` | stream-json line → `LogEntry` for the `/log` API/dashboard |
 | `src/fake.rs` | `internal/agent/fake` | scriptable in-process backend, the orchestrator's test double |
 | `src/proctree.rs` | — | harness-agnostic process-TREE kill (`kill_tree`, `KillTreeOnDrop`); no Go counterpart |
+| `src/harness.rs` | — | the pluggable-harnesses contract (`HarnessSpec`/`HarnessCapabilities`/`Harness`, STUDIO-900); no Go counterpart — the frozen reference runs one backend. `Harness: Runner`, so `Runner`/`Session` stay the only traits the orchestrator schedules against |
 | `src/claude/mod.rs` | `internal/agent/claude` | re-exports; module doc lists the five submodules' Go files 1:1 |
 | `src/claude/args.rs` | `args.go` | `Config` + `build_args`/`split_command` |
 | `src/claude/billing.rs` | `billing.go` | env-scrub name sets + billing-guard decisions |
 | `src/claude/mcpinject.rs` | `mcpinject.go` | per-workspace `.symphony-mcp.json` merge + "me" identity env |
 | `src/claude/parse.rs` | `parse.go` | one stream-json line → normalized `Event`/`TurnResult` |
-| `src/claude/runner.rs` | `runner.go` | the subprocess `Runner`/`Session` impl; wires the four modules above |
+| `src/claude/runner.rs` | `runner.go` | the subprocess `Runner`/`Session` impl; wires the four modules above; also implements `harness::Harness` for `Runner` (STUDIO-900) — its declared `HarnessCapabilities` live next to the behavior they describe |
+| `src/opencode/*` | — | the SECOND backend (STUDIO-902); no Go counterpart. The same module split as `claude/` (`args`/`parse`/`mcpinject`/`runner`) plus `state` (the per-run `XDG_DATA_HOME`), built against the committed captures in `harness/harness-spike/opencode/`. Read its `mod.rs` first: it tabulates every spike finding against the module that implements it |
 | `tests/fake_claude_gate.rs` | — | P4 phase gate: runs the real Claude `Runner` against the committed `harness/stubs/fake-claude*` and diffs the humanized output against `harness/fixtures/runs/*.jsonl` |
 
 ## Architecture — reading order
@@ -41,12 +43,17 @@ to understand the crate's actual behavior, not any single module in isolation:
   spans — the leader's group unconditionally, so STUDIO-840's guarantee holds even when `ps` cannot
   be read. It lives outside `claude/` deliberately: a future opencode or codex backend arms the same
   `KillTreeOnDrop`. This crate is Unix-only as written (`libc::kill`, `process_group`); there's no
-  Windows path.
-- **stdin is an operator mailbox (INF-250).** stdin stays open after the initial prompt; a second
-  `mpsc::Receiver<String>` (passed the SAME channel across continuation turns) is drained inside the
-  same `tokio::select!` as the stdout scanner, folding queued operator messages into the live turn.
-  The mailbox arm is gated `if mailbox_open && !terminal_seen` and stdin is dropped the instant a
-  terminal result is classified — "no write after result" is structural, not just documented.
+  Windows path. (Since STUDIO-902 that "future opencode backend" exists and arms exactly this
+  guard — its own runner test asserts an escaped tool child dies with the turn.)
+- **stdin is an operator mailbox (INF-250)** — for claude. stdin stays open after the initial
+  prompt; a second `mpsc::Receiver<String>` (passed the SAME channel across continuation turns) is
+  drained inside the same `tokio::select!` as the stdout scanner, folding queued operator messages
+  into the live turn. The mailbox arm is gated `if mailbox_open && !terminal_seen` and stdin is
+  dropped the instant a terminal result is classified — "no write after result" is structural, not
+  just documented. ⚠️ It is NOT a crate-wide assumption: `harness::StdinPolicy` declares the
+  requirement per backend, and `opencode` closes stdin at start (its prompt is an argv positional),
+  so that backend has no mailbox, declares `Steering::BetweenTurns`, and logs any message it could
+  not deliver rather than dropping it silently.
 - **Billing guard is fail-closed and per-turn.** Every turn's first `system`/`init` line must report
   `apiKeySource == "none"` (checked once per turn via `billing_checked`, since `--resume` re-emits its
   own init). A non-`"none"` source kills the process tree immediately (`BillingGuard`); a result
@@ -84,9 +91,17 @@ to understand the crate's actual behavior, not any single module in isolation:
 - `runner.rs`'s own tests spawn `bash <script>` "fake claude" scripts written inline per test (not
   the committed `harness/stubs/fake-claude`) to control stream-json output precisely. Every test that
   invokes `run_turn` (which reads `std::env::vars_os()` for the scrub) must hold
-  `ENV_GUARD.read().await` first; the two tests that mutate process env with `set_var`/`remove_var`
-  must take the write lock instead. `std::env` is not internally synchronized in Rust the way Go's
-  `os` package is — add the read-lock line to any new `run_turn`-invoking test or it can race.
+  `crate::ENV_GUARD.read().await` first; the two tests that mutate process env with
+  `set_var`/`remove_var` must take the write lock instead. `std::env` is not internally synchronized
+  in Rust the way Go's `os` package is — add the read-lock line to any new `run_turn`-invoking test
+  or it can race. The guard lives at the CRATE root (STUDIO-902), not in one backend's test module:
+  both backends' runners read the environment, so a per-module guard would serialize each backend
+  against itself and against nothing else.
+- `src/opencode/runner.rs`'s tests follow the same pattern, with one addition worth copying: its
+  fake CLI REPRODUCES the hazard (it refuses a state directory already in use, exactly as a real
+  turn losing the `database is locked` race does — zero events, exit 1) rather than always
+  succeeding, so deleting the per-run isolation turns the concurrency test red instead of leaving it
+  green.
 - `tests/fake_claude_gate.rs` is the crate's one integration test: it drives the *real*
   `claude::Runner` against the committed `harness/stubs/fake-claude*` scripts and diffs the humanized
   event stream against `harness/fixtures/runs/*.jsonl` (see `harness/CLAUDE.md`). It resolves stub

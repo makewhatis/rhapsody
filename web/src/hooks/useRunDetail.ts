@@ -5,11 +5,13 @@ import {
   fetchRunDetail,
   fetchRunIdentityEvents,
   fetchRunMessages,
+  fetchRunProvenance,
   fetchRunTranscript,
   type EventHit,
   type IssueHistoryResponse,
   type RunDetail,
   type RunMessage,
+  type RunProvenance,
   type RunTranscriptResponse,
 } from "@/lib/api";
 
@@ -35,15 +37,33 @@ export function useRunDetail(runId: number, enabled = true) {
   });
 }
 
+// useRunProvenance fetches what a run actually ran on (GET /api/v1/runs/{id}/provenance,
+// STUDIO-909). Provenance is written once at dispatch and never changes, so this never polls and
+// never goes stale — one fetch per run id, unlike the run detail it sits beside.
+export function useRunProvenance(runId: number, enabled = true) {
+  return useQuery<RunProvenance>({
+    queryKey: ["run-provenance", runId],
+    queryFn: () => fetchRunProvenance(runId),
+    enabled: enabled && runId > 0,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  });
+}
+
 // useTranscript fetches a run's humanized transcript. While the run is in flight it streams
 // (polls @1.5s, never stale); once finished it freezes (no interval, infinite staleTime). On the
 // running→finished edge it fires exactly one extra refetch to capture the final lines.
-export function useTranscript(runId: number, inFlight: boolean, enabled = true) {
+export function useTranscript(
+  runId: number,
+  inFlight: boolean,
+  enabled = true,
+  pollMs = 1500,
+) {
   const query = useQuery<RunTranscriptResponse>({
     queryKey: ["run-transcript", runId],
     queryFn: () => fetchRunTranscript(runId),
     enabled: enabled && runId > 0,
-    refetchInterval: inFlight ? 1500 : false,
+    refetchInterval: inFlight ? pollMs : false,
     staleTime: inFlight ? 0 : Infinity,
     refetchOnWindowFocus: false,
   });

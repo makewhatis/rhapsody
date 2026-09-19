@@ -22,6 +22,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
 use crate::app::App;
+use crate::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_UPDATE};
 
 /// Emitted (once, non-blocking) by the quiet on-launch check when a newer version exists, so the UI can
 /// badge the update affordance without the user asking. Payload: [`UpdateInfo`].
@@ -67,6 +68,11 @@ pub struct InstallReport {
     pub installed: bool,
     /// The active-run count that blocked an unforced install (0 when the install was allowed to proceed).
     pub blocked_active_runs: i64,
+    /// What a requested drain did (STUDIO-880), or `None` when none was asked for. Present on BOTH
+    /// outcomes on purpose: an install that proceeded because the drain worked and one that was
+    /// deferred because the drain's budget expired must be distinguishable to whoever is watching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainOutcome>,
 }
 
 /// Shared updater session state: the [`Update`] the last successful `check()` found (so download/install
@@ -78,6 +84,41 @@ pub struct UpdateState {
     current: Mutex<Option<Update>>,
     /// Bytes from a completed [`update_download`], consumed by the next install; `None` until then.
     downloaded: Mutex<Option<Vec<u8>>>,
+}
+
+/// Logs a drain that did not settle the daemon, so an install that was deferred says why in the
+/// app's own output as well as in its return value. A drain that expired is the interesting case:
+/// nothing was interrupted and the install simply waits for the next graceful quit.
+fn tracing_note(outcome: &DrainOutcome) {
+    eprintln!(
+        "rhapsody-desktop: update install: the daemon did not settle ({outcome:?}); \
+         deferring the install to the next graceful quit"
+    );
+}
+
+/// Whether an install should ask the daemon to settle before the guard reads the run count
+/// (STUDIO-880).
+///
+/// `force` WINS, and that is the whole content of this predicate: forcing means "install over live
+/// work", so waiting up to half an hour and then stopping the agents anyway is the worst of both.
+/// Pinned rather than inlined because `drain && !force` reads like a detail and is a decision — an
+/// edit to a bare `drain` would make every forced install sit through the budget first.
+pub(crate) fn should_drain_first(drain: bool, force: bool) -> bool {
+    drain && !force
+}
+
+/// Whether a drain outcome left the daemon settled, so the guard below it is reading a settled count
+/// rather than a busy one.
+///
+/// `NotRunning` counts: a daemon that is not running has nothing in flight to protect, which is the
+/// property the wait exists to establish. Everything else — an expired budget above all — did NOT
+/// settle it, and falls through to the ordinary refuse-and-defer path with the outcome attached, so
+/// an expired budget never reads as a plain "runs are active".
+pub(crate) fn drain_settled(outcome: &DrainOutcome) -> bool {
+    matches!(
+        outcome,
+        DrainOutcome::AlreadyIdle | DrainOutcome::Drained { .. } | DrainOutcome::NotRunning
+    )
 }
 
 /// The install guard's pure core, unit-tested headlessly: an install may proceed to restart the app only
@@ -247,7 +288,29 @@ pub async fn update_install(
     handle: AppHandle,
     state: State<'_, UpdateState>,
     force: bool,
+    drain: bool,
 ) -> Result<InstallReport, String> {
+    // STUDIO-880: `drain` makes "upgrade now, cleanly" possible for the first time. The deferred
+    // marker below exists precisely because an install COULD NOT interrupt work; a drain removes
+    // that constraint by letting the work finish instead of racing it.
+    //
+    // Ordering matters: drain BEFORE the guard reads the count, so the guard then sees the settled
+    // daemon rather than the busy one. `force` still skips everything, and is still the only way to
+    // install over live work.
+    let mut drained = None;
+    if should_drain_first(drain, force) {
+        let outcome = app
+            .drain_and_wait(DEFAULT_DRAIN_BUDGET, REASON_UPDATE)
+            .await;
+        if !drain_settled(&outcome) {
+            // The drain did not settle the daemon — expired budget, or it could not even be asked
+            // for. Fall through to the guard, which refuses and defers exactly as before; the
+            // `drain` field is what tells the caller WHICH of those happened, so an expired budget
+            // never reads as an ordinary "runs are active" refusal.
+            tracing_note(&outcome);
+        }
+        drained = Some(outcome);
+    }
     let active = app.active_run_count().await;
     if !may_install_now(active, force) {
         // Refuse the restart now; defer to the next graceful quit when work has drained.
@@ -255,6 +318,7 @@ pub async fn update_install(
         return Ok(InstallReport {
             installed: false,
             blocked_active_runs: active,
+            drain: drained,
         });
     }
     install_update(&handle, &state, &app).await?;
@@ -329,6 +393,69 @@ pub async fn install_pending_on_quit(handle: AppHandle, app: App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- STUDIO-880: the drain-on-install decisions -------------------------------------------
+
+    // Round 1 plumbed this branch end to end and then left it unreachable — no caller passed
+    // `drain: true` and nothing here exercised it. These two predicates are what that branch
+    // decides; the wait itself belongs to `drain.rs` and is tested there on a paused clock.
+    #[test]
+    fn a_forced_install_never_waits_for_a_drain() {
+        assert!(
+            should_drain_first(true, false),
+            "asked to drain, not forced → settle the daemon first"
+        );
+        assert!(
+            !should_drain_first(true, true),
+            "force means install over live work; waiting the whole budget and THEN stopping the \
+             agents is the worst of both"
+        );
+        assert!(
+            !should_drain_first(false, false),
+            "no drain asked for → no wait"
+        );
+        assert!(
+            !should_drain_first(false, true),
+            "no drain asked for → no wait, forced or not"
+        );
+    }
+
+    #[test]
+    fn only_a_settled_daemon_lets_the_install_proceed() {
+        assert!(
+            drain_settled(&DrainOutcome::AlreadyIdle),
+            "nothing was in flight"
+        );
+        assert!(
+            drain_settled(&DrainOutcome::Drained { waited_secs: 12 }),
+            "the runs finished"
+        );
+        assert!(
+            drain_settled(&DrainOutcome::NotRunning),
+            "a daemon that is not running has no work to protect"
+        );
+        // The one that matters: an expired budget must NOT read as a drained daemon, or the install
+        // would proceed to restart over exactly the work the drain existed to let finish.
+        assert!(
+            !drain_settled(&DrainOutcome::Expired {
+                running: 1,
+                waited_secs: 1800
+            }),
+            "the budget ran out with work still in flight"
+        );
+        assert!(
+            !drain_settled(&DrainOutcome::RequestFailed {
+                error: "connection refused".into()
+            }),
+            "the daemon was never even asked, so nothing settled"
+        );
+        assert!(
+            !drain_settled(&DrainOutcome::RestartFailed {
+                error: "spawn failed".into()
+            }),
+            "not reachable from `drain_and_wait`, but it is not a settled daemon either"
+        );
+    }
 
     // The guard is the safety core: with runs active an unforced install is refused (deferred), and only
     // `force` or a zero count lets it proceed to restart. Mirrors the spec's "never silently restart with

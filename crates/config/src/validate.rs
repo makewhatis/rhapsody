@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use chrono::Duration;
 use rhapsody_core::normalize_state;
 
+use crate::harness::HARNESS_NAMES;
 use crate::model::{
     CLAIM_MODE_ASSIGNEE, CLAIM_MODE_POOL, Config, DEPENDENCY_MODE_DAG, DEPENDENCY_MODE_DISABLED,
     DEPENDENCY_MODE_GRAPHITE, WORKSPACE_MODE_CLONE, WORKSPACE_MODE_WORKTREE,
@@ -131,7 +132,7 @@ pub fn validate(config: &mut Resolved) -> Result<(), ValidationError> {
             return Err(ValidationError::UnsupportedTrackerKind(other.to_string()));
         }
     }
-    if config.agent.backend != "claude" && config.agent.backend != "codex" {
+    if !HARNESS_NAMES.contains(&config.agent.backend.as_str()) {
         return Err(ValidationError::UnsupportedAgentBackend(
             config.agent.backend.clone(),
         ));

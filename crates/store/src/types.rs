@@ -158,6 +158,12 @@ pub struct RunFilter {
     pub since: String,
     /// exact match on runs.project_slug; "" => no project filter
     pub project: String,
+    /// Only meaningful for the ISSUE-paged listing ([`Store::list_issue_runs`]): keep an issue only
+    /// when its NEWEST run carries this outcome. Distinct from [`RunFilter::outcome`], which filters
+    /// BEFORE the per-issue partition and so returns each issue's newest run *with that outcome* —
+    /// often an old run of a finished ticket (STUDIO-931). "the issue's newest run" is not a
+    /// run-paged concept, so [`Store::list_runs`] ignores this. "" => no filter.
+    pub latest_outcome: String,
     /// <=0 => default page
     pub limit: i64,
     pub offset: i64,
@@ -188,6 +194,68 @@ pub struct RunSummary {
     pub project_slug: String,
     pub repo: String,
     pub team_id: String,
+}
+
+/// RunProvenance is what a run ACTUALLY ran on — the harness, the model and the provider — plus the
+/// origin of each configurable value, recorded at dispatch (STUDIO-909). Rhapsody-only: the frozen
+/// Go reference records none of it.
+///
+/// It lives in its own [`rhapsody_run_provenance`](crate::Store) table keyed by `run_id` rather than
+/// as columns on `runs`, because the `runs` DDL is byte-pinned to Go by the schema golden and that
+/// golden is recapturable ONLY from the real Go daemon — which can never emit these columns. Adding
+/// them to `runs` would turn `schema_matches_committed_golden` permanently red with no honest fix,
+/// so the store uses the documented Rhapsody-only mechanism (a `rhapsody_`-prefixed table) instead.
+/// See the README "Divergences" entry.
+///
+/// The values are a PROVENANCE RECORD, not a config echo: they are read once from the run that
+/// actually executed and persisted, so a later WORKFLOW.md hot-reload cannot rewrite history. A run
+/// started before this existed has no row and renders as unknown.
+///
+/// `harness_origin`/`model_origin` name the config key the value came from — `profile`,
+/// `review.model.opencode`, `agent.backend`, `claude.model` — so an invisible override becomes
+/// visible. `provider` is DERIVED once, at the same moment, from the recorded harness and model
+/// string, and never re-derived at render time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunProvenance {
+    pub harness: String,
+    /// The config key `harness` resolved from (e.g. `profile`, `agent.backend`).
+    pub harness_origin: String,
+    pub model: String,
+    /// The config key `model` resolved from (e.g. `profile`, `review.model.opencode`, `claude.model`).
+    pub model_origin: String,
+    /// Derived from the recorded harness + model, not from live config.
+    pub provider: String,
+}
+
+/// The windowed token tally for ONE provider — the cost question STUDIO-909 exists to answer
+/// ("what did Fireworks save us this week?"), which is unanswerable while a run's tokens cannot be
+/// attributed to a provider. Aggregated in SQL over the `runs` ⋈ `rhapsody_run_provenance` join so
+/// the figure never depends on which page a client happened to fetch, and bounded by the same
+/// `since` as `day_totals` so the split and the total describe one window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTokens {
+    /// The recorded provider; empty for a run that recorded none (a legacy row, or a harness whose
+    /// provider could not be determined). Empty is reported as its own bucket rather than dropped.
+    pub provider: String,
+    pub runs: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// One (issue key, provider) bucket of the whole-store token ledger — the raw material of the
+/// per-ticket cost split (STUDIO-926). The key is the run's OWN `issue_identifier`, so a review run
+/// (`pr:owner/repo#n@reviewer`) is a bucket of its own; folding it into the ticket it reviewed needs
+/// the review watch set and happens in the HTTP layer, not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunCostBucket {
+    pub issue_identifier: String,
+    /// The recorded provider; empty for a run that recorded none (a legacy row), reported as its
+    /// own bucket rather than dropped, exactly like [`ProviderTokens::provider`].
+    pub provider: String,
+    pub total_tokens: i64,
+    /// True when ANY run in the bucket ended without a clean `result` event (a floored figure).
+    pub usage_estimated: bool,
 }
 
 /// EventQuery is a cross-run text search over events (Phase 5 /api/v1/events).
@@ -353,4 +421,36 @@ pub struct ReviewWatchRow {
     /// "is this still worth watching" — WHY it stopped being open is the watcher's, and it lands
     /// on `status` as [`REVIEW_STATUS_DROPPED`].
     pub open: bool,
+}
+
+/// The newest summons Rhapsody has ever OBSERVED for one ticket — one row per ticket identifier,
+/// and the durable half of the summons re-engagement decision (STUDIO-885). No Go counterpart.
+///
+/// A summons is a durable fact: an `@symphony` comment that still exists on the pull request. The
+/// daemon nevertheless only ever SAW it as a transient one — GitHub enrichment asks for comments
+/// newer than `now - ghLookback` (five minutes), so `Issue::latest_summon_at` is re-derived from
+/// scratch every poll and reverts to unset the moment the comment ages out of that window. A
+/// ticket whose summons landed while the board was at its concurrency cap therefore lost the only
+/// thing that lifts `pr_suppressed`, and stayed suppressed for as long as the daemon ran.
+///
+/// Remembering the observation decouples the two: the comparison `pr_suppressed` actually makes —
+/// summons versus the ticket's LAST RUN START — is between two durable facts, so it keeps its
+/// meaning however long the ticket waits for a slot. It does NOT weaken the suppression: a ticket
+/// whose newest summons predates its last run start is still suppressed, which is the whole point
+/// of the rule.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SummonWatermark {
+    /// The ticket's tracker identifier (`STUDIO-879`) — the row's primary key. Identifier, not
+    /// opaque id, because that is the key `last_run_started_at` compares against.
+    pub identifier: String,
+    /// When the summons was posted, RFC3339 UTC at SECONDS precision with a `Z` suffix — the same
+    /// canonical form every other timestamp column in this store uses. Produced by
+    /// [`format_summon_at`](crate::format_summon_at) and by nothing else, so the column is
+    /// fixed-width and a lexicographic comparison (the retention cutoff in `prune`) is a
+    /// chronological one.
+    pub at: String,
+    /// The body of that SAME comment (INF-448 keeps time and body describing one comment), so a
+    /// re-engagement the watermark triggers can still seed the run with what the reviewer wrote.
+    /// Empty when the source could not surface one.
+    pub body: String,
 }

@@ -95,8 +95,20 @@ impl Orchestrator {
         let mut impl_load: Option<crate::teams::LoadSnapshot> = None;
         let mut impl_tally: HashMap<String, i64> = HashMap::new();
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
-        for iss in issues {
+        let mut issues = issues.into_iter();
+        while let Some(iss) = issues.next() {
             if global_remaining <= 0 {
+                // Name what the cap turned away before stopping (STUDIO-885). The candidates are
+                // sorted, so everything from `iss` onward is unexamined — and the fetch includes
+                // the daemon's OWN in-flight work, which `eligibility` would have dropped further
+                // down, so those are filtered out here rather than reported as waiting. Collected
+                // only on this branch, so a pass that never runs out of slots pays nothing.
+                let held: Vec<String> = std::iter::once(iss)
+                    .chain(issues.by_ref())
+                    .filter(|i| self.is_unworked_candidate(i, &running, &recovered_claims))
+                    .map(|i| i.identifier)
+                    .collect();
+                self.log_capacity_hold(&held, eff.max_concurrent);
                 break;
             }
             if recovered_claims.contains(&iss.identifier) {
@@ -291,8 +303,18 @@ impl Orchestrator {
         let mut reopen = Vec::new();
         let mut held_for_triage = false;
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
-        for ti in tagged {
+        let mut tagged = tagged.into_iter();
+        while let Some(ti) = tagged.next() {
             if global_remaining <= 0 {
+                // See the single-project ladder: the same diagnostic, same filter, on the pass a
+                // `projects:` install actually runs. Two ladders means two call sites or the
+                // feature is silently absent for whichever one is missing it.
+                let held: Vec<String> = std::iter::once(ti)
+                    .chain(tagged.by_ref())
+                    .filter(|t| self.is_unworked_candidate(&t.iss, &running, &recovered_claims))
+                    .map(|t| t.iss.identifier)
+                    .collect();
+                self.log_capacity_hold(&held, eff.max_concurrent);
                 break;
             }
             // The multi path always tags with a project (`pollAllProjects`, O7). A nil-proj entry
@@ -497,6 +519,8 @@ mod tests {
     use crate::testsupport::*;
 
     const SKIP_BLOCKED: &str = "skipping dispatch: blocked by non-terminal blocker";
+    const HELD_FOR_CAPACITY: &str =
+        "skipping dispatch: no global concurrency slot; candidates not considered this tick";
 
     /// A single-project select orchestrator (active `{todo, in progress}`, terminal `{done}`).
     /// Mirrors Go `orchForSelect` / `orchForSelectWithLog` (logging is captured via
@@ -787,6 +811,174 @@ mod tests {
     }
 
     // --- select_multi_test.go -----------------------------------------------------------------
+
+    // STUDIO-885: "the board is full" and "this ticket is correctly suppressed" were
+    // indistinguishable from outside — the first said nothing at all. A pass that runs out of
+    // global slots must name what it is holding, so an operator can tell a state that resolves
+    // itself from one that never will.
+    #[test]
+    fn a_pass_out_of_global_slots_names_what_it_held() {
+        let o = orch_for_select(1, HashMap::new(), None);
+        let input = vec![
+            issue("1", "A-1", "Todo"),
+            issue("2", "A-2", "Todo"),
+            issue("3", "A-3", "Todo"),
+        ];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert_eq!(ids(&got), vec!["A-1"], "cap 1 admits exactly one");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-2, A-3"),
+            "the unexamined tail of the sorted queue, named"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            ev.fields.get("max_concurrent").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    // The diagnostic is for a pass that ran OUT of slots, not for every pass: a board with room to
+    // spare must stay quiet, or the line joins the background it exists to be noticed against.
+    #[test]
+    fn a_pass_with_slots_to_spare_logs_no_capacity_hold() {
+        let o = orch_for_select(10, HashMap::new(), None);
+        let input = vec![issue("1", "A-1", "Todo"), issue("2", "A-2", "Todo")];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert_eq!(got.len(), 2, "both admitted");
+        assert!(
+            !events.iter().any(|e| e.message == HELD_FOR_CAPACITY),
+            "a pass that never ran out of slots must log nothing"
+        );
+    }
+
+    // The multi-project ladder is the one a `projects:` install actually runs, and it needs the
+    // same line — this is where the reported incident happened.
+    #[test]
+    fn the_multi_project_pass_also_names_what_capacity_held() {
+        let o = orch_for_multi(1, vec![proj("a", 10, HashMap::new())], None);
+        let input = tag_for(
+            0,
+            vec![
+                issue("1", "A-1", "Todo"),
+                issue("2", "A-2", "Todo"),
+                issue("3", "A-3", "Todo"),
+            ],
+        );
+        let (got, events) = capture_events(|| o.select_dispatch_multi(input));
+        assert_eq!(got.len(), 1, "global cap 1");
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line on the multi ladder");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-2, A-3"),
+            "the tagged pass names the issues, not the projects"
+        );
+    }
+
+    // The candidate fetch is a state query, so the daemon's OWN in-flight work comes back in it —
+    // and it sorts alongside everything else. Reporting a ticket that is running right now as one
+    // waiting for a slot would be worse than the silence this line replaces.
+    #[test]
+    fn the_hold_never_names_the_daemons_own_in_flight_work() {
+        let mut running = HashMap::new();
+        running.insert(
+            "1".to_string(),
+            running_entry(issue("1", "A-1", "In Progress"), "p", "p"),
+        );
+        let o = orch_for_select(1, HashMap::new(), Some(running));
+        // A-1 is RUNNING and sorts first; A-2 is the ticket genuinely waiting for a slot.
+        let input = vec![issue("1", "A-1", "In Progress"), issue("2", "A-2", "Todo")];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert!(got.is_empty(), "cap 1, one already running ⇒ no slot");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-2"),
+            "only the unworked candidate; the running one must not be reported as waiting"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    // `running` is only ONE of the three ways a candidate is already the daemon's own work, and
+    // the other two come back in the same state query. A ticket whose claim this daemon holds (pool
+    // mode, keyed by the opaque id) and one a recovered retry owns by identifier are both in
+    // flight; naming either as a ticket waiting for a slot is the same misreport.
+    #[test]
+    fn the_hold_never_names_claimed_or_recovery_owned_work() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.claimed.insert("2".to_string());
+        let mut re = retry_entry("3", "A-3", 1);
+        re.recovered = true;
+        o.retry_attempts.insert("3".to_string(), re);
+
+        // Sorted lexicographically: A-1 takes the one slot, and A-2/A-3/A-4 are the unexamined
+        // tail — of which only A-4 is genuinely waiting.
+        let input = vec![
+            issue("1", "A-1", "Todo"),
+            issue("2", "A-2", "Todo"),
+            issue("3", "A-3", "Todo"),
+            issue("4", "A-4", "Todo"),
+        ];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert_eq!(got.len(), 1, "cap 1");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-4"),
+            "the claimed and recovery-owned tickets must not be reported as waiting"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    // A busy board holds more candidates than are worth printing: the line names the front of the
+    // queue and counts the rest, rather than rendering the queue on every poll.
+    #[test]
+    fn a_long_hold_is_sampled_not_rendered_whole() {
+        let o = orch_for_select(1, HashMap::new(), None);
+        let input: Vec<Issue> = (1..=15)
+            .map(|n| issue(&n.to_string(), &format!("A-{n:02}"), "Todo"))
+            .collect();
+        let (_got, events) = capture_events(|| o.select_dispatch(input));
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        let held = ev.fields.get("not_considered").expect("sample field");
+        assert!(
+            held.ends_with("(+4 more)"),
+            "14 held, 10 named, 4 counted; got {held:?}"
+        );
+        assert_eq!(held.matches(", ").count(), 9, "exactly 10 names");
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("14")
+        );
+    }
 
     // Mirrors Go `TestSelectDispatchMultiGlobalCap`.
     #[test]

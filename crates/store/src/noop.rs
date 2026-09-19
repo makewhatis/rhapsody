@@ -90,6 +90,27 @@ impl Store for Noop {
         Ok(Vec::new())
     }
 
+    // Provenance (STUDIO-909) disappears with the rest of the history: a store that holds nothing
+    // has no run to attribute, so it answers "no row" and no per-provider tally.
+    fn set_run_provenance(&self, _run_id: i64, _p: &RunProvenance) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn run_provenance(&self, _run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
+        Ok(None)
+    }
+    fn load_run_provenances(
+        &self,
+        _run_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
+        Ok(std::collections::HashMap::new())
+    }
+    fn tokens_by_provider(&self, _since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn insert_run_message(
         &self,
         _run_id: i64,
@@ -156,6 +177,13 @@ impl Store for Noop {
     }
     fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
         Ok(Vec::new())
+    }
+
+    fn record_summon_watermark(&self, _w: SummonWatermark) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn summon_watermark(&self, _identifier: &str) -> Result<Option<SummonWatermark>, StoreError> {
+        Ok(None)
     }
 
     fn prune(&self, _retention_days: i64) -> Result<(), StoreError> {

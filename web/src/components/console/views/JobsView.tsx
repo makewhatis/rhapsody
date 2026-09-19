@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   Chip,
+  DisplayOptions,
+  ExternalLink,
   Mate,
   NowMates,
   NowStats,
@@ -26,16 +28,25 @@ import {
   mateStates,
   type ConsoleJobFilterId,
   type ConsoleJobRow,
+  type TicketCost,
 } from "@/lib/console-jobs";
+import { mergeIssueRows } from "@/lib/console-board";
 import { sparkSummary, traceSpark } from "@/lib/console-trace-spark";
+import { currentStepLabel } from "@/lib/console-trace-view";
 import { buildTrace } from "@/lib/trace-model";
+import { formatTokens } from "@/lib/format";
 import { mergeJobs } from "@/lib/runs-model";
-import { useLinearProjects } from "@/hooks/useConfig";
+import { useLinearProjects, useTypedConfigQuery } from "@/hooks/useConfig";
 import { useJobsFeed } from "@/hooks/useJobsFeed";
+import { useBoardActive } from "@/hooks/useBoardActive";
 import { useNow } from "@/hooks/useNow";
 import { useTranscript } from "@/hooks/useRunDetail";
 import { useRefresh } from "@/hooks/useStateQuery";
 import { useTeamsEnabled, useTeamsOverview } from "@/hooks/useTeams";
+import { useJobsViewMode } from "@/hooks/useJobsViewMode";
+import { useBoardLaneWidth } from "@/hooks/useBoardLaneWidth";
+import { useBoardCardFields } from "@/hooks/useBoardCardFields";
+import { BoardView } from "./BoardView";
 
 const ALL_PROJECTS = "";
 
@@ -74,25 +85,45 @@ export function JobsView({
   // caller sent (handlers_history.rs), so an unsent limit still answers "is there more?".
   // `useJobsFeed` polls the default window and refreshes a widened one off the live snapshot
   // instead — its own doc comment carries the measurements behind that split.
-  const { state, issueRuns, issueCounts } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
+  const { state, issueRuns, issueCounts, costs } = useJobsFeed(limit > JOBS_PAGE_SIZE ? { limit } : {});
   const projects = useLinearProjects().data ?? [];
   const teamsEnabled = useTeamsEnabled();
   const overview = useTeamsOverview(teamsEnabled);
   const refresh = useRefresh();
+  // The concurrency cap the board footer measures against (STUDIO-925). A missing or unparseable
+  // config reads as "no cap known" — the footer then omits the "/ N" rather than inventing one.
+  const maxConcurrent = useTypedConfigQuery().data?.global?.agent.max_concurrent_agents ?? 0;
 
+  // List or board (STUDIO-925): the board is an ADDITIONAL view, remembered across visits. The
+  // lane width and the card-field chips (STUDIO-932) live in the same display-options popover, so
+  // all three are persisted the same guarded way.
+  const [view, setView] = useJobsViewMode();
+  const [laneWidth, setLaneWidth] = useBoardLaneWidth();
+  const [cardFields, setCardField, resetCardFields] = useBoardCardFields();
   const [filter, setFilter] = useState<ConsoleJobFilterId>("all");
   const [project, setProject] = useState(ALL_PROJECTS);
 
   const issueRows = useMemo(() => issueRuns.data?.issues ?? [], [issueRuns.data]);
+  // The board's non-terminal lanes must be complete, not a sample of the recency page (STUDIO-931):
+  // the page is ordered newest-first, so the longer a ticket sits the more certainly it has fallen
+  // off. The active feed fetches each issue's LATEST run outcome by filter and wider than a page; the
+  // table keeps the page alone, so a list-only visit neither pays for the extra requests nor grows
+  // the window.
+  const activeRows = useBoardActive(view === "board");
+  const boardIssueRows = useMemo(
+    () => (view === "board" ? mergeIssueRows(issueRows, activeRows) : issueRows),
+    [view, issueRows, activeRows],
+  );
   const rows = useMemo(
     () =>
       buildConsoleJobs(
-        mergeJobs(state.data, issueRows, projects, nowMs),
-        issueRows,
+        mergeJobs(state.data, boardIssueRows, projects, nowMs),
+        boardIssueRows,
         overview.data,
         nowMs,
+        costs.data?.costs,
       ),
-    [state.data, issueRows, projects, overview.data, nowMs],
+    [state.data, boardIssueRows, projects, overview.data, nowMs, costs.data],
   );
 
   // The strip's numbers come from the DAEMON's tally over every issue in the store, not from `rows`
@@ -106,7 +137,11 @@ export function JobsView({
   const counts = consoleStoreCounts(issueCounts.data, state.data?.blocked);
   const mates = mateStates(overview.data);
   const roster = mates.map((m) => m.name);
-  const visible = filterConsoleJobs(rows, filter, project);
+  // In Board mode the lanes ARE the status axis (STUDIO-932), so the status filter does not apply:
+  // the Seg is not rendered there, and carrying a List-mode choice into the board would silently
+  // hide cards behind a control the operator cannot see. The operator's List choice is kept.
+  const effectiveFilter: ConsoleJobFilterId = view === "board" ? "all" : filter;
+  const visible = filterConsoleJobs(rows, effectiveFilter, project);
   const projectOptions = [{ value: ALL_PROJECTS, label: "All projects" }, ...consoleJobProjects(rows)];
   // The daemon's own claim, restated verbatim: `next_offset` is non-null exactly when the store
   // filled the page it was asked for, and it is derived from the size the store ACTUALLY applied,
@@ -116,7 +151,7 @@ export function JobsView({
     loaded: rows.length,
     visible: visible.length,
     hasMore,
-    filtered: filter !== "all" || project !== ALL_PROJECTS,
+    filtered: effectiveFilter !== "all" || project !== ALL_PROJECTS,
   });
 
   return (
@@ -127,6 +162,19 @@ export function JobsView({
         <Chip onClick={() => refresh.mutate()} disabled={refresh.isPending}>
           ↻ Refresh
         </Chip>
+        <DisplayOptions
+          view={view}
+          onView={setView}
+          laneWidth={laneWidth}
+          onLaneWidth={setLaneWidth}
+          fields={cardFields}
+          onToggleField={setCardField}
+          onReset={() => {
+            setView("list");
+            setLaneWidth("default");
+            resetCardFields();
+          }}
+        />
       </div>
 
       <NowStrip>
@@ -165,13 +213,17 @@ export function JobsView({
       </NowStrip>
 
       <div className="jfilters">
-        <Seg
-          accent
-          aria-label="Filter by status"
-          options={CONSOLE_JOB_FILTERS.map((f) => ({ value: f.id, label: f.label }))}
-          value={filter}
-          onChange={(v) => setFilter(v as ConsoleJobFilterId)}
-        />
+        {/* List mode only (STUDIO-932): in Board mode the four lanes ARE the status axis, so a
+            status Seg would be a control that undoes the board rather than narrows it. */}
+        {view === "list" ? (
+          <Seg
+            accent
+            aria-label="Filter by status"
+            options={CONSOLE_JOB_FILTERS.map((f) => ({ value: f.id, label: f.label }))}
+            value={filter}
+            onChange={(v) => setFilter(v as ConsoleJobFilterId)}
+          />
+        ) : null}
         <Select
           aria-label="Filter by project"
           options={projectOptions}
@@ -180,43 +232,63 @@ export function JobsView({
         />
       </div>
 
-      <Card>
-        <table className="jtbl">
-          <thead>
-            <tr>
-              <th>Ticket</th>
-              <th>Assigned</th>
-              <th>Status</th>
-              <th>Trace</th>
-              <th>PR</th>
-              <th>Updated</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((row) => (
-              <JobsRow key={row.key} row={row} roster={roster} onOpen={onOpenJob} />
-            ))}
-          </tbody>
-        </table>
-        {visible.length === 0 ? <div className="empty">{emptyMessage(rows.length, issueRuns.isPending)}</div> : null}
-        {/* How much of the history this is (STUDIO-792). Rendered whenever there are rows, not
-            only when the list is cut: "Showing all 386 jobs" is what tells the operator the list
-            ended because the history did, and that is the fact the silent 50 used to withhold. */}
-        {pageNote === "" ? null : (
-          <div className="jmore">
-            <span className="note">{pageNote}</span>
-            {hasMore ? (
-              // `isPlaceholderData`, not `isFetching`: it is true exactly while a WIDER page is in
-              // flight and the previous one is still on screen, and false during a background
-              // refetch of the page already held. Disabling on `isFetching` would make the
-              // control dead for a beat on every poll once STUDIO-791 gives this query one.
-              <Chip onClick={onLoadMore} disabled={issueRuns.isPlaceholderData}>
-                Load {JOBS_PAGE_SIZE} more
-              </Chip>
-            ) : null}
-          </div>
-        )}
-      </Card>
+      {view === "board" ? (
+        <BoardView
+          rows={rows}
+          blocked={state.data?.blocked ?? []}
+          project={project}
+          counts={counts}
+          maxConcurrent={maxConcurrent}
+          laneWidth={laneWidth}
+          fields={cardFields}
+          refreshedAtMs={issueRuns.dataUpdatedAt}
+          nowMs={nowMs}
+          roster={roster}
+          onOpenJob={onOpenJob}
+          pageNote={pageNote}
+          hasMore={hasMore}
+          onLoadMore={onLoadMore}
+          loadingMore={issueRuns.isPlaceholderData}
+        />
+      ) : (
+        <Card>
+          <table className="jtbl">
+            <thead>
+              <tr>
+                <th>Ticket</th>
+                <th>Assigned</th>
+                <th>Status</th>
+                <th>Trace</th>
+                <th>PR</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map((row) => (
+                <JobsRow key={row.key} row={row} roster={roster} onOpen={onOpenJob} />
+              ))}
+            </tbody>
+          </table>
+          {visible.length === 0 ? <div className="empty">{emptyMessage(rows.length, issueRuns.isPending)}</div> : null}
+          {/* How much of the history this is (STUDIO-792). Rendered whenever there are rows, not
+              only when the list is cut: "Showing all 386 jobs" is what tells the operator the list
+              ended because the history did, and that is the fact the silent 50 used to withhold. */}
+          {pageNote === "" ? null : (
+            <div className="jmore">
+              <span className="note">{pageNote}</span>
+              {hasMore ? (
+                // `isPlaceholderData`, not `isFetching`: it is true exactly while a WIDER page is in
+                // flight and the previous one is still on screen, and false during a background
+                // refetch of the page already held. Disabling on `isFetching` would make the
+                // control dead for a beat on every poll once STUDIO-791 gives this query one.
+                <Chip onClick={onLoadMore} disabled={issueRuns.isPlaceholderData}>
+                  Load {JOBS_PAGE_SIZE} more
+                </Chip>
+              ) : null}
+            </div>
+          )}
+        </Card>
+      )}
     </section>
   );
 }
@@ -248,6 +320,46 @@ const SPARK_DWELL_MS = 120;
 // cell showed before the field existed.
 function jobLead(row: ConsoleJobRow): string {
   return row.reviewOf === "" ? row.issue : row.reviewOf;
+}
+
+// The ticket's token cost, split by provider (STUDIO-926) — quiet tabular text under the project
+// line, never a `Pill` or `--rust`: cost is secondary metadata, not a status, so it must not
+// compete with the status Pill for attention. "+" joins two providers deliberately, spelling out
+// that a two-harness ticket is two numbers rather than one blended total. "~" marks an estimated
+// bucket, the same prefix `runVitals.tokens` uses for a single run's own floored total.
+function TicketCostLine({ costs }: { costs: readonly TicketCost[] }) {
+  const text = costs
+    .map((c) => `${c.estimated ? "~" : ""}${formatTokens(c.totalTokens)}${c.provider === "" ? "" : ` ${c.provider}`}`)
+    .join(" + ");
+  return (
+    <div className="cost" title={`tokens: ${text}`}>
+      {text}
+    </div>
+  );
+}
+
+// The Jobs worklist's live-activity signal (STUDIO-926; see the ticket's "no progress bar" rule):
+// the run's current transcript step plus how long it has been going, for a LIVE row only. Unlike
+// `TraceSpark` below this is not gated on the dwell — the set of rows it ever renders for is
+// exactly the daemon's live runs, which `max_concurrent` already bounds, so eagerly reading their
+// transcripts costs nothing like a sweep down 50 finished rows would.
+// The activity line reads the whole transcript to find its LAST step, and a long run's transcript
+// is large, so it polls at the Jobs feed's own cadence rather than the detail page's 1.5s: a stall
+// is a minutes-scale signal and needs no faster answer.
+const LIVE_ACTIVITY_POLL_MS = 10_000;
+
+function LiveActivity({ runId, elapsed }: { runId: number; elapsed: string }) {
+  const transcript = useTranscript(runId, true, runId > 0, LIVE_ACTIVITY_POLL_MS);
+  const step = useMemo(
+    () => currentStepLabel(buildTrace(transcript.data?.entries ?? []).phases),
+    [transcript.data],
+  );
+  const label = step ?? "Starting…";
+  return (
+    <div className="activity" title={`${label} · ${elapsed} elapsed`}>
+      {label} · {elapsed}
+    </div>
+  );
 }
 
 // One worklist row. It is a real activation target, not a div with a click handler: the whole
@@ -326,7 +438,19 @@ function JobsRow({
           {jobLead(row)}
           {row.title === "" ? "" : ` · ${row.title}`}
         </div>
-        <div className="pj">{row.project}</div>
+        {/* The compact provider badge (STUDIO-909): "which of these runs is on Fireworks" is a
+            scanning question, so the provider sits beside the project with no drill-down. Absent for
+            a run that recorded none, so a legacy row reads exactly as it did before the field. */}
+        <div className="pj">
+          {row.project}
+          {row.provider === "" ? null : (
+            <span className="provbadge" title={`ran on ${row.provider}`}>
+              {row.provider}
+            </span>
+          )}
+        </div>
+        {row.costs.length === 0 ? null : <TicketCostLine costs={row.costs} />}
+        {row.live ? <LiveActivity runId={row.runId} elapsed={row.elapsed} /> : null}
       </td>
       <td>
         {row.assignee === "" ? (
@@ -356,7 +480,23 @@ function JobsRow({
       <td>
         <TraceSpark runId={row.runId} live={row.live} armed={armed} />
       </td>
-      <td>{row.pr === "" ? "—" : <TicketChip variant="pr">{row.pr}</TicketChip>}</td>
+      {/* The PR column used to render "—" on every row, including the review rows whose own issue
+          key is literally `pr:owner/repo#n@reviewer` (STUDIO-925). The number was always there; now
+          it is a link. Only the LINK stops the click from also opening the row's job — the empty
+          cell (most rows) and the rare unlinked chip must stay a way into the row. */}
+      <td>
+        {row.pr === "" ? (
+          "—"
+        ) : row.prUrl === "" ? (
+          <TicketChip variant="pr">{row.pr}</TicketChip>
+        ) : (
+          <span onClick={(e) => e.stopPropagation()}>
+            <ExternalLink href={row.prUrl} aria-label={`Open pull request ${row.pr}`}>
+              <TicketChip variant="pr">{row.pr}</TicketChip>
+            </ExternalLink>
+          </span>
+        )}
+      </td>
       <td className="up">{row.updated}</td>
     </tr>
   );

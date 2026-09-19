@@ -6,6 +6,7 @@
 //! implementations: [`Sqlite`] (pure-in-process SQLite via `rusqlite`, WAL mode) and [`Noop`]
 //! (the guard-free disabled store used when `storage.path: off`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod noop;
@@ -52,6 +53,19 @@ pub fn parse_store_path(s: &str) -> StorePath {
     } else {
         StorePath::Disk(PathBuf::from(s))
     }
+}
+
+/// Renders a summons timestamp in the ONE canonical form [`SummonWatermark::at`] is ever stored in:
+/// RFC3339 UTC, seconds precision, `Z` suffix — identical to the format every other timestamp
+/// column in this store uses.
+///
+/// It exists so the comparison "is what I just observed newer than what I remember?" can be made on
+/// the STRINGS. Formatting both sides through here makes that comparison both chronological (the
+/// form is fixed-width) and exactly round-trip stable — a summons whose source reports sub-second
+/// precision renders to the same string every poll, so a stable comment is never rewritten tick
+/// after tick just because its stored form lost a fraction of a second.
+pub fn format_summon_at(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// The error type for store operations. Go's store returns bare `error` values (wrapped with
@@ -171,6 +185,41 @@ pub trait Store {
     fn earliest_run_start(&self) -> Result<Option<String>, StoreError>;
     fn metrics(&self, since_days: i64, project: &str) -> Result<Vec<DayRollup>, StoreError>;
 
+    // --- per-run provenance (STUDIO-909) ---
+    // Additive Rhapsody-only surface with no Go counterpart: the frozen reference records nothing
+    // about what ran a run. Written once at dispatch and never rewritten, so a later config
+    // hot-reload cannot change what a past run says it ran on. Backed by the
+    // `rhapsody_run_provenance` table (see the README "Divergences" entry); a run with no row is
+    // "unknown", which is why [`Store::run_provenance`] returns `None` rather than a zero value.
+    //
+    // [`Store::set_run_provenance`] inserts (upserting on `run_id`) unconditionally and does not
+    // check that `run_id` names a live `runs` row; callers pass the id [`Store::start_run`]
+    // returned.
+    fn set_run_provenance(&self, run_id: i64, p: &RunProvenance) -> Result<(), StoreError>;
+    /// One run's provenance, or `Ok(None)` when the run predates this feature (or recorded nothing).
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError>;
+    /// Provenance for a PAGE of run ids in one query, keyed by run id. Missing ids are absent from
+    /// the map — the same "no answer" [`Store::run_provenance`] returns, batched so a listing never
+    /// pays a query per row.
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<HashMap<i64, RunProvenance>, StoreError>;
+    /// Token totals grouped by recorded provider over the runs that started at or after `since` —
+    /// the cost-attribution question this feature exists to answer, scoped to the same window as
+    /// [`Store::day_totals`] so the two figures can be read beside each other. One row per distinct
+    /// provider, empty provider included, run count descending then provider ascending so the order
+    /// is stable.
+    ///
+    /// The window is the point (STUDIO-909 round 1): a lifetime total rendered under a "today"
+    /// heading answers a question nobody asked and cannot be reconciled with `day_totals`.
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError>;
+    /// Every run's tokens summed per (`issue_identifier`, provider), over the WHOLE store — the
+    /// ledger behind a ticket's cost on the console (STUDIO-926). Unlike `list_issue_runs` this does
+    /// not keep only each key's newest run: a ticket's cost is every run that spent on it. One row
+    /// per distinct pair, empty provider included; order is stable (identifier, then provider).
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError>;
+
     // --- operator messages (INF-250) ---
     /// Records a new operator message for a run with status "sent" and returns its row id. `body`
     /// is the operator's ORIGINAL (unwrapped) text.
@@ -238,9 +287,10 @@ pub trait Store {
         status: &str,
     ) -> Result<(), StoreError>;
 
-    /// Records that a reviewer run ENDED without finishing its round — it burned its whole turn
-    /// budget mid-review — by parking `status` at [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER
-    /// SHA column (STUDIO-721).
+    /// Records that a reviewer run ENDED without a declared verdict — it either burned its whole
+    /// turn budget mid-review (STUDIO-721) or declared a hand-off whose payload was neither
+    /// `approved` nor a recognised rejection (STUDIO-894) — by parking `status` at
+    /// [`REVIEW_STATUS_TRUNCATED`] and touching NEITHER SHA column.
     ///
     /// Deliberately not a `mark_review_completed` with a third status: that method's contract is to
     /// advance `last_reviewed_sha`, and advancing it here is precisely the bug — the head was read
@@ -298,6 +348,22 @@ pub trait Store {
     /// rows are permanent. Callers whose predicate is genuinely broader — retirement, which must
     /// also see a closed-but-undropped row — still use [`Store::load_review_watch`].
     fn load_live_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError>;
+
+    // --- summons watermark (STUDIO-885; no Go counterpart — see [`SummonWatermark`]) ---
+
+    /// Remembers `w` as this ticket's observed summons, replacing any row already there.
+    ///
+    /// Deliberately a last-write-wins upsert rather than a max-only one: the caller has just read
+    /// [`Store::summon_watermark`] to decide whether what it observed is newer, and putting the
+    /// same rule in SQL as well would mean two places could disagree about what "newer" means.
+    /// The caller is the single-threaded control loop, so the read-then-write is not racing
+    /// anything.
+    fn record_summon_watermark(&self, w: SummonWatermark) -> Result<(), StoreError>;
+
+    /// This ticket's remembered summons, or `None` when none was ever observed (or the store is
+    /// disabled — with persistence off there is nowhere to remember one, so the daemon keeps the
+    /// pre-STUDIO-885 behaviour of seeing only what is inside the lookback window right now).
+    fn summon_watermark(&self, identifier: &str) -> Result<Option<SummonWatermark>, StoreError>;
 
     /// Deletes ended runs (and their events/messages/transcripts) older than `retention_days`.
     /// `retention_days <= 0` keeps everything forever (see the sqlite impl).

@@ -1,6 +1,6 @@
 {
   "name": "rhapsody",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Skills for Rhapsody Teams — how named agent teammates get work done (routing, the room, memory, the two review models), how to compose a roster and write a teammate profile, and how to operate a running installation.",
   "author": {
     "name": "makewhatis",

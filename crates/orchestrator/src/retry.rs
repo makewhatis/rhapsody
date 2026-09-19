@@ -287,6 +287,23 @@ impl Orchestrator {
         route: Option<DispatchRoute>,
         stack_context: String,
     ) {
+        // STUDIO-880, a backstop and NOT a gate. Every path that decides whether to dispatch refuses
+        // or parks above this line — `on_tick`, `on_retry`, `dispatch_review` — because each of them
+        // owns bookkeeping a refusal here would strand (a claim, a retry entry, a watch row recorded
+        // as in-flight). So this cannot refuse; what it can do is be LOUD, which is what the two
+        // paths that already got this wrong lacked.
+        //
+        // It is not an invariant violation: a drain armed by the HTTP task DURING a tick's candidate
+        // fetch legitimately lands here. Either way the run is self-limiting — the worker reads the
+        // same flag and winds down at its first turn boundary — so the line says what happened
+        // rather than claiming something is broken.
+        if self.drain.is_draining() {
+            tracing::warn!(
+                issue = %iss.identifier,
+                "drain: dispatching anyway — this path did not consult the drain gate, or the drain \
+                 armed mid-tick; the run will wind down at its first turn boundary"
+            );
+        }
         // A graphite auto-promote stashed a predecessor stacking hint for this issue's first dispatch
         // (it moved the ticket Backlog→Todo and left the slot-accounted dispatch to the select path).
         // Consume it when the caller didn't pass one explicitly, rendering the workspace_mode-aware
@@ -379,6 +396,88 @@ impl Orchestrator {
             // whose profile names neither — which is every built-in — so the worker's session keeps
             // the installation-wide pair and the argv is byte-identical to today.
             re.model_override = td.model_override.clone();
+            // The routed teammate's harness (STUDIO-902). Empty for every profile that names none,
+            // so the worker keeps the configured backend's runner and the dispatch is unchanged.
+            re.harness = td.harness.clone();
+        }
+        // A review run's model/effort come from `review.model`/`review.effort` when the operator
+        // set them, regardless of what the routed teammate's own profile asked for (STUDIO-901) —
+        // but scoped by the HARNESS the review will actually run on (STUDIO-908). A model name is
+        // meaningless without its harness: applying `review.model` to a reviewer running opencode
+        // handed that CLI a Claude model name, and the provider answered with a generic
+        // `UnknownError` one second into the run. `review` is `Some` only for a run
+        // `dispatch_review` staged in `pending_review`, so an ordinary ticket dispatch — where this
+        // would otherwise silently apply to every run — never reaches the branch.
+        //
+        // The harness is the routed reviewer's ACTUAL harness (their profile's, when this build
+        // implements it, else `agent.backend`), the same value `spawn_worker` will select the
+        // runner with. `dispatch_review` has already refused a review whose harness has no entry
+        // for the operator's `review.model`, so by the time this runs the three-way lookup cannot
+        // answer `Refuse`; `Inherit` (nothing configured) leaves the reviewer's own profile in
+        // place, and `Use` overrides it.
+        //
+        // Review-scoped rather than a teammate field, and deliberately outranking the reviewer's own
+        // profile: the operator's intent here is role-based (keep review on the premium model, per
+        // the operator's own words on the ticket) while a profile's `model` is person-based
+        // (STUDIO-868) — the two answer different questions, and when both are set it is the PR
+        // under review being priced, not that teammate's own work.
+        //
+        // Read through `Teams::review_model_for`/`review_effort`, not the raw field: this branch is
+        // unreachable except through `dispatch_review`'s ticketless gate today (jimmy/alice round 1
+        // on PR #168), but the accessor is the convention this crate already uses for every other
+        // `review:` scalar and keeps this call site from disagreeing with `teams show` about when
+        // the override is live.
+        // Whether the MODEL specifically came from `review.model` (STUDIO-909): distinct from the
+        // combined `review_overrode` below, which an effort-only override also sets — the recorded
+        // model origin must name the key that supplied the MODEL, not one that only supplied effort.
+        let mut review_model_overrode = false;
+        if review.is_some()
+            && let Some(teams) = self.teams.as_ref()
+        {
+            let harness = self
+                .harness_actually_run(teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()));
+            // The harness the legacy bare-scalar `review.model`/`review.effort` spelling belongs
+            // to (STUDIO-908): the installation's configured `agent.backend`, not a hardcoded
+            // `claude`. `dispatch_review` derives it the same way, so the refusal and the override
+            // are the same fact.
+            let fallback = self.configured_backend();
+            let mut review_overrode = false;
+            match teams.review_model_for(&harness, &fallback) {
+                rhapsody_config::teams::ReviewModelChoice::Use(model) => {
+                    re.model_override.model = model.to_string();
+                    review_overrode = true;
+                    review_model_overrode = true;
+                }
+                // `dispatch_review` already refused a review whose harness has no `review.model`
+                // entry, so a `Refuse` here means the two derivations of the reviewer's harness
+                // disagreed. Falling through to inherit is exactly the silent cheap review this
+                // ticket exists to prevent, so it is logged at `error!` and never left unspoken
+                // (alice's non-blocking finding 2 on PR #172). Staging the decided model on the
+                // pending-review entry would make the two one computation; that is the follow-up.
+                rhapsody_config::teams::ReviewModelChoice::Refuse(why) => {
+                    tracing::error!(
+                        review = %iss.id,
+                        reason = %why,
+                        "review.model refused at dispatch_issue; the review run inherits the \
+                         reviewer's own profile model"
+                    );
+                }
+                rhapsody_config::teams::ReviewModelChoice::Inherit => {}
+            }
+            if let Some(effort) = teams.review_effort(&harness, &fallback) {
+                re.model_override.effort = effort.to_string();
+                review_overrode = true;
+            }
+            // A rejected `review.model`/`review.effort` must not blame the routed reviewer's own
+            // profile (alice round 1 finding 2 on PR #168): `ModelOverride.identity` exists so a
+            // CLI rejection names "jimmy's profile asked for `<model>`" rather than nobody, and
+            // that attribution is simply wrong once the value came from the operator's `review:`
+            // block instead. Clearing it degrades the message to `model_attribution`'s existing
+            // "a profile asked for …" branch (`runner.rs:213`) — anonymous, but no longer naming a
+            // teammate for a value they did not write.
+            if review_overrode {
+                re.model_override.identity = String::new();
+            }
         }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
@@ -395,6 +494,43 @@ impl Orchestrator {
         if !re.model_override.model.is_empty() {
             re.model = re.model_override.model.clone();
         }
+        // Provenance ORIGINS (STUDIO-909), stamped beside the values they explain. The VALUES are
+        // resolved and persisted by `persist_start_run` from these origins plus the run's own
+        // harness/profile override; recording the origin here means an invisible override — tonight's
+        // unreproducible `Model not found` — becomes a fact on the run row rather than something an
+        // operator has to reconstruct from the config that happens to be live now.
+        //
+        // The harness origin names the key that ACTUALLY took effect: a profile that names a harness
+        // this build has no runner for falls back to the configured backend (spawn_worker logs the
+        // fallback), so the origin is `agent.backend` there rather than a `profile` claim the run did
+        // not honour.
+        let actual_harness = self.harness_actually_run(&re.harness);
+        re.harness_origin =
+            if !re.harness.is_empty() && crate::effective::harness_is_implemented(&re.harness) {
+                "profile".to_string()
+            } else {
+                "agent.backend".to_string()
+            };
+        re.model_origin = if review_model_overrode {
+            // The legacy bare-scalar spelling is `review.model`; the per-harness map spelling names
+            // the harness. `HarnessScoped::legacy` is the one reader that tells them apart, so the
+            // label cannot disagree with `teams show`.
+            match self.teams.as_ref().and_then(|t| t.review.model.legacy()) {
+                Some(_) => "review.model".to_string(),
+                None => format!("review.model.{actual_harness}"),
+            }
+        } else if !re.model_override.model.is_empty() {
+            "profile".to_string()
+        } else {
+            // The value is `configured_model_for`'s answer at persist time. KNOWN IMPRECISION
+            // (alice round 1 on PR #173): on a multi-project install whose project block overrides
+            // `claude.model`, that value comes from `projects.<slug>.claude.model` while this label
+            // names the flat `claude.model` key. `mcfg` cannot tell an explicit project override from
+            // an inherited one, so a project-scoped spelling here could name a key that supplied
+            // nothing — worse than the flat one. The value is still the run's true model; only the
+            // pointer is coarser. `opencode` is not per-project overlaid, so its arm is exact.
+            format!("{actual_harness}.model")
+        };
         if let Some(r) = &route {
             re.project_slug = r.slug.clone();
             // The per-project cap is counted across the whole project group; fall back to the slug when
@@ -439,6 +575,7 @@ impl Orchestrator {
         let capabilities_section = re.capabilities_section.clone();
         let teammate_section = re.teammate_section.clone();
         let model_override = re.model_override.clone();
+        let harness = re.harness.clone();
         let review_checkout = review.as_ref().map(crate::review::ReviewRun::checkout);
         // Stamped by `persist_start_run` above; 0 when the store is off or the insert failed, which
         // the runner treats as "unknown" and emits no env for (STUDIO-675).
@@ -463,6 +600,7 @@ impl Orchestrator {
                 capabilities_section,
                 teammate_section,
                 model_override,
+                harness,
                 run_id,
                 started_at,
                 review_checkout,
@@ -741,6 +879,25 @@ impl Orchestrator {
     /// candidate set, and re-checks per-project + per-state + global slots — then re-dispatches,
     /// requeues, or releases the claim. Mirrors Go `onRetry`. A control-loop (O7) entry point.
     pub async fn on_retry(&mut self, e: EvRetry) {
+        // STUDIO-880: the drain gate's SECOND entry point, and the one that is easy to miss.
+        // `on_tick` is not the only path that dispatches — a due retry dispatches straight from
+        // here, bypassing the tick entirely — so a drain that gated only `on_tick` would settle the
+        // daemon and then immediately re-dispatch every continuation it had just wound down.
+        //
+        // Parking, not dropping: the entry is left in `retry_attempts` EXACTLY as it is, so it keeps
+        // its claim, its due time and its ATTEMPT NUMBER. A drain is not a failure, and requeueing
+        // through the backoff path (as the no-slots case does) would inflate the attempt count for
+        // the whole length of the drain and could exhaust the ticket's retry budget. Only the timer
+        // is re-armed, so the gate is re-checked until the drain is cancelled or the daemon
+        // restarts and boot recovery re-arms it from the persisted row.
+        if self.drain.is_draining() && self.retry_attempts.contains_key(&e.issue_id) {
+            tracing::debug!(
+                issue_id = %e.issue_id,
+                "drain: parking a due retry; claim and attempt kept"
+            );
+            self.arm_retry_timer(&e.issue_id, crate::drain::DRAIN_REQUEUE_DELAY_MS);
+            return;
+        }
         let Some(re) = self.retry_attempts.remove(&e.issue_id) else {
             return;
         };
@@ -1255,7 +1412,7 @@ mod tests {
     /// without a `HANDOFF:` marker. The run must be stored `completed` with no error, and the claim
     /// must be released rather than a continuation scheduled.
     #[test]
-    fn on_worker_exit_review_state_undeclared_records_completed() {
+    fn on_worker_exit_ticket_review_without_handoff_records_completed() {
         let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
         let store_handle: Arc<dyn Store + Send + Sync> = Arc::new(
             rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
@@ -1287,6 +1444,67 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, store::OUTCOME_COMPLETED);
         assert_eq!(runs[0].error, "", "no 'ticket moved externally' diagnosis");
+    }
+
+    /// STUDIO-909: a plain, unrouted dispatch records what it ACTUALLY ran on — the configured
+    /// harness and its model, the ORIGIN of each, and the provider derived from the two. This is
+    /// the run-row provenance the console reads; before it, the row knew only how many tokens the
+    /// run had spent and nothing about what spent them.
+    #[test]
+    fn dispatch_records_the_harness_model_and_provider_it_actually_used() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "claude".to_string();
+            eff.cfg.claude.model = "claude-sonnet-4".to_string();
+        }
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store is on, so the run has a row");
+        let p = store
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(p.harness, "claude");
+        assert_eq!(p.harness_origin, "agent.backend");
+        assert_eq!(p.model, "claude-sonnet-4");
+        assert_eq!(p.model_origin, "claude.model");
+        assert_eq!(p.provider, "anthropic");
+    }
+
+    /// STUDIO-909 round 1: a harness with no model knob records NO model and therefore NO
+    /// `model_origin`. `agent.backend: codex` is a recognized `HARNESS_NAMES` value this build has no
+    /// runner for, so `configured_model_for` answers empty — the origin must not then name a
+    /// `codex.model` key that supplied nothing.
+    #[test]
+    fn dispatch_records_no_model_origin_when_no_model_resolved() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+        );
+        o.set_store(Arc::clone(&store));
+        if let Some(eff) = o.eff.as_mut() {
+            eff.cfg.agent.backend = "codex".to_string();
+        }
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store is on, so the run has a row");
+        let p = store
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(p.harness, "codex");
+        assert_eq!(p.model, "", "codex has no model knob in this build");
+        assert_eq!(
+            p.model_origin, "",
+            "an origin for a model that was never resolved asserts something untrue"
+        );
+        assert_eq!(p.provider, "");
     }
 
     // BO-12: dispatch computes the ADDITIVE capability set (project defaults ∪ the ticket's
@@ -1443,6 +1661,51 @@ mod tests {
             "issue should be claimed and running"
         );
         assert_eq!(*dispatched.lock().unwrap(), vec!["1".to_string()]);
+    }
+
+    /// STUDIO-880's backstop: a dispatch that reached here while draining says so.
+    ///
+    /// Every path that DECIDES to dispatch refuses or parks above this function, because each owns
+    /// bookkeeping a refusal here would strand. So the backstop cannot refuse — the run still
+    /// dispatches, and is self-limiting because the worker reads the same flag and winds down at its
+    /// first turn boundary. What it must not be is silent: the two entry points that already got
+    /// this wrong were caught by a test and a reviewer, not by anything the running daemon said.
+    #[test]
+    fn a_dispatch_that_slipped_past_every_drain_gate_is_loud_about_it() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        o.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        });
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("did not consult the drain gate")),
+            "a dispatch while draining must be reported: {:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(
+            o.running.contains_key("1"),
+            "and it must still dispatch — refusing here would strand the claim this took"
+        );
+    }
+
+    /// …and the same call on an undrained daemon says nothing, so the line above cannot become
+    /// noise every operator learns to scroll past.
+    #[test]
+    fn an_ordinary_dispatch_says_nothing_about_the_drain() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let (_, events) = crate::testsupport::capture_events(|| {
+            o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        });
+        assert!(
+            !events.iter().any(|e| e.message.contains("drain")),
+            "no drain is armed, so nothing here may mention one: {:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     // Mirrors Go `TestOnWorkerExitNormalSchedulesContinuation`.

@@ -179,6 +179,7 @@ where
         report_profile_issues(o.teams.as_ref(), &teams_path);
         report_inert_manager(o.teams.as_ref());
         report_starved_manager(o.teams.as_ref());
+        report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
         //
@@ -761,27 +762,69 @@ where
         })
     });
 
+    // The auto-merge ledger (STUDIO-874), built HERE — beside `triage_seam` above and for the same
+    // reason — so the SAME `Arc` can go to two consumers: the off-loop `AutoMergeDeps` below, which
+    // writes it, and `o.automerge_ledger`, which the control task's reconciliation sweep reads
+    // (STUDIO-923) to name what auto-merge has already said about a pull request it independently
+    // reports diverged.
+    //
+    // Built on exactly `spawn_watcher`'s condition, matching `automerge` below: a ledger nothing
+    // ever writes has nothing to read either, and the sweep's fallback wording covers a `None`
+    // handle without needing one.
+    let automerge_ledger = spawn_watcher
+        .then(|| Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeLedger::default()));
+    o.automerge_ledger = automerge_ledger.clone();
+
     // The watcher task. Its `PrStateSource` is the same `gh` seam the introduction task uses, and
     // like it, the task holds no `Orchestrator`: a hung `gh` parks THIS task and the daemon keeps
     // ticking.
     let review_watch_task = spawn_watcher.then(|| {
         let watch_ctx = shutdown.wait();
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            &resolved
+                .as_ref()
+                .map(|c| c.tracker.summon_token.clone())
+                .unwrap_or_default(),
+            None,
+        ));
+        // The auto-merge's `gh` seams (STUDIO-874), wired UNCONDITIONALLY — like the findings
+        // route-back's `tickets` sink above, and for the same reason. The feature's gate is the
+        // config (`teams.review.auto_merge`, false by default) and it lives on the control task,
+        // where the plan is made: an installation that has not asked for it sends no plan, so this
+        // sink is never called and the D5 invariant holds without a second gate here.
+        //
+        // Gating the CONSTRUCTION on the config instead would break under a hot reload that turns
+        // the key on: `propose_auto_merge` reads the live config and would start handing out plans
+        // that a sink built at boot could not perform, warning once per tick forever.
+        let automerge = Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeDeps {
+            prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
+            mergestate: Arc::clone(&gh)
+                as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
+            policy: Arc::clone(&gh)
+                as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdateSource>,
+            updater: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::BranchUpdater>,
+            checks: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrChecksSource>,
+            merger: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::MergeSource>,
+            allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
+            // `spawn_watcher` gates both this closure and the ledger above, so this is always
+            // `Some` in practice; the fallback is a fresh, equally-empty ledger rather than a
+            // boot-time panic on a daemon that could otherwise run fine.
+            ledger: automerge_ledger.clone().unwrap_or_else(|| {
+                Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeLedger::default())
+            }),
+        });
+        let sink = rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(handle.clone())
+            .with_auto_merge(automerge);
         let deps = rhapsody_orchestrator::reviewwatch::ReviewWatchDeps {
-            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
-                &resolved
-                    .as_ref()
-                    .map(|c| c.tracker.summon_token.clone())
-                    .unwrap_or_default(),
-                None,
-            ))),
+            pr_source: Some(
+                Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
+            ),
             // The base repository's own owner and nothing else — the default trust boundary. A
             // fork's head is refused rather than reviewed (design §14.1 F-SEC); there is no config
             // key to widen it, so widening is a code change a reviewer sees.
             allow: rhapsody_orchestrator::ghsummons::HeadAllowlist::none(),
             teams: teams_cfg.clone(),
-            sink: Arc::new(rhapsody_orchestrator::reviewwatch::ControlWatchSink::new(
-                handle.clone(),
-            )),
+            sink: Arc::new(sink),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::reviewwatch::run_review_watch_task(watch_ctx, deps).await;
@@ -1347,6 +1390,40 @@ fn report_starved_manager(teams: Option<&rhapsody_config::teams::Teams>) {
          time out and every ticket will be assigned by the deterministic fallback. The value is \
          honoured as written — raise manager.timeout_ms in teams.yaml to use the model at all."
     );
+}
+
+/// Warns about every `teams.yaml` `projects:` slug that matches no resolved project
+/// slug (STUDIO-927). The near-certain cause is a Linear project NAME where its
+/// `slugId` hex belongs (`slugs: [booch]` instead of `[4f4a2350682f]`), and the
+/// consequence is silent and in the unsafe direction: the override never fires, so
+/// the project keeps the top-level `review.auto_merge` and self-merges anyway. A
+/// safety brake whose misspelling is invisible is the defect this ticket removes, so
+/// every unmatched slug is named here at boot.
+///
+/// Gated on `review_ticketless`: only the ticketless path reads the override at all,
+/// and staying silent otherwise keeps a Teams-off or `mode: tickets` boot byte-identical
+/// (the D5 invariant).
+fn report_unmatched_project_slugs(
+    teams: Option<&rhapsody_config::teams::Teams>,
+    resolved: Option<&Config>,
+) {
+    let Some(teams) = teams.filter(|t| t.review_ticketless() && !t.projects.is_empty()) else {
+        return;
+    };
+    let Some(resolved) = resolved else { return };
+    let known: Vec<String> = rhapsody_config::projects::resolve_projects(resolved)
+        .into_iter()
+        .map(|p| p.slug)
+        .collect();
+    let unmatched = teams.unmatched_project_slugs(&known);
+    if !unmatched.is_empty() {
+        tracing::warn!(
+            slugs = %unmatched.join(", "),
+            "teams.yaml projects: entries name slugs that match no WORKFLOW.md project, so their \
+             review overrides can never fire. Use the Linear project slugId (e.g. 4f4a2350682f), \
+             not the project name — see README.md's per-project auto_merge section."
+        );
+    }
 }
 
 fn load_resolved(path: &Path) -> Option<Config> {

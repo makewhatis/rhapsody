@@ -1,24 +1,42 @@
-//! prlink — the daemon writes the Linear↔GitHub link its own summons routing depends on
-//! (STUDIO-875).
+//! prlink — the daemon puts a clickable pull-request link on the ticket (STUDIO-875, corrected by
+//! STUDIO-882).
 //!
 //! **No Go v0.4.0 counterpart.** Symphony only ever READ GitHub attachments, on the assumption
 //! that Linear's own GitHub integration had written them.
 //!
-//! # The drop this exists to end
+//! # What this module does NOT do, stated first because it used to claim otherwise
 //!
-//! [`crate::ghenrich::apply_github_summons`] attributes a summoning pull-request comment to a
-//! ticket by walking that ticket's `linked_prs`, which the tracker builds from the issue's GitHub
-//! attachments. A Linear workspace whose repository is not connected in the GitHub integration
-//! answers `attachments: []` on every issue, so the walk has nothing to walk — and a review that
-//! files findings posts a perfectly good token-bearing comment which is then dropped on every poll,
-//! forever. `latest_summon_at` is never advanced, so `review_reopen_eligible` can never fire, and
-//! the board shows an idle ticket with an open pull request: indistinguishable from "the reviewer
-//! approved and there is nothing left to do".
+//! **This write does not feed `linked_prs`, and no write from this daemon can.** STUDIO-875 shipped
+//! this module to repair summons routing on a repository whose GitHub integration is not connected,
+//! reasoning that `attachmentLinkGitHubPR` — rather than the generic `attachmentLinkURL` — would
+//! make Linear classify the attachment as `sourceType: "github"` and so admit it to
+//! `Issue::linked_prs`. STUDIO-882 read a daemon-written attachment back off the live API and
+//! measured otherwise:
 //!
-//! Connecting the repository in Linear repairs it for that repository, invisibly to anyone reading
-//! this code, and silently omits the next repository somebody adds. So the daemon writes the link
-//! itself, at the one moment it has both halves in hand: when it has just resolved a pull request
-//! for a ticket, off-loop, on the review-introduction path.
+//! ```text
+//! daemon-written, unconnected repo:  sourceType: "api"     metadata: {}
+//! integration-written, connected:    sourceType: "github"  metadata: { url, number, status, … }
+//! ```
+//!
+//! The mutation degrades to a plain API attachment on exactly the population 875 targeted, and it
+//! fails `is_github_pr` twice: the `sourceType` gate rejects it, and `linked_prs` is built by
+//! matching a pull-request url out of `metadata.url`, which is not there either. The write landed,
+//! Linear showed it, and the ticket read `linked_prs_total=0` for eleven hours.
+//!
+//! Summons routing is therefore [`crate::ghenrich::DaemonPrLinks`]' job now — the daemon's OWN
+//! record of which pull request belongs to which ticket, read out of the review watch set, which
+//! needs nothing from the tracker.
+//!
+//! # Why the write is still made
+//!
+//! Because it earns its place for the one audience left: a person. The attachment renders on the
+//! Linear issue as `makewhatis/rhapsody#159` linking to the pull request, which is how somebody
+//! reading the ticket gets to the code — and on an unconnected repository nothing else puts it
+//! there. It costs at most one tracker call per pull request, and a connected workspace pays none
+//! at all (its attachment IS the resolved pull request, so the gate below skips).
+//!
+//! What it must never again be is load-bearing. Nothing in the daemon reads this attachment back,
+//! and a failure to write it costs a link in the UI rather than a dropped review.
 //!
 //! # What it asks before writing
 //!
@@ -38,18 +56,26 @@
 //! # Best-effort, and the word is load-bearing
 //!
 //! A failed link must never fail the thing that was actually asked for — the review introduction,
-//! or the quorum fan-out. It costs the NEXT summons on that pull request, and it is retried by
-//! whatever next resolves a pull request for that ticket: another handoff, or
+//! or the quorum fan-out. Since STUDIO-882 it costs a link in the tracker's UI and nothing else;
+//! it is retried by whatever next resolves a pull request for that ticket: another handoff, or
 //! [`crate::reviewadopt`]'s sweep. **That is not "every tick", and on the quorum path it is not
 //! even every handoff** — `fan_out` returns at `AlreadyRequestedAtHead` before it resolves a
-//! tracker, so a repeat handoff at an unchanged head retries nothing. The backstop for a link that
-//! never lands is therefore [`crate::ghenrich::UnlinkedSummons`], which names the ticket out loud
-//! rather than leaving it to be discovered. Every failure here is a warning and a return, never an
-//! error the caller has to thread.
+//! tracker, so a repeat handoff at an unchanged head retries nothing. That mattered when routing
+//! depended on this write; it no longer does, because a ticket the daemon parked for review is
+//! reachable through [`crate::ghenrich::DaemonPrLinks`] whether or not the attachment ever landed.
+//! Every failure here is a warning and a return, never an error the caller has to thread.
 //!
 //! What it is NOT is silent: the two outcomes worth a line get one each, because "the daemon linked
 //! it" and "the daemon tried and Linear refused" are the two facts an operator staring at an idle
 //! board needs to tell apart.
+//!
+//! A third outcome used to masquerade as the second, and no longer does (STUDIO-904). Linear
+//! refuses a second write of a pull request already attached with `INPUT_ERROR` on the
+//! `attachmentLinkGitHubPR` path; `rhapsody_tracker` classifies that refusal as the SUCCESS it is
+//! (the link exists — which is the whole post-condition), so it takes the "the daemon linked it"
+//! line and never the warning. The warning is therefore only ever the genuine failure — the half
+//! worth keeping loud — and it no longer claims the author cannot be re-engaged, because routing
+//! does not read this attachment (see the module doc above).
 
 use std::sync::Arc;
 
@@ -89,17 +115,18 @@ pub struct PrLinkTarget {
 /// # Why the decision is identity and never `merged`
 ///
 /// The obvious gate is the one this function used to apply: skip when the ticket already carries an
-/// UNMERGED linked pull request here, since `apply_github_summons` can already attribute a summons
-/// to it. It reads correctly and it cannot work, because `merged` comes from the attachment's
+/// UNMERGED linked pull request here. It reads correctly and it cannot work, because `merged` comes from the attachment's
 /// `metadata.status`/`mergedAt` — fields maintained by the tracker's GitHub integration, whose
 /// ABSENCE is the entire premise of this module. On the installations that need the link, nothing
 /// writes attachments and so nothing refreshes them: a link the daemon wrote reads `unmerged`
 /// forever, including long after its pull request has merged.
 ///
-/// That stale `unmerged` would then refuse the ticket's SECOND pull request — the one a second
-/// round of review is about to file findings on — and the drop would be invisible, because
-/// `apply_github_summons` counts the ticket as reachable on the strength of the stale link and
-/// never reports it. This ticket's own bug, one round later, with its own instrument blind to it.
+/// That stale `unmerged` would then refuse the ticket's SECOND pull request, leaving the UI link
+/// pointing at the wrong one. (When this gate was routing rather than decoration, the same
+/// staleness was a dropped review: `apply_github_summons` counted the ticket as reachable on the
+/// strength of the stale link and never reported it. STUDIO-882 moved routing off this path
+/// entirely — see the module doc — and the watch set it moved to keeps its own liveness, so the
+/// hazard no longer has a routing half.)
 ///
 /// So the question asked is one whose answer this daemon maintains itself: **is the pull request we
 /// just resolved already among the ones this ticket links to?** A healthy installation still pays
@@ -138,9 +165,10 @@ pub(crate) fn pr_link_target(
 /// or a tracker the quorum has already resolved for the parent's own project.
 #[async_trait]
 pub trait PrLinker: Send + Sync {
-    /// Attaches `url` to `issue_id`. Callers do not depend on the tracker de-duplicating: the
-    /// [`pr_link_target`] gate is what keeps a working installation from writing at all, and see
-    /// [`Tracker::link_pull_request`] for what a duplicate would and would not cost.
+    /// Attaches `url` to `issue_id`. The [`pr_link_target`] gate is what keeps a working
+    /// installation from writing at all; a write that still happens and is refused because the
+    /// link is already there comes back `Ok`, since the refusal proves the post-condition. See
+    /// [`Tracker::link_pull_request`] for what a duplicate costs.
     async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError>;
 }
 
@@ -219,12 +247,18 @@ pub(crate) async fn link_pr_best_effort(
             issue_identifier = %target.identifier, pr = %url,
             "pr-link: attached the pull request to its ticket, so a summons on it can reach the author"
         ),
-        // The consequence, not just the error: whoever reads this line is reading it because
-        // nothing re-engaged an author, and the link is why.
+        // The consequence, and it is deliberately NOT "the author cannot be re-engaged": since
+        // STUDIO-882 summons routing reads the daemon's own watch set
+        // (`ghenrich::DaemonPrLinks`), not this attachment, so a failed write costs a link in the
+        // tracker's UI and nothing more. The line says what is true and actionable — the ticket
+        // shows no link for a person to click — and reassures what used to be feared, so a
+        // genuine failure is not misread as a stall. A duplicate never reaches here: the tracker's
+        // refusal for an already-attached pull request is classified as success upstream
+        // (STUDIO-904).
         Err(e) => tracing::warn!(
             issue_identifier = %target.identifier, pr = %url, err = %e,
-            "pr-link: could not attach the pull request to its ticket; a review that files findings \
-             on it cannot re-engage the author until this succeeds"
+            "pr-link: could not attach the pull request to its ticket, so the ticket will show no \
+             link to it; the daemon's own summons routing does not depend on this attachment"
         ),
     }
 }
@@ -447,6 +481,87 @@ mod tests {
         .await;
         link_pr_best_effort(Some(l.as_ref()), target.as_ref(), "not-a-pull-request-url").await;
         assert_eq!(l.calls().len(), 2, "neither is provably already linked");
+    }
+
+    // ── the two lines an operator reads (STUDIO-904) ────────────────────────────────────────────
+    //
+    // The adapter classifies a duplicate as success, so these two branches are all prlink can see:
+    // "linked" and "genuinely failed". Their lines must differ, and the failure must not carry the
+    // false re-engagement claim that made the old duplicate warning unreadable.
+
+    use crate::testsupport::{CapturedEvent, TRACING_TEST_LOCK, recording_subscriber};
+
+    async fn captured<F, Fut>(f: F) -> Vec<CapturedEvent>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _serial = TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        f().await; // warm-up: force every callsite to register (TRA-243)
+        tracing::callsite::rebuild_interest_cache();
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        f().await;
+        drop(guard);
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A write that landed is an INFO and never a WARN — the shape the duplicate now takes, since
+    /// the tracker's refusal for an already-attached pull request is absorbed upstream.
+    #[tokio::test]
+    async fn a_linked_pull_request_says_so_at_info_and_never_warns() {
+        let events = captured(|| async {
+            let l = Recording::new(None);
+            link_pr_best_effort(Some(l.as_ref()), Some(&target()), PR).await;
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == "INFO" && e.message.contains("attached the pull request")),
+            "expected the success line, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.level == "WARN"),
+            "a landed link must not warn: {events:?}"
+        );
+    }
+
+    /// A genuine failure still warns — and the wording no longer claims the author is stranded.
+    /// Routing does not read this attachment (STUDIO-882), so that claim was false; restoring it,
+    /// or making a failure read as success, reds here.
+    #[tokio::test]
+    async fn a_genuine_failure_warns_without_claiming_the_author_is_unreachable() {
+        let events = captured(|| async {
+            let l = Recording::new(Some(TrackerError::Other("linear said no".into())));
+            link_pr_best_effort(Some(l.as_ref()), Some(&target()), PR).await;
+        })
+        .await;
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("a genuine failure must warn, got {events:?}"));
+        assert!(
+            warn.message.contains("could not attach the pull request"),
+            "got {warn:?}"
+        );
+        assert!(
+            !warn.message.contains("cannot re-engage")
+                && !warn.message.contains("re-engage the author"),
+            "the warning must not claim the author is unreachable: {}",
+            warn.message
+        );
+        assert!(
+            !events.iter().any(|e| e.level == "INFO"),
+            "a failed link must not also claim success: {events:?}"
+        );
     }
 
     /// And the other side of the same gate, which is what keeps a healthy installation's Linear

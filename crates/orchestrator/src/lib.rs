@@ -32,6 +32,7 @@
 //! telemetry attrs — compiles standalone and introduces none.
 
 pub mod agentupdate;
+pub mod automerge;
 pub mod backoff;
 pub mod claim;
 pub mod concurrency;
@@ -39,6 +40,7 @@ pub mod concurrency;
 #[path = "loop.rs"]
 pub mod control_loop;
 pub mod dispatch;
+pub mod drain;
 pub mod effective;
 pub mod ghenrich;
 pub mod ghsummons;
@@ -70,13 +72,16 @@ pub mod reviewdone;
 pub mod reviewintro;
 pub mod reviewnotify;
 pub mod reviewprompt;
+pub mod reviewreconcile;
 pub mod reviewwatch;
+pub mod runautomerge;
 pub mod rundiff;
 pub mod runmerge;
 pub mod select;
 pub mod snapshot;
 pub mod snapshot_json;
 pub mod stop;
+pub mod summonwatermark;
 pub mod teams;
 pub mod teamsanswer;
 mod teamscompose;

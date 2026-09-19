@@ -42,6 +42,14 @@
 .rh-console .trhd .idw { min-width: 0; }
 .rh-console .trhd .k { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
 .rh-console .trhd h1 { margin: 0; font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
+/* What the run actually ran on (STUDIO-909): a compact mono line under the title, each value with
+   the config key it came from. It wraps rather than truncating, because the origin — the half that
+   says an override is in play — is the part that must stay readable. */
+.rh-console .trhd .prov { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 2px; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.rh-console .trhd .prov .pf { display: inline-flex; gap: 4px; }
+.rh-console .trhd .prov .pl { color: var(--ink-4); }
+.rh-console .trhd .prov .pv { color: var(--ink-2); }
+.rh-console .trhd .prov .po { color: var(--ink-4); }
 /* The prototype's `.av` (§3A): the header's assignee disc carries the teammate's INITIAL, where a
    table row's plain disc does not. Size and colour stay inline on the component — only the
    centring and the type live here. The text takes the page background rather than a fixed dark,

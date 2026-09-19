@@ -168,9 +168,22 @@ fn short_sha(sha: &str) -> &str {
 /// declared `HANDOFF: approved` (STUDIO-721; design §15-c, "approved-pauses, push-re-arms").
 pub(crate) const REVIEW_STATE_APPROVED: &str = "review:approved";
 
-/// The synthetic issue's EXIT "state" for every other declared review completion: findings were
-/// posted, or the agent declared done without a verdict this daemon recognises.
+/// The synthetic issue's EXIT "state" for a DECLARED rejection: the agent's `HANDOFF:` payload is
+/// `findings` (the wording `reviewprompt/review-base.md` instructs) or `not approved` (an older
+/// spelling this daemon still honours). Either way the reviewer said no, explicitly.
 pub(crate) const REVIEW_STATE_FINDINGS: &str = "review:findings";
+
+/// The synthetic issue's EXIT "state" when the agent emitted a `HANDOFF:` line — so
+/// [`EvWorkerExit::declared_handoff`](crate::retry::EvWorkerExit) is `true` and the max_turns
+/// backstop never fired — but its payload is neither `approved` nor a recognised rejection
+/// (STUDIO-894). A reviewer who approves in prose without the exact line the prompt asks for lands
+/// here, and so does one whose payload merely drifted from the instructed wording. Neither is
+/// `findings`: recording either one `reviewed` would silently block a pull request nobody actually
+/// asked for changes on, which is the defect this state exists to stop reproducing. See
+/// [`Orchestrator::on_review_exit`](crate::orchestrator::Orchestrator::on_review_exit) for how it is
+/// handled — the same non-terminal parking the max_turns backstop uses, logged loudly and distinctly
+/// from it.
+pub(crate) const REVIEW_STATE_UNDECLARED: &str = "review:undeclared";
 
 /// Reads a review agent's VERDICT off its final result text, as the state a review run exits in.
 ///
@@ -182,19 +195,29 @@ pub(crate) const REVIEW_STATE_FINDINGS: &str = "review:findings";
 /// ever reaching (STUDIO-716), and the review branch below is unreachable for a run with no
 /// [`ReviewRun`].
 ///
-/// The payload must be exactly `approved` (case- and whitespace-insensitive) rather than merely
-/// containing it, so that `HANDOFF: not approved` is what it says it is.
+/// Every payload compared here is an EXACT match (case- and whitespace-insensitive), never a
+/// substring — widening this to `contains` is the fail-open direction the whole function exists to
+/// refuse: it would read `HANDOFF: not approved` as an approval (STUDIO-874 leans on the strictness
+/// to avoid prose-sniffing). A payload this function does not recognise is not guessed at either
+/// way; it becomes [`REVIEW_STATE_UNDECLARED`] rather than defaulting to a rejection, which is the
+/// STUDIO-894 fix — the old default silently recorded every unrecognised payload, including a
+/// reviewer's own approval spelled slightly differently, as changes requested forever.
 pub(crate) fn review_exit_state(result_text: &str) -> &'static str {
-    let approved = result_text.lines().any(|ln| {
-        ln.trim()
-            .strip_prefix("HANDOFF:")
-            .is_some_and(|payload| payload.trim().eq_ignore_ascii_case("approved"))
-    });
-    if approved {
-        REVIEW_STATE_APPROVED
-    } else {
-        REVIEW_STATE_FINDINGS
+    let payloads: Vec<String> = result_text
+        .lines()
+        .filter_map(|ln| ln.trim().strip_prefix("HANDOFF:"))
+        .map(|payload| payload.trim().to_ascii_lowercase())
+        .collect();
+    if payloads.iter().any(|p| p == "approved") {
+        return REVIEW_STATE_APPROVED;
     }
+    if payloads
+        .iter()
+        .any(|p| p == "findings" || p == "not approved")
+    {
+        return REVIEW_STATE_FINDINGS;
+    }
+    REVIEW_STATE_UNDECLARED
 }
 
 /// The watch-set status a DECLARED review completion is recorded with, from the verdict
@@ -232,7 +255,8 @@ fn closed_review_status(status: &str) -> Option<&'static str> {
 /// Why a review dispatch did or did not happen. Returned rather than logged-and-swallowed because
 /// slice 5's watcher has to distinguish "already in flight, come back next tick" from "this will
 /// never work", and because the F-DUP refusal is the property this slice's acceptance test asserts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy` since STUDIO-908: `Refused` carries a formatted message (String).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDispatchOutcome {
     /// A worker was dispatched for this (PR, reviewer).
     Dispatched,
@@ -241,8 +265,13 @@ pub enum ReviewDispatchOutcome {
     /// A run for this exact (PR, reviewer) is already running or claimed — THE overwrite guard
     /// (design §14.1 F-DUP). Nothing was touched.
     AlreadyInFlight,
-    /// The coordinates cannot produce a review run; the payload names which.
-    Refused(&'static str),
+    /// A drain is armed, so the daemon is taking no new work of any kind (STUDIO-880). Nothing was
+    /// touched; the row stays where it is and the sweep re-offers it once the drain is cancelled.
+    Draining,
+    /// The coordinates cannot produce a review run; the payload names which. A `String` rather
+    /// than `&'static str` because the `review.model` refusal (STUDIO-908) names the reviewer's
+    /// harness, the configured model and the `review.model` origin — all data, not literals.
+    Refused(String),
 }
 
 impl Orchestrator {
@@ -266,28 +295,73 @@ impl Orchestrator {
         if !self.teams.as_ref().is_some_and(|t| t.enabled) {
             return ReviewDispatchOutcome::TeamsOff;
         }
+        // STUDIO-880: the drain gate's THIRD entry point. `on_tick` gates and `on_retry` parks, but
+        // `Event::ReviewSweep` reaches dispatch through here, past both. It has no production caller
+        // today (`ControlHandle::review_sweep` is unwired), so this gate is a backstop rather than a
+        // live fix — but the path exists in-tree, and forgetting the second entry point is the bug
+        // this feature already shipped once.
+        //
+        // It must refuse HERE rather than inside `dispatch_issue`: the writes below record the head
+        // as requested and mark the row in-flight, so a refusal further down would leave the watcher
+        // believing a review was dispatched and never re-offering this head. Refusing before them
+        // leaves the row exactly where it was.
+        if self.drain.is_draining() {
+            return ReviewDispatchOutcome::Draining;
+        }
         if run.owner.is_empty() || run.repo.is_empty() {
-            return ReviewDispatchOutcome::Refused("pull request has no owner/repo");
+            return ReviewDispatchOutcome::Refused("pull request has no owner/repo".to_string());
         }
         if run.number <= 0 {
-            return ReviewDispatchOutcome::Refused("pull-request number is not positive");
+            return ReviewDispatchOutcome::Refused(
+                "pull-request number is not positive".to_string(),
+            );
         }
         if run.reviewer.is_empty() {
-            return ReviewDispatchOutcome::Refused("no reviewer");
+            return ReviewDispatchOutcome::Refused("no reviewer".to_string());
         }
         if run.head_sha.is_empty() {
-            return ReviewDispatchOutcome::Refused("no pinned head SHA");
+            return ReviewDispatchOutcome::Refused("no pinned head SHA".to_string());
         }
         // A repo no configured project owns has no workspace, no agent and no prompt to run with —
         // and refusing it also keeps a review confined to repositories this daemon is configured
         // for, which is the trusted-origin property (design §14.1 F-SEC) restated at the dispatch.
         let Some(route) = self.review_route(&run.repo_url) else {
-            return ReviewDispatchOutcome::Refused("no configured project owns the PR's repo");
+            return ReviewDispatchOutcome::Refused(
+                "no configured project owns the PR's repo".to_string(),
+            );
         };
         let id = run.key();
         // THE overwrite guard (F-DUP).
         if self.running.contains_key(&id) || self.claimed.contains(&id) {
             return ReviewDispatchOutcome::AlreadyInFlight;
+        }
+
+        // STUDIO-908: the operator's `review.model` is scoped by harness, so a review routed to a
+        // reviewer whose harness has no entry is refused HERE — before the watch-set writes below,
+        // which would otherwise record this head as requested and mark the row in-flight, leaving
+        // the watcher believing a review ran when none did. The message names the reviewer's
+        // harness, the configured model and the `review.model` origin; that is the whole point,
+        // because the failure this replaces was a provider's generic `UnknownError` naming none of
+        // them. Placed after the overwrite guard so a duplicate of an already-live review still
+        // answers `AlreadyInFlight` rather than blaming a model.
+        let iss = run.synthetic_issue();
+        // `fallback` is the configured `agent.backend` — the harness the legacy bare-scalar
+        // `review.model` spelling belongs to, so an all-opencode installation that wrote a bare
+        // scalar is not refused on its own harness (alice's blocking finding on PR #172).
+        let fallback = self.configured_backend();
+        let refused = self
+            .teams
+            .as_ref()
+            .filter(|t| t.review_ticketless())
+            .and_then(|teams| {
+                match teams.review_model_for(&self.review_harness_for(&iss), &fallback) {
+                    rhapsody_config::teams::ReviewModelChoice::Refuse(why) => Some(why),
+                    _ => None,
+                }
+            });
+        if let Some(why) = refused {
+            tracing::warn!(review = %id, reason = %why, "ticketless review: refused");
+            return ReviewDispatchOutcome::Refused(why);
         }
 
         // Record the head this run was dispatched against BEFORE the dispatch. Without it the
@@ -316,7 +390,6 @@ impl Orchestrator {
             tracing::warn!(review = %id, err = %e, "recording the requested head failed; dispatching anyway");
         }
 
-        let iss = run.synthetic_issue();
         // Carried to the dispatch the way a graphite stacking hint is (`pending_stack`): the worker
         // spawn happens INSIDE `dispatch_issue`, so the pinned head has to be in place before the
         // call rather than stamped onto the running entry after it.
@@ -385,11 +458,39 @@ impl Orchestrator {
             // partial — or entirely absent — review as a complete one, because the watcher's
             // edge-trigger would then see `last_reviewed_sha == head` and never look again. The row
             // is parked NON-terminally instead, which re-arms this same head for another round.
+            // The CLASSIFICATION is the same either way — a partial read is parked non-terminally
+            // and the head is re-reviewed — but the attributed CAUSE is not. A drained review wound
+            // down at a turn boundary on purpose and burned no budget doing it; calling that "the
+            // max_turns backstop" sends whoever reads this line looking for a review that ran away.
+            let cause = if self.drain.is_draining() {
+                "wound down at a turn boundary for an armed drain"
+            } else {
+                "ended on the max_turns backstop"
+            };
             tracing::warn!(
                 review = %run.key(),
                 head = %run.head_sha,
-                "review run ended on the max_turns backstop without declaring it had finished; \
-                 recording the round as truncated so the head is reviewed again"
+                "review run {cause} without declaring it had finished; recording the round as \
+                 truncated so the head is reviewed again"
+            );
+            self.record_review_truncated(run);
+            (store::OUTCOME_COMPLETED, "")
+        } else if e.last_state == REVIEW_STATE_UNDECLARED {
+            // STUDIO-894: the agent DID emit a `HANDOFF:` line — the branch above did not fire —
+            // but `review_exit_state` could not read its payload as `approved` or as a declared
+            // rejection. Guessing either way is the defect this branch exists to avoid (a reviewer
+            // who approved in prose without the exact line must not be recorded `reviewed`, which
+            // would block the pull request forever since nothing then advances the head), so the
+            // round is parked exactly where the max_turns backstop above parks one: non-terminally,
+            // which re-offers this same head for another round. Logged at `error` rather than
+            // `warn` — unlike the backstop, this is not an expected shape of a clean exit, and an
+            // operator reading the log needs it to stand out from routine truncation.
+            tracing::error!(
+                review = %run.key(),
+                head = %run.head_sha,
+                "review run declared a hand-off but its payload is neither `approved` nor a \
+                 recognised rejection; recording the round as truncated rather than guessing a \
+                 verdict"
             );
             self.record_review_truncated(run);
             (store::OUTCOME_COMPLETED, "")
@@ -503,9 +604,10 @@ pub type PendingReviews = HashMap<String, ReviewRun>;
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
+    use rhapsody_config::teams::{HarnessScoped, Identity, Review, ReviewMode, Teams};
     use rhapsody_store::{
-        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, StorePath,
+        REVIEW_STATUS_APPROVED, REVIEW_STATUS_IN_FLIGHT, REVIEW_STATUS_REVIEWED, Sqlite, Store,
+        StorePath,
     };
     use rhapsody_tracker::fake::Fake;
     use rhapsody_workspace::sanitize_key;
@@ -852,6 +954,620 @@ mod tests {
         );
     }
 
+    /// Writes a profile file under a temp dir's `profiles/` subdirectory, creating it — the same
+    /// helper `teams.rs`'s STUDIO-868 tests use, duplicated here rather than shared because the two
+    /// modules' test scaffolding (`orch_with_review` vs `orch_with_teams`) does not otherwise touch.
+    fn write_profile(dir: &TempDir, name: &str, text: &str) {
+        let p = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&p).expect("create profiles dir");
+        std::fs::write(p.join(format!("{name}.md")), text).expect("write profile");
+    }
+
+    /// Drains the batched event writer so the rows it queued are readable — the same helper
+    /// `teams.rs`'s STUDIO-868 tests use, duplicated for [`write_profile`]'s reason.
+    fn flush_events(o: &mut Orchestrator) {
+        o.stop_event_writer();
+    }
+
+    fn events_of(store: &dyn Store, run_id: i64) -> Vec<(String, String)> {
+        store
+            .run_events(run_id)
+            .expect("run events")
+            .into_iter()
+            .map(|e| (e.kind, e.text))
+            .collect()
+    }
+
+    // ── review.model / review.effort (STUDIO-901) ───────────────────────────
+
+    /// **STUDIO-901's acceptance criterion, still green after STUDIO-908 scoped the key by
+    /// harness.** A review run whose reviewer's OWN profile names a model/effort still uses
+    /// `review.model.claude`/`review.effort.claude` when the operator set them for the Claude
+    /// harness the reviewer runs — the review is what is being priced, not that teammate's own
+    /// work (decision 1: review.model wins for a review run).
+    ///
+    /// Mutation check (acceptance #4, "never apply"): reverting the `review.model` block to a
+    /// no-op leaves `cheap-model`/`low` from the reviewer's profile here and turns this red.
+    #[test]
+    fn review_model_wins_over_the_reviewers_own_profile_for_a_review_run() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = HarnessScoped::bare("premium-model");
+            teams.review.effort = HarnessScoped::bare("xhigh");
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override,
+            rhapsody_agent::ModelOverride {
+                // Cleared, not "alice" (alice round 1 finding 2 on PR #168): the model/effort
+                // came from `review.model`/`review.effort`, not alice's own profile, so a CLI
+                // rejection must not attribute it to her.
+                identity: String::new(),
+                model: "premium-model".to_string(),
+                effort: "xhigh".to_string(),
+            },
+            "review.model/effort must win over the reviewer's own profile for a review run"
+        );
+    }
+
+    /// **jimmy round-1 finding 1 on PR #168, mutation-checked.** The `teams.route` events row is
+    /// the durable per-run record of the model an operator reads back to see what a run cost
+    /// (`RunningEntry::model_override`'s own doc, `route_teams`'s own doc). It must name what
+    /// `review.model`/`review.effort` overrode to, not the reviewer's own profile — the exact
+    /// mismatch a cost-allocation feature cannot afford. Reverting `record_route_event` to compose
+    /// the suffix from `td.model_override` (the pre-override profile value) instead of
+    /// `re.model_override` (the post-override final value) turns this red.
+    #[test]
+    fn the_route_event_names_the_review_override_not_the_reviewers_profile() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = HarnessScoped::bare("premium-model");
+            teams.review.effort = HarnessScoped::bare("xhigh");
+        }
+        o.start_event_writer();
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        let id = review_run("alice", HEAD_A).key();
+        let run_id = o.running[&id].run_id;
+        flush_events(&mut o);
+        assert_eq!(
+            events_of(o.store.as_ref(), run_id),
+            vec![(
+                "teams.route".to_string(),
+                "identity=alice reason=label model=premium-model effort=xhigh".to_string()
+            )],
+            "the durable row must name review.model/effort, not the reviewer's cheap-model profile"
+        );
+    }
+
+    /// **Precedence in the other direction (acceptance: "tested in both directions").** The SAME
+    /// teammate, dispatched as an ordinary ticket (an implementation run, not a review), keeps
+    /// their own profile's model/effort untouched — `review.model` must never leak onto a run it
+    /// was not written for.
+    #[test]
+    fn review_model_does_not_apply_to_an_implementation_run() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, dispatched) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = HarnessScoped::bare("premium-model");
+            teams.review.effort = HarnessScoped::bare("xhigh");
+        }
+
+        o.dispatch_issue(
+            rhapsody_core::Issue {
+                id: "1".into(),
+                identifier: "STUDIO-1".into(),
+                title: "work".into(),
+                state: "Todo".into(),
+                // Routes directly to alice (tier 0), the same mechanism the review path's
+                // synthetic issue uses — so this run is routed to the SAME identity the review
+                // above was, and only the run KIND differs.
+                labels: Some(vec!["rhapsody:@alice".to_string()]),
+                ..Default::default()
+            },
+            None,
+            None,
+            String::new(),
+        );
+
+        let entries = dispatched.lock().expect("dispatched lock");
+        assert_eq!(entries[0].identity, "alice", "sanity: routed to alice");
+        assert_eq!(
+            entries[0].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "cheap-model".to_string(),
+                effort: "low".to_string(),
+            },
+            "an implementation run must keep the routed teammate's own profile model/effort"
+        );
+    }
+
+    /// **Absent means inherit (acceptance: byte-identical without `review.model`).** With
+    /// `review.model`/`review.effort` unset — the default — a review run resolves exactly the
+    /// model/effort its reviewer's profile would have given an ordinary dispatch: nothing new to
+    /// observe on an installation that never wrote the key.
+    #[test]
+    fn absent_review_model_leaves_a_review_run_on_the_reviewers_own_profile() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+        }
+        assert!(o.teams.as_ref().is_some_and(|t| t.review.model.is_empty()));
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override,
+            rhapsody_agent::ModelOverride {
+                identity: "alice".to_string(),
+                model: "cheap-model".to_string(),
+                effort: "low".to_string(),
+            },
+            "an unset review.model/effort must not change the reviewer's own profile override"
+        );
+    }
+
+    /// A partial override — `review.model` alone — leaves `effort` at whatever the profile (or the
+    /// installation) already had, the same per-field non-empty-wins shape `turn_cfg` already
+    /// applies to a profile override.
+    #[test]
+    fn review_model_alone_leaves_effort_at_the_profiles_own_value() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = HarnessScoped::bare("premium-model");
+            // review.effort left unset.
+        }
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override,
+            rhapsody_agent::ModelOverride {
+                // Cleared for the same reason as the full-override case: `model` came from
+                // `review.model`, not alice's profile, even though `effort` still did.
+                identity: String::new(),
+                model: "premium-model".to_string(),
+                effort: "low".to_string(),
+            }
+        );
+    }
+
+    /// **alice round-1 finding 2 on PR #168, mutation-checked.** `ModelOverride.identity` exists
+    /// so a CLI-rejected model fails as "teammate `<name>`'s profile asked for `<model>`" rather
+    /// than nobody (`crates/agent/src/lib.rs`). A `review.model` that overrides the reviewer's
+    /// profile must not leave that identity in place — the value came from the operator's
+    /// `review:` block, not from the routed reviewer's profile, and blaming her for the operator's
+    /// typo names the wrong file in the diagnostic. Reverting the `identity = String::new()` line
+    /// in `retry.rs`'s review-override block turns this red.
+    #[test]
+    fn review_model_override_clears_the_reviewers_identity_from_the_diagnostic() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+            teams.review.model = HarnessScoped::bare("premium-model");
+            teams.review.effort = HarnessScoped::bare("xhigh");
+        }
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.identity, "",
+            "a rejected review.model must not be blamed on the routed reviewer's own profile"
+        );
+    }
+
+    /// The sibling of the above: with `review.model`/`review.effort` both unset, the override is
+    /// entirely the reviewer's own profile, so the diagnostic naming her is exactly right and
+    /// must NOT be cleared.
+    #[test]
+    fn absent_review_model_leaves_the_reviewers_identity_on_the_diagnostic() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "staff",
+            "---\nextends: swe\nmodel: cheap-model\neffort: low\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "staff".to_string();
+        }
+
+        o.dispatch_review(review_run("alice", HEAD_A));
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.identity, "alice",
+            "with no review override at all, a rejected model IS the reviewer's own profile"
+        );
+    }
+
+    // ── review.model scoped by harness (STUDIO-908) ─────────────────────────
+
+    /// **The seam this ticket closes, acceptance #1.** An opencode reviewer's profile names
+    /// `harness: opencode`; `review.model` names a model for opencode; the run's model override is
+    /// that model — a model its provider serves — not the Claude one. Before this ticket the
+    /// Claude `review.model` was applied unconditionally and the opencode CLI rejected it one
+    /// second in with a provider-generic error.
+    ///
+    /// Mutation check (acceptance #4, "apply regardless of harness"): making the lookup ignore the
+    /// harness — returning any entry, or the bare scalar — puts `claude-opus-5` on this opencode
+    /// run and turns the assertion red.
+    #[test]
+    fn an_opencode_reviewer_runs_on_the_model_scoped_to_its_own_harness() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nharness: opencode\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+            teams.review.model.insert("claude", "claude-opus-5").insert(
+                "opencode",
+                "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+            );
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.model,
+            "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+            "an opencode reviewer must run on the model scoped to its own harness"
+        );
+        assert_eq!(
+            o.running[&id].model_override.identity, "",
+            "the value came from review.model, not the reviewer's own profile"
+        );
+    }
+
+    /// **STUDIO-909 acceptance: the review override's ORIGIN is recorded, not just its value.** This
+    /// is the exact shape that was undiagnosable tonight — a reviewer whose PROFILE names one model
+    /// while `review.model.opencode` substitutes another, so the run failed on a model the operator
+    /// could not see in the job. The durable provenance must name `review.model.opencode` as the
+    /// model's origin (and the opencode harness as `[profile]`), so the console renders the override
+    /// rather than blaming the teammate's own profile value.
+    ///
+    /// Mutation check (acceptance: "make a review run report its profile's model instead of the
+    /// override"): recording the provenance from `td.model_override`/the profile instead of the
+    /// FINAL `re.model_override` reports `profile` and `cheap-model` here, turning this red — and the
+    /// derived provider would read as unknown instead of `fireworks-ai`.
+    #[test]
+    fn a_review_runs_provenance_names_the_review_model_origin_not_the_profile() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nmodel: cheap-model\nharness: opencode\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+            teams.review.model.insert(
+                "opencode",
+                "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+            );
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_origin, "review.model.opencode",
+            "the model came from the operator's review block, not alice's profile"
+        );
+        assert_eq!(
+            o.running[&id].harness_origin, "profile",
+            "the opencode harness came from alice's profile"
+        );
+
+        let run_id = o.running[&id].run_id;
+        let p = o
+            .store()
+            .run_provenance(run_id)
+            .expect("read provenance")
+            .expect("a provenance row");
+        assert_eq!(
+            p.model,
+            "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        assert_eq!(p.model_origin, "review.model.opencode");
+        assert_eq!(p.harness, "opencode");
+        assert_eq!(p.harness_origin, "profile");
+        assert_eq!(p.provider, "fireworks-ai");
+    }
+
+    /// **Acceptance #5: the mixed roster — today's live configuration and the shape that broke.**
+    /// One Claude reviewer and one opencode reviewer of the SAME pull request, each configured a
+    /// model for their own harness, both dispatch and each run on its own. Mutation check
+    /// ("apply regardless of harness"): both would receive `claude-opus-5`, reddening the opencode
+    /// assertion.
+    #[test]
+    fn a_mixed_roster_runs_each_reviewer_on_the_model_scoped_to_their_own_harness() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nharness: opencode\n---\nStaff.\n",
+        );
+        let (mut o, dispatched) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            // alice keeps the built-in `swe`, whose empty harness inherits `agent.backend` (claude
+            // in this test); jerry overlays it with `harness: opencode`.
+            teams.roster[0].profile = "swe".to_string();
+            teams.roster.push(Identity {
+                name: "jerry".to_string(),
+                profile: "oc".to_string(),
+                ..Identity::default()
+            });
+            teams
+                .review
+                .model
+                .insert("claude", "claude-opus-5")
+                .insert("opencode", "fireworks-ai/x");
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        assert_eq!(
+            o.dispatch_review(review_run("jerry", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        assert_eq!(dispatched.lock().expect("dispatched lock").len(), 2);
+        assert_eq!(
+            o.running[&review_run("alice", HEAD_A).key()]
+                .model_override
+                .model,
+            "claude-opus-5"
+        );
+        assert_eq!(
+            o.running[&review_run("jerry", HEAD_A).key()]
+                .model_override
+                .model,
+            "fireworks-ai/x"
+        );
+    }
+
+    /// **Acceptance #3.** A `review.model` the reviewer's harness cannot serve is refused at
+    /// dispatch, with a message naming the harness, the model and the `review.model` origin — not
+    /// the provider's generic `UnknownError`. Nothing is written, so the watcher cannot mistake a
+    /// refused review for one in flight.
+    ///
+    /// Mutation check: removing the `dispatch_review` refusal (letting `dispatch_issue` apply the
+    /// Claude model to the opencode run) turns this red.
+    #[test]
+    fn a_review_model_scoped_to_another_harness_is_refused_naming_harness_model_and_origin() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nharness: opencode\n---\nStaff.\n",
+        );
+        let (mut o, dispatched) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+            teams.review.model.insert("claude", "claude-opus-5");
+        }
+
+        let outcome = o.dispatch_review(review_run("alice", HEAD_A));
+        let ReviewDispatchOutcome::Refused(why) = outcome else {
+            panic!("an opencode reviewer must be refused, not run on a claude model: {outcome:?}");
+        };
+        assert!(why.contains("opencode"), "must name the harness: {why}");
+        assert!(why.contains("claude-opus-5"), "must name the model: {why}");
+        assert!(why.contains("review.model"), "must name the origin: {why}");
+
+        assert!(
+            dispatched.lock().expect("dispatched lock").is_empty(),
+            "a refused review must not spawn an agent"
+        );
+        assert!(
+            o.running.is_empty(),
+            "a refused review must leave no run behind"
+        );
+        assert!(o.pending_review.is_empty());
+        assert!(
+            o.store()
+                .get_review_watch(&review_run("alice", HEAD_A).watch_key())
+                .expect("read watch row")
+                .is_none(),
+            "a refused review must not record its head as requested"
+        );
+    }
+
+    /// The other half of the decision (acceptance: the fail-CLOSED direction): an opencode reviewer
+    /// whose harness has no `review.model` entry is REFUSED, never silently downgraded to its own
+    /// (cheap) profile model — that silent downgrade is exactly what `review.model` exists to
+    /// prevent.
+    #[test]
+    fn an_opencode_reviewer_with_no_scoped_review_model_is_refused_not_silently_cheap() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nmodel: cheap-model\nharness: opencode\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+            // Only a Claude entry: the opencode reviewer has nothing scoped to it.
+            teams.review.model.insert("claude", "claude-opus-5");
+        }
+
+        assert!(
+            matches!(
+                o.dispatch_review(review_run("alice", HEAD_A)),
+                ReviewDispatchOutcome::Refused(_)
+            ),
+            "an unconfigured harness must not quietly review on the cheap profile model"
+        );
+    }
+
+    /// With `review.model` unset entirely, an opencode reviewer inherits its own profile model —
+    /// the byte-identical-without-the-key property STUDIO-901 promised, preserved per harness.
+    #[test]
+    fn an_opencode_reviewer_with_no_review_model_at_all_inherits_its_profile() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "oc",
+            "---\nextends: swe\nmodel: cheap-model\nharness: opencode\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+        }
+        assert!(o.teams.as_ref().is_some_and(|t| t.review.model.is_empty()));
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(o.running[&id].model_override.model, "cheap-model");
+        assert_eq!(o.running[&id].model_override.identity, "alice");
+    }
+
+    /// **alice's blocking finding on PR #172.** The legacy bare `review.model` spelling belongs to
+    /// the installation's configured `agent.backend`, not a hardcoded `claude`. On an all-opencode
+    /// installation — `agent.backend: opencode`, every profile naming no harness, exactly alice's
+    /// probe — a bare `review.model` works today and must keep working; scoping it to `claude`
+    /// refused every ticketless review on that install. Mutation check: resolving `bare()` under a
+    /// hardcoded `claude` turns this refusal red.
+    #[test]
+    fn a_legacy_bare_review_model_applies_on_an_all_opencode_installation() {
+        let dir = TempDir::new();
+        // No `harness:` line: this profile inherits the installation's backend, as an all-opencode
+        // install's profiles do.
+        write_profile(&dir, "oc", "---\nextends: swe\n---\nStaff.\n");
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        o.eff.as_mut().expect("eff").cfg.agent.backend = "opencode".to_string();
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "oc".to_string();
+            teams.review.model = HarnessScoped::bare("some-opencode-model");
+        }
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.model, "some-opencode-model",
+            "the bare scalar belongs to the configured backend, which is opencode here"
+        );
+    }
+
+    /// The other direction of the same finding: the bare scalar is still refused for a reviewer on
+    /// a harness OTHER than the configured backend — it is never silently re-scoped to make a
+    /// mismatch go away. And the refusal names the backend as the value's own harness, not a
+    /// `claude` the operator never wrote.
+    #[test]
+    fn a_legacy_bare_review_model_is_refused_for_a_reviewer_on_a_different_harness() {
+        let dir = TempDir::new();
+        write_profile(
+            &dir,
+            "cl",
+            "---\nextends: swe\nharness: claude\n---\nStaff.\n",
+        );
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        o.eff.as_mut().expect("eff").cfg.agent.backend = "opencode".to_string();
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].profile = "cl".to_string();
+            teams.review.model = HarnessScoped::bare("some-opencode-model");
+        }
+
+        let ReviewDispatchOutcome::Refused(why) = o.dispatch_review(review_run("alice", HEAD_A))
+        else {
+            panic!("a claude reviewer must not be handed the opencode backend's model");
+        };
+        assert!(
+            why.contains("opencode (model some-opencode-model)"),
+            "the value's harness must be named as opencode, not claude: {why}"
+        );
+        assert!(
+            why.contains("claude"),
+            "must name the reviewer's harness: {why}"
+        );
+    }
+
     /// A ticket dispatch is untouched by any of this: no review coordinates, so the worker takes the
     /// existing provisioning path and the agent gets no review env.
     #[test]
@@ -1104,6 +1820,154 @@ mod tests {
         );
     }
 
+    /// STUDIO-894, the acceptance criterion round-tripped through the real exit path: a reviewer
+    /// that DID declare a hand-off (so the max_turns branch above does not fire) but whose payload
+    /// is not a recognised verdict must not be recorded `reviewed`. The row is left non-terminal
+    /// (distinguishable from both `approved` and `reviewed` "in the row"), no author-facing comment
+    /// is queued (an undeclared round is not a completion), and the daemon says so loudly rather
+    /// than silently ("in the log").
+    ///
+    /// This is NOT the shape PR #161's round 3 hit — that run's own transcript emitted an explicit
+    /// `HANDOFF: findings`, a declared and correctly-parsed rejection, despite prose that concluded
+    /// "Approve." (jimmy's STUDIO-894 review, round 1). That is a reviewer-prompt ambiguity — the
+    /// binary approved/findings vocabulary has no way to say "approve, with non-blocking nits" — and
+    /// is out of scope here; see the pull request body for the follow-up. What this test pins is the
+    /// narrower, real gap this ticket is about: a `HANDOFF:` line whose payload cannot be parsed as
+    /// either verdict must not be guessed at as a rejection.
+    #[test]
+    fn an_undeclared_verdict_is_recorded_non_terminally_and_logged_loudly_not_as_changes_requested()
+    {
+        let (mut o, _d) = orch_with_review(true);
+        let mut rx = o.open_review_notify_channel();
+        let run = review_run("alice", HEAD_A);
+        o.dispatch_review(run.clone());
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_UNDECLARED);
+        });
+
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .expect("read watch row")
+            .expect("row exists");
+        assert_eq!(
+            row.status,
+            rhapsody_store::REVIEW_STATUS_TRUNCATED,
+            "an undeclared verdict must not be recorded as either approved or reviewed"
+        );
+        assert_eq!(
+            row.last_reviewed_sha, "",
+            "nothing this daemon could parse as a verdict was recorded as having been read"
+        );
+        assert!(
+            drain_notifications(&mut rx).is_empty(),
+            "an undeclared round is not a completion, so the author is not summoned over it"
+        );
+        assert!(
+            events.iter().any(|e| e.message.contains(
+                "declared a hand-off but its payload is neither `approved` nor a recognised \
+                 rejection"
+            )),
+            "the daemon must say loudly, in the log, that it would not guess a verdict: {events:?}"
+        );
+    }
+
+    /// STUDIO-880: the third dispatch entry point refuses a drain, and refuses it BEFORE it writes.
+    ///
+    /// `handle_review_sweep` → `dispatch_review` → `dispatch_issue` reaches dispatch from
+    /// `Event::ReviewSweep`, past both `on_tick`'s gate and `on_retry`'s park. The refusal has to
+    /// come before the watch-set writes: those record the head as requested and mark the row
+    /// in-flight, and a watcher that believes a review is in flight is edge-triggered and never
+    /// offers this head again. So the assertion is on the ROW as much as on the outcome.
+    #[test]
+    fn a_draining_daemon_refuses_a_review_dispatch_and_writes_nothing() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        o.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
+
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Draining
+        );
+        assert!(
+            o.store()
+                .get_review_watch(&run.watch_key())
+                .expect("read watch row")
+                .is_none(),
+            "the refusal happened before the watch-set write, so there is no row claiming a review \
+             is in flight at this head"
+        );
+        assert!(
+            !o.running.contains_key(&run.key()) && !o.claimed.contains(&run.key()),
+            "and nothing was claimed"
+        );
+
+        // Cancelling the drain re-opens the same dispatch: a drain defers review work, it does not
+        // consume it.
+        o.drain.disarm();
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+    }
+
+    /// STUDIO-880: the SAME non-terminal parking, attributed to the right cause.
+    ///
+    /// A drained review reaches the truncation branch too — the drain ends the turn loop at a
+    /// boundary and the agent never gets to declare `HANDOFF:` — so both causes land here and the
+    /// bookkeeping is right for both. Only the log line distinguishes them, and "ended on the
+    /// max_turns backstop" sends whoever reads it looking for a review that ran away, when what
+    /// happened was an operator asking the daemon to settle.
+    #[test]
+    fn a_drained_review_is_not_logged_as_a_runaway_one() {
+        for draining in [false, true] {
+            let (mut o, _d) = orch_with_review(true);
+            let run = review_run("alice", HEAD_A);
+            o.dispatch_review(run.clone());
+            if draining {
+                o.drain
+                    .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
+            }
+
+            let (_, events) = crate::testsupport::capture_events(|| {
+                exit_review_as(&mut o, &run, false, "", false, REVIEW_STATE_FINDINGS);
+            });
+            let line = events
+                .iter()
+                .find(|e| e.message.contains("without declaring it had finished"))
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| panic!("draining={draining}: the truncation warning is gone"));
+
+            if draining {
+                assert!(
+                    line.contains("wound down at a turn boundary for an armed drain"),
+                    "a drained review must name the drain: {line}"
+                );
+                assert!(
+                    !line.contains("max_turns"),
+                    "…and must not blame the turn budget it never spent: {line}"
+                );
+            } else {
+                assert!(
+                    line.contains("ended on the max_turns backstop"),
+                    "an undrained one still names the backstop: {line}"
+                );
+            }
+
+            // The classification is identical either way — that is the point of pinning the cause
+            // rather than the outcome.
+            let row = o
+                .store()
+                .get_review_watch(&run.watch_key())
+                .expect("read watch row")
+                .expect("row exists");
+            assert_eq!(row.status, rhapsody_store::REVIEW_STATUS_TRUNCATED);
+            assert_eq!(row.requested_sha, HEAD_A);
+        }
+    }
+
     /// §15-c: a review that found nothing declares `HANDOFF: approved`, and the round is recorded
     /// `approved` at the head it read — the terminal that pauses re-review while the pull request
     /// stays at that head.
@@ -1125,7 +1989,7 @@ mod tests {
     }
 
     /// The verdict is read off the agent's OWN hand-off line, and only an exact `approved` payload
-    /// counts — so `HANDOFF: not approved` is what it says it is rather than an approval.
+    /// counts as an approval.
     #[test]
     fn only_an_exact_approved_payload_reads_as_an_approval() {
         for approving in [
@@ -1139,18 +2003,65 @@ mod tests {
                 "{approving:?}"
             );
         }
-        for not_approving in [
+    }
+
+    /// ⚠️ STUDIO-894's mutation target, pinned on its own: `HANDOFF: not approved` — the exact
+    /// phrase [`crate::automerge`]'s module docs and every reader of this function assume still
+    /// works — must keep reading as a DECLARED rejection, never as an approval and never as
+    /// undeclared. A change that loosens the approval check would flip this to an approval; a
+    /// change that narrows the rejection check to `findings` only would flip it to undeclared.
+    /// Either mutation must turn this assertion red on its own.
+    #[test]
+    fn handoff_not_approved_still_records_as_changes_requested() {
+        assert_eq!(
+            review_exit_state("HANDOFF: not approved"),
+            REVIEW_STATE_FINDINGS
+        );
+        assert_eq!(
+            review_exit_state("  HANDOFF:  Not Approved  "),
+            REVIEW_STATE_FINDINGS,
+            "case- and whitespace-insensitive, like every other payload comparison here"
+        );
+    }
+
+    /// The wording `reviewprompt/review-base.md` actually instructs for a rejection — `HANDOFF:
+    /// findings` — reads as the same declared rejection as `not approved` does.
+    #[test]
+    fn handoff_findings_records_as_changes_requested() {
+        assert_eq!(
+            review_exit_state("posted 2 findings\nHANDOFF: findings"),
+            REVIEW_STATE_FINDINGS
+        );
+    }
+
+    /// STUDIO-894, the acceptance criterion: a `HANDOFF:` line whose payload is neither `approved`
+    /// nor a recognised rejection is UNDECLARED, not a silent "changes requested". The old behaviour
+    /// defaulted every one of these — including a reviewer's own approval spelled slightly
+    /// differently — to [`REVIEW_STATE_FINDINGS`] with no signal that anything had been guessed at.
+    /// The literal PR #161 heading below is included for that reason — it pins the function's OWN
+    /// domain contract in isolation — not because it is the input that produced #161's incident: that
+    /// run's actual payload was a declared, well-formed `HANDOFF: findings`, which is (correctly)
+    /// [`REVIEW_STATE_FINDINGS`] both before and after this change (see
+    /// `handoff_findings_records_as_changes_requested` above). A result with no `HANDOFF:` line at
+    /// all falls in the same UNDECLARED bucket: this function never sees that case in production (the
+    /// `declared_handoff` check ahead of it in [`Orchestrator::on_review_exit`] intercepts it first),
+    /// but the function's own domain must not silently call it a rejection either.
+    #[test]
+    fn an_unrecognised_payload_is_undeclared_rather_than_a_guessed_rejection() {
+        for undeclared in [
+            // No `HANDOFF:` line at all — unreachable in production (`declared_handoff`
+            // intercepts it first), pinned here as the function's own domain contract.
             "",
-            "HANDOFF: not approved",
+            "## Review round 3 — @symphony: approve",
             "HANDOFF: review-posted",
             "HANDOFF: approved with nits",
             "approved",
             "I approved of the change\nHANDOFF: 3 findings",
         ] {
             assert_eq!(
-                review_exit_state(not_approving),
-                REVIEW_STATE_FINDINGS,
-                "{not_approving:?}"
+                review_exit_state(undeclared),
+                REVIEW_STATE_UNDECLARED,
+                "{undeclared:?}"
             );
         }
     }

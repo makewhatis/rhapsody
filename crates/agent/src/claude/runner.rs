@@ -38,6 +38,10 @@ use crate::claude::{
     billing_guard_ok, build_args, classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars,
     split_command,
 };
+use crate::harness::{
+    EventFidelity, Harness, HarnessCapabilities, HarnessId, Resume, Sandbox, StdinPolicy, Steering,
+    ToolEventGranularity, ToolNaming, UsageDetail,
+};
 use crate::proctree::{KillTreeOnDrop, kill_tree};
 use crate::{
     AgentError, EVENT_OPERATOR_MESSAGE, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
@@ -136,6 +140,45 @@ impl crate::Runner for Runner {
     }
 }
 
+/// Claude's declared capabilities (STUDIO-900; design record
+/// `~/.rhapsody/docs/pluggable-harnesses-design.md` §3), matching what this file actually does
+/// rather than the CLI's documentation: `events` and `tool_naming` per §3's `[RAN]` capture
+/// (`mcp__symphony__symphony_state`); `steering: Live` per the INF-250 mailbox above; `resume:
+/// Flags` per `--resume <thread_id>` (`build_args`); `mcp: true` and `sandbox: ToolAllowlist` per
+/// `allowed_tools`/`disallowed_tools` (independent of each other for Claude — the mcp/sandbox
+/// exclusivity defect this crate's `harness` module defers to slice 5 is a codex-only constraint);
+/// `usage: TokensAndCost` — the harness itself reports cost: the committed
+/// `harness/harness-spike/claude/happy.jsonl` capture's `result` line carries `total_cost_usd`
+/// (`STUDIO-869-harness-spike-findings.md` §2, `[RAN]`), even though the `Usage` struct this crate
+/// currently populates (`lib.rs`) has no cost field yet — extracting `total_cost_usd` into `Usage`
+/// is unstarted, adapter-owned work (design §3's "usage extraction is the adapter's job") that
+/// belongs to slice 7/§7.4's spend-budget routing, not this slice; `budgets: false` (the turn
+/// deadline above is the daemon's own timeout, not a Claude-enforced budget); `stdin: HeldOpen` per
+/// the mailbox.
+const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
+    events: EventFidelity::Structured {
+        tool_level: ToolEventGranularity::FileLevel,
+    },
+    steering: Steering::Live,
+    resume: Resume::Flags,
+    mcp: true,
+    sandbox: Sandbox::ToolAllowlist,
+    usage: UsageDetail::TokensAndCost,
+    budgets: false,
+    tool_naming: ToolNaming::McpDoubleUnderscore,
+    stdin: StdinPolicy::HeldOpen,
+};
+
+impl Harness for Runner {
+    fn id(&self) -> HarnessId {
+        HarnessId::Claude
+    }
+
+    fn capabilities(&self) -> &HarnessCapabilities {
+        &CAPABILITIES
+    }
+}
+
 /// One live Claude conversation for one issue (Go `session`). Per-turn state that Go mutates on the
 /// value receiver (`turnN`, `threadID`, the transcript sink, the warn-once flag) lives behind
 /// interior mutability here because the [`Session`] trait's `run_turn` takes `&self`.
@@ -199,7 +242,10 @@ impl ClaudeSession {
     /// The `[teammate …]` clause a failure message carries when this session's model/effort came
     /// from a dispatched teammate's profile; EMPTY when it did not, so an unrouted run's error text
     /// is unchanged (STUDIO-868). Only the fields the profile actually named are listed — reporting
-    /// an inherited global as though the profile had chosen it would misdirect the reader.
+    /// an inherited global as though the profile had chosen it would misdirect the reader. The
+    /// anonymous `"a profile"` branch also fires when `review.model`/`review.effort` (STUDIO-901)
+    /// overrode the routed teammate's own profile — `ModelOverride.identity` is cleared in that
+    /// case precisely so this message does not name a teammate for a value they didn't write.
     fn model_attribution(&self) -> String {
         let over = self.locked_model_override();
         if over.is_empty() {
@@ -821,13 +867,11 @@ mod tests {
 
     use rhapsody_core::Issue;
 
-    // Serializes the two env-scrub tests' `set_var`/`remove_var` (edition-2024 `unsafe`, and racy vs
-    // another test's `std::env::vars_os()` because Rust's std::env is not internally synchronized).
-    // A write lock excludes all readers; every run_turn-invoking test takes a read lock while its
-    // child env is built. Go's os package is mutex-guarded and needs no such lock; this restores that
-    // invariant for the port. A tokio RwLock (not std) is used so the guard may be held across the
-    // run_turn await without tripping `clippy::await_holding_lock`.
-    static ENV_GUARD: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+    // The guard these tests take now lives at the crate root (`crate::ENV_GUARD`, STUDIO-902):
+    // there is a second backend whose runner also reads `std::env::vars_os()`, and a guard private
+    // to this module would not serialize the two env-mutating tests below against it. The rule is
+    // unchanged — read lock to invoke `run_turn`, write lock to mutate the process environment.
+    use crate::ENV_GUARD;
 
     /// RAII temp dir, unique per pid+counter, auto-removed (the port of Go's `t.TempDir()`).
     struct TempDir {
@@ -2314,5 +2358,38 @@ mod tests {
             msg, "turn_failed: exit status: 1: error: unknown model\n",
             "an unrouted run's failure text must be unchanged"
         );
+    }
+
+    // STUDIO-900: Claude is re-expressed behind the pluggable-harnesses contract. This pins the
+    // declared identity/capabilities rather than just the fact that `Runner` implements `Harness`
+    // (the compiler already enforces that); a mutation that routed the claude backend through the
+    // wrong `HarnessId` or reported a capability Claude does not actually have would pass every
+    // other test in this file while failing only this one.
+    #[test]
+    fn claude_runner_declares_its_identity_and_capabilities() {
+        let r = Runner::new(Config::default());
+        assert_eq!(r.id(), HarnessId::Claude);
+        let caps = r.capabilities();
+        assert_eq!(
+            caps.events,
+            EventFidelity::Structured {
+                tool_level: ToolEventGranularity::FileLevel
+            }
+        );
+        assert_eq!(caps.steering, Steering::Live, "INF-250 holds stdin open");
+        assert_eq!(caps.resume, Resume::Flags, "--resume <thread_id>");
+        assert!(caps.mcp, "the daemon's MCP server is injected by default");
+        assert_eq!(caps.sandbox, Sandbox::ToolAllowlist);
+        assert_eq!(
+            caps.usage,
+            UsageDetail::TokensAndCost,
+            "the harness reports total_cost_usd, even though Usage does not extract it yet"
+        );
+        assert!(
+            !caps.budgets,
+            "the daemon's turn deadline is not a CLI budget"
+        );
+        assert_eq!(caps.tool_naming, ToolNaming::McpDoubleUnderscore);
+        assert_eq!(caps.stdin, StdinPolicy::HeldOpen);
     }
 }

@@ -142,6 +142,15 @@ pub struct WorkerDeps {
     /// `None` for every ticket dispatch — and, in this slice, for every dispatch, since nothing
     /// triggers a review yet.
     pub review: Option<crate::review::ReviewCheckout>,
+    /// The daemon-wide "stop starting new work" flag (STUDIO-880), cloned from the orchestrator at
+    /// dispatch. [`Self::run_turns`] consults it at each TURN BOUNDARY: an armed drain ends the loop
+    /// NORMALLY rather than starting another turn, so the run is classified `continued` and keeps
+    /// its claim. The current turn is never interrupted — a live turn is a pipe the daemon is
+    /// reading, and the boundary is the only place the architecture can cut.
+    ///
+    /// Default (never armed) makes the check inert, so every pre-drain construction site — and any
+    /// daemon nobody drains — behaves exactly as it did before.
+    pub drain: crate::drain::DrainSignal,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -474,6 +483,23 @@ pub async fn run_agent_attempt(
 }
 
 impl WorkerDeps {
+    /// Whether an armed drain should end the turn loop here rather than starting turn `turn + 1`
+    /// (STUDIO-880). Logs once per run when it fires, because a run that stopped short of its turn
+    /// budget for a reason the ticket cannot explain is exactly the kind of thing an operator later
+    /// tries to debug from the transcript.
+    fn drained_at_boundary(&self, identifier: &str, turn: i64) -> bool {
+        if !self.drain.is_draining() {
+            return false;
+        }
+        tracing::info!(
+            issue_identifier = %identifier,
+            turns_completed = turn,
+            "drain: ending the turn loop at its boundary; the run keeps its claim and continues \
+             after the restart"
+        );
+        true
+    }
+
     /// Drives the continuation-turn loop on a live session. `prompt_tmpl` is the resolved first-turn
     /// template. Returns the worker's last-known issue state (refreshed after every completed turn)
     /// alongside the freshest final result text and any abnormal-exit error. Mirrors Go
@@ -554,7 +580,10 @@ impl WorkerDeps {
             // `review` unset ⇒ this whole block is inert, i.e. byte-identical to a daemon built
             // before review mode.
             if self.review.is_some() {
-                if has_handoff_marker(&last_result) || turn >= self.max_turns {
+                if has_handoff_marker(&last_result)
+                    || turn >= self.max_turns
+                    || self.drained_at_boundary(&issue.identifier, turn)
+                {
                     let verdict = crate::review::review_exit_state(&last_result);
                     return (verdict.to_string(), last_result, None);
                 }
@@ -606,6 +635,15 @@ impl WorkerDeps {
             }
             if turn >= self.max_turns {
                 // turn budget exhausted → normal exit
+                return (issue.state.clone(), last_result, None);
+            }
+            // STUDIO-880: the drain's turn boundary. Checked AFTER the state refresh above, so a
+            // ticket that left the active set during the final turn still classifies on its real
+            // state rather than as a continuation. A normal exit (`None` error) is the whole point:
+            // the run records `continued`, KEEPS its claim and sits in the retry queue, so the
+            // restarted daemon picks it up — where an interrupt would have recorded `interrupted`
+            // and gone through recovery.
+            if self.drained_at_boundary(&issue.identifier, turn) {
                 return (issue.state.clone(), last_result, None);
             }
             turn += 1;
@@ -673,6 +711,7 @@ mod tests {
             review_handoff_state: None,
             review: None,
             run_id: 0,
+            drain: crate::drain::DrainSignal::new(),
         }
     }
 
@@ -1430,6 +1469,155 @@ mod tests {
         );
     }
 
+    // STUDIO-880: an armed drain ends the turn loop at its BOUNDARY. The ticket stays active the
+    // whole time and the budget is 20, so without the drain this runs 20 turns; with it, exactly one
+    // turn runs and the run winds down NORMALLY (`err.is_none()`), which is what makes the exit
+    // classify `continued` — claim kept, retry queued — rather than `interrupted`.
+    #[tokio::test]
+    async fn a_drain_ends_the_turn_loop_at_the_boundary_without_erroring() {
+        let ag = fake_agent(vec![succeeded_turn(); 20]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let mut tr = trackerfake::Fake::new();
+        // Always active: only the drain can end this loop before the budget.
+        tr.states_by_ids_func = Some(Box::new(move |_ids: &[String]| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![issue("1", "MT-1", "In Progress")])
+        }));
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag, Arc::new(tr), "do it", 20);
+        d.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
+        let (last, _h, err) =
+            run_agent_attempt(&d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(
+            err.is_none(),
+            "a drained wind-down is a NORMAL exit — an error here would classify the run \
+             interrupted, which is the whole thing the drain exists to avoid; got {err:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one turn ran: the drain is checked at the boundary AFTER the state refresh, \
+             so the current turn completed and no second turn started"
+        );
+        assert_eq!(
+            last, "In Progress",
+            "the ticket is still active, which is what makes the exit a continuation"
+        );
+    }
+
+    /// A turn script that emits one notification, so a counting `on_event` closure can tell how many
+    /// turns really ran. Used where there is no per-turn tracker refresh to count instead.
+    fn counted_turn() -> agentfake::TurnScript {
+        agentfake::TurnScript {
+            events: vec![Event {
+                event_type: EVENT_NOTIFICATION.to_string(),
+                message: "turn".to_string(),
+                ..Default::default()
+            }],
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // The current turn is never interrupted: a drain armed BEFORE the run starts still lets turn 1
+    // run to completion. The boundary is the only cut the architecture has — a live turn is a pipe
+    // the daemon is reading — so "drain" can never mean "kill what is running".
+    #[tokio::test]
+    async fn a_drain_never_interrupts_the_turn_already_in_flight() {
+        let ag = fake_agent(vec![counted_turn(), counted_turn()]);
+        let mut tr = trackerfake::Fake::new();
+        tr.states_by_ids_func = Some(Box::new(|_ids: &[String]| {
+            Ok(vec![issue("1", "MT-1", "In Progress")])
+        }));
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let d = make_deps(ws, ag, Arc::new(tr), "do it", 20);
+        d.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
+        let turns = Arc::new(AtomicUsize::new(0));
+        let turns2 = Arc::clone(&turns);
+        let count = move |_e: Event| {
+            turns2.fetch_add(1, Ordering::SeqCst);
+        };
+        let (_l, _h, err) = run_agent_attempt(&d, dispatched(), None, None, &count, None).await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        assert_eq!(
+            turns.load(Ordering::SeqCst),
+            1,
+            "the turn already in flight ran to completion; only the NEXT one was refused"
+        );
+    }
+
+    // A review run has its own wind-down path (it has no ticket to refresh), so the drain has to be
+    // checked there too — or a drain would settle every ticket run and leave reviews spinning to
+    // their whole budget, which is exactly the "two gates, one forgotten" failure.
+    //
+    // Needs a real local origin for the same reason
+    // `worker_provisions_a_detached_review_worktree_and_pins_the_head` does: review provisioning is
+    // a detached worktree at a pinned head, which only exists in git.
+    #[tokio::test]
+    async fn a_drain_ends_a_review_run_at_its_boundary_too() {
+        fn git_run(dir: &str, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hello\n").expect("write README");
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "initial"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&origin.path)
+            .output()
+            .expect("rev-parse");
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        git_run(&origin.path, &["update-ref", "refs/pull/12/head", &head]);
+
+        // A budget of 10 and an agent that never declares a handoff: without the drain this runs the
+        // whole budget, because a `pr:` key resolves to no ticket and the per-turn refresh is empty.
+        let ag = fake_agent(vec![counted_turn(); 10]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, Arc::new(trackerfake::Fake::new()), "p", 10);
+        d.repo_url = origin.path.clone();
+        d.project_slug = "rhapsody".to_string();
+        d.review = Some(crate::review::ReviewCheckout {
+            pr_number: 12,
+            head_sha: head.clone(),
+        });
+        d.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
+        let turns = Arc::new(AtomicUsize::new(0));
+        let turns2 = Arc::clone(&turns);
+        let count = move |_e: Event| {
+            turns2.fetch_add(1, Ordering::SeqCst);
+        };
+        let iss = issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress");
+        let (_l, _h, err) = run_agent_attempt(&d, iss, None, None, &count, None).await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        assert_eq!(
+            turns.load(Ordering::SeqCst),
+            1,
+            "a drained review ends at its boundary, not at max_turns"
+        );
+    }
+
     // Mirrors Go `TestWorkerReturnsLastKnownState`: the worker propagates its last-known state.
     #[tokio::test]
     async fn worker_returns_last_known_state_non_active_flip() {
@@ -1668,9 +1856,10 @@ mod tests {
         );
         assert_eq!(
             last,
-            crate::review::REVIEW_STATE_FINDINGS,
+            crate::review::REVIEW_STATE_UNDECLARED,
             "a synthetic review issue carries no tracker state, so the slot carries the agent's \
-             verdict instead — and `HANDOFF: review-posted` is not an approval"
+             verdict instead — and `HANDOFF: review-posted` is neither `approved` nor a recognised \
+             rejection, so it must not be guessed as changes requested (STUDIO-894)"
         );
     }
 

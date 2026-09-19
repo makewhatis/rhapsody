@@ -62,6 +62,44 @@ export interface StateResponse {
   // Held dependents waiting on an uncleared blockedBy predecessor (INF-318/INF-320). Empty for a
   // disabled project (the hold is part of the opt-in orchestration). Defensive-coalesced in fetchState.
   blocked: BlockedEntry[];
+  // The armed drain (STUDIO-880), or ABSENT when the daemon is dispatching normally.
+  //
+  // Optional because the daemon emits the key ONLY while a drain is armed: /api/v1/state is
+  // byte-pinned to the Go daemon's golden, so a key present in every payload would be parity drift.
+  // Read it as `state.drain?.active` — an absent key and `active: false` mean the same thing.
+  drain?: DrainState;
+  // Pull requests whose board state and activity disagree (STUDIO-898), or ABSENT on a healthy
+  // board.
+  //
+  // Optional for `drain`'s reason and under the same constraint: the daemon emits the key ONLY when
+  // the reconciliation sweep has something to report, because /api/v1/state is byte-pinned to the Go
+  // daemon's golden. Read it as `state.review_divergence?.length` — an absent key and an empty array
+  // mean the same thing.
+  review_divergence?: ReviewDivergence[];
+}
+
+// ReviewDivergence is one row of /api/v1/state's `review_divergence` key (STUDIO-898): a pull request
+// that is neither progressing nor reported blocked.
+//
+// `detail` is the daemon's own sentence for `kind`, carried on the wire deliberately — a console copy
+// of the wording is how the two drift apart. `kind` is still given because it is stable and a client
+// may want to group on it; new kinds can appear, so never switch on it exhaustively.
+export interface ReviewDivergence {
+  pr: string; // owner/repo#number
+  kind: string;
+  detail: string;
+  ticket: string; // "" when the origin names no ticket
+  reviewer: string; // "" when the divergence is a property of every reviewer
+  stale_secs: number;
+}
+
+// DrainState is /api/v1/state's `drain` key (STUDIO-880): the daemon has been asked to stop taking
+// NEW work so its in-flight runs can reach a turn boundary before a restart. Nothing is interrupted
+// while it is armed; `requested_at` is how long it has been settling.
+export interface DrainState {
+  active: boolean;
+  reason: "operator" | "update";
+  requested_at: string; // RFC3339, or "" when unset
 }
 
 // IssueEvent is one entry in a running issue's activity timeline (oldest -> newest).
@@ -101,6 +139,32 @@ export interface RunDetail {
   error: string;
   recent_events: IssueEvent[];
   generated_at: string;
+}
+
+// RunProvenance is the GET /api/v1/runs/{id}/provenance payload (STUDIO-909): what a run ACTUALLY
+// ran on — its harness, model and provider — plus the origin of each configurable value. A run
+// started before the feature (or one the daemon could not attribute) records nothing, so EVERY
+// field is optional: absent means unknown, and the UI must say "unknown" rather than guess.
+//
+// `harness_origin`/`model_origin` name the config key the value came from (`profile`,
+// `review.model.opencode`, `agent.backend`, `claude.model`). The origin is the load-bearing half:
+// tonight's undiagnosable failure was an override nobody could see, not an unknown model.
+export interface RunProvenance {
+  run_id: number;
+  harness?: string;
+  harness_origin?: string;
+  model?: string;
+  model_origin?: string;
+  provider?: string;
+}
+
+// ProviderTokens is one bucket of the DaySummary's per-provider token split (STUDIO-909).
+export interface ProviderTokens {
+  provider: string;
+  runs: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
 }
 
 // LogEntry is one humanized line of an agent session transcript (oldest -> newest), as served
@@ -180,6 +244,10 @@ export interface IssueRun extends RunSummary {
   // this one is not shaped like `lifecycle`/`assignee` above, where absence is a distinguishable
   // third answer — here there is nothing a client could do differently.
   review_ticket?: boolean;
+  // The provider this row's run ACTUALLY billed (STUDIO-909) — a scanning badge for "which of
+  // these runs is on Fireworks", never a per-row drill-down. Absent for a run that recorded none
+  // (a legacy row), which the UI renders as no badge rather than a guess.
+  provider?: string;
   // True when this row's own RUN is a review run (STUDIO-826) — a run the daemon dispatched against
   // a synthetic `pr:owner/repo#n@reviewer` issue rather than a tracker ticket, which is what
   // `review.mode: ticketless` produces.
@@ -258,6 +326,24 @@ export interface IssueCountsResponse {
   buckets: IssueStatusBucket[];
 }
 
+// TicketCostRow is one entry of GET /api/v1/history/costs (STUDIO-926): the tokens EVERY run spent
+// on one ticket on one provider, over the whole store. A review run is already credited to the
+// ticket it reviewed. `provider` is "" for tokens whose run recorded none. `usage_estimated` is true
+// when any run in the bucket ended without a clean `result` event (a floored figure).
+//
+// This is not a fold over IssueRun: /history/issues keeps ONE row per key (its newest run), so a sum
+// over it drops every earlier round and shows a running ticket as 0.
+export interface TicketCostRow {
+  ticket: string;
+  provider: string;
+  total_tokens: number;
+  usage_estimated: boolean;
+}
+
+export interface HistoryCostsResponse {
+  costs: TicketCostRow[];
+}
+
 // DaySummary is the GET /api/v1/history/summary payload (TRA-320): whole-store totals over the runs
 // that STARTED at or after `since`, computed in the daemon's SQL rather than folded over whatever
 // page the client happens to hold. `total_tokens` is the cache-INCLUSIVE billed total, so the
@@ -272,6 +358,10 @@ export interface DaySummary {
   total_tokens: number;
   seconds: number;
   rhythm: number[];
+  // The same window's tokens split by the provider each run actually billed (STUDIO-909) — the
+  // cost question that motivated recording provenance at all. Absent from a daemon older than the
+  // field, which reads as "no per-provider breakdown available".
+  providers?: ProviderTokens[];
 }
 
 // IssueHistoryResponse is the GET /api/v1/issues/<id>/history payload.
@@ -323,6 +413,10 @@ export interface MetricsResponse {
 export interface HistoryFilter {
   issue?: string;
   outcome?: string;
+  // latestOutcome keeps an ISSUE only when its NEWEST run has this outcome — it filters after the
+  // per-issue partition, unlike `outcome`, which returns each issue's newest run *with* that outcome
+  // (an old run of a finished ticket). Only the issue listing honours it (STUDIO-931).
+  latestOutcome?: string;
   project?: string; // Linear project slug; omitted from the query when empty
   since?: string; // RFC3339 lower bound on started_at
   limit?: number;
@@ -391,6 +485,37 @@ export async function fetchRunDetail(runID: number): Promise<RunDetail> {
   // Defensive: tolerate a server that omits/nulls recent_events so the timeline can .map().
   d.recent_events ??= [];
   return d;
+}
+
+// fetchRunProvenance reads what one run actually ran on (GET /api/v1/runs/{id}/provenance,
+// STUDIO-909). Kept a separate request from the run detail on purpose: that body is byte-pinned to
+// the Go capture, and a run that predates the feature answers 200 with no values rather than 404
+// (only an unknown RUN is 404).
+export async function fetchRunProvenance(runID: number): Promise<RunProvenance> {
+  return getJSON<RunProvenance>(`/api/v1/runs/${runID}/provenance`);
+}
+
+// setDrain arms or cancels the daemon's drain (STUDIO-880), resolving to the drain's state
+// afterwards — the SAME three fields `/api/v1/state`'s `drain` key carries, so a caller never has to
+// follow up with a read.
+//
+// Deliberately over HTTP rather than through the desktop's Tauri bridge: the console is served both
+// by the daemon itself (a plain browser) and as the desktop window's content, and only the HTTP
+// route exists in both. A drain the operator can end from one host and not the other would be the
+// same gap the feature already had.
+//
+// `reason` annotates an ARM only; the daemon ignores it when cancelling and when a drain is already
+// armed (re-arming never rewrites the drain that is running).
+export async function setDrain(active: boolean, reason = "operator"): Promise<DrainState> {
+  const res = await fetch("/api/v1/drain", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active, reason }),
+  });
+  if (!res.ok) {
+    throw new Error(`drain ${active ? "arm" : "cancel"} failed: ${res.status}`);
+  }
+  return (await res.json()) as DrainState;
 }
 
 export async function postRefresh(): Promise<void> {
@@ -657,6 +782,7 @@ export function historyQuery(f: HistoryFilter): string {
   const p = new URLSearchParams();
   if (f.issue) p.set("issue", f.issue);
   if (f.outcome) p.set("outcome", f.outcome);
+  if (f.latestOutcome) p.set("latest_outcome", f.latestOutcome);
   if (f.project) p.set("project", f.project);
   if (f.since) p.set("since", f.since);
   if (f.limit != null) p.set("limit", String(f.limit));
@@ -681,6 +807,13 @@ export async function fetchIssueRuns(f: HistoryFilter): Promise<IssueRunsRespons
   // Defensive: tolerate a server that omits/nulls issues so the table can .map() safely.
   r.issues ??= [];
   r.next_offset ??= null;
+  return r;
+}
+
+// fetchHistoryCosts reads the whole-store per-ticket token ledger (STUDIO-926); see TicketCostRow.
+export async function fetchHistoryCosts(): Promise<HistoryCostsResponse> {
+  const r = await getJSON<HistoryCostsResponse>("/api/v1/history/costs");
+  r.costs ??= [];
   return r;
 }
 

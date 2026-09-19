@@ -22,7 +22,7 @@
 
 use crate::workflow::{create_temp, write_temp_and_rename};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
@@ -265,6 +265,173 @@ pub enum ReviewMode {
     Ticketless,
 }
 
+/// A review value scoped by the HARNESS it is for: `review.model` and `review.effort`
+/// (STUDIO-908).
+///
+/// A model name has no meaning on its own — `claude-opus-5` is a Claude model, and
+/// `fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash` is not — so a single bare string
+/// cannot say what a review run should use on a roster whose teammates run different harnesses
+/// (STUDIO-902 made `harness` a per-teammate fact). Scoping the key by harness is the shape that
+/// states "premium review on every harness" rather than "premium review on Claude, broken
+/// elsewhere", which is the seam STUDIO-901 and STUDIO-902 landed on top of each other.
+///
+/// Two YAML spellings parse — the legacy scalar:
+///
+/// ```yaml
+/// review:
+///   model: claude-opus-5
+/// ```
+///
+/// and the per-harness map:
+///
+/// ```yaml
+/// review:
+///   model:
+///     claude: claude-opus-5
+///     opencode: fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash
+/// ```
+///
+/// The bare scalar is the spelling STUDIO-901 shipped, written when every teammate was Claude and
+/// a model name was unambiguous; it is stored UNRESOLVED because which harness it belongs to is
+/// not knowable at parse time (alice's blocking finding on PR #172). Its harness is the
+/// installation's configured `agent.backend` — the harness a bare name was unambiguous for on a
+/// single-harness install — so an all-opencode installation that wrote a bare `review.model`
+/// keeps working, while a reviewer on a *different* harness is still refused rather than handed
+/// the wrong model. [`HarnessScoped::for_harness`] takes that fallback.
+///
+/// An empty scalar and a null both mean "nothing configured" — the same absent-means-inherit rule
+/// every other field in this file follows. Empty values are dropped, so `{ claude: "" }` is unset
+/// rather than an override to the empty string.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HarnessScoped {
+    /// The legacy bare-scalar spelling, unresolved until [`HarnessScoped::for_harness`] is handed
+    /// the fallback harness. `values` is empty whenever this is `Some`; the two spellings never
+    /// mix, because each is produced by its own [`Deserialize`] branch.
+    bare: Option<String>,
+    values: BTreeMap<String, String>,
+}
+
+impl HarnessScoped {
+    /// The value that applies to `harness`, resolving the legacy bare spelling against `fallback`
+    /// (the installation's `agent.backend`), or `None` — including when values exist for OTHER
+    /// harnesses. A caller that must tell "unset everywhere" from "set, but not for this harness"
+    /// asks [`HarnessScoped::is_empty`] first; [`Teams::review_model_for`] is that caller.
+    pub fn for_harness(&self, harness: &str, fallback: &str) -> Option<&str> {
+        match &self.bare {
+            Some(value) => (harness == fallback).then_some(value.as_str()),
+            None => self.values.get(harness).map(String::as_str),
+        }
+    }
+
+    /// Whether any value is configured at all. An absent scalar, an empty scalar and an empty map
+    /// all read as unset.
+    pub fn is_empty(&self) -> bool {
+        self.bare.is_none() && self.values.is_empty()
+    }
+
+    /// Every configured `(harness, value)` pair, in harness order, with the legacy bare spelling
+    /// resolved to `fallback` — `teams show` and the refusal message both render the set back to
+    /// the operator, so nothing here is silently dropped.
+    pub fn resolved<'a>(&'a self, fallback: &'a str) -> Vec<(&'a str, &'a str)> {
+        match &self.bare {
+            Some(value) => vec![(fallback, value.as_str())],
+            None => self
+                .values
+                .iter()
+                .map(|(h, v)| (h.as_str(), v.as_str()))
+                .collect(),
+        }
+    }
+
+    /// The value the legacy bare scalar spelled, or `None` for the per-harness map spelling. Only
+    /// `teams show` needs it: the origin label differs between the two spellings (`review.model`
+    /// vs `review.model.<harness>`), and naming a harness the operator never wrote is the sort of
+    /// misattribution this ticket exists to remove.
+    pub fn legacy(&self) -> Option<&str> {
+        self.bare.as_deref()
+    }
+
+    /// The legacy bare-scalar spelling: `value` is resolved against the installation's
+    /// `agent.backend` at dispatch, the harness a bare model name was unambiguous for when
+    /// STUDIO-901 shipped. Empty is unset.
+    pub fn bare(value: &str) -> Self {
+        Self {
+            bare: (!value.is_empty()).then(|| value.to_string()),
+            values: BTreeMap::new(),
+        }
+    }
+
+    /// Sets `harness`'s value, or removes it when `value` is empty — so a builder can never leave
+    /// an entry that [`HarnessScoped::is_empty`]/[`HarnessScoped::for_harness`] would treat as
+    /// unset. This is the per-harness map spelling; [`HarnessScoped::bare`] is the other, and a
+    /// value built with one is never mixed with the other.
+    pub fn insert(&mut self, harness: &str, value: &str) -> &mut Self {
+        if value.is_empty() {
+            self.values.remove(harness);
+        } else {
+            self.values.insert(harness.to_string(), value.to_string());
+        }
+        self
+    }
+}
+
+impl Serialize for HarnessScoped {
+    /// Serialized in the spelling it was parsed from, so a legacy bare scalar round-trips to the
+    /// same YAML `Teams::save` read. Writing it as a `{claude: …}` map would silently RE-SCOPE it:
+    /// the bare value belongs to `agent.backend`, which may not be `claude` (STUDIO-908).
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.bare {
+            Some(value) => serializer.serialize_str(value),
+            None => self.values.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessScoped {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bare(String),
+            PerHarness(BTreeMap<String, String>),
+        }
+        // `Option<_>` so a YAML null (`model:` with nothing under it, which is what commenting out
+        // the sub-keys leaves behind) is the unset value rather than a type error — the same
+        // tolerance every `#[serde(default)]` field in this file already has.
+        let raw = Option::<Raw>::deserialize(deserializer)?;
+        Ok(match raw {
+            None => Self::default(),
+            Some(Raw::Bare(value)) => Self::bare(&value),
+            Some(Raw::PerHarness(values)) => Self {
+                bare: None,
+                values: values.into_iter().filter(|(_, v)| !v.is_empty()).collect(),
+            },
+        })
+    }
+}
+
+/// What a review run should do about [`Review::model`] for the harness it will actually run on
+/// (STUDIO-908) — the three-way answer [`Teams::review_model_for`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewModelChoice<'a> {
+    /// Nothing is configured for any harness: a review run inherits exactly what it would have
+    /// used anyway (the reviewer's profile, else the installation-wide model). STUDIO-901's
+    /// byte-identical-without-the-key property.
+    Inherit,
+    /// Use this value: the operator configured it for the routed reviewer's own harness.
+    Use(&'a str),
+    /// The operator configured a review model, but not for this reviewer's harness. The run must
+    /// be REFUSED with this message rather than sent to a provider that will reject it — and
+    /// rather than silently downgrading the review to the reviewer's own (cheap) profile model.
+    Refuse(String),
+}
+
 /// The `review:` block (STUDIO-719) — nested under `teams`, sibling to
 /// [`quorum`](Teams::quorum) and never a top-level key, which is what makes
 /// §16's "the whole subsystem is dormant unless `teams.enabled`" structural
@@ -319,6 +486,61 @@ pub struct Review {
     /// implements. Naming a state here separates the third from the first two.
     #[serde(default)]
     pub changes_state: String,
+    /// Whether the daemon MERGES a watched pull request once every reviewer has
+    /// recorded a non-blocking verdict at its current head and CI is green
+    /// (STUDIO-874). `false` — the default — means only a human merges.
+    ///
+    /// Opt-in, and a boolean rather than an inferred always-on for Teams
+    /// installs, because merging is the one action in this subsystem that
+    /// cannot be undone by the next tick: a wrong review state re-reviews, a
+    /// wrong ticket move is re-moved, a wrong merge is on `main`. An operator
+    /// therefore says so once, explicitly.
+    ///
+    /// It lives in `review:` and not in a `merge:` block of its own because the
+    /// thing it consumes is this section's output — the per-(PR, reviewer)
+    /// verdict the ticketless path records — so it is dead without
+    /// `mode: ticketless` exactly as [`Review::done_state`] is, and
+    /// [`Teams::review_auto_merge`] gates it on the same predicate.
+    ///
+    /// This is the installation-wide DEFAULT (STUDIO-927): a per-project entry
+    /// under [`Teams::projects`] may override it, and every caller that knows
+    /// which project a pull request belongs to reads
+    /// [`Teams::review_auto_merge_for`] rather than this field directly.
+    #[serde(default)]
+    pub auto_merge: bool,
+    /// The model a REVIEW run uses, per HARNESS, regardless of what the routed teammate's own
+    /// profile asks for (STUDIO-901, scoped by harness in STUDIO-908). Unset — the default — means
+    /// a review run inherits whatever model it would have used anyway (the routed teammate's
+    /// profile, else the installation-wide `claude.model`), exactly the "absent means whatever
+    /// would have happened" rule [`Review::done_state`] and STUDIO-868's profile `model` both
+    /// already follow — an installation that never sets this key is byte-identical to one built
+    /// before it existed.
+    ///
+    /// Review-scoped rather than a teammate field on purpose: STUDIO-868's profile `model` answers
+    /// "what model does THIS PERSON use", and cannot express "what model does REVIEW use" — every
+    /// teammate both implements and reviews, so a role-based intent has no person to attach to.
+    /// When a routed reviewer's own profile ALSO names a model, this one wins for a review run: the
+    /// operator who wrote `review: { model: … }` is stating role-based intent explicitly, and it is
+    /// the PR under review being priced, not that teammate's own work.
+    ///
+    /// Read through [`Teams::review_model_for`], never raw, exactly as [`Review::done_state`] is
+    /// read through [`Teams::review_done_state`] and for the same reason: `dispatch_review` refuses
+    /// a review whose reviewer's harness has no entry here, and `dispatch_issue` applies the entry
+    /// only to a run `dispatch_review` staged — and only `mode: ticketless` ever stages one.
+    #[serde(default)]
+    pub model: HarnessScoped,
+    /// The effort a REVIEW run uses, paired with [`Review::model`] for the same reason `Config` and
+    /// a teammate's profile pair the two everywhere else in this codebase: setting `model` alone
+    /// would leave whatever effort was already in play — profile or installation-wide — applying to
+    /// a cheap review model, which can cost more than the swap saves. Unset means inherit, exactly
+    /// as `model` does, and it is scoped by harness for the same reason.
+    ///
+    /// Ticketless-only in the same sense as [`Review::model`] — read it through
+    /// [`Teams::review_effort`]. Unlike `model`, a missing entry for the reviewer's harness leaves
+    /// the effort inherited rather than refusing the run: an effort value cannot make a provider
+    /// reject a model, so the "refuse rather than run on the wrong value" rule is `model`'s alone.
+    #[serde(default)]
+    pub effort: HarnessScoped,
 }
 
 impl Default for Review {
@@ -328,6 +550,9 @@ impl Default for Review {
             reviewers: DEFAULT_REVIEW_REVIEWERS,
             done_state: String::new(),
             changes_state: String::new(),
+            auto_merge: false,
+            model: HarnessScoped::default(),
+            effort: HarnessScoped::default(),
         }
     }
 }
@@ -343,6 +568,65 @@ impl Review {
         usize::try_from(self.reviewers.max(MIN_QUORUM_REVIEWERS))
             .unwrap_or(DEFAULT_REVIEW_REVIEWERS as usize)
     }
+}
+
+/// One `projects:` entry in `teams.yaml` (STUDIO-927): a per-project overlay of
+/// the review knobs, keyed by the Linear project slugs it applies to.
+///
+/// Shaped like `WORKFLOW.md`'s own `projects:` list (a `slugs:` list plus a
+/// nested override block) and resolved the same presence-based way: an unset
+/// override inherits the top-level `review.auto_merge`; a set one wins for this
+/// project. The slugs are matched against a resolved project's slug exactly as
+/// the orchestrator routes a run, so a project that no entry names is
+/// byte-identical to one built before this block existed.
+///
+/// Per-PROJECT rather than per-repo on purpose: the thing the operator writes is
+/// the Linear project, and its repo belongs to it — a repo shared by two projects
+/// is two overrides to state, not one. When two resolved projects do share a repo,
+/// the orchestrator ANDs every owning project's answer: naming any ONE owning slug
+/// holds the merge back, while opting in under a global `false` takes naming EVERY
+/// owning slug, since an unnamed sibling inherits the global and holds it. An
+/// override that resolves `false` must never be lost to a first-match scan.
+///
+/// Unknown keys are rejected ([`serde`] `deny_unknown_fields`), deliberately unlike
+/// the lenient top-level blocks. These are brand-new types with no legacy spellings,
+/// and a misspelled key (`auto-merge:`) or a mis-indent (the key beside `slugs`
+/// instead of under `review:`) would otherwise parse cleanly, leave `auto_merge`
+/// unset, and silently inherit the global — the exact unsafe direction this knob
+/// exists to prevent. A rejected `teams.yaml` degrades to Teams-off (no auto-merge),
+/// the safe side.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamsProject {
+    /// The Linear project SLUG IDs this entry applies to — the same `slugs:` values
+    /// `WORKFLOW.md`'s `projects:` list carries (Linear `slugId` hex, e.g.
+    /// `4f4a2350682f`), never the project NAME. A slug no resolved project carries
+    /// leaves its entry inert, and the boot reports every such slug with a warning,
+    /// so a name written where an id belongs is visible rather than silently ignored.
+    #[serde(default)]
+    pub slugs: Vec<String>,
+    /// The per-project review overrides.
+    #[serde(default)]
+    pub review: ProjectReview,
+}
+
+/// The per-project half of [`Review`] (STUDIO-927), scoped to the project whose
+/// slugs name the enclosing [`TeamsProject`].
+///
+/// Only the knobs that make sense per project and are read per project live
+/// here. `auto_merge` is the first: with one global flag, a repo that must not
+/// self-merge had no way to say so inside `teams.yaml` — the only brake was an
+/// adjective in a prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectReview {
+    /// `Some(false)` keeps THIS project human-merged even when the top-level
+    /// `review.auto_merge` is on; `Some(true)` turns it on for a project whose
+    /// default would be off. `None` — the default — inherits the top-level
+    /// value, which is the asymmetric safety property: a project never named
+    /// here behaves exactly as it did before this key existed.
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
 }
 
 /// The `memory:` block (§2.2). Carried as config in T1 — no backend is
@@ -444,6 +728,13 @@ pub struct Teams {
     /// every existing `teams.yaml` is already in.
     #[serde(default)]
     pub review: Review,
+    /// The per-project review overrides (STUDIO-927). An ABSENT block leaves
+    /// every project on the top-level `review.auto_merge`, so an existing
+    /// `teams.yaml` — including one that spells only the bare top-level key —
+    /// parses to exactly the behaviour it had. Read through
+    /// [`Teams::review_auto_merge_for`], never raw.
+    #[serde(default)]
+    pub projects: Vec<TeamsProject>,
     #[serde(default)]
     pub roster: Vec<Identity>,
     /// **The one total byte budget** for the whole Teams turn-1 prepend
@@ -480,6 +771,7 @@ impl Default for Teams {
             memory: Memory::default(),
             quorum: Quorum::default(),
             review: Review::default(),
+            projects: Vec::new(),
             roster: Vec::new(),
             prompt_budget_bytes: DEFAULT_PROMPT_BUDGET_BYTES,
         }
@@ -540,6 +832,142 @@ impl Teams {
         }
         let name = self.review.changes_state.trim();
         (!name.is_empty()).then_some(name)
+    }
+
+    /// Whether a watched pull request that has cleared every gate may be MERGED
+    /// by the daemon (STUDIO-874).
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason, with one extra
+    /// edge to it: the verdict this consumes — the per-(PR, reviewer)
+    /// `approved`/`reviewed` status keyed to a reviewed head — is written ONLY
+    /// by the ticketless path. On a `tickets` install the watch set is empty, so
+    /// an auto-merge there would not be conservative, it would be a merge with
+    /// no reviewer verdict to read at all.
+    ///
+    /// This is the installation-wide default. A caller that knows which project
+    /// a pull request belongs to reads [`review_auto_merge_for`](Self::review_auto_merge_for)
+    /// instead; this accessor remains the fallback for a pull request whose
+    /// project cannot be resolved.
+    pub fn review_auto_merge(&self) -> bool {
+        self.review_ticketless() && self.review.auto_merge
+    }
+
+    /// Whether the project named `project_slug` may be auto-merged (STUDIO-927):
+    /// the per-project overlay of [`review_auto_merge`](Self::review_auto_merge).
+    ///
+    /// The first `projects:` entry whose `slugs` contains `project_slug` wins, and
+    /// its `review.auto_merge` — when set — overrides the top-level value. A slug
+    /// no entry names answers exactly as [`review_auto_merge`](Self::review_auto_merge)
+    /// does, so a project that has never been configured behaves exactly as it
+    /// did before this key existed. An unset per-project override inherits in
+    /// BOTH directions: a project with no entry under a global `true` still
+    /// merges, and one named with no `auto_merge` under a global `false` still
+    /// does not.
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_auto_merge`](Self::review_auto_merge)'s reason: a per-project
+    /// `true` on a Teams-off or `mode: tickets` install is dead config and reads
+    /// as `false`, never as an override that cannot fire.
+    pub fn review_auto_merge_for(&self, project_slug: &str) -> bool {
+        if !self.review_ticketless() {
+            return false;
+        }
+        self.projects
+            .iter()
+            .find(|p| p.slugs.iter().any(|s| s.trim() == project_slug.trim()))
+            .and_then(|p| p.review.auto_merge)
+            .unwrap_or(self.review.auto_merge)
+    }
+
+    /// The `slugs:` values in [`Teams::projects`] that match no resolved project
+    /// slug in `known` (STUDIO-927), in declaration order.
+    ///
+    /// An unmatched slug is inert by construction — no resolved project can route
+    /// to it, so its `review` override can never fire and the project silently keeps
+    /// the top-level `auto_merge`. For a safety brake that is the wrong failure mode:
+    /// an operator who writes the project NAME (`slugs: [booch]`) where the Linear
+    /// `slugId` belongs (`4f4a2350682f`) gets a valid `teams.yaml` that does nothing.
+    /// This exists so the boot can name every such slug and turn a typo into
+    /// something the operator can see, rather than leaving booch self-merging.
+    ///
+    /// `known` are the resolved project slugs — `projects::resolve_projects`'s
+    /// output, the same set the orchestrator routes against. Empty only when there
+    /// are no entries at all.
+    ///
+    /// Both sides are trimmed: `validate` trims `projects[].slugs[]` in place before
+    /// the orchestrator resolves them, but the boot calls this on the unvalidated
+    /// config, so a slug padded with whitespace must not read as a typo here when
+    /// routing would have matched it.
+    pub fn unmatched_project_slugs<'a>(&'a self, known: &[String]) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        for project in &self.projects {
+            for slug in &project.slugs {
+                let slug = slug.trim();
+                if !known.iter().any(|k| k.trim() == slug) {
+                    out.push(slug);
+                }
+            }
+        }
+        out
+    }
+
+    /// What a REVIEW run dispatched to a reviewer on `harness` should do about `review.model`
+    /// (STUDIO-901, scoped by harness in STUDIO-908). `harness` is the harness the run will
+    /// ACTUALLY use — the routed reviewer's resolved profile harness, else the configured
+    /// `agent.backend` — never the reviewer's raw profile field. `fallback` is that configured
+    /// `agent.backend` itself, the harness the legacy bare-scalar spelling belongs to.
+    ///
+    /// Gated on [`review_ticketless`](Self::review_ticketless) for
+    /// [`review_done_state`](Self::review_done_state)'s reason: `dispatch_review`'s and
+    /// `dispatch_issue`'s `review.model` block only ever runs for a run `dispatch_review` staged,
+    /// and only `mode: ticketless` ever stages one — on any other installation, including the
+    /// default `mode: off`, a set value is dead config and reads as [`ReviewModelChoice::Inherit`].
+    ///
+    /// Three answers, and the third is the one this accessor exists for:
+    ///
+    /// * nothing configured anywhere → [`ReviewModelChoice::Inherit`];
+    /// * configured for this harness → [`ReviewModelChoice::Use`];
+    /// * configured, but only for OTHER harnesses → [`ReviewModelChoice::Refuse`], so a review on
+    ///   this harness fails loudly at dispatch naming the harness, the configured model and the
+    ///   `review.model` origin, rather than being handed to a provider that will reject it or
+    ///   silently downgrading to the reviewer's own profile model.
+    pub fn review_model_for(&self, harness: &str, fallback: &str) -> ReviewModelChoice<'_> {
+        if !self.review_ticketless() || self.review.model.is_empty() {
+            return ReviewModelChoice::Inherit;
+        }
+        if let Some(value) = self.review.model.for_harness(harness, fallback) {
+            return ReviewModelChoice::Use(value);
+        }
+        let listed = self
+            .review
+            .model
+            .resolved(fallback)
+            .iter()
+            .map(|(h, v)| format!("{h} (model {v})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ReviewModelChoice::Refuse(format!(
+            "review.model is set for {listed}, but this reviewer runs the {harness} harness, which \
+             cannot serve a model scoped to another harness. The review was refused rather than run \
+             on the wrong model — add a `review.model.{harness}` entry, or remove `review.model` so \
+             every reviewer inherits its own profile's model (origin: review.model)"
+        ))
+    }
+
+    /// The effort a REVIEW run on `harness` uses; the pair to
+    /// [`review_model_for`](Self::review_model_for), gated the same way and for the same reason.
+    /// `fallback` is read for [`review_model_for`](Self::review_model_for)'s reason: the legacy
+    /// bare effort belongs to the configured `agent.backend`.
+    ///
+    /// Deliberately one answer where [`review_model_for`](Self::review_model_for) has three: an
+    /// effort value cannot be rejected by a provider, so a harness the operator did not write an
+    /// entry for simply inherits its profile's effort instead of refusing the run.
+    pub fn review_effort(&self, harness: &str, fallback: &str) -> Option<&str> {
+        if !self.review_ticketless() {
+            return None;
+        }
+        self.review.effort.for_harness(harness, fallback)
     }
 
     /// The configured `manager.timeout_ms` when it is too small for the model
@@ -703,6 +1131,76 @@ impl Teams {
                  false` to move to `ticketless`"
                     .to_string(),
             ));
+        }
+        // STUDIO-891: the CEILING `review.reviewers` never had. `pick_reviewer`
+        // names only non-authors, so a roster of N can hold at most N−1 of one
+        // pull request's required reviews, and an introduction that asks for
+        // more truncates a ranked list already shorter than the count. The
+        // operator gets fewer eyes than they wrote, with nothing above `debug!`
+        // saying so — the fail-OPEN direction, which is why this refuses the
+        // file instead of clamping the count down to fit.
+        //
+        // Scoped to `ticketless` because that is the only path that READS
+        // `review.reviewers`; a Teams-off or fan-out installation validates
+        // exactly as before (the D5 invariant). Like every other rule here it
+        // fires regardless of `enabled`, so the complaint arrives while the file
+        // is still being edited.
+        //
+        // `quorum.reviewers` is deliberately left WITHOUT a ceiling even though
+        // its path has the same non-author constraint. Two reasons, and the
+        // first is decisive: it defaults to 2, so a two-person roster running
+        // the shipped quorum config would stop booting on an upgrade that
+        // changed nothing in the operator's file — the check would turn working
+        // installations off. And the quorum's degradation is a recorded design
+        // decision rather than an oversight (`select_reviewers`: "too few
+        // candidates degrades to however many exist — never an error, and never
+        // a wait"). `review.reviewers` defaults to 1, which every roster of two
+        // or more satisfies, so this ceiling can only ever reject a number an
+        // operator explicitly wrote.
+        //
+        // A roster of exactly N with `reviewers: N−1` is ALLOWED, not warned
+        // about: an introduction excludes only the author, so all N−1 rows are
+        // assignable. The peer exclusion that can strand one of them bites at
+        // REASSIGNMENT time — a teammate removed from the roster mid-flight —
+        // which is a runtime condition no boot check can see, and is surfaced by
+        // `reviewwatch`'s unassignable-round warning instead.
+        //
+        // `teams.yaml` is boot-only today, so validating at boot is sufficient.
+        // **If it is ever made hot-reloadable, this check has to move with it**
+        // — a roster shrunk by a reload would otherwise walk straight past it.
+        if self.review.mode == ReviewMode::Ticketless {
+            // The floor first: `reviewers: 0` is measured as the one reviewer it
+            // actually becomes, not as a free pass under the ceiling.
+            let asked = self.review.effective_reviewers();
+            let roster = self.roster.len();
+            let ceiling = roster.saturating_sub(1);
+            // The second conjunct keeps the promise the paragraph above makes:
+            // this rejects only a count an operator WROTE. One reviewer is the
+            // floor and the default, so a single-teammate roster — which cannot
+            // review anything whatever the count says — keeps booting and keeps
+            // getting `plan_review_intro`'s "the roster holds nobody but the
+            // author" warning, rather than having Teams switched off underneath
+            // it by an upgrade. That is a pre-existing, already-reported
+            // condition and not this ceiling's to escalate.
+            let written = asked > usize::try_from(MIN_QUORUM_REVIEWERS).unwrap_or(1);
+            if written && asked > ceiling {
+                // "Lower it to 0" is not advice — the floor clamps 0 back up to
+                // one — so a roster that cannot review at all is told the only
+                // remedy it actually has.
+                let or_lower = if ceiling == 0 {
+                    String::new()
+                } else {
+                    format!(", or lower `review.reviewers` to {ceiling}")
+                };
+                return Err(TeamsError::Invalid(format!(
+                    "review.reviewers is {asked}, but a roster of {roster} can satisfy at most \
+                     {ceiling} ({roster} teammates − 1 author): a pull request's reviewers must \
+                     be non-authors, so every round would arm {ceiling} of the {asked} reviews \
+                     asked for and drop the rest without saying so. To fix, add {} more \
+                     teammate(s) to `roster:`{or_lower}",
+                    asked + 1 - roster
+                )));
+            }
         }
         Ok(())
     }
@@ -1388,6 +1886,288 @@ mod tests {
         assert_eq!(Teams::disabled().review.mode, ReviewMode::Off);
     }
 
+    // ── review.auto_merge (STUDIO-874) ──────────────────────────────────────
+
+    /// The auto-merge gate's default is OFF, so every `teams.yaml` written
+    /// before the key existed keeps merging exactly nobody. An absent, null and
+    /// empty `review:` block all mean off, and so does an explicit `false`.
+    #[test]
+    fn review_auto_merge_is_absent_means_off() {
+        for text in [
+            "enabled: true\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\nroster:\n  - name: alice\n",
+            "enabled: true\nreview: {}\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: false\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert!(
+                !t.review_auto_merge(),
+                "auto-merge must be off unless asked for ({text:?})"
+            );
+            t.validate()
+                .unwrap_or_else(|e| panic!("must stay valid {text:?}: {e}"));
+        }
+        assert!(!Teams::disabled().review_auto_merge());
+    }
+
+    /// The D5 invariant, in the one predicate every caller reads: `auto_merge:
+    /// true` reaches nothing unless Teams is on AND review is ticketless. A
+    /// Teams-off install, and a `tickets`/`off` install, are unchanged however
+    /// the key is spelled — which matters because the verdict this gate consumes
+    /// is written only by the ticketless path.
+    #[test]
+    fn review_auto_merge_needs_teams_and_the_ticketless_path() {
+        let on = "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\nroster:\n  - name: alice\n";
+        assert!(Teams::parse(on).expect("parse").review_auto_merge());
+
+        for text in [
+            // Teams off — structurally unreachable, however the block reads.
+            "enabled: false\nreview:\n  mode: ticketless\n  auto_merge: true\nroster:\n  - name: alice\n",
+            // A review path that records no machine-readable verdict to gate on.
+            "enabled: true\nreview:\n  mode: tickets\n  auto_merge: true\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: off\n  auto_merge: true\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert!(
+                !t.review_auto_merge(),
+                "auto-merge must not reach a non-ticketless install ({text:?})"
+            );
+        }
+    }
+
+    // ── per-project review.auto_merge (STUDIO-927) ──────────────────────────
+
+    /// The ticket's headline: one project may opt OUT of a global auto-merge
+    /// while its sibling keeps it. Mutation: drop the `projects` lookup in
+    /// [`Teams::review_auto_merge_for`] so the top-level value always wins —
+    /// `booch` then reads `true` and this goes red.
+    #[test]
+    fn a_per_project_false_beats_a_global_true() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [booch]\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(
+            !t.review_auto_merge_for("booch"),
+            "the named project must not auto-merge"
+        );
+        assert!(
+            t.review_auto_merge_for("rhapsody"),
+            "a sibling project with no entry still inherits the global true"
+        );
+        assert!(
+            t.review_auto_merge_for("never-configured"),
+            "a project that has never been configured behaves exactly as it did before the block"
+        );
+    }
+
+    /// A per-project `true` under a global `false` turns auto-merge ON for that
+    /// project alone, and an entry that sets no `auto_merge` inherits — in both
+    /// directions, which is the asymmetry the ticket calls safety-critical.
+    #[test]
+    fn an_unset_per_project_auto_merge_inherits_the_global_in_both_directions() {
+        // Global OFF: naming a project with no `auto_merge` must not turn it on.
+        let off = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n\
+             projects:\n  - slugs: [quiet]\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(!off.review_auto_merge_for("quiet"), "unset inherits false");
+        assert!(!off.review_auto_merge_for("other"), "and so does unlisted");
+
+        // Global OFF, an explicit per-project true is the override.
+        let on = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n\
+             projects:\n  - slugs: [loud]\n    review:\n      auto_merge: true\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(
+            on.review_auto_merge_for("loud"),
+            "set wins for that project"
+        );
+        assert!(!on.review_auto_merge_for("other"), "and only that project");
+    }
+
+    /// The multi-slug spelling: a fanned project's override applies to every slug
+    /// it names, and an absent `projects:` block leaves no project changed.
+    #[test]
+    fn a_multi_slug_entry_applies_to_every_slug_it_names() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [alpha, alpha-2]\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        for slug in ["alpha", "alpha-2"] {
+            assert!(!t.review_auto_merge_for(slug), "{slug}");
+        }
+        assert!(
+            t.review_auto_merge_for("beta"),
+            "beta is a different project"
+        );
+    }
+
+    /// The legacy decode the ticket names: a `teams.yaml` with only the bare
+    /// top-level `review.auto_merge` parses to an EMPTY `projects` block and
+    /// answers identically to the pre-STUDIO-927 accessor for every slug.
+    #[test]
+    fn a_legacy_bare_auto_merge_decodes_to_no_projects_and_unchanged_behaviour() {
+        for (yaml, want) in [
+            (
+                "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\nroster:\n  - name: alice\n",
+                true,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: false\nroster:\n  - name: alice\n",
+                false,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n",
+                false,
+            ),
+        ] {
+            let t = Teams::parse(yaml).unwrap_or_else(|e| panic!("parse {yaml:?}: {e}"));
+            assert!(t.projects.is_empty(), "legacy config carries no projects");
+            for slug in ["booch", "rhapsody", "anything"] {
+                assert_eq!(t.review_auto_merge_for(slug), want, "{slug} under {yaml:?}");
+                assert_eq!(
+                    t.review_auto_merge_for(slug),
+                    t.review_auto_merge(),
+                    "the per-project accessor must agree with the global one when nothing is scoped"
+                );
+            }
+        }
+    }
+
+    /// The D5 invariant, per project: a per-project `true` is dead config unless
+    /// Teams is on AND review is ticketless. Mutation: drop the
+    /// `review_ticketless` gate from [`Teams::review_auto_merge_for`] and the
+    /// Teams-off row below reads `true`.
+    #[test]
+    fn a_per_project_override_cannot_escape_the_ticketless_gate() {
+        for (yaml, want) in [
+            (
+                "enabled: false\nreview:\n  mode: ticketless\n\
+                 projects:\n  - slugs: [booch]\n    review:\n      auto_merge: true\n\
+                 roster:\n  - name: alice\n",
+                false,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: tickets\n\
+                 projects:\n  - slugs: [booch]\n    review:\n      auto_merge: true\n\
+                 roster:\n  - name: alice\n",
+                false,
+            ),
+            (
+                "enabled: true\nreview:\n  mode: ticketless\n\
+                 projects:\n  - slugs: [booch]\n    review:\n      auto_merge: true\n\
+                 roster:\n  - name: alice\n",
+                true,
+            ),
+        ] {
+            let t = Teams::parse(yaml).unwrap_or_else(|e| panic!("parse {yaml:?}: {e}"));
+            assert_eq!(t.review_auto_merge_for("booch"), want, "{yaml:?}");
+        }
+        assert!(!Teams::disabled().review_auto_merge_for("booch"));
+    }
+
+    /// The visibility half of the ticket's trap: an override that names a slug no
+    /// resolved project carries is inert, and [`Teams::unmatched_project_slugs`]
+    /// names it so the boot can warn. A project NAME where the Linear `slugId`
+    /// belongs is the exact case — the documented example `slugs: [booch]` can
+    /// never match a resolved project.
+    #[test]
+    fn an_override_naming_no_resolved_project_slug_is_reported() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [booch]\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            t.unmatched_project_slugs(&["4f4a2350682f".to_string()]),
+            vec!["booch"],
+            "a name where a slugId belongs must be reported"
+        );
+
+        // A matching slug is not reported, and a partially-matching entry reports
+        // only the half that matches nothing.
+        let mixed = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n\
+             projects:\n  - slugs: [4f4a2350682f, typo]\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            mixed.unmatched_project_slugs(&["4f4a2350682f".to_string()]),
+            vec!["typo"]
+        );
+        assert!(Teams::disabled().unmatched_project_slugs(&[]).is_empty());
+
+        // Whitespace around a slug is trimmed on both sides, matching `validate`'s
+        // in-place trim before the orchestrator resolves: padded, it is neither a
+        // false-positive report nor a miss in the override lookup.
+        let padded = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [' 4f4a2350682f ']\n    review:\n      auto_merge: false\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(
+            padded
+                .unmatched_project_slugs(&["4f4a2350682f".to_string()])
+                .is_empty()
+        );
+        assert!(!padded.review_auto_merge_for("4f4a2350682f"));
+    }
+
+    /// A `projects:` entry may be written with an empty or null `review:` block —
+    /// it then inherits, exactly as the null-block tolerance elsewhere in this
+    /// file does. Everything the types cannot accept is a loud parse error rather
+    /// than a silently-inherited override: a wrong type AND an unknown key (a
+    /// misspelling, or the easy mis-indent placing `auto_merge` beside `slugs`
+    /// instead of under `review:`) both fail, so a typo cannot leave `auto_merge`
+    /// unset and a repo the operator meant to hold back merging itself.
+    #[test]
+    fn a_project_entry_with_no_review_block_inherits_and_a_malformed_one_is_rejected() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  auto_merge: true\n\
+             projects:\n  - slugs: [booch]\n  - slugs: [b]\n    review:\n\
+             roster:\n  - name: alice\n",
+        )
+        .expect("parse");
+        assert!(t.review_auto_merge_for("booch"), "no review block inherits");
+        assert!(
+            t.review_auto_merge_for("b"),
+            "an empty review block inherits"
+        );
+
+        for bad in [
+            // `projects` must be a list, not a map or a scalar.
+            "enabled: true\nprojects:\n  booch: false\n",
+            "enabled: true\nprojects: booch\n",
+            // `slugs` must be a list.
+            "enabled: true\nprojects:\n  - slugs: booch\n",
+            // `auto_merge` must be a boolean.
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    review:\n      auto_merge: nope\n",
+            // MIS-INDENT: `auto_merge` beside `slugs` rather than under `review:`
+            // — with a lenient decode this would parse, leave the override unset
+            // and inherit the global ON.
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    auto_merge: false\n",
+            // MISSPELLED keys, at the entry and inside the review block.
+            "enabled: true\nprojects:\n  - slug: [booch]\n    review:\n      auto_merge: false\n",
+            "enabled: true\nprojects:\n  - slugs: [booch]\n    review:\n      auto-merge: false\n",
+        ] {
+            let err = Teams::parse(bad).expect_err("must not parse");
+            assert!(matches!(err, TeamsError::Parse(_)), "{bad:?}: got {err}");
+        }
+    }
+
     /// All three spellings decode, and nothing else does: a typo must be a loud
     /// parse error rather than a silent fall back to `off`, which would leave an
     /// operator who asked for review with none and no complaint.
@@ -1535,6 +2315,340 @@ mod tests {
         }
     }
 
+    /// STUDIO-891: `review.reviewers` has a CEILING as well as a floor, and the
+    /// ceiling is the roster minus the author.
+    ///
+    /// `pick_reviewer` only ever names non-authors, so a roster of N supports at
+    /// most N−1 required reviews of one pull request. Asked for more, the
+    /// introduction path truncates a ranked list that is already shorter than the
+    /// count and arms fewer rows than the operator wrote — silently, with nothing
+    /// above `debug!` to say the config was not honoured. Rejecting the file is
+    /// the fail-CLOSED direction; reviewing with fewer eyes than were asked for
+    /// is the fail-open one.
+    ///
+    /// The boundary is the whole point, so it is asserted at all three points
+    /// either side of it.
+    #[test]
+    fn review_reviewers_above_the_rosters_ceiling_is_rejected() {
+        let yaml = |names: &[&str], reviewers: i64| {
+            let roster: String = names
+                .iter()
+                .map(|n| format!("  - name: {n}\n"))
+                .collect::<String>();
+            format!(
+                "enabled: true\nreview:\n  mode: ticketless\n  reviewers: {reviewers}\nroster:\n{roster}"
+            )
+        };
+        // roster 3 / reviewers 2 — satisfiable (decision 3: exactly N−1 is
+        // ALLOWED, not warned about; the author is the only exclusion an
+        // introduction makes).
+        Teams::parse(&yaml(&["alice", "jimmy", "jerry"], 2))
+            .expect("parses")
+            .validate()
+            .expect("roster 3 / reviewers 2 is satisfiable");
+        // roster 2 / reviewers 1 — satisfiable.
+        Teams::parse(&yaml(&["alice", "jimmy"], 1))
+            .expect("parses")
+            .validate()
+            .expect("roster 2 / reviewers 1 is satisfiable");
+        // roster 2 / reviewers 2 — the case that motivated the ticket.
+        let err = Teams::parse(&yaml(&["alice", "jimmy"], 2))
+            .expect("parses")
+            .validate()
+            .expect_err("roster 2 / reviewers 2 is unsatisfiable");
+        let TeamsError::Invalid(msg) = &err else {
+            panic!("expected Invalid, got {err}")
+        };
+        // The message names BOTH numbers and the arithmetic, so the operator can
+        // act without reading the source.
+        assert!(msg.contains("review.reviewers is 2"), "{msg}");
+        assert!(msg.contains("roster of 2"), "{msg}");
+        assert!(msg.contains("at most 1"), "{msg}");
+        assert!(msg.contains("non-author"), "{msg}");
+        assert!(!msg.contains("  "), "leaked source indentation: {msg}");
+
+        // A roster of one is NOT escalated to a boot rejection: one reviewer is
+        // the floor and the shipped default, so nobody wrote it, and rejecting
+        // here would switch Teams off under an installation whose file did not
+        // change. It cannot review anything either way, and `plan_review_intro`
+        // already warns that it holds nobody but the author.
+        for count in [0, 1] {
+            Teams::parse(&yaml(&["alice"], count))
+                .expect("parses")
+                .validate()
+                .unwrap_or_else(|e| panic!("reviewers: {count} on a solo roster: {e}"));
+        }
+        // But a count that WAS written is still measured against that roster.
+        let solo = Teams::parse(&yaml(&["alice"], 2))
+            .expect("parses")
+            .validate()
+            .expect_err("a roster of 1 has no non-author, so two is unsatisfiable");
+        assert!(solo.to_string().contains("at most 0"), "{solo}");
+    }
+
+    /// The D5 invariant: the ceiling is a rule about the path that READS
+    /// `review.reviewers`, so it fires only under `mode: ticketless`. A Teams-off
+    /// install, and any installation on the ticket fan-out, validate exactly as
+    /// they did before.
+    ///
+    /// `quorum.reviewers` is deliberately NOT given the same ceiling — see
+    /// [`Teams::validate`]'s note. Pinned here because it is a DECISION, not an
+    /// omission: a two-person roster running the quorum's default of two would
+    /// otherwise stop booting on upgrade, with nothing in the operator's file
+    /// having changed.
+    #[test]
+    fn the_reviewer_ceiling_is_scoped_to_the_ticketless_path() {
+        Teams::disabled()
+            .validate()
+            .expect("the off state is unaffected");
+        for mode in ["off", "tickets"] {
+            let t = Teams::parse(&format!(
+                "enabled: true\nreview:\n  mode: {mode}\n  reviewers: 9\nroster:\n  - name: alice\n  - name: jimmy\n"
+            ))
+            .expect("parses");
+            t.validate()
+                .unwrap_or_else(|e| panic!("mode {mode} must not consult the ceiling: {e}"));
+        }
+        // The quorum's own count, at its default, on the roster size that
+        // motivated the ticket.
+        Teams::parse(
+            "enabled: true\nquorum:\n  enabled: true\nroster:\n  - name: alice\n  - name: jimmy\n",
+        )
+        .expect("parses")
+        .validate()
+        .expect("quorum.reviewers has no ceiling; an upgrade must not turn this install off");
+    }
+
+    // ── review.model / review.effort (STUDIO-901, scoped by harness in STUDIO-908) ───
+
+    /// Absent means inherit, never reset — the same rule STUDIO-868's profile
+    /// `model`/`effort` and [`Review::done_state`] already follow. An installation
+    /// that never writes `review.model`/`review.effort` parses to an empty map,
+    /// and a bare `""` is the unset value rather than an override to nothing.
+    #[test]
+    fn review_model_and_effort_default_to_empty_inherit() {
+        assert!(Review::default().model.is_empty());
+        assert!(Review::default().effort.is_empty());
+        for text in [
+            "enabled: true\nreview:\n  mode: ticketless\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: ticketless\n  model: \"\"\nroster:\n  - name: alice\n",
+            "enabled: true\nreview:\n  mode: ticketless\n  model:\nroster:\n  - name: alice\n",
+        ] {
+            let t = Teams::parse(text).unwrap_or_else(|e| panic!("parse {text:?}: {e}"));
+            assert!(t.review.model.is_empty(), "({text:?})");
+            assert!(t.review.effort.is_empty(), "({text:?})");
+            assert_eq!(
+                t.review_model_for("claude", "claude"),
+                ReviewModelChoice::Inherit,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Both wire spellings parse. The bare scalar is the legacy STUDIO-901 spelling: it is stored
+    /// unresolved and resolved against the caller's fallback harness at dispatch, which is the
+    /// installation's `agent.backend` (`a_legacy_bare_review_model_belongs_to_the_configured_backend…`
+    /// covers the non-claude case). The map is the STUDIO-908 spelling and scopes a value per
+    /// harness by name.
+    #[test]
+    fn review_model_parses_both_the_legacy_scalar_and_the_per_harness_map() {
+        let bare = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model: claude-opus-5\n  effort: high\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+        assert_eq!(bare.review.model.legacy(), Some("claude-opus-5"));
+        assert_eq!(bare.review.effort.legacy(), Some("high"));
+        assert_eq!(
+            bare.review_model_for("claude", "claude"),
+            ReviewModelChoice::Use("claude-opus-5")
+        );
+
+        let scoped = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model:\n    claude: claude-opus-5\n    opencode: fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+        assert_eq!(scoped.review.model.legacy(), None);
+        assert_eq!(
+            scoped.review.model.for_harness("claude", "claude"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            scoped.review.model.for_harness("opencode", "claude"),
+            Some("fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash")
+        );
+        assert_eq!(
+            scoped.review_model_for("opencode", "claude"),
+            ReviewModelChoice::Use("fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash")
+        );
+    }
+
+    /// **alice's blocking finding on PR #172.** The legacy bare scalar is NOT pinned to the literal
+    /// `claude`: it belongs to the installation's configured `agent.backend`, so an all-opencode
+    /// installation whose bare `review.model` works today keeps working. Resolving it against a
+    /// hardcoded `claude` refused every ticketless review on that install and blamed the operator's
+    /// opencode model on a `claude` key they never wrote.
+    ///
+    /// The other direction is the acceptance that must not regress: the same bare value is still
+    /// refused for a reviewer on a DIFFERENT harness, never silently re-scoped.
+    #[test]
+    fn a_legacy_bare_review_model_belongs_to_the_configured_backend_not_a_hardcoded_claude() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model: some-opencode-model\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+
+        // All-opencode installation: the bare scalar is an opencode model, and it applies.
+        assert_eq!(
+            t.review_model_for("opencode", "opencode"),
+            ReviewModelChoice::Use("some-opencode-model")
+        );
+        // Same install, a reviewer on another harness: refused, naming the value's own harness.
+        let ReviewModelChoice::Refuse(msg) = t.review_model_for("claude", "opencode") else {
+            panic!("a claude reviewer must not be handed the opencode model");
+        };
+        assert!(
+            msg.contains("opencode (model some-opencode-model)"),
+            "the value's harness must be named as opencode, not claude: {msg}"
+        );
+
+        // All-claude installation: the same bare scalar applies to claude, exactly as STUDIO-901
+        // shipped it.
+        assert_eq!(
+            t.review_model_for("claude", "claude"),
+            ReviewModelChoice::Use("some-opencode-model")
+        );
+    }
+
+    /// **The seam this ticket closes (STUDIO-908), at the config layer.** A value scoped to one
+    /// harness is not applied to a reviewer on another: the answer is `Refuse`, and its message
+    /// names the reviewer's harness, the configured model and the `review.model` origin. Mutation
+    /// check: making the lookup ignore the harness (returning the first entry) turns the `Refuse`
+    /// assertions red.
+    #[test]
+    fn a_review_model_scoped_to_another_harness_is_refused_and_names_harness_model_and_origin() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model:\n    claude: claude-opus-5\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+        let ReviewModelChoice::Refuse(msg) = t.review_model_for("opencode", "claude") else {
+            panic!("an opencode reviewer must not be handed the claude model");
+        };
+        assert!(
+            msg.contains("opencode"),
+            "must name the reviewer's harness: {msg}"
+        );
+        assert!(msg.contains("claude-opus-5"), "must name the model: {msg}");
+        assert!(msg.contains("review.model"), "must name the origin: {msg}");
+        // The harness the value WAS written for is named too, so the operator sees the mismatch.
+        assert!(msg.contains("claude (model claude-opus-5)"), "{msg}");
+    }
+
+    /// The refusal is `model`'s alone. `review.effort` scoped to another harness leaves the effort
+    /// inherited rather than refusing the run: an effort value cannot make a provider reject a
+    /// model, so it is not worth a failed review round.
+    #[test]
+    fn a_review_effort_scoped_to_another_harness_is_inherited_not_refused() {
+        let t = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model:\n    opencode: cheap\n  effort:\n    claude: high\nroster:\n  - name: alice\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            t.review_model_for("opencode", "claude"),
+            ReviewModelChoice::Use("cheap")
+        );
+        assert_eq!(t.review_effort("opencode", "claude"), None);
+        assert_eq!(t.review_effort("claude", "claude"), Some("high"));
+    }
+
+    /// A harness with no entry does not refuse when NOTHING is configured anywhere — the
+    /// byte-identical-without-the-key property STUDIO-901 promised, preserved per harness.
+    #[test]
+    fn an_absent_review_model_inherits_for_every_harness() {
+        let t = Teams {
+            enabled: true,
+            review: Review {
+                mode: ReviewMode::Ticketless,
+                ..Review::default()
+            },
+            ..Teams::disabled()
+        };
+        for h in ["claude", "opencode"] {
+            assert_eq!(
+                t.review_model_for(h, "claude"),
+                ReviewModelChoice::Inherit,
+                "{h}"
+            );
+            assert_eq!(t.review_effort(h, "claude"), None, "{h}");
+        }
+    }
+
+    /// **jimmy/alice round-1 finding 2 on PR #168.** `review_model_for`/`review_effort` must not
+    /// claim an override that cannot fire — scoped to the ticketless path exactly as
+    /// `review_done_state`/`review_changes_state`/`review_auto_merge` already are, on the SAME
+    /// installations those tests exercise (`mode: off`/`tickets`, and Teams disabled entirely).
+    #[test]
+    fn review_model_and_effort_are_off_until_the_review_path_is_ticketless() {
+        assert_eq!(
+            Teams::disabled().review_model_for("claude", "claude"),
+            ReviewModelChoice::Inherit
+        );
+        assert_eq!(Teams::disabled().review_effort("claude", "claude"), None);
+
+        let with = |enabled: bool, mode: ReviewMode| Teams {
+            enabled,
+            review: Review {
+                mode,
+                model: HarnessScoped::bare("claude-opus-5"),
+                effort: HarnessScoped::bare("high"),
+                ..Review::default()
+            },
+            ..Teams::disabled()
+        };
+        for (enabled, mode) in [
+            (true, ReviewMode::Off),
+            (true, ReviewMode::Tickets),
+            (false, ReviewMode::Ticketless),
+        ] {
+            let t = with(enabled, mode);
+            assert_eq!(
+                t.review_model_for("claude", "claude"),
+                ReviewModelChoice::Inherit,
+                "enabled={enabled} mode={mode:?}: a set-but-inert value must read as unset"
+            );
+            assert_eq!(
+                t.review_effort("claude", "claude"),
+                None,
+                "enabled={enabled} mode={mode:?}"
+            );
+        }
+
+        let live = with(true, ReviewMode::Ticketless);
+        assert_eq!(
+            live.review_model_for("claude", "claude"),
+            ReviewModelChoice::Use("claude-opus-5")
+        );
+        assert_eq!(live.review_effort("claude", "claude"), Some("high"));
+    }
+
+    /// An unset value stays unset even on the one installation where it could take effect —
+    /// `review_ticketless()` alone must not manufacture an override nobody configured.
+    #[test]
+    fn review_model_and_effort_stay_absent_on_a_ticketless_team_that_never_set_them() {
+        let t = Teams {
+            enabled: true,
+            review: Review {
+                mode: ReviewMode::Ticketless,
+                ..Review::default()
+            },
+            ..Teams::disabled()
+        };
+        assert_eq!(
+            t.review_model_for("claude", "claude"),
+            ReviewModelChoice::Inherit
+        );
+        assert_eq!(t.review_effort("claude", "claude"), None);
+    }
+
     /// STUDIO-712: the auto-Done transition is OFF unless somebody named the
     /// terminal state, and naming it is not enough on an installation whose
     /// review path cannot produce a merge edge to act on.
@@ -1664,11 +2778,20 @@ mod tests {
                 reviewers: 3,
                 done_state: "Done".to_string(),
                 changes_state: "In Progress".to_string(),
+                auto_merge: true,
+                model: HarnessScoped::bare("claude-opus-5"),
+                effort: HarnessScoped::bare("high"),
             },
-            roster: vec![Identity {
-                name: "alice".to_string(),
-                ..Identity::default()
-            }],
+            // Four, because `reviewers: 3` must be a config the ceiling accepts
+            // (STUDIO-891: a roster of N satisfies at most N−1). The property
+            // under test is the round-trip, and it is unchanged by the width.
+            roster: ["alice", "jimmy", "jerry", "june"]
+                .into_iter()
+                .map(|name| Identity {
+                    name: name.to_string(),
+                    ..Identity::default()
+                })
+                .collect(),
             ..Teams::disabled()
         };
 
@@ -1684,6 +2807,20 @@ mod tests {
         assert_eq!(
             Teams::load(&path).review_changes_state(),
             Some("In Progress")
+        );
+        assert_eq!(
+            Teams::load(&path)
+                .review
+                .model
+                .for_harness("claude", "claude"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            Teams::load(&path)
+                .review
+                .effort
+                .for_harness("claude", "claude"),
+            Some("high")
         );
     }
 
@@ -1754,6 +2891,13 @@ mod tests {
                 mode: ReviewMode::Tickets,
                 ..Review::default()
             },
+            // STUDIO-927: the one new block, round-tripped like the rest.
+            projects: vec![TeamsProject {
+                slugs: vec!["booch".to_string()],
+                review: ProjectReview {
+                    auto_merge: Some(false),
+                },
+            }],
             roster: vec![Identity {
                 name: "alice".to_string(),
                 profile: "swe".to_string(),

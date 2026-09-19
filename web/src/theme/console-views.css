@@ -11,9 +11,10 @@
    `.run`, `.checks` and `.kv` are far too generic to publish alongside the
    Podium screens.
 
-   Every color is a token. The one literal hex — `#34343c`, the hover hairline —
-   is the prototype's own one-off shade, already present in console.css on the
-   same treatment. It is not a duplicate of a token.
+   Every color is a token. The literal hexes below — `#34343c`, the hover hairline,
+   and `#453915`, the `.dchip` warn border (the same shade `.note.warn` uses in
+   console.css) — are the prototype's own one-off shades. They are NOT duplicates
+   of a token; every value that has a token uses `var(--…)`.
 
    The room-slice, memory, manage and teams-console views are sub-tickets 3–5;
    `.memprev`/`.mcard` land here because §4's side column uses them.
@@ -47,6 +48,16 @@
 .rh-console .jtbl tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .rh-console .jtbl .ti { font-weight: 600; font-size: 13px; }
 .rh-console .jtbl .pj { color: var(--ink-4); font-size: 11px; }
+/* The provider badge on a Jobs row (STUDIO-909) — a mono chip beside the project, muted so it
+   scans without competing with the ticket key. */
+.rh-console .jtbl .provbadge { margin-left: 6px; padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+/* The ticket's token cost, split by provider (STUDIO-926) — quiet tabular text, never a Pill and
+   never `--rust`: cost is secondary metadata, and must read as such beside the status column. */
+.rh-console .jtbl .cost { margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--ink-4); font-variant-numeric: tabular-nums; }
+/* The running-row activity line (STUDIO-926): the current transcript step plus elapsed time, the
+   honest "is it moving?" signal in place of a fabricated progress bar. Same quiet treatment as
+   `.cost` — no color, no glyph, just text a reader can skim past or read. */
+.rh-console .jtbl .activity { margin-top: 3px; font-size: 11px; color: var(--ink-3); }
 .rh-console .who2 { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
 /* The assignee slot of a run nothing can name: kept, and dimmed, rather than omitted. */
 .rh-console .who2.none { color: var(--ink-4); }
@@ -58,6 +69,156 @@
 .rh-console .jmore { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 11px 14px; border-top: 1px solid var(--line-soft); }
 .rh-console .jmore .note { color: var(--ink-4); font-size: 11.5px; }
 .rh-console .jmore .chip { margin-left: auto; }
+
+/* ===== §3 board (STUDIO-925) =====
+   The worklist as work: one card per ticket, one lane per run status (Queued, Running, In Review,
+   Done — STUDIO-930). Reuses the same atoms and tokens as the table beside it (`Pill`, `Chip`,
+   `TicketChip`, the warm console palette) —
+   a second view of the worklist, not a second visual language. Cards are a repeated object: the same
+   edges, the same inner padding, and each recurring element in the same place on every card. */
+/* Lanes are FIXED-width tracks, never `1fr`: an elastic track makes one populated lane the whole
+   page. The width is one custom property with three values, set by the Lane width Seg. Sized from
+   the card: Compact (224) is the narrowest that keeps the ticket key and its status pill on one
+   line; Default (288) gives a ~38-character title line, so most titles wrap to two; Wide (360)
+   lets a title, the meta row and a PR chip each sit on one line. */
+.rh-console .boardwrap { min-width: 0; }
+.rh-console .board { --lane-w: 288px; }
+.rh-console .board[data-lane-width="compact"] { --lane-w: 224px; }
+.rh-console .board[data-lane-width="wide"] { --lane-w: 360px; }
+.rh-console .board {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: var(--lane-w);
+  gap: 12px;
+  align-items: start;
+  /* The board scrolls sideways itself; the page body never does. */
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+.rh-console .bcol {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel);
+  overflow: hidden;
+}
+.rh-console .bcolhd {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--panel-2);
+}
+.rh-console .bcolhd .bname { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rh-console .bcolhd .bcount { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); background: var(--panel); border: 1px solid var(--line-soft); border-radius: 99px; padding: 1px 7px; }
+.rh-console .bcolhd .bsub { flex-basis: 100%; font-size: 11px; color: var(--ink-3); }
+/* An empty lane says what its emptiness means; a free Running seat is drawn, not omitted. The slot
+   is the unfilled outline of a card: dashed hairline, no fill, faint label. */
+.rh-console .bempty { padding: 6px 4px; font-size: 12px; color: var(--ink-3); }
+.rh-console .bslot { display: grid; place-items: center; min-height: 64px; border: 1px dashed var(--hair-dashed); border-radius: var(--r-card); font-size: 11.5px; color: var(--faint); }
+/* Each column scrolls its own cards, so a long Done column does not push the live ones out of view. */
+.rh-console .bcards { display: flex; flex-direction: column; gap: 8px; padding: 9px; max-height: calc(100vh - 290px); overflow-y: auto; }
+
+.rh-console .bcard {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+  cursor: pointer;
+}
+.rh-console .bcard:hover { border-color: #34343c; background: var(--raise); }
+.rh-console .bcard:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* The live edge is the table's running-pin, carried across: an agent is on this ticket right now. */
+.rh-console .bcard.live { border-left: 2px solid var(--accent); }
+.rh-console .btop { display: flex; align-items: center; gap: 8px; }
+.rh-console .btop .bkey { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--ticket); }
+.rh-console .btop .pill { margin-left: auto; }
+.rh-console .btitle { font-size: 12.5px; color: var(--ink-2); line-height: 1.35; }
+.rh-console .bmeta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-4); }
+.rh-console .bmeta .provbadge { padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.rh-console .bchips { display: flex; flex-wrap: wrap; gap: 5px; }
+/* A reviewer chip: who, and how their review ended. `done` is GREEN here — the board's whole claim
+   is "two green chips = two gates passed" — so it deliberately does not reuse the status Pill's
+   blue `done`. */
+.rh-console .rchip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; border-radius: 99px; padding: 2px 8px; background: var(--panel); border: 1px solid var(--line-soft); color: var(--ink-3); }
+.rh-console .rchip .d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.rh-console .rchip .o { font-family: var(--mono); font-size: 10px; opacity: .8; }
+.rh-console .rchip.ok { color: var(--ok); }
+.rh-console .rchip.live { color: var(--operator); }
+.rh-console .rchip.bad { color: var(--bad); }
+.rh-console .rchip.queued { color: var(--ink-4); }
+.rh-console .dchip { font-size: 11px; border-radius: 99px; padding: 2px 8px; background: var(--warn-soft); border: 1px solid #453915; color: var(--warn); }
+.rh-console .bpr { display: flex; }
+.rh-console .bpr .tk.pr { cursor: pointer; }
+.rh-console .bpr .tk.pr:hover { border-color: var(--ok); }
+
+/* The board footer: utilization against the cap, the three counts that need a person or a seat, and
+   when the view was last answered. Replaces a bare running counter with the question the operator
+   actually asks — capped or starved? */
+.rh-console .bfoot { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); font-size: 12px; color: var(--ink-3); }
+.rh-console .bfoot .bfrun { font-family: var(--mono); color: var(--ink); }
+.rh-console .bfoot .bfrun b { color: var(--ok); }
+.rh-console .bfoot .bfrun.capped b { color: var(--warn); }
+.rh-console .bfoot .bfstat { font-family: var(--mono); }
+.rh-console .bfoot .bfstat b { color: var(--ink-2); }
+.rh-console .bfoot .bspacer { flex: 1; }
+.rh-console .bfoot .bnote { color: var(--ink-4); font-size: 11.5px; }
+.rh-console .bfoot .bref { color: var(--ink-4); font-family: var(--mono); font-size: 11px; }
+
+/* ===== display options popover (STUDIO-932) =====
+   List/Board, lane width and the five card-field chips leave the filter row for one header popover.
+   It is built from the PODIUM tokens in `src/index.css` — --surface / --hair-card / --r-card /
+   --shadow-pop for the surface, --tint-rust / --rust-text / --hair-control / --btn-label for the
+   chips and the reset, --rust-text for the non-default dot — deliberately NOT the `.rh-console`
+   palette the rest of this file uses. The ticket names those tokens exactly: the popover hangs above
+   the board as a real overlay, and this is one of the few places a shadow is earned. */
+.rh-console .dpwrap { position: relative; display: inline-flex; }
+.rh-console .dptrig { position: relative; display: inline-flex; align-items: center; justify-content: center; padding: 7px 9px; }
+.rh-console .dptrig .dpicon { position: relative; display: inline-flex; }
+/* The non-default marker: rust, 5px, on the icon's top-right — never Linear's blue. */
+.rh-console .dpdot { position: absolute; top: -2px; right: -2px; width: 5px; height: 5px; border-radius: 50%; background: var(--rust-text); }
+.rh-console .dpop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 13px;
+  background: var(--surface);
+  border: 1px solid var(--hair-card);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-pop);
+  /* Fades in because the operator just clicked; nothing here animates on page load. */
+  animation: dp-in .14s ease-out;
+}
+.rh-console .dprow { display: flex; align-items: baseline; gap: 12px; }
+.rh-console .dplabel { flex: none; width: 72px; color: var(--text-muted); font-size: 12px; }
+.rh-console .dprow .seg { margin-left: auto; }
+.rh-console .dprule { height: 1px; background: var(--hair-section); }
+/* Card fields are five chips, not one control, so they wrap as a group to the right of the label. */
+.rh-console .dphfields { align-items: flex-start; }
+.rh-console .dphfields .dplabel { padding-top: 5px; }
+.rh-console .dpchips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+/* Toggle chips: ON is a tint-rust fill with a rust-text label and no border; OFF is transparent with
+   the control hairline. Selection stays `aria-pressed`, so a test and a screen reader read the same. */
+.rh-console .dpop .chip { border-radius: var(--r-chip); border: 1px solid var(--hair-control); background: transparent; color: var(--btn-label); font-size: 12px; padding: 4px 9px; }
+.rh-console .dpop .chip:hover { border-color: var(--hair-strong); color: var(--ink); }
+.rh-console .dpop .chip[aria-pressed="true"] { background: var(--tint-rust); color: var(--rust-text); border-color: transparent; font-weight: 600; }
+/* Reset is an escape hatch, not a call to action: a subtle --btn-label text button. */
+.rh-console .dpreset { justify-content: flex-end; }
+.rh-console .dpreset .btn.link { color: var(--btn-label); font-size: 12px; padding: 0; }
+.rh-console .dpreset .btn.link:hover { color: var(--rust-text); background: none; }
+@keyframes dp-in { from { opacity: 0; transform: translateY(-4px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
 
 /* ===== §4 job detail ===== */
 .rh-console .jobhd { display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }

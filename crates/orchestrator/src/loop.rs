@@ -47,7 +47,8 @@ use crate::agentupdate::AgentUpdate;
 use crate::dispatch::dependency_mode_enabled;
 use crate::effective::{Effective, ResolvedProject};
 use crate::ghenrich::{
-    GH_SUMMONS_TIMEOUT, apply_github_summons, enrich_with_github_summons, fetch_github_summons,
+    DaemonPrLinks, GH_SUMMONS_TIMEOUT, apply_github_summons, enrich_with_github_summons,
+    fetch_github_summons,
 };
 use crate::ghsummons::{self, GH, SummonHit};
 use crate::handoff::HandoffPlan;
@@ -444,7 +445,11 @@ impl Orchestrator {
 /// top-level. Mirrors Go `workerDepsFor` (dropping the telemetry fields — Tracer/Metrics/Model/
 /// DispatchSpanContext — per the P6 deferral; see `worker.rs`). `run_id` is per-dispatch, not
 /// per-project, so [`Orchestrator::spawn_worker`] stamps it (STUDIO-675).
-fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps {
+fn worker_deps_for(
+    eff: &Effective,
+    rp: Option<&ResolvedProject>,
+    drain: &crate::drain::DrainSignal,
+) -> WorkerDeps {
     // Local raw logging is enabled only when a log dir is configured (Go passes `o.eff.transcripts`,
     // which is nil when logging is off).
     let transcripts = if eff.log_dir.is_empty() {
@@ -480,6 +485,9 @@ fn worker_deps_for(eff: &Effective, rp: Option<&ResolvedProject>) -> WorkerDeps 
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
         review_handoff_state: eff.review_states.iter().next().cloned(),
+        // Daemon-wide rather than per-project (STUDIO-880): a drain settles the whole daemon so it
+        // can be restarted, and there is no restart of one project.
+        drain: drain.clone(),
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -725,6 +733,25 @@ impl Orchestrator {
         (self.now)() - chrono::Duration::seconds(DEFAULT_GH_LOOKBACK.as_secs() as i64)
     }
 
+    /// This daemon's own PR→ticket links, for the tick's summons attribution (STUDIO-882).
+    ///
+    /// Built from the LIVE watch rows, so a merged or retired pull request has already left it and
+    /// no separate merge check is owed downstream. See [`DaemonPrLinks`].
+    ///
+    /// A store error yields an empty index — the enrichment degrades to the tracker's `linked_prs`
+    /// exactly as before this ticket, which is the only safe default — and warns, because the
+    /// silent version of this is the eleven hours STUDIO-875 cost. The `Noop` store answers `Ok`
+    /// with no rows, so storage being off is quiet rather than a warning per tick.
+    fn daemon_pr_links(&self) -> DaemonPrLinks {
+        match self.store().load_live_review_watch() {
+            Ok(rows) => DaemonPrLinks::from_watch_rows(&rows),
+            Err(e) => {
+                tracing::warn!(err = %e, "github-summons: the daemon's own pull-request links could not be read; a summons can only reach a ticket the tracker has linked this tick");
+                DaemonPrLinks::default()
+            }
+        }
+    }
+
     /// The wall clock this tick's GitHub-summons enrichment phase may spend before it defers the
     /// repos it has not reached to the next tick (STUDIO-811). See [`GH_ENRICH_BUDGET_DIVISOR`].
     ///
@@ -747,6 +774,15 @@ impl Orchestrator {
     pub(crate) async fn on_tick(&mut self) {
         let poll = self.poll_interval();
         self.reconcile().await;
+        // STUDIO-898: the review reconciliation sweep — compare each watched pull request's board
+        // state against its activity and REPORT any that disagree. Local reads only (the watch set
+        // + the `runs` ledger), no network, and it acts on nothing.
+        //
+        // Here, ABOVE every early return below, and deliberately so: a daemon whose dispatch is
+        // gated by a bad config, an armed drain or a dead credential is exactly a daemon whose board
+        // has quietly stopped, and that is when this report is worth the most. It also runs before
+        // the publish so the snapshot below carries the same tick's verdict.
+        self.reconcile_review_divergence();
         // Reconcile is the network-bound half of the tick AND the half that retires finished runs;
         // republish here so `/state` reflects them without waiting for fetch-candidates + dispatch
         // to finish (STUDIO-551).
@@ -762,6 +798,20 @@ impl Orchestrator {
             // indefinitely against a teammate who is neither queued nor running. This count exists
             // to tell "queued" apart from "broken"; on these paths the honest answer is "broken".
             self.set_held_for_capacity(HashMap::new());
+            self.schedule_tick(poll);
+            return;
+        }
+        // STUDIO-880: the drain gate. Same seam, same property as the credential preflight below —
+        // skip ALL dispatch WITHOUT claiming anything, before candidate fetch — because a drain that
+        // claimed a ticket and then declined to run it would leave exactly the abandoned claim the
+        // "nothing is claimed" invariant exists to prevent. Deliberately ONE gate rather than a
+        // second "should we dispatch" test somewhere else: two of them is how one gets forgotten.
+        //
+        // It sits just ABOVE the credential preflight because the preflight SHELLS OUT (a bounded
+        // `claude -p` probe). A daemon that has been told to stop dispatching has no use for the
+        // answer, so asking would spend a subprocess every tick for a decision already made.
+        if self.drain_preflight() {
+            self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;
         }
@@ -905,7 +955,9 @@ impl Orchestrator {
         if let (Some(repo_url), Some(src)) = (enrich_repo, self.gh_source.as_deref()) {
             let (owner, repo) = ghsummons::parse_repo(&repo_url).unwrap_or_default();
             let since = self.gh_since();
-            let applied = enrich_with_github_summons(issues, Some(src), &owner, &repo, since).await;
+            let links = self.daemon_pr_links();
+            let applied =
+                enrich_with_github_summons(issues, Some(src), &owner, &repo, since, &links).await;
             // The legacy path's half of STUDIO-875, against the top-level review states.
             if let Some(eff) = self.eff.as_ref() {
                 crate::ghenrich::report_unlinked_summons(
@@ -918,6 +970,10 @@ impl Orchestrator {
             }
             issues = applied.issues;
         }
+        // The legacy ladder's half of STUDIO-885 — the multi-project one is at the end of
+        // `poll_all_projects`. Two ladders means two seams; the ONLY way a candidate reaches
+        // dispatch without its remembered summons is for one of them to be missing.
+        self.restore_summon_watermarks(issues.iter_mut());
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
@@ -1200,6 +1256,19 @@ impl Orchestrator {
             }
 
             // --- Pass 3: the pure apply, over the KEPT copies (after the dedup, as Go does). ------
+            // The daemon's own PR→ticket links (STUDIO-882), read ONCE per tick rather than per
+            // issue: it is a single store read serving every repository in the pass, and the apply
+            // step selects the rows it wants by repository out of it.
+            //
+            // Skipped entirely when nothing was fetched, which is not merely an optimisation of the
+            // empty case: `targets` is empty the moment `tracker.github_summons` is off anywhere it
+            // applies, so an installation with the feature off would otherwise pay this store read
+            // every poll interval, forever, to attribute hits that do not exist.
+            let links = if fetched.is_empty() {
+                DaemonPrLinks::default()
+            } else {
+                self.daemon_pr_links()
+            };
             for ti in tagged.iter_mut() {
                 let Some(t) = ti.proj.and_then(|idx| targets.get(&idx)) else {
                     continue;
@@ -1208,7 +1277,7 @@ impl Orchestrator {
                     continue;
                 };
                 let iss = std::mem::take(&mut ti.iss);
-                let applied = apply_github_summons(vec![iss], by_pr, &t.owner, &t.repo);
+                let applied = apply_github_summons(vec![iss], by_pr, &t.owner, &t.repo, &links);
                 // STUDIO-875: a hit this repo produced that reached nothing. Said ONCE per ticket,
                 // and only for a ticket sitting in review — which is the ticket that is waiting for
                 // exactly the re-engagement that can never arrive.
@@ -1221,6 +1290,13 @@ impl Orchestrator {
                 );
                 ti.iss = applied.issues.into_iter().next().unwrap_or_default();
             }
+            // --- The durable summons watermark (STUDIO-885). -------------------------------
+            // LAST, so it reconciles what every source above produced — the enrichment's view and
+            // the tracker's own — against what the store remembers, and every consumer downstream
+            // (mid-run delivery, the select ladder, `pr_suppressed`, `review_reopen_eligible`)
+            // sees one already-complete answer. Ungated: a Linear-comment summons arrives through
+            // the tracker rather than through enrichment, and is worth remembering just the same.
+            self.restore_summon_watermarks(tagged.iter_mut().map(|ti| &mut ti.iss));
             tagged
         }
         .instrument(tracing::info_span!("symphony.fetch_candidates"))
@@ -1359,9 +1435,9 @@ impl Orchestrator {
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
     // STUDIO-643 threads `teammate_section` identically, STUDIO-675 threads `run_id` — which Go
-    // carries on `WorkerDeps` proper — and STUDIO-868 threads `model_override` beside the section it
-    // was resolved with. Bundling these into a struct would diverge from the Go parity shape for no
-    // behavioral gain.
+    // carries on `WorkerDeps` proper — STUDIO-868 threads `model_override` beside the section it was
+    // resolved with, and STUDIO-902 threads `harness` beside that, resolved from the same profile.
+    // Bundling these into a struct would diverge from the Go parity shape for no behavioral gain.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_worker(
         &self,
@@ -1373,6 +1449,7 @@ impl Orchestrator {
         capabilities_section: String,
         teammate_section: String,
         model_override: rhapsody_agent::ModelOverride,
+        harness: String,
         run_id: i64,
         started_at: DateTime<Utc>,
         review: Option<crate::review::ReviewCheckout>,
@@ -1380,7 +1457,7 @@ impl Orchestrator {
         let Some(eff) = self.eff.as_ref() else {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
-        let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug));
+        let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug), &self.drain);
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
@@ -1391,6 +1468,29 @@ impl Orchestrator {
         // its first turn (STUDIO-868). Empty leaves the runner's own `claude.model`/`effort` in
         // place, so a dispatch that routed to nobody is byte-identical to today.
         deps.model_override = model_override;
+        // ⚠️ The routed teammate's HARNESS (STUDIO-902): swap in that backend's already-built
+        // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
+        // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.
+        //
+        // An unrecognized name FALLS BACK to the configured backend with a warning rather than
+        // refusing the run: one mistyped profile field would otherwise strand every ticket routed
+        // to that teammate, and the run itself is still perfectly runnable on the default harness.
+        // Validating the name at config-load time is slice 4's resolution chain, which is where a
+        // typo can be reported once instead of per dispatch.
+        if !harness.is_empty() {
+            let pool = eff
+                .project_by_slug(&project_slug)
+                .map_or(&eff.agents, |rp| &rp.agents);
+            match pool.get(&harness) {
+                Some(runner) => deps.agent = Arc::clone(runner),
+                None => tracing::warn!(
+                    issue = %iss.identifier,
+                    harness = %harness,
+                    "teammate profile names a harness this build has no runner for; \
+                     dispatching on the configured backend instead"
+                ),
+            }
+        }
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
         // its `teams_post` / `teams_retain` can resolve WHICH run is speaking (STUDIO-675).
         deps.run_id = run_id;
@@ -1643,6 +1743,58 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STUDIO-898: `on_tick` still runs the review reconciliation sweep, and runs it ABOVE the three
+    /// gates that return early.
+    ///
+    /// Asserted on source because the property is architectural and invisible at run time. The
+    /// sweep's ONLY production seam is that one call; delete it and every behavioural test in this
+    /// crate — including the twenty-five in `reviewreconcile` — stays green while the feature is
+    /// dead. This daemon has shipped that exact shape twice (STUDIO-822, STUDIO-839), both times a
+    /// feature whose whole wiring was one line nothing pinned.
+    ///
+    /// The POSITION is half the property. Below `validate()`, the drain gate or the credential
+    /// preflight, the sweep would stop running on precisely the daemons whose boards have quietly
+    /// stopped — the state it exists to report.
+    #[test]
+    fn on_tick_runs_the_review_reconciliation_sweep_before_every_early_return() {
+        let src = include_str!("loop.rs");
+        // Assembled at run time so this test's own text is not an occurrence of what it checks for.
+        let call: String = ["self.", "reconcile_review_divergence", "()"].concat();
+
+        let start = src
+            .find("pub(crate) async fn on_tick(")
+            .expect("on_tick is still a method on this module");
+        let end = start
+            + src[start..]
+                .find("\n    }")
+                .expect("on_tick is still a braced method inside an impl block");
+        let body = &src[start..end];
+
+        let at = body.find(call.as_str()).unwrap_or_else(|| {
+            panic!(
+                "on_tick no longer runs the review reconciliation sweep; without that call the \
+                 sweep never runs in production and nothing else would fail (STUDIO-898)"
+            )
+        });
+        // Every early return below is guarded by one of these three; the sweep must precede all of
+        // them, so it must precede the FIRST of them.
+        for gate in [
+            "self.validate()",
+            "self.drain_preflight()",
+            "self.credential_preflight()",
+        ] {
+            let gate_at = body
+                .find(gate)
+                .unwrap_or_else(|| panic!("on_tick no longer consults {gate}"));
+            assert!(
+                at < gate_at,
+                "the reconciliation sweep runs at byte {at} of on_tick, AFTER {gate} at \
+                 {gate_at} — a daemon held by that gate is exactly one whose board may have \
+                 quietly stopped, and it would stop being swept (STUDIO-898)"
+            );
+        }
+    }
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::{
         DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,

@@ -18,6 +18,7 @@ import { MEMORY_EMPTY_NOTE, ROOM_WATCH_WINDOW } from "@/lib/console-watch";
 const h = vi.hoisted(() => ({
   fetchIssueHistory: vi.fn(),
   fetchRunDetail: vi.fn(),
+  fetchRunProvenance: vi.fn(),
   fetchRunTranscript: vi.fn(),
   fetchRunIdentityEvents: vi.fn(),
   sendRunMessage: vi.fn(),
@@ -44,6 +45,7 @@ vi.mock("@/lib/api", async (orig) => {
     ...actual,
     fetchIssueHistory: h.fetchIssueHistory,
     fetchRunDetail: h.fetchRunDetail,
+    fetchRunProvenance: h.fetchRunProvenance,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchRunIdentityEvents: h.fetchRunIdentityEvents,
     sendRunMessage: h.sendRunMessage,
@@ -210,6 +212,11 @@ function mountDetail(runs: RunSummary[], onNavigate = vi.fn()) {
       return detailOf(row);
     });
   }
+  // A test about provenance configures this BEFORE mounting; a legacy daemon answers with the id
+  // and no values, which is the unknown the header renders.
+  if (h.fetchRunProvenance.getMockImplementation() === undefined) {
+    h.fetchRunProvenance.mockImplementation(async (id: number) => ({ run_id: id }));
+  }
   h.fetchState.mockResolvedValue(EMPTY_STATE);
   if (h.fetchTeamsOverview.getMockImplementation() === undefined) {
     h.fetchTeamsOverview.mockResolvedValue({
@@ -363,6 +370,10 @@ afterEach(() => {
   h.fetchRunMergeability.mockReset();
   h.fetchRunDiff.mockReset();
   h.fetchRunMessages.mockReset();
+  // Provenance joins the same list (STUDIO-909 round 1): while the header flashed `unknown` during
+  // the fetch, a leaked mock was invisible to the "recorded nothing" test; now that the header waits
+  // for the answer, a test that configured provenance would otherwise hand it to every test after.
+  h.fetchRunProvenance.mockReset();
   h.fetchReviews.mockReset();
   h.fetchTeamsOverview.mockReset();
   h.fetchRunIdentityEvents.mockReset();
@@ -548,6 +559,73 @@ describe("zone A — the sticky header (§3A)", () => {
         /^run 522 · started \d\d\/\d\d \d\d:\d\d \S/,
       ),
     );
+  });
+
+  // STUDIO-909 — the header names what the run ACTUALLY ran on, each configurable value with the
+  // config key it came from. The model's origin is the load-bearing half: the failure that
+  // motivated the field was a `review.model.opencode` override nothing else on the run named.
+  it("shows the harness, model and provider with their origins", async () => {
+    h.fetchRunProvenance.mockResolvedValue({
+      run_id: 547,
+      harness: "opencode",
+      harness_origin: "profile",
+      model: "deepseek-v4p1-flash",
+      model_origin: "review.model.opencode",
+      provider: "fireworks-ai",
+    });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547, started_at: "2026-09-01T19:11:00Z" })]);
+
+    await waitFor(() => {
+      const line = document.querySelector(".trhd .prov");
+      expect(line?.textContent).toContain("opencode");
+      expect(line?.textContent).toContain("[profile]");
+      expect(line?.textContent).toContain("deepseek-v4p1-flash");
+      // NOT [profile] — the override the operator could not see anywhere else.
+      expect(line?.textContent).toContain("[review.model.opencode]");
+      expect(line?.textContent).toContain("fireworks-ai");
+    });
+  });
+
+  it("shows unknown, with no origin, for a run that recorded no provenance", async () => {
+    // The default mock answers `{run_id}` alone — a run started before the feature existed.
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547, started_at: "2026-09-01T19:11:00Z" })]);
+
+    await waitFor(() => {
+      const line = document.querySelector(".trhd .prov");
+      expect(line?.textContent).toContain("unknown");
+      expect(line?.textContent).not.toContain("[");
+    });
+  });
+
+  it("says nothing while the provenance fetch is in flight, rather than flashing unknown", async () => {
+    // `undefined` cannot tell loading from "recorded nothing"; rendering `unknown` here would assert
+    // a fact the run may not have. The line waits for the answer, like the assignee slot.
+    let release: (p: Record<string, unknown>) => void = () => {};
+    h.fetchRunProvenance.mockImplementation(
+      () => new Promise<Record<string, unknown>>((resolve) => (release = resolve)),
+    );
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    mountDetail([run({ id: 547, started_at: "2026-09-01T19:11:00Z" })]);
+
+    await waitFor(() => {
+      expect(document.querySelector(".trhd .prov")).not.toBeNull();
+    });
+    // The fetch is still in flight, so the line has no value to assert.
+    expect(document.querySelector(".trhd .prov")?.textContent).not.toContain("unknown");
+
+    release({
+      run_id: 547,
+      harness: "opencode",
+      harness_origin: "profile",
+      model: "deepseek-v4p1-flash",
+      model_origin: "review.model.opencode",
+      provider: "fireworks-ai",
+    });
+    await waitFor(() => {
+      expect(document.querySelector(".trhd .prov")?.textContent).toContain("fireworks-ai");
+    });
   });
 
   it("renders one attempt's trace at a time, fetching only that attempt's transcript", async () => {

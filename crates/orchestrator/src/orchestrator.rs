@@ -108,12 +108,33 @@ pub struct RunningEntry {
     /// when the profile names neither, in which case the run inherits the installation-wide
     /// `claude.model` / `claude.effort` and its argv is byte-identical to today.
     ///
-    /// **In memory only**, exactly as `identity` is: the `runs` table is frozen here, and a durable
-    /// `runs.model` column arrives with the pluggable-harnesses design's §6.2
-    /// (`~/.rhapsody/docs/pluggable-harnesses-design.md`), which wants `harness` / `model` /
-    /// `provider` / `session_uuid` together. The per-run record meanwhile is the `teams.route`
-    /// events row, which names the model it resolved.
+    /// **In memory only as a field**, and SNAPSHOTTED at dispatch into the durable per-run
+    /// provenance (STUDIO-909: `rhapsody_run_provenance`, model + `model_origin` + provider), so the
+    /// model a finished run actually used survives the config hot-reloads that motivated the
+    /// record. The `teams.route` events row remains the routing record that names it too.
     pub model_override: rhapsody_agent::ModelOverride,
+
+    /// The `agent.backend` the routed teammate's profile asked for (STUDIO-902). Empty ⇒ the
+    /// configured backend, which is every dispatch that routed to nobody or to a teammate whose
+    /// profile is silent about it.
+    ///
+    /// **Persisted** at dispatch as part of the run's provenance (STUDIO-909): the harness actually
+    /// run (this value when the build implements it, else the configured backend) is written to
+    /// `rhapsody_run_provenance` beside `harness_origin` and the model.
+    pub harness: String,
+
+    /// The config key that named the harness (STUDIO-909), so an operator can tell a profile's
+    /// choice from the installation default. `profile` when the routed teammate's profile named an
+    /// implemented harness, `agent.backend` otherwise. Persisted with the run.
+    pub harness_origin: String,
+
+    /// The config key that supplied the run's model (STUDIO-909): `review.model.<harness>` for a
+    /// review run the override rewrote, `review.model` for the legacy bare-scalar spelling,
+    /// `profile` for the routed teammate's own profile, else the harness's own key
+    /// (`claude.model` / `opencode.model`). Persisted beside `harness_origin`; the model VALUE is
+    /// resolved in [`persist_start_run`](Orchestrator::persist_start_run) from the same facts, so a
+    /// hot-reload later cannot change what this run says it ran on.
+    pub model_origin: String,
 
     /// The `latest_summon_at` of the most recent mid-run summons already delivered to this run's
     /// mailbox (INF-448). The poll-side router delivers a summons only when it is strictly after BOTH
@@ -197,6 +218,9 @@ impl RunningEntry {
             identity: String::new(),
             teammate_section: String::new(),
             model_override: rhapsody_agent::ModelOverride::default(),
+            harness: String::new(),
+            harness_origin: String::new(),
+            model_origin: String::new(),
             last_delivered_summon_at: zero_time(),
             review: None,
             thread_id: String::new(),
@@ -544,6 +568,52 @@ pub struct Orchestrator {
     /// force-push churn floor (STUDIO-721; design §14.2). Written and read only by the watcher's
     /// loop-side handler, and dropped when the pull request leaves the watch set.
     pub(crate) review_rounds: crate::reviewwatch::ReviewRounds,
+    /// What the watcher has already ANNOUNCED about each watched pull request's auto-merge plan,
+    /// keyed by [`churn_key`](crate::reviewwatch::churn_key) exactly as
+    /// [`review_rounds`](Orchestrator::review_rounds) is, and dropped with it when the pull request
+    /// leaves the watch set. Written and read only by the watcher's loop-side handler. STUDIO-881.
+    ///
+    /// It remembers what was SAID, never what was decided: the plan itself is re-formed from the
+    /// watch rows on every tick and this map has no say in it. See
+    /// [`AutoMergeLedger`](crate::runautomerge::AutoMergeLedger), which does the same job for the
+    /// refusals on the other side of the seam.
+    pub(crate) auto_merge_announced: crate::reviewwatch::AnnouncedPlans,
+    /// How many CONSECUTIVE watcher sweeps each review row has found nobody eligible to take it
+    /// (STUDIO-891), keyed by the same `review:<owner>/<repo>#<n>@<reviewer>` id `running` and
+    /// `claimed` use. Written and read only by the watcher's loop-side handler, cleared the moment
+    /// a row gets a reviewer, and dropped when the pull request leaves the watch set.
+    ///
+    /// Separate from [`Orchestrator::review_rounds`] because it counts the opposite thing: that one
+    /// bounds how much review a pull request may be GIVEN, this one notices when it is being given
+    /// none at all.
+    pub(crate) review_unassignable: HashMap<String, usize>,
+    /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
+    /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
+    /// derived view of the watch set and the `runs` ledger, never an accumulator — and read by
+    /// `project_statuses` and `build_snapshot` to surface it.
+    pub(crate) review_divergence: Vec<crate::reviewreconcile::Divergence>,
+    /// How many CONSECUTIVE sweeps each reported pull request has been diverged, keyed by
+    /// `owner/repo#number` (STUDIO-898). Only the log rate-limit reads it: the crossing sweep and
+    /// the recovery say so loudly, and the steady state repeats at
+    /// [`RECONCILE_LOG_EVERY`](crate::reviewreconcile::RECONCILE_LOG_EVERY) instead of every tick.
+    ///
+    /// Separate from [`Orchestrator::review_divergence`] because it must SURVIVE a sweep that
+    /// reports the same pull request again; the vector above is replaced wholesale.
+    pub(crate) review_divergent: HashMap<String, usize>,
+    /// Read-only handle onto the off-loop auto-merge half's own report of what it has already SAID
+    /// about a pull request ([`crate::runautomerge::AutoMergeLedger`], STUDIO-874) — the control
+    /// task never writes it. Shared for one reason (STUDIO-923):
+    /// [`Orchestrator::reconcile_review_divergence`] independently reports an approved-and-open
+    /// pull request as diverged, and when auto-merge has been declining that SAME pull request the
+    /// whole time, its report should name the reason instead of claiming nothing has said anything.
+    /// `None` whenever the off-loop half was never built — the review watcher did not spawn — and
+    /// the sweep then falls back to its unenriched wording; see `runautomerge`'s module doc for why
+    /// a refusal is otherwise never surfaced outside the log.
+    ///
+    /// `pub`, like [`Orchestrator::merge_deps`]/[`Orchestrator::diff_deps`] beside it: the daemon's
+    /// composition root (`rhapsodyd::run`) sets it before `o.run()` moves the orchestrator into the
+    /// control task, the same inject-before-`run()` pattern that crate's `CLAUDE.md` documents.
+    pub automerge_ledger: Option<Arc<crate::runautomerge::AutoMergeLedger>>,
     /// Pull-request coordinates a console merge is currently attempting, and since when
     /// (STUDIO-767; design §3/G4's single-flight). Keyed by `owner/repo:branch` rather than by run
     /// id, because two runs of one ticket share a branch and therefore share the pull request a
@@ -700,6 +770,17 @@ pub struct Orchestrator {
     /// tick. A field (not a const) so tests can shrink it; defaulted to
     /// [`PROBE_TIMEOUT`](crate::preflight::PROBE_TIMEOUT).
     pub(crate) probe_timeout: std::time::Duration,
+
+    // --- STUDIO-880: drain (Rhapsody-only; see `drain.rs`). ---
+    /// The shared "stop starting new work" flag, cloned onto every dispatched worker and onto the
+    /// off-loop [`ControlHandle`](crate::stop::ControlHandle) the HTTP layer drives. Default (never
+    /// armed) makes the whole mechanism inert, so a daemon nobody drains behaves exactly as it did
+    /// before the feature existed.
+    pub(crate) drain: crate::drain::DrainSignal,
+    /// What the last tick observed about the armed drain, for the gate's logging. `Some` exactly
+    /// when the previous tick found the drain armed, which is what makes the cancel transition
+    /// observable. Mutated only by `on_tick` on the single control task, like [`Self::probe_cache`].
+    pub(crate) drain_gate: Option<crate::drain::DrainGateLog>,
 }
 
 /// Returns an OS-seeded random 64-bit value without a `rand`/`getrandom`/`uuid` dependency: each
@@ -778,6 +859,11 @@ impl Orchestrator {
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),
             review_rounds: HashMap::new(),
+            auto_merge_announced: HashMap::new(),
+            review_unassignable: HashMap::new(),
+            review_divergence: Vec::new(),
+            review_divergent: HashMap::new(),
+            automerge_ledger: None,
             merge_inflight: HashMap::new(),
             totals: Totals::default(),
             daemon_id: new_daemon_id(),
@@ -809,6 +895,10 @@ impl Orchestrator {
             cred_probe: None,
             probe_cache: None,
             probe_timeout: crate::preflight::PROBE_TIMEOUT,
+            // STUDIO-880: never draining by default → the gate and the turn-boundary check are both
+            // inert, i.e. byte-identical to a daemon built before the feature.
+            drain: crate::drain::DrainSignal::new(),
+            drain_gate: None,
         }
     }
 

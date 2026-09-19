@@ -4,6 +4,7 @@
 //! [`build_args`] assembles the per-turn `claude` flag vector. Argv order is a byte-compatible
 //! contract: `args_test.go` asserts the FULL vector, and operator `extra_args` must win last.
 
+use std::fmt;
 use std::time::Duration;
 
 use crate::AgentError;
@@ -13,7 +14,13 @@ use crate::AgentError;
 ///
 /// Go's `Logger *slog.Logger` field is intentionally dropped: the port logs via `tracing` (the
 /// workspace convention, as in `rhapsody-tracker`) rather than a stored logger handle.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` is hand-written, not derived, to redact [`Config::tracker_api_key`]: this type is
+/// reachable from `crate::harness::HarnessSpec` (`HarnessKnobs::Claude`), whose own `Debug` a
+/// future `tracing::debug!(?spec)` will use, and the resolved Linear credential must never reach
+/// the rotating file logs (this is not a parity surface — Go's `claude.Config` has no `Debug` at
+/// all).
+#[derive(Clone, Default)]
 pub struct Config {
     /// default `"claude"`; shell-split into name+args by [`split_command`]
     pub command: String,
@@ -61,6 +68,31 @@ pub struct Config {
     /// Passed as `symphony mcp <workflow_path>` so the child resolves the SAME workflow (and thus
     /// the daemon's server port).
     pub workflow_path: String,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("command", &self.command)
+            .field("model", &self.model)
+            .field("effort", &self.effort)
+            .field("permission_mode", &self.permission_mode)
+            .field("allowed_tools", &self.allowed_tools)
+            .field("disallowed_tools", &self.disallowed_tools)
+            .field("mcp_config", &self.mcp_config)
+            .field("setting_sources", &self.setting_sources)
+            .field("add_dirs", &self.add_dirs)
+            .field("workspace_root", &self.workspace_root)
+            .field("turn_timeout", &self.turn_timeout)
+            .field("extra_args", &self.extra_args)
+            .field("billing_guard", &self.billing_guard)
+            .field("ultracode", &self.ultracode)
+            .field("tracker_api_key", &"***")
+            .field("inject_mcp", &self.inject_mcp)
+            .field("daemon_bin", &self.daemon_bin)
+            .field("workflow_path", &self.workflow_path)
+            .finish()
+    }
 }
 
 /// Whitespace-splits the configured command into name + args. Tokens must not contain quoted spaces

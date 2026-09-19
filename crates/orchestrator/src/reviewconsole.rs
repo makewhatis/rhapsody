@@ -319,15 +319,20 @@ impl Orchestrator {
         }
         let mut dropped = 0usize;
         for row in mine {
+            let id = review_key(
+                &row.key.owner,
+                &row.key.repo,
+                row.key.number,
+                &row.key.reviewer,
+            );
+            // STUDIO-891: whether or not the drop below succeeds, this row is one the operator has
+            // said they are not waiting on. Its consecutive-deferral count must not outlive it —
+            // left standing it would keep `REVIEW_UNASSIGNABLE_WARNING` lit on every project for
+            // the rest of the daemon's life, which is a warning that only ever latches.
+            self.review_unassignable.remove(&id);
             match self.store().drop_review_watch(&row.key) {
                 Ok(()) => dropped += 1,
                 Err(e) => {
-                    let id = review_key(
-                        &row.key.owner,
-                        &row.key.repo,
-                        row.key.number,
-                        &row.key.reviewer,
-                    );
                     tracing::warn!(review = %id, err = %e, "ticketless review: the operator's dismissal could not drop the watch row")
                 }
             }
@@ -973,6 +978,34 @@ mod tests {
             ReviewControlOutcome::Applied(1)
         );
         assert_eq!(o.review_rounds.get("makewhatis/rhapsody#12"), None);
+    }
+
+    /// STUDIO-891: and the stall counters go with them, for the same reason plus one of its own.
+    ///
+    /// A dismissed pull request is one nobody is waiting on, so a stalled-round advisory raised
+    /// against it must come down with it. Left behind, the counter would keep
+    /// [`REVIEW_UNASSIGNABLE_WARNING`](crate::reviewwatch::REVIEW_UNASSIGNABLE_WARNING) lit on
+    /// every project for the rest of the daemon's life — a warning that only ever latches, which
+    /// is worse than none.
+    #[test]
+    fn a_dismissal_retires_the_stall_counters_with_the_rows() {
+        let mut o = ticketless();
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        o.review_unassignable.insert(
+            review_key("makewhatis", "rhapsody", 12, "bob"),
+            crate::reviewwatch::REVIEW_UNASSIGNABLE_SWEEPS,
+        );
+        assert!(o.review_rounds_stalled());
+
+        assert_eq!(
+            o.handle_review_dismiss(&pr()),
+            ReviewControlOutcome::Applied(1)
+        );
+        assert!(
+            o.review_unassignable.is_empty(),
+            "a dismissed pull request must not leave a stall counter behind"
+        );
+        assert!(!o.review_rounds_stalled());
     }
 
     /// **Acceptance 4, the control half (§16).** A dormant daemon refuses both controls without

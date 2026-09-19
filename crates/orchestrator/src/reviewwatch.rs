@@ -29,10 +29,12 @@
 //! * a row `in_flight` at a head with **no live run** is a CRASHED round — the exit path leaves the
 //!   marker exactly where the dispatch put it (§14.1, "clear on crash"), so this is where it gets
 //!   cleared, which is what re-surfaces a crashed review without a daemon restart;
-//! * a row `truncated` is a round whose agent burned its whole turn budget without finishing
-//!   (STUDIO-721's carried slice-4 nit) — the head was read partially at best, and
-//!   `last_reviewed_sha` was deliberately not advanced, so nothing but the status distinguishes it
-//!   from a row nobody has looked at.
+//! * a row `truncated` is a round that ended without a declared verdict — either the agent burned
+//!   its whole turn budget without finishing (STUDIO-721's carried slice-4 nit) or it declared a
+//!   hand-off whose payload was neither `approved` nor a recognised rejection (STUDIO-894) — the
+//!   head was read partially at best (or not conclusively at all), and `last_reviewed_sha` was
+//!   deliberately not advanced, so nothing but the status distinguishes it from a row nobody has
+//!   looked at.
 //!
 //! # Reviewer selection is re-made at DISPATCH, not trusted from introduction (§14.2)
 //!
@@ -57,9 +59,11 @@
 //!
 //! Asking GitHub where a pull request stands is a `gh` call, and [`crate::ghsummons::GH`] shells out
 //! through a synchronous `std::process::Command` — off-task and bounded since STUDIO-829, but still
-//! a round trip per watched pull request. [`run_review_watch_task`] owns every one of them,
-//! holds no `Orchestrator` and takes no lock the control task takes — the same structural
-//! containment [`crate::prstate`] was built for and documents. What comes back crosses to the
+//! a round trip per watched pull request. [`run_review_watch_task`] owns every one of them, holds
+//! no `Orchestrator`, and the only lock it shares with the control task is
+//! [`crate::runautomerge::AutoMergeLedger`]'s — taken read-only by the control task through
+//! [`crate::runautomerge::AutoMergeLedger::peek`] (STUDIO-923) — the same structural containment
+//! [`crate::prstate`] was built for and documents. What comes back crosses to the
 //! control task as ONE [`Event::ReviewSweep`], where the watch set stays single-writer beside
 //! `dispatch_review` and `handle_review_introduce`, and where `running`/`claimed` can be read
 //! without a race.
@@ -109,6 +113,36 @@ use crate::teams::LoadSnapshot;
 /// which is the correct outcome for an operator who restarted the daemon to unstick something.
 pub const REVIEW_ROUNDS_PER_PR_CAP: usize = 8;
 
+/// How many CONSECUTIVE sweeps a round may find nobody to take it before the daemon stops treating
+/// that as ordinary back-pressure and calls it stalled (STUDIO-891).
+///
+/// Deferring is normal and usually momentary: the reviewer is mid-round, or this tick's dispatch
+/// budget is spent. What is not normal is deferring for the same reason forever, which is what a
+/// roster that shrank underneath a live watch row produces — the incumbent is gone, every remaining
+/// teammate is either the author or already holds another of this pull request's required reviews,
+/// and no tick will ever change that on its own. Boot validation cannot see it: the config was
+/// satisfiable when it was written.
+///
+/// Three, not one, because the first deferral of a round is usually the concurrency budget and
+/// saying "stalled" there would cry wolf on every busy tick; and not thirty, because the whole
+/// point is that an operator finds out before they mistake it for an idle board.
+pub const REVIEW_UNASSIGNABLE_SWEEPS: usize = 3;
+
+/// While a round stays stalled, the steady-state line is logged once per this many sweeps rather
+/// than on every one. The transitions — crossing [`REVIEW_UNASSIGNABLE_SWEEPS`], and recovering —
+/// always log regardless, mirroring how [`crate::preflight`] and [`crate::drain`] rate-limit
+/// theirs. In sweeps rather than in a `Duration` because this counter is already in sweeps and a
+/// clock here would be a second unit to keep honest.
+pub const REVIEW_UNASSIGNABLE_LOG_EVERY: usize = 20;
+
+/// The operator advisory surfaced on each project's `/api/v1/projects` status while any watched
+/// round has been unassignable for [`REVIEW_UNASSIGNABLE_SWEEPS`] sweeps — the state-visible half,
+/// exactly as [`crate::preflight::CREDENTIAL_DEAD_WARNING`] and [`crate::drain::DRAINING_WARNING`]
+/// are for a paused dispatch. Silence is this condition's failure mode: a pull request that has
+/// quietly stopped being reviewed looks precisely like one nobody has pushed to.
+pub const REVIEW_UNASSIGNABLE_WARNING: &str = "a pull request review cannot be assigned — every eligible teammate is the author or already \
+     holds one of its reviews; add a teammate or lower `review.reviewers`";
+
 /// What one watcher tick did, reported rather than logged-and-forgotten so a caller (and a test)
 /// can tell the four outcomes apart — they look identical in a silent no-op.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -133,6 +167,17 @@ pub struct ReviewSweepReport {
     /// watcher task performs it. Empty on every installation that has not named
     /// `teams.review.done_state`, and on every tick where nothing merged.
     pub done: Vec<crate::reviewdone::ReviewDonePlan>,
+    /// The pull requests whose reviewer verdicts cleared the control task's half of the auto-merge
+    /// gate this tick (STUDIO-874), each with the head those verdicts were recorded against.
+    ///
+    /// A work LIST for [`ReviewSweepReport::done`]'s reason: what remains is several `gh` calls and
+    /// an irreversible one, which must not happen on the control task. Empty on every installation
+    /// that has not set `teams.review.auto_merge`, and on every tick where nothing cleared.
+    pub merge: Vec<crate::automerge::AutoMergePlan>,
+    /// Rows that have now found nobody eligible for [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive
+    /// sweeps (STUDIO-891) — a SUBSET of [`ReviewSweepReport::deferred`], and the part of it that
+    /// is not going to resolve itself. Always `<= deferred`.
+    pub stalled: usize,
 }
 
 /// Delivers the watcher's two control-task round-trips. A trait for [`ReviewIntroSink`]'s reason:
@@ -146,6 +191,14 @@ pub trait ReviewWatchSink: Send + Sync {
     async fn watched(&self) -> Vec<PrCoord>;
     /// Hands one tick's observations to the control task and reports what it decided.
     async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport;
+    /// Merges ONE pull request whose gates the control task cleared (STUDIO-874).
+    ///
+    /// On the sink for [`Self::finish`]'s reason: the remaining gates are GitHub round trips and
+    /// the merge is irreversible, so both happen out here on the watcher's own task. Infallible by
+    /// contract — a refusal is logged where it happens and the pull request is re-considered next
+    /// tick, which is also what makes a merge that races a fresh push safe to simply lose.
+    async fn merge(&self, plan: crate::automerge::AutoMergePlan);
+
     /// Moves ONE merged pull request's implementation ticket to its terminal state (STUDIO-712).
     ///
     /// On the sink rather than inside [`Self::sweep`] because it is a TRACKER write, and the point
@@ -159,11 +212,30 @@ pub trait ReviewWatchSink: Send + Sync {
 /// every other off-loop→loop hand-back uses.
 pub struct ControlWatchSink {
     control: ControlHandle,
+    /// The `gh` seams an auto-merge needs, or `None` when the feature is off or this daemon has no
+    /// GitHub source (STUDIO-874). Held HERE rather than reached through the control task: the
+    /// merge needs no loop-owned state at all, so routing it through the control channel would
+    /// queue an irreversible network call behind the current tick for no benefit.
+    automerge: Option<Arc<crate::runautomerge::AutoMergeDeps>>,
 }
 
 impl ControlWatchSink {
     pub fn new(control: ControlHandle) -> ControlWatchSink {
-        ControlWatchSink { control }
+        ControlWatchSink {
+            control,
+            automerge: None,
+        }
+    }
+
+    /// Gives the sink the seams [`crate::runautomerge::perform_auto_merge`] needs. Without this
+    /// the sink is inert on the merge path and says so once per plan, which is also what a daemon
+    /// with no GitHub source gets.
+    pub fn with_auto_merge(
+        mut self,
+        deps: Arc<crate::runautomerge::AutoMergeDeps>,
+    ) -> ControlWatchSink {
+        self.automerge = Some(deps);
+        self
     }
 }
 
@@ -174,6 +246,31 @@ impl ReviewWatchSink for ControlWatchSink {
     }
     async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
         self.control.review_sweep(observed).await
+    }
+    async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
+        let Some(deps) = self.automerge.as_ref() else {
+            tracing::warn!(pr = %plan.pr, "auto-merge: no GitHub source is configured; not merging");
+            return;
+        };
+        // Infallible by contract: no outcome has a caller with anything to do about it, and every
+        // one of them is logged — the two that CHANGED something where the change happens, in
+        // `runautomerge`, which holds the fields describing it, and the three that changed nothing
+        // here. A refusal is re-considered on the next tick.
+        match crate::runautomerge::perform_auto_merge(&plan, deps).await {
+            crate::runautomerge::AutoMergeOutcome::Merged(_) => {}
+            crate::runautomerge::AutoMergeOutcome::Updated => {}
+            crate::runautomerge::AutoMergeOutcome::Declined(why) => {
+                tracing::info!(pr = %plan.pr, reason = why, "auto-merge: declined")
+            }
+            // The same refusal as last tick, at the same head. Said once, above, on the tick it
+            // was decided; saying it again every minute is what STUDIO-881 measured 182 of.
+            crate::runautomerge::AutoMergeOutcome::Held(why) => {
+                tracing::debug!(pr = %plan.pr, reason = why, "auto-merge: still declined")
+            }
+            crate::runautomerge::AutoMergeOutcome::Failed(err) => {
+                tracing::warn!(pr = %plan.pr, %err, "auto-merge: a gate could not be read; not merging")
+            }
+        }
     }
     async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
         self.control.finish_review_ticket(plan).await
@@ -251,10 +348,25 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 dispatched = report.dispatched,
                 retired = report.retired,
                 deferred = report.deferred,
+                // The subset of `deferred` that is not going to resolve itself (STUDIO-891). Its
+                // own field rather than folded into the count above, so a tick line that reads
+                // "deferred = 1" every 30 seconds can be told apart from one that is waiting.
+                stalled = report.stalled,
                 armed = report.armed,
                 done = report.done.len(),
+                merge = report.merge.len(),
                 "ticketless review watcher tick"
             );
+        }
+        // The auto-merges (STUDIO-874), out here because each is several `gh` calls ending in an
+        // irreversible one. Before the auto-Done moves below and not after: a merge performed now
+        // is observed as MERGED by the NEXT tick, which is what produces its ticket's Done plan
+        // through the existing STUDIO-712 path rather than a second one written here.
+        for plan in report.merge {
+            if ctx.is_cancelled() {
+                return;
+            }
+            deps.sink.merge(plan).await;
         }
         // The auto-Done moves (STUDIO-712), out here because each is a tracker round-trip. Serially
         // and with a cancellation check between them, for `sweep_pr_states`' reasons: a shutting-down
@@ -292,8 +404,8 @@ pub(crate) fn review_round_due(row: &ReviewWatchRow, head: &str, in_flight_now: 
         REVIEW_STATUS_REVIEWED | REVIEW_STATUS_APPROVED => row.last_reviewed_sha != head,
         // Everything else still owes a review of this head, INCLUDING at the same SHA: `requested`
         // was never dispatched, `in_flight` without a live run is a crashed round, and `truncated`
-        // is a round that ran out of turns mid-review. The last two are why this is a status match
-        // and not a SHA comparison — a SHA comparison calls all three "already handled".
+        // is a round that ended without a declared verdict. The last two are why this is a status
+        // match and not a SHA comparison — a SHA comparison calls all three "already handled".
         _ => true,
     }
 }
@@ -410,6 +522,59 @@ impl Orchestrator {
         report
     }
 
+    /// Records that `id`'s round found nobody this sweep, and answers whether that has now been
+    /// true for [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive sweeps.
+    ///
+    /// The log follows [`crate::drain`]'s discipline exactly: the sweep that CROSSES the threshold
+    /// says so loudly and once, and the steady state repeats at [`REVIEW_UNASSIGNABLE_LOG_EVERY`]
+    /// rather than at poll rate — a stalled round would otherwise emit a warning every 30 seconds
+    /// for as long as the pull request stays open, which is how an operator learns to filter the
+    /// one line that mattered.
+    fn note_unassignable(&mut self, pr: &PrCoord, id: &str, reviewer: &str) -> bool {
+        let sweeps = self.review_unassignable.entry(id.to_string()).or_insert(0);
+        *sweeps += 1;
+        let sweeps = *sweeps;
+        if sweeps < REVIEW_UNASSIGNABLE_SWEEPS {
+            return false;
+        }
+        // The crossing sweep and the rate-limited repeats in ONE condition: at the crossing the
+        // difference is zero, and zero is a multiple of everything. Spelling the crossing out as a
+        // separate disjunct would read as a second rule while deciding nothing.
+        if (sweeps - REVIEW_UNASSIGNABLE_SWEEPS).is_multiple_of(REVIEW_UNASSIGNABLE_LOG_EVERY) {
+            tracing::warn!(
+                pr = %pr, reviewer, sweeps,
+                "ticketless review: this round has had no eligible reviewer for {sweeps} \
+                 consecutive sweeps and will not resolve on its own — every teammate left is \
+                 either the pull request's author or already holds one of its reviews. Add a \
+                 teammate to `teams.yaml`, or lower `review.reviewers`."
+            );
+        }
+        true
+    }
+
+    /// Forgets `id`'s consecutive-deferral count, logging the RECOVERY when there was a reported
+    /// stall to recover from — the edge [`note_unassignable`](Self::note_unassignable) is the other
+    /// half of. A round that never reached the threshold clears silently: it was never news.
+    fn clear_unassignable(&mut self, pr: &PrCoord, id: &str, reviewer: &str) {
+        if let Some(sweeps) = self.review_unassignable.remove(id)
+            && sweeps >= REVIEW_UNASSIGNABLE_SWEEPS
+        {
+            tracing::info!(
+                pr = %pr, reviewer, sweeps,
+                "ticketless review: a round that had been unassignable for {sweeps} sweeps has a \
+                 reviewer again"
+            );
+        }
+    }
+
+    /// Whether any watched round is currently stalled — read by `project_statuses` to surface
+    /// [`REVIEW_UNASSIGNABLE_WARNING`] (STUDIO-891).
+    pub(crate) fn review_rounds_stalled(&self) -> bool {
+        self.review_unassignable
+            .values()
+            .any(|n| *n >= REVIEW_UNASSIGNABLE_SWEEPS)
+    }
+
     /// Drops every live row of one pull request out of the watch set and forgets its churn budget.
     /// Returns how many rows were dropped.
     fn retire_review_pr(&mut self, pr: &PrCoord, why: &str) -> usize {
@@ -423,10 +588,20 @@ impl Orchestrator {
             }
         };
         let mut dropped = 0usize;
+        // Collected as the rows go, rather than reconstructed by prefix-matching `review_key`'s
+        // format from here: the key's spelling is that function's business, and a second place
+        // that knows it is a second place for it to drift.
+        let mut retired_ids: Vec<String> = Vec::new();
         for row in rows {
             if !row_is(&row, pr) || (!row.open && row.status == REVIEW_STATUS_DROPPED) {
                 continue;
             }
+            retired_ids.push(review_key(
+                &row.key.owner,
+                &row.key.repo,
+                row.key.number,
+                &row.key.reviewer,
+            ));
             match self.store().drop_review_watch(&row.key) {
                 Ok(()) => dropped += 1,
                 Err(e) => {
@@ -438,8 +613,16 @@ impl Orchestrator {
             tracing::info!(pr = %pr, reason = why, rows = dropped, "ticketless review: pull request dropped from the watch set");
         }
         // A dropped pull request can be re-introduced later; its old churn budget should not follow
-        // it, and leaving the entry would grow this map for the daemon's whole life.
+        // it, and leaving the entry would grow this map for the daemon's whole life. The
+        // consecutive-deferral counts go with it for both of those reasons (STUDIO-891) — and for a
+        // third: a retired pull request that kept a stall count would keep the operator advisory
+        // lit for a review nobody is waiting on any more.
         self.review_rounds.remove(&churn_key(pr));
+        // And what was announced about its auto-merge plan, for the first two of those reasons.
+        self.auto_merge_announced.remove(&churn_key(pr));
+        for id in retired_ids {
+            self.review_unassignable.remove(&id);
+        }
         dropped
     }
 
@@ -534,6 +717,10 @@ impl Orchestrator {
                      re-considered next tick"
                 );
                 report.deferred += 1;
+                // STUDIO-891: "re-considered next tick" is only reassuring while some tick can
+                // change the answer. Count the consecutive ones so a round that no tick will ever
+                // resolve stops presenting as ordinary back-pressure.
+                report.stalled += usize::from(self.note_unassignable(pr, &id, &row.key.reviewer));
                 continue;
             };
             // THE dispatch-side allowlist re-check (the slice-6 F-SEC review's item (a)). The row
@@ -549,6 +736,11 @@ impl Orchestrator {
                 report.deferred += 1;
                 continue;
             };
+            // The recovery edge (STUDIO-891): this round found somebody, so whatever it had been
+            // owed before is settled. Cleared BEFORE the dispatch, because a dispatch that fails
+            // further down is a different problem with its own log line, and leaving the count
+            // standing would let this row keep claiming a stall it no longer has.
+            self.clear_unassignable(pr, &id, &row.key.reviewer);
             let reassigned = chosen != row.key.reviewer;
             let picked = chosen.clone();
             let run = ReviewRun {
@@ -604,12 +796,100 @@ impl Orchestrator {
                 // is precisely what the guard exists for. Next tick.
                 ReviewDispatchOutcome::AlreadyInFlight => report.deferred += 1,
                 ReviewDispatchOutcome::TeamsOff => report.deferred += 1,
+                // A drain is armed: the row is untouched and this head is re-offered on the sweep
+                // after the drain is cancelled, exactly as a deferred one is.
+                ReviewDispatchOutcome::Draining => report.deferred += 1,
                 ReviewDispatchOutcome::Refused(why) => {
                     report.deferred += 1;
                     tracing::warn!(pr = %pr, reason = why, "ticketless review: the dispatch was refused");
                 }
             }
         }
+
+        self.propose_auto_merge(&mine, pr, head, report);
+    }
+
+    /// Whether this pull request's reviewer verdicts clear the auto-merge gate at `head`
+    /// (STUDIO-874), appending the plan to `report` if they do.
+    ///
+    /// Decided from `mine` — the tick's OPENING snapshot of this pull request's rows — for the
+    /// same reason the dispatch loop above is: it is the state the control task owns, and nothing
+    /// this function reads is written by the loop it follows. A row re-armed by
+    /// [`Self::handle_review_head_advanced`] moved to `requested`, which this gate refuses on
+    /// EITHER reading; a row the loop dispatched is `in_flight` on either; and a row whose verdict
+    /// is at an older head is stale on either. So the opening snapshot cannot clear a gate the
+    /// closing one would refuse.
+    fn propose_auto_merge(
+        &mut self,
+        mine: &[&ReviewWatchRow],
+        pr: &PrCoord,
+        head: &str,
+        report: &mut ReviewSweepReport,
+    ) {
+        if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
+            return; // opt-in, and off by default (the D5 invariant)
+        }
+        match crate::automerge::auto_merge_verdict(mine, head) {
+            Ok(approved_by) => {
+                // At INFO when it is news, and at DEBUG for as long as it stays the same plan.
+                // The gate is re-decided from the watch rows on EVERY tick and the plan is handed
+                // out on every tick — a pull request held by a gate on the other side of the seam
+                // must still merge the moment that gate clears. What is quieted is only the line:
+                // STUDIO-881's log carried 97 of these for ONE draft pull request, at INFO, in
+                // lockstep with the refusal they led to.
+                if self.auto_merge_plan_is_news(pr, head, &approved_by) {
+                    tracing::info!(
+                        pr = %pr, head, ?approved_by,
+                        "auto-merge: every reviewer approved this head; the remaining gates are \
+                         asked of GitHub off-loop"
+                    );
+                } else {
+                    tracing::debug!(
+                        pr = %pr, head, ?approved_by,
+                        "auto-merge: the same plan as the last tick; still asking GitHub"
+                    );
+                }
+                report.merge.push(crate::automerge::AutoMergePlan {
+                    pr: pr.clone(),
+                    head: head.to_string(),
+                    approved_by,
+                });
+            }
+            // At DEBUG, not INFO: on a pull request awaiting review this is the answer on every
+            // tick for as long as the review takes, and it is not news.
+            Err(why) => {
+                tracing::debug!(pr = %pr, head, reason = why.why(), "auto-merge: not merging")
+            }
+        }
+    }
+
+    /// Whether announcing this auto-merge plan says anything that has not been said, remembering
+    /// it when it does (STUDIO-881).
+    ///
+    /// News is a plan whose HEAD or whose set of approvals differs from the one last announced for
+    /// this pull request — the two things the line itself claims. Anything else is the same
+    /// sentence about the same commit, and a pull request held by a gate downstream re-forms that
+    /// plan once a minute for as long as the hold lasts.
+    ///
+    /// This governs the REPORT and nothing else: [`Self::propose_auto_merge`] hands the plan out
+    /// either way, so a refusal that clears is merged on the very next tick whatever this answers.
+    fn auto_merge_plan_is_news(
+        &mut self,
+        pr: &PrCoord,
+        head: &str,
+        approved_by: &[String],
+    ) -> bool {
+        let key = churn_key(pr);
+        if self
+            .auto_merge_announced
+            .get(&key)
+            .is_some_and(|(was_head, was_by)| was_head == head && was_by == approved_by)
+        {
+            return false;
+        }
+        self.auto_merge_announced
+            .insert(key, (head.to_string(), approved_by.to_vec()));
+        true
     }
 
     /// Who reviews this round: the incumbent where continuity means something, otherwise the
@@ -688,6 +968,71 @@ impl Orchestrator {
             })
             .map(|p| p.repo.clone())
     }
+
+    /// Every slug of a resolved project that owns `owner/repo`, in resolution
+    /// order; empty when no resolved project owns it. [`Self::review_repo_url`]'s
+    /// lookup, without its `!disabled` filter and returning the slugs rather than
+    /// the repo string.
+    ///
+    /// The missing `!disabled` is deliberate for the one caller,
+    /// [`Self::review_auto_merge_for_repo`]: a project paused after a pull
+    /// request entered the watch set must still have its override read, because
+    /// the override is the fail-safe half — dropping it would fall back to a
+    /// GLOBAL value the operator may have set this very repo aside from.
+    ///
+    /// It returns EVERY owning slug, not the first match, because a WORKFLOW
+    /// project fans out to one resolved project per slug and they share one repo
+    /// (STUDIO-927). A first-match scan would let an override naming any slug but
+    /// the first be invisible — exactly the booch case, whose two hex slugs share
+    /// `git@github.com:makewhatis/booch.git`.
+    fn review_project_slugs_for_repo(&self, owner: &str, repo: &str) -> Vec<&str> {
+        let Some(eff) = self.eff.as_ref() else {
+            return Vec::new();
+        };
+        eff.projects
+            .iter()
+            .filter_map(|p| {
+                crate::ghsummons::parse_repo(&p.repo)
+                    .is_some_and(|(o, r)| {
+                        o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo)
+                    })
+                    .then_some(p.slug.as_str())
+            })
+            .collect()
+    }
+
+    /// The effective `teams.review.auto_merge` for the project set that owns
+    /// `owner/repo` (STUDIO-927): the owning projects' own per-project overrides
+    /// when they have any, else the installation-wide default. A repo that no
+    /// resolved project owns — and an orchestrator carrying no resolved project set
+    /// at all — falls back to the top-level value, so every existing installation
+    /// behaves exactly as it did before the per-project block existed.
+    ///
+    /// When several resolved projects share the repo, their answers are ANDed:
+    /// **any** owning project that resolves `false` holds the merge. That is the
+    /// fail-safe direction — the choice this accessor exists to make — because the
+    /// alternative (first match wins) fails OPEN, letting a repo an operator
+    /// explicitly set aside self-merge simply because its override named the second
+    /// of two slugs.
+    ///
+    /// The AND cuts both ways, though. Holding a merge back takes naming any ONE
+    /// slug (its sibling inherits the global `true`, and the AND still yields
+    /// `false`); opting a repo back IN under a global `false` takes naming EVERY
+    /// slug of the project, because an unnamed sibling inherits the global `false`
+    /// and holds the merge. That asymmetry is deliberate: the alternative — any
+    /// explicit `false` wins, else any explicit `true`, else global — would let a
+    /// single `true` on a sibling slug override another slug's explicit `false` and
+    /// fail OPEN, which is the direction this accessor exists to prevent.
+    pub(crate) fn review_auto_merge_for_repo(&self, owner: &str, repo: &str) -> bool {
+        let Some(teams) = self.teams.as_ref() else {
+            return false;
+        };
+        let slugs = self.review_project_slugs_for_repo(owner, repo);
+        if slugs.is_empty() {
+            return teams.review_auto_merge();
+        }
+        slugs.iter().all(|slug| teams.review_auto_merge_for(slug))
+    }
 }
 
 /// Whether a watch row belongs to `pr`. Case-insensitive, because GitHub logins and repository
@@ -700,6 +1045,11 @@ pub(crate) fn row_is(row: &ReviewWatchRow, pr: &PrCoord) -> bool {
 
 /// The per-pull-request re-review budget, keyed by `owner/repo#number`.
 pub type ReviewRounds = HashMap<String, usize>;
+
+/// The auto-merge plan each watched pull request has already been ANNOUNCED for: its head and the
+/// approvals that cleared the gate at that head, keyed by [`churn_key`] as [`ReviewRounds`] is.
+/// See [`Orchestrator::auto_merge_announced`]. STUDIO-881.
+pub type AnnouncedPlans = HashMap<String, (String, Vec<String>)>;
 
 impl ControlHandle {
     /// The coordinates the watcher should ask GitHub about. Empty when the subsystem is off or the
@@ -882,6 +1232,7 @@ mod tests {
         PrObservation {
             pr: coord(number),
             lookup: PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: head.to_string(),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -895,6 +1246,7 @@ mod tests {
     /// request whose `mergedAt` would not parse must still be a merge (see `reviewdone`).
     fn merged_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: head.to_string(),
             status: PrStatus::Merged,
             merged_at: chrono::DateTime::parse_from_rfc3339("2026-09-10T00:00:00Z")
@@ -907,6 +1259,7 @@ mod tests {
     /// One observation of a pull request that was CLOSED without merging.
     fn closed_at(head: &str) -> PrLookup {
         PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: head.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -1141,12 +1494,14 @@ mod tests {
     #[test]
     fn a_retired_pull_request_leaves_the_watch_set() {
         let merged = PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Merged,
             merged_at: None,
             head_repo: format!("{OWNER}/{REPO}"),
         });
         let closed = PrLookup::Found(PrSnapshot {
+            is_draft: false,
             head_sha: HEAD_A.to_string(),
             status: PrStatus::Closed,
             merged_at: None,
@@ -1280,6 +1635,368 @@ mod tests {
 
         assert!(report.done.is_empty(), "off by default");
         assert_eq!(report.retired, 1);
+    }
+
+    // --- auto-merge on a cleared gate (STUDIO-874) ------------------------------------------
+
+    /// [`ticketless`] with the auto-merge switched on.
+    fn ticketless_automerge(names: &[&str]) -> Teams {
+        let mut teams = ticketless(names);
+        teams.review.auto_merge = true;
+        teams
+    }
+
+    /// A watch row whose reviewer APPROVED the head they were asked about.
+    fn approved_row(number: i64, reviewer: &str, sha: &str) -> ReviewWatchRow {
+        let mut r = row(number, reviewer);
+        r.requested_sha = sha.to_string();
+        r.last_reviewed_sha = sha.to_string();
+        r.status = rhapsody_store::REVIEW_STATUS_APPROVED.to_string();
+        r
+    }
+
+    /// Acceptance: every reviewer approved AT the observed head, so the tick proposes the merge —
+    /// and names the head those verdicts were recorded against, not merely the pull request.
+    #[test]
+    fn an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert_eq!(
+            report.merge,
+            vec![crate::automerge::AutoMergePlan {
+                pr: coord(64),
+                head: HEAD_A.to_string(),
+                approved_by: vec!["bob".to_string()],
+            }]
+        );
+        assert_eq!(report.dispatched, 0, "and no review round is dispatched");
+    }
+
+    /// ⚠️ The D5 invariant and the opt-in, at the one place it decides anything: the SAME approved,
+    /// at-head pull request proposes nothing when `auto_merge` was never asked for.
+    #[test]
+    fn auto_merge_is_off_by_default() {
+        let (mut o, _d) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(report.merge.is_empty(), "off unless the operator asked");
+    }
+
+    /// ⚠️ STUDIO-927: the gate is scoped to the project that owns the pull request's repo. With the
+    /// top-level flag ON, a `projects:` entry for THIS project setting `auto_merge: false` holds the
+    /// merge back. Mutation: make `propose_auto_merge` gate on `Teams::review_auto_merge` again —
+    /// the global wins, the plan is handed out, and this goes red.
+    #[test]
+    fn a_per_project_override_holds_back_this_projects_auto_merge() {
+        let mut teams = ticketless_automerge(&["alice", "bob"]);
+        teams.projects = vec![rhapsody_config::teams::TeamsProject {
+            slugs: vec!["rhapsody".to_string()],
+            review: rhapsody_config::teams::ProjectReview {
+                auto_merge: Some(false),
+            },
+        }];
+        let (mut o, _d) = orch(teams);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "the project this repo belongs to asked not to self-merge"
+        );
+    }
+
+    /// ⚠️ STUDIO-927, the case that must not be missed: a WORKFLOW project fans
+    /// out to one resolved project per slug, ALL sharing one repo, so an operator
+    /// may name ANY of its slugs. Here the override names the SECOND slug of a
+    /// two-slug project; the first has no entry. A first-match scan resolves the
+    /// first slug, finds no entry and falls back to the global `true`, so the repo
+    /// self-merges anyway — the bug alice found on the live install, where booch's
+    /// two hex slugs share one repo. The AND over every owning slug is what holds
+    /// it back. Mutation: return `review_auto_merge_for_repo` to a first-match
+    /// `find_map` and the plan is handed out again, so this goes red.
+    #[test]
+    fn an_override_naming_a_fanned_projects_second_slug_still_holds_the_merge() {
+        let mut teams = ticketless_automerge(&["alice", "bob"]);
+        teams.projects = vec![rhapsody_config::teams::TeamsProject {
+            slugs: vec!["161ac721c8bc".to_string()],
+            review: rhapsody_config::teams::ProjectReview {
+                auto_merge: Some(false),
+            },
+        }];
+        let (mut o, _d) = orch(teams);
+        // Fan the one repo out over two slugs, as `resolve_projects` does for
+        // `slugs: [4f4a2350682f, 161ac721c8bc]`. The override names the second.
+        let tracker = Arc::clone(&o.eff.as_ref().expect("eff").projects[0].tracker);
+        let mut second = empty_resolved_project("161ac721c8bc", tracker);
+        second.repo = REPO_URL.to_string();
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            eff.projects[0].slug = "4f4a2350682f".to_string();
+            eff.projects[0].group = "4f4a2350682f".to_string();
+            eff.projects.push(second);
+        }
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "naming the second slug of a fanned project must still hold the merge"
+        );
+    }
+
+    /// ⚠️ The stale-approval refusal, end to end through the sweep: the reviewer approved HEAD_A
+    /// and the author has since pushed HEAD_B. Nothing is proposed — and the row is re-armed for a
+    /// review of the new head instead, which is the behaviour that makes the refusal temporary
+    /// rather than a dead end.
+    #[test]
+    fn an_approval_that_predates_the_observed_head_proposes_no_merge() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_B)]);
+
+        assert!(
+            report.merge.is_empty(),
+            "an approval of HEAD_A is not one of HEAD_B"
+        );
+        assert_eq!(report.armed, 1, "the new head is re-reviewed instead");
+    }
+
+    /// A round that filed findings blocks the merge, and so does one still owed — the two refusals
+    /// the watch set can distinguish and a bare "is anything running" cannot.
+    #[test]
+    fn a_findings_round_or_an_owed_one_proposes_no_merge() {
+        for status in [
+            rhapsody_store::REVIEW_STATUS_REVIEWED,
+            rhapsody_store::REVIEW_STATUS_REQUESTED,
+            rhapsody_store::REVIEW_STATUS_IN_FLIGHT,
+            rhapsody_store::REVIEW_STATUS_TRUNCATED,
+        ] {
+            let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+            let mut r = approved_row(64, "bob", HEAD_A);
+            r.status = status.to_string();
+            introduce(&o, r);
+
+            let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+            assert!(report.merge.is_empty(), "({status})");
+        }
+    }
+
+    /// Every REQUIRED reviewer, not merely one of them: a second row that has not approved this
+    /// head blocks the merge the first row's approval would otherwise clear.
+    #[test]
+    fn one_reviewers_approval_does_not_merge_a_two_reviewer_pull_request() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob", "carol"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        introduce(&o, row(64, "carol"));
+
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert!(report.merge.is_empty(), "carol has not reviewed this head");
+    }
+
+    /// ⚠️ The ticket bookkeeping, CONFIRMED rather than assumed (STUDIO-874 item 5): a pull request
+    /// this feature merges must land its ticket in Done through STUDIO-712's existing path.
+    ///
+    /// Two ticks, because that is how it really happens: the first clears the gate and hands the
+    /// merge out, and the merge itself writes nothing to the watch set — so the SECOND tick
+    /// observes the pull request as MERGED exactly as it would have observed a human's merge, and
+    /// the auto-Done transition fires on it unchanged. Nothing in the auto-merge path had to know
+    /// about tickets at all, which is the property this pins.
+    #[test]
+    fn a_pull_request_this_feature_merges_lands_its_ticket_in_done() {
+        let mut teams = ticketless_automerge(&["alice", "bob"]);
+        teams.review.done_state = "Done".to_string();
+        let (mut o, _d) = orch(teams);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        run_of(&o, "STUDIO-721");
+
+        // Tick one: the gate clears and the merge is handed to the off-loop half.
+        let first = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        assert_eq!(first.merge.len(), 1, "the merge was proposed");
+        assert!(first.done.is_empty(), "and nothing is Done yet");
+
+        // Tick two, after that merge landed. This is the ONLY thing that changed.
+        let second = o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert_eq!(
+            second.done,
+            vec![crate::reviewdone::ReviewDonePlan {
+                pr: format!("{OWNER}/{REPO}#64"),
+                issue_id: "ID-STUDIO-721".to_string(),
+                team_id: "TEAM-1".to_string(),
+                identifier: "STUDIO-721".to_string(),
+                state: "Done".to_string(),
+            }],
+            "the auto-merged pull request finishes its ticket like any other merge"
+        );
+        assert!(
+            second.merge.is_empty(),
+            "and a merged pull request is never proposed for merging again"
+        );
+    }
+
+    /// Every `tracing` event a test emits, by level and message. Enough of a `Subscriber` to
+    /// COUNT lines, which is the only question STUDIO-881 asks of the log: the ticket was filed
+    /// off `grep | sort | uniq -c`, and "announced once" is a claim about that count.
+    #[derive(Default, Clone)]
+    struct CountedLog(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl CountedLog {
+        /// The messages logged at `level`, in order.
+        fn at(&self, level: tracing::Level) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(l, _)| *l == level)
+                .map(|(_, m)| m.clone())
+                .collect()
+        }
+    }
+
+    /// Pulls the `message` field out of an event and ignores its structured fields.
+    struct MessageOf<'a>(&'a mut String);
+    impl tracing::field::Visit for MessageOf<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CountedLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MessageOf(&mut message));
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((*event.metadata().level(), message));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// ⚠️ The ticket's own measurement, run forward: twenty ticks of a pull request that is stuck
+    /// downstream cost ONE line at INFO, not twenty. The log this ticket was filed from carried 97
+    /// of this exact line for one draft pull request — the count is the defect, so the count is
+    /// what this asserts, and it is counted rather than reasoned about.
+    #[test]
+    fn twenty_ticks_of_a_stuck_pull_request_cost_one_info_line() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        let log = CountedLog::default();
+
+        tracing::subscriber::with_default(log.clone(), || {
+            for _ in 0..20 {
+                let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+                assert_eq!(report.merge.len(), 1, "and every tick still proposes it");
+            }
+        });
+
+        assert_eq!(
+            log.at(tracing::Level::INFO).len(),
+            1,
+            "at INFO: {:?}",
+            log.at(tracing::Level::INFO)
+        );
+        assert!(
+            log.at(tracing::Level::INFO)[0].starts_with("auto-merge: every reviewer approved"),
+            "{:?}",
+            log.at(tracing::Level::INFO)
+        );
+        assert!(
+            log.at(tracing::Level::WARN).is_empty(),
+            "nothing here is a warning: {:?}",
+            log.at(tracing::Level::WARN)
+        );
+    }
+
+    /// ⚠️ STUDIO-881's second half, at the site that actually dominated the log: the plan line is
+    /// announced when it is NEWS and quiet afterwards, while the PLAN itself is re-proposed on
+    /// every tick. Both halves matter — the log the ticket was filed from carried 97 identical
+    /// INFO lines for one stuck draft, and a "fix" that stopped re-proposing would strand the pull
+    /// request the tick its refusal cleared.
+    #[test]
+    fn an_unchanged_plan_is_announced_once_and_proposed_every_tick() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        let first = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        let second = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        let third = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+
+        assert_eq!(first.merge.len(), 1, "the gate cleared");
+        assert_eq!(
+            second.merge, first.merge,
+            "and keeps clearing: the plan is re-proposed"
+        );
+        assert_eq!(third.merge, first.merge);
+        assert!(
+            !o.auto_merge_plan_is_news(&coord(64), HEAD_A, &["bob".to_string()]),
+            "said on the first tick; saying it again every minute is what the ticket measured"
+        );
+    }
+
+    /// What makes the announcement news again: a different head, or a different set of approvals
+    /// at the same head. Either changes the claim the line makes, so either is worth saying.
+    #[test]
+    fn a_new_head_or_a_new_approver_is_news_again() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        let bob = vec!["bob".to_string()];
+
+        assert!(o.auto_merge_plan_is_news(&coord(64), HEAD_A, &bob), "first");
+        assert!(!o.auto_merge_plan_is_news(&coord(64), HEAD_A, &bob));
+        assert!(
+            o.auto_merge_plan_is_news(&coord(64), HEAD_B, &bob),
+            "a head the operator has not been told cleared"
+        );
+        assert!(
+            o.auto_merge_plan_is_news(
+                &coord(64),
+                HEAD_B,
+                &["bob".to_string(), "carol".to_string()]
+            ),
+            "a second approval at that head is a different claim"
+        );
+        assert!(
+            o.auto_merge_plan_is_news(&coord(65), HEAD_B, &bob),
+            "and another pull request is its own subject"
+        );
+    }
+
+    /// The announcement is dropped with the pull request, exactly as its churn budget is: a
+    /// coordinate re-introduced later is announced again, and the map does not grow for the
+    /// daemon's whole life.
+    #[test]
+    fn retiring_a_pull_request_forgets_what_was_announced_about_it() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+
+        o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+        o.handle_review_sweep(&[observed(64, merged_at(HEAD_A))]);
+
+        assert!(
+            o.auto_merge_plan_is_news(&coord(64), HEAD_A, &["bob".to_string()]),
+            "the retirement forgot it"
+        );
     }
 
     // --- load-aware reviewer selection ------------------------------------------------------
@@ -1439,6 +2156,107 @@ mod tests {
         o.teams = Some(ticketless(&["alice", "bob"]));
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
         assert_eq!(reviewers_of(&dispatched), vec!["bob".to_string()]);
+    }
+
+    /// The operator advisory is PROSE that goes out on the wire, and a backslash-continued Rust
+    /// literal is exactly where source indentation leaks into shipped text. A test that compares
+    /// the constant to itself would never see it, so this reads the rendered value.
+    #[test]
+    fn the_stalled_round_advisory_renders_as_one_sentence() {
+        assert!(
+            !REVIEW_UNASSIGNABLE_WARNING.contains("  ")
+                && !REVIEW_UNASSIGNABLE_WARNING.contains('\n'),
+            "leaked source indentation: {REVIEW_UNASSIGNABLE_WARNING:?}"
+        );
+        assert!(
+            REVIEW_UNASSIGNABLE_WARNING.contains("review.reviewers"),
+            "the advisory must name the knob an operator turns"
+        );
+    }
+
+    /// STUDIO-891: a round that keeps deferring stops being a quiet one.
+    ///
+    /// Boot validation cannot see this case — the config was satisfiable when it was written and
+    /// the roster shrank underneath it — so the deferral has to report itself. The failure shape
+    /// this whole batch keeps producing is an idle board: the round defers, `deferred` ticks up in
+    /// a report nobody reads, and a `debug!` line is the only record. After
+    /// [`REVIEW_UNASSIGNABLE_SWEEPS`] consecutive sweeps the row is called stalled, and that fact
+    /// reaches `/api/v1/projects` — the same surface a paused dispatch uses.
+    #[test]
+    fn a_round_that_defers_for_several_sweeps_is_reported_as_stalled() {
+        let (mut o, _dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![ident("alice", 0)],
+        ));
+        introduce(&o, row(12, "bob"));
+
+        // `alice` authored it and is the whole roster, so no sweep can ever assign this round.
+        for sweep in 1..REVIEW_UNASSIGNABLE_SWEEPS {
+            let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+            assert_eq!((report.deferred, report.stalled), (1, 0), "sweep {sweep}");
+            assert!(
+                o.project_statuses()[0]
+                    .warnings
+                    .iter()
+                    .all(|w| w != REVIEW_UNASSIGNABLE_WARNING),
+                "a round that has only just started deferring is not yet news (sweep {sweep})"
+            );
+        }
+        // The sweep that crosses the threshold.
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!((report.deferred, report.stalled), (1, 1));
+        assert!(
+            o.project_statuses()[0]
+                .warnings
+                .iter()
+                .any(|w| w == REVIEW_UNASSIGNABLE_WARNING),
+            "a stalled round must reach the operator's project status"
+        );
+        // It stays reported for as long as it stays stalled.
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).stalled, 1);
+
+        // A roster that can service the round again clears BOTH the count and the advisory on the
+        // very next sweep — the recovery edge, which is the half a warning that only ever latches
+        // would get wrong.
+        o.teams = Some(ticketless(&["alice", "bob"]));
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!((report.dispatched, report.stalled), (1, 0));
+        assert!(
+            o.project_statuses()[0]
+                .warnings
+                .iter()
+                .all(|w| w != REVIEW_UNASSIGNABLE_WARNING),
+            "a round that got a reviewer is no longer stalled"
+        );
+    }
+
+    /// The counter is per ROW and self-cleaning: a pull request that leaves the watch set takes its
+    /// stall count with it, so the map cannot grow for the daemon's whole life and a re-introduced
+    /// pull request does not inherit an old grievance.
+    #[test]
+    fn a_retired_pull_request_forgets_its_stall_count() {
+        let (mut o, _dispatched) = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            vec![ident("alice", 0)],
+        ));
+        introduce(&o, row(12, "bob"));
+        for _ in 0..REVIEW_UNASSIGNABLE_SWEEPS {
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        }
+        assert!(!o.review_unassignable.is_empty());
+        assert!(o.review_rounds_stalled());
+
+        o.handle_review_sweep(&[PrObservation {
+            pr: coord(12),
+            lookup: PrLookup::Gone,
+        }]);
+        assert!(
+            o.review_unassignable.is_empty(),
+            "a retired pull request must not leave a counter behind"
+        );
+        assert!(!o.review_rounds_stalled());
     }
 
     /// An author-less row (written before the column existed, or by a caller that supplied none)
@@ -1910,6 +2728,8 @@ mod tests {
         hand_back: ReviewSweepReport,
         /// The auto-Done moves the task asked for, in order (STUDIO-712).
         finished: Arc<Mutex<Vec<crate::reviewdone::ReviewDonePlan>>>,
+        /// The auto-merges the task asked for, in order (STUDIO-874).
+        merged: Arc<Mutex<Vec<crate::automerge::AutoMergePlan>>>,
     }
 
     #[async_trait]
@@ -1921,6 +2741,9 @@ mod tests {
             self.seen.lock().expect("seen lock").push(observed);
             self.done.notify_one();
             self.hand_back.clone()
+        }
+        async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
+            self.merged.lock().expect("merged lock").push(plan);
         }
         async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
             self.finished.lock().expect("finished lock").push(plan);
@@ -1939,6 +2762,7 @@ mod tests {
             _allow: &HeadAllowlist,
         ) -> PrStateResult {
             Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
                 head_sha: format!("{number:040}"),
                 status: PrStatus::Open,
                 merged_at: None,
@@ -2056,6 +2880,7 @@ mod tests {
                     ..ReviewSweepReport::default()
                 },
                 finished: Arc::clone(&finished),
+                ..FakeSink::default()
             }),
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));

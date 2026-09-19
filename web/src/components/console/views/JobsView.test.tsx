@@ -2,10 +2,17 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { useState } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { HistoryFilter, IssueCountsResponse, IssueRun, IssueStatusBucket, StateResponse } from "@/lib/api";
+import type {
+  HistoryFilter,
+  IssueCountsResponse,
+  IssueRun,
+  IssueStatusBucket,
+  StateResponse,
+  TicketCostRow,
+} from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
 import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
 import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
@@ -18,6 +25,7 @@ const h = vi.hoisted(() => ({
   fetchState: vi.fn(),
   fetchIssueRuns: vi.fn(),
   fetchIssueCounts: vi.fn(),
+  fetchHistoryCosts: vi.fn(async (): Promise<{ costs: TicketCostRow[] }> => ({ costs: [] })),
   fetchTeamsOverview: vi.fn(),
   fetchRunTranscript: vi.fn(),
 }));
@@ -29,6 +37,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchState: h.fetchState,
     fetchIssueRuns: h.fetchIssueRuns,
     fetchIssueCounts: h.fetchIssueCounts,
+    fetchHistoryCosts: h.fetchHistoryCosts,
     fetchTeamsOverview: h.fetchTeamsOverview,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchVersion: vi.fn(async () => ({
@@ -193,6 +202,17 @@ function rowKeys(): string[] {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+// The List/Board choice is PERSISTED (STUDIO-925), so a board test that toggles would otherwise leave
+// the next test's mount in board mode and its table assertions empty. Storage is absent in some test
+// environments (a Node with no localStorage global behind jsdom), hence the guards.
+beforeEach(() => {
+  try {
+    window.localStorage?.clear();
+  } catch {
+    // No storage to reset.
+  }
 });
 
 describe("the Now strip (§3)", () => {
@@ -435,6 +455,17 @@ describe("the filter bar and the table (§3)", () => {
       tr.textContent?.includes("B-2"),
     );
     fireEvent.click(row!);
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("B-2");
+  });
+
+  it("still opens the row when its empty PR cell is clicked", async () => {
+    const onOpen = await mountFourJobs();
+    const row = [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.textContent?.includes("B-2"),
+    )!;
+    const prCell = within(row as HTMLElement).getAllByRole("cell")[4];
+    expect(prCell.textContent).toBe("—");
+    fireEvent.click(prCell);
     expect(onOpen).toHaveBeenCalledExactlyOnceWith("B-2");
   });
 
@@ -1002,6 +1033,106 @@ describe("the row trace-sparkline (§6)", () => {
         expect(themeCss).not.toMatch(new RegExp(`\\.rh-console \\.${cls}\\b`));
       }
     }
+  });
+});
+
+// The ticket's cost, and a running row's activity, in place of the progress bar the ticket bans
+// (STUDIO-926) — driven through the real view rather than only the pure `console-jobs` functions,
+// so a wiring mistake between `buildConsoleJobs` and the row's JSX fails here too.
+describe("the ticket's cost and live activity (STUDIO-926)", () => {
+  function row(issue: string): HTMLElement {
+    return [...document.querySelectorAll(".jtbl tbody tr")].find((tr) =>
+      tr.textContent?.includes(issue),
+    ) as HTMLElement;
+  }
+
+  // The row shows the DAEMON's ledger, not a fold over the listing: `/history/issues` keeps one run
+  // per key, so this ticket's earlier rounds are absent from `issues` and only present in `costs`.
+  it("shows the whole-store cost the ledger reports on the ticket's row", async () => {
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
+    h.fetchIssueRuns.mockResolvedValue({
+      issues: [
+        run({ id: 20, issue_identifier: "A-1", outcome: "completed", total_tokens: 100, provider: "anthropic" }),
+        run({
+          id: 21,
+          issue_identifier: "pr:acme/x#1@alice",
+          outcome: "completed",
+          review_run: true,
+          review_of: "A-1",
+          total_tokens: 200,
+          provider: "anthropic",
+        }),
+      ],
+      next_offset: null,
+    });
+    h.fetchHistoryCosts.mockResolvedValue({
+      costs: [
+        { ticket: "A-1", provider: "anthropic", total_tokens: 900, usage_estimated: false },
+      ],
+    });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    mount();
+    await waitFor(() => expect(row("A-1")).toBeTruthy());
+    await waitFor(() =>
+      expect(row("A-1").querySelector(".cost")?.textContent).toBe("900 anthropic"),
+    );
+  });
+
+  it("shows a running row's current step and elapsed time, with no dwell and no step count", async () => {
+    h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-LIVE-2",
+          issue_identifier: "LIVE-2",
+          title: "LIVE-2 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 30,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+    h.fetchRunTranscript.mockResolvedValue({
+      run_id: 30,
+      entries: [
+        { seq: 1, kind: "tool_use", tool: "Read", text: "file_path=/repo/src/lib/api.ts" },
+        { seq: 2, kind: "tool_result", tool: "", text: "export interface RunSummary" },
+      ],
+      generated_at: "2026-09-01T12:00:00Z",
+    });
+    mount();
+    await waitFor(() => expect(row("LIVE-2")).toBeTruthy());
+    // No dwell needed — a live row's activity reads immediately, unlike the sparkline preview.
+    await waitFor(() => expect(h.fetchRunTranscript).toHaveBeenCalledExactlyOnceWith(30));
+    await waitFor(() =>
+      expect(row("LIVE-2").querySelector(".activity")?.textContent).toContain("Oriented"),
+    );
+    // The ticket's whole reason for existing: never an invented "n/m" denominator.
+    expect(row("LIVE-2").querySelector(".activity")?.textContent).not.toMatch(/\d+\s*\/\s*\d+/);
   });
 });
 
@@ -1595,5 +1726,371 @@ describe("a review row says which ticket it is reviewing", () => {
 
     fireEvent.click(document.querySelector(".jtbl tbody tr")!);
     expect(onOpen).toHaveBeenCalledExactlyOnceWith("pr:makewhatis/tally#230@jimmy");
+  });
+});
+
+// STUDIO-925 — the Jobs home's second view: a card is a ticket, a column is its tracker state. The
+// regroup itself is pinned in `lib/console-board.test.ts`; these are the boxes on the real view.
+describe("the board view (STUDIO-925)", () => {
+  /** A ticket with a live run plus the TWO review rows that used to read as two more jobs. */
+  function boardStore(more = false) {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-STUDIO-924",
+          issue_identifier: "STUDIO-924",
+          title: "STUDIO-924 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 901,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    const rows = [
+      run({
+        id: 901,
+        issue_identifier: "STUDIO-924",
+        outcome: "running",
+        lifecycle: "open",
+        tracker_state: "In Progress",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#539@jimmy",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#540@alice",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+      run({
+        issue_identifier: "STUDIO-925",
+        outcome: "completed",
+        lifecycle: "in_review",
+        tracker_state: "In Review",
+      }),
+    ];
+    h.fetchIssueRuns.mockResolvedValue({ issues: rows, next_offset: more ? rows.length : null });
+    h.fetchIssueCounts.mockImplementation(async () => tallyOf(rows, await h.fetchState()));
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+  }
+
+  // The View Seg moved into the display-options popover (STUDIO-932): open the trigger, then pick
+  // Board. The popover is a dialog, so the two clicks are what an operator does.
+  const openDisplayOptions = () => screen.getByRole("button", { name: "Display options" });
+  const switchToBoard = () => {
+    fireEvent.click(openDisplayOptions());
+    fireEvent.click(screen.getByRole("button", { name: "Board" }));
+  };
+
+  it("folds a ticket's review rows onto its one card, chip each", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4)); // the table still shows every row
+    switchToBoard();
+
+    await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(2));
+    const ticket = [...document.querySelectorAll(".bcard")].find((el) =>
+      el.textContent?.includes("STUDIO-924"),
+    )!;
+    expect(ticket.querySelectorAll(".rchip")).toHaveLength(2);
+    expect(
+      [...ticket.querySelectorAll(".rchip .o")].map((el) => el.textContent),
+    ).toEqual(["done", "done"]);
+  });
+
+  it("always shows the four run-status lanes, whatever cards exist", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+    switchToBoard();
+
+    await waitFor(() =>
+      expect(
+        [...document.querySelectorAll(".bcolhd .bname")].map((el) => el.textContent),
+      ).toEqual(["Queued", "Running", "In Review", "Done"]),
+    );
+  });
+
+  it("links the PR column that used to render a dash", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+    const hrefs = [...document.querySelectorAll(".jtbl a")].map((el) =>
+      (el as HTMLAnchorElement).getAttribute("href"),
+    );
+    expect(hrefs.sort()).toEqual([
+      "https://github.com/makewhatis/booch/pull/539",
+      "https://github.com/makewhatis/booch/pull/540",
+    ]);
+  });
+
+  it("carries the table's truncation sentence and Load more onto the board", async () => {
+    boardStore(true);
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(4));
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(4));
+    expect(document.querySelector(".bfoot .bnote")?.textContent).toContain("Older jobs");
+    expect(screen.getByRole("button", { name: /load more/i })).toBeTruthy();
+  });
+
+  // STUDIO-931, end to end: the board must not bucket a 50-row recency page. Sixty done tickets
+  // dominate recency, so STUDIO-877 — open, Backlog, last run stopped, exactly the shape of the
+  // ticket that filed this — sits at row 61 and cannot be on the page. A page-only board reads its
+  // lane as `0`; the active fetch (filtered to each issue's LATEST run outcome) puts the card in
+  // Queued where it belongs.
+  //
+  // STUDIO-880 is the regression the reviewer demanded: a FINISHED ticket whose OLD run was stopped
+  // and whose newer run completed, both well outside the page. `?outcome=stopped` would hand back
+  // that stale stopped row and card it in Done; `?latest_outcome=stopped` must not.
+  it("cards a stuck non-terminal ticket but not a finished ticket's stale run", async () => {
+    const done = Array.from({ length: 60 }, (_, i) =>
+      run({
+        issue_identifier: `DONE-${i}`,
+        outcome: "completed",
+        lifecycle: "done",
+        tracker_state: "Done",
+      }),
+    );
+    const stuck = run({
+      issue_identifier: "STUDIO-877",
+      outcome: "stopped",
+      lifecycle: "open",
+      tracker_state: "Backlog",
+      started_at: "2026-08-15T10:00:00Z",
+    });
+    // A finished ticket: an OLD stopped run, a NEWER completed run. Newest-first order puts the
+    // completed run ahead of the stopped one, and both behind the sixty DONE rows.
+    const staleStopped = run({
+      issue_identifier: "STUDIO-880",
+      outcome: "stopped",
+      lifecycle: "done",
+      tracker_state: "Done",
+      started_at: "2026-07-01T10:00:00Z",
+    });
+    const staleCompleted = run({
+      issue_identifier: "STUDIO-880",
+      outcome: "completed",
+      lifecycle: "done",
+      tracker_state: "Done",
+      started_at: "2026-07-02T10:00:00Z",
+    });
+    const store = [...done, stuck, staleCompleted, staleStopped];
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    // Emulate the STORE's two filters, which differ on whether they run before the per-issue
+    // partition. A mock that ignored either would pass whether or not the fix was there.
+    h.fetchIssueRuns.mockImplementation(async (f: HistoryFilter = {}) => {
+      // `outcome` narrows the runs first — so it may return several rows for one issue, an old one
+      // among them; the listing then keeps each issue's newest MATCHING row.
+      const narrowed = f.outcome ? store.filter((r) => r.outcome === f.outcome) : store;
+      const byIssue = new Map<string, IssueRun[]>();
+      for (const r of narrowed) {
+        const list = byIssue.get(r.issue_identifier) ?? [];
+        list.push(r);
+        byIssue.set(r.issue_identifier, list);
+      }
+      const newest = (rows: IssueRun[]) =>
+        rows.reduce((a, b) =>
+          b.started_at > a.started_at || (b.started_at === a.started_at && b.id > a.id) ? b : a,
+        );
+      let rows = [...byIssue.values()].map(newest);
+      // `latest_outcome` narrows AFTER the partition: only issues whose NEWEST run has it.
+      if (f.latestOutcome) rows = rows.filter((r) => r.outcome === f.latestOutcome);
+      rows = [...rows].sort((a, b) => (a.started_at < b.started_at ? 1 : -1));
+      const limit = f.limit ?? JOBS_PAGE_SIZE;
+      const page = rows.slice(0, limit);
+      return { issues: page, next_offset: page.length === limit ? limit : null };
+    });
+    h.fetchIssueCounts.mockImplementation(async () => tallyOf(store, await h.fetchState()));
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+
+    mount();
+    // The page holds the newest 50 and neither of the interesting tickets is one of them.
+    await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
+    expect(rowKeys()).not.toContain("STUDIO-877");
+    expect(rowKeys()).not.toContain("STUDIO-880");
+
+    switchToBoard();
+    // The header's tally — the source the board now reports — already knows the ticket is queued,
+    // and the active fetch then puts its CARD in the lane rather than merely counting it.
+    await waitFor(() =>
+      expect(document.querySelector('[data-lane="queued"] .bcount')?.textContent).toBe("1"),
+    );
+    await waitFor(() =>
+      expect(document.querySelector('[data-lane="queued"] .bkey')?.textContent).toBe("STUDIO-877"),
+    );
+    // STUDIO-880's stale stopped run must NOT be resurrected into Done by the active feed.
+    expect(document.querySelector('[data-lane="done"]')?.textContent).not.toContain("STUDIO-880");
+    expect(document.querySelector('[data-lane="queued"]')?.textContent).not.toContain("STUDIO-880");
+  });
+});
+
+// STUDIO-932 — the display options leave the filter row for a popover behind a header icon, and the
+// status filter stops being offered on the board. Driven through the real view: the persistence and
+// the aria state have their own unit tests (`useBoardCardFields.test.ts`) and component tests
+// (`DisplayOptions.test.tsx`); these are the wiring boxes the ticket names.
+describe("the display options popover (STUDIO-932)", () => {
+  function boardStore() {
+    h.fetchState.mockResolvedValue({
+      ...EMPTY_STATE,
+      running: [
+        {
+          issue_id: "id-STUDIO-924",
+          issue_identifier: "STUDIO-924",
+          title: "STUDIO-924 title",
+          state: "In Progress",
+          project: "rhapsody",
+          repo: "",
+          run_id: 901,
+          turn_count: 1,
+          last_codex_event: "",
+          started_at: "2026-09-01T11:00:00Z",
+          last_event_at: "2026-09-01T11:00:00Z",
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        },
+      ],
+    });
+    const rows = [
+      run({
+        id: 901,
+        issue_identifier: "STUDIO-924",
+        outcome: "running",
+        lifecycle: "open",
+        tracker_state: "In Progress",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#539@jimmy",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+      run({
+        issue_identifier: "pr:makewhatis/booch#540@alice",
+        outcome: "completed",
+        review_run: true,
+        review_of: "STUDIO-924",
+      }),
+    ];
+    h.fetchIssueRuns.mockResolvedValue({ issues: rows, next_offset: null });
+    h.fetchIssueCounts.mockImplementation(async () => tallyOf(rows, await h.fetchState()));
+    h.fetchTeamsOverview.mockResolvedValue({
+      enabled: true,
+      manager_mode: "labels",
+      default_identity: "",
+      backend: "local",
+      roster: [],
+    });
+  }
+
+  const displayTrigger = () => screen.getByRole("button", { name: "Display options" });
+  const switchToBoard = () => {
+    fireEvent.click(displayTrigger());
+    fireEvent.click(screen.getByRole("button", { name: "Board" }));
+  };
+  const statusFilter = () => screen.queryByRole("button", { name: "In review" });
+
+  it("renders no status filter in Board mode, and keeps it in List mode", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    expect(statusFilter()).not.toBeNull();
+
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(4));
+    expect(statusFilter()).toBeNull();
+    // The project Select stays in both (STUDIO-932).
+    expect(screen.getByLabelText("Filter by project")).toBeTruthy();
+
+    // The popover is still open, so List is one click away — and the filter comes back with it.
+    fireEvent.click(screen.getByRole("button", { name: "List" }));
+    await waitFor(() => expect(statusFilter()).not.toBeNull());
+  });
+
+  it("shows the lane-width row only in Board mode", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+
+    fireEvent.click(displayTrigger());
+    expect(screen.queryByText("Lane width")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Board" }));
+    expect(screen.getByText("Lane width")).toBeTruthy();
+  });
+
+  // The ticket's acceptance on the chips: aria-pressed is the same fact a screen reader reads, and
+  // the element really goes. The persistence round-trip (including the throwing-storage path) is
+  // pinned in `useBoardCardFields.test.ts` — this jsdom build has no `localStorage` at all, which is
+  // the environment the storage guards exist for.
+  it("hides a card element with a chip, and reports it through aria-pressed", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(1));
+    expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(2);
+
+    const reviews = screen.getByRole("button", { name: "Reviews" });
+    expect(reviews.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(reviews);
+    await waitFor(() => expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(0));
+    expect(screen.getByRole("button", { name: "Reviews" }).getAttribute("aria-pressed")).toBe("false");
+    // The card keeps the elements that are its identity.
+    expect(document.querySelector(".bcard .bkey")?.textContent).toBe("STUDIO-924");
+    expect(document.querySelector(".bcard .pill")).not.toBeNull();
+  });
+
+  it("draws the non-default dot only once a display option differs", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    expect(document.querySelector(".dpdot")).toBeNull();
+
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcol")).toHaveLength(4));
+    expect(document.querySelector(".dpdot")).not.toBeNull();
+  });
+
+  it("Reset returns every display option to its default", async () => {
+    boardStore();
+    mount();
+    await waitFor(() => expect(rowKeys()).toHaveLength(3));
+    switchToBoard();
+    await waitFor(() => expect(document.querySelectorAll(".bcard")).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reviews" }));
+    await waitFor(() => expect(document.querySelectorAll(".bcard .rchip")).toHaveLength(0));
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    // The view returns to the table, the dot clears, and the chips all read as on again.
+    await waitFor(() => expect(statusFilter()).not.toBeNull());
+    expect(document.querySelector(".dpdot")).toBeNull();
+    expect(screen.getByRole("button", { name: "Reviews" }).getAttribute("aria-pressed")).toBe("true");
   });
 });

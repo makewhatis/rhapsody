@@ -204,6 +204,10 @@ pub(crate) fn empty_effective(tracker: Arc<dyn Tracker>) -> Effective {
         tracker,
         workspace,
         agent: Arc::new(agent::fake::Fake::new()),
+        // The test-injected effective drives the legacy single-tracker path with a `Fake` backend;
+        // no test dispatches by harness, so an empty pool is the honest value — `spawn_worker`
+        // leaves `deps.agent` alone whenever the routed profile names no harness (STUDIO-902).
+        agents: std::collections::BTreeMap::new(),
         prompt_tmpl: String::new(),
         active_states: HashSet::new(),
         terminal_states: HashSet::new(),
@@ -276,6 +280,10 @@ pub(crate) fn empty_resolved_project(slug: &str, tracker: Arc<dyn Tracker>) -> R
         gh_owner: String::new(),
         gh_repo: String::new(),
         agent: Arc::new(agent::fake::Fake::new()),
+        // The test-injected effective drives the legacy single-tracker path with a `Fake` backend;
+        // no test dispatches by harness, so an empty pool is the honest value — `spawn_worker`
+        // leaves `deps.agent` alone whenever the routed profile names no harness (STUDIO-902).
+        agents: std::collections::BTreeMap::new(),
         workspace,
     }
 }
@@ -296,6 +304,9 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         project_repo: String::new(),
         model: String::new(),
         model_override: rhapsody_agent::ModelOverride::default(),
+        harness: String::new(),
+        harness_origin: String::new(),
+        model_origin: String::new(),
         stack_context: String::new(),
         capabilities_section: String::new(),
         identity: String::new(),

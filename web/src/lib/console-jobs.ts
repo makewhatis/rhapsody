@@ -29,6 +29,7 @@ import type {
   IssueStatusBucket,
   RunSummary,
   TeamsOverview,
+  TicketCostRow,
 } from "@/lib/api";
 import type { JobRow } from "@/lib/runs-model";
 // The run detail's own vocabulary, imported rather than restated: `statusNote` exists to make the
@@ -36,6 +37,10 @@ import type { JobRow } from "@/lib/runs-model";
 // disagreement it is fixing. `console-job-detail` imports only TYPES back from here, so this is not
 // a runtime cycle.
 import { runOutcomeLabel } from "@/lib/console-job-detail";
+// `console-board` imports ONLY types back from here (`import type`), so this is not a runtime cycle
+// — the same arrangement `console-job-detail` uses above.
+import { parsePullRequest, pullRequestLabel } from "@/lib/console-board";
+import { formatDuration } from "@/lib/format";
 
 /**
  * The states the console's Pill paints (§1.3), plus `reviewing` (STUDIO-780).
@@ -283,12 +288,52 @@ export interface ConsoleJobRow {
   projectSlug: string;
   status: ConsoleJobStatus;
   statusLabel: string;
+  /**
+   * This row's own RUN status, before any ticket-lifecycle mapping — `JobRow.status` verbatim.
+   *
+   * `status`/`statusLabel` are the TICKET's when the daemon resolved a lifecycle, so they cannot
+   * answer "how did this run end" — a failed review run maps to `blocked`, and the board's reviewer
+   * chip would then read "blocked" where it promises the run's own outcome (STUDIO-925). Carried
+   * raw so [`runOutcomeLabel`] is applied at the one surface that prints a run's word.
+   */
+  runOutcome: string;
   /** The tracker's own workflow-state name behind `status`, or "" when the daemon had no answer. */
   trackerState: string;
   /** Teammate name, or "" when solo/unassigned (the table renders "—"). */
   assignee: string;
-  /** PR reference, or "" when none is known. */
+  /**
+   * True when this row's own RUN is a review run (STUDIO-826), carried through from the listing so
+   * the board can fold it onto the ticket it reviews instead of rendering it as its own card
+   * (STUDIO-925). The row's `reviewOf` is where it attaches.
+   */
+  reviewRun: boolean;
+  /**
+   * PR reference, or "" when none is known. Parsed from a review row's `pr:owner/repo#n@reviewer`
+   * issue key (STUDIO-925) — the number has always been in the identifier while this column
+   * rendered "—". The display form is the prototype's `#n`.
+   */
   pr: string;
+  /** The PR's URL, or "" when none — what makes the chip a link rather than a label. */
+  prUrl: string;
+  /**
+   * The provider this row's run actually billed (STUDIO-909), or "" when the run recorded none
+   * (a legacy row) — the compact scanning badge, never a per-row drill-down.
+   */
+  provider: string;
+  /**
+   * The ticket's token cost split by provider (STUDIO-926) — the implementation run plus every
+   * review of it, summed. `[]` when the daemon has no run to cost yet (a queued ticket with no
+   * history row). See [`ticketCostsByIssue`].
+   */
+  costs: TicketCost[];
+  /**
+   * How long the ticket's live run has been going, formatted ("6m"; seconds only under a minute), or "" when [`live`] is
+   * false. This plus the current transcript step is the honest "is it moving?" signal the design
+   * record's progress-bar ban asks for in its place (STUDIO-926) — a card that has shown the same
+   * step for a long while is the real stall tell, and neither half needs a denominator the daemon
+   * does not have.
+   */
+  elapsed: string;
   /**
    * For a review row, the TICKET it is reviewing (STUDIO-834) — what the table leads with in place
    * of the `pr:owner/repo#n@reviewer` key, which names no work. "" for every other row, and for a
@@ -457,6 +502,77 @@ export function durableAssignees(rows: readonly IssueRun[]): Map<string, string>
 }
 
 /**
+ * Ticket key → the provider its newest run actually billed, from the issue-level listing's own
+ * `provider` field (STUDIO-909). The compact badge the worklist scans by: "which of these four runs
+ * is on Fireworks" is a scanning question. A row with no recorded provider is SKIPPED rather than
+ * mapped to "", so an absent key is what leaves the badge off a legacy row — exactly the omission
+ * the daemon's field uses to mean "unknown".
+ */
+export function providerByIssue(rows: readonly IssueRun[]): Map<string, string> {
+  const byIssue = new Map<string, string>();
+  for (const r of rows) {
+    if (r.issue_identifier === "" || !r.provider || byIssue.has(r.issue_identifier)) continue;
+    byIssue.set(r.issue_identifier, r.provider);
+  }
+  return byIssue;
+}
+
+/**
+ * One provider's token total on a ticket's card (STUDIO-926). `provider` is "" for tokens whose
+ * run recorded none (a legacy row) — folded in rather than dropped, because a cost cannot be
+ * skipped the way the single-row badge above can. `estimated` is true when ANY run folded into
+ * this bucket ended without a clean `result` event: a sum with one floored input is itself a
+ * floor, never an authoritative total.
+ */
+export interface TicketCost {
+  provider: string;
+  totalTokens: number;
+  estimated: boolean;
+}
+
+/**
+ * Elapsed time for a live row's activity line. Whole minutes once past one, because the clock that
+ * drives this ticks every 30s: a seconds figure would sit frozen on screen and then jump, claiming
+ * a precision it does not have.
+ */
+function liveElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return formatDuration(s < 60 ? s : Math.floor(s / 60) * 60).replace(/ 0s$/, "");
+}
+
+/**
+ * Ticket key → its token cost, split by provider, from the daemon's whole-store ledger
+ * (`GET /api/v1/history/costs`, STUDIO-926).
+ *
+ * This is the number the ticket's card exists to answer: "one ticket's two reviews cost 9.4M
+ * tokens" is EVERY implementation run plus every review round, not the newest of each. The ledger
+ * arrives already summed per (ticket, provider) with review runs credited to the ticket they
+ * reviewed, so this only groups and orders — it deliberately does NOT sum `/history/issues` rows,
+ * which keep one run per key and would drop every earlier round (and show a running ticket as 0).
+ *
+ * Split BY PROVIDER rather than blended, because that is the one thing this figure must not do:
+ * a ticket whose implementation ran on Fireworks and whose review ran on Anthropic spent two
+ * different currencies, and a single blended number would hide exactly the split the ticket exists
+ * to show. Buckets are ordered largest first (ties broken by provider name) so the biggest cost is
+ * always what a reader sees first. A ticket that has spent nothing has no entry, so a queued row
+ * carries no cost line at all rather than "0".
+ */
+export function ticketCostsByIssue(rows: readonly TicketCostRow[]): Map<string, TicketCost[]> {
+  const out = new Map<string, TicketCost[]>();
+  for (const r of rows) {
+    if (!r.ticket || r.total_tokens <= 0) continue;
+    const bucket = { provider: r.provider ?? "", totalTokens: r.total_tokens, estimated: r.usage_estimated };
+    const list = out.get(r.ticket);
+    if (list) list.push(bucket);
+    else out.set(r.ticket, [bucket]);
+  }
+  for (const list of out.values()) {
+    list.sort((a, b) => b.totalTokens - a.totalTokens || a.provider.localeCompare(b.provider));
+  }
+  return out;
+}
+
+/**
  * Newest activity per ticket, from the issue-level history rows: a run's end when it has one,
  * else its start. `mergeJobs` surfaces only the start, and the column says "Updated".
  */
@@ -514,6 +630,7 @@ export function buildConsoleJobs(
   issueRows: readonly IssueRun[],
   overview: TeamsOverview | undefined,
   nowMs: number,
+  costRows: readonly TicketCostRow[] = [],
 ): ConsoleJobRow[] {
   const durable = durableAssignees(issueRows);
   const live = ticketAssignees(overview);
@@ -522,6 +639,8 @@ export function buildConsoleJobs(
   const reviewTickets = reviewTicketIssues(issueRows);
   const reviewRuns = reviewRunIssues(issueRows);
   const reviewOf = reviewOfTickets(issueRows);
+  const providers = providerByIssue(issueRows);
+  const costs = ticketCostsByIssue(costRows);
 
   const out = jobs.map((job): ConsoleJobRow => {
     const ticket = lifecycles.get(job.issue);
@@ -529,6 +648,9 @@ export function buildConsoleJobs(
     const reviewRun = reviewRuns.has(job.issue);
     const status = consoleJobStatus(job.status, ticket?.lifecycle, reviewTicket, reviewRun);
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
+    // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row
+    // has one; a plain ticket key never matches the parser.
+    const pr = parsePullRequest(job.issue);
     return {
       key: job.key,
       issue: job.issue,
@@ -539,12 +661,20 @@ export function buildConsoleJobs(
       projectSlug: job.project,
       status,
       statusLabel: CONSOLE_STATUS_LABELS[status],
+      runOutcome: job.status,
       trackerState: ticket?.trackerState ?? "",
       // The durable record first: it is the only one that survives the run. The live roster is the
       // fallback for the gap at the other end — a run dispatched moments ago, whose history row the
       // daemon has not yet decorated.
       assignee: durable.get(job.issue) ?? live.get(job.issue) ?? "",
-      pr: "",
+      reviewRun,
+      pr: pr === undefined ? "" : pullRequestLabel(pr),
+      prUrl: pr?.url ?? "",
+      provider: providers.get(job.issue) ?? "",
+      costs: costs.get(job.issue) ?? [],
+      // `updatedAtMs` IS this run's start while it is live (no `ended_at` has landed yet to
+      // outrank it), so it doubles as the elapsed clock's zero without a second lookup.
+      elapsed: job.live ? liveElapsed(nowMs - updatedAtMs) : "",
       reviewOf: reviewOf.get(job.issue) ?? "",
       updated: relativeSince(updatedAtMs, nowMs),
       updatedAtMs,
@@ -581,9 +711,18 @@ export function buildConsoleJobs(
  * actively reviewing is the opposite of parked.
  */
 export function matchConsoleFilter(row: ConsoleJobRow, filter: ConsoleJobFilterId): boolean {
+  return consoleStatusMatches(row.status, filter);
+}
+
+/**
+ * The same rule over a bare STATUS rather than a row (STUDIO-925): the board's cards are not
+ * `ConsoleJobRow`s, but the status Seg above them must still filter them, and a second copy of this
+ * predicate is exactly how the Seg and the thing it filters drift apart.
+ */
+export function consoleStatusMatches(status: ConsoleJobStatus, filter: ConsoleJobFilterId): boolean {
   if (filter === "all") return true;
-  if (filter === "run") return isLive(row.status);
-  return row.status === filter;
+  if (filter === "run") return isLive(status);
+  return status === filter;
 }
 
 /** Whether a status means an agent is working the ticket right now — `run` or `reviewing`. */

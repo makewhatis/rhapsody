@@ -245,6 +245,7 @@ and the `api/history.json` golden is untouched:
 | --- | --- |
 | `GET /api/v1/history/issues` | one row per issue (its latest matching run), paged by **issue** |
 | `GET /api/v1/history/summary?since=` | whole-store run/token/runtime totals for a window |
+| `GET /api/v1/history/costs` | every ticket's tokens over the whole store, by provider (STUDIO-926) |
 
 Both exist because the dashboard's two headline surfaces cannot be derived correctly from a
 run-paged fetch at any page size. An issue-grouped Jobs list built by grouping runs lets one ticket
@@ -298,6 +299,26 @@ midnight as `since` (the dashboard does), and omitting it falls back to the daem
 midnight. This preserves the local-day semantics the client-side fold had; a UTC boundary would
 silently shift every figure for anyone off UTC. `total_tokens` keeps its cache-inclusive billed
 meaning, so the header's `cached = total − in − out` reconciliation still adds up.
+
+### A latest-run outcome filter on the issue listing — `/history/issues?latest_outcome=` (STUDIO-931)
+
+`GET /api/v1/history/issues` keeps one row per issue — its **newest run matching the filters**. The
+`outcome` filter runs in the inner `WHERE`, *before* the per-issue `ROW_NUMBER()`, so it means "each
+issue's newest run **with that outcome**", which is frequently an old run of a ticket that has since
+finished. Measured on the operator's daemon, `?outcome=stopped` returned 7 issues of which 6 were
+done or canceled, each showing its stale stopped run.
+
+`latest_outcome` is an **additive** parameter that filters *after* the partition — `WHERE rn = 1 AND
+outcome = ?` — so it means "the issues whose newest run has this outcome right now". `outcome` is
+unchanged (the golden and every existing caller are untouched); the two are alternatives, and a
+caller that sets both narrows the partition with `outcome` and then selects among it with
+`latest_outcome`. `/history` pages RUNS, where "the issue's newest run" is not a concept, so it
+parses the parameter but ignores it. Rhapsody-only: Go has neither the issue listing nor this filter.
+
+The console's board uses it for its non-terminal lanes: fetching `latest_outcome=running|continued|
+stopped|failed|interrupted` unbounded returns the genuinely-active pipeline, rather than every ticket
+that ever passed through those outcomes, so a lane's cards can no longer be stale runs of finished
+tickets and `BOARD_ACTIVE_LIMIT` is bounded by the pipeline rather than by history.
 
 ### A whole-store per-status tally — `GET /api/v1/history/issues/counts` (STUDIO-828)
 
@@ -393,7 +414,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | --- | --- |
 | `WORKFLOW.md` front matter | no new field — Teams is not a `WORKFLOW.md` key at all |
 | `GET /api/v1/config`, `/projects`, `/state` | no new key; every committed golden untouched |
-| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active |
+| `rhapsody.db` | no column, no new row *kind*; the one Teams-only table (`rhapsody_review_watch`, below) is created by the migration but stays **empty** — nothing writes to it unless the Teams-gated review path is active. (`rhapsody_summon_watermark`, also below, is NOT Teams-gated: it is written for any ticket the daemon observes a summons on.) |
 | Turn-1 prompt | byte-identical (the empty-guard BO-12 proved for `capabilities_section`) |
 | Dispatch | `route()` is not called and nothing is ever held; the same issues dispatch in the same order |
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
@@ -664,7 +685,7 @@ needs a durable home, and the Go v0.4.0 reference — which has no review featur
 
 | Store schema | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
-| `PRAGMA user_version` | 6 | **8** |
+| `PRAGMA user_version` | 6 | **8** at this step — **9** today, see STUDIO-885 below |
 | tables | `runs`, `events`, `retry_queue`, `claims`, `totals`, `run_messages` | the same 6, byte-identical, **plus** `rhapsody_review_watch` |
 
 One row per (PR, reviewer): repository owner/name, PR **number**, the reviewing teammate, the pull
@@ -694,16 +715,113 @@ The exclusion is a name rule, not a loosened assertion. A Go-created object can 
 `rhapsody_*`, so all six ported tables stay gated byte-strictly, and a **new un-prefixed table still
 turns the golden red** — which is the correct outcome for anything that is a port of Go behaviour.
 `divergent_objects_are_gated_by_name_only` asserts exactly that: every live schema object is either
-byte-present in the committed golden or carries the prefix, and the divergent set is pinned to this
-one name. The mechanism is documented again at the top of `crates/store/src/sqlite.rs`.
+byte-present in the committed golden or carries the prefix, and the divergent set is pinned by name —
+to this one name at this step, and to both names since STUDIO-885 below. The mechanism is documented
+again at the top of `crates/store/src/sqlite.rs`.
 
 **Off is still off.** The table is created by the migration on every daemon, including one that has
 never enabled Teams, and on a Go-written database opened by Rhapsody. It is inert: the whole review
 subsystem is gated on `teams.enabled` (design §16), nothing outside that path writes a row, and an
 empty table changes no query, no endpoint and no payload. A database that Rhapsody has opened is no
 longer readable by the Go daemon at ITS schema version — but the Go daemon's `migrate` loop only ever
-runs steps at or above its own `user_version`, so a v8 database is left alone rather than corrupted,
-and running both daemons against one file was never supported in either direction.
+runs steps at or above its own `user_version`, so a database ahead of it (v8 at this step, v10 today)
+is left alone rather than corrupted, and running both daemons against one file was never supported in
+either direction.
+
+### A second schema table with no Go counterpart — `rhapsody_summon_watermark` (STUDIO-885)
+
+A summons is a durable fact: an `@symphony` comment that still exists on the pull request. The Go
+daemon nevertheless only ever SEES it as a transient one. Its GitHub enrichment asks the source for
+comments newer than `now - ghLookback` — five minutes — so `Issue.latestSummonAt` is re-derived from
+scratch on every poll and reverts to unset the moment the comment ages out of that window.
+
+`prSuppressed` meanwhile treats a ticket with a linked pull request as suppressed unless a summons
+is newer than the ticket's last run start. The two together give a summons a five-minute half-life:
+if no concurrency slot happens to free inside that window, the ticket returns to suppressed and
+stays there for as long as the daemon runs. On the reported incident an entirely ordinary busy
+period (four running agents against `max_concurrent_agents: 4`) was enough, and the ticket was
+silently unreachable for twelve hours with the comment still sitting on the pull request.
+
+| Store schema | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **10** (9 at this step; see STUDIO-909 below) |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch` and `rhapsody_summon_watermark` |
+
+One row per ticket identifier: the newest summons ever OBSERVED for it and that same comment's body.
+The candidate-fetch seam of both dispatch ladders reconciles each candidate against it — the newer of
+the two wins — so the comparison `pr_suppressed` actually makes is between two durable facts and
+keeps its meaning however long the ticket waits for a slot.
+
+**It does not weaken the suppression, which is the point.** A ticket does not become permanently
+dispatchable because it was summoned once: the watermark lifts the suppression only while it is
+newer than the last run start, and dispatching the ticket advances that start past it. A merged pull
+request with an old summons stays suppressed exactly as before. Widening `ghLookback` instead was
+rejected as the cheaper change that closes nothing — it converts "stranded after five minutes of
+contention" into "stranded after N minutes of contention".
+
+The gate is the same name rule step 7 established (`schema_dump` excludes objects by the literal
+`rhapsody_` prefix and nothing else), and `divergent_objects_are_gated_by_name_only` now pins both
+names. The table is pruned on the same retention cutoff as the runs it is compared against, so a
+watermark never outlives the history it is measured against. **Off is still off:** with
+`storage.path: off` there is nowhere to remember an observation, so the daemon keeps the pre-885
+behaviour of seeing only what the lookback window covers right now.
+
+### A run records what actually ran it — `rhapsody_run_provenance` (STUDIO-909)
+
+The `runs` row recorded how many tokens a run spent and **nothing about what spent them**. On an
+installation now running two harnesses and two providers at once, that made two questions
+unanswerable from the product: *which provider/model did this failed run use* (the failure that
+motivated the ticket was a `review.model.opencode` override nothing named, and attributing it cost
+the daemon log plus `rhapsodyd teams show`), and *what did Fireworks save us this week* — a token
+cannot be attributed to a provider it was never recorded against.
+
+| Runs provenance | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `PRAGMA user_version` | 6 | **10** |
+| tables | the 6 ported ones | the same 6, byte-identical, **plus** `rhapsody_review_watch`, `rhapsody_summon_watermark` and `rhapsody_run_provenance` |
+| per-run harness/model/provider | — | recorded once at dispatch, on `rhapsody_run_provenance` |
+| `GET /api/v1/runs/{id}/provenance` | — | harness, model, provider and each value's origin |
+
+**The design record's §6.2 asks for `harness`/`model`/`provider` columns on `runs`; this takes the
+table route instead, and that is a deliberate, forced divergence.** `harness/fixtures/schema.sql` is
+recapturable ONLY from the real Go daemon, and that daemon can never emit columns it does not know
+about — so adding them to `runs` would turn `schema_matches_committed_golden` permanently red with no
+honest fix (hand-editing the golden is the drift laundering the parity discipline exists to prevent,
+and widening `divergent_objects_are_gated_by_name_only` to excuse a Go table would weaken the gate
+for every future change). The documented Rhapsody-only mechanism — a `rhapsody_`-prefixed table the
+golden excludes by name — records the same facts without touching `runs`, and a run with no such row
+is exactly the honest "unknown" the ticket asks for. `session_uuid`, the fourth field §6.2 names,
+already exists on `runs` in Go's own schema.
+
+**Recorded, never re-derived.** The values are read once from the config the run was actually
+dispatched with and persisted, so a later `WORKFLOW.md` hot-reload cannot rewrite what a finished run
+says it ran on. A run started before this change has no provenance row and renders as `unknown`
+rather than an inference from whatever config is live now. The **origin** of each configurable value
+rides beside it (`profile`, `review.model.opencode`, `agent.backend`, `claude.model`) because an
+unexplained override is what cost the operator hours, not an unknown model — the job detail header
+renders each value with it. `provider` is DERIVED once, at the same dispatch, from the recorded
+harness and model string (`fireworks-ai/…` names its own provider; a Claude model with no `/` is
+Anthropic; anything else is unknown), so it can never later disagree with the model it describes.
+
+**The cost question is answerable in one query.** `tokens_by_provider` groups the window's tokens by
+recorded provider, and `GET /api/v1/history/summary` carries that split (`providers`) over the same
+`since` as its `runs`/`total_tokens` figures; both are computed in SQL over the `runs` ⋈ provenance
+join rather than folded over a page. Scoping the split to the window (STUDIO-909 round 1) is what lets
+it be read *beside* the totals it decomposes instead of answering a lifetime question under a "today"
+heading.
+**A ticket's cost is its own endpoint.** `GET /api/v1/history/costs` (STUDIO-926, additive,
+Rhapsody-only) returns `{costs: [{ticket, provider, total_tokens, usage_estimated}]}` summed over
+EVERY run in the store and split by provider, with each review run credited to the ticket it reviewed
+through the same watch-set join as `review_of`. It is not a fold over `/history/issues`, which keeps
+one row per key — its newest run — and so drops every earlier round and shows a running ticket as 0.
+The compact provider also rides each row of the additive `GET /api/v1/history/issues`, so "which of
+these four runs is on Fireworks" is a scan. `/api/v1/runs/{id}` and `/api/v1/history` are byte-pinned
+to the Go capture and grew nothing.
+
+**D5 holds.** With Teams off and one harness, the values record `agent.backend` and `claude.model`
+and every Go-pinned golden is untouched: the new table is prefix-gated, the new endpoint is
+additive, and the new fields appear only on the Rhapsody-only issue listing. `divergent_objects_are_gated_by_name_only`
+now pins the third name.
 
 ### A host boundary in the GitHub URL parsers (STUDIO-721)
 
@@ -985,6 +1103,240 @@ the only one of the eight with a Go counterpart and it keeps `GH_SUMMONS_TIMEOUT
 bound; the other seven are Rhapsody-only seams (console merge, review-comment posting, the quorum's
 and the review watcher's lookups) that Go Symphony does not have at all.
 
+### Drain and restart — an upgrade lets in-flight runs finish (STUDIO-880)
+
+Go v0.4.0 has no drain: restarting the daemon throws away whatever turn is in flight, and the turn is
+re-done from scratch afterwards. That is additive surface — one new route, one conditional key, one
+new operator action — and its whole design is forced by a constraint worth stating, because it is the
+first thing anyone proposes to design around.
+
+**Re-attaching a running agent to a fresh daemon is impossible, not merely unbuilt.** The runner
+spawns the agent with piped stdin/stdout/stderr and the DAEMON owns the read end, so a live turn is
+the daemon reading that stream; when the daemon exits the read end closes and the output has nowhere
+to go. A pipe cannot be handed to a successor process. On top of that `KillTreeOnDrop` deliberately
+kills the agent's whole tree as the daemon's task unwinds (STUDIO-871). So the unit that can survive
+a restart is not the run and not the turn — it is the **turn boundary**.
+
+| Restarting the daemon | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| in-flight turn | killed, re-done from scratch | finishes; the next turn is refused |
+| how a run ends | `interrupted`, via boot recovery | `continued` — claim kept, continuation queued |
+| new dispatch during | n/a | gated at the SAME seam as the BO-59 credential preflight |
+| visibility | none | `/api/v1/state`'s `drain` key, a per-project advisory, a console banner, WARN logs |
+| asking for one | n/a | `POST /api/v1/drain`, a tray action, the in-app updater's "Wait, then update" |
+| ending one | n/a | `POST /api/v1/drain` `{"active": false}`, or the console banner's **Cancel drain** |
+| default | n/a | **inert**: a daemon nobody drains behaves exactly as before |
+
+**The `drain` key on `/api/v1/state` is emitted ONLY while a drain is armed.** That conditional is
+load-bearing rather than tidy. `/api/v1/state` is byte-pinned to the Go daemon's
+`harness/fixtures/api/state.json`, which is why `teams_enabled` lives on `/api/v1/version` instead of
+there. A key that appears only in a state the Go daemon cannot be in leaves every payload it CAN
+produce byte-identical, so the golden still passes unchanged — and a second test asserts the key is
+ABSENT on a non-draining daemon, so the conditional cannot quietly decay into an unconditional one.
+
+**There are THREE dispatch entry points, and each is gated at its own door.** `on_tick` is the
+obvious one; a due retry dispatches straight from `on_retry`, bypassing the tick entirely. Gating
+only the tick let a drain settle the daemon and then immediately re-dispatch every continuation it
+had just wound down. A draining daemon PARKS a due retry instead: the entry keeps its claim, its due
+time and its attempt number, because a drain is not a failure and must not burn a ticket's retry
+budget. The third is the ticketless review sweep (`Event::ReviewSweep` → `dispatch_review`), which
+has no production caller today but reaches dispatch past both of the others; it refuses BEFORE its
+watch-set writes, because a row recorded as in-flight is edge-triggered and that head would never be
+offered again. They are three gates rather than one because each owns bookkeeping a late refusal
+would strand — which is also why the shared `dispatch_issue` underneath them only WARNS when it is
+reached while draining. That warn is the mechanical net: a fourth path added without its own gate
+cannot be silent, and the run it dispatches is self-limiting anyway, since the worker reads the same
+flag and winds down at its first turn boundary.
+
+**What a drained run loses is the agent's conversation thread, and only that.** `--resume` is driven
+by the session's in-memory thread id, seeded from the first turn's stream; a re-dispatch builds a
+fresh session whose thread id starts empty, and nothing reads a stored id back into it.
+`runs.session_uuid` cannot help — `persist_start_run` leaves that column empty; it is reserved, never
+written. Everything durable survives: the worktree, the branch, the commits, the claim and the retry
+row. That is exactly why the turn boundary is the right cut — it is the point at which the agent has
+just finished a unit of work, so the conversation is the cheapest thing on the table.
+
+**An expired drain budget interrupts nothing.** The daemon-side drain owns no budget at all and never
+kills anything; the WAITING belongs to whoever asked (the desktop's `drain_and_restart`), because the
+only thing a timeout could do from inside the daemon is interrupt the work the drain exists to
+protect. When the desktop's wait expires it restarts NOTHING, reports how many runs are still in
+flight, and leaves the drain armed. It never silently falls through to the interrupting restart — an
+expiry that restarted anyway would make the whole feature a slower version of the bug. That makes the
+budget a policy number rather than a correctness one: a drain is bounded below by
+`claude.turn_timeout_ms` (one hour by default), so any shorter budget can legitimately expire, and
+expiry is safe by construction.
+
+**Which is why a drain has to be cancellable from the product, not just over HTTP.** An expired
+budget leaves the daemon armed and taking no work at all, and the thing that asked for the drain —
+a tray click, an updater — is long gone by then. The console banner that announces a drain also ends
+one, over the same HTTP route rather than the desktop bridge, because the console is served both by
+the daemon itself and as the desktop window's content and only the HTTP route exists in both. The
+tray's own drain brings the window forward when it does NOT restart, for the same reason: a daemon
+that is still running still reads "Running" in the tray, so nothing else would tell the operator the
+restart never happened.
+
+**The orphan class this removes.** The supervisor SIGTERMs the daemon's process group and escalates
+to SIGKILL after `stop_grace` (5s). A SIGKILL means `Drop` never runs, which means `KillTreeOnDrop`
+never runs, which means the live agent and its whole tree are orphaned. After a drain there is no
+agent process left to kill, so there is nothing a kill could orphan — asserted on process state, with
+a `setpgid`-ing child in the fixture so the assertion is about a tree rather than a single pid.
+
+### A reconciliation sweep reports a ticket whose state and activity disagree (STUDIO-898)
+
+Go v0.4.0 has no ticketless review, so it has nothing to reconcile. This entry is here for the one
+thing the addition touches that IS parity-pinned: a conditional key on `/api/v1/state`.
+
+Six defects between 2026-09-12 and 2026-09-14 all presented as an idle board — a missing tracker
+attachment, an attachment resolving to the wrong `sourceType`, a five-minute summons window, an
+unsatisfiable `review.reviewers`, an approving review recorded as changes-requested, and a summons
+never applied. Each was fixed on its own terms and the CLASS stayed open: STUDIO-885 shipped and
+STUDIO-893 stalled anyway. The invariant nothing asserted is that **a ticket with an open pull request
+is either progressing or blocked, and the daemon can say which.**
+
+The sweep runs on the control tick, reads only the watch set and the `runs` ledger, and asks ONE
+cause-agnostic question of each watched pull request: each live row names a party who owes the next
+move, so has that party moved since the row started owing it? It **reports and never acts** —
+re-dispatching on a rule nobody has watched fire is how a stall becomes a loop, so acting is left to
+its own reviewed change.
+
+| A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| detection | none (the feature does not exist) | a threshold sweep, 90 min, cause-agnostic |
+| visibility | n/a | `/api/v1/state`'s `review_divergence` key, a per-project advisory, a console banner, WARN logs |
+| what it changes | n/a | **nothing** — it dispatches, arms, merges and moves nothing |
+| default | n/a | **inert**: silent with Teams off, off the ticketless path, and on a healthy board |
+
+**The `review_divergence` key on `/api/v1/state` is emitted ONLY when the sweep has something to
+report**, for the `drain` key's reason above and under the same two guards: the golden still passes
+unchanged, and a second test asserts the key is ABSENT on a healthy daemon so the conditional cannot
+decay into an unconditional `[]`. The advisory on `/api/v1/projects` is a fixed string, so the key
+carries the DETAIL — an operator's next question after "something is stuck" is always "which one".
+
+**The threshold is a threshold, not a tick**, and the number is measured rather than chosen: on the
+operator's own store (n=197 completed runs) run durations were p50 7.3 min, p90 26.3 min, longest ever
+61.1 min, so 90 minutes is ~1.5x the longest run this daemon has taken and far below the six and
+eleven hours the incidents actually cost. A pull request mid-round is silent, an in-flight run is
+activity however long it runs, and a row the `runs` ledger cannot date is reported as nothing at all —
+under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
+
+
+### The daemon merges a pull request whose gates have cleared (STUDIO-874)
+
+Go v0.4.0 never merges anything — it has no merge path at all — so this is additive surface, and it
+is the last link of the review loop: STUDIO-712 moves a ticket to Done when its pull request merges,
+but until now the merge itself waited on a human noticing. Two pull requests in one batch sat
+approved, all checks green and `mergeStateStatus: CLEAN` for roughly eleven hours, because the only
+thing that merges on this install is somebody happening to look.
+
+| A pull request whose reviewers approved it | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| what merges it | nothing | the existing ticketless review watcher, off-loop |
+| the verdict read | — | `rhapsody_review_watch.status`, keyed to `last_reviewed_sha` |
+| the CI gate | — | `mergeStateStatus: CLEAN` **and** every check in the rollup non-blocking |
+| the draft gate | — | `isDraft` read on the same `gh pr view`; a draft is refused, never attempted |
+| how it merges | — | `gh pr merge --squash --match-head-commit <head>` |
+| default | — | **off**: `teams.review.auto_merge` is `false` unless an operator sets it |
+
+**`auto_merge` is per project, and unset inherits.** The top-level `teams.review.auto_merge` is the
+installation-wide default; a `projects:` entry in `teams.yaml` overrides it for the Linear project
+slugs it names (STUDIO-927), so a repo that must be merged by a human can say so while a sibling
+repo still merges itself:
+
+```yaml
+review:
+  auto_merge: true            # the default, unchanged
+projects:
+  - slugs: [4f4a2350682f]     # the Linear project's slugId, NOT its name
+    review:
+      auto_merge: false       # this project is merged by a human
+```
+
+`slugs:` here are the same values as `WORKFLOW.md`'s own `projects:` list — Linear's opaque
+**`slugId` hex** (`4f4a2350682f`), never the project's display name. When several resolved projects
+share one repo (a project that fans out to several slugs, or two projects pointing at the same
+repo), their answers are ANDed, so the two directions differ:
+
+- **To hold a merge back** (the overriding direction, `auto_merge: false` under a global `true`),
+  name **any one** of the project's slugs. An unnamed sibling inherits the global `true`, and the
+  AND already yields `false`.
+- **To opt in under a global `false`**, name **every** slug of the project. An unnamed sibling
+  inherits the global `false`, and the AND then yields `false` — so naming only one slug leaves the
+  repo human-merged. This fails closed, but silently: nothing warns that the unnamed sibling is
+  holding it.
+
+An entry whose slug matches nothing can never fire, so the daemon warns at boot naming every
+unmatched slug rather than letting a name-where-an-id-belongs look like success.
+
+A project with no matching entry — and an entry that sets no `auto_merge` — inherits the top-level
+value in both directions, so a project that has never been configured behaves exactly as it did
+before the block existed. An unknown key (a misspelling, or `auto_merge` placed beside `slugs`
+instead of under `review:`) or a wrong type is a rejected `teams.yaml`, which degrades to Teams-off
+(and `rhapsodyd teams show` reports the reason); Teams-off means no auto-merge, the safe side.
+
+**The verdict is data, never prose.** `gh pr review --approve` errors on this install (GitHub
+refuses a self-review from the account that authored the pull request), so `reviewDecision` is empty
+on every pull request here and reviewer verdicts reach GitHub only as English. None of that is read.
+The ticketless review path already records its own verdict structurally: `review_exit_state` matches
+an EXACT `HANDOFF: approved` payload on the review agent's final result, and `mark_review_completed`
+stores the resulting `approved`/`reviewed` status beside the SHA that reviewer actually read. A gate
+that grepped comment bodies would have to call "I would happily approve on the next push" an
+approval; this one never sees it. A hand-off whose payload is neither `approved` nor a recognised
+rejection is not guessed into either status either — it is recorded `truncated`, which this gate
+already refuses as a round still owed.
+
+**A verdict is about a COMMIT.** Every gate is keyed to the head observed this tick — an approval of
+`a324d2d` is not an approval of `c366a61`, and every review round in the batch that motivated this
+pushed new commits after a verdict. A pull request whose head has moved is refused and re-reviewed
+rather than merged.
+
+**`CLEAN` is necessary and not sufficient: a DRAFT reports `CLEAN`** (STUDIO-881). A draft pull
+request with approvals at the head and every check green reports `mergeStateStatus: CLEAN`, so the
+allowlist above does not catch it — `gh pr merge` then fails with `GraphQL: Pull Request is still a
+draft`. `isDraft` is therefore read off the same `gh pr view` that re-resolves the pull request, and
+a draft is refused there, before the merge-state and check reads and before any merge is attempted.
+The answer is re-read every tick and never remembered, because marking a draft ready for review does
+not move the head: a gate that latched on it would strand a pull request the author had already
+un-drafted.
+
+**A refusal is not an unreadable gate.** A failed `gh pr merge` used to be reported wholesale as *"a
+gate could not be read"* — a claim that nothing is known and the next tick may learn more. For
+`Pull Request is still a draft` that claim is false, and the daemon re-asked once a minute for three
+hours (182 attempts) to be told the same thing. The split is now about whether GitHub ANSWERED:
+a refusal it recognises is a decline, and everything else — a network error, an `HTTP 503`, a message
+GitHub adds next year — stays a failure and is retried next tick, because abandoning a mergeable pull
+request on a blip is the worse direction. Nothing latches either way; what does not repeat is the
+REPORT.
+
+**Announced once, on both sides of the seam.** A gate that holds holds for as long as its condition
+does, and the daemon re-decides it every tick — so a line spoken on the way to the decision is a
+line a minute until something changes. The three-hour log this ticket was filed from carried 383 of
+them for two stuck pull requests: 189 WARNs from the merge attempt, and 97 and 96 INFO lines from
+the control task announcing the plan it had just re-formed. Both halves are now announced only when
+they are NEWS — the plan once per pull request and head (with the approvals that cleared it), the
+refusal once per pull request, head and reason, and the detail a gate adds to its refusal only on
+the tick the refusal itself is announced. Everything repeated is at DEBUG. A stuck pull request
+therefore costs two INFO lines — the plan and the refusal — plus the one detail line its particular
+gate adds, and then silence. It still merges the tick its gate clears: the plan is re-formed and
+re-attempted every tick regardless, because it is only the REPORT that is held.
+
+**GitHub's own auto-merge is deliberately NOT armed here**, unlike the console merge action
+(STUDIO-767), whose `--auto` is a guardrail for a human who has already decided. With nobody
+watching, an armed auto-merge fires LATER, at whatever head exists then — possibly one pushed after
+the arming that no reviewer approved. So this path verifies green itself, at a named commit, and
+merges immediately or not at all; `--match-head-commit` makes GitHub refuse a merge whose head moved
+inside the last window.
+
+**`BEHIND` updates and re-gates; it never merges.** STUDIO-784 is this bug already shipped once — the
+console armed an auto-merge on a behind branch that could never land. A behind branch's approval is
+for a commit that has not met its base, so the branch is updated (when `allow_update_branch` permits;
+otherwise the pull request is declined), the head advances, the review re-arms, and only a fresh
+approval of the new head can clear the gate again. The loop is bounded by `REVIEW_ROUNDS_PER_PR_CAP`,
+which already caps the review dispatches one pull request may draw.
+
+**Ticket bookkeeping is not duplicated.** An auto-merge writes nothing to the watch set, so the next
+sweep observes the pull request as `MERGED` exactly as it would a human's merge and STUDIO-712's
+existing transition finishes the ticket. There is no second Done path.
+
 ### A merged pull request moves its ticket to Done (STUDIO-712)
 
 Go v0.4.0 knows what a terminal state IS — `tracker.terminal_states` — but it only ever READS the
@@ -1239,7 +1591,14 @@ ticket is one line, refreshed rather than duplicated, capped at
 `warnings::ORPHANED_REVIEW_WARN_CAP`. The endpoint's shape is unchanged and the two ported producers
 keep their golden ordering ahead of the additions.
 
-### The daemon writes the GitHub attachment its own summons routing reads (STUDIO-875)
+### The daemon links a pull request to its ticket, and routes summons off its own record (STUDIO-875, corrected by STUDIO-882)
+
+> **Read this first.** STUDIO-875 shipped this divergence on the belief that the attachment it
+> writes is what `applyGitHubSummons` reads. **It is not, and no attachment this daemon writes can
+> be.** STUDIO-882 measured the live API and moved routing to the daemon's own review watch set; the
+> write survives only as a link a person can click. The measurement and the replacement are the last
+> two subsections here — the sections between them describe the write, which still happens, and no
+> longer describe how a summons reaches a ticket.
 
 Go v0.4.0 only ever READ GitHub attachments. `applyGitHubSummons` attributes a summoning pull-request
 comment to an issue by walking that issue's `linked_prs`, which the tracker builds from the issue's
@@ -1255,11 +1614,13 @@ perfectly good token-bearing comment which is then dropped on every poll, foreve
 | Mutation | — | `attachmentLinkGitHubPR`, never the generic `attachmentLinkURL` |
 | A hit that reaches no ticket | one `continue` inside a per-tick debug line | one WARNING per (repository, ticket), naming the ticket and the repository's hit pull requests |
 
-**The mutation choice is load-bearing, not cosmetic.** `normalize`'s `isGithubPR` admits an
-attachment only when its `sourceType` is `"github"`, and that field is not caller-supplied — it comes
-from WHICH link mutation created the attachment. A generic `attachmentLinkURL` would create an
-attachment that is visible in Linear, points at the right pull request, and is still invisible to
-`linked_prs`: the original failure wearing a hat.
+**The mutation choice was believed load-bearing; it is not.** The reasoning was that `normalize`'s
+`isGithubPR` admits an attachment only when its `sourceType` is `"github"`, that the field is not
+caller-supplied — it comes from WHICH link mutation created the attachment — and that the
+GitHub-specific mutation therefore yields an admissible attachment where `attachmentLinkURL` would
+not. The premise is true and the conclusion is false: see "What the write actually produces" below.
+`attachmentLinkGitHubPR` is kept because it is the honest mutation for what is being linked, not
+because it changes what `linked_prs` sees.
 
 **A working installation pays nothing.** The control task carries the pull-request numbers the
 ticket already links in that repository; the off-loop write is skipped when the number it actually
@@ -1272,25 +1633,34 @@ this fix had first. `merged` comes from the attachment's `metadata.status`/`merg
 maintained by the tracker's GitHub integration — and this whole divergence exists because that
 integration is absent. Where nothing writes attachments, nothing refreshes them either: a link the
 daemon wrote reads `unmerged` forever, including after its pull request merges, and a gate trusting
-it would refuse the ticket's next pull request while `applyGitHubSummons` counted the ticket as
-reachable on the strength of the stale link — the original defect one round later, with the warning
-below blind to it.
+it would refuse the ticket's next pull request. (When this gate was believed to be routing, that
+staleness was also a dropped review — `applyGitHubSummons` counting the ticket as reachable on the
+strength of the stale link, with the warning below blind to it. STUDIO-882 removed the routing half;
+the watch set it moved to maintains its own liveness.)
 
 **Best-effort, and the word is exact.** A refused link never fails the review introduction or the
-quorum fan-out that was actually asked for. It costs the NEXT summons on that pull request, and it
-is retried by whatever next resolves a pull request for that ticket — another handoff, or the
-adoption sweep. That is deliberately not "every tick", and on the quorum path it is not even every
-handoff (`fan_out` returns at `AlreadyRequestedAtHead` before resolving a tracker), so the backstop
-for a link that never lands is the warning below.
+quorum fan-out that was actually asked for. Since STUDIO-882 it costs a link in the tracker's UI and
+nothing else; it is retried by whatever next resolves a pull request for that ticket — another
+handoff, or the adoption sweep.
 
 On the quorum path the URL written is `resolve_open_pr`'s result, which falls back to the ticket's
 own attachment when the `gh` lookup fails; that fallback URL came off a link the ticket already has,
 so the worst it produces is a duplicate write, never a link to the wrong pull request.
 
-Nothing depends on Linear de-duplicating the write. The gate above is what keeps a working
-installation silent; a duplicate that got through would give `linked_prs` two equal entries, which
-the summons walk attributes twice and advances once — untidy in Linear's UI, harmless to the
-routing.
+Nothing depends on Linear de-duplicating the write — it does not de-duplicate it. A second
+`attachmentLinkGitHubPR` for a pull request the issue already links is answered with a REFUSAL, not
+a no-op (measured, STUDIO-904: `INPUT_ERROR` on the `attachmentLinkGitHubPR` path, top-level message
+`"Duplicate attachment for duplicate url"`; whether the uniqueness is scoped per-issue or per-URL was
+not measured, and cannot matter here, because this write only ever links a pull request to the ticket
+that resolved it). The refusal proves the link is there, so the adapter absorbs it as the success it
+is: `linear_duplicate_attachment`, a Rhapsody-only `LinearErrorKind` that mirrors no `errors.go`
+sentinel. The gate above is what keeps a working installation from writing at all; where it cannot
+see the link — its input is the run-start
+snapshot's `linked_prs`, and a daemon-written attachment on an unconnected repository never enters
+`linked_prs` (STUDIO-882) — the retry is now answered by that classification rather than by a WARN
+claiming the author cannot be re-engaged. The WARN that remains is for a GENUINE failure only, and
+it says what is true: the ticket will show no link for a person to click, and the daemon's own
+summons routing does not depend on this attachment.
 
 **The warning exists because the information already did.** The STUDIO-574 counters had been
 reporting `linked_prs_total=0 … matched=0 advanced=0` every ~35 seconds for eleven hours while three
@@ -1307,3 +1677,121 @@ warning for every unlinked in-review ticket whenever any summons anywhere in the
 or aged out: the same repetition, at WARN. The numbers stay in the line, under the name `repo_prs`,
 because on an unlinked ticket they are the only handle an operator has on the comment that was
 dropped.
+
+#### What the write actually produces (STUDIO-882, measured)
+
+The attachment lands, Linear shows it on the issue, and `linked_prs` stays empty. Read back off the
+live Linear API — the attachment the daemon wrote for STUDIO-880 at 01:36:31 on 2026-09-13, beside
+one the GitHub integration wrote on a CONNECTED repository (tally STUDIO-844):
+
+| | daemon's `attachmentLinkGitHubPR`, unconnected repo | integration, connected repo |
+| --- | --- | --- |
+| `sourceType` | `"api"` | `"github"` |
+| `metadata` | `{}` | `{ url, number, status, mergedAt, updatedAt, branch, … }` |
+| reaches `linked_prs` | no | yes |
+
+Stated exactly, because the distinction is this ticket's whole subject: what is MEASURED is that on
+an unconnected repository the mutation yields `sourceType: "api"` with empty metadata, and that a
+connected repository carries an admissible attachment written by the INTEGRATION. Whether the
+mutation itself would yield `"github"` on a connected repository is not measured here — it would
+mean writing to a production ticket to find out, and it does not change the outcome either way,
+because on a connected repository the integration has already written the attachment that counts.
+
+**So it fails twice, and the second failure is the one that matters.** `isGithubPR` rejects it on the
+`sourceType` gate; and widening that gate would still get nothing, because `linked_prs` is built by
+matching a pull-request url out of `metadata.url` — and `metadata` is empty. The coordinate is only
+in the attachment's top-level `url`, which the ported candidate queries do not even select. Widening
+would therefore mean adding a field to eight ported GraphQL queries and then building a PR
+coordinate out of a value any caller of `attachmentLinkURL` can set to anything — dismantling a
+deliberate trust boundary (the regex-from-`metadata.url` shape exists so a caller cannot inject an
+arbitrary owner/repo/number) to admit a class of attachment the daemon would then have to trust. It
+was not done.
+
+#### Where the link is read from instead (STUDIO-882)
+
+`applyGitHubSummons` takes a second source of the PR→ticket mapping: `DaemonPrLinks`, built from the
+`rhapsody_review_watch` rows this daemon wrote itself. A row exists because the daemon parked a
+ticket in a review state for a pull request it resolved on the run's own trusted repository binding;
+`introduced_by` names the ticket as `handoff:<id>` / `adopt:<id>`, read through the same
+`reviewdone::origin_ticket` that already governs the auto-done transition, and a `console:` origin
+names an operator rather than a ticket and contributes nothing.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| PR→ticket mapping | the tracker's attachments, only | the tracker's attachments, **plus** the daemon's own watch set |
+| Liveness of a link | the attachment's `merged` flag, refreshed by the integration | the watch row's `open`/`status`, refreshed by the daemon's own PR-state sweep |
+| Where a hit lands | `latest_summon_at`, unchanged | `latest_summon_at`, unchanged |
+
+This is additive: an empty index leaves the pass byte-identical to Go's, and on a connected
+repository both sources offer the same pull request and it is walked once. It also settles the
+staleness problem the write could not — the watch row's liveness is maintained by the daemon rather
+than by an integration whose absence is the premise.
+
+The trust argument is the reverse of the one against widening `isGithubPR`. A watch row's
+owner/repo/number were written by this daemon from its own resolved repository binding and are never
+taken from room text (the review design's F-SEC rule); a tracker attachment can be written by anyone
+with tracker access. The daemon's own record is the stricter source, not the looser one.
+
+### A second agent backend — `opencode` (STUDIO-902)
+
+The frozen reference runs exactly one coding-agent backend. Rhapsody now ships two: `claude` and
+**`opencode`**, the first adapter of the pluggable-harnesses design
+(`~/.rhapsody/docs/pluggable-harnesses-design.md`, §9's slice 8). The reason is cost, not
+capability — it moves implementation runs onto a different billing pool and keeps the Claude quota
+for planning and review.
+
+| | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| `agent.backend` values with a runner | `claude` | `claude`, **`opencode`** |
+| `agent.backend` values config-validation accepts | `claude`, `codex` | `claude`, `codex`, **`opencode`** (`codex` still has no runner, in both) |
+| Backend knob blocks | `claude:`, `codex:` | those, plus **`opencode:`** |
+| Which backend a teammate runs on | — (no Teams) | a profile's **`harness:`**, empty ⇒ the configured `agent.backend` |
+
+**Additive, and that is testable rather than asserted.** A workflow with no `opencode:` key and no
+profile naming a `harness:` decodes, resolves and dispatches byte-identically to a daemon built
+before this existed: every new field's default is its zero value, every shipped built-in profile
+ships `harness: ""`, and `Effective::agent` — what a dispatch naming no harness uses — is still the
+configured backend's runner. Claude's argv, its normalized events and its goldens are untouched.
+
+**The parity surfaces were deliberately NOT widened.** `GET /api/v1/config` emits `claude` and does
+not emit `codex`, so it does not emit `opencode` either — adding it would have changed a shape
+`harness/fixtures/api/config.json` pins byte-for-byte. The console therefore cannot yet read
+opencode's configuration; surfacing it belongs with the design's slice 5 console work. Likewise the
+`runs` table gains no `harness` column: design §6.2 wants `harness` / `model` / `provider` /
+`session_uuid` added together, and that is slice 3.
+
+**What the adapter owes the CLI that claude's does not.** Each of these is measured, from the
+STUDIO-869 spike's committed captures in `harness/harness-spike/opencode/`:
+
+- **A private `XDG_DATA_HOME` per run, which is not optional.** Two turns sharing one opencode state
+  directory lose turns to `database is locked` — 8/10 completed against a warm directory, **0/10
+  against a fresh one**, 10/10 isolated. A lost turn exits 1 in under a second with an **empty event
+  stream**, so "the stream ended with no terminal event" is a first-class failure here rather than an
+  impossible state.
+- **The credential is copied into that directory.** opencode keeps `auth.json` inside the very
+  directory being redirected, so a bare redirect leaves the turn unauthenticated and it fails as a
+  401 that reads like a provider misconfiguration. Auth still defers entirely to the operator's own
+  `opencode auth login` — the daemon writes no provider config, it copies an existing credential —
+  and a missing one is refused at `start_session`, before anything is spawned. The operator's
+  `~/.config/opencode/` config is under `XDG_CONFIG_HOME` and is not redirected at all.
+- **Prompt tool names are rewritten.** opencode spells an injected MCP tool `<server>_<tool>` where
+  claude spells it `mcp__<server>__<tool>`, and Rhapsody's prompt template names tools literally —
+  including `mcp__symphony__symphony_handoff`, the tool that ENDS a run. The adapter rewrites the
+  prompt into opencode's spelling; unrewritten, an agent is told to call a tool that does not exist
+  and the run simply never hands off.
+- **The MCP config goes in the run's state directory, not the worktree.** `OPENCODE_CONFIG` was
+  measured to MERGE with the project and global configs rather than replace them, so the daemon's
+  server can be injected without writing into the git worktree the agent is about to commit from.
+- **stdin is closed at start**, where claude requires it held open as the INF-250 operator mailbox.
+  So this backend cannot steer a live turn: a message that arrives mid-turn is drained, counted and
+  logged as undelivered rather than silently dropped.
+- **No billing guard.** Claude's guard forces subscription billing off an `apiKeySource` signal
+  opencode does not emit, and billing a different provider is the point. The TRACKER credential
+  scrub still applies, by name and by value — withholding the Linear key is not a billing decision.
+
+**The session-id question §6.2 leaves open does not bind this adapter.** Per-run isolation costs
+goose its session-id uniqueness (two isolated goose runs both report `20260912_1`), which is why the
+design asks whether an isolated id can still be an identity key. opencode mints a random `ses_…` per
+session instead of numbering per state directory: `concurrency-trials-isolated-xdg.txt` records ten
+isolated turns with ten distinct ids. So isolation costs opencode nothing here, and slice 9 still
+owns the goose case where the trade is real.

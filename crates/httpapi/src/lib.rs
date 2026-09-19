@@ -44,6 +44,7 @@ mod build_info;
 mod config_view;
 mod handlers;
 mod handlers_config;
+mod handlers_drain;
 mod handlers_history;
 mod handlers_linear;
 mod handlers_logs;

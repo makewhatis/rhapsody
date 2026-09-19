@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.5](https://github.com/makewhatis/rhapsody/compare/v0.3.4...v0.3.5) (2026-09-16)
+
+
+### Features
+
+* **agent,config,orchestrator:** add an opencode backend behind the existing Runner/Session traits (STUDIO-902) ([#169](https://github.com/makewhatis/rhapsody/issues/169)) ([69e1435](https://github.com/makewhatis/rhapsody/commit/69e1435b056e999a5ef46d2a0326ce7eca1a8339))
+* **agent:** introduce the pluggable-harnesses contract, Claude re-expressed behind it (STUDIO-900) ([#167](https://github.com/makewhatis/rhapsody/issues/167)) ([57acf81](https://github.com/makewhatis/rhapsody/commit/57acf8102dc74a614b37dcda51883f485f4773bd))
+* **config,orchestrator:** let a review run use its own model (STUDIO-901) ([#168](https://github.com/makewhatis/rhapsody/issues/168)) ([e709797](https://github.com/makewhatis/rhapsody/commit/e7097974262a7c981c555b6db68f4badca1ad1fd))
+* **config:** add one harness-name registry consulted by both validation sites ([#164](https://github.com/makewhatis/rhapsody/issues/164)) ([3953125](https://github.com/makewhatis/rhapsody/commit/3953125a83e729e285c9db8e065aeb44574e3d10))
+* **httpapi,web:** a review row says which ticket it is reviewing (STUDIO-834) ([#150](https://github.com/makewhatis/rhapsody/issues/150)) ([6c93d59](https://github.com/makewhatis/rhapsody/commit/6c93d595a09f5e9af8306e7af2039bb9c7941905))
+* **orchestrator,agent:** make a teammate's profile model and effort live (STUDIO-868) ([#152](https://github.com/makewhatis/rhapsody/issues/152)) ([8e1db25](https://github.com/makewhatis/rhapsody/commit/8e1db2564745bf36c06558d18a8237c9b13fef95))
+* **orchestrator,desktop:** drain and restart so in-flight runs finish before an upgrade (STUDIO-880) ([#159](https://github.com/makewhatis/rhapsody/issues/159)) ([afa3ca4](https://github.com/makewhatis/rhapsody/commit/afa3ca4c3be97ccc118efbcbd89ded71249467ed))
+* **orchestrator,web:** report a ticket whose board state and activity disagree (STUDIO-898) ([#166](https://github.com/makewhatis/rhapsody/issues/166)) ([6b71ec2](https://github.com/makewhatis/rhapsody/commit/6b71ec2d51c62b72d657f71b5b0dfc130374ef00))
+* **orchestrator:** adopt a review-state pull request nothing is watching (STUDIO-838) ([#145](https://github.com/makewhatis/rhapsody/issues/145)) ([10d0147](https://github.com/makewhatis/rhapsody/commit/10d01472526c7177fb998b0623c48470ddca4483))
+* **orchestrator:** merge a pull request whose reviews and CI have cleared (STUDIO-874) ([#156](https://github.com/makewhatis/rhapsody/issues/156)) ([1477359](https://github.com/makewhatis/rhapsody/commit/1477359cdb2b5ac201c6feb29b83da8294f26de7))
+* **rhapsodyd:** report a teammate's resolved harness in teams show (STUDIO-903) ([#170](https://github.com/makewhatis/rhapsody/issues/170)) ([784a160](https://github.com/makewhatis/rhapsody/commit/784a16081a4a098d5328a8326e91303c7366d3c1))
+* **store:** record and surface what actually ran a run (STUDIO-909) ([#173](https://github.com/makewhatis/rhapsody/issues/173)) ([3309501](https://github.com/makewhatis/rhapsody/commit/3309501878517628b5520059b7999837627ed995))
+
+
+### Bug Fixes
+
+* **agent:** kill the agent's whole process tree, not just its group (STUDIO-871) ([#155](https://github.com/makewhatis/rhapsody/issues/155)) ([c261902](https://github.com/makewhatis/rhapsody/commit/c2619020f88eba9970d33ced564468be0eed6666))
+* **config,orchestrator:** reject and report a reviewer count the roster cannot satisfy (STUDIO-891) ([#163](https://github.com/makewhatis/rhapsody/issues/163)) ([c9630b2](https://github.com/makewhatis/rhapsody/commit/c9630b26f96904616cbc6c8fc66dbaf8587abb6c))
+* **orchestrator,tracker:** link a pull request to its ticket so review findings re-engage the author (STUDIO-875) ([#157](https://github.com/makewhatis/rhapsody/issues/157)) ([977c882](https://github.com/makewhatis/rhapsody/commit/977c882f84349cbd440c47b162396b9603e79524))
+* **orchestrator:** distinguish an undeclared review verdict from changes requested (STUDIO-894) ([#165](https://github.com/makewhatis/rhapsody/issues/165)) ([cb5cf3a](https://github.com/makewhatis/rhapsody/commit/cb5cf3a13bedff56833113b9c3f2c4d80646b543))
+* **orchestrator:** move a ticket out of review when its review files findings (STUDIO-839) ([#147](https://github.com/makewhatis/rhapsody/issues/147)) ([6270375](https://github.com/makewhatis/rhapsody/commit/6270375be2621ca15c16ecd2e4a412ba3e72f6d7))
+* **orchestrator:** refuse a draft pull request instead of retrying its merge forever (STUDIO-881) ([#161](https://github.com/makewhatis/rhapsody/issues/161)) ([ded2de4](https://github.com/makewhatis/rhapsody/commit/ded2de4c278ed4cb47a6d905338362e593c932c3))
+* **orchestrator:** remember a summons so a capacity-held ticket is not stranded (STUDIO-885) ([#162](https://github.com/makewhatis/rhapsody/issues/162)) ([c13d056](https://github.com/makewhatis/rhapsody/commit/c13d05673b04f9fa79ca43f3702e215d64c47471))
+* **orchestrator:** route a summons through the daemon's own pull-request link (STUDIO-882) ([#160](https://github.com/makewhatis/rhapsody/issues/160)) ([5a3d54c](https://github.com/makewhatis/rhapsody/commit/5a3d54c708c9fef92c22c9881510ea6042ab93ba))
+* **orchestrator:** scope review.model to the reviewer's harness (STUDIO-908) ([#172](https://github.com/makewhatis/rhapsody/issues/172)) ([1982d4e](https://github.com/makewhatis/rhapsody/commit/1982d4e2de47d7221d802014b1211db28b32f39c))
+* **orchestrator:** treat a duplicate pull-request link as success (STUDIO-904) ([#171](https://github.com/makewhatis/rhapsody/issues/171)) ([2baee96](https://github.com/makewhatis/rhapsody/commit/2baee96da32ef221c76637236da9677ea540afac))
+
 ## [0.3.4](https://github.com/makewhatis/rhapsody/compare/v0.3.3...v0.3.4) (2026-09-10)
 
 

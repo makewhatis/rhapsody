@@ -19,7 +19,7 @@ the `Orchestrator` struct itself. Concretely:
   (`orchestrator`, `dispatch`, `select`, `claim`, `retry`, `reconcile`/`reconcile_run`, `promote`,
   `agentupdate`, `persist`, `recovery`, `reload`, `workspace_gc`, `snapshot`) are loop-confined —
   they never lock anything and must never be called from another task.
-- Five exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
+- Seven exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
@@ -62,8 +62,37 @@ the `Orchestrator` struct itself. Concretely:
     a REFUSAL of a particular id is a verdict that memoizes as a bounded negative instead, and
     conflating them either re-opens the storm or makes one bad id stall every healthy row with it.
 
+  - `drain.rs`'s `DrainSignal` (`Orchestrator::drain`, STUDIO-880) — a lock-free `Arc`-shared
+    atomic flag, cloned onto the control task, onto EVERY dispatched worker, and onto
+    `ControlHandle`. The HTTP task is its only writer (`POST /api/v1/drain`); the control task reads
+    it on the dispatch gate and each worker reads it at its turn boundary. It rides beside
+    `retention_days` for that field's reason — both sides genuinely touch it and neither can wait for
+    the other — and being a plain atomic with no lock and no `.await`, it is a shared-state seam only
+    in the bookkeeping sense. **Three dispatch entry points read it, not one**: `on_tick`'s gate,
+    `on_retry`'s park, and `dispatch_review`'s refusal (the `Event::ReviewSweep` path, which has no
+    production caller today but reaches dispatch past both of the others). Each refuses in its OWN
+    idiom because each owns bookkeeping a late refusal would strand — a claim, a retry entry, a watch
+    row recorded as in-flight — which is also why `dispatch_issue` only WARNS when it is reached
+    while draining rather than refusing there. If you add a fourth path that dispatches, gate it at
+    its own door and give it the same test: forgetting the second one is the failure this feature
+    already had once, and the warn is what will tell you if a fifth slips through.
+
+  - `runautomerge.rs`'s `AutoMergeLedger` (`Orchestrator::automerge_ledger:
+    Option<Arc<AutoMergeLedger>>`, STUDIO-923) — a `Mutex`-guarded map the off-loop auto-merge half
+    (`runautomerge.rs`, itself outside this list: it holds no `Orchestrator` and sends no control
+    event) is the ONLY writer of. The control task holds a read-only `Arc` clone, used from exactly
+    one call site — `reviewreconcile.rs`'s reconciliation sweep, through `AutoMergeLedger::peek` —
+    to name what auto-merge has already said about a pull request the sweep is independently
+    reporting diverged (`ApprovedStillOpen`), rather than claiming nothing has said anything about
+    it; this ledger lock is the one lock the control task shares with the off-loop half, and the
+    control task only ever takes it read-only. `None`
+    whenever the review watcher never spawned, which the sweep's fallback wording already covers.
+    `peek` is the only method this crate exposes outside `runautomerge.rs`'s own module, so a
+    second write path here would need its own deliberate exception to "a refusal is not surfaced
+    outside the log", which that module's doc still states and this read does not weaken.
+
   If you need to touch orchestrator state from outside the loop task, route through one of these
-  five seams; if none fits, that's a real design decision — don't reach for a sixth ad hoc
+  seven seams; if none fits, that's a real design decision — don't reach for an eighth ad hoc
   `Arc<Mutex<..>>` without updating this list.
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
@@ -103,6 +132,14 @@ the `Orchestrator` struct itself. Concretely:
   Testing below). `issuelog.rs` is the `/log` transcript humanizer. `warnings.rs` is the two
   advisory producers (`GET /api/v1/projects`), resolved off the control task with a
   generation-counter guard against a slow pass clobbering a newer reload.
+  `reviewreconcile.rs` (STUDIO-898; Rhapsody-only) is the reconciliation sweep: it compares each
+  watched pull request's board state against the `runs` ledger and REPORTS divergence on both
+  surfaces, acting on nothing. Loop-confined and local-only — no `gh`, no tracker — which is why it
+  runs from `on_tick` ABOVE the validate/drain/credential gates rather than from the review watcher:
+  a daemon held by one of those gates is exactly one whose board may have quietly stopped. Its rule
+  is a pure function (`reconcile_pr`) so each of the six incidents it exists for is a table fixture;
+  if you add a divergence shape, mutation-check it, and keep the default for an unrecognised status
+  SILENT.
 - **GitHub summons integration**: `ghsummons.rs` (repo parsing + the `SummonSource` trait + the
   real `gh`-exec impl) and `ghenrich.rs` (fetch/apply the enrichment onto a candidate). Both are
   Go `internal/orchestrator/*.go` ports, not to be confused with the next group. The fetch still

@@ -6,12 +6,13 @@
 //! and [`Sqlite::open`] applies the same pragmas and the same idempotent `user_version`
 //! migration loop. The `Store` trait, CRUD, queries, and retention land in S3.
 //!
-//! # The one divergent schema object, and how the golden still gates the rest (STUDIO-711)
+//! # The divergent schema objects, and how the golden still gates the rest (STUDIO-711)
 //!
-//! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column) have no Go
-//! counterpart: they are the ticketless
-//! PR-review watch set, a feature the frozen v0.4.0 reference does not have. That creates a
-//! problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
+//! Migration steps 7 and 8 (`rhapsody_review_watch` and its `author` column), step 9
+//! (`rhapsody_summon_watermark`, STUDIO-885) and step 10 (`rhapsody_run_provenance`, STUDIO-909)
+//! have no Go counterpart: they are the ticketless PR-review watch set, the per-ticket summons
+//! watermark and the per-run harness/model/provider record, none of which the frozen v0.4.0
+//! reference has. That creates a problem the rest of the schema does not have. `harness/fixtures/schema.sql` is recapturable
 //! ONLY from the real Go daemon (`make fixtures`), so it can never be made to contain a table the
 //! Go daemon cannot create — a naive new table would turn
 //! `schema_matches_committed_golden` permanently red with no honest way to fix it. Hand-editing
@@ -24,7 +25,7 @@
 //! The exclusion is therefore a name rule, not a loosened assertion — a Go table can never be
 //! named `rhapsody_*`, so the golden keeps gating all 6 ported tables byte-strictly, and a NEW
 //! table added without the prefix still turns it red. `divergent_objects_are_gated_by_name_only`
-//! asserts that property directly, and pins the divergent object set to exactly one name.
+//! asserts that property directly, and pins the divergent object set to exactly those names.
 //!
 //! A new schema object that is a PORT of Go behaviour must never take the prefix: it belongs in
 //! the golden, recaptured with `make fixtures`.
@@ -38,10 +39,10 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 and 8 are Rhapsody-only (the ticketless review watch set, then its
-/// `author` column) and are the one documented reason this number is ahead of the reference — see
-/// the module doc above.
-const SCHEMA_VERSION: i64 = 8;
+/// Go v0.4.0 froze at 6. Steps 7, 8, 9 and 10 are Rhapsody-only (the ticketless review watch set,
+/// then its `author` column, then the summons watermark, then per-run provenance) and are the one
+/// documented reason this number is ahead of the reference — see the module doc above.
+const SCHEMA_VERSION: i64 = 10;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -166,6 +167,40 @@ CREATE TABLE IF NOT EXISTS rhapsody_review_watch (
     // which the reviewer-selection path reads as "author unknown" and fails closed on.
     r#"
 ALTER TABLE rhapsody_review_watch ADD COLUMN author TEXT NOT NULL DEFAULT '';
+"#,
+    // v8 -> v9: the per-ticket summons watermark (STUDIO-885). Rhapsody-only — the Go reference
+    // re-derives `latest_summon_at` from a five-minute GitHub lookback every poll and keeps it
+    // nowhere, which is precisely the defect this table exists to close. Named with the
+    // `rhapsody_` prefix so the schema golden gates it out by name, exactly as step 7 is.
+    //
+    // `identifier TEXT PRIMARY KEY` on a rowid table gets SQLite's implicit auto-index, whose
+    // `sqlite_master.sql IS NULL`, so — as with step 7 — no explicit index is added and nothing
+    // further reaches the golden comparison.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_summon_watermark (
+  identifier  TEXT    NOT NULL PRIMARY KEY,
+  summon_at   TEXT    NOT NULL,
+  summon_body TEXT    NOT NULL DEFAULT ''
+);
+"#,
+    // v9 -> v10: what a run actually ran on — harness/model/provider + the origin of each
+    // configurable value (STUDIO-909). Rhapsody-only, and on a Rhapsody-only table rather than as
+    // `runs` columns: the `runs` DDL is byte-pinned to Go by `harness/fixtures/schema.sql`, which
+    // is recapturable only from the real Go daemon and can never contain these columns. The
+    // `rhapsody_` prefix is what the schema golden excludes by name (see the module doc), so this
+    // lands without touching `runs` or the golden.
+    //
+    // `run_id INTEGER PRIMARY KEY` is the one row per run (`runs.id`); the FK is the run's own id
+    // and nothing else, so a pruned run simply orphans a row that no query joins from.
+    r#"
+CREATE TABLE IF NOT EXISTS rhapsody_run_provenance (
+  run_id         INTEGER NOT NULL PRIMARY KEY,
+  harness        TEXT    NOT NULL DEFAULT '',
+  harness_origin TEXT    NOT NULL DEFAULT '',
+  model          TEXT    NOT NULL DEFAULT '',
+  model_origin   TEXT    NOT NULL DEFAULT '',
+  provider       TEXT    NOT NULL DEFAULT ''
+);
 "#,
 ];
 
@@ -376,6 +411,32 @@ fn map_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
         usage_estimated: row.get(18)?,
         team_id: row.get(19)?,
     })
+}
+
+/// The `rhapsody_run_provenance` value columns, in DDL order — the single shared list for every
+/// provenance read, read positionally by [`map_run_provenance`].
+const PROVENANCE_COLS: &str = "harness, harness_origin, model, model_origin, provider";
+
+/// How many run ids [`Sqlite::load_run_provenances`] binds per statement. Well under SQLite's
+/// 32766-variable ceiling, and small enough that a very large page is a few queries rather than one
+/// that fails closed (STUDIO-909 round 1).
+const PROVENANCE_BIND_CHUNK: usize = 500;
+
+/// Map a provenance row starting at column `off` (0 for a bare [`PROVENANCE_COLS`] select; 1 when
+/// the query leads with `run_id`).
+fn map_run_provenance_at(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<RunProvenance> {
+    Ok(RunProvenance {
+        harness: row.get(off)?,
+        harness_origin: row.get(off + 1)?,
+        model: row.get(off + 2)?,
+        model_origin: row.get(off + 3)?,
+        provider: row.get(off + 4)?,
+    })
+}
+
+/// Map one `rhapsody_run_provenance` row selected as [`PROVENANCE_COLS`].
+fn map_run_provenance(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunProvenance> {
+    map_run_provenance_at(row, 0)
 }
 
 /// Build the ` WHERE …` clause (empty string when unfiltered) and its bound arguments for a
@@ -735,6 +796,19 @@ impl Store for Sqlite {
         // identifier — so those rows stay individual instead of collapsing into one synthetic row.
         // Because the kept row IS each partition's newest, ordering the survivors by started_at is
         // already "most recent activity first".
+        //
+        // `latest_outcome` is applied AFTER the partition, on the kept `rn = 1` row (STUDIO-931).
+        // It is deliberately NOT part of `run_filter_where`: filtering `outcome` there would make
+        // ROW_NUMBER() rank the surviving rows, so the query would return each issue's newest run
+        // *with that outcome* rather than the issues whose newest run has it — the stale-run bug
+        // that made the board bucket a finished ticket from an old `stopped` run. A caller that
+        // sets both still gets the `outcome`-narrowed partition (the existing semantics), then
+        // `latest_outcome` selects among it.
+        let mut outer = String::from("rn = 1");
+        if !f.latest_outcome.is_empty() {
+            outer.push_str(" AND outcome = ?");
+            args.push(Value::Text(f.latest_outcome.clone()));
+        }
         let q = format!(
             "SELECT {RUN_COLS} FROM (
                SELECT {RUN_COLS}, ROW_NUMBER() OVER (
@@ -744,7 +818,7 @@ impl Store for Sqlite {
                       ) AS rn
                  FROM runs{where_sql}
              )
-              WHERE rn = 1
+              WHERE {outer}
               ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
         );
         args.push(Value::Integer(limit));
@@ -828,6 +902,138 @@ impl Store for Sqlite {
         } else {
             Ok(Some(runs.remove(0)))
         }
+    }
+
+    fn set_run_provenance(&self, run_id: i64, p: &RunProvenance) -> Result<(), StoreError> {
+        let conn = self.lock();
+        // UPSERT on the run id: provenance is written once at dispatch, but a re-dispatch of the
+        // same run id (impossible today) must overwrite rather than fail a PRIMARY KEY constraint.
+        conn.execute(
+            "INSERT INTO rhapsody_run_provenance
+               (run_id, harness, harness_origin, model, model_origin, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id) DO UPDATE SET
+               harness = excluded.harness, harness_origin = excluded.harness_origin,
+               model = excluded.model, model_origin = excluded.model_origin,
+               provider = excluded.provider",
+            params![
+                run_id,
+                p.harness,
+                p.harness_origin,
+                p.model,
+                p.model_origin,
+                p.provider,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn run_provenance(&self, run_id: i64) -> Result<Option<RunProvenance>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PROVENANCE_COLS} FROM rhapsody_run_provenance WHERE run_id = ?1"
+        ))?;
+        let mut rows = stmt.query_map([run_id], map_run_provenance)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_run_provenances(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, RunProvenance>, StoreError> {
+        if run_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.lock();
+        let mut out = std::collections::HashMap::new();
+        // Chunked because `/api/v1/history/issues?limit=` is caller-controlled and `effective_run_limit`
+        // caps nothing, so one page can carry more ids than SQLite allows bind variables in a single
+        // statement (32766). Un-chunked, that fails closed — `unwrap_or_default()` on the caller side
+        // silently drops EVERY badge on the page, not just the overflowing ones (STUDIO-909 round 1).
+        for chunk in run_ids.chunks(PROVENANCE_BIND_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let q = format!(
+                "SELECT run_id, {PROVENANCE_COLS} FROM rhapsody_run_provenance \
+                  WHERE run_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&q)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |row| {
+                Ok((row.get::<_, i64>(0)?, map_run_provenance_at(row, 1)?))
+            })?;
+            for r in rows {
+                let (id, p) = r?;
+                out.insert(id, p);
+            }
+        }
+        Ok(out)
+    }
+
+    fn tokens_by_provider(&self, since: &str) -> Result<Vec<ProviderTokens>, StoreError> {
+        let conn = self.lock();
+        // Time-filtered on `started_at` exactly like `day_totals`, so `providers` and `runs` /
+        // `total_tokens` on the same `/history/summary` response describe one window (STUDIO-909
+        // round 1). A pre-window run with provenance must NOT appear in a bucket: the whole point of
+        // the field is the per-window cost split, and an unbounded lifetime total cannot be
+        // reconciled with the totals beside it.
+        let mut stmt = conn.prepare(
+            "SELECT p.provider,
+                    COUNT(*),
+                    COALESCE(SUM(r.input_tokens), 0),
+                    COALESCE(SUM(r.output_tokens), 0),
+                    COALESCE(SUM(r.total_tokens), 0)
+               FROM runs r
+               JOIN rhapsody_run_provenance p ON p.run_id = r.id
+              WHERE r.started_at >= ?1
+              GROUP BY p.provider
+              ORDER BY COUNT(*) DESC, p.provider ASC",
+        )?;
+        let rows = stmt.query_map([since], |row| {
+            Ok(ProviderTokens {
+                provider: row.get(0)?,
+                runs: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                total_tokens: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn run_costs(&self) -> Result<Vec<RunCostBucket>, StoreError> {
+        let conn = self.lock();
+        // LEFT JOIN, unlike `tokens_by_provider`: a run with no provenance row still spent tokens,
+        // and a cost cannot skip it — it lands in the empty-provider bucket.
+        let mut stmt = conn.prepare(
+            "SELECT r.issue_identifier,
+                    COALESCE(p.provider, ''),
+                    COALESCE(SUM(r.total_tokens), 0),
+                    MAX(r.usage_estimated)
+               FROM runs r
+               LEFT JOIN rhapsody_run_provenance p ON p.run_id = r.id
+              WHERE r.issue_identifier != ''
+              GROUP BY r.issue_identifier, COALESCE(p.provider, '')
+              ORDER BY r.issue_identifier ASC, COALESCE(p.provider, '') ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunCostBucket {
+                issue_identifier: row.get(0)?,
+                provider: row.get(1)?,
+                total_tokens: row.get(2)?,
+                usage_estimated: row.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError> {
@@ -1199,6 +1405,39 @@ impl Store for Sqlite {
         Ok(out)
     }
 
+    fn record_summon_watermark(&self, w: SummonWatermark) -> Result<(), StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO rhapsody_summon_watermark (identifier, summon_at, summon_body)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(identifier) DO UPDATE SET
+               summon_at   = excluded.summon_at,
+               summon_body = excluded.summon_body",
+            params![w.identifier, w.at, w.body],
+        )?;
+        Ok(())
+    }
+
+    fn summon_watermark(&self, identifier: &str) -> Result<Option<SummonWatermark>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT identifier, summon_at, summon_body FROM rhapsody_summon_watermark \
+               WHERE identifier = ?1",
+        )?;
+        // The primary key makes this at most one row; absent is Ok(None), not an error.
+        let mut rows = stmt.query_map(params![identifier], |row| {
+            Ok(SummonWatermark {
+                identifier: row.get(0)?,
+                at: row.get(1)?,
+                body: row.get(2)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     fn prune(&self, retention_days: i64) -> Result<(), StoreError> {
         if retention_days <= 0 {
             return Ok(()); // 0 = keep forever
@@ -1226,6 +1465,16 @@ impl Store for Sqlite {
         )?;
         tx.execute(
             "DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at <> '' AND ended_at < ?1",
+            params![cutoff],
+        )?;
+        // A summons watermark is only ever read by comparing it against the ticket's LAST RUN
+        // START (STUDIO-885), so it is pruned on the same cutoff as the runs: keeping one whose
+        // counterpart history has just been deleted would leave a years-old comment able to lift a
+        // suppression with nothing left to compare it to. Both columns are written in the same
+        // canonical fixed-width form (`format_summon_at`, seconds precision), which is what makes
+        // this string comparison a chronological one.
+        tx.execute(
+            "DELETE FROM rhapsody_summon_watermark WHERE summon_at < ?1",
             params![cutoff],
         )?;
         tx.commit()?;
@@ -2003,6 +2252,86 @@ mod tests {
             scoped[0].started_at, "2026-01-01T00:02:00Z",
             "its newest run"
         );
+    }
+
+    // STUDIO-931 — `latest_outcome` selects among PARTITION-NEWEST rows, unlike `outcome`, which
+    // narrows the partition first. The difference is the whole point: a finished ticket whose old
+    // run was stopped must not come back from a "currently stopped" query.
+    #[test]
+    fn list_issue_runs_latest_outcome_filters_after_the_partition() {
+        let st = open_mem();
+        let seed = |ident: &str, started: &str| {
+            st.start_run(RunStart {
+                issue_identifier: ident.into(),
+                started_at: started.into(),
+                ..Default::default()
+            })
+            .expect("start")
+        };
+        let end = |id: i64, outcome: &str| {
+            st.end_run(
+                id,
+                RunEnd {
+                    outcome: outcome.into(),
+                    ended_at: "2026-01-01T04:00:00Z".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end")
+        };
+        // MT-1 finished: an OLD stopped run, then a newer completed one (its actual latest run).
+        // Its stopped run is the oldest thing in the store — far off any recency page.
+        let stale = seed("MT-1", "2026-01-01T00:00:00Z");
+        end(stale, OUTCOME_STOPPED);
+        end(seed("MT-1", "2026-01-01T01:00:00Z"), OUTCOME_COMPLETED);
+        // MT-2 genuinely stopped: its newest run is the stopped one.
+        end(seed("MT-2", "2026-01-01T03:00:00Z"), OUTCOME_STOPPED);
+
+        // The pre-existing `outcome` filter returns MT-1's STALE row too — the bug this parameter
+        // exists to avoid. Pin it so a future refactor cannot quietly redefine `outcome`.
+        let by_outcome = st
+            .list_issue_runs(RunFilter {
+                outcome: OUTCOME_STOPPED.into(),
+                ..Default::default()
+            })
+            .expect("by outcome");
+        let mut seen: Vec<&str> = by_outcome
+            .iter()
+            .map(|r| r.issue_identifier.as_str())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, ["MT-1", "MT-2"], "outcome filters before grouping");
+
+        // `latest_outcome` keeps only the issue whose NEWEST run carries it.
+        let stopped = st
+            .list_issue_runs(RunFilter {
+                latest_outcome: OUTCOME_STOPPED.into(),
+                ..Default::default()
+            })
+            .expect("latest stopped");
+        assert_eq!(stopped.len(), 1, "MT-1's newest run is completed");
+        assert_eq!(stopped[0].issue_identifier, "MT-2");
+        assert_eq!(stopped[0].outcome, OUTCOME_STOPPED);
+
+        let completed = st
+            .list_issue_runs(RunFilter {
+                latest_outcome: OUTCOME_COMPLETED.into(),
+                ..Default::default()
+            })
+            .expect("latest completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].issue_identifier, "MT-1");
+        assert_eq!(completed[0].started_at, "2026-01-01T01:00:00Z");
+
+        // `latest_outcome` composes with the other pre-partition filters.
+        let scoped = st
+            .list_issue_runs(RunFilter {
+                issue: "MT-1".into(),
+                latest_outcome: OUTCOME_STOPPED.into(),
+                ..Default::default()
+            })
+            .expect("scoped");
+        assert!(scoped.is_empty(), "MT-1's latest run is not stopped");
     }
 
     // TRA-320 Defect 2: the day totals are a whole-store SUM, not a fold over a page — with more
@@ -3331,6 +3660,261 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Per-run provenance (STUDIO-909)
+    // ---------------------------------------------------------------------------------------------
+
+    fn provenance_fixture(harness: &str, model: &str, provider: &str) -> RunProvenance {
+        RunProvenance {
+            harness: harness.into(),
+            harness_origin: "profile".into(),
+            model: model.into(),
+            model_origin: format!("review.model.{harness}"),
+            provider: provider.into(),
+        }
+    }
+
+    fn start_provenance_run(store: &Sqlite, key: &str) -> i64 {
+        store
+            .start_run(RunStart {
+                issue_id: format!("iss_{key}"),
+                issue_identifier: key.into(),
+                title: format!("run {key}"),
+                started_at: "2026-09-15T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start_run")
+    }
+
+    // STUDIO-926 — a ticket's cost is EVERY run that spent on it. `list_issue_runs` keeps one row
+    // per key, so a sum over it drops earlier rounds; the ledger must not. Three runs under one
+    // key across two providers, one estimated, plus a legacy run with no provenance and an
+    // unattributed run (empty identifier) that must not appear at all.
+    #[test]
+    fn run_costs_sums_every_run_per_key_and_provider() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let end = |id: i64, total: i64, estimated: bool| {
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: OUTCOME_COMPLETED.into(),
+                        total_tokens: total,
+                        usage_estimated: estimated,
+                        ..Default::default()
+                    },
+                )
+                .expect("end");
+        };
+        let fw = provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai");
+        let an = provenance_fixture("claude", "claude-sonnet-4", "anthropic");
+        let a = start_provenance_run(&store, "T-1");
+        let b = start_provenance_run(&store, "T-1");
+        let c = start_provenance_run(&store, "T-1");
+        let legacy = start_provenance_run(&store, "T-2");
+        store.set_run_provenance(a, &fw).expect("set");
+        store.set_run_provenance(b, &fw).expect("set");
+        store.set_run_provenance(c, &an).expect("set");
+        end(a, 100, false);
+        end(b, 50, true);
+        end(c, 7, false);
+        end(legacy, 9, false);
+        let orphan = store
+            .start_run(RunStart {
+                issue_id: "x".into(),
+                started_at: "2026-09-15T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start");
+        end(orphan, 999, false);
+
+        let got = store.run_costs().expect("run_costs");
+        let row = |k: &str, p: &str, t: i64, e: bool| RunCostBucket {
+            issue_identifier: k.into(),
+            provider: p.into(),
+            total_tokens: t,
+            usage_estimated: e,
+        };
+        assert_eq!(
+            got,
+            vec![
+                row("T-1", "anthropic", 7, false),
+                row("T-1", "fireworks-ai", 150, true),
+                row("T-2", "", 9, false),
+            ]
+        );
+    }
+
+    // Provenance round-trips through its own table, and a run that never recorded any reads back as
+    // `None` — the "unknown" the console renders for a pre-STUDIO-909 row rather than a guess.
+    #[test]
+    fn run_provenance_round_trips_and_is_absent_for_a_legacy_run() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let with = start_provenance_run(&store, "with");
+        let legacy = start_provenance_run(&store, "legacy");
+        let p = provenance_fixture(
+            "opencode",
+            "fireworks-ai/deepseek-v4p1-flash",
+            "fireworks-ai",
+        );
+        store.set_run_provenance(with, &p).expect("set");
+
+        assert_eq!(store.run_provenance(with).expect("get"), Some(p.clone()));
+        assert_eq!(store.run_provenance(legacy).expect("get"), None);
+
+        // The page read returns only the runs that HAVE a row; a legacy id is absent, not zeroed.
+        let batch = store.load_run_provenances(&[with, legacy]).expect("batch");
+        assert_eq!(batch.get(&with), Some(&p));
+        assert!(!batch.contains_key(&legacy));
+        assert!(store.load_run_provenances(&[]).expect("empty").is_empty());
+
+        // A rewrite replaces the row rather than failing on the primary key.
+        let rewritten = provenance_fixture("claude", "claude-sonnet-4", "anthropic");
+        store.set_run_provenance(with, &rewritten).expect("rewrite");
+        assert_eq!(store.run_provenance(with).expect("get"), Some(rewritten));
+    }
+
+    // The cost question this exists to answer: every token in the WINDOW attributed to the provider
+    // that spent it, summed over that window's rows rather than one page. A run with no provenance
+    // row is a different bucket — it is absent entirely, never folded into the empty-string provider
+    // — and a run BEFORE the window is excluded, so `providers` decomposes `day_totals`'s totals
+    // rather than an unbounded lifetime figure sitting beside a windowed one (STUDIO-909 round 1).
+    #[test]
+    fn tokens_by_provider_sums_every_matching_run_in_the_window() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let fireworks_a = start_provenance_run(&store, "fw-a");
+        let fireworks_b = start_provenance_run(&store, "fw-b");
+        let anthropic = start_provenance_run(&store, "an");
+        let unattributed = start_provenance_run(&store, "none");
+        for (id, p) in [
+            (
+                fireworks_a,
+                provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            ),
+            (
+                fireworks_b,
+                provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            ),
+            (
+                anthropic,
+                provenance_fixture("claude", "claude-sonnet-4", "anthropic"),
+            ),
+        ] {
+            store.set_run_provenance(id, &p).expect("set");
+            store
+                .end_run(
+                    id,
+                    RunEnd {
+                        outcome: OUTCOME_COMPLETED.into(),
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        total_tokens: 120,
+                        ..Default::default()
+                    },
+                )
+                .expect("end");
+        }
+        // No provenance row: its tokens must not appear under any provider.
+        store
+            .end_run(
+                unattributed,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 9999,
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        // BEFORE the window, with provenance: it must not be bucketed, or `providers` would answer a
+        // different question than the `day_totals` it ships beside.
+        let before = store
+            .start_run(RunStart {
+                issue_id: "iss_old".into(),
+                issue_identifier: "old".into(),
+                title: "pre-window".into(),
+                started_at: "2026-09-01T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start pre-window");
+        store
+            .set_run_provenance(
+                before,
+                &provenance_fixture("opencode", "fireworks-ai/dsv4", "fireworks-ai"),
+            )
+            .expect("set pre-window");
+        store
+            .end_run(
+                before,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 5000,
+                    ..Default::default()
+                },
+            )
+            .expect("end pre-window");
+
+        let tallies = store
+            .tokens_by_provider("2026-09-15T00:00:00Z")
+            .expect("tokens_by_provider");
+        assert_eq!(
+            tallies.len(),
+            2,
+            "only the two attributed providers: {tallies:?}"
+        );
+        let fw = &tallies[0];
+        assert_eq!(fw.provider, "fireworks-ai");
+        assert_eq!(fw.runs, 2);
+        assert_eq!(fw.input_tokens, 200);
+        assert_eq!(fw.output_tokens, 20);
+        assert_eq!(fw.total_tokens, 240);
+        let an = &tallies[1];
+        assert_eq!(an.provider, "anthropic");
+        assert_eq!(an.runs, 1);
+        assert_eq!(an.total_tokens, 120);
+        assert!(
+            tallies.iter().all(|t| t.total_tokens != 9999),
+            "an unattributed run has no provider to be summed under"
+        );
+        assert!(
+            tallies.iter().all(|t| t.total_tokens != 5000),
+            "a run before the window must not be bucketed: {tallies:?}"
+        );
+    }
+
+    // A database already at the shipped step-9 schema gains the provenance table rather than
+    // re-running an earlier step or failing; it starts empty, so every pre-existing run stays
+    // "unknown".
+    #[test]
+    fn a_v9_database_gains_the_provenance_table_empty() {
+        let scratch = scratch_dir();
+        let db = scratch.join("v9.db");
+        {
+            let mut conn = Connection::open(&db).expect("open raw");
+            let tx = conn.transaction().expect("tx");
+            for m in &MIGRATIONS[0..9] {
+                tx.execute_batch(m).expect("apply step");
+            }
+            tx.execute_batch("PRAGMA user_version = 9")
+                .expect("stamp v9");
+            tx.commit().expect("commit");
+        }
+
+        let store = Sqlite::open(StorePath::Disk(db)).expect("migrate forward");
+        let version: i64 = store
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let runs = store.list_runs(RunFilter::default()).expect("list");
+        assert!(runs.is_empty());
+        assert!(
+            store
+                .tokens_by_provider("1970-01-01T00:00:00Z")
+                .expect("tally")
+                .is_empty()
+        );
+    }
+
     // A database already at the shipped step-7 schema migrates forward to step 8 rather than
     // re-running step 7 (which would not add the column) or failing: the ALTER backfills every
     // existing row with the empty author the selection path fails closed on.
@@ -3742,8 +4326,12 @@ mod tests {
         }
         assert_eq!(
             divergent,
-            vec!["rhapsody_review_watch".to_string()],
-            "exactly one documented divergent object exists today (README `Divergences`)"
+            vec![
+                "rhapsody_review_watch".to_string(),
+                "rhapsody_summon_watermark".to_string(),
+                "rhapsody_run_provenance".to_string(),
+            ],
+            "exactly the documented divergent objects exist today (README `Divergences`)"
         );
     }
 
@@ -3763,5 +4351,130 @@ mod tests {
             "only the literal `rhapsody_` prefix is excluded; a look-alike must still be compared \
              against the golden"
         );
+    }
+
+    // --- the summons watermark (STUDIO-885) ---------------------------------------------------
+
+    fn watermark(identifier: &str, at: &str, body: &str) -> SummonWatermark {
+        SummonWatermark {
+            identifier: identifier.into(),
+            at: at.into(),
+            body: body.into(),
+        }
+    }
+
+    // A ticket nobody has ever summoned has no row, and that is Ok(None) rather than an error —
+    // the caller reads this for EVERY candidate on every poll, so "absent" must be the cheap,
+    // ordinary answer.
+    #[test]
+    fn summon_watermark_absent_is_none() {
+        let st = open_mem();
+        assert_eq!(
+            st.summon_watermark("STUDIO-879").expect("read"),
+            None,
+            "never-summoned ticket has no watermark"
+        );
+    }
+
+    // Time and body are written and read back as ONE comment (INF-448), keyed by identifier.
+    #[test]
+    fn summon_watermark_round_trips() {
+        let st = open_mem();
+        st.record_summon_watermark(watermark(
+            "STUDIO-879",
+            "2026-09-13T04:29:21Z",
+            "@symphony the hindsight tier is still 404ing",
+        ))
+        .expect("record");
+        let got = st.summon_watermark("STUDIO-879").expect("read");
+        assert_eq!(
+            got,
+            Some(watermark(
+                "STUDIO-879",
+                "2026-09-13T04:29:21Z",
+                "@symphony the hindsight tier is still 404ing",
+            ))
+        );
+        assert_eq!(
+            st.summon_watermark("STUDIO-880").expect("read other"),
+            None,
+            "the row is keyed by identifier; another ticket must not see it"
+        );
+    }
+
+    // Last write wins, ON CONFLICT, for BOTH columns together — never a new row, and never a
+    // timestamp left describing a different comment's body.
+    #[test]
+    fn summon_watermark_upserts_in_place() {
+        let st = open_mem();
+        st.record_summon_watermark(watermark("STUDIO-879", "2026-09-13T04:29:21Z", "first"))
+            .expect("record first");
+        st.record_summon_watermark(watermark("STUDIO-879", "2026-09-13T16:21:00Z", "second"))
+            .expect("record second");
+        assert_eq!(
+            st.summon_watermark("STUDIO-879").expect("read"),
+            Some(watermark("STUDIO-879", "2026-09-13T16:21:00Z", "second")),
+            "the newer observation replaces both columns"
+        );
+        let rows: i64 = st
+            .lock()
+            .query_row("SELECT COUNT(*) FROM rhapsody_summon_watermark", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(rows, 1, "upsert, not insert");
+    }
+
+    // Retention applies to the watermark on the SAME cutoff as the runs it is compared against: a
+    // watermark whose run history has just been pruned has nothing left to be newer than.
+    #[test]
+    fn prune_drops_watermarks_past_retention() {
+        let st = open_mem();
+        st.record_summon_watermark(watermark("OLD", &days_ago_rfc3339(40), "old"))
+            .expect("record OLD");
+        st.record_summon_watermark(watermark("NEW", &days_ago_rfc3339(1), "new"))
+            .expect("record NEW");
+
+        st.prune(0).expect("prune 0");
+        assert!(
+            st.summon_watermark("OLD").expect("read OLD").is_some(),
+            "retention 0 keeps everything forever"
+        );
+
+        st.prune(30).expect("prune 30");
+        assert_eq!(
+            st.summon_watermark("OLD").expect("read OLD"),
+            None,
+            "a watermark older than retention is pruned"
+        );
+        assert!(
+            st.summon_watermark("NEW").expect("read NEW").is_some(),
+            "a watermark inside retention survives"
+        );
+    }
+
+    // The canonical column format is fixed-width, which is what makes prune's string comparison a
+    // chronological one — and it is EXACTLY round-trip stable, so a summons whose source reports
+    // sub-second precision renders to the same string on every poll instead of being rewritten
+    // forever because its stored form lost a fraction of a second.
+    #[test]
+    fn format_summon_at_is_canonical_and_stable() {
+        let precise = chrono::DateTime::parse_from_rfc3339("2026-09-13T04:29:21.837Z")
+            .expect("parse")
+            .with_timezone(&chrono::Utc);
+        let once = crate::format_summon_at(precise);
+        assert_eq!(once, "2026-09-13T04:29:21Z", "seconds precision, Z suffix");
+        let reparsed = chrono::DateTime::parse_from_rfc3339(&once)
+            .expect("reparse")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            crate::format_summon_at(reparsed),
+            once,
+            "formatting the stored value again must not move it"
+        );
+        // Fixed width: every rendering is the same length, so `<` on the strings is `<` in time.
+        let later = crate::format_summon_at(precise + chrono::Duration::days(400));
+        assert_eq!(later.len(), once.len());
+        assert!(once < later, "lexicographic order is chronological order");
     }
 }

@@ -2660,6 +2660,39 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::DayRollup>, rhapsody_store::StoreError> {
             self.0.metrics(a0, a1)
         }
+        fn set_run_provenance(
+            &self,
+            a0: i64,
+            a1: &rhapsody_store::RunProvenance,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.set_run_provenance(a0, a1)
+        }
+        fn run_provenance(
+            &self,
+            a0: i64,
+        ) -> Result<Option<rhapsody_store::RunProvenance>, rhapsody_store::StoreError> {
+            self.0.run_provenance(a0)
+        }
+        fn load_run_provenances(
+            &self,
+            a0: &[i64],
+        ) -> Result<
+            std::collections::HashMap<i64, rhapsody_store::RunProvenance>,
+            rhapsody_store::StoreError,
+        > {
+            self.0.load_run_provenances(a0)
+        }
+        fn tokens_by_provider(
+            &self,
+            a0: &str,
+        ) -> Result<Vec<rhapsody_store::ProviderTokens>, rhapsody_store::StoreError> {
+            self.0.tokens_by_provider(a0)
+        }
+        fn run_costs(
+            &self,
+        ) -> Result<Vec<rhapsody_store::RunCostBucket>, rhapsody_store::StoreError> {
+            self.0.run_costs()
+        }
         fn insert_run_message(
             &self,
             a0: i64,
@@ -2738,6 +2771,18 @@ mod tests {
             &self,
         ) -> Result<Vec<rhapsody_store::ReviewWatchRow>, rhapsody_store::StoreError> {
             self.0.load_live_review_watch()
+        }
+        fn record_summon_watermark(
+            &self,
+            a0: rhapsody_store::SummonWatermark,
+        ) -> Result<(), rhapsody_store::StoreError> {
+            self.0.record_summon_watermark(a0)
+        }
+        fn summon_watermark(
+            &self,
+            a0: &str,
+        ) -> Result<Option<rhapsody_store::SummonWatermark>, rhapsody_store::StoreError> {
+            self.0.summon_watermark(a0)
         }
         fn prune(&self, a0: i64) -> Result<(), rhapsody_store::StoreError> {
             self.0.prune(a0)

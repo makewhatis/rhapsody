@@ -6,6 +6,7 @@ export { NavItem, type NavItemProps } from "./NavItem";
 export { Button, type ButtonProps, type ButtonVariant } from "./Button";
 export { Card, type CardProps } from "./Card";
 export { Chip, type ChipProps } from "./Chip";
+export { DisplayOptions, type DisplayOptionsProps } from "./DisplayOptions";
 export { ExternalLink, type ExternalLinkProps } from "./ExternalLink";
 export { Markdown, type MarkdownProps } from "./Markdown";
 export { Note, type NoteProps, type NoteVariant } from "./Note";
@@ -38,4 +39,4 @@ export {
   type StatProps,
   type TeammateAvatarProps,
 } from "./layout";
-export { InfoIcon, JobsIcon, MemoryIcon, SettingsIcon, TeamsIcon, WarnIcon } from "./icons";
+export { InfoIcon, JobsIcon, MemoryIcon, SettingsIcon, SlidersIcon, TeamsIcon, WarnIcon } from "./icons";

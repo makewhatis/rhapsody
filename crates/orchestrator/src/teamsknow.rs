@@ -418,9 +418,10 @@ impl Key {
 ///
 /// The verdict is `status`, which is one of the `REVIEW_STATUS_*` values the watcher records:
 /// `approved` is the reviewer finding nothing, `reviewed` is findings posted, `truncated` is a
-/// round that ran out of turns mid-review and therefore is NOT a verdict at all. Reporting those
-/// three as one would be the confident wrongness this design exists to stop, so the raw status
-/// travels and slice 3 renders it.
+/// round that ended without a declared verdict (turns exhausted, or a hand-off with an unreadable
+/// payload — STUDIO-894) and therefore is NOT a verdict at all. Reporting those three as one would
+/// be the confident wrongness this design exists to stop, so the raw status travels and slice 3
+/// renders it.
 ///
 /// [`ReviewWatchRow`](rhapsody_store::ReviewWatchRow) also carries `requested_sha`,
 /// `last_reviewed_sha` and `introduced_by`. None of them is here: §9.3's minimal projection admits

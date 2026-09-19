@@ -68,6 +68,23 @@ identity is unforgeable), `teams_invalidate`, `teams_reinstate`, `teams_room_rea
 `teams_post`. Direct message to a live teammate arrives mid-turn with a "TEAMMATE MESSAGE"
 wrap (never operator authority); to a sleeping one it waits in the room.
 
+## Which CLI a teammate runs on
+
+A profile's **`harness:`** front-matter field picks the coding-agent backend that teammate's runs
+use — `claude` or `opencode` today (`codex` is a recognized name with no runner yet and falls back
+to the configured backend, with a warning). Empty — the shipped default for every built-in profile
+— inherits the daemon's configured `agent.backend`, so an installation that never writes `harness:`
+anywhere is unaffected. `rhapsodyd teams show <name>` renders the resolved value with its origin,
+and marks it when this build can't actually run it. (If you point a profile at `opencode`, set
+`opencode.command` to an **absolute path**: a bare `opencode` can resolve to a broken npm-global
+install ahead of a working one on `PATH`, exiting 1 without running anything.)
+
+⚠️ **A model name is meaningless without its harness.** `claude-opus-5` is a Claude model name;
+handed to an opencode teammate it reaches that provider as an unrecognized model, and the run fails
+outright rather than degrading gracefully — every review assigned to that teammate fails, and with
+few reviewers configured a required verdict can become unobtainable. This is exactly why
+`review.model`/`review.effort` below are scoped per harness rather than a single string.
+
 ## The room
 
 An append-only JSONL log (`~/.rhapsody/teams/room/YYYY-MM-DD.jsonl`), single-writer (the
@@ -123,6 +140,44 @@ repair as a per-project advisory on `GET /api/v1/projects`.
 A findings verdict also posts a completion comment carrying the summon token, which reopens
 the author's run. An approved one posts a deliberately **tokenless** note, so nothing wakes.
 
+**A review run can use its own model, scoped per harness.** `review.model` / `review.effort`
+override the routed reviewer's own profile for a review run specifically — unset, the default,
+means the review inherits whatever model that reviewer's profile would have used anyway. Both are
+maps from harness name to value (`review.model: { claude: ..., opencode: ... }`); a legacy bare
+scalar (`review.model: claude-opus-5`) still parses and resolves against the installation's own
+configured `agent.backend`. ⚠️ If a model is configured for some harness but not the one the routed
+reviewer's runs actually use, the review is **refused** rather than sent to the wrong provider or
+silently downgraded to a cheaper model — this is the trap above, closed by config. `review.effort`
+in the same situation just inherits, since an effort value can't make a provider reject a model.
+
+**A cleared review can merge itself.** `review.auto_merge` (default `false`) lets the daemon merge
+a pull request once every reviewer has recorded a non-blocking verdict at its current head and CI
+is green. It never arms GitHub's own auto-merge — it checks green once and merges immediately or
+not at all — and it refuses a draft pull request outright. A branch that has fallen behind is never
+merged on its existing approval either: if the repository allows it, the daemon updates the branch
+itself, which moves the head and arms a fresh review round rather than merging (see `operating.md`
+for the two GitHub repository settings this depends on).
+
+**`auto_merge` can be scoped per project.** The top-level `teams.review.auto_merge` is the
+installation-wide default; a top-level `projects:` entry overrides it for the Linear project
+slugs it names, so one repo can be held for a human while a sibling still merges itself:
+
+```yaml
+review:
+  auto_merge: true
+projects:
+  - slugs: [4f4a2350682f]   # the Linear project slugId, NOT its display name
+    review:
+      auto_merge: false      # this repo is merged by a human
+```
+
+`slugs:` takes the same values as `WORKFLOW.md`'s own `projects:` list — Linear's opaque
+**`slugId` hex** — never the project's display name; the daemon warns at boot about any slug that
+matches nothing. An unset override inherits the global value, both directions. When a project fans
+out to several slugs that share one repo, their answers are ANDed: to **hold a merge back**, name
+any one slug; to **opt in under a global `false`**, name **every** slug, or an unnamed sibling
+inherits `false` and keeps the repo human-merged.
+
 ## Planning work for an installation (the operational rules)
 
 - Under the shipped `claim_mode: assignee`, a ticket is claimable only when **all** of these
@@ -160,7 +215,9 @@ allowed to merge is your team's decision, and this skill does not have one.
   + compose, per-teammate memory + invalidate). Settings → Teams edits `teams.yaml`.
 - **API** (find the port: `pgrep -fl rhapsodyd` → `--port N`):
   `GET /api/v1/version` (`teams_enabled`), `GET /api/v1/teams` (roster + live status),
-  `GET/POST /api/v1/teams/room`, `GET /api/v1/teams/recall?identity=&query=`.
+  `GET/POST /api/v1/teams/room`, `GET /api/v1/teams/recall?identity=&query=`,
+  `GET /api/v1/runs/{id}/provenance` (the harness, model and provider a run actually dispatched
+  with, and each value's origin — recorded once at dispatch, never re-derived from live config).
 - **CLI**: `rhapsodyd teams show` (resolved roster), `rhapsodyd teams fork <profile>`.
 - **Files**: `~/.rhapsody/teams.yaml`, `teams/room/*.jsonl`, `teams/banks/<name>/*.md`,
   `teams/profiles/`.

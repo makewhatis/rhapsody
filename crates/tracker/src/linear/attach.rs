@@ -1,37 +1,88 @@
-//! GitHub pull-request attachments — the link that makes a summons on a pull request reach the
-//! ticket that pull request belongs to (STUDIO-875). **No Go v0.4.0 counterpart**: Symphony only
-//! ever READ attachments, on the assumption that Linear's own GitHub integration had written them.
+//! GitHub pull-request attachments — putting a clickable link to the pull request on the ticket
+//! (STUDIO-875, corrected by STUDIO-882). **No Go v0.4.0 counterpart**: Symphony only ever READ
+//! attachments, on the assumption that Linear's own GitHub integration had written them.
 //!
-//! # Why the daemon writes this at all
+//! # What this write is for, and what it was believed to be for
 //!
-//! `apply_github_summons` attributes a summoning PR comment to an issue by walking that issue's
-//! `linked_prs`, and `linked_prs` is built in `normalize` from the issue's GitHub attachments. On a
-//! workspace where the repository is not connected in Linear's GitHub integration every issue comes
-//! back with `attachments: []`, so the walk has nothing to walk: a review that files findings posts
-//! a perfectly good `@rhapsody` comment and the daemon then drops it on every poll, forever, while
-//! the board looks exactly like "the reviewer approved and there is nothing to do".
+//! It was shipped to repair summons routing. `apply_github_summons` attributes a summoning PR
+//! comment to an issue by walking that issue's `linked_prs`, which `normalize` builds from the
+//! issue's GitHub attachments; on a workspace whose repository is not connected in Linear's GitHub
+//! integration every issue comes back with `attachments: []`, so a review that files findings posts
+//! a perfectly good `@rhapsody` comment and the daemon drops it on every poll, forever.
 //!
-//! Connecting the repository in Linear fixes it for that repository, invisibly to anyone reading
-//! the code, and silently omits the next repository somebody adds. Writing the attachment from the
-//! daemon — which knows the ticket and the pull request the moment it resolves one for the other —
-//! fixes it for every repository the daemon will ever touch.
+//! **That is not what this write achieves, and STUDIO-882 measured it rather than reasoning about
+//! it.** Read back off the live API, an attachment this function wrote for a repository with no
+//! GitHub integration answers:
+//!
+//! ```text
+//! sourceType: "api"      metadata: {}
+//! ```
+//!
+//! where an integration-written attachment on a CONNECTED repository answers:
+//!
+//! ```text
+//! sourceType: "github"   metadata: { url, number, status, mergedAt, … }
+//! ```
+//!
+//! So [`normalize::is_github_pr`](super::normalize) rejects it on the `sourceType` gate, and even
+//! with that gate widened `linked_prs` would still get nothing, because it is built by matching a
+//! pull-request url out of `metadata.url` and `metadata` is empty. There is no attachment this
+//! daemon can write on an unconnected repository that `linked_prs` will accept. Summons routing
+//! moved to the daemon's own record of the link instead (`ghenrich::DaemonPrLinks`).
+//!
+//! Precisely what was measured, since mistaking an inference for an observation is how the original
+//! claim survived review: the FIRST shape is this mutation's own output, the second is the
+//! INTEGRATION's. Whether this mutation would yield `"github"` on a connected repository was not
+//! tested, and does not matter — there the integration has already written the attachment.
+//!
+//! What the write still does, and the only reason it survives, is put `makewhatis/rhapsody#159`
+//! on the Linear issue as a link a PERSON can click. On an unconnected repository nothing else
+//! does.
 //!
 //! # `attachmentLinkGitHubPR`, not `attachmentLinkURL`
 //!
-//! [`normalize::is_github_pr`](super::normalize) admits an attachment only when its `sourceType` is
-//! `"github"`, and that field is not caller-supplied: it comes from WHICH link mutation created the
-//! attachment. A generic `attachmentLinkURL` would create an attachment that is visible in Linear,
-//! points at the right pull request, and is still invisible to `linked_prs` — the original failure
-//! wearing a hat. So the GitHub-specific mutation is load-bearing, not cosmetic.
+//! Kept, but no longer for the stated reason. The claim was that the mutation, not the caller,
+//! decides `sourceType`, so the GitHub-specific one yields `"github"` and the generic one would not
+//! — load-bearing, not cosmetic. The first half is true and the conclusion is false: what the
+//! mutation yields on an UNCONNECTED repository is `"api"`, the same as the generic one would, so
+//! neither reaches `linked_prs`. It is kept because on a repository that IS connected it is the
+//! honest mutation for what is being linked, and switching it now would be an unmeasured change to
+//! the case that works, for no gain in the case that does not.
 //!
 //! # Repeats
 //!
-//! Linear keys a link attachment on (issue, url), so re-linking a pull request already attached to
-//! the same issue is expected to be a no-op. Nothing here DEPENDS on that: the caller's own gate
-//! (`prlink::link_pr_best_effort` — "this ticket already links the pull request that was just
-//! resolved") is what keeps a working installation from writing at all, and a duplicate that got
-//! through would give `linked_prs` two equal entries, which the summons walk attributes twice and
-//! advances once. Untidy in Linear's UI, harmless to the routing.
+//! Linear answers a second write of the same pull request with a REFUSAL rather than a no-op.
+//! Measured against the live API (STUDIO-904), the refusal is:
+//!
+//! ```text
+//! code INPUT_ERROR      path ["attachmentLinkGitHubPR"]
+//! message "Duplicate attachment for duplicate url"
+//! ```
+//!
+//! **That refusal is not a failure here.** The post-condition this write exists for is "the ticket
+//! links this pull request", and a duplicate error proves it — so [`link_pull_request`] returns
+//! `Ok` for it, classified on the refusal's machine-readable SHAPE: `INPUT_ERROR` on the
+//! `attachmentLinkGitHubPR` path **and** the top-level `message`
+//! `"Duplicate attachment for duplicate url"`. All three coordinates are required, because
+//! `INPUT_ERROR` is Linear's general user-error bucket for this mutation and the same bucket
+//! carries refusals that never linked anything — a URL Linear rejects as not a pull request. The
+//! `message` is the developer-facing error identity; `userPresentableMessage`, the English
+//! sentence Linear shows a person, is still never consulted. Every other refusal is an error.
+//!
+//! What was measured is that a repeat of the SAME (issue, url) is refused — every observed refusal
+//! is one ticket retrying its own pull request. Whether Linear's uniqueness is scoped per-issue or
+//! globally per-URL is an inference the message (`"An attachment with the same URL already
+//! exists."`) does not settle, and it does not matter here: this write only ever links a pull
+//! request to the one ticket that resolved it (`prlink` passes the parent's own target, never the
+//! review sub-issues), so two tickets never race for one URL. Stated because mistaking an inference
+//! for an observation is how this module's original claim survived review.
+//!
+//! The caller's own gate (`prlink::link_pr_best_effort` — "this ticket already links the pull
+//! request that was just resolved") still keeps a healthy installation from writing at all. This
+//! earns its place where that gate cannot see the link: it is built from the ticket's `linked_prs`,
+//! and a daemon-written attachment on a repository with no GitHub integration never enters
+//! `linked_prs` at all (see this module's opening section) — so the ticket's own first write goes
+//! on to be retried by the next run, and this is the answer to that retry.
 
 use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, query};
@@ -71,6 +122,12 @@ struct AttachmentIdNode {
 /// write that reports success without producing anything, and for the same reason: a caller must be
 /// able to tell that the link did not land, because the whole point of the call is that something
 /// LATER reads the attachment back.
+///
+/// The one refusal that is NOT an error is a duplicate: Linear answering
+/// [`INPUT_ERROR` + `attachmentLinkGitHubPR` + the duplicate message](LinearErrorKind::DuplicateAttachment)
+/// means this issue already links this pull request, so the link landed — just not from this call.
+/// The message coordinate is what keeps this from absorbing the rest of `INPUT_ERROR`, which is
+/// Linear's general user-error bucket for the mutation. See the module doc's "Repeats".
 pub(super) async fn link_pull_request(
     c: &Client,
     issue_id: &str,
@@ -85,9 +142,18 @@ pub(super) async fn link_pull_request(
             .into());
         }
         let vars = json!({ "issueId": issue_id, "url": url });
-        let resp: AttachmentLinkResp = c
+        let resp: AttachmentLinkResp = match c
             .do_graphql(query::MUTATION_ATTACHMENT_LINK_GITHUB_PR, Some(vars))
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            // The link the caller asked for is already there. See the module doc's "Repeats":
+            // this is the one refusal that proves the post-condition holds.
+            Err(TrackerError::Linear(e)) if e.kind == LinearErrorKind::DuplicateAttachment => {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let id = resp
             .attachment_link
             .attachment
@@ -132,9 +198,13 @@ mod tests {
     const PR_URL: &str = "https://github.com/makewhatis/rhapsody/pull/154";
 
     /// The mutation carries exactly the two coordinates the link needs, and it is the GitHub-PR
-    /// mutation rather than the generic URL one — which is the whole of STUDIO-875: an attachment
-    /// whose `sourceType` is not `"github"` never reaches `Issue::linked_prs`, so the summons that
-    /// lands on the pull request still reaches nobody.
+    /// mutation rather than the generic URL one.
+    ///
+    /// STUDIO-882 note: this pins WHICH mutation is sent, and nothing more. It does NOT show that
+    /// the resulting attachment reaches `Issue::linked_prs` — measured against the live API, on an
+    /// unconnected repository it does not (`sourceType: "api"`, `metadata: {}`; see the module
+    /// doc). That gap between "the write is well-formed" and "the write counts" is what let 875
+    /// ship green and not work.
     #[tokio::test]
     async fn link_pull_request_sends_the_github_pr_mutation_with_the_issue_and_url() {
         let seen: Arc<Mutex<(String, serde_json::Value)>> =
@@ -194,6 +264,108 @@ mod tests {
             .await
             .expect_err("an empty attachment id must error");
         assert!(is_kind(&err, LinearErrorKind::MoveRejected), "got {err:?}");
+    }
+
+    /// STUDIO-904's whole fix, at the boundary where the answer arrives: Linear refusing a second
+    /// write of the same pull request means the link is there, so the call succeeds.
+    ///
+    /// The payload is the live refusal, verbatim (`~/.rhapsody/logs/rhapsodyd.2026-09-15.log`,
+    /// 05:33). A mutation that stops classifying it — `classify_graphql_errors` returning
+    /// `GraphqlErrors`, or this function no longer matching the kind — reds here.
+    #[tokio::test]
+    async fn a_duplicate_attachment_is_success_because_the_link_is_already_there() {
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{
+                        "code":"INPUT_ERROR","statusCode":400,"type":"invalid input",
+                        "userError":true,
+                        "userPresentableMessage":"An attachment with the same URL already exists."
+                    },
+                    "locations":[{"column":3,"line":3}],
+                    "message":"Duplicate attachment for duplicate url",
+                    "path":["attachmentLinkGitHubPR"]
+                }]}"#,
+            )
+        })
+        .await;
+        client_at(server.url())
+            .link_pull_request("iss-uuid", PR_URL)
+            .await
+            .expect("a duplicate means the link landed");
+    }
+
+    /// The other half of that boundary, and the half worth keeping: a refusal that only LOOKS like
+    /// a duplicate is still an error. Making every GraphQL refusal read as success would red this.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_a_duplicate_is_still_an_error() {
+        // Same path, different code — Linear refusing the mutation for another reason (a bad
+        // token, a renamed repo, an outage surfaces here too when it comes back as a GraphQL error).
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{"code":"INTERNAL_SERVER_ERROR","userPresentableMessage":"Something went wrong."},
+                    "message":"Something went wrong",
+                    "path":["attachmentLinkGitHubPR"]
+                }]}"#,
+            )
+        })
+        .await;
+        let err = client_at(server.url())
+            .link_pull_request("iss-uuid", PR_URL)
+            .await
+            .expect_err("a non-duplicate refusal must error");
+        assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
+    }
+
+    /// The STUDIO-904 review's pin, at the boundary: a different user error on the SAME mutation —
+    /// same code, same path, only the identity differs — must still be an error. `INPUT_ERROR` is
+    /// Linear's general user-error bucket, not a synonym for "duplicate", and a URL Linear rejects
+    /// as not a pull request is reachable here (`resolve_open_pr`'s attachment fallback can hand the
+    /// link a malformed URL; see `a_pull_request_the_link_set_cannot_speak_for_is_written` in
+    /// `prlink`). Absorbing it would log a link for a write that never landed.
+    #[tokio::test]
+    async fn a_non_duplicate_user_error_on_the_attachment_path_is_still_an_error() {
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{
+                        "code":"INPUT_ERROR","statusCode":400,"type":"invalid input",
+                        "userError":true,
+                        "userPresentableMessage":"That is not a valid GitHub pull request URL."
+                    },
+                    "message":"Invalid pull request url",
+                    "path":["attachmentLinkGitHubPR"]
+                }]}"#,
+            )
+        })
+        .await;
+        let err = client_at(server.url())
+            .link_pull_request("iss-uuid", "not-a-pull-request-url")
+            .await
+            .expect_err("a non-duplicate user error must error");
+        assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
+    }
+
+    /// And the wording is not the trigger: the identical English sentence on an error that does not
+    /// name the attachment mutation is a failure, so a fix keyed on the prose reds here.
+    #[tokio::test]
+    async fn the_presentable_message_alone_does_not_make_a_refusal_a_duplicate() {
+        let server = MockServer::start(|_| {
+            MockResp::ok(
+                r#"{"errors":[{
+                    "extensions":{"code":"INPUT_ERROR","userPresentableMessage":"An attachment with the same URL already exists."},
+                    "message":"something else entirely",
+                    "path":["issueUpdate"]
+                }]}"#,
+            )
+        })
+        .await;
+        let err = client_at(server.url())
+            .link_pull_request("iss-uuid", PR_URL)
+            .await
+            .expect_err("the shape, not the sentence, decides");
+        assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
     }
 
     /// Argument validation is local and refuses before any request is made, matching every other

@@ -65,6 +65,10 @@ pub(crate) struct FakeProvider {
     message_text: Mutex<String>,
     /// The canned `refresh` result (Go's `fakeProvider.refresh`).
     refresh_result: RefreshResult,
+    /// A REAL drain signal rather than a canned answer (STUDIO-880): arming and cancelling are the
+    /// behaviour the route tests are about, and a canned status could not show that a `POST` is what
+    /// changed the subsequent `GET`.
+    drain: rhapsody_orchestrator::drain::DrainSignal,
     /// The WORKFLOW.md path the config endpoints read/write (Go's `fakeProvider.workflowPath`); its
     /// parent dir is the `resolve` base in [`validate_config`].
     workflow_path: String,
@@ -125,6 +129,7 @@ impl FakeProvider {
         Self {
             snap,
             snap_err: None,
+            drain: rhapsody_orchestrator::drain::DrainSignal::new(),
             history: Arc::new(Noop),
             transcript: None,
             linear_projects: Vec::new(),
@@ -528,6 +533,23 @@ impl StateProvider for FakeProvider {
         self.refresh_result.clone()
     }
 
+    fn drain_status(&self) -> rhapsody_orchestrator::drain::DrainStatus {
+        self.drain.status()
+    }
+
+    fn set_drain(
+        &self,
+        active: bool,
+        reason: rhapsody_orchestrator::drain::DrainReason,
+    ) -> rhapsody_orchestrator::drain::DrainStatus {
+        if active {
+            self.drain.arm(chrono::Utc::now(), reason);
+        } else {
+            self.drain.disarm();
+        }
+        self.drain.status()
+    }
+
     fn workflow_path(&self) -> &str {
         &self.workflow_path
     }
@@ -779,7 +801,9 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         retrying: Vec::new(),
         totals: Totals::default(),
         rate_limits: Vec::new(),
+        drain: None,
         projects: Vec::new(),
+        review_divergence: Vec::new(),
     }
 }
 
