@@ -1141,15 +1141,19 @@ pub(crate) struct ReviewerExclusions {
     pub(crate) unpinnable: HashSet<String>,
 }
 
-/// The required reviewers [`rank_reviewers`] actually promotes into its pinned prefix, in
-/// declaration order — the **effective** pin set, as opposed to the configured
-/// [`Teams::review_required`] list.
+/// The required reviewers [`rank_reviewers`] promotes into its pinned prefix **and** the caller's
+/// clamp keeps — i.e. the first `review.effective_reviewers()` of them, in declaration order. The
+/// **effective** pin set, as opposed to the configured [`Teams::review_required`] list: a name the
+/// ranking never promoted, or a tail pin the caller's `truncate` drops, is not a pin a round must
+/// yield to.
 ///
 /// [`reviewwatch`](crate::reviewwatch)'s continuity guard is the caller: it must yield to a
 /// required reviewer only when one is genuinely going to jump the queue. Reading the raw config
 /// list there counted an `unpinnable` or off-roster name as a pin the ranking never made, which
 /// broke continuity to make way for a teammate who was not selected — and handed the round to
-/// whoever merely led on load (STUDIO-951, round 3).
+/// whoever merely led on load (STUDIO-951, round 3). Reading the promoted-but-untruncated prefix
+/// counted a tail pin beyond the clamp, which let a persisted incumbent hold the round against the
+/// declaration-order pin selection actually keeps (round 4).
 pub(crate) fn pinned_required_reviewers(
     teams: &Teams,
     author: &str,
