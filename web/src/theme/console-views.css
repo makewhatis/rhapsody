@@ -142,7 +142,10 @@
 .rh-console .btop .pill { margin-left: auto; }
 .rh-console .btitle { font-size: 12.5px; color: var(--ink-2); line-height: 1.35; }
 .rh-console .bmeta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-4); }
-.rh-console .bmeta .provbadge { padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+/* The same harness-chip treatment on a reviewer chip (STUDIO-952): the provider is metadata, so it
+   stays quiet mono text inside the chip rather than taking a status colour. */
+.rh-console .bmeta .provbadge,
+.rh-console .rchip .provbadge { padding: 0 5px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
 .rh-console .bchips { display: flex; flex-wrap: wrap; gap: 5px; }
 /* A reviewer chip: who, and how their review ended. `done` is GREEN here — the board's whole claim
    is "two green chips = two gates passed" — so it deliberately does not reuse the status Pill's
