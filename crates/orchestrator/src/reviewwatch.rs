@@ -2113,6 +2113,7 @@ mod tests {
         match &report.nudges[0] {
             crate::draftpoke::DraftNudge::Escalate(e) => {
                 assert_eq!(e.pr, coord(12));
+                assert_eq!(e.identifier, "STUDIO-721", "the origin ticket is named");
                 assert_eq!(e.author, "alice");
                 assert_eq!(e.pokes, 1, "poked once; the head never moved");
             }
@@ -2189,6 +2190,7 @@ mod tests {
         match &report.nudges[0] {
             crate::draftpoke::DraftNudge::Escalate(e) => {
                 assert_eq!(e.pr, coord(12));
+                assert_eq!(e.identifier, "STUDIO-721", "the origin ticket is named");
                 assert_eq!(e.author, "alice");
                 assert_eq!(e.pokes, crate::draftpoke::MAX_DRAFT_POKES);
             }
