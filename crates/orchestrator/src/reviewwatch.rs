@@ -681,7 +681,28 @@ impl Orchestrator {
         // per hold, because the cursor reaches only `MAX_PR_STATE_CALLS_PER_TICK` pull requests a
         // tick and a held round re-evaluated once per rotation would otherwise age out while the
         // watcher is sweeping every tick.
-        self.review_watch_swept = Some((self.now)());
+        //
+        // A stamp that has ITSELF aged past `CAPACITY_HOLD_TTL` means the watcher STOPPED between
+        // the two sweeps — a `gh` outage delivers no sweep event at all. The holds it left are
+        // already stale (`fresh_capacity_hold` ages them against this same stamp), but freshness
+        // only FILTERS on read and never removes, so they are still in the map and re-stamping
+        // liveness here would re-date every one of them — RESURRECTING a round nothing has
+        // re-observed since before the outage (STUDIO-950 round 12). A first sweep after a gap
+        // therefore DROPS them rather than re-dating them. The gap is stamp-to-stamp, so a healthy
+        // tick's per-observation hand-backs are microseconds apart and never trip it.
+        let swept_now = (self.now)();
+        if let Some(prev) = self.review_watch_swept {
+            // A clock that went backwards is not continuity either: treat it as a gap, so the holds
+            // are dropped rather than re-dated onto a stamp the wall clock can never outrun.
+            let gap = swept_now
+                .signed_duration_since(prev)
+                .to_std()
+                .unwrap_or(CAPACITY_HOLD_TTL);
+            if gap >= CAPACITY_HOLD_TTL {
+                self.review_capacity_held.clear();
+            }
+        }
+        self.review_watch_swept = Some(swept_now);
         let rows = match self.store().load_live_review_watch() {
             Ok(rows) => rows,
             Err(e) => {
@@ -724,13 +745,18 @@ impl Orchestrator {
         // the log's rate limit and re-emitting the very page this ticket closes. An unreached round
         // therefore KEEPS its hold, bounded only by the watcher's own liveness: while the watcher
         // keeps sweeping, `review_watch_swept` keeps advancing and the hold stays fresh however many
-        // rotations it takes to revisit the round; when the watcher stops, the stamp stops and
-        // `CAPACITY_HOLD_TTL` retires every hold.
+        // rotations it takes to revisit the round; when the watcher stops, the stamp stops, and the
+        // first sweep after it returns DROPS every hold the gap left behind (the check above) rather
+        // than re-dating them — freshness alone would only have filtered them on read, and
+        // re-stamping would have resurrected them (STUDIO-950 round 12).
         //
-        // The clear is deliberately NOT before the store read above (it now lives inside the
-        // per-observation servicing): a first hand-back whose WAL read failed decided nothing, so
-        // the tick's holds are unknown and the deliberate choice is to KEEP the previous tick's
-        // (still `CAPACITY_HOLD_TTL`-fresh) records rather than blank the map.
+        // The per-pull-request refresh is deliberately NOT before the store read above: a first
+        // hand-back whose WAL read failed decided nothing about its rounds, so the tick's holds
+        // there are unknown and the deliberate choice is to KEEP the previous tick's (still
+        // `CAPACITY_HOLD_TTL`-fresh) records rather than blank the map. The continuity clear above
+        // is a different thing and rightly precedes the read: a gap past the TTL means the holds
+        // were already stale whatever this hand-back decides, so dropping them cannot blank a live
+        // hold — it only stops a dead one from being resurrected.
         let fresh_budget = self.review_dispatch_budget();
         let mut slots = slots
             .map(|left| left.min(fresh_budget))
@@ -1411,7 +1437,11 @@ pub struct CapacityHold {
     /// reference for a hold that predates any sweep; the live reference is the watcher's own
     /// [`Orchestrator::review_watch_swept`] liveness, because the cursor may not revisit this round
     /// for several ticks and ageing the hold itself expired rounds a healthy watcher still held
-    /// (STUDIO-950 round 11).
+    /// (STUDIO-950 round 11). The fallback is a TEST AFFORDANCE, not a production state: the only
+    /// production insert site (`reviewwatch`) stamps `review_watch_swept` at the top of the same
+    /// call, and the stamp is never reset to `None`, so a hold in the map always implies a stamp.
+    /// The `reviewreconcile` fixtures insert holds directly and set no stamp, which is the only path
+    /// that reaches it.
     pub recorded: chrono::DateTime<chrono::Utc>,
 }
 
@@ -3674,6 +3704,73 @@ mod tests {
         assert!(
             o.review_divergences()[0].capacity_held.is_none(),
             "a hold no live sweep is refreshing must not be named"
+        );
+    }
+
+    /// STUDIO-950 (round 12): a hold that aged out during a watcher OUTAGE must not be RESURRECTED
+    /// by the first sweep after the watcher returns.
+    ///
+    /// Freshness ages on the watcher's liveness ([`Orchestrator::review_watch_swept`]) and only
+    /// FILTERS on read — it never removes. So when a `gh` outage stops the sweeps, the holds it left
+    /// are already stale by `CAPACITY_HOLD_TTL`, but they are still IN `review_capacity_held`, and
+    /// re-stamping liveness on the recovery sweep re-dates every one of them — including a round
+    /// nothing has re-observed since before the outage. The row then names a capacity reading (the
+    /// holders count and the key) taken before an outage during which those runs may all have
+    /// finished, which is a WRONG named cause — the class this ticket exists to remove.
+    ///
+    /// The sibling stale test advances the clock and never sweeps again, so it cannot see this: only
+    /// the watcher RETURNING and re-observing a DIFFERENT pull request exposes the resurrection.
+    ///
+    /// Mutation check: drop the continuity gap check in `handle_review_sweep_slots` and this reds —
+    /// the pre-outage `Some(4)` comes back as the row's `capacity_held`.
+    #[test]
+    fn a_capacity_hold_is_not_resurrected_when_the_watcher_returns() {
+        let (mut o, _d) = orch(ticketless(&["bob"]));
+        o.eff.as_mut().expect("eff").max_concurrent = 4;
+        for i in 0..4 {
+            add_impl_run(&mut o, &format!("impl-{i}"), "alice");
+        }
+        introduce(&o, row(31, "bob"));
+        finished_run(
+            &o,
+            "STUDIO-721",
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T01:00:00Z",
+        );
+
+        let base = chrono::Utc::now();
+        o.now = Box::new(move || base);
+
+        // The last sweep before the outage records the hold.
+        let report = o.handle_review_sweep(&[open_at(31, HEAD_A)]);
+        assert_eq!(report.deferred, 1);
+        let id31 = review_key(OWNER, REPO, 31, "bob");
+        assert_eq!(
+            o.review_capacity_held.get(&id31).map(|h| h.holders),
+            Some(4),
+            "precondition: the pre-outage sweep recorded the hold"
+        );
+
+        // The watcher goes quiet past `CAPACITY_HOLD_TTL` — its stamps stop advancing — then returns,
+        // and its cursor reaches `#32`, NOT `#31`. Nothing re-observes the held round, so its record
+        // is exactly the one the outage left behind.
+        let later = base
+            + chrono::Duration::seconds(
+                i64::try_from(CAPACITY_HOLD_TTL.as_secs()).expect("ttl") + 1,
+            );
+        o.now = Box::new(move || later);
+        o.handle_review_sweep_slots(&[open_at(32, HEAD_A)], None);
+
+        o.reconcile_review_divergence();
+
+        assert_eq!(
+            o.review_divergences().len(),
+            1,
+            "the owed round still reports"
+        );
+        assert!(
+            o.review_divergences()[0].capacity_held.is_none(),
+            "a hold from before the outage must not be resurrected by the sweep that ends it"
         );
     }
 

@@ -592,7 +592,9 @@ impl Orchestrator {
     /// healthy watcher was still holding (STUDIO-950 round 11). A hold older than
     /// [`CAPACITY_HOLD_TTL`] — or one whose watcher stamp is in the future, which no honest clock
     /// produces — is dropped and the row reports under its ordinary wording. A hold that predates
-    /// any sweep (no liveness stamp yet) falls back to its own `recorded`.
+    /// any sweep (no liveness stamp yet) falls back to its own `recorded`; no PRODUCTION hold can be
+    /// in that state (the watcher stamps before it ever inserts a hold), so the fallback exists for
+    /// this module's own fixtures, which insert holds directly.
     fn fresh_capacity_hold(&self, id: &str, now: DateTime<Utc>) -> Option<CapacityHold> {
         let hold = self.review_capacity_held.get(id)?;
         let swept = self.review_watch_swept.unwrap_or(hold.recorded);

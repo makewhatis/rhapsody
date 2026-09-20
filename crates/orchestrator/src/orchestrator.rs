@@ -626,7 +626,12 @@ pub struct Orchestrator {
     /// individual hold against a one-tick TTL expired a hold a healthy watcher was still carrying,
     /// blinking its annotation off and re-emitting the false "nothing has reported it blocked" page
     /// this ticket exists to stop. A hold's own `recorded` is retained only as the fallback for a
-    /// hold that predates any sweep.
+    /// hold that predates any sweep — a state only this module's fixtures can reach.
+    ///
+    /// A stamp that has itself aged past `CAPACITY_HOLD_TTL` means the watcher STOPPED, so the first
+    /// sweep after it returns also DROPS every hold the gap left behind rather than re-dating them:
+    /// freshness only filters a hold on read, and re-stamping liveness would resurrect a round
+    /// nothing had re-observed since before the outage (STUDIO-950 round 12).
     pub(crate) review_watch_swept: Option<DateTime<Utc>>,
     /// What the reconciliation sweep is currently REPORTING: one entry per pull request whose board
     /// state and activity disagree (STUDIO-898). Recomputed from scratch each sweep — it is a
