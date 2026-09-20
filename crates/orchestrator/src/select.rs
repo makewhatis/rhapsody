@@ -937,6 +937,31 @@ mod tests {
         assert_eq!(held[0].project, "a");
     }
 
+    // STUDIO-949 round 10: the multi-project ladder's own current-label note (`select.rs:376`) is
+    // the ONLY one a `projects:` install ever reaches, and it feeds every decision gate that reads
+    // `labelled()` — `plan_quorum`, the ticketless watcher and the auto-merge gate. The tests above
+    // pin the console's REPORT set (fed by `note_human_hold`), so none of them notices if this write
+    // is deleted: the report survives while the decision gates silently lose the mid-run hold shape
+    // on the ladder most installs run.
+    //
+    // MUTATION: delete the `note_human_label` from the multi ladder's main-loop branch and this
+    // reds while every other test in this file still passes.
+    #[test]
+    fn the_multi_project_ladder_observes_a_live_human_label() {
+        let mut running = HashMap::new();
+        let mut live = issue("1", "STUDIO-939", "In Progress");
+        live.labels = Some(vec!["rhapsody:human".into()]);
+        running.insert("1".to_string(), running_entry(live.clone(), "a", "a"));
+        let o = orch_for_multi(10, vec![proj("a", 10, HashMap::new())], Some(running));
+
+        o.select_dispatch_multi(tag_for(0, vec![live]));
+
+        assert!(
+            o.human_holds.labelled().contains("studio-939"),
+            "the multi ladder must feed the current-label set the decision gates read"
+        );
+    }
+
     // STUDIO-949: the hold must survive a SATURATED pass. `eligibility` is only reached while the
     // global slot budget lasts, so a human ticket past the cap would otherwise drop out of
     // `/api/v1/state` and the console would lose the signal exactly when every seat is taken —

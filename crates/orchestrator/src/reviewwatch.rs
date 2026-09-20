@@ -1443,16 +1443,19 @@ mod tests {
     /// review, even though the row exists from an earlier round — a ticket labelled after an agent
     /// already flailed on it is the likeliest way the label is ever applied. The row is left armed,
     /// so a later label removal still gets the review it is owed.
-    /// MUTATION: delete the origin-hold gate from `service_review_pr` and the first assertion reds.
+    ///
+    /// The fixture seeds the CURRENT-LABEL-only state (`note_human_label`, the state the selection
+    /// pass produces for a candidate labelled while its run is still live) rather than `hold`, which
+    /// feeds the reported subset too. That pins this gate to `labelled()`: seeding `hold` passed
+    /// against either reader.
+    ///
+    /// MUTATION: delete the origin-hold gate from `service_review_pr` and the first assertion reds;
+    /// read the reported `held()` set instead of `labelled()` and it reds too.
     #[test]
     fn a_watch_row_whose_origin_ticket_is_held_for_a_human_is_not_dispatched() {
         let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
         introduce(&o, row(12, "bob")); // origin: `handoff:STUDIO-721`
-        o.human_holds.hold(crate::dispatch::HeldForHuman {
-            issue_identifier: "STUDIO-721".to_string(),
-            title: "human work".to_string(),
-            project: String::new(),
-        });
+        o.human_holds.note_human_label("STUDIO-721");
 
         let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
         assert_eq!(
@@ -1761,16 +1764,14 @@ mod tests {
     /// `an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge` is the live control: the
     /// identical fixture without the hold proposes the plan.
     ///
-    /// MUTATION: delete the `held_origin` gate from `service_review_pr` and this reds.
+    /// MUTATION: delete the `held_origin` gate from `service_review_pr` and this reds; read the
+    /// reported `held()` set instead of `labelled()` and it reds too (the fixture seeds the
+    /// current-label-only state, the live-labelled hold shape).
     #[test]
     fn a_held_origin_ticket_holds_back_auto_merge() {
         let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
         introduce(&o, approved_row(64, "bob", HEAD_A)); // origin: `handoff:STUDIO-721`
-        o.human_holds.hold(crate::dispatch::HeldForHuman {
-            issue_identifier: "STUDIO-721".to_string(),
-            title: "human work".to_string(),
-            project: String::new(),
-        });
+        o.human_holds.note_human_label("STUDIO-721");
 
         let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
 
