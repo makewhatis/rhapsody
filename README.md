@@ -1837,4 +1837,3 @@ per-tick **level** scan: it promotes whatever is *currently* clear, so a ticket 
 after `dag` is enabled. This narrows the blast radius to states the operator nominated; it does not
 eliminate it. Making promotion edge-triggered needs durable per-blocker last-seen state and restart
 semantics, and is deliberately out of scope here.
-
