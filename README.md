@@ -1361,7 +1361,7 @@ that comment (and, once, the escalation's room post); there is no un-draft seam 
 | detection | none (the feature does not exist) | the ticketless review watch set: a row carrying an origin ticket is one a run HANDED OVER (or the adoption sweep adopted), which is what "finished" means here; a console-introduced row has none and is never poked |
 | action | n/a | a summons comment naming the pull request and the action; the daemon never marks it ready |
 | frequency | n/a | **once per head** — the same head is never poked twice, and a per-tick poke is the re-dispatch loop STUDIO-956 bounds |
-| if ignored | n/a | **two bounds**: after three distinct heads, or after about an hour at one static head, it stops poking and escalates to a human (a room post and a tokenless comment) naming the count |
+| if ignored | n/a | **two bounds**: after three distinct heads, or after about an hour at one static head, it stops poking and escalates to a human (a room post naming the origin ticket and a tokenless comment) naming the count |
 | default | n/a | **inert**: silent with Teams off, off the ticketless path (there is no watch set to observe), and on a healthy board |
 
 **The trigger is the handoff, not the process exiting.** A watch row comes from a run handing its

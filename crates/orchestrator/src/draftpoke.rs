@@ -118,6 +118,12 @@ pub struct DraftPokePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftEscalation {
     pub pr: PrCoord,
+    /// The ORIGIN TICKET — the run the summons would have reopened. Carried onto the room post's
+    /// `refs` beside the pull request coordinate so the escalation re-grounds against the same
+    /// candidate map every other manager room post does (`render_ref` re-grounds ticket-shaped refs
+    /// only), and a teammate reading the room back gets the ticket to reopen rather than only a
+    /// pull request to publish.
+    pub identifier: String,
     /// The teammate who authored it, for the record. Empty when unknown.
     pub author: String,
     /// How many times it was poked before the daemon gave up — the count the escalation reports.
@@ -264,37 +270,58 @@ pub async fn perform_nudge(nudge: &DraftNudge, deps: &DraftPokeDeps, at: DateTim
         }
         DraftNudge::Escalate(esc) => {
             let body = escalation_body(esc);
+            // Whether ANY surface actually accepted the escalation. The terminal log line below
+            // must not claim a human now owns this pull request when neither write landed — the
+            // one line an operator greps for would otherwise be false exactly when it matters.
+            let mut told = false;
             if let Some(room) = deps.room.as_ref() {
                 let mut msg = Message::room(MANAGER_IDENTITY, at, body.clone());
-                msg.refs = vec![esc.pr.to_string()];
-                if let Err(e) = room.append(&msg) {
-                    tracing::warn!(
+                // The ticket leads, the pull request follows: the ticket is what re-grounds against
+                // the candidate map (`teamscompose::render_ref`), and the pull request is the
+                // coordinate to act on. `mergeconsole`'s manager room line carries its ticket the
+                // same way.
+                msg.refs = vec![esc.identifier.clone(), esc.pr.to_string()];
+                match room.append(&msg) {
+                    Ok(_) => told = true,
+                    Err(e) => tracing::warn!(
                         pr = %esc.pr,
                         err = %e,
                         "draft poke: the escalation could not be posted to the room; the pull \
                          request comment is unaffected"
-                    );
+                    ),
                 }
             }
-            if let Some(comments) = deps.comments.as_ref()
-                && let Err(e) = comments
+            if let Some(comments) = deps.comments.as_ref() {
+                match comments
                     .post_pr_comment(&esc.pr.owner, &esc.pr.repo, esc.pr.number, &body)
                     .await
-            {
+                {
+                    Ok(()) => told = true,
+                    Err(e) => tracing::warn!(
+                        pr = %esc.pr,
+                        err = %e,
+                        "draft poke: the escalation could not be recorded on the pull request; the \
+                         room post is unaffected"
+                    ),
+                }
+            }
+            if told {
                 tracing::warn!(
                     pr = %esc.pr,
-                    err = %e,
-                    "draft poke: the escalation could not be recorded on the pull request; the \
-                     room post is unaffected"
+                    author = %esc.author,
+                    pokes = esc.pokes,
+                    "draft poke: a draft pull request was ignored across every poke; handing it to a \
+                     human"
+                );
+            } else {
+                tracing::warn!(
+                    pr = %esc.pr,
+                    author = %esc.author,
+                    pokes = esc.pokes,
+                    "draft poke: a draft pull request was ignored across every poke, but the \
+                     escalation reached no surface — no human was told"
                 );
             }
-            tracing::warn!(
-                pr = %esc.pr,
-                author = %esc.author,
-                pokes = esc.pokes,
-                "draft poke: a draft pull request was ignored across every poke; handing it to a \
-                 human"
-            );
         }
     }
 }
@@ -352,6 +379,7 @@ mod tests {
     fn the_escalation_body_is_tokenless_and_names_the_poke_count() {
         let body = escalation_body(&DraftEscalation {
             pr: coord(),
+            identifier: "STUDIO-721".to_string(),
             author: "alice".to_string(),
             pokes: 3,
         });
@@ -405,6 +433,57 @@ mod tests {
         }
     }
 
+    /// A comment sink that refuses every write — the failing sink `RecordingComments` never had, so
+    /// the escalation's error paths are finally observable.
+    struct FailingComments;
+
+    #[async_trait]
+    impl PrCommentSink for FailingComments {
+        async fn post_pr_comment(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            _body: &str,
+        ) -> PrCommentResult {
+            Err("the comment sink is down".into())
+        }
+    }
+
+    fn escalation() -> DraftEscalation {
+        DraftEscalation {
+            pr: coord(),
+            identifier: "STUDIO-721".to_string(),
+            author: "alice".to_string(),
+            pokes: 3,
+        }
+    }
+
+    /// Runs `f` twice under a fresh recording subscriber (the second run is the measured one, the
+    /// first forces every callsite to register — TRA-243), serialized against the other
+    /// subscriber-installing tests.
+    async fn captured<F, Fut>(f: F) -> Vec<crate::testsupport::CapturedEvent>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = crate::testsupport::recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        f().await;
+        tracing::callsite::rebuild_interest_cache();
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        f().await;
+        drop(guard);
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// The one write a poke performs is a comment — the daemon never marks a pull request ready
     /// itself, and this is the test that says so: the only seam a poke touches is `PrCommentSink`,
     /// and the body it posts is an INSTRUCTION to the author rather than a statement that the
@@ -443,16 +522,7 @@ mod tests {
             comments: Some(Arc::clone(&comments) as Arc<dyn PrCommentSink>),
             room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
         };
-        perform_nudge(
-            &DraftNudge::Escalate(DraftEscalation {
-                pr: coord(),
-                author: "alice".to_string(),
-                pokes: 3,
-            }),
-            &deps,
-            Utc::now(),
-        )
-        .await;
+        perform_nudge(&DraftNudge::Escalate(escalation()), &deps, Utc::now()).await;
         let posted = comments.0.lock().expect("lock").clone();
         assert_eq!(posted.len(), 1);
         assert!(!crate::reviewnotify::summons_author(
@@ -462,6 +532,70 @@ mod tests {
         let msgs = room.0.lock().expect("lock").clone();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].from, MANAGER_IDENTITY);
-        assert_eq!(msgs[0].refs, vec!["makewhatis/rhapsody#537".to_string()]);
+        // The ticket LEADS (it is what `render_ref` re-grounds against the candidate map), and the
+        // pull request coordinate follows.
+        assert_eq!(
+            msgs[0].refs,
+            vec![
+                "STUDIO-721".to_string(),
+                "makewhatis/rhapsody#537".to_string()
+            ]
+        );
+    }
+
+    /// ⚠️ The terminal log line is honest: when NEITHER surface accepted the escalation, it must not
+    /// claim a human now owns the pull request. This is the failure `RecordingComments` never had —
+    /// it always returned `Ok`, so the one line an operator would grep for was never tested against
+    /// a write that refused.
+    #[tokio::test]
+    async fn an_escalation_that_reaches_no_surface_does_not_claim_a_human_was_told() {
+        let events = captured(|| async {
+            let deps = DraftPokeDeps {
+                comments: Some(Arc::new(FailingComments) as Arc<dyn PrCommentSink>),
+                room: None,
+            };
+            perform_nudge(&DraftNudge::Escalate(escalation()), &deps, Utc::now()).await;
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == "WARN" && e.message.contains("reached no surface")),
+            "expected the honest no-surface line, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("handing it to a human")),
+            "nothing accepted the escalation, so the log must not claim a human was told: {events:?}"
+        );
+    }
+
+    /// The complement: ONE surface accepting is enough. A refusing comment sink must not suppress
+    /// the handoff line when the room took the escalation, or an operator would be told nobody was
+    /// informed of a pull request a human does in fact own.
+    #[tokio::test]
+    async fn an_escalation_that_reaches_only_the_room_still_hands_it_to_a_human() {
+        let events = captured(|| async {
+            let room = Arc::new(RecordingRoom::default());
+            let deps = DraftPokeDeps {
+                comments: Some(Arc::new(FailingComments) as Arc<dyn PrCommentSink>),
+                room: Some(Arc::clone(&room) as Arc<dyn RoomLog>),
+            };
+            perform_nudge(&DraftNudge::Escalate(escalation()), &deps, Utc::now()).await;
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("handing it to a human")),
+            "the room accepted the escalation, so a human was told: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("reached no surface")),
+            "a surface accepted; the no-surface line must not fire: {events:?}"
+        );
     }
 }

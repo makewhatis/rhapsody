@@ -858,6 +858,7 @@ impl Orchestrator {
                 report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
                     crate::draftpoke::DraftEscalation {
                         pr: pr.clone(),
+                        identifier: identifier.to_string(),
                         author,
                         pokes: state.pokes,
                     },
@@ -870,6 +871,7 @@ impl Orchestrator {
             report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
                 crate::draftpoke::DraftEscalation {
                     pr: pr.clone(),
+                    identifier: identifier.to_string(),
                     author,
                     pokes: state.pokes,
                 },
