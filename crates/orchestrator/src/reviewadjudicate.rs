@@ -903,7 +903,6 @@ mod tests {
     struct BlockingComments {
         posted: tokio::sync::Notify,
         release: tokio::sync::Notify,
-        bodies: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -913,9 +912,8 @@ mod tests {
             _owner: &str,
             _repo: &str,
             _number: i64,
-            body: &str,
+            _body: &str,
         ) -> crate::ghsummons::PrCommentResult {
-            self.bodies.lock().unwrap().push(body.to_string());
             self.posted.notify_one();
             self.release.notified().await;
             Ok(())
