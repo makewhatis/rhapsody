@@ -346,6 +346,7 @@ mod tests {
             adjudicated_head: String::new(),
             rounds: 0,
             findings: Vec::new(),
+            reason: String::new(),
         }];
 
         let rendered = render(&o.build_snapshot());

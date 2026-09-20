@@ -1088,14 +1088,38 @@ impl Orchestrator {
             .collect()
     }
 
-    /// Whether any review round of `pr` is live right now. A decision must not be made over a round
-    /// mid-flight: new findings could still land, and `reconcile_pr` already treats an in-flight
-    /// round as activity that silences the whole pull request.
-    fn review_round_in_flight(&self, _pr: &PrCoord, mine: &[&ReviewWatchRow]) -> bool {
-        mine.iter().any(|r| {
+    /// Whether any half of `pr`'s loop — a review round OR the author's summoned run — is live
+    /// right now.
+    ///
+    /// A decision must not be made over a round mid-flight: new findings could still land, and a fix
+    /// the author is actively writing is about to supersede the head the manager would decide
+    /// against. The author half is easy to miss because the counter is charged at DISPATCH
+    /// ([`crate::retry`]), so an author run is in flight from the very instant its charge lands —
+    /// and with the loop alternating review→author, any EVEN threshold is crossed by the author's
+    /// own dispatch. [`reconcile_pr`](crate::reviewreconcile::reconcile_pr) already treats an
+    /// in-flight run as activity that silences the whole pull request; this is the same rule on the
+    /// decision path.
+    fn review_round_in_flight(&self, mine: &[&ReviewWatchRow]) -> bool {
+        let review_live = mine.iter().any(|r| {
             let id = review_key(&r.key.owner, &r.key.repo, r.key.number, &r.key.reviewer);
             self.running.contains_key(&id) || self.claimed.contains(&id)
-        })
+        });
+        review_live
+            || mine.iter().any(|r| {
+                crate::reviewdone::origin_ticket(&r.introduced_by)
+                    .is_some_and(|ticket| self.author_run_live(ticket))
+            })
+    }
+
+    /// Whether the ticket `identifier` — a watched pull request's author — has a live run.
+    ///
+    /// The author's run is a normal ticket run, so it is keyed by the tracker's opaque ID rather
+    /// than by the identifier this reads; `RunningEntry` carries its own `Issue` and is the one
+    /// place the two are available together.
+    fn author_run_live(&self, identifier: &str) -> bool {
+        self.running
+            .values()
+            .any(|entry| entry.issue.identifier == identifier)
     }
 
     /// Charges one AUTHOR round to every linked pull request of `iss` that already carries a budget,
@@ -1297,18 +1321,44 @@ impl Orchestrator {
                 return;
             }
             if self.rounds_used(pr) >= threshold {
-                // Never decide over a round mid-flight: findings could still land.
-                if self.review_round_in_flight(pr, &mine) {
+                // Never decide over a round mid-flight: findings could still land, and the author's
+                // own fix may be about to supersede the head this would decide against.
+                if self.review_round_in_flight(&mine) {
                     report.deferred += 1;
                     self.propose_auto_merge(&mine, pr, head, report);
                     return;
                 }
                 let rounds = self.rounds_used(pr);
+                let findings = self.open_findings(&mine, head);
+                // A turn that has already failed its bounded attempts ESCALATES instead of being
+                // re-asked: a broken `manager.model` or `claude` must not buy one turn spawn per
+                // pull request per sweep, forever. The escalation names the failure so the operator
+                // knows the bound was the model, not the review.
+                if let Some(ledger) = self.adjudication_ledger.as_ref() {
+                    let attempts = ledger.failures(pr);
+                    if attempts >= crate::reviewadjudicate::MAX_ADJUDICATION_ATTEMPTS {
+                        ledger.record(
+                            pr,
+                            crate::reviewadjudicate::Adjudication::Escalate {
+                                head: head.to_string(),
+                                rounds,
+                                findings,
+                                reason: format!(
+                                    "the manager turn failed {attempts} times; no decision could be \
+                                     made"
+                                ),
+                            },
+                        );
+                        report.deferred += 1;
+                        self.propose_auto_merge(&mine, pr, head, report);
+                        return;
+                    }
+                }
                 let plan = crate::reviewadjudicate::ReviewAdjudicationPlan {
                     pr: pr.clone(),
                     head: head.to_string(),
                     rounds,
-                    findings: self.open_findings(&mine, head),
+                    findings,
                 };
                 if let Some(ledger) = self.adjudication_ledger.as_ref() {
                     // Marks it in flight so the next tick does not hand out a second plan while the
@@ -3683,6 +3733,109 @@ mod tests {
         assert!(
             o.author_round_budget_spent(&iss),
             "and the author half, on the same threshold"
+        );
+    }
+
+    /// **A decision is never made over an in-flight AUTHOR run.** The counter is charged at
+    /// DISPATCH, so the summoned author's run is live from the instant its charge lands — and with
+    /// the loop alternating review→author, every EVEN threshold is crossed by that dispatch. The
+    /// guard used to look only at review rows, so the manager was handed findings somebody was
+    /// actively fixing and a head about to be superseded.
+    #[test]
+    fn an_in_flight_author_run_defers_the_adjudication() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        // `row(12, _)`'s origin ticket is `handoff:STUDIO-721`; its author is mid-fix.
+        o.running.insert(
+            "iss-author".to_string(),
+            RunningEntry::empty(rhapsody_core::Issue {
+                id: "iss-author".to_string(),
+                identifier: "STUDIO-721".to_string(),
+                ..Default::default()
+            }),
+        );
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "the manager must not decide while the author's run is still fixing"
+        );
+        assert_eq!(
+            report.deferred, 1,
+            "the decision is deferred to a later sweep, not dropped"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            None,
+            "no plan was handed out, so nothing was marked in flight"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// **A failing turn is bounded.** A failed adjudication clears the in-flight marker so the next
+    /// sweep re-asks — correct — but a misconfigured `manager.model` must not buy one turn spawn per
+    /// pull request per sweep forever: after [`MAX_ADJUDICATION_ATTEMPTS`] failures the control task
+    /// ESCALATES instead of handing out another plan.
+    ///
+    /// Mutation: removing the failure bound re-arms a plan here and reds this.
+    #[test]
+    fn a_turn_that_failed_its_attempts_escalates_instead_of_re_asking() {
+        let (mut o, dispatched) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        for _ in 0..crate::reviewadjudicate::MAX_ADJUDICATION_ATTEMPTS {
+            l.note_failure(&coord(12));
+        }
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert!(
+            report.adjudicate.is_empty(),
+            "the manager must not be asked again once its turn has failed its attempts"
+        );
+        match l.peek(&coord(12)) {
+            Some(Adjudication::Escalate {
+                head,
+                rounds,
+                reason,
+                ..
+            }) => {
+                assert_eq!(head, HEAD_A);
+                assert_eq!(rounds, 3);
+                assert!(
+                    reason.contains("failed 3 times"),
+                    "the escalation must name the failure, got: {reason}"
+                );
+            }
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+        assert!(dispatched.lock().expect("lock").is_empty());
+    }
+
+    /// …and one short of the bound still re-asks: the retry is real, not a first-failure give-up.
+    #[test]
+    fn a_turn_short_of_its_attempts_re_asks() {
+        let (mut o, _d) = orch(adjudicating(&["alice", "bob"], 3));
+        let l = ledger(&mut o);
+        introduce(&o, row(12, "bob"));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        for _ in 0..(crate::reviewadjudicate::MAX_ADJUDICATION_ATTEMPTS - 1) {
+            l.note_failure(&coord(12));
+        }
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.adjudicate.len(),
+            1,
+            "a turn inside its attempt bound is re-asked"
         );
     }
 

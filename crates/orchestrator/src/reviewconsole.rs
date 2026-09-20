@@ -964,6 +964,7 @@ mod tests {
                 head: HEAD_A.to_string(),
                 rounds: 3,
                 findings: vec!["alice asked for changes".to_string()],
+                reason: "needs a human".to_string(),
             },
         );
         o.adjudication_ledger = Some(std::sync::Arc::clone(&ledger));

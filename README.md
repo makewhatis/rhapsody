@@ -1228,6 +1228,60 @@ eleven hours the incidents actually cost. A pull request mid-round is silent, an
 activity however long it runs, and a row the `runs` ledger cannot date is reported as nothing at all —
 under-reporting a case nobody can act on is free, while crying wolf costs the whole signal.
 
+### The manager decides at the review round threshold — ship it or escalate (STUDIO-956)
+
+Go v0.4.0 has no manager turn at all, so this is additive surface. It exists because a
+convergence property that depends on an agent choosing to stop is not a property: before this, the
+review↔author loop ran until `REVIEW_ROUNDS_PER_PR_CAP` × reviewers (sixteen rounds at two
+reviewers), logged a DEBUG refusal, and stopped with **no decision and no escalation**. Three pull
+requests sat unreviewable on 2026-09-20 until an unrelated restart. Measured against the operator's
+own store, four tickets burned **353M tokens** — STUDIO-170 alone ran eleven author rounds and 23
+review runs on one pull request.
+
+`teams.review.adjudicate_after_rounds` is the opt-in round threshold. At it, the loop stops arming
+rounds and the **manager** makes exactly one decision:
+
+- **ship it** — the open findings do not block; the pull request proceeds to the normal merge gates.
+- **escalate** — a human is needed, and the escalation names the specific open findings, the round
+  count and the head the loop stopped at.
+
+| At the threshold | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| who ends the loop | nothing — there is no review loop | the manager, one turn |
+| the decision | — | `SHIP`, or `ESCALATE: <reason>` |
+| the audit | — | a room post **and** a pull-request comment, both naming the way it went |
+| the report | — | `review_escalated` / `review_shipped` on `/api/v1/state` and a WARN line |
+| default | — | **off**: `adjudicate_after_rounds: 0`, byte-identical to before this ticket |
+
+```yaml
+review:
+  adjudicate_after_rounds: 3     # the maintainer's number: three rounds, then escalate
+  auto_merge: false              # unchanged — a ship adjudicates findings, never the gates
+```
+
+**"Ship it" adjudicates the findings, NEVER the gates.** The manager decides whether the open review
+findings block; it can never override CI, approval-at-head, a draft, a conflict, or any other merge
+gate. A manager that could merge a red pull request would be worse than the loop it replaced. A
+shipped pull request whose rows are not all approved is therefore reported as `review_shipped` (the
+gate still holds it, and no round will ever arm), while one whose rows are all approved either
+merges or falls to the ordinary `approved_still_open` report after the staleness threshold.
+
+**Its own gate, deliberately not `manager.mode`.** `manager.mode: labels` means there is no manager
+assignment turn today — assignment is deterministic and spends nothing — so adjudication cannot
+silently inherit that mode. It is gated by this key alone, runs through the daemon's one model-turn
+path with `manager.model` / `manager.timeout_ms`, and needs no `gh` on the control task: the control
+task decides and hands a plan to the watcher, which performs the turn and the writes off-loop.
+
+**Both halves are bounded, and a failed turn is bounded too.** Author re-dispatches charge the same
+counter (one ROUND each, whatever the reviewer count), which is what bounds the STUDIO-170 shape at
+the threshold. A turn that fails clears its in-flight marker so a later sweep re-asks, but only
+`MAX_ADJUDICATION_ATTEMPTS` (three) times; after that the daemon escalates rather than re-spawning a
+turn per sweep forever. An operator can drop the decision — and the round budget — from the console
+(`POST /api/v1/reviews/clear`).
+
+**Unset is inert, byte-for-byte.** With `adjudicate_after_rounds: 0` no plan is ever emitted, the
+author half is charged nothing and refused nothing, and the legacy `REVIEW_ROUNDS_PER_PR_CAP` ×
+reviewers review-only cap and its stop behave exactly as before. Adjudication is opt-in.
 
 ### A `rhapsody:human` label the dispatcher refuses (STUDIO-949)
 
@@ -1475,9 +1529,10 @@ inside the last window.
 console armed an auto-merge on a behind branch that could never land. A behind branch's approval is
 for a commit that has not met its base, so the branch is updated (when `allow_update_branch` permits;
 otherwise the pull request is declined), the head advances, the review re-arms, and only a fresh
-approval of the new head can clear the gate again. The loop is bounded by `REVIEW_ROUNDS_PER_PR_CAP`,
-which caps both sides of the review↔author loop — the review dispatches a pull request may draw and
-the author re-dispatches their findings summon (STUDIO-956).
+approval of the new head can clear the gate again. The REVIEW side of the loop is bounded by
+`REVIEW_ROUNDS_PER_PR_CAP`; the AUTHOR side by the opt-in manager adjudication above
+(`review.adjudicate_after_rounds`) — an install that sets no threshold keeps the review-only cap and
+its stop, exactly as before STUDIO-956.
 
 **Ticket bookkeeping is not duplicated.** An auto-merge writes nothing to the watch set, so the next
 sweep observes the pull request as `MERGED` exactly as it would a human's merge and STUDIO-712's

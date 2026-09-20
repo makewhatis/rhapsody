@@ -56,6 +56,16 @@ use crate::reviewwatch::churn_key;
 /// the manager is one function however many of its halves exist.
 pub const MANAGER_IDENTITY: &str = "@manager";
 
+/// How many times a pull request's manager turn may FAIL before the loop stops re-asking and
+/// ESCALATES the whole decision to a human (STUDIO-956).
+///
+/// A failed turn clears the in-flight marker so the next sweep re-asks — correct — but nothing used
+/// to count the attempts, so a misconfigured `manager.model` or a broken `claude` command bought one
+/// turn spawn per pull request per sweep, indefinitely. Three matches the rest of this subsystem's
+/// treatment of an operation that cannot succeed: retry a bounded few times, then say so loudly
+/// rather than loop.
+pub const MAX_ADJUDICATION_ATTEMPTS: usize = 3;
+
 /// The manager's one decision about a pull request that has run out its round threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -142,11 +152,13 @@ pub enum Adjudication {
     /// The manager shipped it. No further round arms.
     Ship { head: String, rounds: usize },
     /// The manager escalated it. No further round arms; a human is needed and the findings are
-    /// named.
+    /// named. `reason` is the manager's own words — carried here so it reaches the ledger and the
+    /// reconciliation WARN, not only the room post and the pull-request comment.
     Escalate {
         head: String,
         rounds: usize,
         findings: Vec<String>,
+        reason: String,
     },
 }
 
@@ -183,6 +195,11 @@ impl Adjudication {
 #[derive(Debug, Default)]
 pub struct AdjudicationLedger {
     entries: Mutex<HashMap<String, Adjudication>>,
+    /// How many turns have FAILED per pull request since its last successful decision or its last
+    /// `clear`. Kept apart from `entries` because a failure deliberately CLEARS the entry so the
+    /// next sweep re-asks; this map is the memory that bounds the re-asking
+    /// ([`MAX_ADJUDICATION_ATTEMPTS`]).
+    failures: Mutex<HashMap<String, usize>>,
 }
 
 impl AdjudicationLedger {
@@ -202,9 +219,39 @@ impl AdjudicationLedger {
             .or_insert(Adjudication::InFlight { rounds });
     }
 
-    /// Records a settled decision for `pr`.
+    /// Records a settled decision for `pr`, and forgets any failed attempts: a decision that
+    /// finally landed is not a decision that is still failing.
     pub fn record(&self, pr: &PrCoord, adjudication: Adjudication) {
-        self.map().insert(churn_key(pr), adjudication);
+        let key = churn_key(pr);
+        // Lock `entries` before `failures`, exactly as `note_failure` and `clear` do: the control
+        // task and the watcher task both reach this ledger, and taking the two locks in opposite
+        // orders would deadlock.
+        self.map().insert(key.clone(), adjudication);
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+
+    /// Records that `pr`'s turn FAILED — clearing the in-flight marker so the next sweep re-asks,
+    /// and returning how many times it has now failed since the last success or [`Self::clear`].
+    pub fn note_failure(&self, pr: &PrCoord) -> usize {
+        let key = churn_key(pr);
+        self.map().remove(&key);
+        let mut f = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let count = f.entry(key).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// How many times `pr`'s turn has failed without a decision.
+    pub fn failures(&self, pr: &PrCoord) -> usize {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&churn_key(pr))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// What is known about `pr`, or `None` when nothing is.
@@ -212,10 +259,15 @@ impl AdjudicationLedger {
         self.map().get(&churn_key(pr)).cloned()
     }
 
-    /// Forgets `pr` — used when a turn FAILED (so the next sweep re-asks) and when a pull request
-    /// leaves the watch set.
+    /// Forgets `pr` — used when a pull request leaves the watch set and by the operator's Clear, so
+    /// the failure tally goes with it and a fresh adjudication may be attempted.
     pub fn clear(&self, pr: &PrCoord) {
-        self.map().remove(&churn_key(pr));
+        let key = churn_key(pr);
+        self.map().remove(&key);
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
     }
 }
 
@@ -267,12 +319,14 @@ pub async fn perform_adjudication(
     let verdict = match deps.adjudicator.adjudicate(&req).await {
         Ok(v) => v,
         Err(e) => {
-            // Not a decision: clear so the next sweep re-asks, and leave the loop stopped (no round
-            // arms while an adjudication is outstanding).
-            deps.ledger.clear(&plan.pr);
+            // Not a decision: clear the in-flight marker so the next sweep re-asks, and count the
+            // attempt so a turn that can never succeed is bounded rather than re-spawned forever
+            // (the control task escalates once the count reaches MAX_ADJUDICATION_ATTEMPTS).
+            let attempts = deps.ledger.note_failure(&plan.pr);
             tracing::warn!(
                 pr = %plan.pr,
                 err = %e,
+                attempts,
                 "review adjudication: the manager turn failed; the loop stays stopped and the \
                  decision is re-asked on a later sweep"
             );
@@ -312,10 +366,11 @@ pub async fn perform_adjudication(
             head: plan.head.clone(),
             rounds: plan.rounds,
         },
-        Verdict::Escalate { reason: _ } => Adjudication::Escalate {
+        Verdict::Escalate { reason } => Adjudication::Escalate {
             head: plan.head.clone(),
             rounds: plan.rounds,
             findings: plan.findings.clone(),
+            reason,
         },
     };
     let outcome = match &adjudication {
@@ -366,11 +421,20 @@ pub fn adjudication_prompt(req: &AdjudicationRequest) -> String {
 
 /// Reads `SHIP` or `ESCALATE: …` out of the turn's stdout.
 ///
-/// Lenient about surrounding prose and punctuation, strict about the decision: it scans every line
-/// and takes the first that NAMES one of the two, so a model that prefixes its answer with a
-/// sentence still parses; an answer naming neither is an error, and the caller re-asks rather than
-/// guessing a verdict.
+/// Lenient about surrounding prose and punctuation, strict about the decision. It scans every line
+/// and keeps the LAST one shaped like a decision, because a model asked to justify itself states
+/// its decision last — after any preamble that explains the options. Two rules make that safe:
+///
+/// * The last match wins, so the prompt's own sentence ("SHIP means the remaining open findings do
+///   not block") cannot outrank a decision below it. Taking the FIRST match let exactly that
+///   happen, in the unsafe direction: the reply escalates and the daemon ships.
+/// * A `SHIP` line must BE the decision — bare `SHIP` or a `SHIP:` prefix — not merely begin with
+///   the word. The prompt shows the model "SHIP means …" verbatim, and a line of prose beginning
+///   `SHIP ` is an explanation, not an answer.
+///
+/// An answer naming neither decision is an error, and the caller re-asks rather than guessing.
 pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
+    let mut decided: Option<Verdict> = None;
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -378,15 +442,16 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
         }
         let upper = line.to_ascii_uppercase();
         let bare = upper.trim_end_matches(['.', '!', '*', '`', ' ']);
-        if bare == "SHIP" || bare.starts_with("SHIP:") || bare.starts_with("SHIP ") {
-            return Ok(Verdict::Ship);
+        if bare == "SHIP" || upper.starts_with("SHIP:") {
+            decided = Some(Verdict::Ship);
+            continue;
         }
         if upper.starts_with("ESCALATE:") || bare == "ESCALATE" {
             let rest = line
                 .get("ESCALATE:".len()..)
                 .map(str::trim)
                 .unwrap_or_default();
-            return Ok(Verdict::Escalate {
+            decided = Some(Verdict::Escalate {
                 reason: if rest.is_empty() {
                     "the manager escalated without stating a reason".to_string()
                 } else {
@@ -395,10 +460,12 @@ pub fn parse_verdict(stdout: &str) -> Result<Verdict, String> {
             });
         }
     }
-    Err(format!(
-        "adjudication reply named neither SHIP nor ESCALATE: {}",
-        snippet(stdout)
-    ))
+    decided.ok_or_else(|| {
+        format!(
+            "adjudication reply named neither SHIP nor ESCALATE: {}",
+            snippet(stdout)
+        )
+    })
 }
 
 /// A short, single-line excerpt of a reply for an error message, so a long transcript does not land
@@ -470,6 +537,35 @@ mod tests {
             parse_verdict("Here is my decision.\n\nSHIP"),
             Ok(Verdict::Ship)
         );
+    }
+
+    /// **The unsafe direction.** A reply that explains BOTH options before deciding must parse as
+    /// its decision, not as the first option it names. Taking the first match read the prompt's own
+    /// "SHIP means …" sentence as the verdict and shipped a reply that escalated.
+    #[test]
+    fn a_reply_that_names_both_decisions_parses_as_the_last_one() {
+        let reply = "Let me weigh this.\n\nSHIP means the remaining open findings do not block.\n\
+                     ESCALATE means a human must decide.\n\nDecision:\n\
+                     ESCALATE: the auth rewrite needs a security owner.";
+        assert_eq!(
+            parse_verdict(reply),
+            Ok(Verdict::Escalate {
+                reason: "the auth rewrite needs a security owner.".to_string()
+            }),
+            "the decision line is the ESCALATE, not the prose above it"
+        );
+
+        // …and the other way round: a reply that quotes both and ships must ship.
+        let reply = "SHIP means the findings do not block.\nESCALATE: a human is needed.\n\n\
+                     Decision:\nSHIP";
+        assert_eq!(parse_verdict(reply), Ok(Verdict::Ship));
+    }
+
+    /// A line that merely begins with the word is prose, not a decision — the prompt shows the
+    /// model "SHIP means …" verbatim. Only a bare `SHIP` or a `SHIP:` prefix is an answer.
+    #[test]
+    fn a_line_beginning_with_ship_but_continuing_in_prose_is_not_a_decision() {
+        assert!(parse_verdict("SHIP means the remaining open findings do not block.").is_err());
     }
 
     #[test]
@@ -560,6 +656,7 @@ mod tests {
                 head: "abc".to_string(),
                 rounds: 3,
                 findings: vec!["x".to_string()],
+                reason: "needs a human".to_string(),
             },
         );
         assert_eq!(l.peek(&pr).map(|a| a.settled()), Some(true));
@@ -579,6 +676,31 @@ mod tests {
         l.mark_in_flight(&pr, 3);
         l.clear(&pr);
         assert_eq!(l.peek(&pr), None);
+    }
+
+    /// Failures are counted so the control task can bound the re-asking, and a landed decision or an
+    /// operator Clear resets the tally.
+    #[test]
+    fn failures_are_counted_and_reset_by_a_decision_or_a_clear() {
+        let l = AdjudicationLedger::default();
+        let pr = plan().pr;
+        assert_eq!(l.failures(&pr), 0);
+        assert_eq!(l.note_failure(&pr), 1, "failures count up");
+        assert_eq!(l.note_failure(&pr), 2);
+        assert_eq!(l.peek(&pr), None, "a failure leaves no in-flight marker");
+
+        l.record(
+            &pr,
+            Adjudication::Ship {
+                head: "abc".to_string(),
+                rounds: 3,
+            },
+        );
+        assert_eq!(l.failures(&pr), 0, "a landed decision resets the tally");
+
+        l.note_failure(&pr);
+        l.clear(&pr);
+        assert_eq!(l.failures(&pr), 0, "an operator Clear resets the tally too");
     }
 
     // ── the off-loop decision is recorded in the room AND on the pull request ─────────────────────
@@ -713,6 +835,7 @@ mod tests {
                 head: plan.head.clone(),
                 rounds: 3,
                 findings: plan.findings.clone(),
+                reason: "the migration needs a DBA".to_string(),
             })
         );
     }
@@ -767,6 +890,11 @@ mod tests {
             ledger.peek(&plan.pr),
             None,
             "cleared so the next sweep re-asks"
+        );
+        assert_eq!(
+            ledger.failures(&plan.pr),
+            1,
+            "and the attempt is counted so the re-asking is bounded"
         );
     }
 }
