@@ -36,9 +36,9 @@
 //! # One poke per head, and a human at the end
 //!
 //! The draft state persists until the author acts, so a per-tick summons is a re-dispatch loop —
-//! the churn STUDIO-956 exists to bound. [`Orchestrator::plan_draft_poke`] therefore remembers the
-//! head it last poked and says nothing again while the head is unchanged. When the author pushes
-//! but leaves it a draft, the new head is poked once too.
+//! the churn STUDIO-956 exists to bound. The watcher's own `plan_draft_poke` therefore remembers
+//! the head it last poked and says nothing again while the head is unchanged. When the author
+//! pushes but leaves it a draft, the new head is poked once too.
 //!
 //! An author who deliberately keeps a pull request in draft needs an out, so the poking is bounded:
 //! after [`MAX_DRAFT_POKES`] distinct heads the daemon stops poking and ESCALATES to a human — a
@@ -50,7 +50,7 @@
 //!
 //! The decision is made on the control task, where the watch set and `running` are single-writer;
 //! the two writes — a `gh` comment and a room append — happen off it, on the review watcher's own
-//! task, for [`crate::reviewadjudicate`]'s and [`crate::runautomerge`]'s reason: a slow `gh` or a
+//! task, for [`crate::runautomerge`]'s and [`crate::reviewnotify`]'s reason: a slow `gh` or a
 //! slow disk must park the task that owns this subsystem's I/O and nothing else.
 
 use std::sync::Arc;
@@ -62,7 +62,7 @@ use crate::ghsummons::PrCommentSink;
 use crate::prstate::PrCoord;
 
 /// The `from` every escalation post is host-stamped with. Same value as
-/// [`crate::triage::MANAGER_IDENTITY`] and the adjudicator's, restated rather than imported because
+/// `crate::triage::MANAGER_IDENTITY` and the adjudicator's, restated rather than imported because
 /// the manager is one function however many of its halves exist.
 pub const MANAGER_IDENTITY: &str = "@manager";
 
@@ -109,7 +109,7 @@ pub enum DraftNudge {
 }
 
 /// Per-pull-request poke bookkeeping, keyed by
-/// [`churn_key`](crate::reviewwatch::churn_key) on the control task.
+/// `churn_key` on the control task.
 ///
 /// In memory rather than a column, for [`crate::reviewwatch::REVIEW_ROUNDS_PER_PR_CAP`]'s reason:
 /// it is a churn floor, not an audit record. A restart forgets it, which for an operator who
@@ -183,7 +183,7 @@ pub fn escalation_body(esc: &DraftEscalation) -> String {
 }
 
 /// Everything an off-loop poke or escalation needs. No `Orchestrator`, no store, no control channel
-/// — the off-loop guarantee, in the type, as [`crate::reviewadjudicate`]'s deps state it too.
+/// — the off-loop guarantee, in the type, as [`crate::reviewnotify::ReviewNotifyDeps`] states it.
 pub struct DraftPokeDeps {
     /// Where the poke (and the escalation's half) is posted. `None` disables the poke: a daemon that
     /// cannot reach GitHub cannot re-engage anybody, and there is no second route worth inventing —
