@@ -51,9 +51,10 @@
 //! a person, so a held ticket sitting in Todo is working as intended, not stalled. The sweep must
 //! never report it as a stall, and it cannot rely on such a ticket having no watch row: a ticket
 //! labelled AFTER an agent already ran has one, which is the likeliest way the label is ever applied.
-//! So a row whose origin ticket is currently in the dispatcher's hold set is dropped before the rules
-//! see it (see [`Orchestrator::reconcile_review_divergence`]) — the exclusion is explicit, not by
-//! construction. The dispatch refusal itself lives on the review watcher
+//! So a row whose origin ticket currently WEARS the label is dropped before the rules see it (see
+//! [`Orchestrator::reconcile_review_divergence`]) — the exclusion is explicit, not by construction,
+//! and it reads the live-inclusive current-label set so a label added while the origin run is still
+//! live is honoured too. The dispatch refusal itself lives on the review watcher
 //! ([`crate::reviewwatch`]), so a row that is held arms nothing new either; this filter is what keeps
 //! the ALREADY-ARMED row from reporting the deliberate hold as a stalled obligation. A future change
 //! that made this sweep range over tickets rather than watch rows would have to add the hold back
@@ -474,25 +475,28 @@ impl Orchestrator {
                 return;
             }
         };
-        // The current `rhapsody:human` hold set (STUDIO-949), lowercased once for the case-insensitive
-        // comparison below. A row whose origin ticket is in it is a DELIBERATE hold, not a stalled
-        // obligation, so it is dropped before the rules can date it — the module doc's "a held ticket
-        // never arms a watch row" is false (a label applied after a run leaves one), so this is a
-        // filter, not a construction. Empty on a daemon with no hold, so the default path is
-        // byte-identical.
-        let held: HashSet<String> = self
-            .human_holds
-            .held()
-            .into_iter()
-            .map(|h| h.issue_identifier.to_ascii_lowercase())
-            .collect();
+        // The current `rhapsody:human` LABEL set (STUDIO-949), already lowercased for the
+        // case-insensitive comparison below. A row whose origin ticket wears the label is a
+        // DELIBERATE hold, not a stalled obligation, so it is dropped before the rules can date it —
+        // the module doc's "a held ticket never arms a watch row" is false (a label applied after a
+        // run leaves one), so this is a filter, not a construction.
+        //
+        // This reads the CURRENT-LABEL set, not the reported-hold subset the console reads. The
+        // reported set deliberately excludes a ticket the daemon is RUNNING right now (a live run is
+        // not yet a deliberate hold for an operator), but the sweep must honour a label added to a
+        // run that is still live — the likeliest way the label is ever applied, and precisely the
+        // shape the ticketless watcher and the auto-merge gate already read this same set for. Using
+        // the reported subset instead let the sweep publish a `review_divergence` WARN for a ticket
+        // this feature had deliberately blocked. Empty on a daemon with no hold, so the default path
+        // is byte-identical.
+        let labelled: HashSet<String> = self.human_holds.labelled();
         // Grouped by pull request, preserving `load_live_review_watch`'s stable order so the
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
         let mut by_pr: HashMap<PrCoord, PrFacts> = HashMap::new();
         for row in &rows {
             if let Some(ticket) = origin_ticket(&row.introduced_by)
-                && held.contains(&ticket.to_ascii_lowercase())
+                && labelled.contains(&ticket.to_ascii_lowercase())
             {
                 continue; // a deliberate hold, not this sweep's business
             }
@@ -1435,7 +1439,15 @@ mod store_tests {
     /// STUDIO-949: the shape above, but with the origin ticket CURRENTLY held for a human. The row
     /// exists (it was armed by an earlier run) yet the obligation is a deliberate hold, not a stall,
     /// so the sweep must report nothing — on either surface.
-    /// MUTATION: delete the held-origin filter from `reconcile_review_divergence` and this reds.
+    ///
+    /// The fixture seeds the CURRENT-LABEL-only state (`note_human_label`, which is what the
+    /// selection pass records for a candidate wearing the label while its run is still live) rather
+    /// than `hold` (which feeds the reported subset too). That is the state the two sets disagree
+    /// on, so only this fixture pins the sweep to the live-inclusive signal; seeding `hold` passes
+    /// against either reader.
+    ///
+    /// MUTATION: delete the held-origin filter from `reconcile_review_divergence` and this reds;
+    /// read the reported `held()` set instead of `labelled()` and this reds too.
     #[test]
     fn a_held_ticket_is_not_reported_as_a_stall() {
         let o = &mut orch(false, "2026-09-14T21:20:00Z");
@@ -1453,11 +1465,7 @@ mod store_tests {
             "2026-09-14T13:00:00Z",
             "2026-09-14T14:40:00Z",
         );
-        o.human_holds.hold(crate::dispatch::HeldForHuman {
-            issue_identifier: "STUDIO-893".to_string(),
-            title: "human work".to_string(),
-            project: String::new(),
-        });
+        o.human_holds.note_human_label("STUDIO-893");
 
         o.reconcile_review_divergence();
 
