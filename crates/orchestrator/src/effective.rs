@@ -91,6 +91,10 @@ pub struct ResolvedProject {
     /// always non-empty post-resolve). `dep_mode_prompt_file` is the mode-on prompt path. INF-318.
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
+    /// The project's effective set of backlog-state names auto-promote may promote FROM (STUDIO-948),
+    /// normalized (case/whitespace-folded). EMPTY ⇒ unset: every backlog-type state is promotable —
+    /// the safety-critical default byte-identical to pre-948 behavior. Rhapsody-only.
+    pub promote_from_states: HashSet<String>,
     /// The project's effective ticket-claim policy (`"assignee"` | `"pool"`; always non-empty
     /// post-resolve). INF-477.
     pub claim_mode: String,
@@ -165,6 +169,10 @@ pub struct Effective {
     /// `dep_mode_prompt_file` is the legacy mode-on prompt path. INF-318.
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
+    /// The top-level/legacy set of backlog-state names auto-promote may promote FROM (STUDIO-948),
+    /// normalized. EMPTY ⇒ unset: every backlog-type state is promotable (the pre-948 default).
+    /// Per-project sets live on [`ResolvedProject::promote_from_states`]. Rhapsody-only.
+    pub promote_from_states: HashSet<String>,
     /// The top-level/legacy effective ticket-claim policy (`"assignee"` | `"pool"`; always
     /// non-empty post-resolve). `claim_ttl` / `claim_settle_delay` are the pool-mode election timing
     /// knobs, materialized to [`DEFAULT_CLAIM_TTL`] / [`DEFAULT_CLAIM_SETTLE_DELAY`] when unset.
@@ -636,6 +644,7 @@ pub fn build_effective_with_runner(
             workspace_mode: rp.eff.workspace_mode.clone(),
             dependency_mode: rp.eff.dependency_mode.clone(),
             dep_mode_prompt_file: rp.eff.dep_mode_prompt_file.clone(),
+            promote_from_states: normalize_set(&rp.eff.promote_from_states),
             claim_mode: rp.eff.claim_mode.clone(),
             model: rp.eff.claude.model.clone(),
             stall_timeout: stall_timeout_for(&mcfg),
@@ -658,6 +667,7 @@ pub fn build_effective_with_runner(
         pr_label: cfg.pr_label.clone(),
         dependency_mode: top_eff.dependency_mode.clone(),
         dep_mode_prompt_file: top_eff.dep_mode_prompt_file.clone(),
+        promote_from_states: normalize_set(&top_eff.promote_from_states),
         claim_mode: top_eff.claim_mode.clone(),
         claim_ttl: claim_ttl_or_default(cfg.tracker.claim_ttl),
         claim_settle_delay: claim_settle_or_default(cfg.tracker.claim_settle_delay),
@@ -805,6 +815,56 @@ claude:
         assert!(p.terminal_states.contains("done"));
         assert_eq!(p.per_state_limits.get("in progress"), Some(&2));
         assert_eq!(p.repo, "", "no repo configured");
+    }
+
+    // STUDIO-948: the config→gate seam end to end. DECODE keeps the operator's spelling verbatim;
+    // the FIFTH GATE matches on `normalize_state`. This pins that `build_effective` folds the
+    // configured value with `normalize_set` on BOTH the top-level and per-project paths. Drop either
+    // `normalize_set(...)` and an operator's `Backlog` stays `"Backlog"`, matches no normalized issue
+    // state, and dag silently promotes zero tickets — with no warning, because the boot WARN only
+    // fires when the key is UNSET. The promote tests assign already-lowercased sets directly, so this
+    // is the only test that pins the folding of a value that came from YAML.
+    #[test]
+    fn build_effective_normalizes_promote_from_states() {
+        const WF: &str = "\
+tracker:
+  kind: linear
+  api_key: tok
+  project_slug: proj
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Canceled]
+  dependency_mode: dag
+  promote_from_states: [Backlog]
+projects:
+  - slugs: [proj]
+    promote_from_states: [  Staged  ]
+agent:
+  backend: claude
+claude:
+  command: claude
+";
+        let cfg = decode_cfg(WF, "body");
+        let eff = build_effective(&cfg).expect("build_effective");
+        assert!(
+            eff.promote_from_states.contains("backlog"),
+            "top-level must be normalized (got {:?})",
+            eff.promote_from_states
+        );
+        assert!(
+            !eff.promote_from_states.contains("Backlog"),
+            "the raw spelling must not survive, or the normalized issue state never matches (got {:?})",
+            eff.promote_from_states
+        );
+        let p = eff
+            .projects
+            .iter()
+            .find(|p| p.slug == "proj")
+            .expect("resolved project");
+        assert!(
+            p.promote_from_states.contains("staged"),
+            "per-project override must be normalized too (got {:?})",
+            p.promote_from_states
+        );
     }
 
     // Mirrors Go `TestBuildEffectiveClaimModeOverrideDistinctClient`: a per-project claim_mode:pool

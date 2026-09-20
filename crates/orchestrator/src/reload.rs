@@ -94,6 +94,12 @@ impl Orchestrator {
         cfg.workflow_path = self.workflow_path.clone();
         let eff = build_effective(&cfg)?;
 
+        // STUDIO-948: an enabled dag/graphite scope with `promote_from_states` unset must say so at
+        // boot (and on reload) — the safety-critical default treats the operator's ENTIRE backlog as
+        // ready work, which is how STUDIO-749 was promoted. Emit toward the freshly-built effective
+        // before it moves.
+        crate::promote::warn_unset_promote_from_states(&eff);
+
         // Capture the account-level tracker + resolved key for the read-only Linear endpoints (INF-224)
         // + the warning resolver inputs from the freshly-built effective BEFORE moving it into
         // `self.eff` (so there is no re-borrow / fallible unwrap after the swap).
@@ -246,7 +252,7 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use crate::orchestrator::Orchestrator;
-    use crate::testsupport::TempDir;
+    use crate::testsupport::{TempDir, capture_events};
 
     // A full WORKFLOW.md (front matter + prompt body) mirroring Go `effective_test.go`'s `claudeWF`.
     // Go uses `api_key: $ORCH_TEST_KEY` + `t.Setenv`; the Rust port uses a literal key so the test
@@ -286,6 +292,44 @@ tracker:
   terminal_states: [Done, Canceled]
   github_summons: true
 repo: git@github.com:acme/widget.git
+agent:
+  backend: claude
+claude:
+  command: claude
+---
+Do {{ issue.identifier }}.
+";
+
+    /// An ENABLED `dag` mode with `promote_from_states` UNSET — the shape STUDIO-948 must warn about
+    /// at boot (an operator running dag chose it, but silence about the unset key is how STUDIO-749
+    /// got promoted). The companion DAG_PROMOTE_WF names the key and must be silent.
+    const DAG_WF: &str = "---
+tracker:
+  kind: linear
+  api_key: tok
+  project_slug: proj
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Canceled]
+  dependency_mode: dag
+agent:
+  backend: claude
+claude:
+  command: claude
+---
+Do {{ issue.identifier }}.
+";
+
+    /// Same as [`DAG_WF`] but with the key set — no boot warning.
+    const DAG_PROMOTE_WF: &str = "---
+tracker:
+  kind: linear
+  api_key: tok
+  project_slug: proj
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Canceled]
+  dependency_mode: dag
+  promote_from_states:
+    - Backlog
 agent:
   backend: claude
 claude:
@@ -514,6 +558,65 @@ Do {{ issue.identifier }}.
         assert!(
             o.gh_source.is_none(),
             "onReload must rebuild gh_source after disabling github_summons"
+        );
+    }
+
+    // STUDIO-948: an enabled dag/graphite scope with `promote_from_states` UNSET must say so at boot
+    // — one warning naming the key and the risk, in the same style as the INF-277 unmatched-slug
+    // advisory. Silence here is how STUDIO-749 was promoted.
+    #[test]
+    fn reload_warns_when_dag_promote_from_states_unset() {
+        let (path, _dir) = write_workflow(DAG_WF);
+        let mut o = Orchestrator::new(path);
+        let (res, events) = capture_events(|| o.reload_from_disk());
+        res.expect("reload");
+        let warns: Vec<_> = events
+            .iter()
+            .filter(|e| e.level == "WARN" && e.message.contains("promote_from_states is unset"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one boot warning for the unset key under an enabled dag mode"
+        );
+        assert_eq!(
+            warns[0].fields.get("project_slug").map(String::as_str),
+            Some("proj")
+        );
+        assert_eq!(
+            warns[0].fields.get("dependency_mode").map(String::as_str),
+            Some("dag")
+        );
+    }
+
+    // Naming the key silences the warning: the operator has told dag which states are staged work.
+    #[test]
+    fn reload_does_not_warn_when_promote_from_states_set() {
+        let (path, _dir) = write_workflow(DAG_PROMOTE_WF);
+        let mut o = Orchestrator::new(path);
+        let (res, events) = capture_events(|| o.reload_from_disk());
+        res.expect("reload");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("promote_from_states is unset")),
+            "a named promote_from_states must not warn"
+        );
+    }
+
+    // A disabled-mode daemon promotes nothing, so there is no risk and no warning — the
+    // disabled-is-noop invariant's diagnostic half.
+    #[test]
+    fn reload_does_not_warn_when_dependency_mode_disabled() {
+        let (path, _dir) = write_workflow(CLAUDE_WF); // no dependency_mode => disabled
+        let mut o = Orchestrator::new(path);
+        let (res, events) = capture_events(|| o.reload_from_disk());
+        res.expect("reload");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("promote_from_states is unset")),
+            "a disabled-mode daemon must not warn about promote_from_states"
         );
     }
 }

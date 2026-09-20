@@ -98,6 +98,12 @@ pub struct Tracker {
     /// `"" | "disabled" | "graphite" | "dag"` — empty ⇒ inherit/default at resolve (INF-318).
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
+    /// Backlog-state names auto-promote may promote FROM (STUDIO-948). EMPTY ⇒ unset, which is the
+    /// safety-critical default: every backlog-type state is promotable, byte-identical to pre-948
+    /// behavior. Non-empty ⇒ only issues whose state matches (case/whitespace-insensitively) are
+    /// promoted; every other backlog-type state is a deliberate judgement queue. Rhapsody-only — the
+    /// frozen Go reference has no counterpart.
+    pub promote_from_states: Vec<String>,
     /// `"" | "assignee" | "pool"` — empty ⇒ inherit/default at resolve (INF-477).
     pub claim_mode: String,
     /// Freshness window for pool-mode claim comments; zero ⇒ orchestrator applies the default.
@@ -340,6 +346,9 @@ pub struct Project {
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
     pub claim_mode: String,
+    /// Backlog-state names this project's auto-promote may promote FROM (STUDIO-948). EMPTY ⇒
+    /// inherit the top-level value; non-empty ⇒ this project's own set. See [`Tracker::promote_from_states`].
+    pub promote_from_states: Vec<String>,
     /// Per-project pause flag; `None` ⇒ enabled (default applied at resolve, INF-224).
     pub enabled: Option<bool>,
 }
@@ -442,6 +451,8 @@ pub(crate) struct RawTracker {
     pub capabilities: Vec<String>,
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
+    /// STUDIO-948; Rhapsody-only (no Go v0.4.0 counterpart). Empty ⇒ unset.
+    pub promote_from_states: Vec<String>,
     pub claim_mode: String,
     pub claim_ttl: String,
     pub claim_settle_delay: String,
@@ -591,6 +602,8 @@ pub(crate) struct RawProject {
     pub dependency_mode: String,
     pub dep_mode_prompt_file: String,
     pub claim_mode: String,
+    /// STUDIO-948; Rhapsody-only. Empty ⇒ inherit the top-level value.
+    pub promote_from_states: Vec<String>,
     pub claude: Option<RawClaudeOverride>,
     pub hooks: Option<RawHooks>,
     pub max_concurrent_agents: Option<i64>,

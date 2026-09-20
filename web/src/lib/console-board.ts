@@ -77,6 +77,13 @@ export interface ReviewerChip {
   key: string;
   /** The reviewer, from the review key's `@name`, else the row's durable assignee. */
   reviewer: string;
+  /**
+   * The provider THIS review ran on (STUDIO-952), or "" when the run recorded none (STUDIO-909
+   * precedes it). The card can hold runs on several providers on purpose — implementation and
+   * review are deliberately different models — so the chip carries its own row's provider rather
+   * than reusing `BoardCard.provider`, which is the author's.
+   */
+  provider: string;
   /** The reviewer's RUN status, which is what colours the chip: `done` green, `failed` red, … */
   status: ConsoleJobStatus;
   /** The run's own outcome, verbatim ("done", "running", "failed") — the chip's word. */
@@ -316,6 +323,9 @@ export function buildConsoleBoard(
     card.reviewers.push({
       key: row.key,
       reviewer: pr?.reviewer || row.assignee || "unknown",
+      // The review row's OWN provider, not the card's: implementation and review run on different
+      // models on purpose, so folding them onto one field is the defect STUDIO-952 fixes.
+      provider: row.provider,
       status: row.status,
       // The row's OWN run outcome, not the ticket status' label: a failed review maps to `blocked`,
       // and the chip's word must say how the run ended, not that a person is now needed (STUDIO-925).

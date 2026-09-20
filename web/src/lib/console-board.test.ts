@@ -219,6 +219,38 @@ describe("the board regroup (STUDIO-925)", () => {
   });
 });
 
+// STUDIO-952 — one card can hold runs on several providers on purpose, so each reviewer chip must
+// carry its OWN row's provider rather than the card's. The [STUDIO-949] fixture is the real case:
+// jerry implemented on fireworks-ai and sol reviewed on openai.
+describe("a review's own provider on the chip (STUDIO-952)", () => {
+  const studio949 = () =>
+    buildConsoleBoard([
+      row({
+        issue: "STUDIO-949",
+        trackerState: "In Review",
+        assignee: "jerry",
+        provider: "fireworks-ai",
+      }),
+      review("pr:makewhatis/rhapsody#186@sol", "STUDIO-949", { provider: "openai" }),
+    ]);
+
+  it("keeps the review's openai off the card's fireworks-ai", () => {
+    const card = cards(studio949())[0];
+    expect(card.provider).toBe("fireworks-ai");
+    expect(card.reviewers.map((r) => r.provider)).toEqual(["openai"]);
+  });
+
+  it("gives a chip whose run recorded no provider an empty string, not the card's", () => {
+    const card = cards(
+      buildConsoleBoard([
+        row({ issue: "LEGACY-1", assignee: "jerry", provider: "fireworks-ai" }),
+        review("pr:makewhatis/rhapsody#1@sol", "LEGACY-1", { provider: "" }),
+      ]),
+    )[0];
+    expect(card.reviewers[0].provider).toBe("");
+  });
+});
+
 describe("boardLaneOf", () => {
   it("treats a live run as running even when the status word is stale", () => {
     expect(boardLaneOf({ status: "queued", live: true, trackerState: "Todo" })).toBe("running");
