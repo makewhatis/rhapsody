@@ -55,17 +55,26 @@
 //! who read the previous round. A row that has never been reviewed has no continuity to preserve,
 //! so it is selected fresh.
 //!
-//! # The head is re-read immediately before dispatch (STUDIO-953)
+//! # The head is re-read immediately before its OWN dispatch (STUDIO-953)
 //!
 //! The observation a tick decides from is a BATCH: up to
 //! [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) serial `gh`
-//! round-trips, so the first pull request's head can be many seconds older than the dispatch it
-//! feeds. A review pinned to that superseded SHA is a wasted round and, worse, a false blocking
-//! verdict a human has to adjudicate — makewhatis/rhapsody#185, where the summon named `59108fe`
-//! while the head was `6a8ce86`. [`run_review_watch_task`] therefore re-reads every OPEN
-//! observation's head once, off-loop, immediately before handing the batch over, and ADOPTS the
-//! fresh answer: refusing on a move would let a short-cycle author starve the review entirely,
-//! which is strictly worse than reviewing slightly-stale code.
+//! round-trips, so without a re-read the first pull request's head can be seconds older than the
+//! dispatch it feeds. [`run_review_watch_task`] therefore re-reads each OPEN observation's head
+//! once, off-loop, and hands THAT observation to the control task immediately — before re-reading
+//! the next — so no later pull request's blocking `gh` call can sit between a head and its
+//! dispatch. The fresh answer is ADOPTED: refusing on a move would let a short-cycle author starve
+//! the review entirely, which is strictly worse than reviewing slightly-stale code.
+//!
+//! **What this closes, and what it does not.** It closes the window between the batched
+//! observation and the dispatch — on this deployment that is the ~2.4 s the tick body spends on
+//! its serial lookups. It does NOT close the window that produced makewhatis/rhapsody#185: there
+//! the summon named `59108fe`, the run began at 02:37:19, the author's `6a8ce86` landed at
+//! 02:41:31, and the daemon's own log shows the watcher still reading `59108fe` 4 m 10 s after the
+//! dispatch — the head was correct when the review fired, and the author pushed DURING the run.
+//! Closing that needs a check on the dispatch→verdict seam (`reviewnotify`), not here, and is out
+//! of this ticket's scope. The cost of this guard is honest and not free: one extra `gh` call per
+//! OPEN observation per tick, up to doubling this subsystem's share of GitHub's hourly budget.
 //!
 //! # Off the loop, then back onto it (§5, F3)
 //!
@@ -75,10 +84,10 @@
 //! no `Orchestrator`, and the only lock it shares with the control task is
 //! [`crate::runautomerge::AutoMergeLedger`]'s — taken read-only by the control task through
 //! [`crate::runautomerge::AutoMergeLedger::peek`] (STUDIO-923) — the same structural containment
-//! [`crate::prstate`] was built for and documents. What comes back crosses to the
-//! control task as ONE [`Event::ReviewSweep`], where the watch set stays single-writer beside
-//! `dispatch_review` and `handle_review_introduce`, and where `running`/`claimed` can be read
-//! without a race.
+//! [`crate::prstate`] was built for and documents. What comes back crosses to the control task as
+//! a stream of [`Event::ReviewSweep`]s, one per observation, each handed over as soon as its head
+//! is re-read, where the watch set stays single-writer beside `dispatch_review` and
+//! `handle_review_introduce`, and where `running`/`claimed` can be read without a race.
 //!
 //! # Teams-gating (§16)
 //!
@@ -304,17 +313,22 @@ pub struct ReviewWatchDeps {
     pub sink: Arc<dyn ReviewWatchSink>,
 }
 
-/// Re-reads the head of every OPEN observation once, immediately before the batch is handed to the
-/// control task — the re-verification that closes the window between the batched `gh` lookup and the
-/// dispatch it feeds (STUDIO-953).
+/// Re-reads one OPEN observation's head once, off-loop, immediately before that observation is
+/// handed to the control task — the re-verification that closes the window between the batched `gh`
+/// lookup and the dispatch it feeds (STUDIO-953).
 ///
-/// The sweep is serial: up to [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK)
-/// blocking round-trips, so by the time the control task acts on the first pull request's answer the
-/// author may already have pushed past it. A review pinned to that superseded head is the defect
-/// makewhatis/rhapsody#185 is named for: the summon named `59108fe`, the head was `6a8ce86`, and the
-/// blocking finding it produced had already been fixed 90 seconds before the review began.
+/// One observation at a time, not a second batch. A batch would re-create the very window it exists
+/// to close: the first pull request's re-read would still wait behind every later pull request's
+/// blocking `gh` call before its dispatch, which is the defect a reviewer reproduced on #189. Each
+/// caller therefore re-reads and hands over in the same step, so nothing blocking sits between a
+/// head and its dispatch.
 ///
-/// Two deliberate choices, both about not replacing a stale review with no review:
+/// The re-read is a READ, not a refusal: up to
+/// [`MAX_PR_STATE_CALLS_PER_TICK`](crate::prstate::MAX_PR_STATE_CALLS_PER_TICK) lookups precede it,
+/// so by the time the control task acts on the first pull request's answer its author may already
+/// have pushed past it.
+///
+/// Three deliberate choices, all about not replacing a stale review with no review:
 ///
 /// * a moved head is ADOPTED, not refused. Refusing whenever the head moved would let an author
 ///   pushing on a short cycle starve the review forever, which is strictly worse than reviewing
@@ -323,40 +337,40 @@ pub struct ReviewWatchDeps {
 ///   asked about and arms nothing further.
 /// * a re-read that FAILS keeps the observed answer and says so once. A failed re-read is not
 ///   evidence the head moved, and refusing on it would be the same livelock by another route.
+/// * a non-OPEN observation is not re-read at all: a merged, closed, gone or untrusted answer
+///   dispatches nothing, so its head does not matter.
 ///
-/// Only OPEN observations are re-read: a merged, closed, gone or untrusted answer dispatches
-/// nothing, so its head does not matter. The extra cost is therefore bounded by the same per-tick
-/// budget as the sweep, and a tick that observed nothing asks GitHub nothing.
-async fn refresh_observed_heads(
+/// §16 first: with Teams off the sweep has already observed nothing, and this refuses to spawn a
+/// process even if a stale watch set hands it one.
+async fn refresh_observed_head(
     ctx: &CancelWait,
+    teams: &Teams,
     src: &dyn PrStateSource,
     allow: &HeadAllowlist,
-    observed: Vec<PrObservation>,
-) -> Vec<PrObservation> {
-    let mut fresh = Vec::with_capacity(observed.len());
-    for obs in observed {
-        let open = matches!(&obs.lookup, PrLookup::Found(snap) if snap.status == PrStatus::Open);
-        if !open || ctx.is_cancelled() {
-            fresh.push(obs);
-            continue;
-        }
-        match src
-            .pr_state(&obs.pr.owner, &obs.pr.repo, obs.pr.number, allow)
-            .await
-        {
-            Ok(lookup) => fresh.push(PrObservation { pr: obs.pr, lookup }),
-            Err(e) => {
-                tracing::warn!(
-                    pr = %obs.pr,
-                    error = %e,
-                    "pr-state re-read before dispatch failed; the observed head stands and the \
-                     review dispatches from it"
-                );
-                fresh.push(obs);
-            }
+    obs: PrObservation,
+) -> PrObservation {
+    if !crate::prstate::pr_state_polling_enabled(teams) || ctx.is_cancelled() {
+        return obs;
+    }
+    let open = matches!(&obs.lookup, PrLookup::Found(snap) if snap.status == PrStatus::Open);
+    if !open {
+        return obs;
+    }
+    match src
+        .pr_state(&obs.pr.owner, &obs.pr.repo, obs.pr.number, allow)
+        .await
+    {
+        Ok(lookup) => PrObservation { pr: obs.pr, lookup },
+        Err(e) => {
+            tracing::warn!(
+                pr = %obs.pr,
+                error = %e,
+                "pr-state re-read before dispatch failed; the observed head stands and the \
+                 review dispatches from it"
+            );
+            obs
         }
     }
-    fresh
 }
 
 /// Polls the watch set on [`PR_STATE_POLL_INTERVAL`](crate::prstate::PR_STATE_POLL_INTERVAL) until
@@ -409,11 +423,25 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         if sweep.observed.is_empty() {
             continue;
         }
-        // Re-read before the hand-back (STUDIO-953): the batch above is serial, so an author can
-        // push between the first lookup and the dispatch it leads to. ADOPTS the fresh answer.
-        let observed =
-            refresh_observed_heads(&ctx, src.as_ref(), &deps.allow, sweep.observed).await;
-        let report = deps.sink.sweep(observed).await;
+        // Re-read each head and hand that observation over BEFORE re-reading the next (STUDIO-953).
+        // One at a time, not a second batch: the batch above is serial, so an author can push
+        // between the first lookup and the dispatch it leads to, and a second batch would leave the
+        // first pull request waiting behind every later re-read exactly as before. ADOPTS the fresh
+        // answer. The per-observation reports are folded back into one tick report so the log line
+        // and the merge/Done work lists keep their tick shape.
+        let mut report = ReviewSweepReport::default();
+        for obs in sweep.observed {
+            let fresh =
+                refresh_observed_head(&ctx, &deps.teams, src.as_ref(), &deps.allow, obs).await;
+            let one = deps.sink.sweep(vec![fresh]).await;
+            report.dispatched += one.dispatched;
+            report.retired += one.retired;
+            report.deferred += one.deferred;
+            report.armed += one.armed;
+            report.stalled += one.stalled;
+            report.done.extend(one.done);
+            report.merge.extend(one.merge);
+        }
         if report != ReviewSweepReport::default() {
             tracing::info!(
                 dispatched = report.dispatched,
@@ -2869,9 +2897,16 @@ mod tests {
 
         let seen = seen.lock().expect("seen lock");
         assert!(!seen.is_empty(), "the task never handed a tick back");
-        let first = &seen[0];
+        // Since STUDIO-953 the task hands each observation over on its own, immediately after its
+        // head is re-read, so a tick is a run of single-observation hand-backs rather than one
+        // batch. The coordinates, and their order, are unchanged.
+        let handed: Vec<PrCoord> = seen
+            .iter()
+            .take(2)
+            .flat_map(|batch| batch.iter().map(|o| o.pr.clone()))
+            .collect();
         assert_eq!(
-            first.iter().map(|o| o.pr.clone()).collect::<Vec<_>>(),
+            handed,
             vec![coord(12), coord(13)],
             "exactly the coordinates the control task named, and no others"
         );
@@ -2913,8 +2948,11 @@ mod tests {
             "expected at least two ticks, got {}",
             ticks.len()
         );
+        // Since STUDIO-953 a tick is a run of single-observation hand-backs, not one batch: the
+        // first `budget` calls are its whole budget.
+        let first_tick: Vec<&PrObservation> = ticks.iter().take(budget).flatten().collect();
         assert_eq!(
-            ticks[0].len(),
+            first_tick.len(),
             budget,
             "the first tick spends the whole budget"
         );
@@ -3116,9 +3154,9 @@ mod tests {
         async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
     }
 
-    /// The re-read itself, driven directly: a moved head is ADOPTED, an unchanged one kept, a
-    /// non-open observation is never re-asked about, and a FAILED re-read keeps the observed answer
-    /// rather than dropping the review.
+    /// The re-read itself, driven directly: a moved head is ADOPTED, a non-open observation is
+    /// never re-asked about, and a FAILED re-read keeps the observed answer rather than dropping
+    /// the review.
     #[tokio::test]
     async fn the_pre_dispatch_re_read_adopts_a_moved_head_and_keeps_a_failed_one() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3129,17 +3167,30 @@ mod tests {
             ]),
             calls: Arc::clone(&calls),
         };
-        let observed = vec![
-            open_at(12, HEAD_A),
-            open_at(13, HEAD_A),
-            observed(14, PrLookup::Gone),
-        ];
+        let teams = ticketless(&["alice", "bob"]);
 
-        let fresh = refresh_observed_heads(
+        let moved = refresh_observed_head(
             &CancelWait::default(),
+            &teams,
             &src,
             &HeadAllowlist::none(),
-            observed,
+            open_at(12, HEAD_A),
+        )
+        .await;
+        let failed = refresh_observed_head(
+            &CancelWait::default(),
+            &teams,
+            &src,
+            &HeadAllowlist::none(),
+            open_at(13, HEAD_A),
+        )
+        .await;
+        let gone = refresh_observed_head(
+            &CancelWait::default(),
+            &teams,
+            &src,
+            &HeadAllowlist::none(),
+            observed(14, PrLookup::Gone),
         )
         .await;
 
@@ -3149,29 +3200,60 @@ mod tests {
             "only the two OPEN observations may be re-read"
         );
         assert_eq!(
-            head_of(&fresh[0]),
+            head_of(&moved),
             Some(HEAD_B),
             "the moved head is adopted, not the swept one"
         );
         assert_eq!(
-            head_of(&fresh[1]),
+            head_of(&failed),
             Some(HEAD_A),
             "a failed re-read keeps the observed head; the review still dispatches"
         );
         assert_eq!(
-            fresh[2].lookup,
+            gone.lookup,
             PrLookup::Gone,
             "a non-open observation dispatches nothing and is not re-read"
         );
     }
 
-    /// The makewhatis/rhapsody#185 case end to end: the author pushes between the observation
-    /// snapshot and the dispatch. The review must be pinned to the head actually there when it
-    /// fires (`6a8ce86` in the incident), never to the superseded snapshot (`59108fe`) — the stale
-    /// pin is what produced a blocking finding against code the author had already fixed 90 seconds
-    /// before the review began. Removing [`refresh_observed_heads`] reds this test.
+    /// §16, the nit a reviewer flagged: the re-read carries the same master gate as every other
+    /// entry point in this subsystem — with Teams off it asks GitHub nothing and adopts nothing.
+    #[tokio::test]
+    async fn the_pre_dispatch_re_read_is_dormant_with_teams_off() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let src = ScriptedSource {
+            answers: Mutex::new(vec![Ok(open_at(12, HEAD_B).lookup)]),
+            calls: Arc::clone(&calls),
+        };
+        let teams = teams_with(false, ReviewMode::Ticketless, vec![ident("bob", 0)]);
+
+        let kept = refresh_observed_head(
+            &CancelWait::default(),
+            &teams,
+            &src,
+            &HeadAllowlist::none(),
+            open_at(12, HEAD_A),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a Teams-off re-read must ask GitHub nothing"
+        );
+        assert_eq!(head_of(&kept), Some(HEAD_A), "and must not adopt anything");
+    }
+
+    /// The ticket's acceptance case: the author pushes between the observation snapshot and the
+    /// dispatch. The review must be pinned to the head live when it fires, never to the superseded
+    /// snapshot. Removing [`refresh_observed_head`] reds this test.
+    ///
+    /// Deliberately NOT named after makewhatis/rhapsody#185: the log shows that incident's window
+    /// was dispatch→verdict, not observation→dispatch, so this guard would not have prevented it
+    /// (see the module doc). Naming the test after it would assert a causality the log refutes.
     #[tokio::test(start_paused = true)]
-    async fn makewhatis_rhapsody_185_a_moved_head_is_reviewed_at_the_new_head() {
+    async fn a_head_that_moves_between_the_observation_and_its_dispatch_is_reviewed_at_the_new_head()
+     {
         let (o, dispatched) = orch(ticketless(&["alice", "bob"]));
         introduce(&o, row(12, "bob"));
         let done = Arc::new(tokio::sync::Notify::new());
@@ -3214,6 +3296,151 @@ mod tests {
             entries[0].review.as_ref().map(|r| r.head_sha.as_str()),
             Some(HEAD_B),
             "the worker was sent to the head the author had NOT superseded"
+        );
+    }
+
+    /// A [`PrStateSource`] that records each pre-dispatch RE-READ (the first call per number is the
+    /// sweep's own lookup, every later one the re-read) and, when asked about `later`, advances
+    /// `earlier`'s head — "the first pull request's author pushes while the second is re-read".
+    struct InterleavingSource {
+        counts: Mutex<HashMap<i64, usize>>,
+        head: Mutex<HashMap<i64, String>>,
+        events: Arc<Mutex<Vec<String>>>,
+        earlier: i64,
+        later: i64,
+    }
+
+    #[async_trait]
+    impl PrStateSource for InterleavingSource {
+        async fn pr_state(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            number: i64,
+            _allow: &HeadAllowlist,
+        ) -> PrStateResult {
+            let call = {
+                let mut counts = self.counts.lock().expect("counts lock");
+                let call = counts.entry(number).or_insert(0);
+                *call += 1;
+                *call
+            };
+            if call > 1 {
+                self.events
+                    .lock()
+                    .expect("events lock")
+                    .push(format!("refresh:{number}"));
+                if number == self.later {
+                    self.head
+                        .lock()
+                        .expect("head lock")
+                        .insert(self.earlier, HEAD_B.to_string());
+                }
+            }
+            let head = self
+                .head
+                .lock()
+                .expect("head lock")
+                .get(&number)
+                .cloned()
+                .unwrap_or_else(|| HEAD_A.to_string());
+            Ok(PrLookup::Found(PrSnapshot {
+                is_draft: false,
+                head_sha: head,
+                status: PrStatus::Open,
+                merged_at: None,
+                head_repo: format!("{OWNER}/{REPO}"),
+            }))
+        }
+    }
+
+    /// A sink running the real control decision AND recording the order in which each observation
+    /// was handed over — so a test can assert the watcher interleaves re-read and hand-back rather
+    /// than batching the re-reads.
+    struct OrderRecordingSink {
+        watched: Vec<PrCoord>,
+        orch: Mutex<Orchestrator>,
+        done: Arc<tokio::sync::Notify>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewWatchSink for OrderRecordingSink {
+        async fn watched(&self) -> Vec<PrCoord> {
+            self.watched.clone()
+        }
+        async fn sweep(&self, observed: Vec<PrObservation>) -> ReviewSweepReport {
+            for obs in &observed {
+                self.events
+                    .lock()
+                    .expect("events lock")
+                    .push(format!("sweep:{}", obs.pr.number));
+            }
+            let report = self
+                .orch
+                .lock()
+                .expect("orchestrator lock")
+                .handle_review_sweep(&observed);
+            self.done.notify_one();
+            report
+        }
+        async fn merge(&self, _plan: crate::automerge::AutoMergePlan) {}
+        async fn finish(&self, _plan: crate::reviewdone::ReviewDonePlan) {}
+    }
+
+    /// Sol's blocking finding on #189: a two-pull-request tick must hand each re-read head to the
+    /// control task BEFORE re-reading the next, or the first pull request waits behind the second's
+    /// blocking `gh` call exactly as it did when the re-read was a second batch. This asserts the
+    /// ORDER — the first pull request's hand-back sits between its own re-read and the later
+    /// re-read — which a batched implementation cannot satisfy (it would log
+    /// `refresh:12, refresh:13, sweep:12, sweep:13`).
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_pr_tick_hands_each_re_read_head_over_before_re_reading_the_next() {
+        let (o, _dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        introduce(&o, row(13, "bob"));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(OrderRecordingSink {
+            watched: vec![coord(12), coord(13)],
+            orch: Mutex::new(o),
+            done: Arc::clone(&done),
+            events: Arc::clone(&events),
+        });
+        let deps = ReviewWatchDeps {
+            pr_source: Some(Arc::new(InterleavingSource {
+                counts: Mutex::new(HashMap::new()),
+                head: Mutex::new(HashMap::from([
+                    (12, HEAD_A.to_string()),
+                    (13, HEAD_A.to_string()),
+                ])),
+                events: Arc::clone(&events),
+                earlier: 12,
+                later: 13,
+            })),
+            allow: HeadAllowlist::none(),
+            teams: ticketless(&["alice", "bob"]),
+            sink: sink.clone(),
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
+
+        let ticked =
+            tokio::time::timeout(crate::prstate::PR_STATE_POLL_INTERVAL * 3, done.notified()).await;
+        assert!(
+            ticked.is_ok(),
+            "the watcher never handed a tick back at all"
+        );
+        // Let the rest of the tick (the second observation) finish before reading the log.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        signal.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+
+        let events = events.lock().expect("events lock").clone();
+        assert_eq!(
+            events,
+            vec!["refresh:12", "sweep:12", "refresh:13", "sweep:13"],
+            "each re-read must be handed over before the next blocking re-read begins"
         );
     }
 
