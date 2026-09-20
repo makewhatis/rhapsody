@@ -1467,14 +1467,14 @@ pub trait ReviewDeltaSource: Send + Sync {
         head: &str,
     ) -> DeltaResult<bool>;
 
-    /// The findings comments already on the pull request, oldest first, newest-first truncated to
+    /// The findings comments already on the pull request, oldest first, capped at
     /// [`MAX_DELTA_FINDINGS`].
     ///
-    /// Both issue comments and inline review comments are read, because a reviewer may have used
+    /// BOTH issue comments and inline review comments are read, because a reviewer may have used
     /// either. No author filter is applied: reviewers post under the daemon's own `gh` identity, so
     /// attributing a comment to a Teams teammate is not possible from GitHub. The delta round is
-    /// therefore handed the pull request's findings — a superset of its own — and told which commit
-    /// it last read.
+    /// therefore handed the pull request's findings — a superset of its own, including the daemon's
+    /// own completion comments — and told which commit it last read.
     async fn prior_findings(
         &self,
         owner: &str,
@@ -1528,8 +1528,8 @@ impl ReviewDeltaSource for GH {
         }
     }
 
-    /// Two bounded `gh api` reads (issue comments + inline review comments), newest first, each
-    /// page capped at [`MAX_DELTA_FINDINGS`].
+    /// Two bounded `gh api` reads (issue comments + inline review comments), merged into one
+    /// newest-first list capped at [`MAX_DELTA_FINDINGS`].
     ///
     /// A failure on either endpoint is an error, not a partial list: the caller degrades to a full
     /// review, which is the safe direction. Silently handing a round half its findings would be
@@ -1543,7 +1543,11 @@ impl ReviewDeltaSource for GH {
         if owner.is_empty() || repo.is_empty() || number <= 0 {
             return Ok(Vec::new());
         }
-        let mut out: Vec<String> = Vec::new();
+        // `(created_at, body)`, merged across the two endpoints rather than concatenated: taking the
+        // newest overall must not mean "whichever endpoint was read first wins". `created_at` is
+        // RFC3339 (`Z`), so a lexicographic sort is chronological; a comment with no timestamp sorts
+        // oldest, and is never dropped in favour of one that has a timestamp.
+        let mut found: Vec<(String, String)> = Vec::new();
         for endpoint in ["issues", "pulls"] {
             let path = format!(
                 "repos/{owner}/{repo}/{endpoint}/comments?per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc"
@@ -1560,18 +1564,22 @@ impl ReviewDeltaSource for GH {
                         format!("gh api {path}: expected a JSON array of comments").into()
                     })?;
             for c in comments {
-                if let Some(body) = c.get("body").and_then(serde_json::Value::as_str)
-                    && !body.trim().is_empty()
+                if let Some(raw) = c.get("body").and_then(serde_json::Value::as_str)
+                    && !raw.trim().is_empty()
                 {
-                    out.push(bounded_finding(body));
+                    let at = c
+                        .get("created_at")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    found.push((at, bounded_finding(raw)));
                 }
             }
         }
-        // Both endpoints answered newest-first; keep the newest overall and restore chronological
-        // order so the round reads the conversation the way it happened.
-        out.truncate(MAX_DELTA_FINDINGS);
-        out.reverse();
-        Ok(out)
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        found.truncate(MAX_DELTA_FINDINGS);
+        found.reverse();
+        Ok(found.into_iter().map(|(_, body)| body).collect())
     }
 }
 
@@ -3441,9 +3449,9 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
             let ep = args.last().copied().unwrap_or_default();
             let body = if ep.contains("/issues/comments") {
-                r#"[{"body":"newer issue finding"},{"body":"   "}]"#
+                r#"[{"body":"newer issue finding","created_at":"2026-09-20T12:00:00Z"},{"body":"   "}]"#
             } else {
-                r#"[{"body":"older review finding"}]"#
+                r#"[{"body":"older review finding","created_at":"2026-09-20T09:00:00Z"}]"#
             };
             Ok(body.as_bytes().to_vec())
         });
