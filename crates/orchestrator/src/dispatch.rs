@@ -122,11 +122,12 @@ const HUMAN_HOLD_CAPACITY: usize = 256;
 /// needs a person while the daemon is gated — so keeping a populated set is the honest answer.
 ///
 /// The converse is also load-bearing: on a daemon held by one of those gates since boot, NO pass has
-/// ever run, so an empty set is not "no hold" but "nothing has looked", and reading it as the former
-/// is how a `rhapsody:human` ticket's pull request self-merges on a drained daemon (STUDIO-949 round
-/// 11). [`HumanHoldState::primed`] carries that distinction; every `labelled()` decision gate that
-/// does not flow through the per-tick candidate pass — the auto-merge refusal, the reconciliation
-/// sweep and the ticket-mode handoff quorum — fails closed while it is `false`.
+/// ever READ THE BOARD, so an empty set is not "no hold" but "nothing has looked", and reading it as
+/// the former is how a `rhapsody:human` ticket's pull request self-merges on a drained daemon
+/// (STUDIO-949 rounds 11-13). [`HumanHoldState::primed`] carries that distinction; every `labelled()`
+/// decision gate that does not flow through the per-tick candidate pass — the ticketless watcher's
+/// round and auto-merge gates, the reconciliation sweep and the ticket-mode handoff quorum — fails
+/// closed while it is `false`.
 ///
 /// Shared (`Arc`) rather than loop-confined because the selection pass takes `&self` by design and
 /// the control task assembles the snapshot from the same cell. A `Mutex` held for two map operations
@@ -152,24 +153,32 @@ struct HumanHoldState {
     /// issue snapshot predates it. Kept separate so tightening a decision gate never makes the
     /// console call live work "held".
     labelled: HashSet<String>,
-    /// Whether a selection pass has run in this process — set by the first
-    /// [`HumanHoldLedger::begin_pass`] and never cleared (STUDIO-949 round 11).
+    /// Whether a selection pass has READ THE BOARD in this process — set by the first
+    /// [`HumanHoldLedger::begin_pass`] that was told the candidate fetch succeeded, and never
+    /// cleared (STUDIO-949 rounds 11-13).
     ///
     /// `labelled` is written ONLY from inside a selection pass (both ladders) or from the
     /// auto-promote pass that runs immediately after one, and every one of those writers sits BELOW
     /// `on_tick`'s three early-return gates (a failed config validation, an armed drain, a dead
     /// agent credential). On a daemon held by one of those gates `labelled` is therefore empty for
     /// the WHOLE process lifetime, and a decision gate reading it would see "no hold" rather than
-    /// "no information". Three gates turn on it and none flows through the per-tick candidate pass:
-    /// the auto-merge refusal (`Event::ReviewSweep` from the watcher's 120s task), the reconciliation
-    /// sweep's held-row filter (from `on_tick` ABOVE the gates) and the ticket-mode handoff quorum
-    /// (from the `evHandoffRun` handler, which is not on `on_tick` at all). All three keep executing
-    /// while dispatch is gated.
+    /// "no information". FOUR gates turn on it and none flows through the per-tick candidate pass:
+    /// the ticketless watcher's round gate and its auto-merge gate (both `Event::ReviewSweep` from
+    /// the watcher's 120s task), the reconciliation sweep's held-row filter (from `on_tick` ABOVE
+    /// the gates) and the ticket-mode handoff quorum (from the `evHandoffRun` handler, which is not
+    /// on `on_tick` at all). All four keep executing while dispatch is gated.
     ///
-    /// `primed` is that distinction: `false` until a pass has actually looked, so those three gates
+    /// `primed` is that distinction: `false` until a pass has actually looked, so those four gates
     /// fail CLOSED instead of silently open. `begin_pass` is the only writer on purpose — the
     /// auto-promote pass observes only Backlog dependents, a partial view, and must not be able to
     /// make an unknown label set look known.
+    ///
+    /// It is deliberately "read the board", not "ran a pass" (STUDIO-949 round 13): a `projects:`
+    /// install's ladder is reached unconditionally even when EVERY project's candidate fetch failed
+    /// (`poll_all_projects` `continue`s past each error), so a pass that saw no candidate because it
+    /// could not fetch is exactly the unknown-set case this latch exists to forbid. The fetch verdict
+    /// is threaded in through [`HumanHoldLedger::begin_pass`]; a pass that could not look neither
+    /// clears nor primes, leaving the last good answer (or the un-primed state) standing.
     primed: bool,
 }
 
@@ -182,28 +191,28 @@ impl Default for HumanHoldLedger {
 }
 
 impl HumanHoldLedger {
-    /// Starts a fresh selection pass: the CURRENT hold set is dropped, so a ticket that stopped
-    /// wearing the label — or left the candidate set — stops being reported. The announced set is
-    /// deliberately NOT touched, and the **primed** flag is set: this is the first moment the
-    /// process can be said to have looked at all, which is what lets the fail-closed decision gates
-    /// (the auto-merge refusal, the reconciliation sweep's held-row filter, the ticket-mode handoff
-    /// quorum) read an answer. No other method sets it; see [`HumanHoldState::primed`].
-    pub(crate) fn begin_pass(&self) {
+    /// Starts a fresh selection pass over a board the caller COULD SEE: the CURRENT hold set is
+    /// dropped, so a ticket that stopped wearing the label — or left the candidate set — stops being
+    /// reported. The announced set is deliberately NOT touched, and the **primed** flag is set: this
+    /// is the first moment the process can be said to have looked at all, which is what lets the
+    /// fail-closed decision gates (the ticketless watcher's round and auto-merge gates, the
+    /// reconciliation sweep's held-row filter, the ticket-mode handoff quorum) read an answer.
+    ///
+    /// `read_the_board` is the candidate fetch's verdict (STUDIO-949 round 13). When it is `false`
+    /// the pass could not look — on a `projects:` install where every project's fetch failed, the
+    /// ladder still runs on an empty candidate list — so this does NOTHING: the sets are neither
+    /// cleared nor primed, and the last answer (or the un-primed state) stands. Clearing on a failed
+    /// fetch would reopen every gate by emptying the set; priming would mark an unknown set known.
+    /// The legacy single-tracker path passes `true` by construction (its failed fetch returns before
+    /// the ladder). No other method sets `primed`; see [`HumanHoldState::primed`].
+    pub(crate) fn begin_pass(&self, read_the_board: bool) {
+        if !read_the_board {
+            return;
+        }
         let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         st.held.clear();
         st.labelled.clear();
         st.primed = true;
-    }
-
-    /// Whether a full selection pass has run in this process (STUDIO-949 round 11). While `false`,
-    /// [`Self::labelled`] is not an answer — it is an absence of one — and the decision gates that
-    /// read it must fail closed rather than treat an empty set as "no hold". See
-    /// [`HumanHoldState::primed`].
-    pub(crate) fn is_primed(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .primed
     }
 
     /// Records a ticket the pass OBSERVED wearing [`HUMAN_LABEL`](crate::teams::HUMAN_LABEL), with
@@ -254,15 +263,22 @@ impl HumanHoldLedger {
     }
 
     /// The tickets the most recent selection pass OBSERVED wearing the human label, including any
-    /// the daemon is running right now — lowercased. This is the decision signal for a gate on a
-    /// RUNNING ticket (the handoff review decision, the ticketless origin gate); the console reads
-    /// [`Self::held`] instead, which excludes live work.
-    pub(crate) fn labelled(&self) -> HashSet<String> {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .labelled
-            .clone()
+    /// the daemon is running right now — lowercased — TOGETHER WITH the priming latch, read under
+    /// ONE lock (STUDIO-949 round 13).
+    ///
+    /// This is the decision signal for a gate on a RUNNING ticket (the handoff review decision, the
+    /// ticketless origin gate); the console reads [`Self::held`] instead, which excludes live work.
+    /// The latch distinguishes "the last pass saw no hold" from "no pass has read the board yet":
+    /// while it is `false` the set is an absence of information, and a gate that treated it as "no
+    /// hold" would fail open on a daemon whose dispatch is gated (see [`HumanHoldState::primed`]).
+    ///
+    /// The two are returned together rather than by separate accessors because read separately a
+    /// pass landing between the two calls looks like this: the gate reads an empty (un-primed) set,
+    /// the pass primes it with a real one, the gate then reads `primed == true` and treats the empty
+    /// set it already holds as a settled "no hold". One lock returns the pair one pass produced.
+    pub(crate) fn labelled_and_primed(&self) -> (HashSet<String>, bool) {
+        let st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        (st.labelled.clone(), st.primed)
     }
 
     /// The tickets held by the most recent selection pass, for the snapshot. Empty until a pass has
@@ -1371,7 +1387,7 @@ mod tests {
             "two notes with no begin_pass between them are ONE held ticket: {:?}",
             ledger.held()
         );
-        ledger.begin_pass();
+        ledger.begin_pass(true);
         assert!(ledger.held().is_empty(), "begin_pass still clears the set");
         assert!(!ledger.hold(entry("booch")), "the announced set survives");
     }

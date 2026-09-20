@@ -433,7 +433,7 @@ mod tests {
         // has therefore run and primed the human-hold ledger. Prime it here so the un-primed
         // fail-closed branch in `plan_quorum` (STUDIO-949 round 12) is exercised by its own test
         // rather than being what every handoff fixture happens to trip.
-        o.human_holds.begin_pass();
+        o.human_holds.begin_pass(true);
         let cancelled = Arc::new(Mutex::new(HashMap::<String, CancelWait>::new()));
         let cancelled2 = Arc::clone(&cancelled);
         o.spawn = Some(Box::new(move |iss, _attempt, re| {

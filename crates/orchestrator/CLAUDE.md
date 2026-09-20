@@ -109,13 +109,18 @@ the `Orchestrator` struct itself. Concretely:
     reads the same cell. Never held across an `.await` — two map operations and out. Unlike
     `held_for_capacity`, which the `&mut self` caller stores wholesale, the announced half must
     SURVIVE a pass, so the ledger owns it; `begin_pass` clears both current sets and sets the
-    ledger's **primed** flag — the boolean that distinguishes "the last pass saw no hold" from
-    "no pass has ever looked". Every writer is below `on_tick`'s three early-return gates while
-    THREE decision gates keep running independently of them — the auto-merge gate, the reconciliation
-    sweep, and the ticket-mode handoff quorum (`plan_quorum`, reached from `evHandoffRun`, off the
-    `on_tick` path entirely) — so on a daemon gated since boot `labelled` is empty for the whole
-    process lifetime. All three therefore fail CLOSED while `is_primed()` is false — auto-merge
-    refuses, the sweep reports nothing, `plan_quorum` refuses the fan-out (STUDIO-949 rounds 11-12).
+    ledger's **primed** flag — the boolean that distinguishes "the last pass read the board and saw
+    no hold" from "no pass has read the board yet". `begin_pass` takes the caller's candidate-FETCH
+    verdict and does nothing at all when it is false (every enabled project's fetch failed on a
+    multi-project install), so a pass that could not look neither clears nor primes. Every writer is
+    below `on_tick`'s three early-return gates while FOUR decision gates keep running independently
+    of them — the ticketless watcher's round gate and its auto-merge gate, the reconciliation sweep,
+    and the ticket-mode handoff quorum (`plan_quorum`, reached from `evHandoffRun`, off the `on_tick`
+    path entirely) — so on a daemon gated since boot `labelled` is empty for the whole process
+    lifetime. All four therefore fail CLOSED while the ledger is un-primed — the round gate defers,
+    auto-merge refuses, the sweep reports nothing, `plan_quorum` refuses the fan-out (STUDIO-949
+    rounds 11-13). Those gates read the label set and the latch TOGETHER, under one lock
+    (`labelled_and_primed`), so the pair is always the pair one pass produced.
     The quorum is the one a TICKET-mode install depends on, since `quorum_enabled()` excludes the
     ticketless watcher and its auto-merge branch. Don't move the primed write into
     `hold`/`note_human_label`: the

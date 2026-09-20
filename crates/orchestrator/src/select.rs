@@ -69,10 +69,14 @@ impl Orchestrator {
     ) -> (Vec<Issue>, Vec<Issue>, HashMap<String, i64>) {
         // The human-hold set is a per-PASS fact (STUDIO-949): clear it here so a ticket no longer
         // held stops being reported, while the ledger's announced set keeps the log once-per-ticket.
-        self.human_holds.begin_pass();
+        // This ladder is reached only after a successful candidate fetch — its caller returns on the
+        // fetch error — so `read_the_board` is `true` by construction (STUDIO-949 round 13). The
+        // clear/prime is BELOW the `eff` check on purpose: a pass that returned without a config
+        // examined no candidate, so it must not mark the set known.
         let Some(eff) = self.eff.as_ref() else {
             return (Vec::new(), Vec::new(), HashMap::new());
         };
+        self.human_holds.begin_pass(true);
         crate::dispatch::sort_for_dispatch(&mut issues);
 
         let mut running = self.running_id_set();
@@ -336,6 +340,13 @@ impl Orchestrator {
     /// issues; `reopen` holds review-state issues (tagged with their project) the loop must promote
     /// before dispatching. Mirrors Go `selectDispatchMultiWithReopens`.
     ///
+    /// This is the board-READ form: the caller is handing in a candidate list it fetched, so the
+    /// human-hold ledger is primed as a pass that saw the board. A production caller whose fetch may
+    /// have FAILED (the multi-project poll `continue`s past a per-project error and reaches the
+    /// ladder even when every project failed) must use
+    /// [`Self::select_dispatch_multi_after_fetch`] and pass the fetch verdict, or an empty candidate
+    /// list would mark an unknown label set as known (STUDIO-949 round 13).
+    ///
     /// `held_for_capacity` is the third return, carried out and stored by the `&mut self` caller
     /// exactly as in [`Orchestrator::select_dispatch_with_reopens`] (STUDIO-803) — the capacity
     /// hold applies to this pass too, and since this is the pass a multi-project installation
@@ -343,13 +354,30 @@ impl Orchestrator {
     /// Teams off.
     pub fn select_dispatch_multi_with_reopens(
         &self,
-        mut tagged: Vec<TaggedIssue>,
+        tagged: Vec<TaggedIssue>,
     ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
-        // See the single-project ladder: the hold set is per-PASS.
-        self.human_holds.begin_pass();
+        self.select_dispatch_multi_after_fetch(tagged, true)
+    }
+
+    /// [`Self::select_dispatch_multi_with_reopens`] with the candidate FETCH VERDICT threaded in
+    /// (STUDIO-949 round 13). `read_the_board` is `true` when at least one enabled project's
+    /// candidate fetch succeeded. When it is `false` the ladder still runs — `poll_all_projects`
+    /// `continue`s past each failed project rather than returning — but the human-hold ledger is
+    /// neither cleared nor primed: an un-read board must not look like an empty one, or every
+    /// fail-closed decision gate a gated daemon has reopens on a tracker outage that started before
+    /// boot. The legacy single-project ladder has no such parameter because its failed fetch returns
+    /// BEFORE the ladder, so it is `true` by construction.
+    pub fn select_dispatch_multi_after_fetch(
+        &self,
+        mut tagged: Vec<TaggedIssue>,
+        read_the_board: bool,
+    ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
         let Some(eff) = self.eff.as_ref() else {
             return (Vec::new(), Vec::new(), HashMap::new());
         };
+        // See the single-project ladder: the hold set is per-PASS. Skipped entirely when the fetch
+        // verdict says the board could not be read (STUDIO-949 round 13).
+        self.human_holds.begin_pass(read_the_board);
         sort_tagged_stable(&mut tagged);
 
         let mut running = self.running_id_set();
@@ -957,7 +985,7 @@ mod tests {
         o.select_dispatch_multi(tag_for(0, vec![live]));
 
         assert!(
-            o.human_holds.labelled().contains("studio-939"),
+            o.human_holds.labelled_and_primed().0.contains("studio-939"),
             "the multi ladder must feed the current-label set the decision gates read"
         );
     }

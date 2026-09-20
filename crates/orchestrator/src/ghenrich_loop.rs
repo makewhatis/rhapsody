@@ -140,7 +140,7 @@ async fn poll_all_projects_enrich_advances_summon_when_source_set() {
     let (src, log) = fake_src(&[(7, summon)]);
     o.gh_source = Some(src);
 
-    let tagged = o.poll_all_projects().await;
+    let tagged = o.poll_all_projects().await.0;
 
     let (owner, repo, since) = log.first().expect("gh source must be queried");
     assert_eq!((owner.as_str(), repo.as_str()), ("o", "r"));
@@ -165,7 +165,7 @@ async fn poll_all_projects_no_source_leaves_issues_untouched() {
     let (mut o, _spawned) = orch_for_retry_multi(vec![summon_project("x", "o", "r", issues)], 10);
     o.gh_source = None; // feature off
 
-    let tagged = o.poll_all_projects().await;
+    let tagged = o.poll_all_projects().await.0;
 
     assert_eq!(tagged.len(), 1, "expected 1 tagged issue");
     assert!(
@@ -207,7 +207,7 @@ async fn poll_all_projects_shared_repo_fetched_once() {
     let (src, log) = fake_src(&[(7, summon)]);
     o.gh_source = Some(src);
 
-    let tagged = o.poll_all_projects().await;
+    let tagged = o.poll_all_projects().await.0;
 
     assert_eq!(log.calls(), 1, "two projects on o/r ⇒ one fetch");
     assert_eq!(tagged.len(), 2, "expected 2 tagged issues");
@@ -259,7 +259,7 @@ async fn poll_all_projects_duplicate_issue_tagged_once_and_enriched() {
     let (src, log) = fake_src(&[(7, summon)]);
     o.gh_source = Some(src);
 
-    let tagged = o.poll_all_projects().await;
+    let tagged = o.poll_all_projects().await.0;
 
     assert_eq!(tagged.len(), 1, "expected 1 tagged issue (deduped)");
     assert_eq!(
@@ -396,7 +396,7 @@ async fn github_summons_on_unmerged_pr_lifts_pr_suppression() {
     // ticket down the active branch and into `pr_suppressed` (the branch that logged the failure).
     let (o, _spawned, endpoints) = studio574_orch(&["todo", "in progress", "in review"]);
 
-    let tagged = o.poll_all_projects().await;
+    let tagged = o.poll_all_projects().await.0;
 
     assert_eq!(tagged.len(), 1, "the candidate must survive the poll");
     let iss = &tagged[0].iss;
@@ -940,7 +940,7 @@ fn studio882_orch() -> (
 async fn a_summons_reaches_an_unconnected_repos_ticket_through_the_daemons_own_link() {
     let (o, _spawned, _eps) = studio882_orch();
 
-    let tagged = o.poll_all_projects().await;
+    let tagged = o.poll_all_projects().await.0;
 
     assert_eq!(tagged.len(), 1, "the candidate must survive the poll");
     let iss = &tagged[0].iss;
@@ -1112,7 +1112,7 @@ async fn a_summons_observed_at_capacity_still_dispatches_after_the_lookback_expi
         "other".to_string(),
         running_entry(issue("other", "STUDIO-880", "In Progress"), "x", "x"),
     );
-    let tagged = o.poll_all_projects().await;
+    let tagged = o.poll_all_projects().await.0;
     assert_eq!(tagged.len(), 1, "the candidate must survive the poll");
     assert_eq!(
         tagged[0].iss.latest_summon_at,

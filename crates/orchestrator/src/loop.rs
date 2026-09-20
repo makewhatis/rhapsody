@@ -872,7 +872,7 @@ impl Orchestrator {
         self.set_held_for_capacity(HashMap::new());
         let has_projects = self.eff.as_ref().is_some_and(|e| !e.projects.is_empty());
         if has_projects {
-            let tagged = self.poll_all_projects().await;
+            let (tagged, read_the_board) = self.poll_all_projects().await;
             // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448,
             // O6 `message.rs`).
             self.deliver_mid_run_summons_tagged(&tagged);
@@ -895,7 +895,7 @@ impl Orchestrator {
                 std::time::Instant::now(),
             );
             let (picked, reopen, held_for_capacity) =
-                self.select_dispatch_multi_with_reopens(tagged);
+                self.select_dispatch_multi_after_fetch(tagged, read_the_board);
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
             // the reset at the top of the tick exactly as the single-project path below does — and
             // PUBLISHED through the same setter, because this is the only ladder a `projects:`
@@ -1062,7 +1062,17 @@ impl Orchestrator {
     /// With the feature off (`gh_source` `None`, or every project's `github_summons` false) no repo is
     /// ever wanted, so passes 2 and 3 do nothing and the result is byte-identical to before — and
     /// any advisory a previously-on tick left behind is retracted rather than frozen.
-    async fn poll_all_projects(&self) -> Vec<TaggedIssue> {
+    /// The multi-project candidate poll. Returns the tagged candidates AND whether at least one
+    /// enabled project's candidate fetch SUCCEEDED (STUDIO-949 round 13).
+    ///
+    /// The verdict exists because a per-project fetch error is `continue`d, not returned, and the
+    /// selection ladder is then called unconditionally on whatever survived — so when every project
+    /// fails, the ladder runs with an empty list and cannot tell "the board had nothing" from "the
+    /// board could not be read". The human-hold ledger's priming needs exactly that distinction:
+    /// priming on a fetch that never succeeded marks an unknown label set as known, which reopens
+    /// every fail-closed decision gate on a daemon whose dispatch is gated. `true` means at least
+    /// one enabled project answered.
+    async fn poll_all_projects(&self) -> (Vec<TaggedIssue>, bool) {
         struct ProjPoll {
             idx: usize,
             tracker: Arc<dyn Tracker>,
@@ -1091,7 +1101,7 @@ impl Orchestrator {
             review_states: std::collections::HashSet<String>,
         }
         let Some(eff) = self.eff.as_ref() else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
         // Snapshot each enabled project's poll inputs before the awaits (no `self.eff` borrow held
         // across the async fetches).
@@ -1152,6 +1162,9 @@ impl Orchestrator {
             // --- Pass 1: candidates + dedup. No GitHub I/O at all. -------------------------------
             let mut tagged: Vec<TaggedIssue> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Whether ANY enabled project answered this tick — the human-hold ledger's
+            // prime/no-prime verdict (STUDIO-949 round 13). See `poll_all_projects`'s doc.
+            let mut read_the_board = false;
             // The distinct repos this tick actually needs, in config order: a repo earns a fetch only
             // once a project on it has contributed a surviving candidate, which is exactly when Go's
             // interleaved fetch fired.
@@ -1161,6 +1174,8 @@ impl Orchestrator {
                     Ok(i) => {
                         // Recovered (or never broken): drop any streak so the warning clears.
                         warnings.clear_fetch_failures(&p.group);
+                        // An answer, even an empty one, is a read of the board (STUDIO-949 round 13).
+                        read_the_board = true;
                         i
                     }
                     Err(e) => {
@@ -1297,7 +1312,7 @@ impl Orchestrator {
             // sees one already-complete answer. Ungated: a Linear-comment summons arrives through
             // the tracker rather than through enrichment, and is worth remembering just the same.
             self.restore_summon_watermarks(tagged.iter_mut().map(|ti| &mut ti.iss));
-            tagged
+            (tagged, read_the_board)
         }
         .instrument(tracing::info_span!("symphony.fetch_candidates"))
         .await
@@ -2404,6 +2419,56 @@ mod tests {
             "only project B's issue should dispatch when A errors"
         );
         assert_eq!(entries[0].issue.id, "b1");
+    }
+
+    // STUDIO-949 round 13: the human-hold ledger's priming latch means "a pass READ THE BOARD",
+    // not "a pass ran". `poll_all_projects` `continue`s past a per-project candidate-fetch error and
+    // the multi ladder is then called unconditionally on whatever survived, so a total tracker
+    // outage reaches the ladder with an empty candidate list — the exact state the latch exists to
+    // refuse. Without the fetch verdict threaded in, tick 1 of an outage that started before boot
+    // primes the ledger with an empty set and reopens every fail-closed decision gate (the
+    // ticketless round and auto-merge gates, the reconciliation sweep, the ticket-mode quorum) for
+    // as long as the outage lasts.
+    //
+    // MUTATION: make `begin_pass` prime regardless of `read_the_board` (or have the ladder pass
+    // `true` unconditionally) and this reds while `a_successful_candidate_fetch_primes_the_hold_ledger`
+    // still passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_total_candidate_fetch_outage_does_not_prime_the_hold_ledger() {
+        let mut ta = Fake::new();
+        ta.candidates_err = Some(TrackerError::Other("linear is down".to_string()));
+        let (mut o, _spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::new(ta), "promptA")], 10);
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert!(
+            !o.human_holds.labelled_and_primed().1,
+            "a tick whose candidate fetch never succeeded must not mark the hold set known"
+        );
+    }
+
+    // The control for the test above: an answer, even an EMPTY one, is a read of the board and does
+    // prime the latch. Without this the outage test could pass against a latch that never primes at
+    // all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_candidate_fetch_primes_the_hold_ledger() {
+        let ta = Fake::new(); // no candidates: an empty but SUCCESSFUL fetch
+        let (mut o, _spawned) =
+            orch_for_retry_multi(vec![proj_with_tracker("a", Arc::new(ta), "promptA")], 10);
+
+        o.on_tick().await;
+        if let Some(t) = o.tick_timer.take() {
+            t.abort();
+        }
+
+        assert!(
+            o.human_holds.labelled_and_primed().1,
+            "an empty successful fetch is still a read of the board and must prime the latch"
+        );
     }
 
     // STUDIO-406: a project whose fetch keeps failing must SURFACE on its project status, not just in

@@ -661,7 +661,12 @@ impl Orchestrator {
         // hold excludes a ticket the daemon is running, but this gate must also catch an origin
         // labelled while its run was still LIVE — the mid-run hold shape. Empty on any daemon with no
         // hold, which is what keeps the default path paying only a clone of an empty set.
-        let held: HashSet<String> = self.human_holds.labelled();
+        //
+        // Read together with the priming latch, under one lock (STUDIO-949 round 13): read
+        // separately, a selection pass landing between the two calls would let a gate hold an
+        // un-primed empty set and then read `primed == true`, treating "nothing has looked" as "no
+        // hold". The pair is now always the pair one pass produced.
+        let (held, ledger_primed) = self.human_holds.labelled_and_primed();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
         // reassigns. `mine` is the tick's opening snapshot, so reading peers off it directly would
         // go stale the moment one row is reassigned: the next row would still see the retired
@@ -686,6 +691,27 @@ impl Orchestrator {
             // the earlier round. The row is LEFT ARMED — the hold can come off, and the obligation it
             // records is still real when it does — so this defers rather than retires, and unlike the
             // `requested` back-pressure above it is a deliberate hold, not a budget.
+            //
+            // Fail CLOSED while the ledger has never been primed (STUDIO-949 round 13). The
+            // current-label set has no writer above `on_tick`'s three early-return gates, so on a
+            // daemon held by a bad config, an armed drain or a dead credential it is empty for the
+            // WHOLE process lifetime — and this sweep runs from the watcher's own 120s task,
+            // independent of those gates. `dispatch_review` gates on a drain but on neither of the
+            // other two, so reading an unknown empty set as "no hold" here dispatches a REAL review
+            // round, for the whole life of the gate, at a held ticket's pull request. An empty set
+            // with no pass having looked is "unknown", not "no hold".
+            //
+            // MUTATION: drop this fail-closed branch and
+            // `an_unprimed_hold_ledger_refuses_the_review_round` reds (a round is dispatched).
+            if !ledger_primed {
+                tracing::debug!(
+                    pr = %pr, reviewer = %row.key.reviewer,
+                    "ticketless review: no selection pass has run yet, so the human-hold label set \
+                     is unknown; the round waits"
+                );
+                report.deferred += 1;
+                continue;
+            }
             let origin = crate::reviewdone::origin_ticket(&row.introduced_by)
                 .map(|t| t.to_ascii_lowercase());
             if origin.as_deref().is_some_and(|t| held.contains(t)) {
@@ -850,12 +876,13 @@ impl Orchestrator {
         // exact daemon whose dispatch has stopped — `held` is empty for the whole process lifetime
         // and `held_origin` is `false` for a ticket that genuinely wears the label. The gate then
         // opens and merges human-only work, irreversibly. Fail CLOSED instead: until a pass has
-        // actually looked, an empty set is "unknown", not "no hold". Once a pass has run the answer
-        // is real and the gate behaves exactly as before.
+        // actually READ THE BOARD, an empty set is "unknown", not "no hold". Once a pass has run the
+        // answer is real and the gate behaves exactly as before. `ledger_primed` is the same latch
+        // the round gate above reads, taken in the same lock as `held`.
         //
-        // MUTATION: make this read `is_primed()` as always-true (drop the fail-closed branch) and
+        // MUTATION: drop the fail-closed branch and
         // `an_unprimed_hold_ledger_refuses_auto_merge` reds (a plan is proposed).
-        if !self.human_holds.is_primed() {
+        if !ledger_primed {
             tracing::debug!(
                 pr = %pr,
                 "auto-merge: no selection pass has run yet, so the human-hold label set is unknown; \
@@ -1223,7 +1250,7 @@ mod tests {
     /// un-primed state is its own case — see [`orch_before_first_pass`].
     fn orch(teams: Teams) -> (Orchestrator, DispatchedEntries) {
         let (o, dispatched) = orch_before_first_pass(teams);
-        o.human_holds.begin_pass();
+        o.human_holds.begin_pass(true);
         (o, dispatched)
     }
 
@@ -1500,7 +1527,42 @@ mod tests {
 
         // The label comes off — the next selection pass clears the current hold set — so the row is
         // still owed, and now dispatches.
-        o.human_holds.begin_pass();
+        o.human_holds.begin_pass(true);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+    }
+
+    /// ⚠️ STUDIO-949 round 13: the SAME un-primed latch fail-closes the ROUND gate ten lines above
+    /// the auto-merge gate, on the same sweep. `dispatch_review` gates on a drain but on neither
+    /// `validate()` nor `credential_preflight()`, both of which are on `on_tick`'s dispatch half
+    /// only — so on a daemon whose config validation has failed since boot this sweep would
+    /// otherwise dispatch a REAL review round at a held ticket's pull request for the whole life of
+    /// the gate. Nothing is held here; the set is simply unknown.
+    ///
+    /// `a_watch_row_whose_origin_ticket_is_held_for_a_human_is_not_dispatched` is the live control:
+    /// the same fixture through a primed ledger refuses for the held reason, and dispatches once the
+    /// label is cleared.
+    ///
+    /// MUTATION: drop the `!ledger_primed` branch before the origin-hold check and this reds (a
+    /// round is dispatched).
+    #[test]
+    fn an_unprimed_hold_ledger_refuses_the_review_round() {
+        let (mut o, dispatched) = orch_before_first_pass(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob")); // nothing held — the label set is just unknown
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 0,
+            "with no pass having read the board, the hold set is unknown and no round may dispatch"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_REQUESTED,
+            "the row must stay armed for once the set is known"
+        );
+
+        // Once a pass has read the board the set is a real answer, and the row is dispatched.
+        o.human_holds.begin_pass(true);
         assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
     }
 
@@ -1812,7 +1874,7 @@ mod tests {
 
         // The label comes off — the next selection pass clears the current hold set — and the merge
         // the reviewers already approved is proposed on the next tick.
-        o.human_holds.begin_pass();
+        o.human_holds.begin_pass(true);
         assert_eq!(
             o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
             1,
@@ -1830,7 +1892,7 @@ mod tests {
     /// `an_approved_pull_request_at_its_reviewed_head_is_proposed_for_merge` is the live control: it
     /// runs the SAME fixture through a primed daemon and proposes the plan.
     ///
-    /// MUTATION: drop the `is_primed()` fail-closed branch in `service_review_pr` and this reds (a
+    /// MUTATION: drop the un-primed (`!ledger_primed`) fail-closed branch in `service_review_pr` and this reds (a
     /// plan is proposed).
     #[test]
     fn an_unprimed_hold_ledger_refuses_auto_merge() {
@@ -1846,7 +1908,7 @@ mod tests {
         );
 
         // Once a pass has run the set is a real answer, and the same pull request merges.
-        o.human_holds.begin_pass();
+        o.human_holds.begin_pass(true);
         assert_eq!(
             o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(),
             1,

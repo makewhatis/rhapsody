@@ -1302,33 +1302,40 @@ is reassigned to the person taking it over. And a project whose candidate fetch 
 that tick (`poll_all_projects`), so its tickets contribute nothing to either current set until a
 later fetch succeeds — which, because `begin_pass` clears both sets at the top of the next selection
 pass, is the window in which a label that was live a tick ago stops reaching the decision readers.
+When **every** enabled project's fetch fails the pass has not read the board at all, so it neither
+clears nor primes (`STUDIO-949` round 13) and the previous answer stands rather than being emptied.
 These readers are therefore best-effort off the candidate path rather than guarantees, and they say so
 here rather than implying the refusal holds while the daemon no longer owns the ticket.
 
 **Every one of those writers sits below `on_tick`'s three early-return gates** — a failed config
-validation, an armed drain, a dead agent credential — while three of the decision gates keep running
+validation, an armed drain, a dead agent credential — while **four** decision gates keep running
 anyway, none of them through the per-tick candidate pass: the reconciliation sweep is called from
-`on_tick` ABOVE those gates on purpose, the auto-merge decision is reached through the ticketless
-review watcher's own 120s task, and the ticket-mode handoff quorum (`plan_quorum`) is reached from the
-`evHandoffRun` handler, which is not on `on_tick` at all — a live run restored by recovery on a gated
-boot can hand off before any pass has looked. On a daemon held by one of those gates **since boot**,
-no selection pass has ever run, so the current-label set is not "no hold" but "nothing has looked". An
-empty set read as the former is how a `rhapsody:human` ticket's approved pull request self-merges on a
-drained daemon, irreversibly, or how a held parent's handoff mints a fresh unlabelled review ticket
-the hold cannot reach. All three gates therefore **fail closed** on a ledger no pass has primed: while
-`HumanHoldLedger::is_primed()` is `false` the auto-merge gate refuses (and logs at `debug!` why), the
-reconciliation sweep reports nothing — a false `review_divergence` WARN on the exact ticket the
-operator took over is the alarm that filter exists to prevent — and `plan_quorum` refuses the fan-out.
-The quorum is the one that matters most for a TICKET-mode install, because it is the only
-`labelled()` gate such an install runs: `quorum_enabled()` is
-`teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the watcher and its
-auto-merge branch are simply absent there. This is a deliberate conservatism for a bounded window: a
-healthy daemon's first
-tick runs immediately (before the watcher's first sweep), so the ledger is primed long before any
-gate can act on real work, and once a single pass has run the set is real and the bounds above are
-the ones left. Those bounds are unchanged by this: after any pass the set is only as fresh as that
-pass, so a daemon gated *after* it dispatched freezes the set at the last one and a label that lands
-during the gate is unseen until dispatch resumes. That is the same "as fresh as the last pass"
+`on_tick` ABOVE those gates on purpose, the ticketless review watcher's **round** gate and its
+**auto-merge** gate are reached through the watcher's own 120s task, and the ticket-mode handoff
+quorum (`plan_quorum`) is reached from the `evHandoffRun` handler, which is not on `on_tick` at all —
+a live run restored by recovery on a gated boot can hand off before any pass has looked. On a daemon
+held by one of those gates **since boot**, no selection pass has ever read the board, so the
+current-label set is not "no hold" but "nothing has looked". An empty set read as the former is how a
+`rhapsody:human` ticket's approved pull request self-merges on a drained daemon, irreversibly, how a
+real review round is dispatched at its pull request, or how a held parent's handoff mints a fresh
+unlabelled review ticket the hold cannot reach. All four gates therefore **fail closed** on a ledger
+no pass has primed: while `HumanHoldLedger` is un-primed the ticketless round gate and the auto-merge
+gate refuse (each logging at `debug!` why), the reconciliation sweep reports nothing — a false
+`review_divergence` WARN on the exact ticket the operator took over is the alarm that filter exists
+to prevent — and `plan_quorum` refuses the fan-out. The quorum is the one that matters most for a
+TICKET-mode install, because it is the only `labelled()` gate such an install runs: `quorum_enabled()`
+is `teams.enabled && teams.quorum.enabled && !review_ticketless_enabled()`, so the watcher and its
+auto-merge branch are simply absent there. Priming means a pass actually **read the board**, not that
+a pass ran: the multi-project ladder is reached even when every project's candidate fetch failed, and
+the fetch verdict is threaded in so a pass that could not look neither clears nor primes. This is a
+deliberate conservatism for a bounded window. A healthy daemon's first tick runs immediately; the
+auto-merge gate and the ticket-mode quorum can only act after it (the watcher's first sweep is 120s
+out, and a handoff has to arrive), and the reconciliation sweep — which `on_tick` deliberately runs
+above the gates, before dispatch — publishes nothing on that first un-primed sweep of each process,
+one poll interval of quiet. Once a single pass has read the board the set is real and the bounds
+above are the ones left. Those bounds are unchanged by this: after any pass the set is only as fresh
+as that pass, so a daemon gated *after* it dispatched freezes the set at the last one and a label that
+lands during the gate is unseen until dispatch resumes. That is the same "as fresh as the last pass"
 property the two-writer paragraph names; the fail-closed branch closes the strictly larger "never
 looked at all" case, not this one.
 

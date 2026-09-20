@@ -91,7 +91,7 @@
 //!   nothing at all. Under-reporting a case nobody can act on costs an operator nothing; crying wolf
 //!   costs them the whole signal, and then the seventh variant is invisible again.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -465,18 +465,23 @@ impl Orchestrator {
         // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
         // round 11). This sweep deliberately runs ABOVE them, so it keeps executing on a daemon held
         // by a bad config, an armed drain or a dead credential — and on a daemon held since boot NO
-        // selection pass has ever run, leaving `labelled` empty for the whole process lifetime. The
-        // held-row filter below would then match nothing, and this sweep would publish a
-        // `review_divergence` WARN for the very ticket the operator deliberately took over — the
+        // selection pass has ever READ THE BOARD, leaving `labelled` empty for the whole process
+        // lifetime. The held-row filter below would then match nothing, and this sweep would publish
+        // a `review_divergence` WARN for the very ticket the operator deliberately took over — the
         // false alarm the filter exists to prevent, on every tick. With no pass having looked, an
         // empty set is "unknown", not "no hold", so report NOTHING rather than a verdict the sweep
         // cannot stand behind. (Once a pass has run the set is a real answer and the filter is
         // exact; a false stall for a held ticket is strictly worse than a deferred report, and this
         // sweep is a report, not a control.)
         //
+        // The set and the latch are read together, under one lock (STUDIO-949 round 13): read
+        // separately, a pass landing between the two calls would let this sweep hold an un-primed
+        // empty set and then read `primed == true`, treating "nothing has looked" as "no hold".
+        //
         // MUTATION: drop this branch and
         // `an_unprimed_hold_ledger_reports_no_divergence` reds (the held row is reported).
-        if !self.human_holds.is_primed() {
+        let (labelled, ledger_primed) = self.human_holds.labelled_and_primed();
+        if !ledger_primed {
             self.set_review_divergences(Vec::new());
             return;
         }
@@ -497,7 +502,8 @@ impl Orchestrator {
         // case-insensitive comparison below. A row whose origin ticket wears the label is a
         // DELIBERATE hold, not a stalled obligation, so it is dropped before the rules can date it —
         // the module doc's "a held ticket never arms a watch row" is false (a label applied after a
-        // run leaves one), so this is a filter, not a construction.
+        // run leaves one), so this is a filter, not a construction. Read with the priming latch,
+        // above, under one lock.
         //
         // This reads the CURRENT-LABEL set, not the reported-hold subset the console reads. The
         // reported set deliberately excludes a ticket the daemon is RUNNING right now (a live run is
@@ -507,7 +513,6 @@ impl Orchestrator {
         // the reported subset instead let the sweep publish a `review_divergence` WARN for a ticket
         // this feature had deliberately blocked. Empty on a daemon with no hold, so the default path
         // is byte-identical.
-        let labelled: HashSet<String> = self.human_holds.labelled();
         // Grouped by pull request, preserving `load_live_review_watch`'s stable order so the
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
@@ -1303,7 +1308,7 @@ mod store_tests {
     /// un-primed state is its own case — see [`orch_before_first_pass`].
     fn orch(auto_merge: bool, now: &str) -> Orchestrator {
         let o = orch_before_first_pass(auto_merge, now);
-        o.human_holds.begin_pass();
+        o.human_holds.begin_pass(true);
         o
     }
 
@@ -1520,7 +1525,7 @@ mod store_tests {
     /// `a_diverged_pull_request_is_reported_on_both_surfaces` is the live control: the SAME fixture
     /// through a primed daemon reports on both surfaces.
     ///
-    /// MUTATION: drop the `is_primed()` branch from `reconcile_review_divergence` and this reds (a
+    /// MUTATION: drop the un-primed (`!ledger_primed`) branch from `reconcile_review_divergence` and this reds (a
     /// divergence is published).
     #[test]
     fn an_unprimed_hold_ledger_reports_no_divergence() {
@@ -1547,7 +1552,7 @@ mod store_tests {
         );
 
         // Once a pass has run, the same row is reported again.
-        o.human_holds.begin_pass();
+        o.human_holds.begin_pass(true);
         o.reconcile_review_divergence();
         assert_eq!(
             o.review_divergences().len(),
