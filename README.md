@@ -1795,3 +1795,45 @@ design asks whether an isolated id can still be an identity key. opencode mints 
 session instead of numbering per state directory: `concurrency-trials-isolated-xdg.txt` records ten
 isolated turns with ten distinct ids. So isolation costs opencode nothing here, and slice 9 still
 owns the goose case where the trade is real.
+
+### Auto-promote names the backlog states it may act on — `promote_from_states` (STUDIO-948)
+
+The frozen reference's DAG auto-promote pass selects its input by Linear state **type** — a ticket in
+any `backlog`-type state with cleared blockers may be promoted — so a ticket deliberately parked as
+`Deferred` is indistinguishable from staged work. On this workspace that promoted **STUDIO-749**
+(the “Console: run detail” slice, parked as *Deferred* and never run) forty seconds after
+`dependency_mode: dag` was first enabled, and `dag` was reverted within the hour. Rhapsody now adds a
+config key naming the states the pass may promote **from**:
+
+```yaml
+tracker:
+  dependency_mode: dag
+  promote_from_states:
+    - Backlog          # staged work: dag may start these when their blockers clear
+  # Evaluating, Deferred — untouched by dag, whatever their edges say
+```
+
+**Where it applies.** The filter is a fifth gate in `promote_unblocked_scope`, alongside the four
+that already existed (edge-bearing only, never-run, cancelled-blocker orphan, label). It is **not**
+in the tracker: `fetch_blocked_backlog_issues` stays config-free and keeps its documented type-level
+selection. The backlog state a ticket sits in is matched with `normalize_state` — case- and
+whitespace-insensitively, the same helper `blocker_cleared` uses.
+
+**Resolution.** Top-level with a per-project override, exactly as `dependency_mode` resolves: a
+non-empty per-project list wins, an empty one inherits.
+
+**The default is the safety-critical decision.** An **unset** (or empty) key preserves pre-948
+behavior exactly — every backlog-type state is promotable — so an existing installation's upgrade
+observably changes nothing. But an unset key under an enabled `dag`/`graphite` scope now emits one
+`WARN` at boot (and on reload) naming the key and the risk, because silence about the default is how
+STUDIO-749 was promoted. The key is deliberately kept out of `GET /api/v1/config`'s typed
+`global`/`projects` view, like `capabilities` and `mcp.allow_handoff`: adding it would change a shape
+the committed Go fixtures pin byte-for-byte. It does appear in the response's verbatim `config`
+block when present, because that block is the on-disk front matter itself.
+
+**Known limitation — parked-vs-staged is now explicit, not edge-triggered.** The pass is still a
+per-tick **level** scan: it promotes whatever is *currently* clear, so a ticket in a
+`promote_from_states` state whose blocker was satisfied months ago still promotes on the first tick
+after `dag` is enabled. This narrows the blast radius to states the operator nominated; it does not
+eliminate it. Making promotion edge-triggered needs durable per-blocker last-seen state and restart
+semantics, and is deliberately out of scope here.

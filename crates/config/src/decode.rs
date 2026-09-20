@@ -92,6 +92,8 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         capabilities: r.tracker.capabilities,
         dependency_mode: r.tracker.dependency_mode,
         dep_mode_prompt_file: r.tracker.dep_mode_prompt_file,
+        // Mapped verbatim: empty ⇒ unset (the pre-948 "promote every backlog-type state" default).
+        promote_from_states: r.tracker.promote_from_states,
         claim_mode: r.tracker.claim_mode,
         claim_ttl: parse_optional_duration(&r.tracker.claim_ttl, "claim_ttl")?,
         claim_settle_delay: parse_optional_duration(
@@ -311,6 +313,8 @@ fn decode_project(rp: RawProject) -> Project {
         dependency_mode: rp.dependency_mode,
         dep_mode_prompt_file: rp.dep_mode_prompt_file,
         claim_mode: rp.claim_mode,
+        // Mapped verbatim (empty ⇒ inherit) so the overlay applies the inherit-vs-set distinction.
+        promote_from_states: rp.promote_from_states,
         // Mapped verbatim (None preserved) so the enabled default is applied at resolve time.
         enabled: rp.enabled,
     }
@@ -939,6 +943,32 @@ mod tests {
         assert_eq!(
             c.projects[1].dep_mode_prompt_file, "",
             "project[1] inherits"
+        );
+    }
+
+    // STUDIO-948: `promote_from_states` decodes VERBATIM at the tracker and per-project levels (no
+    // default applied at decode — empty ⇒ unset ⇒ the effective layer's promote-every-state default).
+    #[test]
+    fn decode_promote_from_states() {
+        let c = decode_yaml(
+            concat!(
+                "tracker:\n  kind: linear\n  api_key: \"$X\"\n  active_states:\n    - Todo\n  terminal_states:\n    - Done\n",
+                "  promote_from_states:\n    - Backlog\n",
+                "repo: \"git@github.com:o/r.git\"\n",
+                "projects:\n",
+                "  - slugs:\n      - a-1\n    promote_from_states:\n      - Staged\n",
+                "  - slugs:\n      - b-1\n",
+            ),
+            "body",
+        );
+        assert_eq!(c.tracker.promote_from_states, vec!["Backlog".to_string()]);
+        assert_eq!(
+            c.projects[0].promote_from_states,
+            vec!["Staged".to_string()]
+        );
+        assert!(
+            c.projects[1].promote_from_states.is_empty(),
+            "project[1] inherits (empty at decode)"
         );
     }
 
