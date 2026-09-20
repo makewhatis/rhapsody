@@ -48,13 +48,16 @@
 //! # A human-gated ticket is deliberately NOT this sweep's business (STUDIO-949)
 //!
 //! `rhapsody:human` is the one hold the dispatcher applies on purpose: the ticket can only be done by
-//! a person, so a held ticket sitting in Todo is working as intended, not stalled. The sweep can
-//! never report it as a stall and needs no rule to be taught that, because its input is the LIVE
-//! WATCH SET — one row per pull request a run introduced — and a human-gated ticket is refused at
-//! dispatch, so it never runs and never arms a watch row. The exclusion is by CONSTRUCTION rather
-//! than by a filter here, which is why the sweep's own "unknown is never a divergence" rule is not
-//! the thing keeping it quiet: there is no row to date in the first place. A future change that made
-//! this sweep range over tickets rather than watch rows would have to add the hold back deliberately.
+//! a person, so a held ticket sitting in Todo is working as intended, not stalled. The sweep must
+//! never report it as a stall, and it cannot rely on such a ticket having no watch row: a ticket
+//! labelled AFTER an agent already ran has one, which is the likeliest way the label is ever applied.
+//! So a row whose origin ticket is currently in the dispatcher's hold set is dropped before the rules
+//! see it (see [`Orchestrator::reconcile_review_divergence`]) — the exclusion is explicit, not by
+//! construction. The dispatch refusal itself lives on the review watcher
+//! ([`crate::reviewwatch`]), so a row that is held arms nothing new either; this filter is what keeps
+//! the ALREADY-ARMED row from reporting the deliberate hold as a stalled obligation. A future change
+//! that made this sweep range over tickets rather than watch rows would have to add the hold back
+//! deliberately.
 //!
 //! # It reports and it does NOT act
 //!
@@ -87,7 +90,7 @@
 //!   nothing at all. Under-reporting a case nobody can act on costs an operator nothing; crying wolf
 //!   costs them the whole signal, and then the seventh variant is invisible again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -471,11 +474,28 @@ impl Orchestrator {
                 return;
             }
         };
+        // The current `rhapsody:human` hold set (STUDIO-949), lowercased once for the case-insensitive
+        // comparison below. A row whose origin ticket is in it is a DELIBERATE hold, not a stalled
+        // obligation, so it is dropped before the rules can date it — the module doc's "a held ticket
+        // never arms a watch row" is false (a label applied after a run leaves one), so this is a
+        // filter, not a construction. Empty on a daemon with no hold, so the default path is
+        // byte-identical.
+        let held: HashSet<String> = self
+            .human_holds
+            .held()
+            .into_iter()
+            .map(|h| h.issue_identifier.to_ascii_lowercase())
+            .collect();
         // Grouped by pull request, preserving `load_live_review_watch`'s stable order so the
         // reported list is stable across sweeps and a console diff is not noise.
         let mut order: Vec<PrCoord> = Vec::new();
         let mut by_pr: HashMap<PrCoord, PrFacts> = HashMap::new();
         for row in &rows {
+            if let Some(ticket) = origin_ticket(&row.introduced_by)
+                && held.contains(&ticket.to_ascii_lowercase())
+            {
+                continue; // a deliberate hold, not this sweep's business
+            }
             let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
             // Per project (STUDIO-927): each pull request reads the override for the project
             // that owns its repo, so one repo can be held back while a sibling still merges.
@@ -1410,6 +1430,46 @@ mod store_tests {
         // Surface two: the detail on /api/v1/state.
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
         assert_eq!(rendered["review_divergence"][0]["ticket"], "STUDIO-893");
+    }
+
+    /// STUDIO-949: the shape above, but with the origin ticket CURRENTLY held for a human. The row
+    /// exists (it was armed by an earlier run) yet the obligation is a deliberate hold, not a stall,
+    /// so the sweep must report nothing — on either surface.
+    /// MUTATION: delete the held-origin filter from `reconcile_review_divergence` and this reds.
+    #[test]
+    fn a_held_ticket_is_not_reported_as_a_stall() {
+        let o = &mut orch(false, "2026-09-14T21:20:00Z");
+        reviewed_row(o, "alice", "STUDIO-893");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-14T14:50:00Z",
+            "2026-09-14T15:20:00Z",
+        );
+        // The authoring run ended BEFORE the review, which is the divergence the test above pins.
+        run(
+            o,
+            "STUDIO-893",
+            "2026-09-14T13:00:00Z",
+            "2026-09-14T14:40:00Z",
+        );
+        o.human_holds.hold(crate::dispatch::HeldForHuman {
+            issue_identifier: "STUDIO-893".to_string(),
+            title: "human work".to_string(),
+            project: String::new(),
+        });
+
+        o.reconcile_review_divergence();
+
+        assert!(
+            o.review_divergences().is_empty(),
+            "a held ticket is a deliberate hold, not a stalled obligation"
+        );
+        assert!(
+            o.project_statuses()
+                .iter()
+                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING))
+        );
     }
 
     /// The healthy case through the same path: the author answered the findings, so nothing is

@@ -656,6 +656,15 @@ impl Orchestrator {
             .map_or(1, |t| t.review.effective_reviewers().max(1));
 
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
+        // The current `rhapsody:human` hold set (STUDIO-949), lowercased once for the case-insensitive
+        // comparison against a row's origin ticket below. Empty on any daemon with no hold, which is
+        // what keeps the default path paying only a clone of an empty Vec.
+        let held: HashSet<String> = self
+            .human_holds
+            .held()
+            .into_iter()
+            .map(|h| h.issue_identifier.to_ascii_lowercase())
+            .collect();
         // Who currently holds each of this pull request's required reviews, updated AS the loop
         // reassigns. `mine` is the tick's opening snapshot, so reading peers off it directly would
         // go stale the moment one row is reassigned: the next row would still see the retired
@@ -671,6 +680,23 @@ impl Orchestrator {
             );
             let live = self.running.contains_key(&id) || self.claimed.contains(&id);
             if !review_round_due(row, head, live) {
+                continue;
+            }
+            // A `rhapsody:human` origin ticket is refused at dispatch on every path (STUDIO-949), and
+            // this watcher is a dispatch path. The gate is deliberately on the ROW'S CURRENT HOLD
+            // rather than on the row's creation: a ticket labelled after an agent already flailed on
+            // it is the likeliest way the label is ever applied, and that ticket has a watch row from
+            // the earlier round. The row is LEFT ARMED — the hold can come off, and the obligation it
+            // records is still real when it does — so this defers rather than retires, and unlike the
+            // `requested` back-pressure above it is a deliberate hold, not a budget.
+            let origin = crate::reviewdone::origin_ticket(&row.introduced_by)
+                .map(|t| t.to_ascii_lowercase());
+            if origin.as_deref().is_some_and(|t| held.contains(t)) {
+                tracing::debug!(
+                    pr = %pr, reviewer = %row.key.reviewer, origin = %row.introduced_by,
+                    "ticketless review: the origin ticket is held for a human; the round waits"
+                );
+                report.deferred += 1;
                 continue;
             }
             if *slots <= 0 {
@@ -1391,6 +1417,39 @@ mod tests {
             assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
         }
         assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
+    /// STUDIO-949: a watch row whose ORIGIN ticket is currently held for a human dispatches no
+    /// review, even though the row exists from an earlier round — a ticket labelled after an agent
+    /// already flailed on it is the likeliest way the label is ever applied. The row is left armed,
+    /// so a later label removal still gets the review it is owed.
+    /// MUTATION: delete the origin-hold gate from `service_review_pr` and the first assertion reds.
+    #[test]
+    fn a_watch_row_whose_origin_ticket_is_held_for_a_human_is_not_dispatched() {
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob")); // origin: `handoff:STUDIO-721`
+        o.human_holds.hold(crate::dispatch::HeldForHuman {
+            issue_identifier: "STUDIO-721".to_string(),
+            title: "human work".to_string(),
+            project: String::new(),
+        });
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 0,
+            "a held ticket's review must not dispatch"
+        );
+        assert!(dispatched.lock().expect("lock").is_empty());
+        assert_eq!(
+            watch_row(&o, 12, "bob").status,
+            REVIEW_STATUS_REQUESTED,
+            "the row must stay armed for a later label removal"
+        );
+
+        // The label comes off — the next selection pass clears the current hold set — so the row is
+        // still owed, and now dispatches.
+        o.human_holds.begin_pass();
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
     }
 
     /// Acceptance: a `max_turns`-truncated round is re-reviewed AT THE SAME HEAD. Nothing but the
