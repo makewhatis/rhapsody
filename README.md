@@ -1216,10 +1216,10 @@ that denial is reported as an unreadable coordinate, with the attempt count, rat
 to the false "nothing has reported it blocked", so a hold from before a `gh` outage cannot keep being
 named and a coordinate GitHub has stopped answering for cannot read as an unexplained stall. The
 denial takes the same route to all three surfaces: the state row carries it under
-`capacity_unreadable`, the console banner names it, and the per-project advisory reports the
-coordinate GitHub has stopped answering for in place of the plain "nothing has reported it blocked",
-so an operator following the advisory's own pointer to `review_divergence` can tell the row it is
-about from an ordinary divergence.
+`capacity_unreadable`, the console banner names it, and the per-project advisory reports that the
+GitHub state could not be read rather than the plain "nothing has reported it blocked", so an
+operator following the advisory's own pointer to `review_divergence` can tell the row it is about
+from an ordinary divergence.
 
 | A pull request that has quietly stopped | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
