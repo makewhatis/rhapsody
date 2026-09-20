@@ -1593,6 +1593,245 @@ impl PrStateSource for GH {
     }
 }
 
+/// The fallible result of a [`ReviewDeltaSource`] read. Opaque like [`SummonResult`]: every caller
+/// treats a failure the same way — the round degrades to a full review — so the cause is only
+/// worth a log line.
+pub type DeltaResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// How many findings comments one delta round is handed, and how much the WHOLE list may weigh
+/// (STUDIO-959).
+///
+/// The round is told what was already found so it does not re-derive it; it is NOT handed the whole
+/// comment history of a long-lived pull request, which would grow without bound and crowd the
+/// change being reviewed out of the prompt.
+///
+/// The cap is a budget on the LIST, not on each comment (jimmy's round-4 blocker). Bounding each
+/// comment to a fixed size silently deleted the TAIL of every long comment, and a review comment
+/// puts its verdict and reasoning first and its smaller findings LAST — so a per-comment head-clip
+/// systematically dropped exactly the findings the round was told to confirm, on the majority of
+/// this repository's real review comments (54–67% of the text at a 2,000-char cap). Instead the
+/// newest comments are taken WHOLE, in order, until the total budget is spent; fewer complete
+/// comments beats twenty half-comments. At most one comment — the newest, when it alone exceeds the
+/// budget — is ever clipped, and [`PriorFindings::clipped`] says so out loud.
+pub const MAX_DELTA_FINDINGS: usize = 20;
+/// The total characters the findings list may weigh, `MAX_DELTA_FINDINGS * 2,000`: the same ceiling
+/// the per-comment cap used to imply, now spent on whole bodies instead of on twenty fragments.
+pub const MAX_DELTA_FINDINGS_CHARS: usize = 40_000;
+
+/// The `per_page` a delta round's comment reads ask for, paired with `--paginate --slurp`.
+///
+/// The endpoint that carries a review thread, `GET /repos/{o}/{r}/issues/{n}/comments`, answers in
+/// ASCENDING id order and has NO `sort`/`direction` parameter at all — `direction=desc`,
+/// `direction=asc` and no parameter return the identical first page — so asking it for the newest
+/// comments by query is silently impossible (STUDIO-959, alice's round-2 blocker). It honours only
+/// `per_page`/`page`, which is why the round pages the whole thread and selects the newest in code,
+/// the same shape [`SummonSource::summons_since`] uses. The cap the round actually reads stays
+/// [`MAX_DELTA_FINDINGS`]; this is only the page size.
+pub const DELTA_FINDINGS_PAGE: usize = 100;
+
+/// The two reads a DELTA review round needs from GitHub (STUDIO-959): whether the commit the
+/// reviewer last read is an ancestor of the head, and the findings comments already on the pull
+/// request.
+///
+/// Kept out of [`PrStateSource`] deliberately — that trait answers "where does this pull request
+/// stand", a question the watcher asks every tick about every watched pull request, while these are
+/// asked once per delta round, by the run that is about to be dispatched. Folding them together
+/// would spend two extra `gh` calls per pull request per tick on an answer nobody is waiting for.
+///
+/// Object-safe (the worker holds it as `Option<Arc<dyn ReviewDeltaSource>>`), so it is declared via
+/// `async_trait`. A failure on EITHER method is the caller's cue to fall back to a full review: the
+/// cost of re-reading a small change is far below the cost of a delta taken across a rebase or of a
+/// reviewer asked to confirm findings the host could not retrieve.
+#[async_trait]
+pub trait ReviewDeltaSource: Send + Sync {
+    /// Whether `base` is an ancestor of `head` — `gh api repos/<o>/<r>/compare/<base>...<head>`.
+    ///
+    /// `false` for a rebase or force-push (the compare is `diverged` or `behind`) and for a base
+    /// commit GitHub no longer holds; an error is reserved for a lookup that could not be made.
+    async fn is_ancestor(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> DeltaResult<bool>;
+
+    /// The findings comments already on the pull request, oldest first, whole bodies taken until
+    /// [`MAX_DELTA_FINDINGS_CHARS`] or [`MAX_DELTA_FINDINGS`] is spent.
+    ///
+    /// BOTH issue comments and inline review comments are read, because a reviewer may have used
+    /// either. No author filter is applied: reviewers post under the daemon's own `gh` identity, so
+    /// attributing a comment to a Teams teammate is not possible from GitHub. The delta round is
+    /// therefore handed the pull request's findings — a superset of its own, including the daemon's
+    /// own completion comments — and told which commit it last read.
+    async fn prior_findings(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> DeltaResult<PriorFindings>;
+}
+
+/// The findings a delta round is handed, and whether the newest had to be cut (STUDIO-959).
+///
+/// A struct rather than a bare `Vec<String>` because the round has to be told when it is holding a
+/// fragment: a comment presented as whole while it is not would have the round confirm a list it
+/// only half has — the exact failure the delta path exists to prevent. Only the newest comment can
+/// be clipped (it alone may exceed the list budget), so one flag for the list is exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorFindings {
+    /// The comment bodies, oldest first.
+    pub bodies: Vec<String>,
+    /// True when the newest comment exceeded [`MAX_DELTA_FINDINGS_CHARS`] on its own and only its
+    /// start is in [`Self::bodies`], marked with a trailing `…`.
+    pub clipped: bool,
+}
+
+impl PriorFindings {
+    /// An empty list — no comments on the pull request, or none worth handing over.
+    fn none() -> Self {
+        PriorFindings {
+            bodies: Vec::new(),
+            clipped: false,
+        }
+    }
+}
+
+/// The head of `body`, bounded to `budget` characters and marked with an ellipsis, never splitting
+/// a UTF-8 character (the `chars()` walk, not a byte slice).
+fn clip_finding(body: &str, budget: usize) -> String {
+    let head: String = body.chars().take(budget).collect();
+    format!("{head}…")
+}
+
+#[async_trait]
+impl ReviewDeltaSource for GH {
+    /// One bounded `gh api repos/<o>/<r>/compare/<base>...<head>`.
+    ///
+    /// GitHub's `status` answers the ancestor question directly: `ahead` means head is strictly
+    /// ahead of base (base is an ancestor), `identical` means the same commit, `behind` means the
+    /// reverse, and `diverged` means neither is an ancestor — a force-push or a rebase. Anything
+    /// else, including a body with no `status`, is an error rather than a `false`: an ancestor
+    /// question that was not answered must not be read as "rebased", because that would send every
+    /// round full on a parse regression and nobody would see the delta path disappear.
+    async fn is_ancestor(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> DeltaResult<bool> {
+        if owner.is_empty() || repo.is_empty() || base.is_empty() || head.is_empty() {
+            return Ok(false);
+        }
+        let path = format!("repos/{owner}/{repo}/compare/{base}...{head}");
+        let body = self.run_off_task(vec!["api".into(), path.clone()]).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh api {path}: {e}").into()
+            },
+        )?;
+        match v.get("status").and_then(serde_json::Value::as_str) {
+            Some("ahead" | "identical") => Ok(true),
+            Some("behind" | "diverged") => Ok(false),
+            other => Err(format!("gh api {path}: unrecognised compare status {other:?}").into()),
+        }
+    }
+
+    /// Two `gh api --paginate --slurp` reads (issue comments + inline review comments), merged and
+    /// then reduced to the newest comments that fit [`MAX_DELTA_FINDINGS_CHARS`] whole.
+    ///
+    /// A failure on either endpoint is an error, not a partial list: the caller degrades to a full
+    /// review, which is the safe direction. Silently handing a round half its findings would be
+    /// exactly the "verify a list you do not have" failure the delta round exists to avoid.
+    async fn prior_findings(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> DeltaResult<PriorFindings> {
+        if owner.is_empty() || repo.is_empty() || number <= 0 {
+            return Ok(PriorFindings::none());
+        }
+        // `(created_at, body)`, merged across the two endpoints rather than concatenated: taking the
+        // newest overall must not mean "whichever endpoint was read first wins". `created_at` is
+        // RFC3339 (`Z`), so a lexicographic sort is chronological; a comment with no timestamp sorts
+        // oldest and is therefore the FIRST thing dropped when the cap binds (every real GitHub
+        // comment carries `created_at`, so this is a degenerate-input note, not a live case).
+        let mut found: Vec<(String, String)> = Vec::new();
+        // Per-PULL-REQUEST paths, not the repository-wide `repos/{o}/{r}/issues/comments` lists
+        // (STUDIO-959, alice's round-1 blocker): the repo-wide form returns every pull request's
+        // comments, so a delta round would be handed some other review's findings. The number is
+        // the path segment here, which is why it is not merely a positivity guard above.
+        //
+        // `--paginate --slurp`, and NO `sort`/`direction`: the per-issue endpoint does not accept
+        // them and answers ascending whatever they say, so the newest comments have to be selected
+        // here rather than asked for (alice's round-2 blocker). `--slurp` wraps the pages as
+        // `[[page1…],[page2…]]`, even for one page.
+        for endpoint in ["issues", "pulls"] {
+            let path = format!(
+                "repos/{owner}/{repo}/{endpoint}/{number}/comments?per_page={DELTA_FINDINGS_PAGE}"
+            );
+            let body = self
+                .run_off_task(vec![
+                    "api".into(),
+                    "--paginate".into(),
+                    "--slurp".into(),
+                    path.clone(),
+                ])
+                .await?;
+            let pages: Vec<Vec<serde_json::Value>> = serde_json::from_slice(&body).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("decode gh api {path}: {e}").into()
+                },
+            )?;
+            for page in &pages {
+                for c in page {
+                    if let Some(raw) = c.get("body").and_then(serde_json::Value::as_str)
+                        && !raw.trim().is_empty()
+                    {
+                        let at = c
+                            .get("created_at")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        found.push((at, raw.trim().to_string()));
+                    }
+                }
+            }
+        }
+        // Newest first, so the budget below is spent from the most recent comment backwards.
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        // Walk newest-first taking WHOLE bodies until the list budget is spent, then stop. Skipping a
+        // comment that does not fit to reach an older one that would would leave a gap in the
+        // conversation, so the walk ends at the first non-fitting body. The ONE exception is the
+        // newest body when it alone exceeds the whole budget: dropping it would hand the round no
+        // findings at all, so it is clipped and `clipped` says so.
+        let mut bodies: Vec<String> = Vec::new();
+        let mut spent = 0usize;
+        let mut clipped = false;
+        for (_at, body) in &found {
+            if bodies.len() >= MAX_DELTA_FINDINGS {
+                break;
+            }
+            let len = body.chars().count();
+            if spent + len <= MAX_DELTA_FINDINGS_CHARS {
+                bodies.push(body.clone());
+                spent += len;
+            } else if bodies.is_empty() {
+                bodies.push(clip_finding(body, MAX_DELTA_FINDINGS_CHARS));
+                clipped = true;
+                break;
+            } else {
+                break;
+            }
+        }
+        // Back to oldest-first: the round should read the conversation as it happened.
+        bodies.reverse();
+        Ok(PriorFindings { bodies, clipped })
+    }
+}
+
 #[async_trait]
 impl SummonSource for GH {
     /// Makes exactly two `gh api` calls (issues/comments + pulls/comments), matches the summon
@@ -3394,6 +3633,296 @@ mod tests {
         assert_eq!(GH::new("@symphony", None).exec_timeout, GH_EXEC_TIMEOUT);
     }
 
+    // ── STUDIO-959: the delta round's two reads ─────────────────────────────────────────────────
+
+    /// GitHub's `compare` status maps onto the ancestor question, and the argv is pinned: a wrong
+    /// path is a silently-failing ancestry check that sends every round full.
+    #[tokio::test]
+    async fn is_ancestor_maps_the_compare_status() {
+        let cases = [
+            ("ahead", Some(true)),
+            ("identical", Some(true)),
+            ("behind", Some(false)),
+            ("diverged", Some(false)),
+        ];
+        for (status, want) in cases {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            let body = format!(r#"{{"status":"{status}"}}"#);
+            let run: RunFn = Box::new(move |args: &[&str]| {
+                sink.lock().expect("argv lock").push(args.join(" "));
+                Ok(body.clone().into_bytes())
+            });
+            let src = GH::new("@symphony", Some(run));
+            let got = src
+                .is_ancestor("o", "r", "base1", "head2")
+                .await
+                .expect("the compare answered");
+            assert_eq!(got, want.expect("a recognised status"), "status {status}");
+            assert_eq!(
+                seen.lock().expect("argv lock").as_slice(),
+                ["api repos/o/r/compare/base1...head2".to_string()],
+                "the compare is read at the pinned path"
+            );
+        }
+    }
+
+    /// Only `ahead`/`behind`/`diverged`/`identical` answer the question; anything else — including a
+    /// body with no status at all — is an ERROR, never a silent `false`. Reading an unrecognised
+    /// body as "rebased" would send every round full on a parse regression and hide the delta path.
+    #[tokio::test]
+    async fn is_ancestor_errors_on_an_unrecognised_status() {
+        let run: RunFn = Box::new(|_args| Ok(br#"{"status":"mystery"}"#.to_vec()));
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.is_ancestor("o", "r", "a", "b").await.is_err());
+
+        let run: RunFn = Box::new(|_args| Ok(b"{}".to_vec()));
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.is_ancestor("o", "r", "a", "b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn is_ancestor_propagates_a_failed_read() {
+        let run: RunFn = Box::new(|_args| Err("gh: 404".into()));
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.is_ancestor("o", "r", "a", "b").await.is_err());
+    }
+
+    /// Both comment endpoints are read, empty bodies are skipped, and the list comes back oldest
+    /// first (the API answers newest first and the round should read it as it happened).
+    ///
+    /// The argv is pinned in full, like `is_ancestor_maps_the_compare_status`: the repository-wide
+    /// `repos/{o}/{r}/issues/comments` list is the shape `SummonSource` wants, and handing a delta
+    /// round comments from OTHER pull requests is a defect no assertion on the returned bodies can
+    /// see (STUDIO-959, alice's round-1 blocker).
+    #[tokio::test]
+    async fn prior_findings_reads_both_endpoints_and_orders_them() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            sink.lock().expect("argv lock").push(args.join(" "));
+            let ep = args.last().copied().unwrap_or_default();
+            let body = if ep.contains("/issues/12/comments") {
+                r#"[[{"body":"newer issue finding","created_at":"2026-09-20T12:00:00Z"},{"body":"   "}]]"#
+            } else {
+                r#"[[{"body":"older review finding","created_at":"2026-09-20T09:00:00Z"}]]"#
+            };
+            Ok(body.as_bytes().to_vec())
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src
+            .prior_findings("o", "r", 12)
+            .await
+            .expect("both endpoints answered");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one read per comment endpoint"
+        );
+        assert_eq!(
+            got.bodies,
+            vec!["older review finding", "newer issue finding"]
+        );
+        assert!(!got.clipped, "a short thread is delivered whole");
+        let argv = seen.lock().expect("argv lock").clone();
+        assert_eq!(
+            argv,
+            [
+                format!(
+                    "api --paginate --slurp repos/o/r/issues/12/comments?per_page={DELTA_FINDINGS_PAGE}"
+                ),
+                format!(
+                    "api --paginate --slurp repos/o/r/pulls/12/comments?per_page={DELTA_FINDINGS_PAGE}"
+                ),
+            ],
+            "the comments are read at the pull request's OWN endpoints, paged and unsorted \
+             (the per-issue endpoint ignores sort/direction, so the newest is selected in code)"
+        );
+    }
+
+    /// The per-issue endpoint answers in ASCENDING order and applies only `per_page`/`page`, so a
+    /// round that trusts a `direction=desc` query is handed the OLDEST page. This fake models that
+    /// documented behaviour — it returns the first `per_page` comments of an ascending 86-comment
+    /// thread, wrapped for `--slurp` — and asserts the round still comes away with the newest 20.
+    ///
+    /// What this pins is the IN-CODE selection, not `DELTA_FINDINGS_PAGE`. The code under test now
+    /// sends `--paginate`, and real `gh` follows the Link headers, so even a reverted
+    /// `per_page={MAX_DELTA_FINDINGS}&sort=created&direction=desc` query would come back with all 86
+    /// comments and the newest would still win — `--paginate` alone closed alice's round-2 defect,
+    /// and the page size is a request-count optimisation. The guard that actually matters is the
+    /// `sort_by`/`truncate`/`reverse` below, which THIS fake cannot page past (it honours `per_page`
+    /// and returns exactly one ascending page), so removing that selection reds this test even
+    /// though the literal is not load-bearing for correctness.
+    #[tokio::test]
+    async fn prior_findings_takes_the_newest_page_of_an_ascending_thread() {
+        // 86 comments, ascending, one minute apart. The last is the newest.
+        let all: Vec<String> = (0..86)
+            .map(|i| {
+                format!(
+                    r#"{{"body":"finding-{i:02}","created_at":"2026-09-20T{:02}:{:02}:00Z"}}"#,
+                    i / 60,
+                    i % 60
+                )
+            })
+            .collect();
+        let newest = "finding-85";
+        let oldest = "finding-00";
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if !ep.contains("/issues/12/comments") {
+                return Ok(b"[]".to_vec());
+            }
+            // Model the endpoint: honour `per_page` (first N of the ascending list), ignore
+            // `sort`/`direction` entirely, and wrap the single page for `--slurp`.
+            let per_page: usize = ep
+                .split("per_page=")
+                .nth(1)
+                .and_then(|s| s.split('&').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            let page: Vec<String> = all.iter().take(per_page).cloned().collect();
+            // `--slurp` wraps all pages as `[[page1…],…]`, even for a single page.
+            Ok(format!("[[{}]]", page.join(",")).into_bytes())
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert_eq!(got.bodies.len(), MAX_DELTA_FINDINGS);
+        assert_eq!(got.bodies.last().map(String::as_str), Some(newest));
+        assert!(
+            !got.bodies.iter().any(|c| c == oldest),
+            "the oldest page must not be what a delta round is handed"
+        );
+    }
+
+    /// THE pin for jimmy's round-4 blocker: a single long comment is handed over WHOLE, tail
+    /// included. A real review comment puts its verdict first and its smaller findings LAST, so a
+    /// per-comment head-clip silently deleted the findings the round is ordered to confirm. A
+    /// 9,000-char body (alice's own round-3 review is 9,518) must arrive complete.
+    ///
+    /// Mutation: reintroduce a per-comment cap below 9,000 and the `tail` assertion reds.
+    #[tokio::test]
+    async fn prior_findings_delivers_a_long_comment_whole() {
+        let tail = "⚪ Minor: the last finding, which a head-clip would delete";
+        let mut long = "x".repeat(9_000 - tail.chars().count());
+        long.push_str(tail);
+        let body = serde_json::json!([[{ "body": long }]]).to_string();
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/issues/12/comments") {
+                Ok(body.clone().into_bytes())
+            } else {
+                Ok(b"[]".to_vec())
+            }
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert_eq!(got.bodies.len(), 1);
+        assert!(
+            !got.clipped,
+            "a 9,000-char comment fits well inside the list budget, so nothing is cut"
+        );
+        assert!(
+            got.bodies[0].ends_with(tail),
+            "the whole comment, tail included, must reach the round"
+        );
+        assert!(!got.bodies[0].ends_with('…'), "nothing was truncated");
+    }
+
+    /// The budget is spent on the LIST, not on each comment: the newest comments are taken whole
+    /// until the total is spent, then the walk stops — fewer complete comments instead of many
+    /// fragments. Nothing that fits is clipped, and the total stays inside the budget.
+    #[tokio::test]
+    async fn prior_findings_spends_the_budget_on_the_list_not_each_comment() {
+        // 30 comments of 3,000 chars each = 90,000, more than the 40,000 budget. Bodies are
+        // distinguishable so the newest retained one can be named.
+        let all: Vec<String> = (0..30)
+            .map(|i| {
+                let body = format!("body-{i:02}-{}", "y".repeat(2_990));
+                format!(
+                    r#"{{"body":{},"created_at":"2026-09-20T{:02}:00:00Z"}}"#,
+                    serde_json::to_string(&body).expect("encode"),
+                    i
+                )
+            })
+            .collect();
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/issues/12/comments") {
+                // The endpoint answers oldest-first; the code selects the newest.
+                Ok(format!("[[{}]]", all.join(",")).into_bytes())
+            } else {
+                Ok(b"[]".to_vec())
+            }
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert!(!got.clipped, "the newest body fits the whole budget");
+        assert!(
+            got.bodies.len() < MAX_DELTA_FINDINGS,
+            "the budget, not the count cap, is what binds here"
+        );
+        let total: usize = got.bodies.iter().map(|b| b.chars().count()).sum();
+        assert!(
+            total <= MAX_DELTA_FINDINGS_CHARS,
+            "the list as a whole must fit the budget: {total}"
+        );
+        assert!(
+            got.bodies.iter().all(|b| !b.ends_with('…')),
+            "every retained comment is complete"
+        );
+        assert!(
+            got.bodies
+                .last()
+                .map(|b| b.starts_with("body-29"))
+                .unwrap_or(false),
+            "the NEWEST comment must survive the budget"
+        );
+    }
+
+    /// The one comment that can be clipped: the newest body is larger than the whole list budget.
+    /// Dropping it would hand the round no findings at all, so its head is kept and `clipped` says
+    /// so, in a form the description renders as host-written words.
+    #[tokio::test]
+    async fn prior_findings_clips_only_a_body_larger_than_the_whole_budget() {
+        let long = "é".repeat(MAX_DELTA_FINDINGS_CHARS + 50);
+        let body = serde_json::json!([[{ "body": long }]]).to_string();
+        let run: RunFn = Box::new(move |args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/issues/12/comments") {
+                Ok(body.clone().into_bytes())
+            } else {
+                Ok(b"[]".to_vec())
+            }
+        });
+        let src = GH::new("@symphony", Some(run));
+        let got = src.prior_findings("o", "r", 12).await.expect("answered");
+        assert_eq!(got.bodies.len(), 1);
+        assert!(got.clipped, "an over-budget body must be flagged as cut");
+        assert_eq!(
+            got.bodies[0].chars().count(),
+            MAX_DELTA_FINDINGS_CHARS + 1,
+            "the clipped body is the budget plus the ellipsis, counted in chars"
+        );
+        assert!(got.bodies[0].ends_with('…'));
+    }
+
+    /// If EITHER endpoint fails, the read fails: half a findings list is exactly the "verify a list
+    /// you do not have" failure the round exists to avoid, and the caller must fall back to full.
+    #[tokio::test]
+    async fn prior_findings_fails_when_one_endpoint_fails() {
+        let run: RunFn = Box::new(|args: &[&str]| {
+            let ep = args.last().copied().unwrap_or_default();
+            if ep.contains("/pulls/12/comments") {
+                return Err("gh: boom".into());
+            }
+            Ok(b"[]".to_vec())
+        });
+        let src = GH::new("@symphony", Some(run));
+        assert!(src.prior_findings("o", "r", 12).await.is_err());
+    }
     // --- ReviewDiffSource (STUDIO-960) --------------------------------------------------------
 
     /// The base-ref read asks the one endpoint that names a pull request's target branch, and the

@@ -1214,6 +1214,10 @@ impl Orchestrator {
                 repo_url,
                 head_sha: head.to_string(),
                 introduced_by: row.introduced_by.clone(),
+                // Empty at DISPATCH: `dispatch_review` fills it from the watch row's
+                // `last_reviewed_sha` before the dispatch writes this head as requested
+                // (STUDIO-959). The watcher has no prior-round record to offer here.
+                prior_sha: String::new(),
             };
             match self.dispatch_review(run) {
                 ReviewDispatchOutcome::Dispatched => {

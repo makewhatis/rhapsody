@@ -485,6 +485,9 @@ fn worker_deps_for(
         // Per-dispatch and review-only (STUDIO-715): `spawn_worker` stamps it, and `None` keeps the
         // two existing provisioning paths exactly as they were.
         review: None,
+        // Review-only (STUDIO-959): `spawn_worker` stamps the `gh` reads a delta round needs, and
+        // `None` keeps every non-review run — and every delta-less review — byte-identical.
+        review_delta: None,
         // The review state a declared HANDOFF parks the ticket in (TRA-240). review_states is a
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
@@ -1502,6 +1505,18 @@ impl Orchestrator {
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
+        // A delta review round's `gh` reads (STUDIO-959), built only for a review dispatch and
+        // handed to the worker's own off-loop task. The summon token is `GH::new`'s only
+        // construction input and the compare/comments reads do not use it, so a daemon with no
+        // readable workflow still gets a working seam. Every round is FULL the moment any read
+        // fails — the safe direction, since a delta is only taken when GitHub answers.
+        if deps.review.is_some() {
+            deps.review_delta = Some(std::sync::Arc::new(crate::ghsummons::GH::new(
+                &eff.cfg.tracker.summon_token,
+                None,
+            ))
+                as std::sync::Arc<dyn crate::ghsummons::ReviewDeltaSource>);
+        }
         deps.stack_context = stack_context;
         deps.capabilities_section = capabilities_section;
         deps.teammate_section = teammate_section;
