@@ -209,8 +209,11 @@ pub struct Divergence {
     /// (STUDIO-950). Like `auto_merge_reason` it is a fact this process already has, copied from
     /// [`Orchestrator::review_capacity_held`] — the sweep invents nothing. It ANNOTATES: the row is
     /// still reported, and [`Orchestrator::set_review_divergences`] names the hold and its holder
-    /// count instead of claiming nothing has reported it blocked. Also deliberately NOT rendered
-    /// onto `/api/v1/state`, for `auto_merge_reason`'s reason.
+    /// count instead of claiming nothing has reported it blocked. Unlike `auto_merge_reason` it IS
+    /// rendered onto `/api/v1/state`, as a conditional `capacity_held` object on the (already
+    /// Rhapsody-only, already conditional) divergence row — the console banner and the project
+    /// advisory both need it to say the wait is deliberate, and it cannot be folded into the fixed
+    /// advisory string. Absent when there is no hold, so the healthy payload is untouched.
     pub capacity_held: Option<CapacityHold>,
 }
 
