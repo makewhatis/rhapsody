@@ -270,7 +270,12 @@ impl Orchestrator {
     /// A quorum review is a real tracker ticket on this same ladder and is deliberately NOT
     /// subtracted: only [`running_ticketless_reviews`](Orchestrator::running_ticketless_reviews)
     /// (the entries carrying `review` coordinates) belong to the separate pool.
-    fn implementation_pool_holders(&self) -> i64 {
+    ///
+    /// `pub(crate)` because the RETRY ladder
+    /// ([`on_retry`](Orchestrator::on_retry)) is a third implementation draw that dispatches straight
+    /// from itself, bypassing both ladders above — it must ask the same question or a due retry is
+    /// refused a slot `select` would have given it.
+    pub(crate) fn implementation_pool_holders(&self) -> i64 {
         let total = i64::try_from(self.running.len()).unwrap_or(i64::MAX);
         match self.eff.as_ref().and_then(|e| e.max_concurrent_reviews) {
             Some(_) => (total - self.running_ticketless_reviews()).max(0),
