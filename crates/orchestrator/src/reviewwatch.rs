@@ -5762,6 +5762,67 @@ mod tests {
         );
     }
 
+    /// The other half of the same acceptance item, and the half the single-sweep test above cannot
+    /// reach: the budget must subtract the reviews ALREADY RUNNING, not only decrement within the
+    /// tick that dispatched them.
+    ///
+    /// `review_runs_never_exceed_their_own_budget` drives ONE sweep, so it pins the per-dispatch
+    /// decrement of a budget that started full — with nothing running, `global_slots(max_reviews,
+    /// holding)` and `global_slots(max_reviews, 0)` are the same number, and substituting the second
+    /// for the first leaves that test (and the rest of the crate) green. This test drives TWO ticks
+    /// with the pool already full on the second, where the two differ: a tick that starts with
+    /// `max_concurrent_reviews` reviews in flight has NO budget at all.
+    ///
+    /// It is the subtraction the README's safety claim rests on — that total live agents exceed
+    /// `max_concurrent_agents` by at most `max_concurrent_reviews`. Without it the review pool is
+    /// only a per-tick rate limit and the daemon can run unboundedly many reviews.
+    ///
+    /// Mutation check: `global_slots(max_reviews, holding)` -> `global_slots(max_reviews, 0)` in
+    /// `review_dispatch_budget` and this reds `left: 2, right: 0` on the second tick.
+    #[test]
+    fn a_full_review_pool_leaves_the_next_tick_no_budget() {
+        let (mut o, dispatched) = orch(ticketless(&["bob"]));
+        {
+            let eff = o.eff.as_mut().expect("eff");
+            // Deliberately generous, so nothing the implementation budget does can explain the
+            // refusal below: the ONLY bound in play is the review pool.
+            eff.max_concurrent = 10;
+            eff.max_concurrent_reviews = Some(2);
+        }
+        for n in 31..35 {
+            introduce(&o, row(n, "bob"));
+        }
+
+        // Tick one fills the review pool exactly.
+        let first = o.handle_review_sweep(&[open_at(31, HEAD_A), open_at(32, HEAD_A)]);
+        assert_eq!(first.dispatched, 2, "tick one must fill the pool");
+        assert_eq!(first.deferred, 0);
+        assert_eq!(
+            o.running_ticketless_reviews(),
+            2,
+            "the two dispatched rounds must be holding the review pool"
+        );
+
+        // Tick two: a FRESH budget, counted against a pool that is already full.
+        let second = o.handle_review_sweep(&[open_at(33, HEAD_A), open_at(34, HEAD_A)]);
+
+        assert_eq!(
+            second.dispatched, 0,
+            "a tick that starts with the review pool full has no budget to dispatch from"
+        );
+        assert_eq!(second.deferred, 2);
+        assert_eq!(
+            dispatched.lock().expect("lock").len(),
+            2,
+            "only tick one's two rounds ever ran"
+        );
+        assert_eq!(
+            o.running_ticketless_reviews(),
+            2,
+            "running review runs must never exceed agent.max_concurrent_reviews"
+        );
+    }
+
     /// STUDIO-950's second half: a round the watcher is HOLDING for capacity is not an unexplained
     /// stall — but it is still REPORTED. `reviewwatch` records the hold when it defers the round;
     /// the reconciliation sweep copies it onto the divergence and its WARN names the hold and its
