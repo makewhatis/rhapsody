@@ -352,7 +352,9 @@ mod tests {
 
     use super::*;
     use crate::orchestrator::Orchestrator;
-    use crate::testsupport::{DispatchedEntries, empty_effective, record_entries, set_of};
+    use crate::testsupport::{
+        DispatchedEntries, empty_effective, empty_resolved_project, record_entries, set_of,
+    };
 
     /// A legacy-path (no projects) orchestrator with a fake tracker, a recording spawn (captures the
     /// running entry so tests can read `stack_context`), and a dependency mode. Mirrors Go
@@ -367,6 +369,44 @@ mod tests {
         eff.max_concurrent = 10;
         eff.max_retry_backoff_ms = 300_000;
         eff.poll_interval = Duration::from_secs(3600);
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        let dispatched: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&dispatched));
+        (o, dispatched)
+    }
+
+    /// A PRODUCTION-shaped multi-project orchestrator: one `ResolvedProject` bound to `tr`, so the pass
+    /// takes [`Orchestrator::promote_scopes`]'s projects branch rather than the legacy/test-injected
+    /// single-tracker branch `new_promote_orch` exercises. The top-level `dependency_mode` is left
+    /// disabled, so ONLY the project scope can promote — which is what production resolves for a
+    /// legacy `tracker.project_slug` config (`resolve` turns it into exactly one `eff.projects`
+    /// entry). STUDIO-948: this is the branch that actually carries a config's `promote_from_states`
+    /// to the fifth gate, and no other test drives it.
+    fn new_promote_orch_multi(
+        tr: Arc<Fake>,
+        mode: &str,
+        promote_from: &[&str],
+    ) -> (Orchestrator, DispatchedEntries) {
+        let dyn_tr = Arc::clone(&tr) as Arc<dyn Tracker>;
+        let mut eff = empty_effective(Arc::clone(&dyn_tr));
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done", "cancelled"]);
+        eff.canceled_states = set_of(&["cancelled"]);
+        eff.review_states = set_of(&["in review"]);
+        eff.max_concurrent = 10;
+        eff.max_retry_backoff_ms = 300_000;
+        eff.poll_interval = Duration::from_secs(3600);
+        eff.dependency_mode = String::new();
+        let mut p = empty_resolved_project("proj-a", dyn_tr);
+        p.dependency_mode = mode.to_string();
+        p.active_states = eff.active_states.clone();
+        p.terminal_states = eff.terminal_states.clone();
+        p.canceled_states = eff.canceled_states.clone();
+        p.review_states = eff.review_states.clone();
+        p.promote_from_states = set_of(promote_from);
+        eff.projects = vec![p];
+
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
         let dispatched: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
@@ -574,6 +614,52 @@ mod tests {
             1,
             "state matching must fold case and whitespace"
         );
+    }
+
+    // STUDIO-948 production path (negative half). The tests above reach the gate through the legacy /
+    // test-injected single-tracker branch; production resolves to an `eff.projects` entry, and the
+    // value only reaches the gate if `promote_scopes` copies it from the `ResolvedProject`
+    // (`promote_from: p.promote_from_states.clone()`). Emptying that copy leaves the gate inert and
+    // re-promotes the parked ticket — the STUDIO-749 regression — while every legacy-branch test
+    // above stays green. This test drives the projects branch and reds on that mutation.
+    #[tokio::test]
+    async fn promote_unblocked_multi_project_deferred_not_promoted_studio_749() {
+        let mut f = Fake::new();
+        f.blocked_backlog = vec![backlog_dep_in("Deferred", "Done")];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = new_promote_orch_multi(Arc::clone(&tr), "dag", &["backlog"]);
+
+        o.promote_unblocked().await;
+
+        assert_eq!(
+            tr.move_to_type_calls().len(),
+            0,
+            "the project's promote_from_states must gate the production (projects) branch too"
+        );
+        assert_eq!(dispatched_len(&dispatched), 0);
+    }
+
+    // STUDIO-948 production path (positive half), so the pair pins direction on the projects branch:
+    // inverting the fifth gate must red BOTH this and its Deferred companion.
+    #[tokio::test]
+    async fn promote_unblocked_multi_project_named_state_is_promoted() {
+        let mut f = Fake::new();
+        f.blocked_backlog = vec![backlog_dep_in("Backlog", "Done")];
+        f.move_to_type_name = "Todo".into();
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = new_promote_orch_multi(Arc::clone(&tr), "dag", &["backlog"]);
+
+        o.promote_unblocked().await;
+
+        let moves = tr.move_to_type_calls();
+        assert_eq!(
+            moves.len(),
+            1,
+            "a ticket in a named project promote_from_states must still be promoted"
+        );
+        assert_eq!(moves[0].issue_id, "b2");
+        assert_eq!(dispatched_len(&dispatched), 0);
     }
 
     // The next dispatch of a promoted issue consumes the stashed stack hint (and clears it). Mirrors Go

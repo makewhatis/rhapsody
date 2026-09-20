@@ -774,6 +774,56 @@ claude:
         assert_eq!(p.repo, "", "no repo configured");
     }
 
+    // STUDIO-948: the config→gate seam end to end. DECODE keeps the operator's spelling verbatim;
+    // the FIFTH GATE matches on `normalize_state`. This pins that `build_effective` folds the
+    // configured value with `normalize_set` on BOTH the top-level and per-project paths. Drop either
+    // `normalize_set(...)` and an operator's `Backlog` stays `"Backlog"`, matches no normalized issue
+    // state, and dag silently promotes zero tickets — with no warning, because the boot WARN only
+    // fires when the key is UNSET. The promote tests assign already-lowercased sets directly, so this
+    // is the only test that pins the folding of a value that came from YAML.
+    #[test]
+    fn build_effective_normalizes_promote_from_states() {
+        const WF: &str = "\
+tracker:
+  kind: linear
+  api_key: tok
+  project_slug: proj
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Canceled]
+  dependency_mode: dag
+  promote_from_states: [Backlog]
+projects:
+  - slugs: [proj]
+    promote_from_states: [  Staged  ]
+agent:
+  backend: claude
+claude:
+  command: claude
+";
+        let cfg = decode_cfg(WF, "body");
+        let eff = build_effective(&cfg).expect("build_effective");
+        assert!(
+            eff.promote_from_states.contains("backlog"),
+            "top-level must be normalized (got {:?})",
+            eff.promote_from_states
+        );
+        assert!(
+            !eff.promote_from_states.contains("Backlog"),
+            "the raw spelling must not survive, or the normalized issue state never matches (got {:?})",
+            eff.promote_from_states
+        );
+        let p = eff
+            .projects
+            .iter()
+            .find(|p| p.slug == "proj")
+            .expect("resolved project");
+        assert!(
+            p.promote_from_states.contains("staged"),
+            "per-project override must be normalized too (got {:?})",
+            p.promote_from_states
+        );
+    }
+
     // Mirrors Go `TestBuildEffectiveClaimModeOverrideDistinctClient`: a per-project claim_mode:pool
     // override (global default assignee) must build a DISTINCT tracker client, not reuse the
     // assignee-mode top-level one — else the candidate query never flips to unassigned (INF-477).
